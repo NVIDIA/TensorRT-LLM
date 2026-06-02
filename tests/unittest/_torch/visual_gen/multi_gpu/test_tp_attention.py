@@ -154,68 +154,73 @@ def _shard_tp_weights(ref_attn, tp_attn, tp_rank, tp_size, qkv_mode=QKVMode.FUSE
     RMSNorm (TP-enabled): split weight
     """
     with torch.no_grad():
-        if qkv_mode == QKVMode.FUSE_QKV:
-            # Fused QKV: weight is [q_dim + 2*kv_dim, hidden_size]
-            full_w = ref_attn.qkv_proj.weight.data
-            q_dim = ref_attn.q_dim
-            kv_dim = ref_attn.kv_dim
-            q_w, k_w, v_w = full_w.split([q_dim, kv_dim, kv_dim], dim=0)
+        q_start, q_end = tp_attn.local_q_dim_start, tp_attn.local_q_dim_end
+        kv_start, kv_end = tp_attn.local_kv_dim_start, tp_attn.local_kv_dim_end
 
-            q_shard = _shard_dim0(q_w, tp_rank, tp_size)
-            k_shard = _shard_dim0(k_w, tp_rank, tp_size)
-            v_shard = _shard_dim0(v_w, tp_rank, tp_size)
-            tp_attn.qkv_proj.weight.data.copy_(torch.cat([q_shard, k_shard, v_shard], dim=0))
+        if qkv_mode == QKVMode.FUSE_QKV:
+            q_w, k_w, v_w = ref_attn.qkv_proj.weight.data.split(
+                [ref_attn.q_dim, ref_attn.kv_dim, ref_attn.kv_dim], dim=0
+            )
+            tp_attn.qkv_proj.weight.data.copy_(
+                torch.cat(
+                    [
+                        q_w[q_start:q_end],
+                        k_w[kv_start:kv_end],
+                        v_w[kv_start:kv_end],
+                    ],
+                    dim=0,
+                ).contiguous()
+            )
 
             if ref_attn.qkv_proj.bias is not None:
-                full_b = ref_attn.qkv_proj.bias.data
-                q_b, k_b, v_b = full_b.split([q_dim, kv_dim, kv_dim], dim=0)
+                q_b, k_b, v_b = ref_attn.qkv_proj.bias.data.split(
+                    [ref_attn.q_dim, ref_attn.kv_dim, ref_attn.kv_dim], dim=0
+                )
                 tp_attn.qkv_proj.bias.data.copy_(
                     torch.cat(
                         [
-                            _shard_dim0(q_b, tp_rank, tp_size),
-                            _shard_dim0(k_b, tp_rank, tp_size),
-                            _shard_dim0(v_b, tp_rank, tp_size),
+                            q_b[q_start:q_end],
+                            k_b[kv_start:kv_end],
+                            v_b[kv_start:kv_end],
                         ],
                         dim=0,
-                    )
+                    ).contiguous()
                 )
         else:
-            for name in ("to_q", "to_k", "to_v"):
+            for name, bounds in (
+                ("to_q", (q_start, q_end)),
+                ("to_k", (kv_start, kv_end)),
+                ("to_v", (kv_start, kv_end)),
+            ):
                 ref_proj = getattr(ref_attn, name)
                 tp_proj = getattr(tp_attn, name)
-                tp_proj.weight.data.copy_(_shard_dim0(ref_proj.weight.data, tp_rank, tp_size))
+                start, end = bounds
+                tp_proj.weight.data.copy_(ref_proj.weight.data[start:end].contiguous())
                 if ref_proj.bias is not None:
-                    tp_proj.bias.data.copy_(_shard_dim0(ref_proj.bias.data, tp_rank, tp_size))
+                    tp_proj.bias.data.copy_(ref_proj.bias.data[start:end].contiguous())
 
-        # Output projection: row-parallel (split input dim = dim 1)
+        # Output projection: row-parallel (split input dim = dim 1, head-aligned)
         ref_out = ref_attn.to_out[0]
         tp_out = tp_attn.to_out[0]
-        shard_size = math.ceil(ref_out.weight.shape[1] / tp_size)
-        start = tp_rank * shard_size
-        end = min(start + shard_size, ref_out.weight.shape[1])
-        tp_out.weight.data.copy_(ref_out.weight.data[:, start:end].contiguous())
+        q_start, q_end = tp_attn.local_q_dim_start, tp_attn.local_q_dim_end
+        tp_out.weight.data.copy_(ref_out.weight.data[:, q_start:q_end].contiguous())
         if ref_out.bias is not None:
             tp_out.bias.data.copy_(ref_out.bias.data)
 
-        # QK norm weights (if TP-enabled, they're sharded)
+        # QK norm weights (if TP-enabled, use Attention head-based shard bounds)
         if hasattr(ref_attn, "norm_q") and hasattr(tp_attn, "norm_q"):
             if tp_attn.norm_q.enable_tp:
-                shard_size = ref_attn.norm_q.weight.shape[0] // tp_size
-                start = tp_rank * shard_size
-                end = start + shard_size
-                tp_attn.norm_q.weight.data.copy_(ref_attn.norm_q.weight.data[start:end])
-                tp_attn.norm_k.weight.data.copy_(ref_attn.norm_k.weight.data[start:end])
+                tp_attn.norm_q.weight.data.copy_(
+                    ref_attn.norm_q.weight.data[tp_attn.local_q_dim_start : tp_attn.local_q_dim_end]
+                )
+                tp_attn.norm_k.weight.data.copy_(
+                    ref_attn.norm_k.weight.data[
+                        tp_attn.local_kv_dim_start : tp_attn.local_kv_dim_end
+                    ]
+                )
             else:
                 tp_attn.norm_q.weight.data.copy_(ref_attn.norm_q.weight.data)
                 tp_attn.norm_k.weight.data.copy_(ref_attn.norm_k.weight.data)
-
-
-def _shard_dim0(tensor, tp_rank, tp_size):
-    """Shard a tensor along dim 0 (works for both 1D bias and 2D weight)."""
-    shard_size = math.ceil(tensor.shape[0] / tp_size)
-    start = tp_rank * shard_size
-    end = min(start + shard_size, tensor.shape[0])
-    return tensor[start:end].contiguous()
 
 
 # =============================================================================
@@ -397,16 +402,18 @@ def _logic_tp_hidden_512(rank, world_size):
     _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=512, num_heads=4)
 
 
-def _logic_tp_heads_not_divisible(rank, world_size):
-    """TP when num_heads % tp_size != 0. Expected to fail until uneven sharding is implemented."""
-    _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=320, num_heads=5)
+def _logic_tp_size_3_uneven_heads(rank, world_size):
+    """TP=3 when num_heads and hidden_size are not divisible by tp_size."""
+    _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=512, num_heads=8)
 
 
 def _logic_tp_world_size_4(rank, world_size):
     _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=512, num_heads=16)
 
 
-def _logic_tp_ulysses_combined(rank, world_size, ulysses_size, tp_size):
+def _logic_tp_ulysses_combined(
+    rank, world_size, ulysses_size, tp_size, hidden_size=512, num_heads=16
+):
     """TP + Ulysses combined matches F.sdpa reference on the full sequence.
 
     4 GPUs: tp_size=2, ulysses_size=2.
@@ -415,8 +422,6 @@ def _logic_tp_ulysses_combined(rank, world_size, ulysses_size, tp_size):
     assert tp_size * ulysses_size == world_size
     device = torch.device(f"cuda:{rank}")
 
-    hidden_size = 512
-    num_heads = 16
     head_dim = hidden_size // num_heads
     batch = 2
     seq_per_rank = 8
@@ -458,6 +463,18 @@ def _logic_tp_ulysses_combined(rank, world_size, ulysses_size, tp_size):
     torch.testing.assert_close(combined_out, expected_shard, rtol=1e-2, atol=1e-2)
 
 
+def _logic_tp3_ulysses_uneven_combined(rank, world_size):
+    """TP=3 + Ulysses=2 with 8 attention heads (4+2+2 TP split)."""
+    _logic_tp_ulysses_combined(
+        rank,
+        world_size,
+        ulysses_size=2,
+        tp_size=3,
+        hidden_size=512,
+        num_heads=8,
+    )
+
+
 # =============================================================================
 # Test classes
 # =============================================================================
@@ -488,9 +505,9 @@ class TestTPAttentionEdgeCases:
     def test_hidden_512(self):
         _run(2, _logic_tp_hidden_512)
 
-    @pytest.mark.xfail(reason="Uneven head sharding not yet implemented", raises=Exception)
-    def test_tp_heads_not_divisible(self):
-        _run(2, _logic_tp_heads_not_divisible)
+    def test_tp_size_3_uneven_heads(self):
+        """TP=3 with 8 heads (4+2+2 split) matches F.sdpa reference."""
+        _run(3, _logic_tp_size_3_uneven_heads)
 
     def test_tp_world_size_4(self):
         _run(4, _logic_tp_world_size_4)
@@ -516,6 +533,9 @@ class TestTPUlyssesCombined:
         ulysses_size = 2
         world = ulysses_size * tp_size
         _run(world, _logic_tp_ulysses_combined, ulysses_size, tp_size)
+
+    def test_tp_3_ulysses_2_uneven(self):
+        _run(6, _logic_tp3_ulysses_uneven_combined)
 
 
 if __name__ == "__main__":

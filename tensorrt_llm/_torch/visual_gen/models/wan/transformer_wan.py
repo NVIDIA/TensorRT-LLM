@@ -356,6 +356,7 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
             self.add_v_proj = Linear(
                 added_kv_proj_dim,
@@ -367,6 +368,7 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
             self.norm_added_k = RMSNormTPAware(
                 hidden_size=hidden_size,
@@ -375,6 +377,7 @@ class WanBlock(nn.Module):
                 has_weights=True,
                 enable_tp=(tp_size > 1),
                 mapping=model_config.mapping,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
 
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility

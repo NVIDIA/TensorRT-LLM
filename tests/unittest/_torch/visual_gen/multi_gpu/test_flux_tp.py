@@ -49,6 +49,13 @@ try:
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
+    from .tp_shard_utils import (
+        copy_tp_parameter,
+        shard_dim1,
+        shard_fused_gate_up,
+        shard_fused_qkv_by_heads,
+    )
+
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
@@ -150,6 +157,18 @@ _FLUX2_TEST_CONFIG = dict(
     timestep_guidance_channels=256,
 )
 
+# TP=3 uneven configs: 8 heads already gives an uneven 3+3+2 attention split.
+_FLUX1_UNEVEN_TP3_CONFIG = {
+    **_FLUX1_TEST_CONFIG,
+    # FLUX.1 FFN intermediate is 512 * 4 = 2048, also uneven over TP=3.
+}
+
+_FLUX2_UNEVEN_TP3_CONFIG = {
+    **_FLUX2_TEST_CONFIG,
+    "mlp_ratio": 3.5,
+    # Keep heads unchanged; make FLUX.2 MLP hidden dim 512 * 3.5 = 1792, uneven over TP=3.
+}
+
 
 def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA"):
     """Create DiffusionModelConfig for testing with TP and/or Ulysses."""
@@ -195,72 +214,30 @@ def _stabilize_model_weights(model):
 
 
 # =============================================================================
-# TP weight sharding helpers
+# TP weight sharding helpers (see tp_shard_utils.py)
 # =============================================================================
 
 
-def _shard_dim0(tensor, tp_rank, tp_size):
-    """Shard a tensor along dim 0."""
-    chunk = tensor.shape[0] // tp_size
-    return tensor[tp_rank * chunk : (tp_rank + 1) * chunk].contiguous()
-
-
-def _shard_dim1(tensor, tp_rank, tp_size):
-    """Shard a tensor along dim 1."""
-    chunk = tensor.shape[1] // tp_size
-    return tensor[:, tp_rank * chunk : (tp_rank + 1) * chunk].contiguous()
-
-
-def _shard_fused_qkv(tensor, tp_rank, tp_size, q_dim, kv_dim):
-    """Shard a fused QKV weight [q_dim + 2*kv_dim, ...] preserving Q/K/V structure."""
-    q, k, v = tensor.split([q_dim, kv_dim, kv_dim], dim=0)
-    return torch.cat(
-        [
-            _shard_dim0(q, tp_rank, tp_size),
-            _shard_dim0(k, tp_rank, tp_size),
-            _shard_dim0(v, tp_rank, tp_size),
-        ],
-        dim=0,
-    )
-
-
-def _shard_fused_gate_up(tensor, tp_rank, tp_size):
-    """Shard a fused gate_up weight [2*intermediate, ...] preserving gate/up structure."""
-    half = tensor.shape[0] // 2
-    gate, up = tensor.split([half, half], dim=0)
-    return torch.cat(
-        [
-            _shard_dim0(gate, tp_rank, tp_size),
-            _shard_dim0(up, tp_rank, tp_size),
-        ],
-        dim=0,
-    )
-
-
-def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size):
-    """Copy weights from a TP=1 reference model into a TP model with correct sharding.
-
-    Handles column-parallel (QKV, MLP up/gate), row-parallel (output projs),
-    fused QKV/gate_up weights, and wrapper projectors (FluxJointAttnMLPProj,
-    FluxJointQKVMLPProj) that have different sub-module structure at TP>1.
-    """
+def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
+    """Copy weights from a TP=1 reference model into a TP model with correct sharding."""
     ref_params = dict(ref_model.named_parameters())
-
-    # First handle wrapper projectors whose sub-module names differ between TP=1 and TP>1.
-    # At TP=1: single .proj Linear. At TP>1: split into sub-Linears.
+    num_heads = config_dict["num_attention_heads"]
+    head_dim = config_dict["attention_head_dim"]
+    vgm = getattr(tp_model.model_config, "visual_gen_mapping", None)
+    ulysses_size = vgm.ulysses_size if vgm is not None else 1
     handled_tp_params = set()
 
     for tp_name, tp_module in tp_model.named_modules():
         if isinstance(tp_module, FluxJointAttnMLPProj) and tp_module.tp_size > 1:
-            # TP model has .attn_proj + .mlp_proj; ref has .proj
-            ref_w = ref_params[f"{tp_name}.proj.weight"]  # [out, attn_dim + mlp_dim]
+            ref_w = ref_params[f"{tp_name}.proj.weight"]
             w_attn = ref_w[:, : tp_module.attn_dim]
             w_mlp = ref_w[:, tp_module.attn_dim :]
+            attn_start, attn_end = tp_module.attn_shard
             tp_model.get_parameter(f"{tp_name}.attn_proj.weight").data.copy_(
-                _shard_dim1(w_attn, tp_rank, tp_size)
+                w_attn[:, attn_start:attn_end].contiguous()
             )
             tp_model.get_parameter(f"{tp_name}.mlp_proj.weight").data.copy_(
-                _shard_dim1(w_mlp, tp_rank, tp_size)
+                shard_dim1(w_mlp, tp_rank, tp_size)
             )
             handled_tp_params.update(
                 [
@@ -274,20 +251,25 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size):
                 handled_tp_params.add(f"{tp_name}.bias")
 
         elif isinstance(tp_module, FluxJointQKVMLPProj) and tp_module.tp_size > 1:
-            # TP model has .qkv_proj + .mlp_proj; ref has .proj
-            ref_w = ref_params[f"{tp_name}.proj.weight"]  # [qkv+mlp, hidden]
+            ref_w = ref_params[f"{tp_name}.proj.weight"]
             w_qkv = ref_w[: tp_module.full_qkv_dim]
             w_mlp = ref_w[tp_module.full_qkv_dim :]
 
-            # QKV: split into Q/K/V, shard each, re-fuse
             tp_model.get_parameter(f"{tp_name}.qkv_proj.weight").data.copy_(
-                _shard_fused_qkv(
-                    w_qkv, tp_rank, tp_size, tp_module.full_q_dim, tp_module.full_kv_dim
+                shard_fused_qkv_by_heads(
+                    w_qkv,
+                    tp_rank,
+                    tp_size,
+                    num_heads,
+                    num_heads,
+                    head_dim,
+                    tp_module.full_q_dim,
+                    tp_module.full_kv_dim,
+                    ulysses_size,
                 )
             )
-            # MLP: split gate/up, shard each, re-fuse
             tp_model.get_parameter(f"{tp_name}.mlp_proj.weight").data.copy_(
-                _shard_fused_gate_up(w_mlp, tp_rank, tp_size)
+                shard_fused_gate_up(w_mlp, tp_rank, tp_size)
             )
             handled_tp_params.update(
                 [
@@ -295,18 +277,25 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size):
                     f"{tp_name}.mlp_proj.weight",
                 ]
             )
-            # Handle bias if present
             if f"{tp_name}.proj.bias" in ref_params:
                 ref_b = ref_params[f"{tp_name}.proj.bias"]
                 b_qkv = ref_b[: tp_module.full_qkv_dim]
                 b_mlp = ref_b[tp_module.full_qkv_dim :]
                 tp_model.get_parameter(f"{tp_name}.qkv_proj.bias").data.copy_(
-                    _shard_fused_qkv(
-                        b_qkv, tp_rank, tp_size, tp_module.full_q_dim, tp_module.full_kv_dim
+                    shard_fused_qkv_by_heads(
+                        b_qkv,
+                        tp_rank,
+                        tp_size,
+                        num_heads,
+                        num_heads,
+                        head_dim,
+                        tp_module.full_q_dim,
+                        tp_module.full_kv_dim,
+                        ulysses_size,
                     )
                 )
                 tp_model.get_parameter(f"{tp_name}.mlp_proj.bias").data.copy_(
-                    _shard_fused_gate_up(b_mlp, tp_rank, tp_size)
+                    shard_fused_gate_up(b_mlp, tp_rank, tp_size)
                 )
                 handled_tp_params.update(
                     [
@@ -315,49 +304,20 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size):
                     ]
                 )
 
-    # Now handle all remaining parameters by shape comparison.
     with torch.no_grad():
         for tp_name, tp_param in tp_model.named_parameters():
-            if tp_name in handled_tp_params:
+            if tp_name in handled_tp_params or tp_name not in ref_params:
                 continue
-            if tp_name not in ref_params:
-                continue
-
-            ref_param = ref_params[tp_name]
-
-            if tp_param.shape == ref_param.shape:
-                # Replicated parameter (norms, embeddings, etc.)
-                tp_param.data.copy_(ref_param.data)
-            elif tp_param.ndim >= 2 and tp_param.shape[1] == ref_param.shape[1]:
-                # Column parallel: dim 0 is smaller (output dim sharded)
-                if "qkv_proj" in tp_name or "add_qkv_proj" in tp_name:
-                    # Fused QKV: figure out q_dim from total (q=k=v for FLUX)
-                    q_dim = ref_param.shape[0] // 3
-                    tp_param.data.copy_(
-                        _shard_fused_qkv(ref_param.data, tp_rank, tp_size, q_dim, q_dim)
-                    )
-                elif "gate_up_proj" in tp_name:
-                    tp_param.data.copy_(_shard_fused_gate_up(ref_param.data, tp_rank, tp_size))
-                else:
-                    tp_param.data.copy_(_shard_dim0(ref_param.data, tp_rank, tp_size))
-            elif tp_param.ndim >= 2 and tp_param.shape[0] == ref_param.shape[0]:
-                # Row parallel: dim 1 is smaller (input dim sharded)
-                tp_param.data.copy_(_shard_dim1(ref_param.data, tp_rank, tp_size))
-            elif tp_param.ndim == 1 and tp_param.shape[0] < ref_param.shape[0]:
-                # 1D bias for column parallel
-                if "qkv_proj" in tp_name or "add_qkv_proj" in tp_name:
-                    q_dim = ref_param.shape[0] // 3
-                    tp_param.data.copy_(
-                        _shard_fused_qkv(ref_param.data, tp_rank, tp_size, q_dim, q_dim)
-                    )
-                elif "gate_up_proj" in tp_name:
-                    tp_param.data.copy_(_shard_fused_gate_up(ref_param.data, tp_rank, tp_size))
-                else:
-                    tp_param.data.copy_(_shard_dim0(ref_param.data, tp_rank, tp_size))
-            else:
-                raise ValueError(
-                    f"Cannot shard {tp_name}: ref={ref_param.shape}, tp={tp_param.shape}"
-                )
+            copy_tp_parameter(
+                tp_name,
+                ref_params[tp_name],
+                tp_param,
+                tp_rank,
+                tp_size,
+                num_heads,
+                head_dim,
+                ulysses_size=ulysses_size,
+            )
 
 
 # =============================================================================
@@ -410,6 +370,16 @@ def _logic_flux1_tp_forward(rank, world_size):
 
 def _logic_flux1_tp_vs_single_gpu(rank, world_size):
     """FLUX.1: TP 2-GPU output matches single-GPU reference."""
+    _logic_flux1_tp_vs_single_gpu_with_config(rank, world_size, _FLUX1_TEST_CONFIG)
+
+
+def _logic_flux1_tp3_uneven_vs_single_gpu(rank, world_size):
+    """FLUX.1: TP=3 with uneven head/MLP dims matches single-GPU reference."""
+    _logic_flux1_tp_vs_single_gpu_with_config(rank, world_size, _FLUX1_UNEVEN_TP3_CONFIG)
+
+
+def _logic_flux1_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
+    """FLUX.1: TP output matches single-GPU reference."""
     from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import FluxTransformer2DModel
 
     device = torch.device(f"cuda:{rank}")
@@ -418,22 +388,25 @@ def _logic_flux1_tp_vs_single_gpu(rank, world_size):
     batch = 1
     img_seq = 16
     txt_seq = 8
+    in_channels = 64
 
     # Create single-GPU reference model
     torch.manual_seed(123)
-    ref_config = _make_model_config(_FLUX1_TEST_CONFIG, tp_size=1)
+    ref_config = _make_model_config(config_dict, tp_size=1)
     ref_model = FluxTransformer2DModel(ref_config).to(device).to(compute_dtype)
     _stabilize_model_weights(ref_model)
 
     # Create TP model and copy sharded weights from ref
     torch.manual_seed(123)
-    tp_config = _make_model_config(_FLUX1_TEST_CONFIG, tp_size=world_size)
+    tp_config = _make_model_config(config_dict, tp_size=world_size)
     tp_model = FluxTransformer2DModel(tp_config).to(device).to(compute_dtype)
-    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size)
+    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size, config_dict)
 
     # Same inputs on all ranks
     torch.manual_seed(456)
-    hidden_states = torch.randn(batch, img_seq, 64, device=device, dtype=compute_dtype) * 0.1
+    hidden_states = (
+        torch.randn(batch, img_seq, in_channels, device=device, dtype=compute_dtype) * 0.1
+    )
     encoder_hidden_states = (
         torch.randn(batch, txt_seq, 256, device=device, dtype=compute_dtype) * 0.1
     )
@@ -517,6 +490,16 @@ def _logic_flux2_tp_forward(rank, world_size):
 
 def _logic_flux2_tp_vs_single_gpu(rank, world_size):
     """FLUX.2: TP 2-GPU output matches single-GPU reference."""
+    _logic_flux2_tp_vs_single_gpu_with_config(rank, world_size, _FLUX2_TEST_CONFIG)
+
+
+def _logic_flux2_tp3_uneven_vs_single_gpu(rank, world_size):
+    """FLUX.2: TP=3 with uneven head/MLP dims matches single-GPU reference."""
+    _logic_flux2_tp_vs_single_gpu_with_config(rank, world_size, _FLUX2_UNEVEN_TP3_CONFIG)
+
+
+def _logic_flux2_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
+    """FLUX.2: TP output matches single-GPU reference."""
     from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import Flux2Transformer2DModel
 
     device = torch.device(f"cuda:{rank}")
@@ -525,22 +508,25 @@ def _logic_flux2_tp_vs_single_gpu(rank, world_size):
     batch = 1
     img_seq = 16
     txt_seq = 8
+    in_channels = 128
 
     # Create single-GPU reference model
     torch.manual_seed(123)
-    ref_config = _make_model_config(_FLUX2_TEST_CONFIG, tp_size=1)
+    ref_config = _make_model_config(config_dict, tp_size=1)
     ref_model = Flux2Transformer2DModel(ref_config).to(device).to(compute_dtype)
     _stabilize_model_weights(ref_model)
 
     # Create TP model and copy sharded weights from ref
     torch.manual_seed(123)
-    tp_config = _make_model_config(_FLUX2_TEST_CONFIG, tp_size=world_size)
+    tp_config = _make_model_config(config_dict, tp_size=world_size)
     tp_model = Flux2Transformer2DModel(tp_config).to(device).to(compute_dtype)
-    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size)
+    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size, config_dict)
 
     # Same inputs on all ranks
     torch.manual_seed(456)
-    hidden_states = torch.randn(batch, img_seq, 128, device=device, dtype=compute_dtype) * 0.1
+    hidden_states = (
+        torch.randn(batch, img_seq, in_channels, device=device, dtype=compute_dtype) * 0.1
+    )
     encoder_hidden_states = (
         torch.randn(batch, txt_seq, 256, device=device, dtype=compute_dtype) * 0.1
     )
@@ -608,7 +594,7 @@ def _logic_flux2_tp_ulysses_vs_single_gpu(rank, world_size):
     )
     combined_model = Flux2Transformer2DModel(combined_config).to(device).to(compute_dtype)
     vgm = combined_config.visual_gen_mapping
-    _copy_ref_weights_to_tp(ref_model, combined_model, vgm.tp_rank, tp_size)
+    _copy_ref_weights_to_tp(ref_model, combined_model, vgm.tp_rank, tp_size, _FLUX2_TEST_CONFIG)
 
     # Same inputs on all ranks (Ulysses shards at runtime)
     torch.manual_seed(456)
@@ -680,6 +666,18 @@ class TestFlux2TPUlyssesCombined:
     def test_flux2_tp_ulysses_vs_single_gpu(self):
         """FLUX.2 TP=2 + Ulysses=2 (4 GPUs) matches single-GPU reference."""
         run_test_in_distributed(world_size=4, test_fn=_logic_flux2_tp_ulysses_vs_single_gpu)
+
+
+class TestFluxUnevenTP3:
+    """TP=3 tests where head count and MLP dims are not divisible by tp_size."""
+
+    def test_flux1_tp3_uneven_vs_single_gpu(self):
+        """FLUX.1 TP=3 (8 heads, uneven MLP) matches single-GPU reference."""
+        run_test_in_distributed(world_size=3, test_fn=_logic_flux1_tp3_uneven_vs_single_gpu)
+
+    def test_flux2_tp3_uneven_vs_single_gpu(self):
+        """FLUX.2 TP=3 (8 heads, uneven MLP) matches single-GPU reference."""
+        run_test_in_distributed(world_size=3, test_fn=_logic_flux2_tp3_uneven_vs_single_gpu)
 
 
 if __name__ == "__main__":

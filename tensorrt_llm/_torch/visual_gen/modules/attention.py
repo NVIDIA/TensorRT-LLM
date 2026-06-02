@@ -71,10 +71,7 @@ class Attention(nn.Module):
         self.bias = bias
 
         self.tp_size = self.mapping.tp_size if self.mapping else 1
-        assert (
-            self.num_attention_heads % self.tp_size == 0
-            and self.num_key_value_heads % self.tp_size == 0
-        ), "TP size must divide the number of Query and KV Heads"
+        self.tp_rank = self.mapping.tp_rank if self.mapping else 0
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
         # Backed by torch.ops.trtllm.fused_dit_qk_norm_rope which auto-dispatches:
@@ -108,11 +105,7 @@ class Attention(nn.Module):
         self.q_dim = self.num_attention_heads * self.head_dim
         self.kv_dim = self.num_key_value_heads * self.head_dim
 
-        self.local_num_attention_heads = self.num_attention_heads // self.tp_size
-        self.local_num_key_value_heads = self.num_key_value_heads // self.tp_size
-        self.local_q_dim = self.local_num_attention_heads * self.head_dim
-        self.local_kv_dim = self.local_num_key_value_heads * self.head_dim
-
+        self._calculate_tp_parameters(ulysses_size if enable_ulysses else None)
         self._init_qkv_proj()
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
@@ -124,6 +117,12 @@ class Attention(nn.Module):
             q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
             k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
             enable_tp_rms = self.tp_size > 1 and qk_norm_mode == "full"
+
+            q_start = self.local_q_dim_start
+            q_end = self.local_q_dim_end
+            k_start = self.local_kv_dim_start
+            k_end = self.local_kv_dim_end
+
             self.norm_q = RMSNormTPAware(
                 hidden_size=q_norm_dim,
                 eps=self.eps,
@@ -131,6 +130,7 @@ class Attention(nn.Module):
                 has_weights=True,
                 enable_tp=enable_tp_rms,
                 mapping=self.mapping,
+                override_tp_sharding=(q_start, q_end) if qk_norm_mode == "full" else None,
             )
             self.norm_k = RMSNormTPAware(
                 hidden_size=k_norm_dim,
@@ -139,6 +139,7 @@ class Attention(nn.Module):
                 has_weights=True,
                 enable_tp=enable_tp_rms,
                 mapping=self.mapping,
+                override_tp_sharding=(k_start, k_end) if qk_norm_mode == "full" else None,
             )
 
         # TODO: Use weight mapper to create just a Linear module
@@ -156,6 +157,7 @@ class Attention(nn.Module):
                     tensor_parallel_mode=TensorParallelMode.ROW if self.tp_size > 1 else None,
                     reduce_output=(self.tp_size > 1),
                     allreduce_strategy=self.allreduce_strategy,
+                    override_tp_sharding=(self.local_q_dim_start, self.local_q_dim_end),
                 )
             ]
         )
@@ -231,6 +233,46 @@ class Attention(nn.Module):
 
                 self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
 
+    def _calculate_tp_parameters(self, ulysses_size: Optional[int]):
+        assert self.num_attention_heads % self.num_key_value_heads == 0
+        gqa_ratio = self.num_attention_heads // self.num_key_value_heads
+
+        if not ulysses_size:
+            ulysses_size = 1
+
+        assert self.num_key_value_heads % ulysses_size == 0
+        # Note: this is intentionally stronger than `num_kv_head >= ulysses_size * tp_size`
+        assert self.num_key_value_heads // ulysses_size >= self.tp_size
+
+        def _calc_shard(full, size, rank):
+            full //= ulysses_size
+            shard = (full // size) * rank + min(full % size, rank)
+            return shard * ulysses_size
+
+        self.local_key_value_head_start = _calc_shard(
+            self.num_key_value_heads, self.tp_size, self.tp_rank
+        )
+        self.local_key_value_head_end = _calc_shard(
+            self.num_key_value_heads, self.tp_size, self.tp_rank + 1
+        )
+        self.local_num_key_value_heads = (
+            self.local_key_value_head_end - self.local_key_value_head_start
+        )
+
+        self.local_attention_head_start = gqa_ratio * self.local_key_value_head_start
+        self.local_attention_head_end = gqa_ratio * self.local_key_value_head_end
+        self.local_num_attention_heads = (
+            self.local_attention_head_end - self.local_attention_head_start
+        )
+
+        self.local_q_dim_start = self.local_attention_head_start * self.head_dim
+        self.local_q_dim_end = self.local_attention_head_end * self.head_dim
+        self.local_q_dim = self.local_q_dim_end - self.local_q_dim_start
+
+        self.local_kv_dim_start = self.local_key_value_head_start * self.head_dim
+        self.local_kv_dim_end = self.local_key_value_head_end * self.head_dim
+        self.local_kv_dim = self.local_kv_dim_end - self.local_kv_dim_start
+
     def _init_qkv_proj(self) -> None:
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
 
@@ -258,6 +300,11 @@ class Attention(nn.Module):
                 },
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                override_tp_sharding={
+                    "q": (self.local_q_dim_start, self.local_q_dim_end),
+                    "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                    "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+                },
             )
         else:
             self.to_q = Linear(
@@ -271,6 +318,7 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(self.local_q_dim_start, self.local_q_dim_end),
             )
             self.to_k = Linear(
                 self.hidden_size,
@@ -283,6 +331,7 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(self.local_kv_dim_start, self.local_kv_dim_end),
             )
             self.to_v = Linear(
                 self.hidden_size,
@@ -295,6 +344,7 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(self.local_kv_dim_start, self.local_kv_dim_end),
             )
 
     def get_qkv(
