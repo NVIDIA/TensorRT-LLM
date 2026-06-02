@@ -40,6 +40,10 @@ REQUEST_TYPE_MAPPING = {
     LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
 }
 
+# Internal request id for the attention-DP padding dummy. Generated real
+# request ids do not use 0; disaggregated global ids use a separate high range.
+ATTENTION_DP_DUMMY_REQUEST_ID = 0
+
 if TYPE_CHECKING:
     from .sampling_utils import Strategy
 
