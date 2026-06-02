@@ -839,8 +839,8 @@ def _use_w4a16_for_nvfp4_on_hopper():
         # Per-instance disable of FP4 attention output (kernel is SM100-only).
         # Mirrors what `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0` does.
         original_attn_create_weights(self)
-        if hasattr(self.attn, 'has_nvfp4'):
-            self.attn.has_nvfp4 = False
+        if hasattr(self.attn, 'use_nvfp4_output'):
+            self.attn.use_nvfp4_output = lambda *args, **kwargs: False
 
     # Allow SM 90 through can_implement(); existing entries preserved.
     constraint_type, constraint_set = original_sm_constraint
