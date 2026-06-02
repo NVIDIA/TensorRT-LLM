@@ -90,8 +90,7 @@ class ModelEngine(ABC):
                 new_tensors_device: Optional[SampleStateTensors],
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
-                num_accepted_tokens_device: Optional[torch.Tensor] = None,
-                trtllm_gen_fmha_jit_warmup: bool = False):
+                num_accepted_tokens_device: Optional[torch.Tensor] = None):
         raise NotImplementedError
 
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -626,6 +625,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER if is_draft_model else ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
+        self._trtllm_gen_fmha_jit_warmup = False
 
         # Create config and runner
         cuda_graph_runner_config = CUDAGraphRunnerConfig(
@@ -1043,6 +1043,15 @@ class PyTorchModelEngine(ModelEngine):
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
+        @contextlib.contextmanager
+        def trtllm_gen_fmha_jit_warmup():
+            previous = self._trtllm_gen_fmha_jit_warmup
+            self._trtllm_gen_fmha_jit_warmup = True
+            try:
+                yield
+            finally:
+                self._trtllm_gen_fmha_jit_warmup = previous
+
         logger.info("Running TRTLLM-Gen FMHA JIT warmup...")
 
         warmup_requests_configs = []
@@ -1061,14 +1070,13 @@ class PyTorchModelEngine(ModelEngine):
                     warmup_request, resource_manager) as batch:
                 if batch is None and self.mapping.tp_size <= 1:
                     continue  # Not enough KV cache space (single rank, safe to skip)
-                self._assert_all_tp_ranks_have_warmup_batch(
-                    batch, num_tokens)
+                self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
                 if batch is None:
                     continue  # All ranks agree: not enough space
-                self.forward(batch,
-                             new_tensors_device=None,
-                             resource_manager=resource_manager,
-                             trtllm_gen_fmha_jit_warmup=True)
+                with trtllm_gen_fmha_jit_warmup():
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
                 torch.cuda.synchronize()
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
@@ -4434,8 +4442,7 @@ class PyTorchModelEngine(ModelEngine):
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
-                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-                trtllm_gen_fmha_jit_warmup: bool = False):
+                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
@@ -4445,7 +4452,7 @@ class PyTorchModelEngine(ModelEngine):
                                                    draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
             attn_metadata.trtllm_gen_fmha_jit_warmup = (
-                trtllm_gen_fmha_jit_warmup)
+                self._trtllm_gen_fmha_jit_warmup)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
