@@ -150,11 +150,15 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 "EagleDecodingConfig(eagle3_one_model=True)."
             )
 
-        self.model_factory = "eagle_one_model"
         return self
 
     @model_validator(mode="after")
     def setup_hidden_state_capture(self):
+        """Enable the hidden state capture transform if the speculative config requires it.
+
+        This validator only configures transforms — factory selection is handled by
+        create_factory() to avoid mutating model_factory in place.
+        """
         spec_config = self.speculative_config
         if spec_config is None:
             return self
@@ -166,14 +170,15 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                     "enabled. Ensure num_nextn_predict_layers is set in the model config."
                 )
             capture_layers = {-1}
-        else:
-            assert isinstance(spec_config, EagleDecodingConfig)
+        elif isinstance(spec_config, EagleDecodingConfig):
             if spec_config.max_draft_len is None:
                 raise ValueError(
                     "EagleDecodingConfig.max_draft_len must not be None. "
                     "Provide a positive integer for max_draft_len."
                 )
             capture_layers = spec_config.eagle3_layers_to_capture
+        else:
+            return self
 
         self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
@@ -432,6 +437,17 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         """Whether CachedSequenceInterface must enforce a uniform KV cache mapping."""
         return self.attn_backend.lower() == "trtllm"
 
+    def _requires_eagle_one_model(self) -> bool:
+        """Check if the speculative config requires Eagle one-model factory."""
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return False
+        if isinstance(spec_config, MTPDecodingConfig):
+            return spec_config.mtp_eagle_one_model
+        if isinstance(spec_config, EagleDecodingConfig):
+            return spec_config.eagle3_one_model
+        return False
+
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.
 
@@ -440,20 +456,25 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             The value is inferred from the model configuration via the factory and written back to
             `self.max_seq_len` so that all downstream consumers see the same value.
         """
-
-        # TODO (lucaslie): consider supporting Path objects in the model factory
-        factory = ModelFactoryRegistry.get(self.model_factory)(
+        common_kwargs = dict(
             model=str(self.model),
             model_kwargs=self.model_kwargs,
             tokenizer=None if self.tokenizer is None else str(self.tokenizer),
             tokenizer_kwargs=self.tokenizer_kwargs,
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
-            # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
-            sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
-            speculative_config=self.speculative_config,
-            speculative_model_kwargs=self.speculative_model_kwargs or None,
         )
+
+        if self._requires_eagle_one_model():
+            factory = ModelFactoryRegistry.get("eagle_one_model")(
+                **common_kwargs,
+                speculative_config=self.speculative_config,
+                speculative_model_kwargs=self.speculative_model_kwargs or None,
+                target_factory_cls_name=self.model_factory,
+                sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
+            )
+        else:
+            factory = ModelFactoryRegistry.get(self.model_factory)(**common_kwargs)
 
         # The factory handles the logic internally for getting the `max_seq_len` if not provided
         # by the user.
