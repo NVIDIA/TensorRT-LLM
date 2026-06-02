@@ -14,25 +14,8 @@ config_file=${8}
 server_role=${9}
 disagg_cluster_uri=${10}
 
-# CUDA_VISIBLE_DEVICES selection:
-#   - Default packing (no gpu_map file): each node is dedicated to one
-#     worker, so SLURM_LOCALID maps directly to the physical GPU id.
-#   - Compact packing (gpu_map file emitted by submit.py): two workers may
-#     share a node and would both see LOCALID=0, so look up the per-worker
-#     gpu_map "<rank> <host> <local_gpu_id>" by SLURM_PROCID. srun
-#     --distribution=arbitrary assigns PROCID in hostfile order, so it
-#     indexes directly into the map.
-gpu_map_file="${log_dir}/gpu_map_${role}_${instance_id}.txt"
-if [ -f "${gpu_map_file}" ]; then
-    gpu_id=$(awk -v p="${SLURM_PROCID}" '$1==p {print $3; exit}' "${gpu_map_file}")
-    if [ -z "${gpu_id}" ]; then
-        echo "ERROR: no GPU mapping for SLURM_PROCID=${SLURM_PROCID} in ${gpu_map_file}" >&2
-        exit 1
-    fi
-    export CUDA_VISIBLE_DEVICES=${gpu_id}
-else
-    export CUDA_VISIBLE_DEVICES=${SLURM_LOCALID}
-fi
+# Do not set CUDA_VISIBLE_DEVICES here. Let Slurm/enroot expose the devices
+# assigned to this step; TRT-LLM relies on that visibility for peer checks.
 
 # Clear UCX_TLS for specific clusters
 unset UCX_TLS
@@ -48,7 +31,7 @@ if [ -n "${DYN_KVBM_LEADER_ZMQ_HOST:-}" ]; then
 fi
 
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
-echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
 
 if [ "${numa_bind}" = "true" ]; then
     numa_bind_cmd="numactl -m 0,1"

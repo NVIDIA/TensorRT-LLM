@@ -1732,6 +1732,10 @@ def create_py_executor_instance(
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
 
+    hang_detection_timeout = None
+    if os.environ.get("TRTLLM_HANG_DETECTION_TIMEOUT"):
+        hang_detection_timeout = int(os.environ["TRTLLM_HANG_DETECTION_TIMEOUT"])
+
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -1760,6 +1764,7 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
+        hang_detection_timeout=hang_detection_timeout,
         dwdp_manager=dwdp_manager,
     )
 

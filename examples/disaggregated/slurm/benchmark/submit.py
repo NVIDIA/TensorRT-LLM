@@ -810,6 +810,9 @@ def submit_job(config, log_dir, dry_run):
     # Append benchmark commands
     if benchmark_config.get('enable_benchmark', True):
         env_var = config['benchmark'].get('env_var', {})
+        if benchmark_config.get('use_aiperf', False):
+            env_var['TMPDIR'] = log_dir
+            client_cmds.append(f"mkdir -p '{env_var['TMPDIR']}'")
         benchmark_prefix = client_slurm_prefix + [
             f"--export \"{convert_envs_to_str(env_var)}\""
         ]

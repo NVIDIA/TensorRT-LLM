@@ -347,13 +347,32 @@ class OpenAIServer(_VideoRoutesMixin):
         self.media_storage_path.mkdir(exist_ok=True, parents=True)
         self.video_gen_tasks = {}
 
+    def _inner_tokenizer(self, tokenizer: Any) -> Any:
+        return getattr(tokenizer, "tokenizer", None) or tokenizer
+
+    def _tokenizer_name_or_path(self) -> Optional[str]:
+        for tokenizer in (self._inner_tokenizer(self.tokenizer),
+                          self.tokenizer):
+            name_or_path = getattr(tokenizer, "name_or_path", None)
+            if name_or_path:
+                return name_or_path
+        return None
+
+    def _tokenizer_vocab_size(self) -> Optional[int]:
+        tokenizer = self._inner_tokenizer(self.tokenizer)
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if vocab_size is None:
+            try:
+                vocab_size = len(tokenizer)
+            except TypeError:
+                vocab_size = None
+        return None if vocab_size is None else int(vocab_size)
+
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
         hf_tokenizer_path = self.generator._hf_model_dir
         if not hf_tokenizer_path:
-            hf_tokenizer_path = getattr(
-                self.tokenizer.tokenizer, "name_or_path", None) or getattr(
-                    self.tokenizer, "name_or_path", None)
+            hf_tokenizer_path = self._tokenizer_name_or_path()
         trust_remote_code = self.generator.args.trust_remote_code
         try:
             self.processor = AutoProcessor.from_pretrained(
@@ -443,7 +462,10 @@ class OpenAIServer(_VideoRoutesMixin):
             vocab_size = getattr(config, "vocab_size", None)
             if vocab_size is not None:
                 return int(vocab_size)
-        return int(self.tokenizer.tokenizer.vocab_size)
+        vocab_size = self._tokenizer_vocab_size()
+        if vocab_size is None:
+            raise ValueError("Cannot determine tokenizer vocab_size")
+        return vocab_size
 
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
@@ -554,9 +576,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
     @property
     def _vocab_size(self) -> Optional[int]:
-        if self.tokenizer is not None and self.tokenizer.tokenizer is not None:
-            return self.tokenizer.tokenizer.vocab_size
-        return None
+        if self.tokenizer is None:
+            return None
+        return self._tokenizer_vocab_size()
 
     @staticmethod
     def create_error_response(
@@ -1141,11 +1163,6 @@ class OpenAIServer(_VideoRoutesMixin):
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            # Pass the model vocabulary size so ``logit_bias`` can be
-            # expanded into an embedding bias tensor in the sampler.
-            vocab_size = getattr(self.tokenizer.tokenizer,
-                                 "vocab_size", None) or getattr(
-                                     self.tokenizer, "vocab_size", None)
             sampling_params = request.to_sampling_params(
                 vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
