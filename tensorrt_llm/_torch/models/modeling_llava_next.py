@@ -15,14 +15,12 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalParams)
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
-                       TextPrompt, TokensPrompt, register_input_processor,
-                       support_multimodal_disaggregated)
+                       TextPrompt, register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -112,8 +110,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         num_mm_tokens_per_placeholder: List[int],
     ) -> Tuple[List[int], List[int], List[int]]:
         """
-        Shared logic (called by expand_prompt_token_ids_for_mm and
-        build_disagg_prefill_multimodal_inputs):
+        Shared logic (called by expand_prompt_token_ids_for_mm):
         replace each image placeholder token in prompt_token_ids
         with placeholder_id repeated num_mm_tokens_per_placeholder[i] times.
 
@@ -269,76 +266,6 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         # [num_frames, feature_length, hidden_dim] -> [num_frames * feature_length, hidden_dim]
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
-
-    def build_disagg_prefill_multimodal_inputs(
-            self, inputs: Union[TextPrompt, TokensPrompt],
-            mm_handles: List[Dict[str, Any]]) -> DisaggPrefillMultimodalInputs:
-        """
-        Build disaggregated prefill inputs from multimodal embedding handles.
-
-        Uses an already tokenized prompt or tokenizes the txt prompt first.
-
-        Args:
-            inputs: Inputs containing an already tokenized text prompt or a text prompt string.
-            mm_handles: List of multimodal embedding handles.
-
-        Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
-        """
-        # TODO: Move this function to the base input processor class when extending for more models
-        text_prompt = inputs.get("prompt")
-        prompt_token_ids = inputs.get("prompt_token_ids")
-        if text_prompt:
-            prompt_token_ids = self.tokenizer(
-                text_prompt, return_tensors="pt").input_ids[0].tolist()
-        elif not prompt_token_ids:
-            raise ValueError(
-                "Text prompt or token IDs are required but neither is provided")
-
-        if not isinstance(mm_handles, list):
-            raise ValueError("mm_handles must be a list")
-
-        expected_hidden_size = self.config.text_config.hidden_size
-        for i, mm_handle in enumerate(mm_handles):
-            hidden_size = mm_handle['tensor_size'][1]
-            if hidden_size != expected_hidden_size:
-                raise RuntimeError(
-                    f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
-                )
-
-        num_mm_tokens_per_image = [h["tensor_size"][0] for h in mm_handles]
-        expanded_ids, mm_token_length, mm_token_offsets = (
-            self._expand_image_placeholders_in_token_ids(
-                prompt_token_ids, num_mm_tokens_per_image))
-
-        # Final assertions to check the correctness of the expanded ids.
-        final_length = len(expanded_ids)
-        expected_final_length = (len(prompt_token_ids) -
-                                 len(num_mm_tokens_per_image) +
-                                 sum(num_mm_tokens_per_image))
-        assert final_length == expected_final_length, (
-            f"Write position mismatch: {final_length} != {expected_final_length}"
-        )
-        if mm_token_length:
-            assert mm_token_length[-1] + mm_token_offsets[-1] <= final_length, (
-                f"mm_token_length[-1] + mm_token_offsets[-1] "
-                f"({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
-                f"than or equal to final_length ({final_length})")
-
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids,
-            multimodal_lengths=mm_token_length,
-            multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[
-                mm_handle["tensor_size"][0] for mm_handle in mm_handles
-            ],
-            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) +
-                                                      1)),
-            multimodal_run_positions=mm_token_offsets,
-            multimodal_run_lengths=mm_token_length,
-        )
 
     def _attach_multimodal_embeddings_impl(
         self, inputs: TextPrompt,
@@ -611,7 +538,6 @@ class LlavaNextVisionModel(nn.Module):
         return [image_features]
 
 
-@support_multimodal_disaggregated
 @register_vision_encoder(LlavaNextVisionModel)
 @register_auto_model("LlavaNextForConditionalGeneration")
 @register_input_processor(LlavaNextInputProcessor,
@@ -710,6 +636,7 @@ class LlavaNextModel(PreTrainedModel):
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=multimodal_params[:num_context_requests])
             else:
+                # TODO(TRTLLM-13140): Support/validate E/PD for this model
                 raise NotImplementedError(
                     "LlavaNextModel does not support disaggregated inference yet. Please unset "
                     f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
