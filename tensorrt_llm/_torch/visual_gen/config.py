@@ -107,7 +107,7 @@ class DiffusionModelConfig(BaseModel):
     mapping: Mapping = PydanticField(default_factory=Mapping)
     skip_create_weights_in_init: bool = False
     force_dynamic_quantization: bool = False
-    allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.AUTO)
+    allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.NCCL)
     extra_attrs: Dict = PydanticField(default_factory=dict)
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)

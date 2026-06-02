@@ -222,7 +222,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_seq_len": 2048,
             "compile_backend": "torch-simple",
         },
-        "triton_paged": {
+        "triton": {
             "max_batch_size": 128,
             "max_seq_len": 8192,
             "compile_backend": "torch-cudagraph",
@@ -294,7 +294,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             # For batch_size=32: 8.25 GiB KV + ~15 GiB weights ~= 23.3 GiB.
             # If batch size is increased, this parameterization must be gated at a higher memory threshold.
             "torch",
-            "triton_paged",
+            "triton",
         ],
     )
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
