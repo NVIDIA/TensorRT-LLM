@@ -60,7 +60,7 @@ PAGE_SIZE = 128
 
 
 def _seq_lens_for_batch(batch, seq):
-    return [seq + 128 * (batch_idx // 10) for batch_idx in range(batch)]
+    return [seq] * batch
 
 
 def _seq_label(seq_lens):
@@ -102,7 +102,7 @@ def _trtllm_mla_io_bytes(seq_lens, heads, kv_lora_rank, qk_rope_head_dim, q_len=
     return q + kv + out
 
 
-def run_one_trtllm(batch, seq, heads, q_len=1):
+def run_one_trtllm(batch, seq, heads, q_len=1, warmup=0, iters=1):
     """Fp8 baseline using the FlashInfer trtllm-gen MLA decode kernel.
 
     Feeds fp8 (e4m3) Q and KV cache so the kernel uses fp8 tensor cores
@@ -166,7 +166,7 @@ def run_one_trtllm(batch, seq, heads, q_len=1):
 
     run()
     torch.cuda.synchronize()
-    avg_ms = _bench(run)
+    avg_ms = _bench(run, warmup=warmup, iters=iters)
     qk_dim = kv_lora_rank + qk_rope_head_dim
     pv_dim = kv_lora_rank
     flops = 2 * q_len * heads * total_seq * (qk_dim + pv_dim)
@@ -186,7 +186,7 @@ def run_one_trtllm(batch, seq, heads, q_len=1):
     return avg_ms
 
 
-def run_one(batch, seq, heads, backend, q_len=1):
+def run_one(batch, seq, heads, backend, q_len=1, warmup=0, iters=1):
     os.environ[FLASHINFER_FP4_MLA_ATTENTION_ENV] = "1"
     os.environ[FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV] = backend
     seq_lens = _seq_lens_for_batch(batch, seq)
@@ -219,7 +219,7 @@ def run_one(batch, seq, heads, backend, q_len=1):
 
         run()
         torch.cuda.synchronize()
-        avg_ms = _bench(run)
+        avg_ms = _bench(run, warmup=warmup, iters=iters)
         qk_dim = kv_lora_rank + qk_rope_head_dim + FP4_MLA_Q_RESIDUAL_DIM
         pv_dim = kv_lora_rank
         flops = 2 * q_len * heads * total_seq * (qk_dim + pv_dim)
@@ -244,7 +244,7 @@ def run_one(batch, seq, heads, backend, q_len=1):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--batch", type=int, default=None)
+    p.add_argument("--batch", type=int, nargs="+", default=None)
     p.add_argument("--seq", type=int, default=30080)
     p.add_argument("--heads", type=int, default=128)
     p.add_argument(
@@ -261,9 +261,11 @@ def main():
         choices=BACKEND_CHOICES,
         help=("Backend to benchmark; default runs all fast backends."),
     )
+    p.add_argument("--warmup", type=int, default=0)
+    p.add_argument("--iters", type=int, default=1)
     args = p.parse_args()
 
-    batches = [args.batch] if args.batch else [16, 30, 60, 120, 200, 300]
+    batches = args.batch if args.batch else [16, 30, 60, 120, 200, 300]
     if args.backend:
         backends = [args.backend]
     else:
@@ -272,9 +274,9 @@ def main():
     for b in batches:
         for be in backends:
             if be == "trtllm_fp8":
-                run_one_trtllm(b, args.seq, args.heads, args.q_len)
+                run_one_trtllm(b, args.seq, args.heads, args.q_len, args.warmup, args.iters)
             else:
-                run_one(b, args.seq, args.heads, be, args.q_len)
+                run_one(b, args.seq, args.heads, be, args.q_len, args.warmup, args.iters)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,8 @@ from tensorrt_llm._torch.attention_backend.fp4_mla import (
     run_fp4_mla_attention_decode,
     scatter_fp4_mla_kv_cache,
     update_hp_kv_for_fp4_mla,
+    _get_cutile_v_packed_cache,
+    _maybe_update_cutile_v_packed_cache,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -1409,6 +1411,153 @@ def test_fp4_mla_attention_decode_cutile_matches_reference(monkeypatch):
 
 
 @pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+def test_fp4_mla_attention_decode_cutile_shared_v_pack_matches_reference(monkeypatch):
+    """Shared V-packed storage must preserve the prepacked PV fast path."""
+    monkeypatch.setenv("TRTLLM_FP4_MLA_PERSISTENT_V_PACK", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1")
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutile",
+        num_heads=128,
+        seq_lens=[128, 128],
+        seed=17,
+        check_probs=False,
+    )
+
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+def test_fp4_mla_attention_decode_cutile_grouped_tail_matches_reference(monkeypatch):
+    """Grouped page-stats must handle a partial final page group."""
+    monkeypatch.setenv("TRTLLM_FP4_MLA_PERSISTENT_V_PACK", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_GROUP_PAGES", "8")
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutile",
+        num_heads=128,
+        seq_lens=[9 * FP4_MLA_TOKENS_PER_BLOCK, 9 * FP4_MLA_TOKENS_PER_BLOCK],
+        seed=19,
+        check_probs=False,
+    )
+
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+def test_fp4_mla_cutile_shared_v_pack_storage_is_layer_tagged(monkeypatch):
+    """Layer ownership is metadata state; storage is reused across layers."""
+    monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV, "cutile")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_PERSISTENT_V_PACK", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1")
+
+    device = torch.device("cuda")
+    metadata = SimpleNamespace()
+    num_pages = 4
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    v_head_dim = 512
+    head_dim = v_head_dim + 64
+    kv_cache = torch.randint(
+        0,
+        256,
+        (num_pages, 1, page_size, 1, head_dim // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
+    v_sf = torch.empty(
+        (2, num_pages, v_head_dim, page_size // FP4_BLOCK_SIZE),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+
+    _maybe_update_cutile_v_packed_cache(
+        metadata,
+        0,
+        kv_cache,
+        page_ids,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        local_layer=0,
+        v_sf=v_sf[0],
+    )
+    torch.cuda.synchronize()
+    shared = metadata._fp4_mla_attention_v_packed_buf
+    shared_ptr = shared.data_ptr()
+    assert not hasattr(metadata, "_fp4_mla_attention_v_packed_buf_l0")
+    assert _get_cutile_v_packed_cache(
+        metadata,
+        0,
+        kv_cache,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        local_layer=0,
+        v_sf=v_sf[0],
+        page_ids=page_ids,
+    ) is not None
+    assert (
+        _get_cutile_v_packed_cache(
+            metadata,
+            1,
+            kv_cache,
+            v_head_dim=v_head_dim,
+            page_size=page_size,
+            local_layer=1,
+            v_sf=v_sf[1],
+            page_ids=page_ids,
+        )
+        is None
+    )
+
+    _maybe_update_cutile_v_packed_cache(
+        metadata,
+        1,
+        kv_cache,
+        page_ids,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        local_layer=1,
+        v_sf=v_sf[1],
+    )
+    torch.cuda.synchronize()
+    assert metadata._fp4_mla_attention_v_packed_buf.data_ptr() == shared_ptr
+    assert not hasattr(metadata, "_fp4_mla_attention_v_packed_buf_l1")
+    assert (
+        _get_cutile_v_packed_cache(
+            metadata,
+            0,
+            kv_cache,
+            v_head_dim=v_head_dim,
+            page_size=page_size,
+            local_layer=0,
+            v_sf=v_sf[0],
+            page_ids=page_ids,
+        )
+        is None
+    )
+    assert (
+        _get_cutile_v_packed_cache(
+            metadata,
+            1,
+            kv_cache,
+            v_head_dim=v_head_dim,
+            page_size=page_size,
+            local_layer=0,
+            v_sf=v_sf[0],
+            page_ids=page_ids,
+        )
+        is None
+    )
+    assert _get_cutile_v_packed_cache(
+        metadata,
+        1,
+        kv_cache,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        local_layer=1,
+        v_sf=v_sf[1],
+        page_ids=page_ids,
+    ) is not None
+
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
 def test_fp4_mla_attention_decode_cutile_linear_mtp_matches_reference(monkeypatch):
     """CuTile linear MTP rows must use per-query causal KV lengths."""
     _assert_fp4_mla_attention_decode_accuracy(
@@ -1419,6 +1568,23 @@ def test_fp4_mla_attention_decode_cutile_linear_mtp_matches_reference(monkeypatc
         seed=13,
         check_probs=False,
         query_len_per_seq=3,
+    )
+
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+def test_fp4_mla_attention_decode_cutile_grouped_mtp_matches_reference(monkeypatch):
+    """CuTile grouped page-stats must mask MTP future tokens on the final page."""
+    monkeypatch.setenv("TRTLLM_FP4_MLA_PERSISTENT_V_PACK", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_GROUP_PAGES", "8")
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutile",
+        num_heads=128,
+        seq_lens=[9 * FP4_MLA_TOKENS_PER_BLOCK, 9 * FP4_MLA_TOKENS_PER_BLOCK],
+        seed=23,
+        check_probs=False,
+        query_len_per_seq=4,
     )
 
 
