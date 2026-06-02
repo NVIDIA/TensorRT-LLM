@@ -1884,7 +1884,7 @@ def _estimate_full_attn_size_per_token(
 
 def _estimate_swa_cache_size(layer_sizes: Sequence[int],
                              attention_windows: Sequence[Optional[int]],
-                             tokens_per_block: int, *, prefill: bool,
+                             tokens_per_block: int, *, context: bool,
                              scratch: bool) -> Tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
@@ -1894,7 +1894,7 @@ def _estimate_swa_cache_size(layer_sizes: Sequence[int],
         if window_size is not None and window_size > 0:
             window_tokens = math.ceil(
                 window_size / tokens_per_block) * tokens_per_block
-            if not prefill:
+            if not context:
                 size_per_request += window_tokens * layer_size
             elif not scratch:
                 size_per_token += layer_size
@@ -2377,19 +2377,35 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows)
-        swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
+        context_swa_size_per_token, _ = _estimate_swa_cache_size(
             layer_sizes,
             attention_windows,
             self.tokens_per_block,
-            prefill=True,
-            scratch=getattr(self, "enable_swa_scratch_reuse", False))
-        size_per_request = self.max_batch_size * swa_size_per_request
-        if quota < size_per_request:
+            context=True,
+            scratch=self.enable_swa_scratch_reuse)
+        (
+            generation_swa_size_per_token,
+            generation_swa_size_per_request,
+        ) = _estimate_swa_cache_size(layer_sizes,
+                                     attention_windows,
+                                     self.tokens_per_block,
+                                     context=False,
+                                     scratch=False)
+        size_per_batch = self.max_batch_size * generation_swa_size_per_request
+        if quota < size_per_batch:
             return 0
-        size_per_token = full_attn_size_per_token + swa_size_per_token
-        if size_per_token <= 0:
+        context_size_per_token = full_attn_size_per_token + context_swa_size_per_token
+        context_limit_quota = self.max_num_tokens * context_size_per_token + size_per_batch
+        if quota <= context_limit_quota:
+            if context_size_per_token <= 0:
+                return float('inf')
+            return (quota - size_per_batch) / context_size_per_token
+
+        generation_size_per_token = full_attn_size_per_token + generation_swa_size_per_token
+        if generation_size_per_token <= 0:
             return float('inf')
-        return (quota - size_per_request) / size_per_token
+        return self.max_num_tokens + (
+            quota - context_limit_quota) / generation_size_per_token
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components(
@@ -2397,30 +2413,29 @@ class KVCacheManagerV2(BaseResourceManager):
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows)
         (
-            prefill_swa_size_per_token,
+            context_swa_size_per_token,
             _,
         ) = _estimate_swa_cache_size(layer_sizes,
                                      attention_windows,
                                      self.tokens_per_block,
-                                     prefill=True,
-                                     scratch=getattr(
-                                         self, "enable_swa_scratch_reuse",
-                                         False))
+                                     context=True,
+                                     scratch=self.enable_swa_scratch_reuse)
         (
-            decode_swa_size_per_token,
-            decode_swa_size_per_request,
+            generation_swa_size_per_token,
+            generation_swa_size_per_request,
         ) = _estimate_swa_cache_size(layer_sizes,
                                      attention_windows,
                                      self.tokens_per_block,
-                                     prefill=False,
+                                     context=False,
                                      scratch=False)
         context_tokens = min(max_tokens, self.max_num_tokens)
+        generation_tokens = max_tokens - context_tokens
         generation_quota = (
-            max_tokens *
-            (full_attn_size_per_token + decode_swa_size_per_token) +
-            self.max_batch_size * decode_swa_size_per_request)
-        context_overhead = context_tokens * prefill_swa_size_per_token
-        return int(generation_quota + context_overhead)
+            max_tokens * full_attn_size_per_token +
+            generation_tokens * generation_swa_size_per_token +
+            self.max_batch_size * generation_swa_size_per_request)
+        context_extra_quota = context_tokens * context_swa_size_per_token
+        return int(generation_quota + context_extra_quota)
 
     def _get_event_num_blocks_per_cache_level(
         self,
@@ -3913,7 +3928,7 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_sizes,
             attention_windows,
             kwargs["tokens_per_block"],
-            prefill=False,
+            context=False,
             scratch=False)
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
         return (full_attn_size_per_token + swa_size_per_token,

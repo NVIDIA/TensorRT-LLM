@@ -78,6 +78,7 @@ def _make_creator(
     # behavior; production sets this in __init__ via
     # _get_model_kv_cache_manager_cls(), which we bypass here.
     c._kv_cache_manager_cls = KVCacheManagerV2
+    c._is_kv_cache_manager_v2 = True
 
     return c
 
@@ -304,7 +305,7 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
     assert per_pool_tokens >= max_seq_len
 
 
-def test_v2_cache_size_per_token_models_prefill_swa_scratch():
+def test_v2_cache_size_per_token_models_generation_swa_cost():
     class FakeModelConfig:
         quant_config = None
         pretrained_config = SimpleNamespace(
@@ -342,8 +343,9 @@ def test_v2_cache_size_per_token_models_prefill_swa_scratch():
     )
 
     # Per layer: K+V * kv_heads * head_dim * bf16 bytes = 2 * 2 * 8 * 2.
-    assert no_scratch_size_per_token == CacheCost(slope=3 * 64)
-    assert scratch_size_per_token == CacheCost(slope=2 * 64, intercept=3 * 2048 * 64)
+    expected = CacheCost(slope=64, intercept=3 * 2 * 2048 * 64)
+    assert no_scratch_size_per_token == expected
+    assert scratch_size_per_token == expected
 
 
 def test_creator_uses_v2_affine_cache_cost():
@@ -365,26 +367,29 @@ def test_creator_uses_v2_affine_cache_cost():
     assert cost == CacheCost(slope=20, intercept=21)
 
 
-def test_v2_quota_from_max_tokens_models_prefill_swa_scratch():
+def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(KVCacheManagerV2)
     manager.num_local_layers = 3
     manager.pp_layers = [0, 1, 2]
     manager.max_attention_window_vec = [128, 128, None]
     manager.tokens_per_block = 64
     manager.max_batch_size = 4
+    manager.max_num_tokens = 1000
     manager.get_layer_bytes_per_token = lambda local_layer_idx, data_role: [10, 10, 20][
         local_layer_idx
     ]
 
+    max_tokens = 1200
+
     manager.enable_swa_scratch_reuse = False
-    no_scratch_quota = manager._get_quota_from_max_tokens(1000)
-    assert no_scratch_quota == 1000 * 40
-    assert manager._get_max_tokens_from_quota(no_scratch_quota) == 1000
+    no_scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
+    assert no_scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 20 + 4 * 2 * 128 * 10)
+    assert manager._get_max_tokens_from_quota(no_scratch_quota) == max_tokens
 
     manager.enable_swa_scratch_reuse = True
-    scratch_quota = manager._get_quota_from_max_tokens(1000)
-    assert scratch_quota == 4 * 128 * 10 + 1000 * 30
-    assert manager._get_max_tokens_from_quota(scratch_quota) == 1000
+    scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
+    assert scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 10 + 4 * 2 * 128 * 10)
+    assert manager._get_max_tokens_from_quota(scratch_quota) == max_tokens
 
 
 # ---------------------------------------------------------------------------

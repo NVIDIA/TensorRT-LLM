@@ -802,8 +802,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
         )
         (
-            decode_swa_size_per_token,
-            decode_swa_size_per_request,
+            generation_swa_size_per_token,
+            generation_swa_size_per_request,
         ) = _estimate_swa_cache_size(
             self.head_dim,
             self.index_head_dim,
@@ -819,13 +819,15 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
         )
         context_tokens = min(max_tokens, max_context_tokens)
+        generation_tokens = max_tokens - context_tokens
         generation_quota = (
-            max_tokens * (non_sliding_attn_size_per_token + decode_swa_size_per_token)
-            + self.max_batch_size * decode_swa_size_per_request
+            max_tokens * non_sliding_attn_size_per_token
+            + generation_tokens * generation_swa_size_per_token
+            + self.max_batch_size * generation_swa_size_per_request
         )
-        context_quota = context_tokens * context_swa_size_per_token
+        context_extra_quota = context_tokens * context_swa_size_per_token
         padding = self._get_extra_quota_padding()
-        return int(generation_quota + context_quota + padding)
+        return int(generation_quota + context_extra_quota + padding)
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
@@ -837,7 +839,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
         )
-        swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
+        context_swa_size_per_token, _ = _estimate_swa_cache_size(
             self.head_dim,
             self.index_head_dim,
             compress_ratios,
@@ -848,14 +850,34 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
         )
+        (
+            generation_swa_size_per_token,
+            generation_swa_size_per_request,
+        ) = _estimate_swa_cache_size(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            context=False,
+            scratch=False,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
         padding = self._get_extra_quota_padding()
-        size_per_batch = self.max_batch_size * swa_size_per_request + padding
+        size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
         if quota < size_per_batch:
             return 0
-        size_per_token = non_sliding_attn_size_per_token + swa_size_per_token
-        if size_per_token == 0:
-            return float("inf")
-        return (quota - size_per_batch) / size_per_token
+        context_size_per_token = non_sliding_attn_size_per_token + context_swa_size_per_token
+        if self._max_num_tokens is None:
+            return (quota - size_per_batch) / context_size_per_token
+
+        context_limit_quota = self._max_num_tokens * context_size_per_token + size_per_batch
+        if quota <= context_limit_quota:
+            return (quota - size_per_batch) / context_size_per_token
+
+        generation_size_per_token = non_sliding_attn_size_per_token + generation_swa_size_per_token
+        return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
     def _build_cache_config(
         self,

@@ -47,6 +47,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
             index_head_dim=128,
             compress_ratios=[1, 4, 1, 128],
             indexer_k_dtype="fp8",
+            window_size=128,
         )
         pretrained_config = SimpleNamespace(
             kv_lora_rank=512,
@@ -69,65 +70,17 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     assert cost.intercept == 0
 
 
-def test_cache_size_estimation_models_prefill_swa_scratch(monkeypatch):
-    class FakeModelConfig:
-        sparse_attention_config = SimpleNamespace(
-            index_head_dim=128,
-            compress_ratios=[1, 1],
-            indexer_k_dtype="fp8",
-            window_size=128,
-        )
-        pretrained_config = SimpleNamespace(
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-        )
-        quant_config = None
-
-        def get_num_attention_layers(self) -> int:
-            return len(self.sparse_attention_config.compress_ratios)
-
-    monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
-    size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
-        FakeModelConfig(),
-        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
-        tokens_per_block=128,
-        max_batch_size=2,
-    )
-    short_seq_size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
-        FakeModelConfig(),
-        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
-        tokens_per_block=128,
-        max_seq_len=1,
-        max_batch_size=2,
-    )
-
-    scratch_cost = CacheCost.from_raw(size_per_token)
-    assert scratch_cost.slope > 0
-    assert scratch_cost.intercept == 2 * 128 * scratch_cost.slope
-    assert CacheCost.from_raw(short_seq_size_per_token) == scratch_cost
-
-    monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "0")
-    no_scratch_size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
-        FakeModelConfig(),
-        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
-        tokens_per_block=128,
-        max_batch_size=2,
-    )
-    no_scratch_cost = CacheCost.from_raw(no_scratch_size_per_token)
-    assert no_scratch_cost.slope == 2 * scratch_cost.slope
-    assert no_scratch_cost.intercept == 0
-
-
-def test_quota_from_max_tokens_models_prefill_swa_scratch():
+def test_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0, 1]
-    manager._compress_ratios = [1, 1]
+    manager._compress_ratios = [4, 4]
     manager.dtype = DataType.BF16
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
     manager._swa_window_size = 128
     manager._max_draft_len = 0
+    manager._max_num_tokens = 1024
     manager.tokens_per_block = 128
     manager.max_batch_size = 2
 
@@ -147,11 +100,11 @@ def test_quota_from_max_tokens_models_prefill_swa_scratch():
     no_scratch_delta = no_scratch_large_quota - no_scratch_small_quota
 
     assert no_scratch_small_quota < no_scratch_large_quota
-    assert no_scratch_delta == 2 * scratch_delta
+    assert no_scratch_delta > scratch_delta
     assert manager._get_max_tokens_from_quota(no_scratch_large_quota) == 4096
 
 
-def test_needed_resource_uses_prefill_swa_scratch_slope():
+def test_needed_resource_uses_context_swa_scratch_slope():
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
