@@ -14,6 +14,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import AsyncMock
 
 import pytest
@@ -31,6 +32,9 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerI
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatMessage,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -101,10 +105,98 @@ def _make_completion_response(
     )
 
 
+def _make_chat_response(
+    finish_reason: str,
+    disagg_request_id: int = 42,
+    prompt_token_ids=None,
+) -> ChatCompletionResponse:
+    if prompt_token_ids is None:
+        prompt_token_ids = [1, 2, 3]
+    return ChatCompletionResponse(
+        model="test-model",
+        usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+        prompt_token_ids=prompt_token_ids,
+        choices=[
+            ChatCompletionResponseChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=""),
+                finish_reason=finish_reason,
+                disaggregated_params=DisaggregatedParams(
+                    request_type="context_only",
+                    disagg_request_id=disagg_request_id,
+                    ctx_request_id=disagg_request_id,
+                ),
+            )
+        ],
+    )
+
+
 async def _mock_streaming_response(chunks):
     for chunk in chunks:
         await asyncio.sleep(0)
         yield chunk
+
+
+def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
+    service = _make_service("context_first")
+    ctx_prompt_token_ids = [101, 102, 103]
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        prompt_token_ids=[1, 2, 3],
+    )
+    ctx_response = _make_chat_response(
+        finish_reason="length",
+        prompt_token_ids=ctx_prompt_token_ids,
+    )
+
+    gen_request = service._get_gen_request(request, ctx_response, 42)
+
+    assert gen_request.prompt_token_ids == ctx_prompt_token_ids
+    assert gen_request.disaggregated_params.request_type == "generation_only"
+
+
+@pytest.mark.asyncio
+async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    prompt_token_ids = [101, 102, 103]
+
+    class FakePromise:
+        def __init__(self) -> None:
+            self.outputs = []
+            self.prompt_token_ids = prompt_token_ids
+
+        async def aresult(self):
+            return self
+
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.generator = mock.MagicMock()
+    server.generator.args.num_postprocess_workers = 0
+    server._extract_metrics = mock.AsyncMock()
+
+    post_processor = mock.Mock(
+        return_value=_make_chat_response(
+            finish_reason="length",
+            prompt_token_ids=None,
+        )
+    )
+    postproc_params = SimpleNamespace(post_processor=post_processor, postproc_args=object())
+    disaggregated_params = SimpleNamespace(request_type="context_only", disagg_request_id=123)
+
+    response = await server._create_chat_response(
+        FakePromise(),
+        postproc_params,
+        raw_request=None,
+        disaggregated_params=disaggregated_params,
+    )
+
+    assert response.prompt_token_ids == prompt_token_ids
 
 
 @pytest.mark.asyncio
