@@ -136,7 +136,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reu
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True] SKIP (https://nvbugs/6210714)
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_9B::test_bf16[mtp_off] SKIP (https://nvbugs/6212250)
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_9B::test_bf16[mtp_on] SKIP (https://nvbugs/6212250)
-accuracy/test_llm_api_pytorch.py::TestQwen3_6_27B::test_fp8 SKIP (https://nvbugs/6185150)
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales_early_first_token_response SKIP (https://nvbugs/6200128)
 accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6211189)
 accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6211189)
