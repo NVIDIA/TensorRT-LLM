@@ -317,6 +317,8 @@ def test_KvCacheConfig_declaration():
                            max_attention_window=[1024, 1024, 1024],
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
+                           disk_cache_size=2048,
+                           disk_cache_path="/tmp",
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
@@ -330,12 +332,25 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.max_attention_window == [1024, 1024, 1024]
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
+    assert config.disk_cache_size == 2048
+    assert config.disk_cache_path == "/tmp"
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+
+
+def test_KvCacheConfig_disk_cache_validation(tmp_path):
+    config = KvCacheConfig(disk_cache_size=2048, disk_cache_path=str(tmp_path))
+
+    assert config.disk_cache_size == 2048
+    assert config.disk_cache_path == str(tmp_path)
+
+    with pytest.raises(ValidationError) as exc_info:
+        KvCacheConfig(disk_cache_size=2048)
+    assert "disk_cache_path" in str(exc_info.value)
 
 
 def test_CapacitySchedulerPolicy():
