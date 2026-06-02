@@ -962,6 +962,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
             self._compute_and_store_draft_probs(draft_logits_list,
                                                 spec_metadata, batch_size)
+        elif spec_metadata.use_rejection_sampling:
+            # No draft probs were written this iter (all-greedy or empty draft
+            # loop). Invalidate the buffer so the next iter does not read stale
+            # data if it transitions back to a non-greedy mix.
+            spec_metadata.draft_probs_valid = False
 
         return next_draft_tokens
 
