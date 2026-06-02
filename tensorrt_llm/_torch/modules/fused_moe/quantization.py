@@ -37,6 +37,8 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ...utils import (ActivationType, replace_parameter_and_save_metadata,
                       swizzle_sf, unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
+from ..triton_dequant_nvfp4 import (build_active_expert_mask,
+                                    dequant_nvfp4_active_triton)
 from .interface import MoEWeightLoadingMode
 from .moe_load_balancer import advise_tensor_pageout
 
@@ -2900,18 +2902,25 @@ class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     ``CutlassFusedMoE.run_moe`` dispatches here and uses an active-mask Triton
     kernel (``dequant_active_experts_to_hp``) to dequant only routed experts
     into a static [E_total, N, K] workspace, then runs the bf16 ``fused_moe``.
+
+    Online EPLB is disabled: only the resident expert scales are un-swizzled
+    at load time, so a migrated expert's scale would still be in CUTLASS
+    swizzled layout and ``dequant_active_experts_to_hp`` would interpret it
+    as linear -- producing garbage outputs. EPLB on the SM<100 fallback path
+    is not a perf goal worth supporting; subclasses can opt back in by
+    also un-swizzling the shared EPLB scale pool.
     """
+
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def process_weights_after_loading(self, module: torch.nn.Module):
         super().process_weights_after_loading(module)
 
         # Scale buffer: int32-packed FP8, viewed as uint8 has shape
         # [E, pad_up(N, 128), pad_up(K/sf_vec, 4)] -- the 3D layout
-        # block_scale_interleave_reverse accepts.
+        # block_scale_interleave_reverse explicitly supports.
         def _unswizzle_inplace(scale_param: torch.nn.Parameter):
             sf_view = scale_param.data.view(float4_sf_dtype)
-            E, pad_rows, pad_cols = (sf_view.shape[0], sf_view.shape[1],
-                                     sf_view.shape[2])
             linear = torch.ops.trtllm.block_scale_interleave_reverse(sf_view)
             scale_param.data.view(float4_sf_dtype).copy_(linear)
 
@@ -2932,9 +2941,6 @@ class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         MoE loader stores alpha = amax_in*amax_w/(448*6)**2 and
         input_scale = (448*6)/amax_in).
         """
-        from .triton_dequant_nvfp4 import (build_active_expert_mask,
-                                           dequant_nvfp4_active_triton)
-
         fc31_w_scale_2 = module.fc31_alpha * module.fc31_input_scale
         fc2_w_scale_2 = module.fc2_alpha * module.fc2_input_scale
 
