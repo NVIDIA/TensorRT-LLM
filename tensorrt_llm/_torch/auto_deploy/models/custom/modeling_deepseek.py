@@ -37,9 +37,10 @@ Sharding strategy:
   verbatim from the non-IR base (no sharding hints; AD has no fusion that
   recovers these kernels from a vanilla rewrite). ``torch_moe`` carries
   ``layer_type="moe"``. The shared expert MLP is constructed with
-  ``add_all_reduce=False, layer_type="moe"`` so its closing all_reduce is
-  deferred. A single ``all_reduce(layer_type="moe")`` is emitted after the
-  routed + shared partial sums.
+  ``add_all_reduce=False, layer_type="shared_expert"`` so it stays REPLICATED
+  (excluded from ``shard_layers``; NVFP4 TP-sharding corrupts its deswizzled
+  weight scales). The routed (EP) output is ``all_reduce(layer_type="moe")``-d
+  first, then the replicated shared output is added.
 * **MLP** (``DeepSeekV3MLP``): SwiGLU gate/up are colwise, down is rowwise +
   ``all_reduce(layer_type="mlp")``.
 
@@ -347,7 +348,7 @@ class DeepSeekV3MoE(nn.Module):
                 config,
                 intermediate_size=intermediate_size,
                 add_all_reduce=False,
-                layer_type="moe",
+                layer_type="shared_expert",
             )
         else:
             self.shared_experts = None
@@ -379,13 +380,16 @@ class DeepSeekV3MoE(nn.Module):
 
         final_hidden_states = final_hidden_states.view(*orig_shape)
 
-        if self.shared_experts is not None:
-            final_hidden_states = final_hidden_states + shared_expert_output
-
-        # Single merge-point all_reduce for routed + shared partial sums.
+        # All-reduce the (EP-sharded) routed-expert output first, then add the
+        # replicated shared-expert output. The shared expert is excluded from TP
+        # sharding (NVFP4 TP-sharding corrupts its deswizzled weight scales), so
+        # adding it before the all-reduce would scale it by the TP world size.
         final_hidden_states = torch.ops.auto_deploy.all_reduce(
             final_hidden_states, layer_type="moe"
         )
+
+        if self.shared_experts is not None:
+            final_hidden_states = final_hidden_states + shared_expert_output
 
         return final_hidden_states.to(hidden_states.dtype)
 

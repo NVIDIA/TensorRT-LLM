@@ -1,0 +1,84 @@
+runtime: trtllm
+compile_backend: torch-cudagraph
+max_batch_size: 256
+max_seq_len: 2200
+max_num_tokens: 2200
+enable_chunked_prefill: true
+kv_cache_config:
+  dtype: fp8
+  tokens_per_block: 32
+  free_gpu_memory_fraction: 0.7
+cuda_graph_config:
+  max_batch_size: 256
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 80
+  - 96
+  - 112
+  - 128
+  - 192
+  - 208
+  - 224
+  - 240
+  - 256
+transforms:
+  fuse_gemms_mixed_children:
+    enabled: false
+  mlir_elementwise_fusion:
+    enabled: true
+  match_swiglu_pattern:
+    enabled: true
+  match_nvfp4_swiglu_pattern:
+    enabled: true
+  fuse_nvfp4_moe:
+    allow_different_input_scales: true
+  fuse_nvfp4_swiglu:
+    enabled: true
+  fuse_swiglu:
+    enabled: true
+  multi_stream_moe:
+    enabled: true
+  insert_cached_mla_attention:
+    backend: trtllm_mla
+  fuse_rope_into_trtllm_mla:
+    enabled: true
+  fuse_dsv3_a_gemm:
+    enabled: true
+  fuse_dsv3_router_gemm:
+    enabled: true
+  multi_stream_mla_attn:
+    enabled: true
+  fuse_allreduce_residual_rmsnorm:
+    enabled: true
+  fuse_add_rms_norm:
+    enabled: true
+  fuse_moe_allreduce_residual_rmsnorm:
+    enabled: true
+  detect_sharding:
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
+  apply_sharding_hints:
+    enabled: true
+    allreduce_strategy: SYMM_MEM
+    shard_layers:
+    - mla
+    - moe
+    - mlp
+  cleanup_identity_dtype_cast:
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
+  compile_model:
+    piecewise_enabled: true
+    piecewise_num_tokens:
+    - 256
+    - 512
+    - 1024
+    - 2048
