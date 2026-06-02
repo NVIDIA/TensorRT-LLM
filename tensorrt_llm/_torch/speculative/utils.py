@@ -381,10 +381,21 @@ def update_spec_config_from_model_config(spec_config, model_config):
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
     if not isinstance(spec_config, MTPDecodingConfig):
         return
-    # Read num_nextn_predict_layers from the model's pretrained config.
-    # This determines the actual MTP layer count in the checkpoint and drives
-    # the spec_dec_mode decision (EAGLE vs vanilla MTP).
-    spec_config.num_nextn_predict_layers = model_config.num_nextn_predict_layers
+    # Read the MTP layer count from the model's pretrained config. This
+    # determines the actual MTP layer count in the checkpoint and drives the
+    # spec_dec_mode decision (EAGLE vs vanilla MTP). Different checkpoints expose
+    # this under different names: DeepSeek-style configs use
+    # `num_nextn_predict_layers`, while Qwen3Next-style configs (including
+    # Qwen3.5) use `mtp_num_hidden_layers`. Fall back to a single shared MTP /
+    # EAGLE layer when neither field is present.
+    num_nextn_predict_layers = getattr(model_config, "num_nextn_predict_layers",
+                                       None)
+    if num_nextn_predict_layers is None:
+        num_nextn_predict_layers = getattr(model_config,
+                                           "mtp_num_hidden_layers", None)
+    if num_nextn_predict_layers is None:
+        num_nextn_predict_layers = 1
+    spec_config.num_nextn_predict_layers = num_nextn_predict_layers
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
 
     # Resolve max_draft_len when the user didn't set it:
