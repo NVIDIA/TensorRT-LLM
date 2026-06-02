@@ -652,7 +652,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // 15h * 60min/h / 3min = 300 iterations.
                 while (!CloudManager.isNodeOnline(nodeName) && counter < 300) {
                     // Wait 3 minutes to check status of the node again.
-                    Thread.sleep(3L * 60L * 1000L)
+                    // Thread.sleep(3L * 60L * 1000L)
+                    // TEST-ONLY: temporarily shortened from 3 minutes to 2 seconds.
+                    Thread.sleep(2L * 1000L)
                     // Avoid the node being stuck in the held state.
                     // Release every 10 iterations (~30 min), matching the previous cadence.
                     if (counter % 10 == 0) {
