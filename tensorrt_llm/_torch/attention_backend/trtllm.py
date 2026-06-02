@@ -1593,8 +1593,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 max_context_length=metadata.max_context_length,
-                trtllm_gen_fmha_jit_warmup=metadata.
-                trtllm_gen_fmha_jit_warmup,
+                trtllm_gen_fmha_jit_warmup=metadata.trtllm_gen_fmha_jit_warmup,
                 trtllm_gen_fmha_jit_warmup_max_seq_len_kv=metadata.max_seq_len,
 
                 # --- Per-call (AttentionForwardArgs) ---
