@@ -46,6 +46,10 @@ OpOrOverload = Union[OpOverloadPacket, OpOverload]
 OperatorLike = Union[OpOrOverload, Callable]
 
 
+def _auto_deploy_op(name: str) -> Optional[OpOverloadPacket]:
+    return getattr(torch.ops.auto_deploy, name, None)
+
+
 class LayerType(Enum):
     """Enum for layer type."""
 
@@ -670,13 +674,17 @@ def is_any_moe_op(node: Node) -> bool:
     return is_op(
         node,
         ops=[
-            torch.ops.auto_deploy.torch_moe,
-            torch.ops.auto_deploy.torch_quant_fp8_moe,
-            torch.ops.auto_deploy.torch_quant_nvfp4_moe,
-            torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
-            torch.ops.auto_deploy.triton_mxfp4_moe,
-            torch.ops.auto_deploy.torch_moe_fused,
-            torch.ops.auto_deploy.torch_moe_dense_mlp,
+            op
+            for op in [
+                _auto_deploy_op("torch_moe"),
+                _auto_deploy_op("torch_quant_fp8_moe"),
+                _auto_deploy_op("torch_quant_nvfp4_moe"),
+                _auto_deploy_op("torch_quant_finegrained_fp8_moe"),
+                _auto_deploy_op("triton_mxfp4_moe"),
+                _auto_deploy_op("torch_moe_fused"),
+                _auto_deploy_op("torch_moe_dense_mlp"),
+            ]
+            if op is not None
         ],
     )
 
