@@ -54,6 +54,7 @@ from .._page import (
     BatchedLockTarget,
     BlockPage,
     CommittedPage,
+    Page,
     ScratchSlotLock,
     UncommittedPage,
     _PageHolder,
@@ -932,6 +933,49 @@ class _KVCache:
         self._status = self.Status.ACTIVE
         return True
 
+    def prefetch(self, target: CacheLevel) -> bool:
+        """Best-effort prefetch active pages to the target cache level.
+
+        The cache must be suspended. Prefetch is only a performance hint: a False
+        return value means the requested pages could not be recalled due to cache
+        pressure, but the cache remains functionally valid.
+
+        Args:
+            target: Destination cache level for active pages in lower tiers.
+
+        Returns:
+            True if the prefetch was dispatched, False if storage could not reserve enough pages.
+        """
+        assert self.status == self.Status.SUSPENDED
+        manager = self.manager
+        storage = manager._storage
+        num_tiers = storage.num_cache_levels
+        assert CacheLevel(0) <= target < num_tiers
+
+        num_pool_groups = storage.num_pool_groups
+        lc2pg = storage.get_pool_group_index
+
+        all_pages = make_typed(
+            lambda _: make_typed(lambda _: list[Page](), num_tiers), num_pool_groups
+        )
+
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            holder = self._page(ordinal, beam_idx, lc_idx)
+            if holder is None:
+                continue
+            page = expect_type(_PageHolder, holder).page
+            lvl = page.cache_level
+            if lvl < target:
+                continue
+            pg_idx = lc2pg(lc_idx)
+            all_pages[pg_idx][lvl].append(page)
+
+        try:
+            storage.prefetch(target, all_pages)
+        except OutOfPagesError:
+            return False
+        return True
+
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:
         """Yields (ordinal, beam_idx, lc_idx) for all active pages.
 
@@ -975,12 +1019,25 @@ class _KVCache:
     def _page(
         self, block_ordinal: BlockOrdinal, beam_index: BeamIndex, life_cycle: LifeCycleId
     ) -> BlockPage:
-        return self._blocks[block_ordinal].pages[beam_index][life_cycle]
+        """Return the page holder for an attention block or the SSM block."""
+        is_ssm = block_ordinal == BAD_BLOCK_ORDINAL
+        assert (life_cycle == self.manager._life_cycles.ssm_life_cycle_id) == is_ssm
+        return (
+            self._ssm_blocks[beam_index][life_cycle]
+            if is_ssm
+            else self._blocks[block_ordinal].pages[beam_index][life_cycle]
+        )
 
     def _block(
         self, block_ordinal: BlockOrdinal, beam_index: BeamIndex
     ) -> TypedIndexList[LifeCycleId, BlockPage]:
-        return self._blocks[block_ordinal].pages[beam_index]
+        """Return the life-cycle page list for an attention block or the SSM block."""
+        is_ssm = block_ordinal == BAD_BLOCK_ORDINAL
+        return (
+            self._ssm_blocks[beam_index]
+            if is_ssm
+            else self._blocks[block_ordinal].pages[beam_index]
+        )
 
     def _snapshot_ssm_to_tree_block(
         self, tree_block: Block, ssm_lc_id: LifeCycleId, beam_idx: BeamIndex
