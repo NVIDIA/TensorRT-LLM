@@ -52,9 +52,12 @@ class MultimodalEncoder(_TorchLLM):
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         checkpoint_format = getattr(self.args, "checkpoint_format", None)
-        self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer,
-                                                      checkpoint_format)
+        trust_remote_code = self.args.trust_remote_code
+        self.input_processor = create_input_processor(
+            self._hf_model_dir,
+            self.tokenizer,
+            checkpoint_format,
+            trust_remote_code=trust_remote_code)
         self._tokenizer = self.input_processor.tokenizer
 
         assert isinstance(self.args, TorchLlmArgs)
