@@ -361,6 +361,18 @@ def _register_fake():
         scale_fp8_sf = input.new_empty((sf_size, ), dtype=torch.uint8)
         return val_mxfp8, scale_fp8_sf
 
+    @torch.library.register_fake("trtllm::megamoe_prepare")
+    def _(
+        input: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_out: torch.Tensor,
+        x_sf_out: torch.Tensor,
+        topk_idx_out: torch.Tensor,
+        topk_weights_out: torch.Tensor,
+    ):
+        return None
+
     @torch.library.register_fake("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner")
     def _(
         routing_logits: Optional[torch.Tensor],
