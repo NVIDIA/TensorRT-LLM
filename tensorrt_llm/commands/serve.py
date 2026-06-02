@@ -313,6 +313,29 @@ def get_llm_args(
     return llm_args, llm_args_extra_dict
 
 
+def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
+    """Construct llm_args from a disaggregated server config's `other_args`.
+
+    `other_args` is a single source — there is no separate CLI / YAML
+    distinction here. Every key is user-set, so we pass all keys as
+    `explicit_cli_keys` to `get_llm_args` to bypass the value-based filter
+    that would otherwise drop fields equal to their LlmArgs class defaults
+    (e.g. `tensor_parallel_size: 1`).
+
+    Do NOT pass `explicit_cli_keys` to `update_llm_args_with_extra_dict`:
+    `llm_args_extra_dict` here is just the catch-all for kwargs that didn't
+    match `get_llm_args`'s named signature (e.g. `quant_config`,
+    `lora_config`, `pytorch_backend_config`) — it isn't a separate YAML
+    being overridden. Passing the explicit set would trigger the merge
+    function's "drop YAML keys claimed by explicit CLI" filter and
+    silently lose those kwargs.
+    """
+    disagg_explicit_keys = set(other_args)
+    llm_args, llm_args_extra_dict = get_llm_args(
+        **other_args, explicit_cli_keys=disagg_explicit_keys)
+    return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
+
+
 def launch_server(
         host: str,
         port: int,
@@ -1337,15 +1360,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
-        # Treat every disagg-YAML field as user-set so default-valued fields
-        # (e.g. tensor_parallel_size: 1) are not silently dropped.
-        disagg_explicit_keys = set(server_cfg.other_args)
-        llm_args, llm_args_extra_dict = get_llm_args(
-            **server_cfg.other_args, explicit_cli_keys=disagg_explicit_keys)
-        llm_args = update_llm_args_with_extra_dict(
-            llm_args,
-            llm_args_extra_dict,
-            explicit_cli_keys=disagg_explicit_keys)
+        llm_args = _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         # Ignore the non-LLM args
         llm_args.pop("router", None)
@@ -1368,15 +1383,10 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             instance_idx)
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
-        # Treat every disagg-YAML field as user-set so default-valued fields
-        # (e.g. tensor_parallel_size: 1) are not silently dropped.
-        disagg_explicit_keys = set(server_cfg.other_args)
-        llm_args, llm_args_extra_dict = get_llm_args(
-            **server_cfg.other_args, explicit_cli_keys=disagg_explicit_keys)
-        llm_args = update_llm_args_with_extra_dict(
-            llm_args,
-            llm_args_extra_dict,
-            explicit_cli_keys=disagg_explicit_keys)
+        # NOTE: the resulting llm_args is currently unused; _launch_disaggregated_leader
+        # does not take it. Keeping the call symmetric with the client branch above
+        # so any future use of llm_args here behaves the same way.
+        _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
                                      log_level)

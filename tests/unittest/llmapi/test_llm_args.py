@@ -942,6 +942,57 @@ class TestBenchTranslationMap:
         assert self._collect({"extra_llm_api_options", "config"}) == set()
 
 
+class TestDisaggLauncherKwargsPreservation:
+    """Regression tests for `_build_llm_args_from_disagg_server_cfg`.
+
+    The disagg launcher takes a single `server_cfg.other_args` dict and
+    must produce an llm_args dict that contains every user-set field —
+    including kwargs that fell through `get_llm_args`'s named signature
+    into its `**llm_args_extra_dict` catch-all (e.g. `quant_config`,
+    `lora_config`, `pytorch_backend_config`).
+    """
+
+    def test_extra_kwargs_survive(self):
+        from tensorrt_llm.commands.serve import \
+            _build_llm_args_from_disagg_server_cfg
+
+        other_args = {
+            "model": llama_model_path,
+            "backend": "pytorch",
+            "tensor_parallel_size": 1,
+            "gpus_per_node": 1,
+            # These do not match get_llm_args's named params; they go into
+            # **llm_args_extra_dict and must reach the LLM constructor.
+            "quant_config": {
+                "quant_algo": "FP8"
+            },
+            "lora_config": {
+                "lora_dir": ["/tmp/lora-test"]
+            },
+        }
+
+        final = _build_llm_args_from_disagg_server_cfg(other_args)
+
+        assert "quant_config" in final
+        assert "lora_config" in final
+        assert isinstance(final["quant_config"], QuantConfig)
+        assert isinstance(final["lora_config"], LoraConfig)
+
+    def test_default_valued_named_params_survive(self):
+        """A disagg-YAML field equal to its LlmArgs class default survives."""
+        from tensorrt_llm.commands.serve import \
+            _build_llm_args_from_disagg_server_cfg
+
+        other_args = {
+            "model": llama_model_path,
+            "backend": "pytorch",
+            "tensor_parallel_size": 1,  # equals LlmArgs class default
+            "gpus_per_node": 1,
+        }
+        final = _build_llm_args_from_disagg_server_cfg(other_args)
+        assert final.get("tensor_parallel_size") == 1
+
+
 class TestTorchLlmArgsCudaGraphSettings:
 
     def test_cuda_graph_batch_sizes_case_0(self):
