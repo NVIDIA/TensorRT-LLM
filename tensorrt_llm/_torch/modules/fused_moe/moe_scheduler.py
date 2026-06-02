@@ -861,6 +861,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
+        if len(outputs) == 1:
+            return outputs[0]
         return torch.cat(outputs, dim=0)
 
     def _strip_adp_padding(

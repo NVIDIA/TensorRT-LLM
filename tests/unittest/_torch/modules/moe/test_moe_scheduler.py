@@ -193,6 +193,28 @@ def test_fused_comm_scheduler_skips_quantize_when_backend_supports_fused_prepare
     assert backend.token_final_scales.dtype == torch.float32
 
 
+def test_fused_comm_scheduler_single_chunk_forward_avoids_cat_copy():
+    routing_method = _SeparatedRouting()
+    backend = _RecordingFusedBackend(supports_fused_prepare=True)
+    scheduler = FusedCommMoEScheduler(_FakeMoe(backend, routing_method))
+
+    x = torch.randn(2, 8, dtype=torch.bfloat16)
+    router_logits = torch.randn(2, 4)
+
+    output = scheduler.forward(
+        x,
+        router_logits,
+        do_finalize=True,
+        output_dtype=torch.bfloat16,
+        all_rank_num_tokens=None,
+        use_dp_padding=None,
+        input_ids=None,
+    )
+
+    assert output.data_ptr() == x.data_ptr()
+    assert backend.x.data_ptr() == x.data_ptr()
+
+
 def test_fused_comm_scheduler_quantizes_when_fused_prepare_is_disabled():
     routing_method = _SeparatedRouting()
     backend = _RecordingFusedBackend(supports_fused_prepare=False)
