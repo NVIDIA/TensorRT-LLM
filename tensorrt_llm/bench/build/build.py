@@ -33,6 +33,7 @@ def get_benchmark_engine_settings(
     target_input_len: int,
     target_output_len: int,
     kv_cache_gpu_mem_fraction: float = 0.95,
+    enable_attention_dp: bool = False,
 ) -> Tuple[int, int]:
     """ Retrieve benchmark settings for a specific model + configuration.
 
@@ -43,6 +44,10 @@ def get_benchmark_engine_settings(
         pp_size (int): Number of pipeline parallel stages.
         target_input_len (int): Target input length to compile the engine.
         target_output_len (int): Target output length to compile the engine.
+        kv_cache_gpu_mem_fraction (float): Fraction of free memory to allocate
+            for KV cache.
+        enable_attention_dp (bool): Whether attention data parallelism is
+            enabled.
 
     Raises:
         ValueError: When the model_name is not supported.
@@ -61,6 +66,7 @@ def get_benchmark_engine_settings(
             target_input_len,
             target_output_len,
             kv_cache_gpu_mem_fraction,
+            enable_attention_dp=enable_attention_dp,
         )
     else:
         max_batch_size = DEFAULT_MAX_BATCH_SIZE

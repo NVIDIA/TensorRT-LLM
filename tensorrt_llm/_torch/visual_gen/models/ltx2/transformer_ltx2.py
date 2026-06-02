@@ -23,7 +23,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -33,6 +32,7 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -103,6 +103,18 @@ class LTX2Attention(Attention):
         # Cross-attention: SEPARATE_QKV since K/V come from a different source.
         qkv_mode = QKVMode.SEPARATE_QKV if self._is_cross_attn else QKVMode.FUSE_QKV
 
+        # Decide whether to ask the base class for the Ulysses-wrapped path.
+        # Caller opts in via use_ulysses. Cross-attn additionally requires no
+        # other CP to be active (Ring/Attention2D + Ulysses cross-attn is
+        # unvalidated and falls through to the plain + AG path).
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        cp_size = vgm.cp_size if vgm is not None else 1
+        enable_ulysses = use_ulysses and (cp_size == 1 or not self._is_cross_attn)
+
+        # Map LTX RoPE type to the fused-kernel INTERLEAVE template parameter:
+        #   INTERLEAVED → pair (2i, 2i+1) pattern   → kernel INTERLEAVE=true
+        #   SPLIT       → rotate-half pattern        → kernel INTERLEAVE=false
+        # (cos/sin are stored block-duplicated for SPLIT; see _split_freqs_cis.)
         super().__init__(
             hidden_size=query_dim,
             num_attention_heads=heads,
@@ -112,24 +124,38 @@ class LTX2Attention(Attention):
             qk_norm_mode="full",
             eps=norm_eps,
             bias=True,
+            interleave=(rope_type == LTXRopeType.INTERLEAVED),
+            fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
+            enable_ulysses=enable_ulysses,
         )
 
-        # For audio self-attention that may need a runtime Ulysses toggle
-        # (sequence length not always divisible by ulysses_size), create a
-        # plain backend as fallback.  The base class already set self.attn
-        # to UlyssesAttention(inner_backend=sharded_backend).
+        # Build a runtime-toggleable Ulysses ↔ plain pair.
+        # Self-attn: audio length isn't always divisible by ulysses_size, so
+        # we need a plain fallback. Cross-attn (v2a): same need — audio Q is
+        # padded when divisible, plain backend is used otherwise. Plain has
+        # to be built with the full (unsharded) head count.
         self._has_dual_attn = False
-        ulysses_size = vgm.ulysses_size if vgm is not None else 1
-        if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
+        if enable_ulysses and ulysses_size > 1:
+            U = ulysses_size
+            H = self.num_attention_heads
+            H_kv = self.num_key_value_heads
+            if H % U != 0 or H_kv % U != 0:
+                raise ValueError(
+                    f"Ulysses requires num_attention_heads ({H}) and "
+                    f"num_key_value_heads ({H_kv}) divisible by ulysses_size ({U})"
+                )
+            # Base class already built `self.attn` as the Ulysses-wrapped path
+            # (sharded inner backend + UlyssesAttention) for both self-attn and
+            # cross-attn paths.
             self._ulysses_attn = self.attn
             self._plain_attn = create_attention(
                 backend=self.attn_backend,
                 layer_idx=self.layer_idx,
-                num_heads=self.num_attention_heads,
+                num_heads=H,
                 head_dim=self.head_dim,
-                num_kv_heads=self.num_key_value_heads,
+                num_kv_heads=H_kv,
                 quant_config=self.quant_config,
                 dtype=self.dtype,
                 attention_config=config.attention,
@@ -152,14 +178,25 @@ class LTX2Attention(Attention):
             self.to_gate_logits = None
 
     def set_ulysses_active(self, active: bool):
-        """Toggle between UlyssesAttention and plain attention at runtime.
+        """Toggle between Ulysses-wrapped and plain attention at runtime.
 
-        Only effective for modules created with ``use_ulysses=True``.
+        Effective for modules created with ``use_ulysses=True`` (works for
+        both self-attn and cross-attn). No-op otherwise.
         """
-        if not self._has_dual_attn:
-            return
-        self._modules.pop("attn", None)
-        self.attn = self._ulysses_attn if active else self._plain_attn
+        if self._has_dual_attn:
+            self._modules.pop("attn", None)
+            self.attn = self._ulysses_attn if active else self._plain_attn
+
+    def is_ulysses_active(self) -> bool:
+        """Whether ``self.attn`` is currently the Ulysses-wrapped path.
+
+        Symmetric with ``set_ulysses_active``. Returns False when no Ulysses
+        pair was built (e.g. Attention2D mode, ulysses_size==1, or cross-attn
+        without pure Ulysses), so callers can use it to decide whether to pass
+        seq-sharded K/V (wrapper handles a2a) or to all-gather K/V into full
+        sequence first (plain backend).
+        """
+        return self._has_dual_attn and self.attn is self._ulysses_attn
 
     def _init_qkv_proj(self):
         """Override for cross-attention: use _context_dim for K/V input.
@@ -204,17 +241,32 @@ class LTX2Attention(Attention):
     def project_kv(
         self,
         context: torch.Tensor,
+        pe: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project and normalize K/V from context.
+        """Project K/V from context, optionally apply RMSNorm + RoPE on K.
 
-        Used by the project-before-gather pattern in AV cross-attention:
-        project K/V on sharded data, then all-gather the smaller projected
-        tensors instead of all-gathering the full context first.
+        Used by the project-before-gather pattern in AV cross-attention.
+        When *pe* is given, RoPE is applied on the LOCAL K shard (Ulysses)
+        before all-gather. RoPE is per-token element-wise so it commutes with
+        seq-dim concat — bit-identical to the post-gather rope while saving
+        the cos/sin all-gather collective and reducing K-rope compute by U×.
+        The forward() consumer should pass ``k_pe=None`` to signal that K is
+        already rotated.
         """
         k = self.to_k(context)
         v = self.to_v(context)
-        if self.qk_norm:
-            k = self.norm_k(k)
+
+        # All cross-attn K-norm paths (with or without RoPE) go through the
+        # split-fuse kernels. Fallback only kicks in for unsupported head_dim
+        # — the fused kernel template covers {64, 128}; mini-config tests use
+        # head_dim=32 and must take the eager branch.
+        if self.qk_norm and self.head_dim in (64, 128):
+            self.apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
+        else:
+            if self.qk_norm:
+                k = self.norm_k(k)
+            if pe is not None:
+                k = apply_rotary_emb(k, pe, self.rope_type)
         return k, v
 
     def forward(
@@ -224,16 +276,100 @@ class LTX2Attention(Attention):
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         k_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
+        Caller contract:
+          - FUSE_QKV (self-attn): pe must be set; k_pe and pre_projected_kv unused.
+          - SEPARATE_QKV (cross-attn): cached path requires pre_projected_kv;
+            uncached path requires `context`. pe optional (None = norm-only).
+            k_pe overrides pe for K (e.g. AV cross-attn) when provided.
+
         Args:
-            x: Query input [B, T, D].
-            context: Key/value input [B, S, C]. None → self-attention.
-            pe: (cos, sin) RoPE embeddings for Q (and K when k_pe is None).
-            k_pe: Separate (cos, sin) RoPE embeddings for K (for AV cross-attn).
-            pre_projected_kv: Pre-projected (k, v) tuple from project_kv().
-                When provided, skips K/V projection and K-norm (already done).
+            key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
+                False = pad. Forwarded through ``_attn_impl`` to the backend.
+                Honored by ``VanillaAttention`` and ``FlashAttn4Attention``
+                (and ``UlyssesAttention`` wrapping either); the TRTLLM backend
+                silently ignores it. ``LTX2Attention`` constructs ``audio_attn1``
+                with a VANILLA backend whenever Ulysses is active under a
+                TRTLLM backend config (see ``_init_audio_modules``).
+        """
+        # Fallback to the naive eager rope path when fusion is disabled or
+        # the kernel doesn't support this head_dim. LTX-2 prod has
+        # fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
+        # only fires under mini-config unit tests (head_dim=32).
+        if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128):
+            return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv, key_padding_mask)
+
+        if self.qkv_mode == QKVMode.FUSE_QKV:
+            # ─── self-attn → packed kernel (norm + rope on QKV in-place) ───
+            qkv = self.qkv_proj(x)
+            cos, sin = pe
+            self.apply_packed_qk_norm_rope(qkv, cos, sin)
+            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+
+        elif self.qkv_mode == QKVMode.SEPARATE_QKV:
+            # ─── cross-attn → split kernel (norm or norm+rope based on pe) ───
+            if pre_projected_kv is not None:
+                # K/V cached by caller (text cross-attn + AV cross-attn).
+                # The caller is responsible for any K-norm + K-rope on the
+                # cached tensor; we only fuse Q here.
+                k, v = pre_projected_kv
+                q = self.to_q(x)
+                self.apply_split_norm_or_norm_rope(
+                    q, self.norm_q.weight, self.num_attention_heads, pe
+                )
+            else:
+                # Uncached cross-attn (not exercised by LTX-2 in practice; kept for fuse-dispatch consistency).
+                q = self.to_q(x)
+                k = self.to_k(context)
+                v = self.to_v(context)
+                self.apply_split_norm_or_norm_rope(
+                    q, self.norm_q.weight, self.num_attention_heads, pe
+                )
+                self.apply_split_norm_or_norm_rope(
+                    k,
+                    self.norm_k.weight,
+                    self.num_key_value_heads,
+                    k_pe if k_pe is not None else pe,
+                )
+
+        attn_kwargs = {}
+        if key_padding_mask is not None:
+            attn_kwargs["key_padding_mask"] = key_padding_mask
+        out = self._attn_impl(q, k, v, **attn_kwargs)
+
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)
+            b, t, _ = out.shape
+            out = out.view(b, t, self.num_attention_heads, self.head_dim)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, self.num_attention_heads * self.head_dim)
+
+        return self.to_out[0](out)
+
+    def _forward_unfused(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor | None,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+        k_pe: tuple[torch.Tensor, torch.Tensor] | None,
+        pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fallback path for unsupported configs (head_dim ∉ {64, 128} or
+        ``fuse_qk_norm_rope=False``).
+
+        LTX-2 prod hardcodes ``fuse_qk_norm_rope=True`` and head_dim ∈
+        {64, 128}, so in production this is never entered. Exercised by the
+        mini-config unit tests in ``test_ltx2_transformer.py`` (head_dim=32)
+        and by ablation tests that explicitly disable fusion.
+
+        Contract: caller must pass *pe* / *k_pe* in 4D layout
+        ([B, T, H, D] for SPLIT rope, [B, T, D] for INTERLEAVED). The fused
+        kernel's 2D form is not compatible with the naive ``apply_rotary_emb``.
         """
         if pre_projected_kv is not None:
             k, v = pre_projected_kv
@@ -246,9 +382,16 @@ class LTX2Attention(Attention):
 
         if pe is not None:
             q = apply_rotary_emb(q, pe, self.rope_type)
-            k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+            # k_pe=None with pre_projected_kv signals K already rotated.
+            if k_pe is not None:
+                k = apply_rotary_emb(k, k_pe, self.rope_type)
+            elif pre_projected_kv is None:
+                k = apply_rotary_emb(k, pe, self.rope_type)
 
-        out = self._attn_impl(q, k, v)
+        attn_kwargs = {}
+        if key_padding_mask is not None:
+            attn_kwargs["key_padding_mask"] = key_padding_mask
+        out = self._attn_impl(q, k, v, **attn_kwargs)
 
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
@@ -295,19 +438,12 @@ class BasicAVTransformerBlock(nn.Module):
         self.idx = idx
         self.norm_eps = norm_eps
 
-        self._use_seq_parallel = False
-        self._seq_parallel_size = 1
-        self._seq_parallel_pg = None
-        self._audio_is_sharded = False
+        # Per-block sharder: mirrors the root sharder's topology so the block
+        # can run cross-attention all-gathers independently.  Head-divisibility
+        # is checked once at the root model — skip num_heads here.
         vgm = config.visual_gen_mapping if config is not None else None
-        if vgm is not None and vgm.ulysses_size > 1:
-            self._use_seq_parallel = True
-            self._seq_parallel_size = vgm.ulysses_size
-            self._seq_parallel_pg = vgm.ulysses_group
-        elif vgm is not None and vgm.attn2d_row_size * vgm.attn2d_col_size > 1:
-            self._use_seq_parallel = True
-            self._seq_parallel_size = vgm.attn2d_row_size * vgm.attn2d_col_size
-            self._seq_parallel_pg = vgm.attn2d_mesh_group
+        self._sharder = SequenceSharder.from_vgm(vgm)
+        self._audio_is_sharded = False
 
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
@@ -359,6 +495,22 @@ class BasicAVTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
+        # Audio under Ulysses needs key_padding_mask support on audio_attn1
+        # (audio is padded to be divisible by ulysses_size; mask zeros pad
+        # slots). TRTLLM self-attn silently drops key_padding_mask, so downgrade
+        # to VANILLA whenever Ulysses is active under a TRTLLM backend config.
+        # Mirrors the existing cross-attn TRTLLM→VANILLA fallback
+        # (modules/attention.py); audio is small (T_a ~ 126) so the downgrade
+        # is negligible.
+        audio_self_config = model_config
+        vgm = model_config.visual_gen_mapping
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        if ulysses_size > 1 and model_config.attention.backend == "TRTLLM":
+            audio_self_config = model_config.model_copy(
+                update={
+                    "attention": model_config.attention.model_copy(update={"backend": "VANILLA"})
+                }
+            )
         self.audio_attn1 = LTX2Attention(
             query_dim=cfg.dim,
             heads=cfg.heads,
@@ -367,7 +519,7 @@ class BasicAVTransformerBlock(nn.Module):
             rope_type=rope_type,
             norm_eps=eps,
             apply_gated_attention=cfg.apply_gated_attention,
-            config=model_config,
+            config=audio_self_config,
             layer_idx=idx,
             use_ulysses=True,
         )
@@ -407,6 +559,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=a_cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            use_ulysses=True,
         )
         self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, a_cfg.dim))
         self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, v_cfg.dim))
@@ -468,20 +621,7 @@ class BasicAVTransformerBlock(nn.Module):
 
     def _sp_all_gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         """All-gather *x* along *dim* across sequence-parallel ranks."""
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(self._seq_parallel_size)]
-        dist.all_gather(gathered, x, group=self._seq_parallel_pg)
-        return torch.cat(gathered, dim=dim)
-
-    def _sp_gather_pe(self, pe):
-        """All-gather RoPE (cos, sin) tuple along the sequence dim."""
-        if pe is None:
-            return None
-        cos, sin = pe
-        # Split RoPE: [B, H, S, D] — sequence at dim 2
-        # Interleaved RoPE: [B, S, D] — sequence at dim 1
-        seq_dim = 2 if cos.ndim == 4 else 1
-        return (self._sp_all_gather(cos, dim=seq_dim), self._sp_all_gather(sin, dim=seq_dim))
+        return self._sharder.gather(x, dim=dim)
 
     # -- Forward -------------------------------------------------------------
 
@@ -553,7 +693,14 @@ class BasicAVTransformerBlock(nn.Module):
             )
             if not skip_a_self:
                 norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
-                a_self_out = self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa
+                a_self_out = (
+                    self.audio_attn1(
+                        norm_ax,
+                        pe=audio.positional_embeddings,
+                        key_padding_mask=audio.audio_padding_mask,
+                    )
+                    * agate_msa
+                )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
                 ):
@@ -611,22 +758,28 @@ class BasicAVTransformerBlock(nn.Module):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
 
                 # Project-before-gather: K/V projections run on sharded data
-                # so they benefit from Ulysses scaling.  Only the smaller
-                # projected tensors are all-gathered.
-                k_a2v, v_a2v = self.audio_to_video_attn.project_kv(ax_scaled)
+                # so they benefit from Ulysses scaling.  RoPE is applied to K
+                # inside project_kv on the sharded shard (RoPE commutes with
+                # seq-dim concat), so the cos/sin all-gather is unneeded and K
+                # rope work is U× cheaper. a2v keeps the all-gather path
+                # (Q=video huge, K/V=audio small — AG of the small audio is
+                # far cheaper than full-video a2a collectives).
+                # key_padding_mask zeros attention on the audio pad slots that
+                # configure_audio_ulysses appended to make T_a divisible by U.
+                k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
+                    ax_scaled, pe=audio.cross_positional_embeddings
+                )
                 if self._audio_is_sharded:
                     k_a2v = self._sp_all_gather(k_a2v)
                     v_a2v = self._sp_all_gather(v_a2v)
-                    k_pe_a2v = self._sp_gather_pe(audio.cross_positional_embeddings)
-                else:
-                    k_pe_a2v = audio.cross_positional_embeddings
 
                 a2v_out = (
                     self.audio_to_video_attn(
                         vx_scaled,
                         pre_projected_kv=(k_a2v, v_a2v),
                         pe=video.cross_positional_embeddings,
-                        k_pe=k_pe_a2v,
+                        k_pe=None,  # K already rotated in project_kv
+                        key_padding_mask=audio.audio_padding_mask,
                     )
                     * gate_out_a2v
                 )
@@ -642,21 +795,32 @@ class BasicAVTransformerBlock(nn.Module):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
 
-                # Project-before-gather (video → audio direction).
-                k_v2a, v_v2a = self.video_to_audio_attn.project_kv(vx_scaled)
-                if self._use_seq_parallel:
+                # v2a: when the Ulysses wrapper is active, K/V (video, large)
+                # stay seq-sharded and the wrapper handles Q + K|V + output
+                # a2a internally. RoPE is applied to K in project_kv on the
+                # local shard (commutes with a2a along the seq dim, so
+                # rotate-before-gather is value-preserving). No
+                # key_padding_mask — video K/V is unpadded; padded audio Q is
+                # stripped on exit by LTXModel.forward. When inactive (no
+                # wrapper built, Stage 2 disable, or audio not sharded), fall
+                # back to AG so the plain backend sees full K/V. Gate on
+                # is_ulysses_active() — _audio_is_sharded can be true under
+                # Attention2D where no wrapper was built.
+                k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
+                    vx_scaled, pe=video.cross_positional_embeddings
+                )
+                if not self.video_to_audio_attn.is_ulysses_active() and self._sharder.is_active:
+                    # Fallback: wrapper inactive → all-gather sharded video
+                    # K/V to full so plain backend can run.
                     k_v2a = self._sp_all_gather(k_v2a)
                     v_v2a = self._sp_all_gather(v_v2a)
-                    k_pe_v2a = self._sp_gather_pe(video.cross_positional_embeddings)
-                else:
-                    k_pe_v2a = video.cross_positional_embeddings
 
                 v2a_out = (
                     self.video_to_audio_attn(
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
-                        k_pe=k_pe_v2a,
+                        k_pe=None,  # K already rotated in project_kv
                     )
                     * gate_out_v2a
                 )
@@ -835,40 +999,31 @@ class LTXModel(nn.Module):
         self._init_preprocessors(cross_pe_max_pos)
 
         vgm = model_config.visual_gen_mapping
-        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
-        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
-        attn2d_size = attn2d_row_size * attn2d_col_size
-        ulysses_size = vgm.ulysses_size if vgm else 1
+        # Validate video-head divisibility through the factory; audio heads
+        # are checked separately because the factory only accepts one count.
+        self._sharder = SequenceSharder.from_vgm(
+            vgm,
+            num_attention_heads=num_attention_heads if model_type.is_video_enabled() else None,
+        )
+        self._cp_size = vgm.cp_size if vgm is not None else 1
+        self._ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        if (
+            self._sharder.is_active
+            and vgm is not None
+            and vgm.ulysses_size > 1
+            and model_type.is_audio_enabled()
+            and audio_num_attention_heads % vgm.ulysses_size != 0
+        ):
+            raise ValueError(
+                f"audio_num_attention_heads ({audio_num_attention_heads}) "
+                f"must be divisible by ulysses_size ({vgm.ulysses_size})"
+            )
 
-        use_attn2d = attn2d_size > 1
-        use_ulysses = ulysses_size > 1
-        self.use_seq_parallel = use_attn2d or use_ulysses
-        self.seq_parallel_size = attn2d_size if use_attn2d else ulysses_size
-        if use_attn2d:
-            self.seq_parallel_pg = vgm.attn2d_mesh_group
-            self.seq_parallel_rank = vgm.attn2d_mesh_rank
-        elif use_ulysses:
-            self.seq_parallel_pg = vgm.ulysses_group if vgm else None
-            self.seq_parallel_rank = vgm.ulysses_rank if vgm else 0
-        else:
-            self.seq_parallel_pg = None
-            self.seq_parallel_rank = 0
-
-        # Ulysses shards heads; Attention2D shards sequence — no head-count constraint for the latter.
-        if use_ulysses and model_type.is_video_enabled():
-            if num_attention_heads % ulysses_size != 0:
-                raise ValueError(
-                    f"num_attention_heads ({num_attention_heads}) "
-                    f"must be divisible by dit_ulysses_size ({ulysses_size})"
-                )
-        if use_ulysses and model_type.is_audio_enabled():
-            if audio_num_attention_heads % ulysses_size != 0:
-                raise ValueError(
-                    f"audio_num_attention_heads ({audio_num_attention_heads}) "
-                    f"must be divisible by dit_ulysses_size ({ulysses_size})"
-                )
+        if self.model_config.mapping.tp_size > 1:
+            raise ValueError("LTX2 does not currently support TP.")
 
         self._audio_is_sharded = False
+        self._audio_pad = 0  # set by configure_audio_ulysses
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
         # Per-block text cross-attn KV lists, looked up by inner.idx in the
@@ -1163,64 +1318,172 @@ class LTXModel(nn.Module):
     # -- Sequence sharding / gathering ----------------------------------------
 
     def _shard_transformer_args(self, args: TransformerArgs) -> TransformerArgs:
-        """Shard sequence-dependent fields of *args* across sequence-parallel ranks."""
+        """Shard step-dependent fields of *args* across sequence-parallel ranks.
+
+        PE (``positional_embeddings`` / ``cross_positional_embeddings``) is
+        already sharded-local in ``TextCache`` (one-time in
+        ``prepare_text_cache``) so we leave it untouched. Only step-varying
+        fields (``x``, timesteps, etc.) need slicing each step.
+        """
         seq_len = args.x.shape[1]
-        chunk = seq_len // self.seq_parallel_size
-        s = self.seq_parallel_rank * chunk
-        e = s + chunk
-
-        def _shard(t):
-            if t is None or t.ndim < 2 or t.shape[1] != seq_len:
-                return t
-            return t[:, s:e]
-
-        def _shard_pe(pe):
-            if pe is None:
-                return None
-            cos, sin = pe
-            if cos.ndim == 4 and cos.shape[2] == seq_len:
-                # Split RoPE: [B, H, S, D] — sequence dim at index 2
-                return (cos[:, :, s:e], sin[:, :, s:e])
-            elif cos.ndim == 3 and cos.shape[1] == seq_len:
-                # Interleaved RoPE: [B, S, D] — sequence dim at index 1
-                return (cos[:, s:e], sin[:, s:e])
-            return pe
-
+        sh = self._sharder
         return replace(
             args,
-            x=args.x[:, s:e],
-            timesteps=_shard(args.timesteps),
-            embedded_timestep=_shard(args.embedded_timestep),
-            positional_embeddings=_shard_pe(args.positional_embeddings),
-            cross_positional_embeddings=_shard_pe(args.cross_positional_embeddings),
-            cross_scale_shift_timestep=_shard(args.cross_scale_shift_timestep),
-            cross_gate_timestep=_shard(args.cross_gate_timestep),
+            x=sh.shard(args.x, dim=1),
+            timesteps=sh.shard(args.timesteps, dim=1, expected_seq_len=seq_len),
+            embedded_timestep=sh.shard(args.embedded_timestep, dim=1, expected_seq_len=seq_len),
+            cross_scale_shift_timestep=sh.shard(
+                args.cross_scale_shift_timestep, dim=1, expected_seq_len=seq_len
+            ),
+            cross_gate_timestep=sh.shard(args.cross_gate_timestep, dim=1, expected_seq_len=seq_len),
         )
+
+    def _make_pe_local(
+        self,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+        *,
+        is_audio: bool,
+        fuse: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Sharded-local PE for the attention consumer.
+
+        Slices the source 4D PE along seq dim by Ulysses rank (one-time, in
+        ``prepare_text_cache``), then either reshapes to 2D ``[T_local, H*D]``
+        for the fused kernel or keeps 4D for the eager apply_rotary_emb path.
+        LTX-2 SPLIT rope produces 4D PE; INTERLEAVED is not used in prod.
+
+        ``_audio_is_sharded`` (set in ``configure_audio_ulysses``) already
+        encodes whether audio_seq_len is divisible by ulysses_size, so we
+        gate sharding on that flag alone — no second divisibility check.
+        """
+        if pe is None:
+            return None
+        cos, sin = pe
+        sh = self._sharder
+        if sh.is_active and (not is_audio or self._audio_is_sharded):
+            chunk = cos.shape[1] // sh.size
+            s = sh.rank * chunk
+            e = s + chunk
+            cos = cos[:, s:e]
+            sin = sin[:, s:e]
+        cos = cos.contiguous()
+        sin = sin.contiguous()
+        if fuse:
+            # [B, T_local, H, D] -> [B*T_local, H*D]. PE source from
+            # precompute_freqs_cis has B=1 so this collapses to [T_local, H*D];
+            # the fused kernel broadcasts cos over B internally.
+            cos = cos.reshape(cos.shape[0] * cos.shape[1], -1)
+            sin = sin.reshape(sin.shape[0] * sin.shape[1], -1)
+        return (cos, sin)
 
     def _gather_sequence(self, x: torch.Tensor) -> torch.Tensor:
         """All-gather hidden states along the sequence dim."""
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(self.seq_parallel_size)]
-        dist.all_gather(gathered, x, group=self.seq_parallel_pg)
-        return torch.cat(gathered, dim=1)
+        return self._sharder.gather(x, dim=1)
+
+    @staticmethod
+    def _pad_pe(
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+        pad: int,
+        seq_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Repeat-last pad a (cos, sin) PE tuple by ``pad`` slots on ``seq_dim``.
+
+        Used by ``prepare_text_cache`` to extend audio PE when audio padding
+        is active, so the rope helper sees consistent shapes between padded
+        audio input and PE. Repeat-last keeps RoPE values at pad slots equal
+        to the last valid token (no OOB positional index).
+
+        Caller passes ``seq_dim`` explicitly (depends on rope type and PE
+        layout): SPLIT rope = ``[B, H, T, D]`` so 2; INTERLEAVED = ``[B, T, D]``
+        so 1.
+        """
+        if pe is None or pad <= 0:
+            return pe
+        cos, sin = pe
+        if not (0 <= seq_dim < cos.ndim):
+            raise ValueError(f"_pad_pe: seq_dim={seq_dim} out of range for cos.ndim={cos.ndim}")
+
+        def _ext(t: torch.Tensor) -> torch.Tensor:
+            idx = [slice(None)] * t.ndim
+            idx[seq_dim] = slice(t.shape[seq_dim] - 1, t.shape[seq_dim])
+            last = t[tuple(idx)]
+            tail_shape = list(t.shape)
+            tail_shape[seq_dim] = pad
+            tail = last.expand(*tail_shape).contiguous()
+            return torch.cat([t, tail], dim=seq_dim)
+
+        return (_ext(cos), _ext(sin))
+
+    @staticmethod
+    def _pad_modality_audio(audio: Modality, pad: int) -> Modality:
+        """Pad ``audio`` on the token axis by ``pad`` slots.
+
+        Used by ``forward`` when Ulysses is active and ``T_a % ulysses_size
+        != 0`` to make audio shardable.
+
+        - ``latent``: zero-pad on ``dim=1``. Attention zeros out pad rows via
+          ``audio_padding_mask``; norm/MLP on zero rows is harmless because
+          pad rows are stripped before output processing.
+        - ``positions``: repeat-last on ``dim=2`` (works for both 3D
+          ``(B, n_dims, T)`` and 4D ``(B, n_dims, T, 2)`` shapes). RoPE
+          cos/sin at pad slots equals the last valid token's; keeps RoPE
+          indices inside the model's trained range regardless of
+          ``positional_embedding_max_pos``.
+        - ``timesteps``: repeat-last on ``dim=1`` only when per-token
+          ``(B, T)``; scalar ``(B,)`` timesteps are not padded.
+        - ``context`` / ``context_mask``: untouched (text-side, audio-token-
+          count-independent).
+        """
+        if pad <= 0:
+            return audio
+        # Latent: zero-pad. F.pad pads last dim first; (0,0,0,pad) pads dim=-2.
+        latent = F.pad(audio.latent, (0, 0, 0, pad))
+        # Positions: repeat-last on dim=2.
+        pos = audio.positions
+        last = pos[:, :, -1:, ...]
+        repeat_shape = list(pos.shape)
+        repeat_shape[2] = pad
+        tail = last.expand(*repeat_shape).contiguous()
+        positions = torch.cat([pos, tail], dim=2)
+        # Timesteps: repeat-last on dim=1 only when per-token.
+        if audio.timesteps.ndim >= 2 and audio.timesteps.shape[1] == pos.shape[2]:
+            ts = audio.timesteps
+            last_ts = ts[:, -1:, ...].expand(ts.shape[0], pad, *ts.shape[2:]).contiguous()
+            timesteps = torch.cat([ts, last_ts], dim=1)
+        else:
+            timesteps = audio.timesteps
+        return replace(audio, latent=latent, positions=positions, timesteps=timesteps)
 
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
-        """Configure whether audio uses Ulysses based on sequence length.
+        """Configure audio sharding + padding for Ulysses.
 
         Call once before the denoising loop when the audio token count is
-        known.  The decision is cached — ``forward()`` uses it without
+        known. The decision is cached — ``forward()`` uses it without
         re-checking.
+
+        When sequence parallelism is active, audio is always padded to
+        ``(U - T_a % U) % U`` slots so ``T_a`` becomes divisible by ``U``
+        and a ``[B, T_a_padded]`` validity mask is attached so attention
+        zeros out pad positions. ``forward`` strips the pad tail on exit.
         """
-        if not self.use_seq_parallel:
+        if not self._sharder.is_active:
             self._audio_is_sharded = False
+            self._audio_pad = 0
             return
 
-        self._audio_is_sharded = audio_seq_len % self.seq_parallel_size == 0
+        U = self._sharder.size
+        self._audio_pad = (U - audio_seq_len % U) % U
+        self._audio_is_sharded = True
+
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
             target._audio_is_sharded = self._audio_is_sharded
             if hasattr(target, "audio_attn1"):
                 target.audio_attn1.set_ulysses_active(self._audio_is_sharded)
+            # v2a cross-attn requires sharded audio Q — gate on
+            # _audio_is_sharded (video K/V is always sharded under Ulysses).
+            if hasattr(target, "video_to_audio_attn"):
+                target.video_to_audio_attn.set_ulysses_active(self._audio_is_sharded)
 
     def set_ulysses_enabled(self, enabled: bool) -> None:
         """Enable or disable Ulysses parallelism at runtime.
@@ -1231,21 +1494,28 @@ class LTXModel(nn.Module):
         multi-rank operation; audio sharding will be reconfigured by
         the next :meth:`configure_audio_ulysses` call.
         """
-        if self.seq_parallel_size <= 1:
+        if self._sharder.size <= 1:
             return
 
-        self.use_seq_parallel = enabled
-        if not enabled:
+        if enabled:
+            self._sharder.enable()
+        else:
+            self._sharder.disable()
             self._audio_is_sharded = False
 
         for block in self.transformer_blocks:
-            block._use_seq_parallel = enabled
-            if not enabled:
-                block._audio_is_sharded = False
-            if hasattr(block, "attn1"):
-                block.attn1.set_ulysses_active(enabled)
-            if hasattr(block, "audio_attn1") and not enabled:
-                block.audio_attn1.set_ulysses_active(False)
+            target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
+            if enabled:
+                target._sharder.enable()
+            else:
+                target._sharder.disable()
+                target._audio_is_sharded = False
+            if hasattr(target, "attn1"):
+                target.attn1.set_ulysses_active(enabled)
+            if hasattr(target, "audio_attn1") and not enabled:
+                target.audio_attn1.set_ulysses_active(False)
+            if hasattr(target, "video_to_audio_attn") and not enabled:
+                target.video_to_audio_attn.set_ulysses_active(False)
 
     # -- Output processing ---------------------------------------------------
 
@@ -1299,6 +1569,30 @@ class LTXModel(nn.Module):
                 audio_context, audio_context_mask, audio_positions, dtype
             )
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
+            # Extend audio PE to padded length once at cache-build time.
+            # seq_dim per rope type: SPLIT cos [B,H,T,D] → 2, INTERLEAVED [B,T,D] → 1.
+            if self._audio_pad > 0:
+                pe_seq_dim = 2 if (a_pe is not None and a_pe[0].ndim == 4) else 1
+                a_pe = self._pad_pe(a_pe, self._audio_pad, seq_dim=pe_seq_dim)
+                a_cross_pe = self._pad_pe(a_cross_pe, self._audio_pad, seq_dim=pe_seq_dim)
+
+        # Build sharded-local PE in the form the attention consumer expects.
+        # fuse_qk_norm_rope=True (LTX-2 default) -> 2D [T_local, H*D] contiguous,
+        # ready for the fused kernel; False -> 4D [B, T_local, H, D] for the
+        # naive apply_rotary_emb path. Done one-time here, so the inner loop
+        # has no reshape/contiguous/shard work on PE.
+        # Inspect any LTX2Attention to learn whether fusion is on (per-modality
+        # attentions are constructed with the same flag in this codepath).
+        fuse_video = self.transformer_blocks[0].attn1.fuse_qk_norm_rope
+        fuse_audio = (
+            self.transformer_blocks[0].audio_attn1.fuse_qk_norm_rope
+            if hasattr(self.transformer_blocks[0], "audio_attn1")
+            else True
+        )
+        v_pe = self._make_pe_local(v_pe, is_audio=False, fuse=fuse_video)
+        v_cross_pe = self._make_pe_local(v_cross_pe, is_audio=False, fuse=fuse_video)
+        a_pe = self._make_pe_local(a_pe, is_audio=True, fuse=fuse_audio)
+        a_cross_pe = self._make_pe_local(a_cross_pe, is_audio=True, fuse=fuse_audio)
 
         return TextCache(
             video_context=v_ctx,
@@ -1338,6 +1632,25 @@ class LTXModel(nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
+        # Audio padding for Ulysses: when self._audio_pad > 0 (set once by
+        # configure_audio_ulysses to make T_a divisible by ulysses_size), pad
+        # audio on entry to make it shardable. Build a [B, T_a_padded] bool mask
+        # (True=valid, False=pad) that travels through TransformerArgs to
+        # audio_attn1 + a2v. Strip the padded tail on output below.
+        # text_cache.audio_{pe,cross_pe} are already padded in prepare_text_cache.
+        audio_padding_mask = None
+        s_real_audio = None
+        if audio is not None and self._audio_pad > 0:
+            s_real_audio = audio.latent.shape[1]
+            audio = self._pad_modality_audio(audio, self._audio_pad)
+            s_full_audio = audio.latent.shape[1]
+            audio_padding_mask = torch.ones(
+                (audio.latent.shape[0], s_full_audio),
+                dtype=torch.bool,
+                device=audio.latent.device,
+            )
+            audio_padding_mask[:, s_real_audio:] = False
+
         video_args = (
             self.video_args_preprocessor.prepare(
                 video,
@@ -1349,6 +1662,7 @@ class LTXModel(nn.Module):
             if video is not None
             else None
         )
+
         audio_args = (
             self.audio_args_preprocessor.prepare(
                 audio,
@@ -1361,10 +1675,15 @@ class LTXModel(nn.Module):
             else None
         )
 
-        # Shard sequences for parallelism (Ulysses head-sharding or Attention2D context parallelism).
+        # Attach the full-seq audio padding mask (identical across Ulysses
+        # ranks; _shard_transformer_args passes it through unchanged).
+        if audio_args is not None and audio_padding_mask is not None:
+            audio_args = replace(audio_args, audio_padding_mask=audio_padding_mask)
+
+        # Shard sequences for parallelism (Ulysses head-sharding, ring CP, or Attention2D).
         # Video is always sharded.  Audio sharding is decided once by
         # configure_audio_ulysses() and cached in self._audio_is_sharded.
-        if self.use_seq_parallel:
+        if self._sharder.is_active:
             if video_args is not None:
                 video_args = self._shard_transformer_args(video_args)
             if self._audio_is_sharded and audio_args is not None:
@@ -1406,7 +1725,7 @@ class LTXModel(nn.Module):
         # Only gather embedded_timestep if it was actually sharded (dim-1
         # matches x); scalar timestep embeddings [B, 1, D] are
         # broadcast-compatible and must not be gathered.
-        if self.use_seq_parallel:
+        if self._sharder.is_active:
             if video_args is not None:
                 gathered_vx = self._gather_sequence(video_args.x)
                 v_et = video_args.embedded_timestep
@@ -1450,6 +1769,9 @@ class LTXModel(nn.Module):
             if audio_args is not None
             else None
         )
+        # Strip the padded tail when audio was padded on entry.
+        if ax is not None and s_real_audio is not None:
+            ax = ax[:, :s_real_audio]
         return vx, ax
 
     @staticmethod

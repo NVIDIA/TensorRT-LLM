@@ -17,8 +17,12 @@
 
 #include "rnnCacheTransBuffer.h"
 #include "cacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+
+#include <algorithm>
 
 namespace tensorrt_llm::batch_manager::rnn_state_manager
 {
@@ -67,6 +71,81 @@ RnnCacheTransBufferManager::RnnCacheTransBufferManager(
 {
     TLLM_CHECK(mRnnStateManager != nullptr);
     TLLM_LOG_INFO("RnnCacheTransBufferManager created for RNN cache");
+}
+
+size_t RnnCacheTransBufferManager::computeTransferBufferSizeFromPool(
+    kv_cache_manager::BaseKVCacheManager* kvCacheManager, executor::kv_cache::CacheState const& cacheState,
+    std::optional<size_t> maxNumTokens)
+{
+    TLLM_CHECK(cacheState.hasRnnConfig());
+    auto const& rnnCacheState = cacheState.getRnnCacheState();
+    auto const& rnnModel = rnnCacheState.mModelConfig;
+
+    int const tpNum = cacheState.getParallelConfig().mTensorParallelism;
+    int const dpSize = cacheState.getParallelConfig().mDPsize;
+    int const tpPerDP = cacheState.getParallelConfig().mEnableAttentionDP ? tpNum / dpSize : tpNum;
+
+    int const numHeadsLocal = rnnModel.mNumHeads / tpPerDP;
+
+    // Compute conv dim local (accounting for conv section layout)
+    int convDimLocal = 0;
+    auto const globalSectionDims = rnnModel.getConvSectionDims();
+    for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
+    {
+        convDimLocal += globalSectionDims[s] / tpPerDP;
+    }
+
+    size_t const convDtypeSize = common::getDTypeSize(rnnCacheState.mConvStateDataType);
+    size_t const ssmDtypeSize = common::getDTypeSize(rnnCacheState.mSsmStateDataType);
+
+    size_t const convBytesPerLayer = static_cast<size_t>(convDimLocal) * (rnnModel.mDConv - 1) * convDtypeSize;
+    size_t const ssmBytesPerLayer
+        = static_cast<size_t>(numHeadsLocal) * rnnModel.mHeadDim * rnnModel.mDState * ssmDtypeSize;
+
+    // Use max layer count across PP ranks for buffer sizing (conservative).
+    // This ensures the buffer is large enough regardless of which PP rank we are.
+    SizeType32 numLocalLayers = 0;
+    for (auto layerCount : rnnCacheState.mLayerNumPerPP)
+    {
+        numLocalLayers = std::max(numLocalLayers, layerCount);
+    }
+
+    size_t bufferSizePerBlock = numLocalLayers * (convBytesPerLayer + ssmBytesPerLayer);
+
+    // Compute max real blocks per request for buffer sizing.
+    // Real blocks are allocated at: every statesSnapshotInterval tokens + end-of-prompt + saveLastSnapshot.
+    auto const& blockManager = kvCacheManager->getBlockManager();
+    auto const& linearMeta = blockManager.getLinearAttentionMetadata();
+    SizeType32 maxRealBlocksPerSeq = 1; // Default: at least 1 real block (end-of-prompt)
+    if (linearMeta.has_value() && linearMeta->statesSnapshotInterval > 0)
+    {
+        auto const recurrentWs
+            = static_cast<SizeType32>(kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
+        auto const wsMeta = blockManager.getWindowSizeMetadata(recurrentWs);
+        SizeType32 maxTokenNum = wsMeta.maxTokenNum;
+        // Number of interval snapshots + end-of-prompt block + saveLastSnapshot.
+        maxRealBlocksPerSeq
+            = maxTokenNum / linearMeta->statesSnapshotInterval + 1 + (linearMeta->saveLastSnapshot ? 1 : 0);
+    }
+
+    size_t bufferSize = static_cast<size_t>(maxRealBlocksPerSeq) * bufferSizePerBlock;
+
+    TLLM_LOG_DEBUG(
+        "RNN computeTransferBufferSizeFromPool: numLocalLayers=%d, convBytesPerLayer=%lu, ssmBytesPerLayer=%lu, "
+        "bufferSizePerBlock=%lu, maxRealBlocksPerSeq=%d, totalBufferSize=%lu",
+        numLocalLayers, convBytesPerLayer, ssmBytesPerLayer, bufferSizePerBlock, maxRealBlocksPerSeq, bufferSize);
+
+    return bufferSize > 0 ? bufferSize : common::getEnvMemSizeForKVCacheTransferBuffer();
+}
+
+RnnCacheTransBufferManager::RnnCacheTransBufferManager(kv_cache_manager::BaseKVCacheManager* kvCacheManager,
+    executor::kv_cache::CacheState const& cacheState, std::optional<size_t> maxNumTokens)
+    : BaseTransBufferManager(computeTransferBufferSizeFromPool(kvCacheManager, cacheState, maxNumTokens),
+        nvinfer1::DataType::kUINT8, maxNumTokens)
+    , mRnnStateManager{nullptr}
+{
+    TLLM_CHECK(kvCacheManager != nullptr);
+    TLLM_LOG_INFO("RnnCacheTransBufferManager created for unified pool RNN cache");
 }
 
 size_t RnnCacheTransBufferManager::preAllocBufferSize(

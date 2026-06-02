@@ -38,6 +38,11 @@ def sampler_type_fixture(request) -> str:
     return request.param
 
 
+@pytest.fixture(scope="module", params=[False, True])
+def enable_early_first_token_response_fixture(request) -> bool:
+    return request.param
+
+
 class CacheSalter:
     _salt = 0
 
@@ -63,9 +68,16 @@ class CacheSalter:
 def llm(
     sampler_type_fixture: str,
     disable_overlap_scheduler_fixture: bool,
+    enable_early_first_token_response_fixture: bool,
 ):
     sampler_type = sampler_type_fixture
     disable_overlap_scheduler = disable_overlap_scheduler_fixture
+    enable_early_first_token_response = enable_early_first_token_response_fixture
+
+    if enable_early_first_token_response and disable_overlap_scheduler:
+        pytest.skip(
+            "enable_early_first_token_response is relevant only when the overlap scheduler is enabled."
+        )
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
@@ -73,6 +85,7 @@ def llm(
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         sampler_type=sampler_type,
         disable_overlap_scheduler=disable_overlap_scheduler,
+        enable_early_first_token_response=enable_early_first_token_response,
     )
     with llm:
         yield llm
@@ -346,6 +359,92 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
                     )
 
         print(f"{'=' * 80}\n")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_logprobs_simple_format(simple_llm: LLM):
+    """When ``logprobs_simple_format=True`` and ``prompt_logprobs_simple_format=True``
+    with the corresponding K==0, the per-token logprobs are returned as a flat
+    ``list[float]`` instead of the default ``list[dict[int, Logprob]]`` and the
+    numeric values match the dict-format path within tolerance."""
+
+    prompt = "The future of AI is"
+    common_kwargs = dict(max_tokens=8, temperature=0.0)
+
+    dict_params = SamplingParams(logprobs=0, prompt_logprobs=0, **common_kwargs)
+    simple_params = SamplingParams(
+        logprobs=0,
+        prompt_logprobs=0,
+        logprobs_simple_format=True,
+        prompt_logprobs_simple_format=True,
+        **common_kwargs,
+    )
+
+    [dict_out] = list(simple_llm.generate([prompt], sampling_params=dict_params))
+    [simple_out] = list(simple_llm.generate([prompt], sampling_params=simple_params))
+
+    dict_gen_logprobs = dict_out.outputs[0].logprobs
+    simple_gen_logprobs = simple_out.outputs[0].logprobs
+
+    # Simple format must be list[float]; dict format must remain list[dict].
+    assert all(isinstance(x, float) for x in simple_gen_logprobs), (
+        f"Expected list[float], got element types: {[type(x) for x in simple_gen_logprobs]}"
+    )
+    assert all(isinstance(x, dict) for x in dict_gen_logprobs)
+
+    for token_id, lp_simple, lp_dict in zip(
+        dict_out.outputs[0].token_ids, simple_gen_logprobs, dict_gen_logprobs, strict=True
+    ):
+        torch.testing.assert_close(
+            torch.tensor(lp_simple, dtype=torch.float32),
+            torch.tensor(lp_dict[token_id].logprob, dtype=torch.float32),
+            atol=1e-4,
+            rtol=0,
+        )
+
+    dict_prompt_logprobs = dict_out.outputs[0].prompt_logprobs
+    simple_prompt_logprobs = simple_out.outputs[0].prompt_logprobs
+    assert all(isinstance(x, float) for x in simple_prompt_logprobs)
+    assert all(isinstance(x, dict) for x in dict_prompt_logprobs)
+    prompt_token_ids = dict_out.prompt_token_ids[1:] + dict_out.outputs[0].token_ids[:1]
+    for token_id, lp_simple, lp_dict in zip(
+        prompt_token_ids, simple_prompt_logprobs, dict_prompt_logprobs, strict=True
+    ):
+        torch.testing.assert_close(
+            torch.tensor(lp_simple, dtype=torch.float32),
+            torch.tensor(lp_dict[token_id].logprob, dtype=torch.float32),
+            atol=1e-4,
+            rtol=0,
+        )
+
+
+def test_logprobs_simple_format_validation():
+    """``SamplingParams`` rejects incompatible combinations of the simple-format
+    flag with non-zero / unset ``logprobs`` and with beam search."""
+    SamplingParams(max_tokens=4, logprobs=0, logprobs_simple_format=True)
+    SamplingParams(max_tokens=4, prompt_logprobs=0, prompt_logprobs_simple_format=True)
+
+    with pytest.raises(ValueError, match=r"logprobs_simple_format=True requires logprobs == 0"):
+        SamplingParams(max_tokens=4, logprobs=2, logprobs_simple_format=True)
+    with pytest.raises(ValueError, match=r"logprobs_simple_format=True requires logprobs == 0"):
+        SamplingParams(max_tokens=4, logprobs=None, logprobs_simple_format=True)
+    with pytest.raises(
+        ValueError, match=r"prompt_logprobs_simple_format=True requires prompt_logprobs == 0"
+    ):
+        SamplingParams(max_tokens=4, prompt_logprobs=3, prompt_logprobs_simple_format=True)
+    with pytest.raises(
+        ValueError, match=r"prompt_logprobs_simple_format=True requires prompt_logprobs == 0"
+    ):
+        SamplingParams(max_tokens=4, prompt_logprobs=None, prompt_logprobs_simple_format=True)
+    with pytest.raises(ValueError, match="beam search"):
+        SamplingParams(
+            max_tokens=4,
+            logprobs=0,
+            logprobs_simple_format=True,
+            use_beam_search=True,
+            best_of=2,
+            n=2,
+        )
 
 
 @pytest.mark.parametrize("logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])

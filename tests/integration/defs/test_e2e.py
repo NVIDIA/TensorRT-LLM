@@ -696,7 +696,8 @@ def test_trtllm_bench_sanity(llm_root, llm_venv, engine_dir, model_subdir,
                              model_name, quant, streaming, use_extra_config,
                              pytorch_backend_config,
                              temp_extra_llm_api_options_file):
-    """Sanity check on the new benchmark script to make sure it works
+    """Sanity check on the new benchmark script to make sure it works.
+
     - meta-llama/Llama-3.1-8B for baseline
     - fp16 and fp8 to test quantization
     """
@@ -806,7 +807,8 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
 @pytest.mark.parametrize("quant", [None, "FP8"], ids=["FP16", "FP8"])
 def test_trtllm_bench_latency_sanity(llm_root, llm_venv, engine_dir,
                                      model_subdir, model_name, quant):
-    """Sanity check on the new benchmark script to make sure it works
+    """Sanity check on the new benchmark script to make sure it works.
+
     - meta-llama/Llama-3.1-8B for baseline
     - fp16 and fp8 to test quantization
     """
@@ -1057,6 +1059,19 @@ def test_openai_misc_example(llm_root, llm_venv, backend: str):
     ])
 
 
+def test_openai_kv_cache_contamination(llm_root, llm_venv):
+    """NVBug 6025177 regression: cross-request KV-cache contamination on cancel-during-chunked-prefill.
+
+    PyTorch backend only — the bug lives in
+    the PyExecutor chunked-prefill / store_context_blocks path.
+    """
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest", "-v",
+        str(test_root / "_test_openai_kv_cache_contamination.py")
+    ])
+
+
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_completions_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1124,6 +1139,15 @@ def test_openai_chat_harmony(llm_root, llm_venv):
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_chat_harmony.py")])
+
+
+@skip_pre_hopper
+def test_openai_chat_harmony_perf_metrics(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat_harmony_perf_metrics.py")
+    ])
 
 
 def test_openai_responses(llm_root, llm_venv):
@@ -1246,7 +1270,7 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(40000)
-@pytest.mark.parametrize("service_discovery", ["etcd", "http"])
+@pytest.mark.parametrize("service_discovery", ["etcd"])
 def test_openai_disagg_multi_nodes_completion_service_discovery(
         llm_root, llm_venv, service_discovery):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1772,6 +1796,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 @pytest.mark.skip_less_device(8)
 def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
     """Test DeepSeek-R1 FP4 with MTP speculative decoding using BenchRunner.
+
     The goal is to test the bug fix for https://nvbugs/5670108.
     Average input sequence length: 1k, average output sequence length: 10k.
     """
@@ -2340,8 +2365,6 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
                  marks=skip_pre_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
-    pytest.param('nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
-                 marks=skip_pre_hopper),
 ])
 def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                           mmlu_dataset_root):

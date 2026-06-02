@@ -156,6 +156,10 @@ google/gemma-3-27b-it:
     accuracy: 76.80
 google/gemma-4-26B-A4B-it:
   - accuracy: 71.296
+google/gemma-3n-E2B-it:
+  - accuracy: 59.527
+google/gemma-4-E2B-it:
+  - accuracy: 56.823
 Qwen/Qwen2-0.5B-Instruct:
   - accuracy: 45.30
   - quant_algo: FP8
@@ -403,6 +407,14 @@ GPT-OSS/MXFP4:
     accuracy: 75.50
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 75.50
+poolside/laguna-XS.2:
+  - accuracy: 74.93
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 75.19
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 73.66
 mistralai/Mistral-Nemo-12b-Base:
   - accuracy: 69.66
   - quant_algo: FP8

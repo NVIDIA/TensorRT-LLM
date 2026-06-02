@@ -25,8 +25,8 @@ from typing import Optional, Type
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
-from ..config import AttentionConfig
 from .interface import AttentionBackend
 
 
@@ -37,7 +37,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL")
 
     Returns:
         Diffusion attention backend class
@@ -48,9 +48,12 @@ def get_visual_gen_attention_backend(
         - "TRTLLM": Optimized for self-attention (requires same Q/KV seq lengths)
                     Better performance but requires fused QKV
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
-                         Requires flash-attn package with cute interface
+                 Requires flash-attn package with cute interface
+        - "CUTEDSL": CuTe DSL FMHA kernels; uses packaged cubins when present,
+                     otherwise compiles from CuTe DSL source
     """
     # Lazy imports to avoid circular dependency
+    from .cute_dsl import CuTeDSLAttention
     from .flash_attn4 import FlashAttn4Attention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
@@ -63,6 +66,8 @@ def get_visual_gen_attention_backend(
         return TrtllmAttention
     elif backend_name == "FA4":
         return FlashAttn4Attention
+    elif backend_name == "CUTEDSL":
+        return CuTeDSLAttention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
@@ -89,7 +94,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
@@ -100,7 +105,7 @@ def create_attention(
             will automatically reallocate if larger batches are encountered.
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
-        attention_config: Optional AttentionConfig; sage_attention_config is
+        attention_config: Optional AttentionConfig; quant_attention_config is
             extracted and forwarded to the TRTLLM backend when present.
         attention_metadata_state: Optional model-scoped metadata state from
             visual-gen config. Required for TRTLLM backend.
@@ -111,11 +116,11 @@ def create_attention(
     """
     attn_cls = get_visual_gen_attention_backend(backend)
 
-    # Extract sage_attention_config from AttentionConfig and pass to TRTLLM backend.
-    # AttentionConfig validation disables unsupported SageAttention configs by
-    # normalizing sage_attention_config to None.
-    if attention_config is not None and attention_config.sage_attention_config is not None:
-        kwargs["sage_attention_config"] = attention_config.sage_attention_config
+    # Extract quant_attention_config from AttentionConfig and pass to backends
+    # that support it (TRTLLM SAGE recipes, CUTEDSL QK16PV8). AttentionConfig
+    # validation rejects unsupported (backend, recipe) combinations upstream.
+    if attention_config is not None and attention_config.quant_attention_config is not None:
+        kwargs["quant_attention_config"] = attention_config.quant_attention_config
     if backend.upper() == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(

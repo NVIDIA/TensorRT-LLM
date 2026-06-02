@@ -155,7 +155,7 @@ def _lg(window=None):
 
 
 class TestAdapterPerLayerGroup:
-    """Per-layer cached prefix: SWA groups are clamped up to stale_end*tpb."""
+    """Per-layer cached prefix: adapter reports only the reuse-hit scalar."""
 
     TPB = 8
 
@@ -165,36 +165,37 @@ class TestAdapterPerLayerGroup:
         assert out == [0, 0]
 
     def test_zero_scalar(self):
+        # No reuse hit: every group reports 0 — SWA stale handling is the
+        # transfer call site's concern, not the adapter's.
         ad = _StubAdapter(scalar=0, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
         assert out == [0, 0]
 
     def test_full_attn_passthrough(self):
-        # full-attn group: scalar is returned as-is.
         ad = _StubAdapter(scalar=64, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg()])
         assert out == [64, 64]
 
-    def test_swa_scalar_inside_window_no_clamp(self):
-        # prompt_len=32, window=16, tpb=8 → stale_end=2 → stale_end*tpb=16.
-        # scalar=24 ≥ 16 → no clamp.
+    def test_swa_passthrough_above_stale(self):
+        # SWA layer: adapter passes scalar through unchanged regardless of stale_end.
         ad = _StubAdapter(scalar=24, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), [_lg(window=16)])
         assert out == [24]
 
-    def test_swa_scalar_below_stale_clamped_up(self):
-        # stale_end*tpb = 16; scalar=8 → clamped up to 16.
+    def test_swa_passthrough_below_stale(self):
+        # scalar=8 is below stale_end*tpb=16; adapter still returns the raw
+        # scalar — the call site reconciles with stale_end via max(0, ...).
         ad = _StubAdapter(scalar=8, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), [_lg(window=16)])
-        assert out == [16]
+        assert out == [8]
 
     def test_mixed_groups(self):
         ad = _StubAdapter(scalar=8, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(
             _FakeReq(32), [_lg(), _lg(window=16), _lg(window=32)]
         )
-        # full-attn=8, swa(window=16) clamped to 16, swa(window=32) stale_end=0 → 8.
-        assert out == [8, 16, 8]
+        # All groups see the same reuse-hit scalar.
+        assert out == [8, 8, 8]
 
 
 # ---------------------------------------------------------------------------
@@ -202,12 +203,14 @@ class TestAdapterPerLayerGroup:
 # ---------------------------------------------------------------------------
 
 
-def _swa_trim(block_ids, prompt_len, tpb, window_size, scalar_cached_tokens):
+def _swa_trim(block_ids, prompt_len, tpb, window_size, cached_tokens, is_gen_only=True):
     """Replicate the SWA branch of KvCacheTransceiverV2._create_kv_slice.
 
     Inputs:
       block_ids: list possibly containing stale entries (V1 pre-eviction view).
-      scalar_cached_tokens: the cache-manager scalar BEFORE adapter SWA clamp.
+      cached_tokens: reuse-hit prefix reported by the adapter (token-aligned).
+      is_gen_only: True mirrors the gen-side path; False mirrors the ctx-side
+        path where ``cached_per_lg`` is synthetically 0.
     """
     block_ids = np.array(block_ids, dtype=np.int64)
     total_blocks = (prompt_len + tpb - 1) // tpb
@@ -217,9 +220,10 @@ def _swa_trim(block_ids, prompt_len, tpb, window_size, scalar_cached_tokens):
         block_ids = (
             block_ids[-expected_valid:] if expected_valid > 0 else np.array([], dtype=np.int64)
         )
-    # Adapter clamps cached_lg ≥ stale_end*tpb.
-    cached_lg = max(scalar_cached_tokens, stale_end * tpb)
-    cache_skip = cached_lg // tpb - stale_end
+    # Ctx side bypasses adapter (cached=0); gen side uses adapter scalar.
+    cached_lg = cached_tokens if is_gen_only else 0
+    # Reuse-hit blocks beyond the already-pruned stale region.
+    cache_skip = max(0, cached_lg // tpb - stale_end)
     if cache_skip > 0:
         block_ids = (
             block_ids[cache_skip:] if cache_skip < block_ids.size else np.array([], dtype=np.int64)
@@ -255,23 +259,41 @@ class TestSwaTrim:
         # scalar=32 → cache_skip=2, list size=2 → empty.
         assert self._trim([20, 21], scalar=32).size == 0
 
-    def test_window_offset_skip_uses_clamped_value(self):
-        # window=24 → stale_end=1; scalar=16 (2 blocks) → cached_lg=16, cache_skip=1.
+    def test_window_offset_skip_subtracts_stale(self):
+        # window=24 → stale_end=1; scalar=16 (2 blocks) → cache_skip=2-1=1.
         # Naive block_ids[scalar//tpb:] would skip 2 from a 3-block list and return 1 block.
-        out = _swa_trim([10, 11, 12], prompt_len=32, tpb=8, window_size=24, scalar_cached_tokens=16)
+        out = _swa_trim([10, 11, 12], prompt_len=32, tpb=8, window_size=24, cached_tokens=16)
         np.testing.assert_array_equal(out, [11, 12])
 
     def test_window_covers_all_no_stale(self):
         # window=prompt_len → stale_end=0; behaves like full-attn.
-        out = _swa_trim(
-            [10, 11, 12, 13], prompt_len=32, tpb=8, window_size=32, scalar_cached_tokens=8
-        )
+        out = _swa_trim([10, 11, 12, 13], prompt_len=32, tpb=8, window_size=32, cached_tokens=8)
         np.testing.assert_array_equal(out, [11, 12, 13])
 
     def test_v1_pre_eviction_includes_stale(self):
         # Pre-eviction list has all 4 blocks; window-trim keeps last expected_valid=2.
         out = _swa_trim([10, 11, 12, 13], self.PROMPT_LEN, self.TPB, self.WINDOW, 0)
         np.testing.assert_array_equal(out, [12, 13])
+
+    def test_ctx_side_no_adapter_no_skip(self):
+        # Ctx-side path: adapter not invoked, cached_per_lg synthetically 0.
+        # cache_skip = max(0, 0 - stale_end) = 0 — full valid window is sent.
+        out = _swa_trim([20, 21], self.PROMPT_LEN, self.TPB, self.WINDOW, 0, is_gen_only=False)
+        np.testing.assert_array_equal(out, [20, 21])
+
+    def test_ctx_side_v1_pre_eviction(self):
+        # Ctx-side path with V1 pre-eviction list: window-trim still drops stale
+        # blocks, cache_skip stays 0 so trimmed window is sent in full.
+        out = _swa_trim(
+            [10, 11, 12, 13], self.PROMPT_LEN, self.TPB, self.WINDOW, 0, is_gen_only=False
+        )
+        np.testing.assert_array_equal(out, [12, 13])
+
+    def test_gen_side_reuse_inside_stale_no_skip(self):
+        # gen side with reuse-hit fully inside the stale region: cache_skip = 0.
+        # Regression for SWA + reuse-hit < stale_end*tpb (no adapter clamp).
+        out = _swa_trim([20, 21], self.PROMPT_LEN, self.TPB, self.WINDOW, 8, is_gen_only=True)
+        np.testing.assert_array_equal(out, [20, 21])
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
+import java.nio.charset.StandardCharsets
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -770,15 +771,23 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             return null
         }
         // Piggyback input JSON on testFilter so each L0_Test stage agent can
-        // re-run main.py and regenerate cbts_test_db/ locally. Capped at
-        // 256 KB; oversize → drop piggyback, Layer 3 falls back to source.
+        // re-run main.py and regenerate cbts_test_db/ locally. The payload is
+        // base64-encoded because the raw JSON contains PR diffs and may include
+        // ${...} or {...} sequences that the Jenkins tokenmacro plugin would
+        // try to evaluate when the parent serializes globalVars for the
+        // Parameterized-Remote-Trigger plugin, raising MacroEvaluationException
+        // and blocking test dispatch. Capped at 256 KB (post-encoding, since
+        // that is what travels on the wire); oversize → drop piggyback,
+        // Layer 3 falls back to source.
         final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
-        def inputJsonSize = inputJson.length()
-        if (inputJsonSize <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
-            result.cbts_input_json = inputJson
-            pipeline.echo("CBTS Layer 3: cbts_input_json piggyback enabled (${inputJsonSize} bytes)")
+        def inputJsonB64 = inputJson.getBytes(StandardCharsets.UTF_8).encodeBase64().toString()
+        def inputJsonB64Size = inputJsonB64.length()
+        if (inputJsonB64Size <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
+            result.cbts_input_json_b64 = inputJsonB64
+            pipeline.echo("CBTS Layer 3: cbts_input_json_b64 piggyback enabled " +
+                          "(${inputJsonB64Size} bytes encoded, ${inputJson.length()} bytes raw)")
         } else {
-            pipeline.echo("CBTS Layer 3: cbts_input_json is ${inputJsonSize} bytes, " +
+            pipeline.echo("CBTS Layer 3: cbts_input_json_b64 is ${inputJsonB64Size} bytes, " +
                           "exceeds ${CBTS_INPUT_PIGGYBACK_MAX_BYTES}-byte piggyback limit; " +
                           "downstream stages will fall back to source test-db " +
                           "(Layer 2 stage filtering still applies)")
@@ -948,8 +957,39 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/openai_server.py",
         "tensorrt_llm/serve/router.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
+        "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_b200.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_b300.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_h200_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_gpus.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node4_gpu16.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx2_node1_gpu4_gen1_node4_gpu16.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb300.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
+        "tests/integration/test_lists/test-db/l0_verl.yml",
         "tests/unittest/auto_deploy/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
@@ -1692,6 +1732,7 @@ pipeline {
             steps
             {
                 script {
+                    globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_MergeRequest')
                     preparation(this, testFilter, globalVars)
                     println globalVars
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])

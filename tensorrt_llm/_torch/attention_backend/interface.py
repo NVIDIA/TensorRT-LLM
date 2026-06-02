@@ -16,8 +16,8 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
-from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
-                                     RotaryScalingType)
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RopeEmbeddingUtils, RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -384,9 +384,15 @@ class AttentionMetadata:
             max_total_draft_tokens,
             model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
-            spec_tree_manager: Optional['SpecTreeManager'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
+            num_contexts: int = 0):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
+
+        ``num_contexts`` is the number of context (prefill) requests in the
+        mixed batch, occupying the leading rows of slot-storage buffers.
+        Backends that consume gen-only slots (e.g. dynamic tree) must skip
+        these rows to align with the XQA kernel's expected row layout.
         """
 
     def update_helix_param(
@@ -689,6 +695,20 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
+class AttentionSparseArgs:
+    """Sparse-attention inputs passed to the attention op.
+
+    Backends without sparse attention leave ``AttentionForwardArgs.sparse``
+    at its default-constructed value (all-``None`` / ``0`` fields).
+    """
+    sparse_kv_indices: Optional[torch.Tensor] = None
+    sparse_kv_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices_block_size: int = 0
+
+
+@dataclass(kw_only=True, slots=True)
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
@@ -697,8 +717,8 @@ class AttentionForwardArgs:
 
     out_scale: Optional[torch.Tensor] = None
     out_scale_sf: Optional[torch.Tensor] = None
-    kv_scales_sf: Optional[torch.Tensor] = None
-    kv_scales_sf_inv: Optional[torch.Tensor] = None
+    kv_scale_orig_quant: Optional[torch.Tensor] = None
+    kv_scale_quant_orig: Optional[torch.Tensor] = None
 
     attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
     attention_input_type: AttentionInputType = AttentionInputType.mixed
@@ -708,7 +728,8 @@ class AttentionForwardArgs:
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
-    mrope_config: Optional[dict] = None
+    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
+    mrope_position_deltas: Optional[torch.Tensor] = None
 
     softmax_stats_tensor: Optional[torch.Tensor] = None
     chunked_prefill_buffer_batch_size: int = 1
@@ -726,9 +747,23 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
 
-    enable_attn_nvfp4_output: bool = True
     topk_indices: Optional[torch.Tensor] = None
-    is_generation: bool = False
+
+    is_fused_qkv: bool = False
+    update_kv_cache: bool = True
+
+    sparse: AttentionSparseArgs = field(default_factory=AttentionSparseArgs)
+
+    @property
+    def mask_type(self) -> int:
+        """Integer mask type accepted by the C++ attention op
+        (``causal`` or ``padding``)."""
+        if self.attention_mask == PredefinedAttentionMask.CAUSAL:
+            return int(AttentionMaskType.causal)
+        if self.attention_mask == PredefinedAttentionMask.FULL:
+            return int(AttentionMaskType.padding)
+        raise ValueError(
+            f"Unexpected attention mask type: {self.attention_mask!r}")
 
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(

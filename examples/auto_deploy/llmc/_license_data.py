@@ -34,7 +34,7 @@ VENDORED_PROJECTS = [
     {
         "name": "flash-linear-attention",
         "url": "https://github.com/fla-org/flash-linear-attention",
-        "copyright": "Copyright (c) 2023-2025 Songlin Yang",
+        "copyright": "Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li",
         "license_id": "MIT",
     },
     {

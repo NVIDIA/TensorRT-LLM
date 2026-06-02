@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Optional
 
 import torch
@@ -11,7 +12,12 @@ import triton.language as tl
 from torch import nn
 from transformers import Qwen3NextConfig
 
-from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
+# Default: FlashInfer GDN prefill ON. Set TLLM_USE_FLASHINFER_GDN_PREFILL=0 to
+# fall back to the vendored Triton chunk_gated_delta_rule.
+if os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1":
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+else:
+    from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -250,7 +256,11 @@ def fused_gdn_gating_with_sigmoid(
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty_like(a, dtype=torch.float32)
-    beta_out = torch.empty_like(b)
+    # Allocate beta in fp32 since (1) the kernel already computes sigmoid in fp32
+    # and was previously casting back to b.dtype only to be re-cast to fp32 by the
+    # FlashInfer GDN prefill wrapper, and (2) the Triton chunk_gated_delta_rule
+    # path also accepts fp32 beta. Eliminates a redundant cast in the FI hot path.
+    beta_out = torch.empty_like(b, dtype=torch.float32)
     fused_gdn_gating_with_sigmoid_kernel[grid](
         g,
         beta_out,
@@ -436,15 +446,36 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         query = mixed_qkvz[..., :q_end]
         key = mixed_qkvz[..., q_end:k_end]
 
-        # Optimize: Use view (zero-copy) instead of reshape for contiguous slices
-        # Layout: [v_concat | z_concat], need to reshape each separately
-        value = mixed_qkvz[..., k_end:v_end].view(batch_size, num_v_heads_local, self.head_v_dim)
-        z = mixed_qkvz[..., v_end:z_end].view(batch_size, num_v_heads_local, self.head_v_dim)
+        # When heads_ratio == 1, ng == num_v_heads_local, so view works directly.
+        # When heads_ratio > 1 (dense models), the last-dim slice is
+        # [b, ng, ratio*hv] and we need [b, ng*ratio, hv].  A plain view
+        # fails because the slice is not contiguous in the packed qkvz
+        # tensor.  Adding .contiguous() before view is equivalent to
+        # reshape but makes the copy explicit and avoids a hidden perf
+        # drop.  An alternative zero-copy path would require changing
+        # the packing layout, which is a larger refactor.
+        if heads_ratio == 1:
+            value = mixed_qkvz[..., k_end:v_end]
+            z = mixed_qkvz[..., v_end:z_end]
+        else:
+            value = (
+                mixed_qkvz[..., k_end:v_end]
+                .contiguous()
+                .view(batch_size, num_v_heads_local, self.head_v_dim)
+            )
+            z = (
+                mixed_qkvz[..., v_end:z_end]
+                .contiguous()
+                .view(batch_size, num_v_heads_local, self.head_v_dim)
+            )
 
         # Slice ba components: [b, ng, 2*np/ng] -> [b, np] each
-        # Optimize: Use view instead of reshape (zero-copy for contiguous data)
-        b = mixed_ba[..., :heads_ratio].view(batch_size, num_v_heads_local)
-        a = mixed_ba[..., heads_ratio:].view(batch_size, num_v_heads_local)
+        if heads_ratio == 1:
+            b = mixed_ba[..., 0]
+            a = mixed_ba[..., 1]
+        else:
+            b = mixed_ba[..., :heads_ratio].contiguous().view(batch_size, num_v_heads_local)
+            a = mixed_ba[..., heads_ratio:].contiguous().view(batch_size, num_v_heads_local)
 
         return query, key, value, z, b, a
 
@@ -466,7 +497,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decodes = kwargs["num_decodes"]
 
         if is_target_verify:
-            draft_token_num = spec_metadata.max_total_draft_tokens + 1
+            draft_token_num = spec_metadata.runtime_draft_len + 1
             assert num_decodes > 0
             assert mixed_qkv.shape[0] == num_decodes * draft_token_num
             assert a.shape[0] == num_decodes * draft_token_num
@@ -634,7 +665,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
 
             if is_target_verify:
-                draft_token_num = spec_metadata.max_total_draft_tokens + 1
+                draft_token_num = spec_metadata.runtime_draft_len + 1
                 assert num_decodes > 0
                 assert mixed_qkv_d.shape[0] == num_decodes * draft_token_num
                 assert a_d.shape[0] == num_decodes * draft_token_num
@@ -722,7 +753,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 beta_p = b_p.sigmoid().unsqueeze(0)
                 g_p = fused_gdn_gating(self.A_log, a_p, self.dt_bias).unsqueeze(0)
                 recurrent_state_p = ssm_states[state_indices_p]
-
                 attn_out_prefill, last_recurrent_state = chunk_gated_delta_rule(
                     q=query_p,
                     k=key_p,
@@ -738,7 +768,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
                 ssm_states[state_indices_p] = last_recurrent_state
 
-            draft_token_num = spec_metadata.max_total_draft_tokens + 1
+            draft_token_num = spec_metadata.runtime_draft_len + 1
             query_d = query[:, num_prefill_tokens:, :, :].reshape(
                 num_decodes, draft_token_num, self.num_k_heads // self.attn_tp_size, self.head_k_dim
             )

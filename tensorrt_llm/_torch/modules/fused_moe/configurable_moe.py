@@ -28,6 +28,7 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
+import copy
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
@@ -66,6 +67,13 @@ _BACKEND_SYNC_ATTRS = (
 
 
 class ConfigurableMoE(MoE):
+    # ConfigurableMoE is a thin wrapper that dispatches to a concrete backend
+    # (CuteDslFusedMoE / CutlassFusedMoE / ...). Allow the wrapper itself to
+    # pass the non-divisible-EP gate so the inner backend's own gate is the
+    # authoritative check -- if the chosen inner backend doesn't opt in, its
+    # ``MoE.__init__`` will still raise.
+    _supports_non_divisible_ep: bool = True
+
     """
     Configurable MoE layer using composition pattern with automatic configuration
 
@@ -182,6 +190,16 @@ class ConfigurableMoE(MoE):
             **kwargs,
         )
 
+        # ========== Optional DWDP integration ==========
+        # Must run BEFORE _create_comm_strategy_auto so the factory can skip
+        # alltoall strategies for DWDP (VA path swaps param.data; the backend
+        # reads from its own weight attrs, no comm strategy needed).
+        self.dwdp_manager = get_global_dwdp_manager()
+        self.enable_dwdp = False
+        if self.dwdp_manager is not None and self._should_enable_dwdp():
+            self.enable_dwdp = True
+            self.dwdp_manager.add_layer(layer_idx=self.layer_idx)
+
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
 
@@ -207,19 +225,6 @@ class ConfigurableMoE(MoE):
 
         # Validate configuration
         self.validate_config()
-
-        # ========== Optional DWDP integration ==========
-        self.dwdp_manager = get_global_dwdp_manager()
-        self.dwdp_handle_collector = None
-        self.dwdp_rank = None
-        self.enable_dwdp = False
-        if self.dwdp_manager is not None and self._should_enable_dwdp():
-            self.enable_dwdp = True
-            self.dwdp_handle_collector = self.dwdp_manager.add_layer(
-                layer_idx=self.layer_idx,
-            )
-            self.dwdp_rank = self.dwdp_manager.dwdp_rank
-            self.backend.dwdp_handle_collector = self.dwdp_handle_collector
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
@@ -281,11 +286,24 @@ class ConfigurableMoE(MoE):
           / etc., which only become known after the sync. Defer weight
           creation to the explicit ``backend.create_weights()`` call below.
         """
-        from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
+        from tensorrt_llm._torch.modules.fused_moe.create_moe import (
+            create_moe_backend,
+            resolve_moe_cls,
+        )
 
-        moe_cls = get_moe_cls(model_config, override_quant_config=override_quant_config)
+        moe_cls = resolve_moe_cls(
+            model_config,
+            routing_method,
+            self.dtype,
+            override_quant_config=override_quant_config,
+        )
 
-        with self._temporarily_skip_weight_creation(model_config):
+        backend_model_config = model_config
+        if override_quant_config is not None:
+            backend_model_config = copy.deepcopy(model_config)
+            backend_model_config.quant_config = override_quant_config
+
+        with self._temporarily_skip_weight_creation(backend_model_config):
             backend = create_moe_backend(
                 moe_cls=moe_cls,
                 routing_method=routing_method,
@@ -294,7 +312,7 @@ class ConfigurableMoE(MoE):
                 intermediate_size=self.intermediate_size,
                 dtype=self.dtype,
                 reduce_results=self.reduce_results,
-                model_config=model_config,
+                model_config=backend_model_config,
                 aux_stream_dict=self.aux_stream_dict,
                 weight_loading_mode=self.weight_loading_mode,
                 bias=kwargs.get("bias", False),
@@ -321,7 +339,7 @@ class ConfigurableMoE(MoE):
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
-        if not model_config.skip_create_weights_in_init:
+        if not backend_model_config.skip_create_weights_in_init:
             self.backend.create_weights()
 
     def _supports_load_balancer(self) -> bool:
@@ -388,17 +406,20 @@ class ConfigurableMoE(MoE):
             else False,
         }
 
+    @staticmethod
+    def _dp_padded_num_rows(all_rank_num_tokens: List[int]) -> int:
+        """Padded total rows after DP dispatch: num_dp_ranks * max_tokens_per_rank."""
+        return len(all_rank_num_tokens) * max(all_rank_num_tokens)
+
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         """
-        Calculate how many chunks are needed.
+        Calculate how many chunks are needed based on total tokens after dispatch.
 
-        Uses ep_size * max(all_rank_num_tokens) when A2A communication is active,
-        because the A2A recv buffer is shaped [ep_size, max_tokens_per_rank, hidden]
-        regardless of how tokens are distributed across ranks. This matches the
-        actual memory footprint of the MoE GEMM workspace.
+        When using DP communication, the dispatch (AllGather/AllToAll) collects
+        tokens from all DP ranks, so total tokens = num_dp_ranks * max_tokens_per_rank.
         """
         if self.use_dp and self.comm is not None:
-            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
+            num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
         else:
             num_rows = sum(all_rank_num_tokens)
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens
@@ -479,7 +500,7 @@ class ConfigurableMoE(MoE):
     def __exit__(self, *exc_info):
         self.destroy()
 
-    def _create_comm_strategy_auto(self) -> Communication:
+    def _create_comm_strategy_auto(self) -> Optional[Communication]:
         """
         Auto-create the best communication strategy based on hardware and configuration
 
@@ -488,8 +509,14 @@ class ConfigurableMoE(MoE):
         host-side comm entirely; layering Communication.dispatch / combine
         on top of the fused exchange would double-count traffic and break
         the in-kernel NVLink barrier semantics.
+
+        DWDP VA path: returns None — there is no expert parallelism from the
+        backend's perspective (fixup_moe_backends sets ep_size=1 / slot_start=0
+        so the kernel sees full weights via param.data pointer swap).
         """
         if self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM:
+            return None
+        if self.enable_dwdp:
             return None
         return CommunicationFactory.create_strategy(
             model_config=self.model_config,
@@ -534,6 +561,13 @@ class ConfigurableMoE(MoE):
             assert output_dtype is not None
         else:
             output_dtype = x.dtype
+
+        # DWDP: wait for prefetch to complete and swap backend weight param.data
+        # to the composite (full-experts) tensor. Per-layer, not per-chunk —
+        # owned at the wrapper so the scheduler does not run it twice (e.g.
+        # external-comm may enter via single- or multi-chunk paths).
+        if self.enable_dwdp:
+            self.dwdp_manager.wait_and_bind(self.backend, self.layer_idx)
 
         outputs = self.scheduler.forward(
             x,

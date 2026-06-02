@@ -1221,7 +1221,8 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
       * "dsl"      -> torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits.
         The DSL FP4 kernel only supports next_n ∈ {1, 2, 3} natively, so
         the test caller-side reshapes [B, next_n, ...] -> [B*factor,
-        eff_next_n, ...] via `_pick_fp4_dsl_expand` when next_n > 3.
+        eff_next_n, ...] via `_pick_dsl_expand` when the wave-aware picker
+        chooses to split (factor > 1).
     - reference fed FP4-simulated bf16 inputs (dequantize the same FP4
       bytes the kernel sees) so FP4 quantization noise cancels in the
       diff check.
@@ -1236,7 +1237,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
     from tensorrt_llm._torch.attention_backend.sparse.dsa import \
-        _pick_fp4_dsl_expand
+        _pick_dsl_expand
     from tensorrt_llm.deep_gemm import fp8_fp4_paged_mqa_logits
 
     use_dsl = backend == "dsl"
@@ -1317,17 +1318,37 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         meta.scheduler_metadata_buffer_full_next_n = torch.zeros(
             (meta.num_sms + 1, 2), device='cuda', dtype=torch.int32)
 
-    def _force_dsl_fp4_expand_setup(meta):
-        """Mirror DSAtrtllmAttentionMetadata.prepare's `expand_for_dsl_fp4`
+    def _force_dsl_expand_setup(meta):
+        """Mirror DSAtrtllmAttentionMetadata.prepare's `expand_for_dsl`
         populate so Indexer.prepare can build the schedule from
-        kv_lens_expanded_cuda. Only called for DSL backend with next_n > 3.
+        kv_lens_expanded_cuda. Calls the wave-aware picker; expand only
+        happens when factor > 1.
+
+        Always sets `expand_for_dsl=True` (analogous to dsa.py's prepare)
+        and writes the picker decision to `dsl_expand_factor`/`dsl_atom` so
+        downstream Indexer.prepare + forward read the same values.
         """
         if meta.num_generations == 0:
             return
-        factor, _ = _pick_fp4_dsl_expand(1 + meta.max_draft_tokens)
-        num_tokens = meta.num_generations * factor
-        meta.expand_for_dsl_fp4 = True
+        meta.expand_for_dsl = True
+        next_n = 1 + meta.max_draft_tokens
+        # FP4 kernel supports atoms ∈ {1, 2, 3}; matches dsa.py's
+        # `kernel_atoms = (1, 2, 3) if use_fp4 else (1, 2, 3, 4)` path.
         gen_kv_lens = meta.kv_lens[meta.num_contexts:meta.num_seqs]
+        max_ctx = int(gen_kv_lens.max().item()) if gen_kv_lens.numel() else 0
+        factor, atom = _pick_dsl_expand(
+            next_n,
+            batch_size=meta.num_generations,
+            max_ctx=max_ctx,
+            num_sms=meta.num_sms,
+            kernel_atoms=(1, 2, 3),
+        )
+        meta.dsl_expand_factor = factor
+        meta.dsl_atom = atom
+        if factor <= 1:
+            # Picker chose kernel-native; no buffer populate needed.
+            return
+        num_tokens = meta.num_generations * factor
         gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(factor)
         meta.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
         meta.kv_lens_expanded_cuda[:num_tokens].copy_(
@@ -1392,8 +1413,11 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     )
     if not use_dsl:
         _force_direct_path(metadata_gen)
-    elif next_n > 3:
-        _force_dsl_fp4_expand_setup(metadata_gen)
+    else:
+        # Unconditional for DSL: picker inside decides factor (1 = native,
+        # >1 = atom-split). Mirrors dsa.py's `if expand_for_dsl and
+        # num_generations > 0` block which runs for any next_n ≥ 2.
+        _force_dsl_expand_setup(metadata_gen)
     Indexer.prepare(metadata_gen)
 
     k_gen_fp4, k_gen_scale = torch.ops.trtllm.fused_cat_fp4(
@@ -1421,9 +1445,9 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
 
     if use_dsl:
         # DSL FP4 path: q tuple split into two args, q.dtype == uint8.
-        # For next_n > 3, reshape via _pick_fp4_dsl_expand and use the
-        # expanded metadata buffers populated above. The wiring under test
-        # is dsa.py's sparse_attn_indexer DSL FP4 branch.
+        # The picker decision (factor, atom) was cached on metadata_gen
+        # in `_force_dsl_expand_setup`; expand only when factor > 1.
+        # The wiring under test is dsa.py's sparse_attn_indexer DSL FP4 branch.
         dsl_q = q_fp4.view(torch.uint8)
         dsl_sf_q = sf_q
         dsl_context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
@@ -1431,8 +1455,9 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
             0:batch_size]
         dsl_schedule_meta = metadata_gen.scheduler_metadata_buffer
 
-        if next_n > 3:
-            factor, eff_next_n = _pick_fp4_dsl_expand(next_n)
+        if metadata_gen.dsl_expand_factor > 1:
+            factor = metadata_gen.dsl_expand_factor
+            eff_next_n = metadata_gen.dsl_atom
             exp_B = batch_size * factor
             dsl_q = dsl_q.reshape(exp_B, eff_next_n, heads, pe_dim)
             dsl_sf_q = dsl_sf_q.reshape(exp_B, eff_next_n, heads)

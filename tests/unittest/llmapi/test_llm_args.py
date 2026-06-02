@@ -315,7 +315,6 @@ def test_KvCacheConfig_declaration():
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
                            max_attention_window=[1024, 1024, 1024],
-                           sink_token_length=32,
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
                            cross_kv_cache_fraction=0.5,
@@ -329,7 +328,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_block_reuse == True
     assert pybind_config.max_tokens == 1024
     assert pybind_config.max_attention_window == [1024, 1024, 1024]
-    assert pybind_config.sink_token_length == 32
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.cross_kv_cache_fraction == 0.5

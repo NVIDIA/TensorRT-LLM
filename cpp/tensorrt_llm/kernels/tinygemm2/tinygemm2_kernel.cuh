@@ -236,7 +236,6 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
         if (!weight_warp)
         {
             cudaGridDependencySynchronize();
-            cudaTriggerProgrammaticLaunchCompletion();
         }
 
         for (int ki = 0; ki < K_LOOPS_DMA; ki++)
@@ -421,6 +420,11 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
         reduction_buffer[threadIdx.x] = accum4;
 
         __syncthreads();
+
+        if (threadIdx.x == 0) // one thread per block suffices according to official code examples
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
 
         if (warp_id == 0)
         {

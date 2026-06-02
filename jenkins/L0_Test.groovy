@@ -1,8 +1,8 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
+import java.nio.charset.StandardCharsets
 import groovy.transform.Field
-import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
@@ -108,13 +108,24 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 // Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
 // Recognised failure patterns are tagged with scope=SLURM or BOTH in the
 // shared-lib PATTERN_CATALOG.
-SLURM_INFRA_RETRY_MAX = 2
+//
+// Capped at 1 (2 attempts) because each SLURM attempt that times out at the
+// partition walltime burns ~4 hours, and the dominant retryable failure
+// (AgentOfflineException after test ran for hours) is a test-timeout
+// proxy — not a transient blip worth multi-retry. Cross-layer total is also
+// capped at 2: SLURM dispatcher pods pass singleAttempt:true to the outer
+// K8s pod retry, so 1 pod × 2 SLURM attempts = 2 total.
+SLURM_INFRA_RETRY_MAX = 1
 
 // Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
 // independently as production telemetry comes in. Patterns tagged scope=K8S
 // or BOTH in the shared-lib PATTERN_CATALOG.
-K8S_INFRA_RETRY_MAX = 2
+//
+// Capped at 1 (2 attempts) so a non-SLURM K8s stage runs at most 2 pods.
+// For SLURM dispatcher pods this budget is bypassed (singleAttempt:true)
+// to avoid nesting with the inner SLURM retry.
+K8S_INFRA_RETRY_MAX = 1
 
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
@@ -943,7 +954,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
-    def disaggMode = stageName.contains("Disagg-PerfSanity")
+    def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
+    def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
@@ -1085,7 +1097,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMode)
+                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -1158,8 +1170,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
 
                 def exemptionComment = ""
-                if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
-                    exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
+                if (SlurmConfig.needsIdleGpuExemption(cluster)) {
+                    exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
 
                 def envExportStatements = envVarsToExport.collect { varName, varValue ->
@@ -1205,24 +1217,24 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ${srunPrologue}
                 """.replaceAll("(?m)^\\s*", "")
 
-                if (disaggMode) {
+                if (disaggMultiNodeMode || aggMultiNodeMode) {
                     def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
                     def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
-                    def scriptLaunchDraftPathLocal = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
-                    def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/submit.py"
+                    // The unified submit.py handles both agg and disagg; only the
+                    // draft launch script differs between the two paths.
+                    def scriptLaunchDraftPathLocal = disaggMultiNodeMode
+                        ? "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
+                        : "${llmSrcLocal}/jenkins/scripts/perf/aggregated/slurm_launch_draft.sh"
+                    def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/submit.py"
 
-                    // Remove unrelated mpi envs before passing to submit.py
-                    // because mpi env will be set in slurm_launch.sh for disagg.
                     srunArgs.removeAll { it == "--mpi=pmi2" || it == "--mpi=pmix" }
 
                     pipeline.writeFile(file: scriptLaunchPrefixPathLocal, text: scriptLaunchPrefix)
                     pipeline.writeFile(file: scriptLaunchSrunArgsPathLocal, text: srunArgs.join(" "))
 
-                    // Output is the corresponding scriptLaunchPathLocal script under the disaggMode
                     sh """
                         pip3 install pyyaml && \\
                         python3 ${scriptSubmitLocalPath} \\
-                        --run-ci \\
                         --llm-src ${llmSrcLocal} \\
                         --test-list ${testListPathLocal} \\
                         --draft-launch-sh ${scriptLaunchDraftPathLocal} \\
@@ -1340,7 +1352,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Wait until Slurm job is done
                     while true; do
                         # Use --allocations to ensure we match the exact job ID and not job steps (like 123.batch, 123.0)
-                        STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations)
+                        # Tolerate transient sacct failures (e.g. slurmdbd unreachable) so the tracker survives controller blips.
+                        if ! STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations 2>&1); then
+                            echo "Warning: sacct failed for job \$jobId: \$STATUS"
+                            sleep 60
+                            continue
+                        fi
 
                         if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
                             echo "Slurm job \$jobId state: \${STATUS:-UNKNOWN}"
@@ -1462,7 +1479,7 @@ def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
     return [skip: false, splits: 1, splitId: 1]
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="")
 {
   def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
   if (collapse.skip) {
@@ -1487,7 +1504,14 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       // clobbered and the ensureStageResultNotUploaded guard does not trip on
       // the retry. First attempt keeps the canonical unsuffixed name so existing
       // downstream consumers (dashboards, the JIRA bot, etc.) are unaffected.
-      def postTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+      //
+      // outerAttemptTag is the K8s outer dispatcher pod's tag ("" for outer
+      // attempt 1, "-pod-${N}" for outer attempt N>=2). Prefixing the inner
+      // postTag with it ensures the new dispatcher pod's inner attempt 1
+      // upload doesn't collide with the dead pod's already-recorded upload
+      // in GlobalState.uploadResultStageNames.
+      def innerSuffix = (attempt == 1) ? "" : "-attempt-${attempt}"
+      def postTag = "${outerAttemptTag}${innerSuffix}"
 
       if (nodeCount > 1 || runWithSbatch) {
         runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag)
@@ -1518,6 +1542,11 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       if (attempt > effectiveMax) {
         echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
              "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+        throw e
+      }
+      if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.SLURM, c, attempt, effectiveMax, 60L * 1000L, true)) {
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
+             "but remaining CI timeout budget is too small for another SLURM attempt. Failing without retry."
         throw e
       }
 
@@ -1633,6 +1662,8 @@ def globalVars = [
 
 class GlobalState {
     static def uploadResultStageNames = []
+    static def stageAttemptEstimateMs = [:]
+    static def stageAttemptEstimateDetails = [:]
 
     // HOST_NODE_NAME to starting port section map
     // This map maintains the next available starting port for each host node
@@ -1645,6 +1676,83 @@ class GlobalState {
     static final int BASE_PORT = 10000           // Base starting port
     static final int PORT_SECTION_SIZE = 1000    // Number of ports per section/stage
     static final int MAX_PORT = 32000            // Maximum port number to avoid system ports
+}
+
+def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount)
+{
+    def estimate = trtllm_utils.estimateRenderedStageAttemptMillis(pipeline, llmSrc, testListPath, stageName, renderedTestCount)
+    if (estimate.error) {
+        echo "[CI-BUDGET] ${stageName}: failed to read .test_durations; using count-based estimate. Error: ${estimate.error}"
+    }
+
+    GlobalState.stageAttemptEstimateMs[stageName] = estimate.estimatedMs
+    GlobalState.stageAttemptEstimateDetails[stageName] = [
+        renderedCount: estimate.renderedCount,
+        knownCount: estimate.knownCount,
+        unknownCount: estimate.unknownCount,
+    ]
+    echo "[CI-BUDGET] ${stageName}: recorded test runtime estimate " +
+         "${trtllm_utils.formatCiBudgetMillis(estimate.estimatedMs)} " +
+         "(rendered=${estimate.renderedCount}, known=${estimate.knownCount}, unknown=${estimate.unknownCount})"
+}
+
+long estimateStageRetryRuntimeMs(String stageName, String scope)
+{
+    Long testEstimateValue = trtllm_utils.parseCiBudgetLong(GlobalState.stageAttemptEstimateMs[stageName])
+    long testEstimateMs = testEstimateValue != null ? testEstimateValue : 0L
+    if (testEstimateMs > 0L) {
+        long overheadMs = scope == InfraFailure.SLURM ? 45L * 60L * 1000L : 30L * 60L * 1000L
+        return testEstimateMs + overheadMs
+    }
+    return scope == InfraFailure.SLURM ? 4L * 60L * 60L * 1000L : 2L * 60L * 60L * 1000L
+}
+
+long retrySafetyMarginMs(String scope)
+{
+    return scope == InfraFailure.SLURM ? 20L * 60L * 1000L : 15L * 60L * 1000L
+}
+
+int retryMaxForFailure(String scope, InfraFailure failure)
+{
+    if (failure.severity == InfraFailure.PERSISTENT) {
+        return 1
+    }
+    return scope == InfraFailure.SLURM ? SLURM_INFRA_RETRY_MAX : K8S_INFRA_RETRY_MAX
+}
+
+boolean hasBudgetForInfraRetry(def pipeline, String stageName, String scope, InfraFailure failure, int attempt, int effectiveMax, long backoffMs, boolean logDecision)
+{
+    if (attempt > effectiveMax) {
+        return false
+    }
+    long estimateMs = estimateStageRetryRuntimeMs(stageName, scope)
+    long safetyMs = retrySafetyMarginMs(scope)
+    return trtllm_utils.canSpendCiBudget(pipeline, [
+        globalVars: globalVars,
+        label: "infra-retry:${scope}:${stageName}:attempt-${attempt + 1}",
+        estimateMs: estimateMs,
+        backoffMs: backoffMs,
+        safetyMs: safetyMs,
+        logDecision: logDecision,
+    ])
+}
+
+boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error, boolean logDecision=false)
+{
+    if (retryContext == null || error == null) {
+        return false
+    }
+    String scope = retryContext.scope ?: InfraFailure.K8S
+    def classified = FailureClassifier.classify(error, scope)
+    if (!(classified instanceof InfraFailure)) {
+        return false
+    }
+    Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
+    int attempt = parsedAttempt != null ? parsedAttempt as int : 1
+    int effectiveMax = retryMaxForFailure(scope, classified)
+    Long parsedBackoffMs = trtllm_utils.parseCiBudgetLong(retryContext.backoffMs)
+    long backoffMs = parsedBackoffMs != null ? parsedBackoffMs : 60L * 1000L
+    return hasBudgetForInfraRetry(pipeline, retryContext.stageName ?: "Unknown", scope, classified, attempt, effectiveMax, backoffMs, logDecision)
 }
 
 /**
@@ -1690,7 +1798,7 @@ def getHostNodeName() {
     ''', returnStdout: true).trim()
 }
 
-def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true)
+def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null)
 {
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
@@ -1731,11 +1839,16 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             // (on a fresh pod) cannot remove. The tar artifact is still uploaded
             // for forensics; only the in-build test reporting is gated.
             boolean suppressTestReporting = false
-            if (!isFinalAttempt && stageIsFailed && caughtError != null) {
-                def c = FailureClassifier.classify(caughtError, InfraFailure.K8S)
-                if (c instanceof InfraFailure) {
+            if (stageIsFailed && caughtError != null) {
+                if (retryContext != null) {
+                    suppressTestReporting = retryContextAllowsRetry(null, retryContext, caughtError, false)
+                } else if (!isFinalAttempt) {
+                    def c = FailureClassifier.classify(caughtError, InfraFailure.K8S)
+                    suppressTestReporting = c instanceof InfraFailure
+                }
+                if (suppressTestReporting) {
                     suppressTestReporting = true
-                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() on intermediate retryable infra failure (${c.detectedPattern})"
+                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() because a retry is still planned"
                 }
             }
 
@@ -2345,16 +2458,29 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
     // CBTS Layer 3: regenerate cbts_test_db/ on this stage agent from the
-    // piggybacked input JSON if not already present.
+    // piggybacked input JSON if not already present. The piggyback payload is
+    // base64-encoded on the orchestrator (see getCbtsResult in
+    // L0_MergeRequest.groovy) to keep tokenmacro from interpreting ${...} or
+    // {...} fragments inside the PR diff when globalVars is serialized. If
+    // decoding or regeneration throws (truncated/malformed payload), we
+    // swallow the error: the override directory will be absent below, the
+    // overrideYaml check will fail, and renderTestDB falls back to the
+    // source test-db.
     def cbts = testFilter[(CBTS_RESULT)]
-    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json) {
+    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json_b64) {
         def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
-            def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
-            pipeline.writeFile(file: cbtsInputLocal, text: cbts.cbts_input_json)
-            sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
-            sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+            try {
+                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64(), StandardCharsets.UTF_8)
+                def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
+                pipeline.writeFile(file: cbtsInputLocal, text: cbtsInputJson)
+                sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
+                sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+            } catch (Exception e) {
+                echo "CBTS Layer 3: failed to materialize piggyback payload " +
+                     "(${e.class.simpleName}: ${e.message}); falling back to source test-db"
+            }
         }
     }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
@@ -2387,6 +2513,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
+    recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount)
 
     return testList
 }
@@ -2818,24 +2945,37 @@ REUSED_TESTS_EOF
  * Decode a postTag into the postTags used by prior attempts of the same
  * stage in this build.
  *
- * The retry runner (runKubernetesPodWithInfraRetry, runLLMTestlistOnSlurm)
- * composes postTag as ``${callerSuppliedBase}-attempt-${N}`` for retries
- * (and the bare base for attempt 1, e.g. ``""`` or ``"-SubJob-RunTest"``).
+ * The retry runners compose postTag from two retry layers:
+ *   - runKubernetesPodWithInfraRetry (outer K8s pod retry) contributes
+ *     ``"-pod-${P}"`` for outer attempt P>=2 (and ``""`` for P=1).
+ *   - runLLMTestlistOnSlurm (inner SLURM retry) appends ``"-attempt-${I}"``
+ *     for inner attempt I>=2 (and ``""`` for I=1).
+ * The two suffixes nest: full postTag = ``${base}${outerTag}${innerSuffix}``
+ * where base is the caller-supplied prefix (e.g. ``""`` or
+ * ``"-SubJob-RunTest"``). The ``-pod-`` and ``-attempt-`` separators are
+ * distinct so the nested form is unambiguous.
+ *
  * This function inverts that composition to enumerate the postTags of
  * earlier attempts so reusePassedTestResults() can locate their uploaded
  * tarballs.
  *
  * Returns an empty list when ``postTag`` does not encode a retry — either
- * attempt 1 (``postTag == ""``), or a caller-supplied tag that never went
- * through the retry loop (e.g. ``"-SubJob-RunTest"``).
+ * attempt 1 of attempt 1 (``postTag == ""``), or a caller-supplied tag that
+ * never went through the retry loop (e.g. ``"-SubJob-RunTest"``).
  *
- * Examples:
+ * For nested cases we don't know how many inner attempts each prior outer
+ * pod attempt completed, so we over-enumerate up to SLURM_INFRA_RETRY_MAX+1;
+ * the HTTP probe in reusePassedTestResults handles 404 for absent tarballs.
+ *
+ * Examples (with default SLURM_INFRA_RETRY_MAX=2):
  *
  *   ""                            -> []
  *   "-attempt-2"                  -> [""]
  *   "-attempt-3"                  -> ["", "-attempt-2"]
- *   "-SubJob-RunTest-attempt-2"   -> ["-SubJob-RunTest"]
+ *   "-pod-2"                      -> ["", "-attempt-2", "-attempt-3"]
+ *   "-pod-2-attempt-2"            -> ["", "-attempt-2", "-attempt-3", "-pod-2"]
  *   "-SubJob-RunTest"             -> []
+ *   "-SubJob-RunTest-pod-2"       -> ["-SubJob-RunTest", "-SubJob-RunTest-attempt-2", "-SubJob-RunTest-attempt-3"]
  *
  * @param postTag the current attempt's full tar suffix.
  * @return List of postTag strings, ordered oldest-attempt-first.
@@ -2843,13 +2983,42 @@ REUSED_TESTS_EOF
 @NonCPS
 def priorAttemptTags(String postTag) {
     if (!postTag) return []
-    def m = postTag =~ /^(.*)-attempt-(\d+)$/
-    if (!m.matches()) return []
-    String base = m[0][1]
-    int currentAttempt = (m[0][2] as Integer)
-    def priors = [base]   // attempt 1 used the caller's base tag, e.g. "" or "-SubJob-RunTest"
-    for (int n = 2; n < currentAttempt; n++) {
-        priors << "${base}-attempt-${n}"
+    // Peel "-attempt-N" suffix (inner SLURM retry counter) if present.
+    String remaining = postTag
+    Integer innerAttempt = null
+    def mInner = remaining =~ /^(.*)-attempt-(\d+)$/
+    if (mInner.matches()) {
+        innerAttempt = (mInner[0][2] as Integer)
+        remaining = mInner[0][1]
+    }
+    // Peel "-pod-P" suffix (outer K8s retry counter) if present.
+    Integer podAttempt = null
+    def mPod = remaining =~ /^(.*)-pod-(\d+)$/
+    if (mPod.matches()) {
+        podAttempt = (mPod[0][2] as Integer)
+        remaining = mPod[0][1]
+    }
+    String base = remaining
+    if (innerAttempt == null && podAttempt == null) return []   // no retry encoded
+    int outerN = podAttempt ?: 1
+    int innerN = innerAttempt ?: 1
+    int maxInner = SLURM_INFRA_RETRY_MAX + 1
+    def priors = []
+    // Earlier outer attempts (1..outerN-1) with all possible inner attempts.
+    for (int p = 1; p < outerN; p++) {
+        String podSuffix = (p == 1) ? "" : "-pod-${p}"
+        priors << "${base}${podSuffix}".toString()                          // inner attempt 1
+        for (int i = 2; i <= maxInner; i++) {
+            priors << "${base}${podSuffix}-attempt-${i}".toString()
+        }
+    }
+    // Current outer attempt's earlier inner attempts (1..innerN-1).
+    String thisPodSuffix = (outerN == 1) ? "" : "-pod-${outerN}"
+    if (innerN > 1) {
+        priors << "${base}${thisPodSuffix}".toString()                      // inner attempt 1
+        for (int i = 2; i < innerN; i++) {
+            priors << "${base}${thisPodSuffix}-attempt-${i}".toString()
+        }
     }
     return priors
 }
@@ -3128,7 +3297,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Generate comprehensive rerun report if any reruns occurred
         stage ("Generate Report") {
-            generateRerunReport(stageName, llmSrc)
+            timeout(time: 15, unit: 'MINUTES'){
+                generateRerunReport(stageName, llmSrc)
+            }
         }
 
         if (rerunFailed) {
@@ -3188,7 +3359,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     | tar -C "${llmSrc}/tensorrt_llm" -xv
             """
             withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-                sh "cd ${llmSrc} && python3 -m pre_commit run type-check --all-files || (cat /root/.cache/pre-commit/pre-commit.log && /bin/false)"
+                // Strip the wheel's tensorrt_llm/libs (and its ucx/ subdir) out of
+                // LD_LIBRARY_PATH for this stage. The tar above populated
+                // ${llmSrc}/tensorrt_llm/{libs,bindings.*.so} from the wheel, so the
+                // source tree now has its own copies. With the wheel libs path on
+                // LD_LIBRARY_PATH, bindings.so's DT_NEEDED resolves libth_common.so
+                // to <wheel>/tensorrt_llm/libs/ while _common.py explicitly loads
+                // <src>/tensorrt_llm/libs/libth_common.so via torch.classes.load_library
+                // — two different absolute paths register the same Torch op twice
+                // and PyTorch aborts. Removing the wheel paths lets DT_NEEDED fall
+                // back to bindings.so's RUNPATH ($ORIGIN/libs = <src>/tensorrt_llm/libs/),
+                // matching the explicit load. This restores pre-#722cbdd071 behavior
+                // for type-check only; UCX/NIXL kv_cache_transceiver tests above
+                // still see the new LD_LIBRARY_PATH.
+                sh """
+                    TRTLLM_WHEEL_LIBS=\$(pip3 show tensorrt_llm | awk -F': ' '/^Location:/ { print \$2 }')/tensorrt_llm/libs
+                    export LD_LIBRARY_PATH=\$(echo "\$LD_LIBRARY_PATH" | tr ':' '\\n' | grep -vxF "\$TRTLLM_WHEEL_LIBS" | grep -vxF "\$TRTLLM_WHEEL_LIBS/ucx" | paste -sd:)
+                    cd ${llmSrc} && python3 -m pre_commit run type-check --all-files || (cat /root/.cache/pre-commit/pre-commit.log && /bin/false)
+                """
             }
 	}
     }
@@ -3202,7 +3390,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null)
 {
     def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
     if (collapse.skip) {
@@ -3249,7 +3437,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         // Copy CPP test result
         sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
         sh "ls -al ${stageName}/"
-    }, false, postTag, isFinalAttempt)
+    }, false, postTag, isFinalAttempt, retryContext)
 }
 
 
@@ -3497,19 +3685,33 @@ def runInKubernetes(pipeline, podSpec, containerName)
 // a fresh pod on each retry rather than
 // retrying the test body inside a dying pod.
 //
-// `runner` is invoked with `(attemptTag, isFinalAttempt)`. Callers append
+// `runner` is invoked with `(attemptTag, isFinalAttempt, retryContext)`. Callers append
 // `attemptTag` to any postTag they pass into cacheErrorAndUploadResult so each
 // attempt's tar and ensureStageResultNotUploaded guard key are unique;
 // `isFinalAttempt` lets cacheErrorAndUploadResult suppress synthetic stage-fail
 // XML and junit() for intermediate retryable failures so the per-build test
 // report isn't poisoned by transient infra blips that the next attempt
 // recovers from.
-def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stageName, Closure runner)
+//
+// Options (Map; all optional):
+//   singleAttempt (bool, default false) skip the retry loop entirely; run
+//                                       once with attemptTag="" and
+//                                       isFinalAttempt=true. Used by SLURM
+//                                       dispatcher closures so the outer
+//                                       pod-level retry does not nest on top
+//                                       of the inner SLURM retry and inflate
+//                                       the worst-case attempt budget.
+def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerName, String stageName, Closure runner)
 {
+    boolean singleAttempt = opts.singleAttempt ?: false
+
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
-    if (testFilter[(DEBUG_MODE)]) {
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true) })
+    // singleAttempt (per-call opt) opts out of the retry loop for the same
+    // reason at the call site -- e.g. SLURM dispatcher pods rely on their
+    // inner SLURM retry and don't want an outer pod-level retry budget.
+    if (singleAttempt || testFilter[(DEBUG_MODE)]) {
+        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
         return
     }
 
@@ -3527,9 +3729,12 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             }
             // Attempt 1 keeps the caller-supplied postTag verbatim so the
             // canonical artifact name is unchanged for downstream consumers.
-            // Retries append "-attempt-N" to dodge the upload-once guard and
-            // preserve every attempt's tarball in Artifactory.
-            def attemptTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+            // Retries append "-pod-N" to dodge the upload-once guard and
+            // preserve every attempt's tarball in Artifactory. The "-pod-"
+            // separator is distinct from the inner SLURM retry's "-attempt-"
+            // suffix so the two nest unambiguously: outer-pod 2 / inner-attempt
+            // 2 yields "-pod-2-attempt-2" rather than colliding with "-attempt-2".
+            def attemptTag = (attempt == 1) ? "" : "-pod-${attempt}"
             // For attempt 1 we don't yet know whether the failure (if any) will
             // be PERSISTENT, so use the worst-case multi-retry budget. From
             // attempt 2 onward we know the prior classification — if it was
@@ -3540,7 +3745,13 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             // another intermediate attempt.
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
-            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner(attemptTag, isFinalAttempt) })
+            def retryContext = [
+                scope: InfraFailure.K8S,
+                stageName: stageName,
+                attempt: attempt,
+                backoffMs: 60L * 1000L,
+            ]
+            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
             }
@@ -3565,6 +3776,11 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             if (attempt > effectiveMax) {
                 echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
                      "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+                throw e
+            }
+            if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, attempt, effectiveMax, 60L * 1000L, true)) {
+                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
+                     "but remaining CI timeout budget is too small for another K8s attempt. Failing without retry."
                 throw e
             }
 
@@ -3688,7 +3904,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt ->
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3696,20 +3912,23 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt)
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
-        "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 4],
-        "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 4],
-        "DGX_H100-PyTorch-3": ["auto:dgx-h100-x1", "l0_h100", 3, 4],
-        "DGX_H100-PyTorch-4": ["auto:dgx-h100-x1", "l0_h100", 4, 4],
+        "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 6],
+        "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 6],
+        "DGX_H100-PyTorch-3": ["auto:dgx-h100-x1", "l0_h100", 3, 6],
+        "DGX_H100-PyTorch-4": ["auto:dgx-h100-x1", "l0_h100", 4, 6],
+        "DGX_H100-PyTorch-5": ["auto:dgx-h100-x1", "l0_h100", 5, 6],
+        "DGX_H100-PyTorch-6": ["auto:dgx-h100-x1", "l0_h100", 6, 6],
         "DGX_H100-PyTorch-Post-Merge-1": ["auto:dgx-h100-x1", "l0_h100", 1, 2],
         "DGX_H100-PyTorch-Post-Merge-2": ["auto:dgx-h100-x1", "l0_h100", 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
-        "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
+        "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
+        "DGX_H100-2_GPUs-PyTorch-GptOss-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -3719,11 +3938,13 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 5, 1, 1, true],
-        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 5, 1, 1, true],
-        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 5, 1, 1, true],
-        "DGX_B200-PyTorch-4": ["auto:dgx-b200-flex", "l0_b200", 4, 5, 1, 1, true],
-        "DGX_B200-PyTorch-5": ["auto:dgx-b200-flex", "l0_b200", 5, 5, 1, 1, true],
+        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 7, 1, 1, true],
+        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 7, 1, 1, true],
+        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 7, 1, 1, true],
+        "DGX_B200-PyTorch-4": ["auto:dgx-b200-flex", "l0_b200", 4, 7, 1, 1, true],
+        "DGX_B200-PyTorch-5": ["auto:dgx-b200-flex", "l0_b200", 5, 7, 1, 1, true],
+        "DGX_B200-PyTorch-6": ["auto:dgx-b200-flex", "l0_b200", 6, 7, 1, 1, true],
+        "DGX_B200-PyTorch-7": ["auto:dgx-b200-flex", "l0_b200", 7, 7, 1, 1, true],
         "DGX_B200-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-Triton-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
@@ -3733,16 +3954,20 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 3, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 2, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 4, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 2, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 8, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 4, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 3, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 3, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 3, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
-        "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
-        "DGX_B300-4_GPUs-PyTorch-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
+        "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
+        "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // PerfSanity post-merge tests
@@ -3751,12 +3976,25 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
     ]
+    // B200 PerfSanity post-merge disaggregated
+    // 2 Nodes
+    x86SlurmTestConfigs += buildStageConfigs(
+        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8-Post-Merge",
+        "auto:dgx-b200-flex",
+        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
+        6,
+        16,
+        2
+    )
     fullSet += x86SlurmTestConfigs.keySet()
 
-    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt ->
-        // attemptTag/isFinalAttempt come from runKubernetesPodWithInfraRetry
-        // for the outer dispatcher pod; the inner SLURM job runs its own
-        // retry loop (runLLMTestlistOnSlurm) so we don't thread these through.
+    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
+        // dispatcher pod (when retry is enabled — see opts below) and is
+        // threaded into runLLMTestlistOnSlurm so a future re-enable of outer
+        // pod retry composes a unique postTag instead of colliding with the
+        // dead pod's recorded upload. With singleAttempt:true (default for
+        // SLURM stages) the outer retry is off and attemptTag is always "".
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3764,8 +4002,15 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
-    }]]}
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
+    }, [singleAttempt: true]]]}
+    // SLURM dispatcher pods run their own inner retry loop
+    // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
+    // K8s pod retry (singleAttempt:true) here caps total attempts at
+    // SLURM_INFRA_RETRY_MAX+1 instead of (SLURM_INFRA_RETRY_MAX+1) *
+    // (K8S_INFRA_RETRY_MAX+1). Each SLURM attempt that hits the partition
+    // walltime burns ~4h, so nesting the two layers cost up to ~36h per stage
+    // on consistently-timing-out tests before this cap.
 
     parallelJobs += parallelSlurmJobs
 
@@ -3783,8 +4028,9 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1],
-        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 2, 4],
-        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 2, 4],
+        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4],
+        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4],
+        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4],
         // PerfSanity pre-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
@@ -3966,14 +4212,19 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
-        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt)
+        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
         }]]}
 
         // Add SBSA Slurm jobs
-        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt ->
-            // SLURM dispatchers run their own retry loop (runLLMTestlistOnSlurm);
-            // the outer pod-level retry args are accepted but unused here.
+        // singleAttempt:true disables the outer K8s pod retry; see the x86
+        // SLURM closure above for the full rationale (cap nested retry budget
+        // so consistently-timing-out tests don't burn ~36h on retry cascades).
+        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+            // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
+            // dispatcher pod's tag so the inner SLURM retry's postTag can't
+            // collide with a previous dispatcher pod's upload. See the x86
+            // SLURM closure for the full rationale.
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
@@ -3981,12 +4232,13 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
-        }]]}
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
+        }, [singleAttempt: true]]]}
         parallelJobs += parallelSlurmJobs
 
         // Add SBSA multi node Slurm jobs
-        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt ->
+        // singleAttempt:true disables the outer K8s pod retry; see above.
+        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
@@ -3994,8 +4246,8 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false)
-        }]]}
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag)
+        }, [singleAttempt: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
     }
@@ -4014,12 +4266,12 @@ def launchTestJobs(pipeline, testFilter)
         docBuildConfigs = [:]
     }
 
-    docBuildJobs = docBuildConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt ->
+    docBuildJobs = docBuildConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt, retryContext = null ->
         // attemptTag uniquifies the upload-once guard key and tar filename per
         // pod-launch attempt; isFinalAttempt suppresses synthetic stage-fail XML
         // and junit() on intermediate retryable infra failures.
         stage("[${key}] Run") {
-            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt)
+            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
         }
     }]]}
 
@@ -4147,7 +4399,7 @@ def launchTestJobs(pipeline, testFilter)
             if (checkPipStage) {
                 stage("Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
-                    runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt ->
+                    runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
                         echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
@@ -4200,13 +4452,27 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         echo "###### Run LLMAPI tests Start ######"
 
+                        // Resolve the real tensorrt_llm install location after pip install,
+                        // and expose UCX shared libraries shipped inside the wheel
+                        // (tensorrt_llm/libs/ucx/*.so and libtensorrt_llm_ucx_wrapper.so)
+                        // so dlopen can find them at test runtime.
+                        // Use `pip3 show` (metadata only) instead of `import tensorrt_llm`,
+                        // because importing executes tensorrt_llm/__init__.py which prints a
+                        // version banner to stdout and would pollute the captured path.
+                        def trtllmLibsDir = sh(
+                            script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'",
+                            returnStdout: true,
+                        ).replaceAll("\\s","")
+                        libEnv += ["LD_LIBRARY_PATH+trtllm_ucx=${trtllmLibsDir}/ucx"]
+                        libEnv += ["LD_LIBRARY_PATH+trtllm_libs=${trtllmLibsDir}"]
+
                         def config = VANILLA_CONFIG
                         if (cpu_arch == AARCH64_TRIPLE) {
                             config = LINUX_AARCH64_CONFIG
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -4355,7 +4621,8 @@ def launchTestJobs(pipeline, testFilter)
     // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
     // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
     // perfsanity_required). Pure -Perf- stages always excluded (own trigger
-    // model, full-list benchmarks).
+    // model, full-list benchmarks). Post-Merge stages are never force-kept;
+    // they only run when explicitly listed in affected_stages.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
         def affectedSet = (cbts.affected_stages ?: []) as Set
@@ -4363,6 +4630,7 @@ def launchTestJobs(pipeline, testFilter)
         def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
             if (key =~ /-Perf-/) return false
+            if (key =~ /Post-Merge/) return affectedSet.contains(key)
             return affectedSet.contains(key) ||
                    (needsSanity && key =~ /PackageSanityCheck/) ||
                    (needsPerfSanity && key =~ /PerfSanity/)
@@ -4393,8 +4661,13 @@ def launchTestJobs(pipeline, testFilter)
                     echo "Skip - Passed in the previous pipelines."
                 }
             } else if (values instanceof List) {
-                runKubernetesPodWithInfraRetry(pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt ->
-                    values[1](attemptTag, isFinalAttempt)
+                // parallelJobs entries are either [podSpec, runner] or
+                // [podSpec, runner, opts] where opts is a Map passed through
+                // to runKubernetesPodWithInfraRetry (e.g. singleAttempt:true
+                // for SLURM dispatcher pods to disable nested pod retry).
+                def opts = (values.size() >= 3 && values[2] instanceof Map) ? values[2] : [:]
+                runKubernetesPodWithInfraRetry(opts, pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt, retryContext = null ->
+                    values[1](attemptTag, isFinalAttempt, retryContext)
                 })
             } else {
                 values()
@@ -4467,10 +4740,10 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             stage(values.name) {
                 echo "Run ${values.name} sanity test."
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
-                runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt ->
+                runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, true, isFinalAttempt)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, true, isFinalAttempt, retryContext)
                 })
             }
         } else {
@@ -4525,6 +4798,7 @@ pipeline {
                     println testFilter
                     echo "env.globalVars is: ${env.globalVars}"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
+                    globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                 }
             }
