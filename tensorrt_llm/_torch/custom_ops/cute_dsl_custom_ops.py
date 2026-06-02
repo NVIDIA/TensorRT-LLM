@@ -235,23 +235,23 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     - permuted_idx_to_expanded_idx specifies the gather pattern
     - Shape inference uses permuted_idx_to_expanded_idx size instead of a size
 
-    Input layout (positions 1, 3, 4 are lists for multi-B support):
-        0: a                               - tensor, original input activation
-        1: b_list                          - list of tensors, weight tensors
-        2: a_sf                            - tensor, scale factor for a
-        3: b_sf_list                       - list of tensors, scale factors for b
-        4: alpha_list                      - list of tensors, per-expert scaling factors
-        5: tile_idx_to_group_idx           - tensor, tile to expert mapping
-        6: tile_idx_to_mn_limit            - tensor, tile M/N limits
-        7: permuted_idx_to_expanded_idx    - tensor, token permutation mapping
-        8: num_non_exiting_tiles           - tensor, number of valid tiles
-        9: global_sf                       - tensor, global scale factor
+    Input tensor layout:
+        0: a                       - Original input activation (not permuted)
+        1: b                       - Weight tensor
+        2: a_sf                    - Scale factor for a
+        3: b_sf                    - Scale factor for b
+        4: alpha                   - Per-expert scaling factor
+        5: tile_idx_to_group_idx   - Tile to expert mapping
+        6: tile_idx_to_mn_limit    - Tile M/N limits
+        7: permuted_idx_to_expanded_idx        - Token permutation mapping
+        8: num_non_exiting_tiles   - Number of valid tiles
+        9: global_sf               - Global scale factor
     """
     # Override: use permuted_idx_to_expanded_idx for shape inference
     IDX_PERMUTED_IDX_TO_EXPANDED_IDX = 7
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
-    def inputs_pre_hook(self, inputs: List) -> List:
+    def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Pre-hook for gather-based activation fusion kernel.
 
         Generates:
@@ -259,22 +259,9 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             - tile_idx_to_mn_limit
             - permuted_idx_to_expanded_idx (for gather operation)
             - num_non_exiting_tiles
-
-        Input layout (positions 1, 3, 4 are lists):
-            0: a                               - tensor
-            1: b_list                          - list of tensors
-            2: a_sf                            - tensor
-            3: b_sf_list                       - list of tensors
-            4: alpha_list                      - list of tensors
-            5: tile_idx_to_group_idx           - tensor
-            6: tile_idx_to_mn_limit            - tensor
-            7: permuted_idx_to_expanded_idx    - tensor
-            8: num_non_exiting_tiles           - tensor
-            9: global_sf                       - tensor
         """
-        a, b_list, a_sf, b_sf_list, alpha_list, tile_idx_to_group_idx, \
-            tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, \
-            num_non_exiting_tiles, global_sf = inputs
+        a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, \
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf = inputs
         # Verify permuted_idx_to_expanded_idx index matches the class constant
         assert inputs[
             self.
@@ -306,7 +293,7 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             local_num_experts=self.num_local_experts,
             tile_tokens_dim=self.tile_size,
         )
-        return (a, b_list, a_sf, b_sf_list, alpha_list, tile_idx_to_group_idx,
+        return (a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx,
                 tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles, global_sf)
 
@@ -1686,7 +1673,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a, b, *_ = inputs
             b_list = b if isinstance(b, (list, tuple)) else [b]
             m, k = a.size(0), a.size(1) * 2
-            l = sum(bi.size(0) for bi in b_list)
+            l = sum(bi.size(0) for bi in b_list)  # noqa: E741
             n = b_list[0].size(1)
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
@@ -1758,7 +1745,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert alpha.dim() == 1
 
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
@@ -1943,8 +1930,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      output_dtype: torch.dtype,
-                     scaling_vector_size: int = 16,
-                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None):
+                     scaling_vector_size: int = 16):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -1955,7 +1941,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert output_dtype == torch.bfloat16
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
-            self.b_tensor_l_sizes = b_tensor_l_sizes
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -1976,7 +1961,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
-                self.b_tensor_l_sizes,
             )
 
         def get_valid_tactics(
@@ -1985,12 +1969,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple[int, int]]:
-            a, b_list, *_ = inputs
-            if not isinstance(b_list, (list, tuple)):
-                raise TypeError("weight must be a list of tensors")
+            a, b, *_ = inputs
             m, k = a.size(0), a.size(1) * 2
-            l = sum(bi.size(0) for bi in b_list)
-            n = b_list[0].size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -2056,45 +2037,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def forward(self, inputs: List[torch.Tensor],
                     tactic: Optional[tuple]) -> torch.Tensor:
-            a, b_list, a_sf, b_sf_list, alpha_list, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
-            if not isinstance(b_list, (list, tuple)):
-                raise TypeError("weight must be a list of tensors")
-            if not isinstance(b_sf_list, (list, tuple)):
-                raise TypeError("weight_scale must be a list of tensors")
-            if not isinstance(alpha_list, (list, tuple)):
-                raise TypeError("alpha must be a list of tensors")
-            assert len(b_list) == len(b_sf_list) == len(alpha_list)
-            b_tensor_l_sizes = tuple(bi.size(0) for bi in b_list)
-
-            b0 = b_list[0]
-            b_sf0 = b_sf_list[0]
-            alpha0 = alpha_list[0]
+            a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
-            assert b0.dtype == torch.float4_e2m1fn_x2
-            assert b0.dim() == 3
+            assert b.dtype == torch.float4_e2m1fn_x2
+            assert b.dim() == 3
             assert a_sf.dtype == torch.uint8
             assert a_sf.dim() == 1
-            assert b_sf0.dtype == torch.uint8
-            assert b_sf0.dim() == 3
-            assert alpha0.dtype == torch.float32
-            assert alpha0.dim() == 1
+            assert b_sf.dtype == torch.uint8
+            assert b_sf.dim() == 3
+            assert alpha.dtype == torch.float32
+            assert alpha.dim() == 1
 
             m, k = a.size(0), a.size(1) * 2
-            sum(bi.size(0) for bi in b_list)
-            n = b0.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
-            assert b0.size(2) * 2 == k
+            assert b.size(2) * 2 == k
             assert a_sf.size(0) == m * scale_k
-            for bi, bsfi, ai in zip(b_list, b_sf_list, alpha_list):
-                assert bi.size(1) == n
-                assert bi.size(2) * 2 == k
-                assert bsfi.size(0) == bi.size(0)
-                assert bsfi.size(1) == n
-                assert bsfi.size(2) == scale_k
-                assert ai.size(0) == bi.size(0)
+            assert b_sf.size(0) == l
+            assert b_sf.size(1) == n
+            assert b_sf.size(2) == scale_k
+            assert alpha.size(0) == l
 
             assert c.dtype == self.output_dtype
             assert c.dim() == 2
@@ -2118,10 +2083,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              a.data_ptr(),
                              cute.AddressSpace.gmem,
                              assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
             a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
                                 a_sf.data_ptr(),
                                 cute.AddressSpace.gmem,
                                 assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                 cute.AddressSpace.gmem)
             tile_idx_to_group_idx_ptr = make_ptr(
                 cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
                 cute.AddressSpace.gmem)
@@ -2142,20 +2117,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              cute.AddressSpace.gmem,
                              assumed_align=16)
 
-            b_ptr = tuple(
-                make_ptr(cutlass.Float4E2M1FN,
-                         bi.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=32) for bi in b_list)
-            b_sf_ptr = tuple(
-                make_ptr(cutlass.Float8E4M3FN,
-                         bsfi.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16) for bsfi in b_sf_list)
-            alpha_ptr = tuple(
-                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
-                for ai in alpha_list)
-
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -2169,7 +2130,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn, raster_along_m, b_tensor_l_sizes)
+                         cluster_shape_mn, raster_along_m)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -2177,7 +2138,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn=cluster_shape_mn,
                     use_blkred=True,
                     raster_along_m=raster_along_m,
-                    b_tensor_l_sizes=b_tensor_l_sizes,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -2199,6 +2159,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m,
                     n,
                     k,
+                    l,
                     num_tokens,
                     self.top_k,
                 ]
@@ -2230,6 +2191,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m,
                 n,
                 k,
+                l,
                 num_tokens,
                 self.top_k,
             ]
@@ -2242,10 +2204,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
         input: torch.Tensor,
-        weight: List[torch.Tensor],
+        weight: torch.Tensor,
         input_scale: torch.Tensor,
-        weight_scale: List[torch.Tensor],
-        alpha: List[torch.Tensor],
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
         output: torch.Tensor,
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
@@ -2262,11 +2224,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         tuner = AutoTuner.get()
 
-        b_tensor_l_sizes = tuple(w.size(0)
-                                 for w in weight) if len(weight) > 1 else None
         runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size, b_tensor_l_sizes)
+            tile_size, output_dtype, scaling_vector_size)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -2289,10 +2249,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         device_types="cuda")
     def cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
         input: torch.Tensor,
-        weight: List[torch.Tensor],
+        weight: torch.Tensor,
         input_scale: torch.Tensor,
-        weight_scale: List[torch.Tensor],
-        alpha: List[torch.Tensor],
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -2307,7 +2267,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
         num_tokens = token_final_scales.size(0)
-        n = weight[0].size(1)
+        n = weight.size(1)
         output = torch.zeros(num_tokens,
                              n,
                              dtype=output_dtype,
@@ -2338,10 +2298,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell")
     def _(
         input: torch.Tensor,
-        weight: List[torch.Tensor],
+        weight: torch.Tensor,
         input_scale: torch.Tensor,
-        weight_scale: List[torch.Tensor],
-        alpha: List[torch.Tensor],
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
         tile_idx_to_group_idx: torch.Tensor,
         tile_idx_to_mn_limit: torch.Tensor,
         permuted_idx_to_expanded_idx: torch.Tensor,
@@ -2356,7 +2316,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
     ) -> torch.Tensor:
         num_tokens = token_final_scales.size(0)
-        n = weight[0].size(1)
+        n = weight.size(1)
         return torch.empty(num_tokens,
                            n,
                            dtype=output_dtype,
@@ -2411,7 +2371,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> List[Tuple[int, int]]:
             a, b, *_ = inputs
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -2482,7 +2442,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert alpha.dim() == 1
 
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             interm_size = n // 2
             assert m % self.tile_size == 0
@@ -2687,9 +2647,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
         tuning_config_cache = dict()
 
-        # Maximum number of B tensors supported (must match kernel's MAX_B_TENSORS)
-        MAX_B_TENSORS = 4
-
         def __init__(self,
                      num_experts: int,
                      top_k: int,
@@ -2697,13 +2654,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      scaling_vector_size: int = 16,
-                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
                      activation_type: ActivationType = ActivationType.Swiglu):
             """Initialize the runner.
 
             Args:
-                b_tensor_l_sizes: Tuple of L sizes for each B tensor in multi-B mode.
-                    None for single-B mode. Used for kernel cache key.
                 activation_type: ``ActivationType`` for the fused epilogue. Only
                     ``Swiglu`` (gated) and ``Relu2`` (non-gated) are supported.
             """
@@ -2720,7 +2674,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
-            self.b_tensor_l_sizes = b_tensor_l_sizes
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -2740,7 +2693,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.local_expert_offset,
                 self.tile_size,
                 self.scaling_vector_size,
-                self.b_tensor_l_sizes,
                 self.activation_type,
             )
 
@@ -2750,15 +2702,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple[int, int]]:
-            # Tuning uses layout: a, b_list, a_sf, b_sf_list, alpha_list, ...
+            # Tuning uses layout: a, b, a_sf, b_sf, alpha, ...
             a = inputs[0]
-            b_list = inputs[1]  # List of B tensors
+            b = inputs[1]
             permuted_idx_to_expanded_idx = inputs[7]
             # m is the permuted size from permuted_idx_to_expanded_idx, not from a
             m = permuted_idx_to_expanded_idx.size(0)
             k = a.size(1) * 2
-            l = sum(bi.size(0) for bi in b_list)
-            n = b_list[0].size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -2799,8 +2750,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                        self.local_expert_offset,
                                                        self.tile_size)
                 # Tuning uses layout:
-                # a, b_list, a_sf, b_sf_list, alpha_list, tile_idx, tile_mn_limit, permuted_idx, ...
-                # Constraint indices adjusted for list inputs at positions 1, 3, 4
+                # a, b, a_sf, b_sf, alpha, tile_idx, tile_mn_limit, permuted_idx, ...
                 self.__class__.tuning_config_cache[key] = TuningConfig(
                     # Use permuted_idx_to_expanded_idx (IDX_SHAPE_INFER) for tuning
                     dynamic_tensor_specs=(DynamicTensorSpec(
@@ -2824,46 +2774,41 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def forward(self, inputs: List,
                     tactic: Optional[tuple]) -> torch.Tensor:
-            """Forward pass supporting both single tensor and list inputs.
+            """Forward pass.
 
-            Input layout (positions 1, 3, 4 are lists for multi-B support):
+            Input layout:
                 0: a                               - tensor
-                1: b_list                          - list of tensors
+                1: b                               - tensor
                 2: a_sf                            - tensor
-                3: b_sf_list                       - list of tensors
-                4: alpha_list                      - list of tensors
+                3: b_sf                            - tensor
+                4: alpha                           - tensor
                 5: tile_idx_to_group_idx           - tensor
                 6: tile_idx_to_mn_limit            - tensor
                 7: permuted_idx_to_expanded_idx    - tensor
                 8: num_non_exiting_tiles           - tensor
                 9: global_sf                       - tensor
             """
-            a, b_list, a_sf, b_sf_list, alpha_list, tile_idx_to_group_idx, \
+            a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, \
                 tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, \
                 num_non_exiting_tiles, global_sf = inputs
-
-            b_tensor_l_sizes = tuple(bi.size(0) for bi in b_list)
-
-            b0 = b_list[0]  # Use first B for shape inference
 
             # Verify input dtypes and dimensions
             assert a.dtype == torch.float4_e2m1fn_x2
             assert a.dim() == 2
-            assert b0.dtype == torch.float4_e2m1fn_x2
-            assert b0.dim() == 3
+            assert b.dtype == torch.float4_e2m1fn_x2
+            assert b.dim() == 3
             assert a_sf.dtype == torch.uint8
             assert a_sf.dim() == 2
-            assert b_sf_list[0].dtype == torch.uint8
-            assert b_sf_list[0].dim() == 3
-            assert alpha_list[0].dtype == torch.float32
-            assert alpha_list[0].dim() == 1
+            assert b_sf.dtype == torch.uint8
+            assert b_sf.dim() == 3
+            assert alpha.dtype == torch.float32
+            assert alpha.dim() == 1
 
             # a.size(0) is orig_m (original input size before gather)
             # permuted_idx_to_expanded_idx.size(0) is m (permuted size after gather)
             orig_m, k = a.size(0), a.size(1) * 2
             m = permuted_idx_to_expanded_idx.size(0)
-            n = b0.size(1)
-            sum(bi.size(0) for bi in b_list)
+            l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             interm_size = n // 2 if self.is_gated else n
 
@@ -2873,7 +2818,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert n % (self.scaling_vector_size * 4 * 2) == 0
             else:
                 assert n % (self.scaling_vector_size * 4) == 0
-            assert b0.size(2) * 2 == k
+            assert b.size(2) * 2 == k
             assert a_sf.size(0) == orig_m
             assert a_sf.size(1) == scale_k
 
@@ -2895,15 +2840,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                dtype=a_sf.dtype,
                                device=a_sf.device)
 
-            # Create common pointers
+            # Create pointers.
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
                              cute.AddressSpace.gmem,
                              assumed_align=32)
             a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
                                 a_sf.data_ptr(),
                                 cute.AddressSpace.gmem,
                                 assumed_align=16)
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                 cute.AddressSpace.gmem)
             c_ptr = make_ptr(cutlass.Float4E2M1FN,
                              c.data_ptr(),
                              cute.AddressSpace.gmem,
@@ -2927,20 +2882,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             global_sf_ptr = make_ptr(cutlass.Float32, global_sf.data_ptr(),
                                      cute.AddressSpace.gmem)
 
-            b_ptr = tuple(
-                make_ptr(cutlass.Float4E2M1FN,
-                         bi.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=32) for bi in b_list)
-            b_sf_ptr = tuple(
-                make_ptr(cutlass.Float8E4M3FN,
-                         bsfi.data_ptr(),
-                         cute.AddressSpace.gmem,
-                         assumed_align=16) for bsfi in b_sf_list)
-            alpha_ptr = tuple(
-                make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
-                for ai in alpha_list)
-
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -2955,7 +2896,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
-                         b_tensor_l_sizes, self.activation_type)
+                         self.activation_type)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -2965,7 +2906,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     vectorized_f32=True,
                     topk=self.top_k,
                     raster_along_m=raster_along_m,
-                    b_tensor_l_sizes=b_tensor_l_sizes,
                     activation_type=self.activation_type,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -2989,6 +2929,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m,
                     n,
                     k,
+                    l,
                 ]
 
                 compiled_gemm = cute.compile(
@@ -3021,104 +2962,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m,
                 n,
                 k,
+                l,
             ]
 
             compiled_gemm(*exec_args, stream=stream)
 
             return c, c_sf
-
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
-        mutates_args=(),
-        device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
-        input: torch.Tensor,
-        weight: List[torch.Tensor],
-        input_scale: torch.Tensor,
-        weight_scale: List[torch.Tensor],
-        alpha: List[torch.Tensor],
-        tile_idx_to_group_idx: torch.Tensor,
-        tile_idx_to_mn_limit: torch.Tensor,
-        permuted_idx_to_expanded_idx: torch.Tensor,
-        num_non_exiting_tiles: torch.Tensor,
-        global_sf: torch.Tensor,
-        num_experts: int,
-        top_k: int,
-        num_local_experts: int,
-        local_expert_offset: int,
-        tile_size: int,
-        scaling_vector_size: int = 16,
-        activation_type: int = int(ActivationType.Swiglu),
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (multi-B list interface).
-
-        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
-        (non-gated) epilogues; other ``ActivationType`` values raise an assertion.
-
-        Args:
-            weight: List of B tensors. Single-B mode: [b], multi-B mode: [b0, b1, ...].
-            weight_scale: List of scale tensors, matching weight.
-            alpha: List of alpha tensors, matching weight.
-            activation_type: ``ActivationType`` value selecting the fused activation.
-        """
-        tuner = AutoTuner.get()
-
-        b_tensor_l_sizes = tuple(w.size(0) for w in weight)
-
-        runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size, b_tensor_l_sizes, activation_type)
-        inputs = [
-            input, weight, input_scale, weight_scale, alpha,
-            tile_idx_to_group_idx, tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf
-        ]
-
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
-            [runner],
-            runner.get_tuning_config(),
-            inputs,
-        )
-
-        # Call forward with inputs list
-        output = runner.forward(inputs, tactic=best_tactic)
-        return output
-
-    @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b"
-    )
-    def _fake_multi_b(
-        input: torch.Tensor,
-        weight: List[torch.Tensor],
-        input_scale: torch.Tensor,
-        weight_scale: List[torch.Tensor],
-        alpha: List[torch.Tensor],
-        tile_idx_to_group_idx: torch.Tensor,
-        tile_idx_to_mn_limit: torch.Tensor,
-        permuted_idx_to_expanded_idx: torch.Tensor,
-        num_non_exiting_tiles: torch.Tensor,
-        global_sf: torch.Tensor,
-        num_experts: int,
-        top_k: int,
-        num_local_experts: int,
-        local_expert_offset: int,
-        tile_size: int,
-        scaling_vector_size: int = 16,
-        activation_type: int = int(ActivationType.Swiglu),
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m = permuted_idx_to_expanded_idx.size(0)
-        n = weight[0].size(1)
-        is_gated = is_gated_activation(ActivationType(activation_type))
-        interm_size = n // 2 if is_gated else n
-        output = torch.empty(m,
-                             interm_size // 2,
-                             dtype=input.dtype,
-                             device=input.device)
-        output_scale = torch.empty(m * interm_size // scaling_vector_size,
-                                   dtype=input_scale.dtype,
-                                   device=input_scale.device)
-        return output, output_scale
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
@@ -3143,31 +2992,36 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (single-B tensor interface).
+        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
-        Thin wrapper: wraps single tensors into lists and calls
-        cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b.
-        ``activation_type`` must be ``ActivationType.Swiglu`` or ``ActivationType.Relu2``.
+        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
+        (non-gated) epilogues; other ``ActivationType`` values raise an
+        assertion in the runner.
         """
-        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
-            input,
-            [weight],
-            input_scale,
-            [weight_scale],
-            [alpha],
-            tile_idx_to_group_idx,
-            tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles,
-            global_sf,
+        tuner = AutoTuner.get()
+
+        runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             num_experts,
             top_k,
             num_local_experts,
             local_expert_offset,
             tile_size,
             scaling_vector_size,
-            activation_type,
+            activation_type=activation_type)
+        inputs = [
+            input, weight, input_scale, weight_scale, alpha,
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf
+        ]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
         )
+        output = runner.forward(inputs, tactic=best_tactic)
+        return output
 
     @torch.library.register_fake(
         "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell")
@@ -3905,7 +3759,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m = a.shape[0]
             k = a.shape[1] * 2  # fp4 packed in k dimension
             n = b.shape[0] * b.shape[1]  # num_expert * weight_per_expert
-            l = 1  # dense GEMM
+            l = 1  # dense GEMM  # noqa: E741
 
             # Define candidates together
             mma_tiler_mn_candidates = [(128, 128), (128, 256), (256, 256)]
@@ -3979,7 +3833,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m = a.shape[0]
             k = a.shape[1] * 2  # fp4 packed in k dimension
             n = b.shape[0] * b.shape[1]  # num_expert * weight_per_expert
-            l = 1  # dense GEMM
+            l = 1  # dense GEMM  # noqa: E741
             n_out = n // 2  # SwiGLU output
 
             # Default tactic if not provided
@@ -4200,7 +4054,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         m = input.shape[0]
         n = weight.shape[0] * weight.shape[1]  # num_expert * weight_per_expert
         n_out = n // 2  # SwiGLU output
-        l = 1  # dense GEMM
+        l = 1  # dense GEMM  # noqa: E741
 
         if output_dtype == torch.float4_e2m1fn_x2:
             # FP4 packed: 2 elements per byte
@@ -4290,7 +4144,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m = a.shape[0]
             k = a.shape[1] * 2  # fp4 packed in k dimension
             n = b.shape[0]
-            l = 1  # dense GEMM
+            l = 1  # dense GEMM  # noqa: E741
 
             # Define candidates
             mma_tiler_mn_candidates = [(128, 64), (128, 128), (128, 256),
@@ -4378,7 +4232,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m = a.shape[0]
             k = a.shape[1] * 2  # fp4 packed in k dimension
             n = b.shape[0]
-            l = 1  # dense GEMM
+            l = 1  # dense GEMM  # noqa: E741
 
             # The kernel wrapper expects alpha_scale laid out token-major
             # (token has stride 1, expert has stride m), which gives

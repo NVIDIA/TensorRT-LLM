@@ -434,7 +434,7 @@ def test_insert_cached_attention_lowers_semantic_mask_for_torch_backend():
 
 
 @torch.inference_mode()
-def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend():
+def test_insert_cached_attention_lowers_semantic_mask_for_triton_backend():
     model = SpanMaskedAttentionModel().eval()
     input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
     position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
@@ -459,7 +459,7 @@ def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend()
         {
             "insert_cached_attention": {
                 "stage": "cache_init",
-                "backend": "triton_paged",
+                "backend": "triton",
             },
         },
     )(cm, gm)
@@ -471,7 +471,7 @@ def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend()
     cached_nodes = [
         node
         for node in gm_transformed.graph.nodes
-        if is_op(node, torch.ops.auto_deploy.triton_paged_mha_with_cache)
+        if is_op(node, torch.ops.auto_deploy.triton_mha_with_cache)
     ]
     assert len(cached_nodes) == 1
     assert is_op(cached_nodes[0].args[-1], torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
@@ -503,7 +503,7 @@ def test_insert_cached_attention_rejects_unsupported_semantic_mask_backend():
         RuntimeError,
         match=(
             "Cached attention backend 'flashinfer' does not support lowering semantic mask op"
-            ".*gemma4_multimodal_mask.*Supported backends: torch, triton_paged"
+            ".*gemma4_multimodal_mask.*Supported backends: torch, triton"
         ),
     ):
         InferenceOptimizer(
@@ -706,10 +706,10 @@ def test_insert_cached_attention_uses_add_resource():
 
     # Verify resources were added
     assert len(cm._resource_lookup) > 0
-    # Should have k_cache and v_cache resources registered
+    # Triton attention registers one combined paged KV cache resource.
     resource_names = list(cm._resource_lookup.keys())
-    assert any("k_cache" in name for name in resource_names)
-    assert any("v_cache" in name for name in resource_names)
+    assert any(name.endswith("kv_cache") for name in resource_names)
+    assert any(handler.is_paged for handler in cm._resource_lookup.values())
 
 
 def test_insert_cached_attention_passes_kv_cache_config():
@@ -784,9 +784,7 @@ def test_insert_cached_attention_passes_kv_cache_config():
     # Initialize resources
     cm.initialize_resources()
 
-    assert not any(handler.is_paged for handler in cm._resource_lookup.values()), (
-        "triton should not use paged resources"
-    )
+    assert any(handler.is_paged for handler in cm._resource_lookup.values())
     assert cm._caches, "at least some resources should be present"
 
     # Verify cache dtype matches config
@@ -951,7 +949,7 @@ class VSWAModel(nn.Module):
         return x + self.o_proj_1(a1.reshape(b, s, -1))
 
 
-def _build_optimizer_with_backend(model, backend="triton_paged"):
+def _build_optimizer_with_backend(model, backend="triton"):
     """Helper to create an InferenceOptimizer for testing."""
     return InferenceOptimizer(
         DummyFactory(model, cache_config_updates={}),
@@ -1146,7 +1144,7 @@ def test_kv_cache_manager_initialized_with_sliding_window():
             },
             "insert_cached_attention": {
                 "stage": "cache_init",
-                "backend": "triton_paged",
+                "backend": "triton",
             },
             "initialize_cache": {
                 "stage": "cache_init",

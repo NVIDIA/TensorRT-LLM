@@ -720,6 +720,7 @@ def default_multimodal_input_loader(
                                   List[List[torch.Tensor]]]] = None,
     device: str = "cpu",
     extract_audio: bool = False,
+    trust_remote_code: bool = True,
 ) -> List[dict[str, Union[str, torch.Tensor]]]:
 
     def convert_to_conversation_message(
@@ -837,13 +838,13 @@ def default_multimodal_input_loader(
         model_type) == ContentFormat.PASSTHROUGH)
 
     if tokenizer is None and not is_passthrough:
-        tokenizer = ModelLoader.load_hf_tokenizer(model_dir, use_fast=True)
+        tokenizer = ModelLoader.load_hf_tokenizer(
+            model_dir, trust_remote_code=trust_remote_code, use_fast=True)
 
     processor = None
     if not is_passthrough:
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  use_fast=True,
-                                                  trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_dir, use_fast=True, trust_remote_code=trust_remote_code)
 
     inputs = []
     for prompt_idx, (prompt,

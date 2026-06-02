@@ -1329,7 +1329,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             model_dir,
             trust_remote_code=self._config.model_name
             in TRUST_REMOTE_CODE_MODELS)
-        dataset = load_dataset("cnn_dailymail",
+        dataset = load_dataset(os.path.join(llm_models_root(), "datasets",
+                                            "cnn_dailymail"),
                                "3.0.0",
                                split="validation",
                                streaming=True,

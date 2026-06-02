@@ -2072,10 +2072,11 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
         = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
 
     std::vector<BlockKey> blockKeys;
+    blockKeys.reserve(blockedUniqueTokens.size());
     for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
     {
-        blockKeys.push_back(blockKey);
-        blockKeys.back().uniqueTokens = blockedUniqueTokensList;
+        blockKeys.emplace_back(blockKey.usesExtraIds, blockKey.loraTaskId, blockedUniqueTokensList, blockKey.extraKeys,
+            blockKey.cacheSaltID);
     }
     return searchReuseTree(blockKeys);
 }
