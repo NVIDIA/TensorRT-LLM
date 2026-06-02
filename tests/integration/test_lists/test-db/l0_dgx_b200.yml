@@ -357,8 +357,9 @@ l0_dgx_b200:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[fp8-4-attn_dp_off-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[fp8-4-attn_dp_on-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-4-attn_dp_on-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[ws4_180gb-flashinfer]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[ws4_180gb-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[bf16-ws4_180gb-flashinfer]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[bf16-ws4_180gb-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[nvfp4-ws4_180gb-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronUltraV3::test_accuracy[nvfp4-4]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-NVFP4-True]
   # ------------- AutoDeploy Perf Sanity ---------------

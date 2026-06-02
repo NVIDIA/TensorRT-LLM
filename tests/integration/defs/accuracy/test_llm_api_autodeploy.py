@@ -720,11 +720,18 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             ),
         ],
     )
-    def test_mtp(self, world_size, attn_backend):
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "bf16",
+            pytest.param("nvfp4", marks=skip_pre_blackwell),
+        ],
+    )
+    def test_mtp(self, model_id, world_size, attn_backend):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
 
-        model_path = self.MODEL_PATHS["bf16"]
+        model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
         low_memory_overrides(
             kwargs,
@@ -759,6 +766,11 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 enable_iter_perf_stats=True,
                 **kwargs,
         ) as llm:
+            _set_quant_config(llm, model_id)
+            # The NVFP4 Super V3 checkpoint is mixed precision; resolve gsm8k
+            # thresholds against the MIXED_PRECISION reference (matches test_accuracy).
+            if model_id == "nvfp4":
+                llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             self.check_acceptance_rate(llm, min_acceptance_rate=0.45)
