@@ -32,6 +32,7 @@ accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestKimiK2::test_nvfp4
+accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4_eagle3
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-False-False]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-False-True]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-True-False]
