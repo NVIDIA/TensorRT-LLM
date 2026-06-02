@@ -516,13 +516,10 @@ def get_model_yaml_config(model_label: str,
         },
         # Nemotron-3-Super-120B-NVFP4 (throughput variant, aligned with curated yaml)
         # Non-streaming cases use attention DP and larger cuda_graph batch for throughput.
-        # Patterns are intentionally narrowed so they do NOT match the
+        # Pattern is intentionally narrowed so it does NOT match the
         # 'serve-pytorch-streaming-' streaming variant above.
         {
-            'patterns': [
-                'nemotron_3_super_120b_nvfp4-bench-pytorch-',
-                'nemotron_3_super_120b_nvfp4-serve-pytorch-float',
-            ],
+            'patterns': ['nemotron_3_super_120b_nvfp4-serve-pytorch-float'],
             'config': {
                 'max_seq_len': 1048576,
                 'enable_chunked_prefill': True,
@@ -544,13 +541,10 @@ def get_model_yaml_config(model_label: str,
             }
         },
         # Nemotron-3-Super-120B-NVFP4_MTP (throughput variant with MTP spec decoding)
-        # Patterns are intentionally narrowed so they do NOT match the
+        # Pattern is intentionally narrowed so it does NOT match the
         # '_mtp-serve-pytorch-streaming-' streaming variant above.
         {
-            'patterns': [
-                'nemotron_3_super_120b_nvfp4_mtp-bench-pytorch-',
-                'nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-float',
-            ],
+            'patterns': ['nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-float'],
             'config': {
                 'max_seq_len': 1048576,
                 'enable_chunked_prefill': True,
