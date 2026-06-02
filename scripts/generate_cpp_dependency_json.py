@@ -53,7 +53,7 @@ def check_oss_components(package_name: str) -> tuple[str, int] | None:
     """Return (web_url, project_id) if package_name exists in oss-components, else None."""
     project_path = urllib.parse.quote(f"{GITLAB_OSS_GROUP}/{package_name}", safe="")
     url = f"{GITLAB_API_BASE}/projects/{project_path}"
-    req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": TOKEN})
+    req = urllib.request.Request(url)
     try:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read())
@@ -68,7 +68,7 @@ def commit_exists_in_project(project_id: int, ref: str) -> bool:
     """Return True if ref (tag or commit SHA) exists in the GitLab project."""
     encoded_ref = urllib.parse.quote(ref, safe="")
     url = f"{GITLAB_API_BASE}/projects/{project_id}/repository/commits/{encoded_ref}"
-    req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": TOKEN})
+    req = urllib.request.Request(url)
     try:
         with urllib.request.urlopen(req) as resp:
             resp.read()
@@ -83,7 +83,7 @@ def get_namespace_id() -> int:
     """Return the numeric namespace ID for GITLAB_OSS_GROUP."""
     group_path = urllib.parse.quote(GITLAB_OSS_GROUP, safe="")
     url = f"{GITLAB_API_BASE}/groups/{group_path}"
-    req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": TOKEN})
+    req = urllib.request.Request(url)
     with urllib.request.urlopen(req) as resp:
         data = json.loads(resp.read())
         return data["id"]
@@ -116,7 +116,7 @@ def create_oss_component(
 def wait_for_mirror(project_id: int, poll_interval: int = 10, timeout: int = 300) -> None:
     """Poll until the project mirror import finishes; return False if it times out."""
     url = f"{GITLAB_API_BASE}/projects/{project_id}"
-    req = urllib.request.Request(url, headers={"PRIVATE-TOKEN": TOKEN})
+    req = urllib.request.Request(url)
     deadline = time.monotonic() + timeout
     while True:
         with urllib.request.urlopen(req) as resp:
@@ -155,8 +155,6 @@ def main():
     )
 
     args = parser.parse_args()
-    if not args.token:
-        parser.error("A GitLab token is required: pass --token or set $GITLAB_TOKEN")
     TOKEN = args.token
 
     src_dirs = list(sorted(args.deps_dir.glob("*-src")))
