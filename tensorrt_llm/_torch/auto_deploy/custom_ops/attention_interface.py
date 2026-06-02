@@ -402,17 +402,10 @@ class BatchInfo:
     Slot 12 (spec-decoding info, set once at runtime init):
     - [12] max_draft_len: maximum draft length per request (0 when not spec dec)
 
-    Slot 13 (DP-aware token info, updated per forward when attention-DP is on):
-    - [13] max_dp_num_tokens: max(total_num_tokens) across all DP ranks for this
-      forward step. Equals local total_num_tokens when attention-DP is off.
-      Used by MoE all-to-all to size dispatch padding without over-padding to the
-      static config max_num_tokens. Mirrors base TRT-LLM's
-      ``runtime_max_tokens_per_rank`` from ``model_engine._get_all_rank_num_tokens``.
-
     All fields can be accessed and updated with the convenience functions below.
     """
 
-    _NUM_ELEMENTS = 14
+    _NUM_ELEMENTS = 13
 
     def __init__(self, batch_info_host: Optional[torch.Tensor] = None):
         if batch_info_host is None:
@@ -534,21 +527,6 @@ class BatchInfo:
 
     def get_max_draft_len(self) -> int:
         return int(self._batch_info[12])
-
-    # --- DP-aware token info (slot 13) writer ---
-
-    def update_max_dp_num_tokens(self, max_dp_num_tokens: int) -> None:
-        """Set the max-across-DP-ranks total token count for this forward.
-
-        When attention-DP is off, callers should write the local total_num_tokens
-        so consumers can read this slot uniformly without checking attn-DP state.
-        """
-        self._batch_info[13] = max_dp_num_tokens
-
-    # --- DP-aware token info (slot 13) reader ---
-
-    def get_max_dp_num_tokens(self) -> int:
-        return int(self._batch_info[13])
 
 
 class SequenceInfo:
@@ -1187,9 +1165,6 @@ class SequenceInfo:
             num_prefill_tokens = int(sl_host.sum()) - num_decode
             batch_info = [num_prefill, num_prefill_tokens, 0, 0, num_decode, num_decode]
         self.batch_info.update(batch_info)
-        # Default slot 13 to local total tokens; the executor overrides this with the
-        # cross-rank max via update_max_dp_num_tokens() when attention-DP is enabled.
-        self.batch_info.update_max_dp_num_tokens(self.batch_info.get_total_num_tokens())
 
         # check for updated input_pos (i.e. cache start position)
         if isinstance(input_pos, int):
@@ -1516,8 +1491,6 @@ class SequenceInfo:
         # update batch_info
         self.batch_info.update([0, 0, 0, 0, num_seq, num_seq])
         self.batch_info.update_tokens_gather_info(num_seq, False)
-        # Default slot 13 to local total tokens; the executor overrides this when attention-DP is on.
-        self.batch_info.update_max_dp_num_tokens(num_seq)
 
         # check if we need a d2h sync
         _REQUIRES_UPDATE = {

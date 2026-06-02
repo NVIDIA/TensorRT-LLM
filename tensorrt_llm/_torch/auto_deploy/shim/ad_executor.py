@@ -833,29 +833,6 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
-        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 13.
-        # Mirrors base TRT-LLM's `model_engine._get_all_rank_num_tokens`. The MoE
-        # all-to-all reads slot 13 as ``runtime_max_tokens_per_rank`` to size the
-        # dispatch padding to the cross-rank max instead of the static
-        # ``max_num_tokens`` (up to 6x perf). ``nest_sequences`` seeds slot 13
-        # with the local total as a safe default; this overrides with the
-        # cross-rank max when attention-DP is on.
-        #
-        # Correctness under CUDA graphs: the ``.item()`` read inside the MoE op
-        # is baked at capture time. For pure-decode all-replay this is safe
-        # because attention-DP forces all ranks to the same ``cg_batch_size``,
-        # so the captured value equals the replay-time cross-rank max. The
-        # mixed prefill/decode case (a prefill rank goes eager, a sibling decode
-        # rank would replay a stale-baked value) is handled by
-        # ``maybe_pad_for_cuda_graph`` forcing all ranks eager via
-        # ``_set_bypass_captured_graphs`` (commit #13718 / ecc7ae1c85).
-        if self.enable_attention_dp and self.dist_config.tp_size > 1:
-            assert self.dist is not None, "Distributed object is required for attention DP mode"
-            info = self.cache_seq_interface.info
-            local_total_num_tokens = info.batch_info.get_total_num_tokens()
-            all_rank_num_tokens = list(self.dist.tp_allgather(local_total_num_tokens))
-            info.batch_info.update_max_dp_num_tokens(max(all_rank_num_tokens))
-
         # compute outputs
         outputs = self._run_forward()
 
