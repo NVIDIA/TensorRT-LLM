@@ -8,6 +8,7 @@ import os
 import threading
 import time
 import traceback
+from collections import Counter
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
@@ -383,6 +384,16 @@ class PyExecutor:
                                      or self.enable_batch_wait_timeout
                                      or self.batch_wait_max_tokens_ratio > 0)
         self.batch_wait_deadline_s: Optional[float] = None
+        self.delay_batch_debug_enabled = (
+            self.enable_batch_wait_timeout
+            and os.environ.get("TRTLLM_DELAY_BATCH_DEBUG",
+                               "1").lower() not in ("0", "false", "off", "no"))
+        self.delay_batch_debug_all_ranks = os.environ.get(
+            "TRTLLM_DELAY_BATCH_DEBUG_ALL_RANKS",
+            "0").lower() in ("1", "true", "on", "yes", "all")
+        self._last_delay_batch_debug: Dict[str, object] = {}
+        self._delay_batch_fetched_all_ctx_runtime_enabled = False
+        self.model_engine.delay_batch_debug_enabled = self.delay_batch_debug_enabled
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
@@ -435,6 +446,7 @@ class PyExecutor:
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         self._skip_current_iteration = False
+        self._suppress_next_iter_log = False
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
         # from _send_kv_async the owning DP rank has a response but the other
@@ -1120,24 +1132,33 @@ class PyExecutor:
                         prev_device_step_time = start_event_1.elapsed_time(
                             end_event_1)
 
-                if prev_device_step_time is None:
-                    prev_device_step_time = "N/A"  # Handle first iteration
-                else:
-                    prev_device_step_time = f"{prev_device_step_time}ms"
-                host_step_time = (end_time - start_time) * 1000  # milliseconds
-                formatted_timestamp = datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S")
-                logger.info(
-                    f"iter = {self.iter_counter}, "
-                    f"global_rank = {self.global_rank}, "
-                    f"rank = {self.dist.rank}, "
-                    f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
-                    f"{self.num_fetch_requests}, "
-                    f"host_step_time = {host_step_time}ms, "
-                    f"prev_device_step_time = {prev_device_step_time}, "
-                    f"timestamp = {formatted_timestamp}, "
-                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
-                    f"states = {self.model_engine.iter_states}")
+                suppress_iter_log = self._suppress_next_iter_log
+                self._suppress_next_iter_log = False
+                if not suppress_iter_log:
+                    if prev_device_step_time is None:
+                        prev_device_step_time = "N/A"  # Handle first iteration
+                    else:
+                        prev_device_step_time = f"{prev_device_step_time}ms"
+                    host_step_time = (end_time -
+                                      start_time) * 1000  # milliseconds
+                    formatted_timestamp = datetime.datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    delay_batch_debug = (
+                        f"delay_batch_debug = {self._last_delay_batch_debug}, "
+                        if self.delay_batch_debug_enabled
+                        and self._last_delay_batch_debug else "")
+                    logger.info(
+                        f"iter = {self.iter_counter}, "
+                        f"global_rank = {self.global_rank}, "
+                        f"rank = {self.dist.rank}, "
+                        f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
+                        f"{self.num_fetch_requests}, "
+                        f"host_step_time = {host_step_time}ms, "
+                        f"prev_device_step_time = {prev_device_step_time}, "
+                        f"timestamp = {formatted_timestamp}, "
+                        f"num_scheduled_requests: {self.num_scheduled_requests}, "
+                        f"{delay_batch_debug}"
+                        f"states = {self.model_engine.iter_states}")
 
             it += 1
 
@@ -2165,6 +2186,53 @@ class PyExecutor:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
+    def _cleanup_attention_dp_dummy_requests(self, reason: str) -> None:
+        if not self.enable_attention_dp:
+            return
+
+        dummy_requests = [
+            req for req in list(self.active_requests)
+            if getattr(req, "is_attention_dp_dummy", False)
+        ]
+        if not dummy_requests:
+            return
+
+        for request in dummy_requests:
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            req_id = getattr(request, "py_request_id", None)
+            if req_id is not None:
+                erase = getattr(self.inflight_req_ids, "erase", None)
+                if erase is not None:
+                    erase(req_id)
+                else:
+                    self.inflight_req_ids.discard(req_id)
+            self._terminate_request(request)
+            try:
+                self.active_requests.remove(request)
+            except ValueError:
+                pass
+
+        self._delay_batch_log(
+            f"cleaned attention-DP dummy requests reason={reason} "
+            f"count={len(dummy_requests)}",
+            all_ranks=True)
+
+    def _revert_ctx_alloc(self, dropped_context_requests):
+        """Revert KV cache capacity growth for ctx requests deferred by
+        delay batching.
+
+        With KV cache manager V2 + scheduler V2, ctx KV cache is grown
+        during scheduling (``resize_context``).  When delay batching
+        (``_balance_adp_requests`` for ADP, or ``_waiting_requests``
+        for non-ADP batch waiting) defers ctx requests, the
+        freshly-allocated pages would otherwise sit idle until the
+        request is re-scheduled, blocking pool space — particularly
+        painful for long-context workloads where each deferred ctx can
+        hold GBs of KV.
+        """
+        for req in dropped_context_requests:
+            self.kv_cache_manager.revert_allocate_context(req)
+
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
         if self._scheduler_manages_kv_suspend and isinstance(
@@ -2241,8 +2309,13 @@ class PyExecutor:
 
         if self._skip_current_iteration:
             self.num_scheduled_requests = 0
+            self._suppress_next_iter_log = True
             logger.debug(f'has {len(self.active_requests)} active_requests, '
                          'skipping this iteration for delay batching')
+            self._delay_batch_log(
+                f"executor returned skipped delay-batch iteration "
+                f"active_requests={len(self.active_requests)}",
+                all_ranks=True)
             return scheduled_batch, iter_stats
 
         if self.kv_cache_transceiver:
@@ -2335,6 +2408,13 @@ class PyExecutor:
                         return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
+        if self.delay_batch_debug_enabled:
+            self._delay_batch_log(
+                f"executor scheduled batch ctx={scheduled_batch.num_context_requests} "
+                f"gen={scheduled_batch.num_generation_requests} "
+                f"batch_size={scheduled_batch.batch_size} "
+                f"active_requests={len(self.active_requests)}",
+                all_ranks=True)
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
             f'scheduled {scheduled_batch.num_context_requests} context requests and '
@@ -3264,6 +3344,7 @@ class PyExecutor:
         new_requests = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests,
             all_ranks_num_active_requests)
+        self._update_delay_batch_fetched_all_ctx(new_requests, "fetch")
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -3426,6 +3507,195 @@ class PyExecutor:
                     balanced_context_requests = context_requests
         return balanced_context_requests
 
+    def _delay_batch_log(self, message: str, *, all_ranks: bool = False):
+        if not self.delay_batch_debug_enabled:
+            return
+        if (not all_ranks and not self.delay_batch_debug_all_ranks
+                and self.dist.rank != 0):
+            return
+        logger.info(f"[delay_batch_debug] iter={self.iter_counter} "
+                    f"global_rank={self.global_rank} rank={self.dist.rank} "
+                    f"{message}")
+
+    @staticmethod
+    def _debug_value_name(value):
+        if value is None:
+            return "None"
+        return getattr(value, "name", str(value))
+
+    @staticmethod
+    def _debug_bool_attr(req, attr: str) -> bool:
+        try:
+            value = getattr(req, attr, False)
+            if callable(value):
+                value = value()
+            return bool(value)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _debug_attr(req, attr: str, default=None):
+        try:
+            return getattr(req, attr)
+        except AttributeError:
+            return default
+        except Exception as e:
+            return f"<unavailable:{type(e).__name__}>"
+
+    @staticmethod
+    def _debug_draft_len(req) -> int:
+        try:
+            return get_draft_token_length(req)
+        except Exception:
+            try:
+                return len(getattr(req, "py_draft_tokens", []) or [])
+            except Exception:
+                return -1
+
+    def _delay_batch_request_debug(self, req):
+        if isinstance(req, RequestQueueItem):
+            return {
+                "id":
+                self._debug_attr(req, "id"),
+                "queue_item":
+                True,
+                "request_type":
+                self._debug_value_name(
+                    self._debug_attr(req.request, "request_type")),
+                "child_req_ids":
+                self._debug_attr(req, "child_req_ids"),
+            }
+
+        flags = []
+        for attr, label in (
+            ("is_attention_dp_dummy", "adp_dummy"),
+            ("is_cuda_graph_dummy", "cuda_graph_dummy"),
+            ("is_dummy", "dummy"),
+            ("is_context_only_request", "ctx_only"),
+            ("is_generation_only_request", "gen_only"),
+            ("is_disagg_generation_init_state", "disagg_gen_init"),
+            ("is_disagg_generation_transmission_in_progress",
+             "disagg_trans_in_progress"),
+            ("is_disagg_generation_transmission_complete",
+             "disagg_trans_complete"),
+            ("py_is_first_draft", "first_draft"),
+        ):
+            if self._debug_bool_attr(req, attr):
+                flags.append(label)
+
+        return {
+            "id":
+            self._debug_attr(req, "py_request_id",
+                             self._debug_attr(req, "request_id")),
+            "state":
+            self._debug_value_name(self._debug_attr(req, "state")),
+            "type":
+            self._debug_value_name(
+                self._debug_attr(req, "py_llm_request_type",
+                                 self._debug_attr(req, "llm_request_type"))),
+            "raw_type":
+            self._debug_value_name(self._debug_attr(req, "llm_request_type")),
+            "draft_tokens":
+            self._debug_draft_len(req),
+            "ctx_pos":
+            self._debug_attr(req, "context_current_position"),
+            "ctx_chunk":
+            self._debug_attr(req, "context_chunk_size"),
+            "ctx_remaining":
+            self._debug_attr(req, "context_remaining_length"),
+            "decode_iter":
+            self._debug_attr(req, "py_decoding_iter",
+                             self._debug_attr(req, "decoding_iter")),
+            "max_beam_tokens":
+            self._debug_attr(req, "max_beam_num_tokens"),
+            "flags":
+            flags,
+        }
+
+    def _delay_batch_generation_source(self, req) -> str:
+        if self._debug_bool_attr(req, "is_attention_dp_dummy"):
+            return "attention_dp_dummy"
+        if self._debug_bool_attr(req, "is_cuda_graph_dummy"):
+            return "cuda_graph_dummy"
+        if self._debug_bool_attr(req,
+                                 "is_disagg_generation_transmission_complete"):
+            return "disagg_transfer_complete_first_gen"
+        if self._debug_bool_attr(
+                req, "is_disagg_generation_transmission_in_progress"):
+            return "disagg_transfer_in_progress"
+        if self._debug_bool_attr(req, "is_disagg_generation_init_state"):
+            return "disagg_generation_init"
+        if self._debug_bool_attr(req, "py_is_first_draft"):
+            return "first_draft"
+        if self._debug_bool_attr(req, "is_generation_only_request"):
+            return "generation_only_decode"
+        state = getattr(req, "state", None)
+        if state == LlmRequestState.GENERATION_IN_PROGRESS:
+            return "decode_in_progress"
+        return f"state:{self._debug_value_name(state)}"
+
+    def _log_delay_batch_generation_sources(
+            self, generation_requests: list[LlmRequest], reason: str):
+        if not self.delay_batch_debug_enabled or not generation_requests:
+            return
+
+        draft_total = sum(
+            self._debug_draft_len(req) for req in generation_requests)
+        source_counts = Counter(
+            self._delay_batch_generation_source(req)
+            for req in generation_requests)
+        state_counts = Counter(
+            self._debug_value_name(getattr(req, "state", None))
+            for req in generation_requests)
+        type_counts = Counter(
+            self._debug_value_name(
+                getattr(req, "py_llm_request_type",
+                        getattr(req, "llm_request_type", None)))
+            for req in generation_requests)
+        schedule_view_tokens = len(generation_requests) + draft_total
+        prev_device_tensors = False
+        try:
+            sample_state = (self.previous_batch.sample_state
+                            if self.previous_batch is not None else None)
+            prev_device_tensors = bool(
+                sample_state and getattr(sample_state, "device", None))
+        except Exception:
+            prev_device_tensors = False
+
+        sample = [
+            self._delay_batch_request_debug(req)
+            for req in generation_requests[:8]
+        ]
+        self._last_delay_batch_debug = {
+            "decision":
+            reason,
+            "gen_requests":
+            len(generation_requests),
+            "py_draft_tokens":
+            draft_total,
+            "schedule_view_gen_tokens":
+            schedule_view_tokens,
+            "runtime_draft_len":
+            getattr(self.model_engine, "runtime_draft_len", None),
+            "spec_decode":
+            getattr(self.model_engine, "enable_spec_decode", None),
+            "previous_device_tensors":
+            prev_device_tensors,
+            "sources":
+            dict(source_counts),
+        }
+        self._delay_batch_log(
+            f"GEN token source reason={reason} "
+            f"requests={len(generation_requests)} "
+            f"py_draft_tokens={draft_total} "
+            f"schedule_view_gen_tokens={schedule_view_tokens} "
+            f"runtime_draft_len={getattr(self.model_engine, 'runtime_draft_len', None)} "
+            f"spec_decode={getattr(self.model_engine, 'enable_spec_decode', None)} "
+            f"previous_device_tensors={prev_device_tensors} "
+            f"sources={dict(source_counts)} states={dict(state_counts)} "
+            f"types={dict(type_counts)} sample={sample}",
+            all_ranks=True)
+
     @staticmethod
     def _is_delay_batch_dummy_generation_request(req: LlmRequest) -> bool:
         # Scheduler-time delay batching sees ADP/resource-manager dummies.
@@ -3443,6 +3713,85 @@ class PyExecutor:
             req for req in generation_requests
             if not cls._is_delay_batch_dummy_generation_request(req)
         ]
+
+    @staticmethod
+    def _is_delay_batch_context_only_request(req) -> bool:
+        if isinstance(req, RequestQueueItem):
+            request_type = getattr(req.request, "request_type", None)
+            if request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
+                return True
+            if request_type in (
+                    RequestType.REQUEST_TYPE_GENERATION_ONLY,
+                    RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION):
+                return False
+
+        request_type = getattr(req, "py_llm_request_type", None)
+        if request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+            return True
+        if request_type in (
+                LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+                LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION):
+            return False
+
+        request_type = getattr(req, "llm_request_type", None)
+        if request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+            return True
+        if request_type in (
+                LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+                LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION):
+            return False
+
+        try:
+            is_context_only = getattr(req, "is_context_only_request", False)
+            if callable(is_context_only):
+                is_context_only = is_context_only()
+        except Exception:
+            is_context_only = False
+        return bool(is_context_only)
+
+    def _sync_delay_batch_fetched_all_ctx(self, fetched_all_ctx: bool,
+                                          real_request_count: int):
+        if (not self.enable_attention_dp
+                or getattr(self.dist, "world_size", 1) == 1):
+            return fetched_all_ctx, real_request_count
+
+        payload = ([int(fetched_all_ctx),
+                    int(real_request_count)]
+                   if self.dist.tp_rank == 0 else None)
+        payload = self.dist.tp_broadcast(payload, root=0)
+        return bool(payload[0]), int(payload[1])
+
+    def _update_delay_batch_fetched_all_ctx(self, candidates: list,
+                                            reason: str) -> None:
+        if not self.enable_batch_wait_timeout or self.is_warmup:
+            return
+
+        real_candidates = [
+            req for req in candidates
+            if (not isinstance(req, RequestQueueItem) or
+                (req.is_normal_request and req.request is not None))
+            and not self._is_delay_batch_dummy_generation_request(req)
+        ]
+        if not real_candidates:
+            return
+
+        fetched_all_ctx = all(
+            self._is_delay_batch_context_only_request(req)
+            for req in real_candidates)
+        fetched_all_ctx, real_request_count = (
+            self._sync_delay_batch_fetched_all_ctx(fetched_all_ctx,
+                                                   len(real_candidates)))
+        changed = self._delay_batch_fetched_all_ctx_runtime_enabled != fetched_all_ctx
+        sample = ([
+            self._delay_batch_request_debug(req) for req in real_candidates[:4]
+        ] if self.delay_batch_debug_enabled else [])
+        self._delay_batch_log(
+            f"fetched all-CTX update enabled={fetched_all_ctx} "
+            f"changed={changed} reason={reason} "
+            f"real_requests={real_request_count} "
+            f"sample={sample}",
+            all_ranks=True)
+        self._delay_batch_fetched_all_ctx_runtime_enabled = fetched_all_ctx
 
     @staticmethod
     def _compute_scheduled_tokens(context_requests, generation_requests):
@@ -3520,6 +3869,20 @@ class PyExecutor:
             context_requests, [])
         target_tokens = self.batch_wait_max_tokens_ratio * self.max_num_tokens
         if num_scheduled_tokens >= target_tokens:
+            self._last_delay_batch_debug = {
+                "decision": "run_ctx_target_met",
+                "ctx_requests": len(context_requests),
+                "ctx_tokens": num_scheduled_tokens,
+                "target_tokens": target_tokens,
+                "timeout_ms": self.batch_wait_delay_timeout_ms,
+            }
+            self._delay_batch_log(
+                f"timeout decision: run ctx target met "
+                f"ctx_requests={len(context_requests)} "
+                f"ctx_tokens={num_scheduled_tokens} "
+                f"target_tokens={target_tokens:.1f} "
+                f"timeout_ms={self.batch_wait_delay_timeout_ms}",
+                all_ranks=True)
             self.batch_wait_deadline_s = None
             return context_requests, False
 
@@ -3527,35 +3890,73 @@ class PyExecutor:
         if self.batch_wait_deadline_s is None:
             self.batch_wait_deadline_s = (
                 now + self.batch_wait_delay_timeout_ms / 1000.0)
+            self._delay_batch_log(
+                f"timeout window started ctx_requests={len(context_requests)} "
+                f"ctx_tokens={num_scheduled_tokens} "
+                f"target_tokens={target_tokens:.1f} "
+                f"deadline_in_ms={self.batch_wait_delay_timeout_ms}",
+                all_ranks=True)
 
         if now < self.batch_wait_deadline_s:
+            remaining_ms = (self.batch_wait_deadline_s - now) * 1000.0
+            self._last_delay_batch_debug = {
+                "decision": "skip_ctx_waiting_timeout",
+                "ctx_requests": len(context_requests),
+                "ctx_tokens": num_scheduled_tokens,
+                "target_tokens": target_tokens,
+                "remaining_ms": remaining_ms,
+            }
+            self._delay_batch_log(
+                f"timeout decision: skip iter waiting for ctx batch "
+                f"ctx_requests={len(context_requests)} "
+                f"ctx_tokens={num_scheduled_tokens} "
+                f"target_tokens={target_tokens:.1f} "
+                f"remaining_ms={remaining_ms:.3f}",
+                all_ranks=True)
             return [], True
 
+        self._last_delay_batch_debug = {
+            "decision": "run_ctx_timeout_expired",
+            "ctx_requests": len(context_requests),
+            "ctx_tokens": num_scheduled_tokens,
+            "target_tokens": target_tokens,
+            "timeout_ms": self.batch_wait_delay_timeout_ms,
+        }
+        self._delay_batch_log(
+            f"timeout decision: run ctx timeout expired "
+            f"ctx_requests={len(context_requests)} "
+            f"ctx_tokens={num_scheduled_tokens} "
+            f"target_tokens={target_tokens:.1f} "
+            f"timeout_ms={self.batch_wait_delay_timeout_ms}",
+            all_ranks=True)
         # Keep the expired deadline until the global delay-batch decision is
         # known. Another attention-DP rank can still force a global skip; if
         # that happens this rank must stay timeout-ready in the next iter.
         return context_requests, False
 
-    def _sync_delay_batch_skip(self, local_skip_iteration: bool,
-                               local_has_generation: bool) -> bool:
+    def _sync_delay_batch_skip(self, local_skip_iteration: bool) -> bool:
         if (not self.enable_attention_dp
                 or getattr(self.dist, "world_size", 1) == 1):
             return local_skip_iteration
-        all_delay_batch_states = self.dist.tp_allgather(
-            (int(local_skip_iteration), int(local_has_generation)))
-        if any(has_generation for _, has_generation in all_delay_batch_states):
-            return False
-        all_skip_flags = [
-            skip_iteration for skip_iteration, _ in all_delay_batch_states
-        ]
-        return any(all_skip_flags)
+        all_skip_flags = self.dist.tp_allgather(int(local_skip_iteration))
+        skip_iteration = any(all_skip_flags)
+        if skip_iteration:
+            self._delay_batch_log(
+                f"global skip enabled all_rank_delay_flags={all_skip_flags}")
+        return skip_iteration
 
     def _clear_scheduled_requests_for_skip(
             self, scheduled_requests: ScheduledRequests) -> None:
+        self._delay_batch_log(
+            f"clearing scheduled requests for skipped iter "
+            f"ctx_requests={scheduled_requests.num_context_requests} "
+            f"gen_requests={scheduled_requests.num_generation_requests}",
+            all_ranks=True)
         if (self._scheduler_manages_kv_suspend
                 and scheduled_requests.num_context_requests > 0):
             self._revert_ctx_alloc(scheduled_requests.context_requests)
         self._revert_gen_alloc(scheduled_requests)
+        self._cleanup_attention_dp_dummy_requests("delay_batch_skip")
         scheduled_requests.reset_context_requests([])
         scheduled_requests.generation_requests = []
 
@@ -3571,42 +3972,70 @@ class PyExecutor:
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
 
-        delay_batch_runtime_enabled = (self.enable_batch_wait_timeout
-                                       and not self.is_warmup)
-        real_generation_requests = self._real_generation_requests_for_delay_batch(
-            scheduler_output.generation_requests)
+        delay_batch_config_enabled = (self.enable_batch_wait_timeout
+                                      and not self.is_warmup)
+        delay_batch_runtime_enabled = (
+            delay_batch_config_enabled
+            and self._delay_batch_fetched_all_ctx_runtime_enabled)
         local_skip_iteration = False
         should_check_waiting = False
-        is_ctx_only = (len(scheduled_context_requests) > 0
-                       and len(real_generation_requests) == 0)
-        if delay_batch_runtime_enabled and is_ctx_only:
+        if (delay_batch_config_enabled and not delay_batch_runtime_enabled
+                and self.batch_wait_deadline_s is not None):
+            self._delay_batch_log(
+                f"timeout window reset reason=not_fetched_all_ctx "
+                f"fetched_all_ctx={self._delay_batch_fetched_all_ctx_runtime_enabled}",
+                all_ranks=True)
+            self.batch_wait_deadline_s = None
+
+        if delay_batch_runtime_enabled and self.delay_batch_debug_enabled:
+            self._delay_batch_log(
+                f"schedule candidate ctx_original={len(original_ctx_requests)} "
+                f"ctx_after_adp_balance={len(scheduled_context_requests)} "
+                f"gen={len(scheduler_output.generation_requests)} "
+                f"fetched_all_ctx={self._delay_batch_fetched_all_ctx_runtime_enabled} "
+                f"ctx_tokens={self._compute_scheduled_tokens(scheduled_context_requests, [])} "
+                f"max_tokens={self.max_num_tokens} "
+                f"target_ratio={self.batch_wait_max_tokens_ratio}",
+                all_ranks=True)
+            self._log_delay_batch_generation_sources(
+                scheduler_output.generation_requests, "scheduler_candidate")
+        if delay_batch_runtime_enabled:
             scheduled_context_requests, local_skip_iteration = (
                 self._waiting_context_requests_with_timeout(
                     scheduled_context_requests))
         else:
-            if delay_batch_runtime_enabled:
-                self.batch_wait_deadline_s = None
             # If no generation requests, no need to wait in iters mode, to
             # avoid dead waiting.
-            should_check_waiting = (not self.is_warmup
-                                    and not self.enable_attention_dp
-                                    and self.batch_wait_timeout_iters > 0
-                                    and self.batch_wait_max_tokens_ratio > 0
-                                    and len(scheduled_context_requests) > 0
-                                    and len(real_generation_requests) > 0)
+            should_check_waiting = (
+                not self.is_warmup and not self.enable_attention_dp
+                and self.batch_wait_timeout_iters > 0
+                and self.batch_wait_max_tokens_ratio > 0
+                and len(scheduled_context_requests) > 0
+                and len(scheduler_output.generation_requests) > 0)
             if should_check_waiting:
                 # With KV cache manager V2, scheduling has already grown context request KV cache capacity. Requests dropped
                 # for batch waiting still occupy KV cache and may reduce the batch size available for generation requests.
                 scheduled_context_requests = self._waiting_requests(
-                    scheduled_context_requests, real_generation_requests)
+                    scheduled_context_requests,
+                    scheduler_output.generation_requests)
 
-        skip_iteration = (self._sync_delay_batch_skip(
-            local_skip_iteration,
-            len(real_generation_requests) > 0)
+        skip_iteration = (self._sync_delay_batch_skip(local_skip_iteration)
                           if delay_batch_runtime_enabled else False)
 
-        if (delay_batch_runtime_enabled and is_ctx_only
-                and not local_skip_iteration and not skip_iteration):
+        if delay_batch_runtime_enabled:
+            self._delay_batch_log(
+                f"final schedule decision "
+                f"decision={'skip' if skip_iteration else 'run'} "
+                f"local_skip={local_skip_iteration} "
+                f"global_skip={skip_iteration} "
+                f"ctx_original={len(original_ctx_requests)} "
+                f"ctx_selected={len(scheduled_context_requests)} "
+                f"gen={len(scheduler_output.generation_requests)} "
+                f"fetched_all_ctx={self._delay_batch_fetched_all_ctx_runtime_enabled}",
+                all_ranks=True)
+
+        if (delay_batch_runtime_enabled and not local_skip_iteration
+                and not skip_iteration):
             self.batch_wait_deadline_s = None
 
         if skip_iteration:
@@ -3634,6 +4063,9 @@ class PyExecutor:
             self._clear_scheduled_requests_for_skip(scheduled_requests)
             fitting_disagg_gen_init_requests = []
             self._skip_current_iteration = True
+        else:
+            self._log_delay_batch_generation_sources(
+                scheduled_requests.generation_requests, "scheduled_forward")
 
         return scheduled_requests, fitting_disagg_gen_init_requests, num_fitting
 
@@ -3822,6 +4254,11 @@ class PyExecutor:
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
+            self._delay_batch_log(
+                f"added attention-DP dummy request is_gen={self._adp_dummy_is_gen} "
+                f"token_nums={token_nums} "
+                f"request={self._delay_batch_request_debug(llm_request)}",
+                all_ranks=True)
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
@@ -3859,6 +4296,19 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
+                first_gen_tokens = req.context_phase_params.first_gen_tokens
+                ctx_draft_tokens = req.context_phase_params.draft_tokens
+                draft_len = 0 if ctx_draft_tokens is None else len(
+                    ctx_draft_tokens)
+                ctx_draft_sample = ([] if ctx_draft_tokens is None else
+                                    list(ctx_draft_tokens)[:8])
+                self._delay_batch_log(
+                    f"disagg GEN source: transition complete, prepending "
+                    f"context_phase first_gen_tokens={list(first_gen_tokens)} "
+                    f"ctx_draft_tokens_len={draft_len} "
+                    f"ctx_draft_tokens_sample={ctx_draft_sample} "
+                    f"request={self._delay_batch_request_debug(req)}",
+                    all_ranks=True)
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 if self.kv_cache_transceiver is not None:
@@ -3867,8 +4317,6 @@ class PyExecutor:
                 req.py_decoding_iter = 1
                 req.py_kv_transfer_start_time = None
                 req.py_kv_transfer_timed_out = False
-                first_gen_tokens = req.context_phase_params.first_gen_tokens
-                ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):

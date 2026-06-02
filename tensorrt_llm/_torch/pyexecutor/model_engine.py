@@ -2034,8 +2034,19 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states.update({
             'num_ctx_requests': 0,
             'num_ctx_tokens': 0,
-            'num_generation_tokens': num_generation_tokens
+            'num_generation_tokens': num_generation_tokens,
         })
+        if getattr(self, 'delay_batch_debug_enabled', False):
+            self.iter_states['num_generation_token_source'] = {
+                'path': 'incremental',
+                'scheduled_generation_requests':
+                scheduled_requests.num_generation_requests,
+                'num_generation_tokens': num_generation_tokens,
+                'num_extend_ctx_requests': num_extend_ctx_requests,
+                'formula': 'incremental_path_num_generation_tokens',
+            }
+        else:
+            self.iter_states.pop('num_generation_token_source', None)
 
         return lora_params
 
@@ -3274,6 +3285,29 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_generation_tokens'] = num_generation_tokens
         # Count the already-cached prefix for the sequences scheduled this iteration.
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
+        if getattr(self, 'delay_batch_debug_enabled', False):
+            self.iter_states['num_generation_token_source'] = {
+                'path':
+                'prepare_inputs',
+                'scheduled_generation_requests':
+                scheduled_requests.num_generation_requests,
+                'plain_generation_requests':
+                len(generation_requests),
+                'extend_generation_requests':
+                len(extend_requests),
+                'first_draft_requests':
+                len(first_draft_requests),
+                'draft_tokens':
+                sum(draft_lens),
+                'runtime_draft_len':
+                self.runtime_draft_len,
+                'previous_device_draft':
+                next_draft_tokens_device is not None,
+                'formula':
+                'plain_generation_requests + extend_generation_requests + draft_tokens + first_draft_requests',
+            }
+        else:
+            self.iter_states.pop('num_generation_token_source', None)
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
