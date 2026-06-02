@@ -6320,6 +6320,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     def test_bf16(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B"
         with LLM(model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=128,
                  kv_cache_config=self.kv_cache_config,
@@ -6332,6 +6333,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     def test_fp8(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         with LLM(model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=128,
                  kv_cache_config=self.kv_cache_config,
@@ -6353,6 +6355,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         extra_acc_spec = "h20" if is_h20_gpu else None
 
         with LLM(target_model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=8,
                  kv_cache_config=self.kv_cache_config,
@@ -6452,6 +6455,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         extra_acc_spec = "h20" if is_h20_gpu else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6481,6 +6485,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         ) if mtp_flag else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6508,6 +6513,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=128)
         with LLM(model_dir,
+                 trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6547,6 +6553,7 @@ class TestQwen3_5_9B(LlmapiAccuracyTestHarness):
         ) if mtp_flag else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_num_tokens=4096,
                  max_batch_size=128,
@@ -6608,6 +6615,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                               if cuda_graph else None)
 
         with LLM(model_path,
+                 trust_remote_code=True,
                  tensor_parallel_size=tp_size,
                  max_num_tokens=16384,
                  max_batch_size=32,
@@ -7132,6 +7140,35 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
+
+    @skip_pre_hopper
+    @skip_post_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_nvfp4_4gpus_hopper_w4a16(self):
+        """W4A16 NVFP4 dequant fallback on Hopper (SM 90), MTP draft_len=4."""
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="float16",
+            free_gpu_memory_fraction=0.5,
+        )
+        max_batch_size = 32
+        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
+                                            enable_padding=True)
+        mtp_config = MTPDecodingConfig(max_draft_len=4)
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config)
+        with LLM(
+                model_path,
+                kv_cache_config=kv_cache_config,
+                max_batch_size=max_batch_size,
+                tensor_parallel_size=4,
+                speculative_config=mtp_config,
+                **pytorch_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(4)

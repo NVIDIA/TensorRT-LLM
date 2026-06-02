@@ -13,6 +13,7 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     can_process_attention_dp_request,
+    derive_attention_dp_per_rank_request_cap,
     get_from_waiting_queue,
     merge_helix_requests,
     merge_requests,
@@ -379,3 +380,83 @@ def test_can_process_attention_dp_request(attention_dp_config):
     assert not can_process_attention_dp_request(
         req_no_capacity, all_ranks_full, max_num_active_requests
     )
+
+
+# --------------------------------------------------------------------------
+# nvbug-6133201: per-rank gen-phase step-token cap via tightened
+# per-rank request cap.
+# --------------------------------------------------------------------------
+# Under enable_attention_dp the global Python scheduler caps tokens
+# cluster-wide and the ADP router caps per-rank requests, but no
+# component caps per-rank gen-phase step-tokens.  PyExecutor tightens
+# the per-rank request cap to
+# ``max_num_tokens // (1 + max_total_draft_tokens)`` so per-rank step-
+# token load cannot exceed max_num_tokens by construction.
+
+
+class TestDeriveAttentionDpPerRankRequestCap:
+    """Unit tests for ``derive_attention_dp_per_rank_request_cap``.
+
+    The fix for nvbug-6133201 is the cap arithmetic implemented in this
+    helper; PyExecutor calls it once at ``__init__`` and the result
+    flows through the existing ``max_num_active_requests`` plumbing.
+    """
+
+    def test_no_tightening_when_max_num_tokens_is_none(self):
+        # LlmArgs.max_num_tokens == None -> helper is a no-op.
+        assert (
+            derive_attention_dp_per_rank_request_cap(
+                base_cap=128, max_num_tokens=None, max_total_draft_tokens=3
+            )
+            == 128
+        )
+
+    def test_nvbug_6133201_failing_config(self):
+        # nvbug-6133201 numbers: max_batch_size=128,
+        # max_total_draft_tokens=3 (MTP3), max_num_tokens=256.
+        # Per-rank step-token cost per req = 1 + 3 = 4.
+        # Effective cap = 256 // 4 = 64; per-rank load at saturation
+        # 64 * 4 = 256 = max_num_tokens, so the per-rank assert in
+        # model_engine.py cannot trip on gen-phase accumulation.
+        assert (
+            derive_attention_dp_per_rank_request_cap(
+                base_cap=128, max_num_tokens=256, max_total_draft_tokens=3
+            )
+            == 64
+        )
+
+    def test_no_tightening_when_arithmetic_already_fits(self):
+        # Correctly-sized LlmArgs (max_batch_size * (1+max_total_draft_tokens)
+        # <= max_num_tokens): cap == base_cap, no behavioral change.
+        assert (
+            derive_attention_dp_per_rank_request_cap(
+                base_cap=128, max_num_tokens=512, max_total_draft_tokens=3
+            )
+            == 128
+        )
+        assert (
+            derive_attention_dp_per_rank_request_cap(
+                base_cap=128, max_num_tokens=4096, max_total_draft_tokens=3
+            )
+            == 128
+        )
+
+    def test_no_spec_decoding(self):
+        # max_total_draft_tokens == 0: step-token cost per req == 1,
+        # effective cap == max_num_tokens.
+        assert (
+            derive_attention_dp_per_rank_request_cap(
+                base_cap=128, max_num_tokens=64, max_total_draft_tokens=0
+            )
+            == 64
+        )
+
+    def test_negative_max_total_draft_tokens_clamped(self):
+        # Defensive: a stray negative value must not yield div-by-zero
+        # or a negative cap.
+        assert (
+            derive_attention_dp_per_rank_request_cap(
+                base_cap=128, max_num_tokens=256, max_total_draft_tokens=-5
+            )
+            == 128
+        )
