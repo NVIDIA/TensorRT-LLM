@@ -1867,6 +1867,19 @@ class PyTorchModelEngine(ModelEngine):
             return list(self.dist.tp_allgather(num_ctx_requests))
         return None
 
+    def _set_spec_metadata_all_rank_num_tokens(
+            self, spec_metadata: SpecMetadata,
+            spec_all_rank_num_tokens: List[int],
+            all_rank_num_seqs: List[int]) -> None:
+        # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
+        # draft loop iterations i>0 (per-sequence counts, since each
+        # sequence contributes one token per iteration).
+        spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
+        spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+        if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
+                or spec_metadata.spec_dec_mode.is_eagle3_one_model()):
+            spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
+
     def _get_padding_params(
         self, total_num_tokens: int, num_ctx_requests: int,
         attn_all_rank_num_tokens: Optional[List[int]]
@@ -2075,20 +2088,9 @@ class PyTorchModelEngine(ModelEngine):
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
-                spec_metadata.all_rank_num_tokens = [
-                    item[0] for item in all_rank_num_tokens
-                ]
-                spec_metadata.all_rank_num_seqs = [
-                    item[1] for item in all_rank_num_tokens
-                ]
-                # Both Eagle3 one-model and MTP-eagle one-model use
-                # subseq_all_rank_num_tokens for draft loop iterations i>0
-                # (per-sequence counts since each sequence contributes one
-                # token per iteration).
-                if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
-                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()):
-                    spec_metadata.subseq_all_rank_num_tokens = (
-                        spec_metadata.all_rank_num_seqs)
+                self._set_spec_metadata_all_rank_num_tokens(
+                    spec_metadata, [item[0] for item in all_rank_num_tokens],
+                    [item[1] for item in all_rank_num_tokens])
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
@@ -3310,16 +3312,9 @@ class PyTorchModelEngine(ModelEngine):
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     [spec_metadata.num_tokens,
                      len(sequence_lengths)])
-
-                spec_all_rank_num_tokens = [
-                    item[0] for item in all_rank_num_tokens
-                ]
-                all_rank_num_seqs = [item[1] for item in all_rank_num_tokens]
-                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-                if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
-                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()):
-                    spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
+                self._set_spec_metadata_all_rank_num_tokens(
+                    spec_metadata, [item[0] for item in all_rank_num_tokens],
+                    [item[1] for item in all_rank_num_tokens])
 
         if mm_token_indices is not None:
             mask = torch.ones(total_num_tokens, dtype=torch.bool)
@@ -3481,19 +3476,12 @@ class PyTorchModelEngine(ModelEngine):
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
-                attn_all_rank_num_tokens = [
+                attn_metadata.all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
-                spec_all_rank_num_tokens = [
-                    item[1] for item in all_rank_num_tokens
-                ]
-                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
-                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
-                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-                if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
-                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()):
-                    spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
+                self._set_spec_metadata_all_rank_num_tokens(
+                    spec_metadata, [item[1] for item in all_rank_num_tokens],
+                    [item[2] for item in all_rank_num_tokens])
             else:
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     attn_metadata.num_tokens)
