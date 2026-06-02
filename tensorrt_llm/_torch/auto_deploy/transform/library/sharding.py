@@ -2813,8 +2813,14 @@ def _process_mla_sharding(
     # intentionally kept replicated and must not abort MLA processing of the
     # remaining linears (q_b/kv_b/o_proj). Count only the ones we actually
     # attempted to shard when validating against the "already sharded" guard.
+    # exclude_shard_node_filter matches the WEIGHT name (e.g. "q_a_proj"), not the
+    # generic FX linear-node name (torch_linear_simple), so resolve the weight name.
+    def _excl_name(n):
+        w = extract_weight_name(n)
+        return w if isinstance(w, str) else n.name
+
     a_proj_candidates = [q_a_proj, kv_a_proj]
-    a_proj_to_shard = [n for n in a_proj_candidates if not _is_node_excluded(n.name, config)]
+    a_proj_to_shard = [n for n in a_proj_candidates if not _is_node_excluded(_excl_name(n), config)]
     num_simple_shards = (
         _process_simple_shard(a_proj_to_shard, transform_container, layer_type=LayerType.MLA)
         if a_proj_to_shard
