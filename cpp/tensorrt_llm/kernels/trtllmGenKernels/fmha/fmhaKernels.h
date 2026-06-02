@@ -18,9 +18,11 @@
 
 #include "cuda_runtime_api.h"
 #include "tensorrt_llm/common/config.h"
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <linux/limits.h>
 #include <memory>
 #include <mutex>
@@ -387,7 +389,7 @@ private:
         TLLM_LOG_DEBUG(
             "TRTLLM-Gen Fmha Warmup Params: maxBatchSize=%d, maxSeqLenKv=%d, useGenKernelForPrefill=%d, maxSeqLenQ=%d",
             maxBatchSize, maxSeqLenKv, useGenKernelForPrefill, maxSeqLenQ);
-        TLLM_CHECK_WITH_INFO(maxBatchSize != 0 && maxSeqLenKv != 0 && (!useGenKernelForPrefill || maxSeqLenQ != 0),
+        TLLM_CHECK_WITH_INFO(maxBatchSize > 0 && maxSeqLenKv > 0 && (!useGenKernelForPrefill || maxSeqLenQ > 0),
             "TRTLLM-Gen Fmha Warmup Param is invalid.");
 
         auto const& batchSizeDefaults
@@ -410,8 +412,14 @@ private:
                 for (int seqLenKv : seqLenKvCandidates)
                 {
                     warmupParams.mMaxSeqLenKv = seqLenKv;
-                    warmupParams.mSumOfSeqLensQ = warmupParams.mBatchSize * warmupParams.mMaxSeqLenQ;
-                    warmupParams.mSumOfSeqLensKv = warmupParams.mBatchSize * warmupParams.mMaxSeqLenKv;
+                    int64_t const sumOfSeqLensQ
+                        = static_cast<int64_t>(warmupParams.mBatchSize) * warmupParams.mMaxSeqLenQ;
+                    int64_t const sumOfSeqLensKv
+                        = static_cast<int64_t>(warmupParams.mBatchSize) * warmupParams.mMaxSeqLenKv;
+                    warmupParams.mSumOfSeqLensQ
+                        = static_cast<int>(std::min<int64_t>(sumOfSeqLensQ, std::numeric_limits<int>::max()));
+                    warmupParams.mSumOfSeqLensKv
+                        = static_cast<int>(std::min<int64_t>(sumOfSeqLensKv, std::numeric_limits<int>::max()));
                     if (useGenKernelForPrefill && warmupParams.mMaxSeqLenKv < warmupParams.mMaxSeqLenQ)
                     {
                         continue;
