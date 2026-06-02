@@ -1,13 +1,20 @@
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from typing import TYPE_CHECKING
 
-from .dsa import DSACacheManager, DSATrtllmAttention
-from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
-                     RocketVanillaAttention)
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+
+# Imports of the concrete backends / cache managers are kept local to each
+# function: they pull in ``trtllm`` and ``resource_manager``, which import
+# ``interface`` and would otherwise form an import cycle when this package is
+# loaded.
 
 
 def get_sparse_attn_kv_cache_manager(
         sparse_attn_config: "SparseAttentionConfig"):
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
+    from .dsa import DSACacheManager
+    from .rocket import RocketKVCacheManager
     if sparse_attn_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attn_config.algorithm == "dsa":
@@ -22,6 +29,7 @@ def get_sparse_attn_kv_cache_manager(
 
 def get_vanilla_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
+    from .rocket import RocketVanillaAttention
     if sparse_attn_config.algorithm == "rocket":
         return RocketVanillaAttention
     else:
@@ -32,6 +40,10 @@ def get_vanilla_sparse_attn_attention_backend(
 
 def get_trtllm_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+
+    from .dsa import DSATrtllmAttention
+    from .rocket import RocketTrtllmAttention
     if sparse_attn_config.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_attn_config.algorithm == "dsa":

@@ -1551,9 +1551,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
         else:
             # Every kwarg sources from ``self`` / ``metadata`` /
-            # ``forward_args`` (with ``forward_args.sparse`` for sparse-attn
-            # inputs) or a literal allowlisted in ``_THOP_LITERALS``.
-            # ``test_attention_op_sync.py`` enforces this statically.
+            # ``forward_args`` (with ``forward_args.sparse_prediction`` for
+            # sparse-attn inputs) or a literal allowlisted in
+            # ``_THOP_LITERALS``. ``test_attention_op_sync.py`` enforces this
+            # statically.
             thop.attention(
                 q=q,
                 k=k,

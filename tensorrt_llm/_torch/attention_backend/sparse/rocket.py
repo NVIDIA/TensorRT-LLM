@@ -1,5 +1,5 @@
 import math
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -23,6 +23,9 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 from .kernel import (triton_bmm, triton_flatten_to_batch, triton_index_gather,
                      triton_rocket_batch_to_flatten,
