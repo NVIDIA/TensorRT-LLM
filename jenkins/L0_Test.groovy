@@ -650,14 +650,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
                 // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
                 // 15h * 60min/h / 3min = 300 iterations.
-                //
-                // Use native Thread.sleep instead of the pipeline `sleep` step so the polling
-                // loop does not emit one flow-node per iteration. Otherwise this stage would
-                // contribute ~300 sleep entries to the Jenkins flow graph, which (a) bloats
-                // the Blue Ocean / Stage View display past its node-count cap and (b) makes
-                // the rest of the stage hard to read. The wait is no longer checkpoint-
-                // resumable across a Jenkins controller restart, which is an acceptable
-                // trade-off for a polling loop that only waits for node bring-up.
                 while (!CloudManager.isNodeOnline(nodeName) && counter < 300) {
                     // Wait 3 minutes to check status of the node again.
                     Thread.sleep(3L * 60L * 1000L)
