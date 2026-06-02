@@ -294,6 +294,20 @@ class BaseMultimodalInputProcessor(ABC):
         """
         ...
 
+    def promote_nested_mm_data(self, mm_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Promote nested modality payloads to first-class top-level items.
+
+        Returns the (possibly rebuilt) `mm_data`. The base implementation is a
+        no-op (returns `mm_data` unchanged). Models whose raw `multi_modal_data`
+        carries one modality embedded inside another (e.g. Nano's video-embedded
+        audio, modeled as a separate `(audio, k)` prompt item) override this to
+        hoist the nested payload so that both `find_mm_token_lengths` and
+        `MultimodalPromptOrder.resolve` see the promoted items. Called once at
+        the top of `call_with_token_ids`; the promoted `mm_data` is reused for
+        length computation, order resolution, and placeholder expansion alike.
+        """
+        return mm_data
+
     def call_with_token_ids(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
@@ -333,7 +347,11 @@ class BaseMultimodalInputProcessor(ABC):
             )
 
         prompt_token_ids = inputs["prompt_token_ids"]
-        mm_data = inputs["multi_modal_data"]
+        # Promote any modality payload nested inside another modality's items
+        # (e.g. Nano's video-embedded audio) to a first-class top-level item
+        # before counts, lengths, and order resolution are derived, so the
+        # promoted `mm_data` flows consistently into every downstream step.
+        mm_data = self.promote_nested_mm_data(inputs["multi_modal_data"])
         mm_counts = _mm_data_to_counts(mm_data)
 
         # Run the HF processor / vision encoder on a synthetic placeholder

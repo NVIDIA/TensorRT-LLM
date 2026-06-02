@@ -75,22 +75,13 @@ class TestMultimodalPromptOrder:
         result = MultimodalPromptOrder.from_raw_entries([("image", 0), ("video", 2)], source="x")
         assert list(result) == [("image", 0), ("video", 2)]
 
-    def test_from_raw_entries_layout_item_types_form(self):
-        result = MultimodalPromptOrder.from_raw_entries(
-            [0, 1, 2], source="layout_metadata.item_types"
-        )
-        assert list(result) == [("image", 0), ("video", 0), ("audio", 0)]
-
     def test_from_raw_entries_rejects_unsupported_types(self):
-        # float is none of dict/str/int-with-item_types/2-tuple
+        # float is none of dict/str/2-tuple
         with pytest.raises(ValueError):
             MultimodalPromptOrder.from_raw_entries([3.5], source="x")
-        # int with non-item_types source: falls to tuple unpack → ValueError
+        # bare int: falls to tuple unpack → ValueError
         with pytest.raises(ValueError):
             MultimodalPromptOrder.from_raw_entries([7], source="x")
-        # unknown int item_type code via layout_metadata.item_types
-        with pytest.raises(ValueError, match="unknown item type: 7"):
-            MultimodalPromptOrder.from_raw_entries([7], source="layout_metadata.item_types")
 
     def test_from_metadata_prefers_multimodal_item_order(self):
         # Mixed dict + tuple entry shapes resolve to the same (modality, index) pairs.
@@ -105,11 +96,6 @@ class TestMultimodalPromptOrder:
         )
         assert list(result) == [("image", 1), ("video", 0), ("image", 0)]
         assert isinstance(result, MultimodalPromptOrder)
-
-    def test_from_metadata_falls_back_to_layout_item_types(self):
-        # 0=IMAGE, 1=VIDEO, 2=AUDIO
-        result = MultimodalPromptOrder.from_metadata({"layout_metadata": {"item_types": [0, 1, 2]}})
-        assert list(result) == [("image", 0), ("video", 0), ("audio", 0)]
 
     def test_from_metadata_returns_none_when_absent(self):
         assert MultimodalPromptOrder.from_metadata(None) is None

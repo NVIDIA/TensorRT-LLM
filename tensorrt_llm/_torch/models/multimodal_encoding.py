@@ -19,12 +19,18 @@ Per-model code supplies (a) an extractor that walks each :class:`MultimodalParam
 and yields :class:`ModalityItem` instances, and (b) per-modality encoder adapters
 that bridge a bucket of items to the model's existing encoder call. This module
 owns partition, index-tensor build, and per-modality scatter assembly.
+
+Every item owns exactly one prompt slot. There are no ghosts and no shared slots:
+an item's `rows` is both the number of rows its encoder emits and the size of its
+scatter destination range. Interleaved repeated modalities (`image -> video ->
+image`, `video(+audio)` promoted to a first-class `(audio, k)` item) are handled
+by the plain per-item scatter — no post-process re-placement.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Protocol, Tuple
 
 import torch
 
@@ -34,48 +40,71 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalPromptOrd
 @dataclass(frozen=True, slots=True)
 class ModalityItem:
     """One single-modality payload (one image, video, or audio) as a unit of
-    work in a `MixedModalityAssembly`, tagged with its source request
-    (`src_param_idx`) and prompt-order position (`item_idx_in_param`).
+    work in a `MixedModalityAssembly`.
 
-    Carries the join keys (``src_param_idx``, ``item_idx_in_param``) that
-    let the assembly reconcile modality-grouping (encoder batching) with
-    source-param grouping (cache contract + MultimodalPromptOrder reassembly).
+    Canonical six-field item: every item owns exactly one prompt slot
+    (`prompt_pos`) and its `rows` is both the encoder-output row count and its
+    scatter-destination footprint. There are no flags, no ghosts, and no shared
+    slots.
 
-    Ghost items (`item_idx_in_param == -1`) exist in encoder space but have no
-    independent slot in prompt-order space. A ghost is a bookkeeping handle: it
-    says "encode me in my modality's bucket, but do NOT scatter my rows to my own
-    prompt-order slot - a model-specific post-process will merge them into a paired
-    host item's destination range instead." The ghost's embedding rows DO end up in
-    the final tensor; they are just placed by interleaving into the host item's
-    range rather than by a direct scatter to a slot of their own. The sole current
-    instance is Nano's audio-extracted-from-video: the audio rides the audio encoder
-    bucket, and `_nano_post_encode` interleaves its rows into the paired video
-    item's destination range.
+    Fields:
+        src_param_idx: which request in the batch this item belongs to.
+        modality: which encoder bucket the item rides (image / video / audio).
+        mm_idx_per_modality: which blob in `multimodal_data[modality]` this item
+            is, used to slice the per-item encoder payload.
+        prompt_pos: this item's rank in the prompt-order stream; it OWNS this
+            slot, so each `prompt_pos` appears at most once per source param.
+        rows: encoder-output row count == this item's scatter footprint.
+        payload: the single-item encoder input (already sliced).
 
-    ``token_count`` is the post-process row count contributed to the
-    final scatter destination. ``encoder_token_count`` is the row count
-    the per-modality encoder is expected to emit BEFORE any
-    post-process expansion (defaults to ``token_count``). The two values
-    differ for Nano video items whose post-process step interleaves
-    audio rows from the paired ghost audio item — the video encoder
-    only emits vision rows, but the final scatter destination for that
-    item covers vision + audio.
+    Placement (bucket slot, destination range) is derived by the assembly and is
+    never stored on the item.
     """
 
     src_param_idx: int
-    item_idx_in_param: int
     modality: str
-    token_count: int
+    mm_idx_per_modality: int
+    prompt_pos: int
+    rows: int
     payload: Mapping[str, Any]
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-    encoder_token_count: Optional[int] = None
-
-    @property
-    def encoder_rows(self) -> int:
-        return self.token_count if self.encoder_token_count is None else self.encoder_token_count
 
 
 ItemExtractor = Callable[[int, MultimodalParams], Iterable[ModalityItem]]
+
+
+class PayloadSlicer(Protocol):
+    """Per-model contract for turning a `MultimodalParams` into per-item slices.
+
+    A model's extractor walks the prompt-order stream and, for each entry, asks
+    its slicer for that single item's encoder payload (already sliced from the
+    aggregate `multimodal_data[modality]` blob) and the row count that payload
+    produces. The concrete `NanoPayloadSlicer` / `Qwen3VLPayloadSlicer`
+    implementations live in their respective model files; this module only
+    declares the shape they satisfy so the extractor + assembly stay
+    model-agnostic.
+    """
+
+    def slice_payload(
+        self,
+        param: MultimodalParams,
+        modality: str,
+        mm_idx_per_modality: int,
+    ) -> Mapping[str, Any]:
+        """Return the single-item encoder input for the `mm_idx_per_modality`-th
+        blob of `modality` in `param` (zero-copy where the source already stores
+        per-item lists)."""
+        ...
+
+    def rows_for(
+        self,
+        param: MultimodalParams,
+        modality: str,
+        mm_idx_per_modality: int,
+        prompt_pos: int,
+    ) -> int:
+        """Return the encoder-output row count for that single item (its scatter
+        footprint)."""
+        ...
 
 
 @dataclass
@@ -87,18 +116,14 @@ class MixedModalityAssembly:
 
     Built once via :meth:`from_params`; subsequently exposes precomputed
     index tensors that drive a vectorized per-modality scatter assembly
-    in :func:`assemble_embeddings`.
-
-    Ghost items (``item_idx_in_param == -1``) participate in the encoder
-    bucket call but do NOT contribute to ``_param_lengths`` or (later)
-    ``_dst_indices`` — their rows are consumed by the model-specific
-    post-process step instead.
+    in :func:`assemble_embeddings`. Every item contributes its `rows` to both its
+    modality bucket (`_bucket_offsets`) and its source-param destination range
+    (`_param_lengths` / `_dst_indices`) — there is no encoder-vs-destination
+    distinction.
     """
 
     items: Tuple[ModalityItem, ...]
-    n_params: int
-    _param_lengths: torch.Tensor  # int64[n_params]
-    _param_offsets: torch.Tensor  # int64[n_params]
+    _param_lengths: torch.Tensor  # int64[len(multimodal_params)]
     _modality_slots: Dict[str, torch.Tensor]
     _bucket_offsets: Dict[str, torch.Tensor]
     total_tokens: int
@@ -115,60 +140,54 @@ class MixedModalityAssembly:
         param_lengths: List[int] = [0] * len(multimodal_params)
         modality_slots: Dict[str, List[int]] = {}
         bucket_token_counts: Dict[str, List[int]] = {}
-        per_param_non_ghost: List[List[int]] = [[] for _ in multimodal_params]
+        per_param_items: List[List[int]] = [[] for _ in multimodal_params]
 
         for param_idx, param in enumerate(multimodal_params):
             for item in extract(param_idx, param):
                 flat_idx = len(items)
                 items.append(item)
                 modality_slots.setdefault(item.modality, []).append(flat_idx)
-                # `_bucket_offsets` indexes the RAW (pre-postprocess) encoder
-                # output, which has `encoder_rows` rows per item — not the
-                # post-process `token_count` (the two differ for Nano video
-                # items whose destination spans interleaved audio rows). Build
-                # the bucket offsets from `encoder_rows` so any consumer slicing
-                # the encoder bucket via `_bucket_offsets` stays aligned.
-                bucket_token_counts.setdefault(item.modality, []).append(item.encoder_rows)
-                if item.item_idx_in_param != -1:
-                    param_lengths[param_idx] += item.token_count
-                    per_param_non_ghost[param_idx].append(flat_idx)
+                # `_bucket_offsets` indexes the per-modality encoder output, which
+                # has `rows` rows per item. Each item owns its rows outright, so
+                # the bucket offsets are simply the prefix sum of `rows`.
+                bucket_token_counts.setdefault(item.modality, []).append(item.rows)
+                param_lengths[param_idx] += item.rows
+                per_param_items[param_idx].append(flat_idx)
 
-        # Validate non-ghost item_idx_in_param uniqueness per param
-        for param_idx, flat_idxs in enumerate(per_param_non_ghost):
-            seen = set()
+        # Per-param uniqueness invariants. `mm_idx_per_modality` indexes into a
+        # source param's own `multimodal_data[modality]`, so it is unique WITHIN
+        # a param (the same `(image, 0)` legitimately recurs across batched
+        # requests); `prompt_pos` is likewise a per-param prompt rank.
+        for param_idx, flat_idxs in enumerate(per_param_items):
+            seen_pos: set = set()
+            seen_modality_group: set = set()
             for fi in flat_idxs:
-                pos = items[fi].item_idx_in_param
-                if pos in seen:
-                    raise ValueError(f"duplicate item_idx_in_param={pos} in param {param_idx}")
-                seen.add(pos)
-
-        # Enforce the per-bucket ghost-ordering invariant by construction:
-        # stable-partition each modality bucket so non-ghost items
-        # (`item_idx_in_param != -1`) lead and ghost items (`== -1`) form a
-        # single TRAILING contiguous block. `_bucket_offsets` and `_dst_indices`
-        # are derived from `modality_slots` below, so partitioning the slots here
-        # makes "leading bucket rows == non-ghost" hold structurally — both the
-        # scatter slice (`bucket[:dst.numel()]`) and the Nano post-process
-        # truncation (`bucket[:n_non_ghost_rows]`) become correct without
-        # depending on the extractor's yield order. The ghost-block start is
-        # implicitly `dst.numel()`, so no extra index tensor is needed.
-        for modality, slot_idxs in modality_slots.items():
-            nonghost = [fi for fi in slot_idxs if items[fi].item_idx_in_param != -1]
-            ghost = [fi for fi in slot_idxs if items[fi].item_idx_in_param == -1]
-            partitioned = nonghost + ghost  # stable within each group
-            modality_slots[modality] = partitioned
-            bucket_token_counts[modality] = [items[fi].encoder_rows for fi in partitioned]
-            # Fail-loud guard: catch any future code path that re-introduces a
-            # ghost-before-non-ghost ordering instead of silently mis-scattering.
-            seen_ghost = False
-            for fi in partitioned:
-                is_ghost = items[fi].item_idx_in_param == -1
-                if seen_ghost and not is_ghost:
+                item = items[fi]
+                if item.prompt_pos in seen_pos:
+                    raise ValueError(f"duplicate prompt_pos={item.prompt_pos} in param {param_idx}")
+                seen_pos.add(item.prompt_pos)
+                key = (item.modality, item.mm_idx_per_modality)
+                if key in seen_modality_group:
                     raise ValueError(
-                        f"bucket {modality!r}: non-ghost item follows a ghost; "
-                        "non-ghost items must lead each modality bucket"
+                        f"duplicate (modality, mm_idx_per_modality)={key} in param "
+                        f"{param_idx}; each modality blob is owned by one item"
                     )
-                seen_ghost = seen_ghost or is_ghost
+                seen_modality_group.add(key)
+
+        # Cross-check: a param's summed item rows must equal its declared
+        # `total_embeds_in_request` (the encoder-output row count). Skipped when
+        # the runtime metadata is absent (e.g. lightweight unit-test stubs), per
+        # the same contract as `_validate_primary_embedding_rows`.
+        for param_idx, param in enumerate(multimodal_params):
+            runtime = getattr(param, "multimodal_runtime", None)
+            total = getattr(runtime, "total_embeds_in_request", None) if runtime else None
+            if total is None:
+                continue
+            if param_lengths[param_idx] != int(total):
+                raise ValueError(
+                    f"param {param_idx}: sum(rows)={param_lengths[param_idx]} != "
+                    f"total_embeds_in_request={int(total)}"
+                )
 
         param_lengths_t = torch.tensor(param_lengths, dtype=torch.int64)
         if len(param_lengths) > 0:
@@ -177,24 +196,32 @@ class MixedModalityAssembly:
             param_offsets_t = torch.empty(0, dtype=torch.int64)
 
         slots_t = {m: torch.tensor(idxs, dtype=torch.int64) for m, idxs in modality_slots.items()}
+        # `_bucket_offsets[m]` is the exclusive prefix sum of per-item `rows`
+        # (length `len(counts) + 1`, leading 0): a zero prepended to the
+        # cumulative sum of the bucket's row counts.
         offsets_t = {
-            m: torch.tensor([0] + list(_running_sum(counts)), dtype=torch.int64)
+            m: torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int64),
+                    torch.cumsum(torch.tensor(counts, dtype=torch.int64), dim=0),
+                ]
+            )
             for m, counts in bucket_token_counts.items()
         }
 
-        # Compute within-param offsets by MultimodalPromptOrder rank for non-ghost items
+        # Within-param destination offset for each item, by prompt-order rank.
         within_param_offsets: Dict[int, int] = {}
-        for flat_idxs in per_param_non_ghost:
-            sorted_idxs = sorted(flat_idxs, key=lambda fi: items[fi].item_idx_in_param)
+        for flat_idxs in per_param_items:
+            sorted_idxs = sorted(flat_idxs, key=lambda fi: items[fi].prompt_pos)
             running = 0
             for fi in sorted_idxs:
                 within_param_offsets[fi] = running
-                running += items[fi].token_count
+                running += items[fi].rows
 
-        # Build _dst_indices[m]: per modality, expand each non-ghost item's
-        # destination row range [start, start+token_count) with a single
-        # vectorized repeat_interleave + arange (no per-token Python loop).
-        # Per-item Python only assembles the small (start, length) lists.
+        # Build `_dst_indices[m]`: per modality, expand each item's destination
+        # row range `[start, start + rows)` with a single vectorized
+        # repeat_interleave + arange (no per-token Python loop). Per-item Python
+        # only assembles the small (start, length) lists.
         dst_indices_t: Dict[str, torch.Tensor] = {}
         param_offsets_list = param_offsets_t.tolist()
         for modality, slot_indices in modality_slots.items():
@@ -202,10 +229,8 @@ class MixedModalityAssembly:
             lengths: List[int] = []
             for fi in slot_indices:
                 item = items[fi]
-                if item.item_idx_in_param == -1:
-                    continue
                 starts.append(param_offsets_list[item.src_param_idx] + within_param_offsets[fi])
-                lengths.append(item.token_count)
+                lengths.append(item.rows)
             dst_indices_t[modality] = _expand_ranges(
                 torch.tensor(starts, dtype=torch.int64),
                 torch.tensor(lengths, dtype=torch.int64),
@@ -213,22 +238,13 @@ class MixedModalityAssembly:
 
         return cls(
             items=tuple(items),
-            n_params=len(multimodal_params),
             _param_lengths=param_lengths_t,
-            _param_offsets=param_offsets_t,
             _modality_slots=slots_t,
             _bucket_offsets=offsets_t,
             total_tokens=int(param_lengths_t.sum().item()) if len(param_lengths) > 0 else 0,
             active_modalities=list(modality_slots.keys()),
             _dst_indices=dst_indices_t,
         )
-
-
-def _running_sum(xs: List[int]) -> Iterable[int]:
-    s = 0
-    for x in xs:
-        s += x
-        yield s
 
 
 def _expand_ranges(starts: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -238,7 +254,7 @@ def _expand_ranges(starts: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     ``torch.cat([torch.arange(s, s + l) for s, l in zip(starts, lengths)])``,
     built with a single `repeat_interleave` + `arange` (no per-token Python
     loop). Both inputs are int64 1-D tensors of equal length; returns an empty
-    int64 tensor when there are no rows (e.g. an all-ghost bucket).
+    int64 tensor when there are no rows.
     """
     total = int(lengths.sum()) if lengths.numel() > 0 else 0
     if total == 0:
@@ -251,15 +267,9 @@ def _expand_ranges(starts: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
 
 
 # Adapter contract: given a bucket's items and the source-param list,
-# return one tensor of shape (sum(item.token_count for item in items), hidden_dim)
+# return one tensor of shape (sum(item.rows for item in items), hidden_dim)
 # with rows in bucket order (= order in assembly._modality_slots[modality]).
 ModalityEncoder = Callable[[List[ModalityItem], List[MultimodalParams]], torch.Tensor]
-
-# Post-process: runs after encode, before scatter. May mutate
-# ``bucket_outputs`` in place (e.g. Nano video-audio interleave).
-PostProcess = Callable[
-    [Dict[str, torch.Tensor], "MixedModalityAssembly", List[MultimodalParams]], None
-]
 
 
 def assemble_embeddings(
@@ -270,7 +280,6 @@ def assemble_embeddings(
     device: torch.device,
     dtype: torch.dtype,
     hidden_dim: int,
-    post_process: Optional[PostProcess] = None,
 ) -> torch.Tensor:
     """Run one encoder call per active modality and assemble via scatter.
 
@@ -291,32 +300,17 @@ def assemble_embeddings(
         slot_indices = assembly._modality_slots[modality].tolist()
         bucket_items = [assembly.items[i] for i in slot_indices]
         out = encoders[modality](bucket_items, multimodal_params)
-        # Use ``encoder_token_count`` (defaults to ``token_count``) for the
-        # encoder-output assertion. Items whose ``token_count`` reflects a
-        # post-process expansion (e.g. Nano video + interleaved audio) must
-        # set ``encoder_token_count`` to the encoder-only row count.
-        expected_rows = sum(item.encoder_rows for item in bucket_items)
+        expected_rows = sum(item.rows for item in bucket_items)
         assert out.shape[0] == expected_rows, (
             f"encoder for {modality!r} returned {out.shape[0]} rows; "
-            f"assembly expected {expected_rows} (sum of item encoder_rows)"
+            f"assembly expected {expected_rows} (sum of item rows)"
         )
         bucket_outputs[modality] = out
-
-    if post_process is not None:
-        post_process(bucket_outputs, assembly, multimodal_params)
 
     final = torch.empty((assembly.total_tokens, hidden_dim), dtype=dtype, device=device)
     for modality in assembly.active_modalities:
         dst = assembly._dst_indices[modality]
-        if dst.numel() == 0:
-            continue  # all-ghost bucket; rows consumed by post_process
-        bucket = bucket_outputs[modality]
-        if dst.numel() != bucket.shape[0]:
-            # Some items in this bucket are ghosts. Convention: non-ghost
-            # items come first in bucket order (extractor's contract);
-            # scatter only the leading non-ghost portion.
-            bucket = bucket[: dst.numel()]
-        final.index_copy_(0, dst.to(device), bucket)
+        final.index_copy_(0, dst.to(device), bucket_outputs[modality])
 
     assert final.shape[0] == int(assembly._param_lengths.sum().item()), (
         f"final shape {final.shape[0]} != sum(_param_lengths) "

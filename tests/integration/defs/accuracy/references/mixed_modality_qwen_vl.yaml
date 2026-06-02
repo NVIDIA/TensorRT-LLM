@@ -9,11 +9,12 @@
 # MixedModalityEvaluator; this reference is the absolute mixed target-accuracy
 # floor.
 #
-# Provisional floor pending a measured B100/B200 run on a node that can build
+# This accuracy is an interim ref_accuracy used only to gate the mixed-vs-pure
+# delta, not a measured run; it awaits a B100/B200 run on a node that can build
 # the decode-attention CUDA graph. Qwen3-VL-8B scores 55.11 on pure MMMU
 # (image); the mixed target accuracy averages the (typically harder) video
 # target with the image target, so the floor sits below the pure image number.
-# Update with the observed value once the gate runs green.
+# Replace it with the observed value once the gate runs green.
 Qwen/Qwen3-VL-8B-Instruct:
   - accuracy: 45.00
     num_samples: 50

@@ -165,9 +165,12 @@ class MixedModalityEvaluator(Evaluator):
         )
         self.active_modalities = _normalize_modalities(active_modalities, "active", min_count=2)
         self.target_modalities = _normalize_modalities(
-            target_modalities or self.active_modalities, "target", min_count=1
+            self.active_modalities if target_modalities is None else target_modalities,
+            "target",
+            min_count=1,
         )
         _validate_target_modalities(self.active_modalities, self.target_modalities)
+        _validate_num_samples(num_samples, self.target_modalities)
         self.modality_dataset_paths = dict(modality_dataset_paths)
         _validate_dataset_paths(self.active_modalities, self.modality_dataset_paths)
         self.num_samples = num_samples
@@ -175,10 +178,11 @@ class MixedModalityEvaluator(Evaluator):
         self.num_frames = num_frames
         # When True, the video loader extracts each video's embedded audio track
         # (load_video(..., extract_audio=True)) so the video item rides into the
-        # model as a video carrying audio. This exercises the Nano post-encode
-        # video-audio interleave path (multimodal_data["video"]["audio"] +
-        # ghost-audio item) when video is mixed with other modalities. Requires
-        # PyAV at runtime (TRTLLM_ENABLE_PYAV=1); see _materialize_media.
+        # model as a video carrying audio. Nano then hoists that embedded audio
+        # to a first-class top-level `(audio, k)` item (no ghosts, no shared
+        # slots, no post-encode re-placement), exercising the hoisted-audio path
+        # when video is mixed with other modalities. Requires PyAV at runtime
+        # (TRTLLM_ENABLE_PYAV=1); see _materialize_media.
         self.extract_video_audio = extract_video_audio
         if self.extract_video_audio:
             # Media (incl. audio extraction) is materialized in this process
@@ -433,12 +437,17 @@ def select_mixed_modality_samples(
     """Select deterministic mixed samples with randomized target assignment."""
     rng = random.Random(random_seed)
     active_modalities = _normalize_modalities(
-        active_modalities or tuple(input_samples_by_modality), "active", min_count=2
+        tuple(input_samples_by_modality) if active_modalities is None else active_modalities,
+        "active",
+        min_count=2,
     )
     target_modalities = _normalize_modalities(
-        target_modalities or active_modalities, "target", min_count=1
+        active_modalities if target_modalities is None else target_modalities,
+        "target",
+        min_count=1,
     )
     _validate_target_modalities(active_modalities, target_modalities)
+    _validate_num_samples(num_samples, target_modalities)
 
     samples_by_modality = {
         modality: list(input_samples_by_modality[modality]) for modality in active_modalities
@@ -505,6 +514,28 @@ def _validate_target_modalities(
         raise ValueError(
             "Mixed modality target modalities must be a subset of active modalities: "
             f"active={active_modalities}, target={target_modalities}."
+        )
+
+
+def _validate_num_samples(
+    num_samples: Optional[int],
+    target_modalities: tuple[str, ...],
+) -> None:
+    """Fail fast on an unusable sample count before any GPU work runs.
+
+    `num_samples` must be positive and at least the number of target modalities
+    so each target is exercised at least once. Without this check an invalid
+    count is only caught by the per-target baseline gate after both serial
+    evaluation passes have already consumed GPU time.
+    """
+    if num_samples is None:
+        return
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}.")
+    if num_samples < len(target_modalities):
+        raise ValueError(
+            f"num_samples ({num_samples}) must be at least the number of target "
+            f"modalities ({len(target_modalities)}) so each target is exercised."
         )
 
 

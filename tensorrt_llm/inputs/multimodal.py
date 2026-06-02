@@ -2,7 +2,6 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
-import enum
 from dataclasses import dataclass, field
 from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple,
                     Union)
@@ -265,29 +264,8 @@ class MultimodalInput:
                    multimodal_run_positions=mm_run_positions,
                    multimodal_run_lengths=mm_run_lengths)
 
-    def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert data to tensors."""
-        return (
-            # int32 to match the type in TRTLLM SizeType32
-            torch.tensor(self.multimodal_hashes, dtype=torch.int32),
-            torch.tensor(self.multimodal_positions, dtype=torch.int32),
-            torch.tensor(self.multimodal_lengths, dtype=torch.int32))
-
 
 _SUPPORTED_HASHING_MODALITIES = ("image", "video", "audio")
-
-
-class _MultimodalItemType(enum.IntEnum):
-    """Stable integer codes used by multimodal layout metadata."""
-
-    IMAGE = 0
-    VIDEO = 1
-    AUDIO = 2
-
-    @property
-    def modality(self) -> str:
-        """Return the `multi_modal_data` key represented by this item type."""
-        return self.name.lower()
 
 
 def _normalize_mm_items(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
@@ -333,10 +311,7 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
                          source: str) -> "MultimodalPromptOrder":
         """Normalize order metadata to `(modality, item_index)` pairs.
 
-        Accepted metadata shapes are `(modality, index)` pairs, dicts, and
-        integer `layout_metadata.item_types`. Integer item types are decoded
-        through `_MultimodalItemType` because those values are stable metadata
-        codes.
+        Accepted metadata shapes are `(modality, index)` pairs and dicts.
         """
         counters: Dict[str, int] = {}
         item_order: List[Tuple[str, int]] = []
@@ -346,15 +321,6 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
                 item_index = entry.get("index", entry.get("item_index"))
                 if item_index is None:
                     item_index = counters.get(modality, 0)
-            elif isinstance(entry, int) and source.endswith("item_types"):
-                try:
-                    item_type = _MultimodalItemType(entry)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"{source} entry has unknown item type: {entry}"
-                    ) from exc
-                modality = item_type.modality
-                item_index = counters.get(modality, 0)
             else:
                 try:
                     modality, item_index = entry
@@ -385,11 +351,6 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
             return cls.from_raw_entries(
                 multimodal_data["multimodal_item_order"],
                 source="multimodal_item_order")
-        layout_metadata = multimodal_data.get("layout_metadata")
-        if isinstance(layout_metadata,
-                      dict) and "item_types" in layout_metadata:
-            return cls.from_raw_entries(layout_metadata["item_types"],
-                                        source="layout_metadata.item_types")
         return None
 
     @classmethod
@@ -1012,30 +973,6 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
             value = value - 0x100000000  # Convert to signed by subtracting 2^32
         result.append(value)
     return result
-
-
-def int32_to_hexdigest(int32_values: List[int]) -> str:
-    """Convert 8 int32 values back to a 64-character hexadecimal digest.
-
-    This is the inverse of hexdigest_to_int32.
-
-    Args:
-        int32_values: List of 8 signed int32 values
-
-    Returns:
-        64-character hexadecimal string representing the 32-byte hash
-    """
-    if len(int32_values) != 8:
-        raise ValueError(f"Expected 8 int32 values, got {len(int32_values)}")
-
-    result = []
-    for value in int32_values:
-        # Convert signed int32 back to unsigned
-        if value < 0:
-            value = value + 0x100000000
-        # Format as 8 hex characters (zero-padded)
-        result.append(f'{value:08x}')
-    return ''.join(result)
 
 
 def find_mm_token_lengths(

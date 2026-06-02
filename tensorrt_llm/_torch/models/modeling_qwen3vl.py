@@ -1,5 +1,7 @@
 import copy
 import re
+from collections.abc import Mapping as AbcMapping
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -17,6 +19,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm._torch.models.multimodal_encoding import (
     MixedModalityAssembly,
     ModalityItem,
+    PayloadSlicer,
     assemble_embeddings,
 )
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -69,57 +72,147 @@ _QWEN_PLACEHOLDERS = {
     "video": ("<|vision_start|><|video_pad|><|vision_end|>", "<|video_pad|>"),
 }
 
-_QWEN3VL_PLAN_MODALITIES = ("image", "video")
-
-
+# Per-modality aggregate-payload keys: the pixel tensor and the `[N, 3]` grid that
+# describes its `N` sub-items. The slicer carves a single sub-item out of each.
+_QWEN3VL_PIXEL_KEY = {"image": "pixel_values", "video": "pixel_values_videos"}
 _QWEN3VL_GRID_KEY = {"image": "image_grid_thw", "video": "video_grid_thw"}
 
 
-def _qwen3vl_grid_token_count(grid_thw, spatial_merge_size: int) -> int:
-    """Post-merge token count for a Qwen3VL grid tensor.
-
-    A modality payload can carry MULTIPLE sub-items (e.g. a request with two
-    images): `image_grid_thw` is then `[N, 3]` and the visual encoder emits the
-    summed post-merge rows across all `N` sub-grids. The per-grid post-merge
-    count is `t * (h // merge) * (w // merge)`, matching `get_num_tokens_per_video`
-    and the visual encoder's merger output. Returns the sum over all sub-grids so
-    the single aggregate `ModalityItem` sizes its encoder rows AND its scatter
-    destination to cover every sub-item (not just the first).
-    """
+def _qwen3vl_grid_to_2d(grid_thw) -> torch.Tensor:
+    """Normalize a Qwen3VL grid tensor to shape `[N, 3]` (one row per sub-item)."""
     grid = torch.as_tensor(grid_thw)
     if grid.ndim == 1:
         grid = grid.reshape(1, 3)
+    if grid.ndim != 2 or grid.shape[1] != 3:
+        raise ValueError(f"grid_thw must have shape [3] or [N, 3], got {tuple(grid.shape)}")
+    return grid
+
+
+def _qwen3vl_grid_token_count(grid_thw, spatial_merge_size: int) -> int:
+    """Post-merge token count summed over a Qwen3VL grid tensor.
+
+    A grid may carry MULTIPLE sub-items (`[N, 3]`); the visual encoder emits the
+    summed post-merge rows across all `N` sub-grids. The per-grid post-merge count
+    is `t * (h // merge) * (w // merge)`, matching the visual encoder's merger
+    output. This is the single source for the per-grid formula (used by the
+    per-item slicer and `get_num_tokens_per_video`).
+    """
     m = int(spatial_merge_size)
+    grid = _qwen3vl_grid_to_2d(grid_thw)
     return sum(int(t) * (int(h) // m) * (int(w) // m) for t, h, w in grid.tolist())
 
 
+@dataclass(frozen=True)
+class Qwen3VLPayloadSlicer(PayloadSlicer):
+    """Per-item payload slicer for Qwen3VL (image / video).
+
+    A Qwen3VL modality payload is an AGGREGATE: `pixel_values` (resp.
+    `pixel_values_videos`) is every sub-item's patches concatenated, and
+    `*_grid_thw` is the `[N, 3]` grid describing those `N` sub-items. This slicer
+    carves out one sub-item:
+
+    - `rows_for` is the per-grid post-merge token count `t*(h//m)*(w//m)` (the
+      encoder-output row count == scatter footprint), the Qwen3VL source of truth.
+    - `slice_payload` slices `pixel_values` by the raw-patch prefix sum
+      `Sigma prod(grid_thw[:i])` (raw rows per sub-item are `t*h*w`) and pairs the
+      slice with that sub-item's single-row grid, so a bucket adapter's
+      re-concatenation reproduces the original aggregate.
+
+    When `spatial_merge_size` is unset (test-convention payloads carrying an
+    explicit `num_tokens`, or pure single-modality requests), a single-sub-item
+    payload is returned whole and its rows fall back to `num_tokens` /
+    `multimodal_embedding_lengths` / `total_embeds_in_request`. Slicing a
+    multi-sub-item payload requires the grid + merge size.
+    """
+
+    spatial_merge_size: Optional[int] = None
+
+    def slice_payload(
+        self,
+        param: MultimodalParams,
+        modality: str,
+        mm_idx_per_modality: int,
+    ) -> AbcMapping[str, Any]:
+        payload = (param.multimodal_data or {})[modality]
+        pixel_key = _QWEN3VL_PIXEL_KEY[modality]
+        grid_key = _QWEN3VL_GRID_KEY[modality]
+        grid = payload.get(grid_key)
+        if grid is None or self.spatial_merge_size is None:
+            # No grid (or no merge size): single-sub-item / test-convention path.
+            # The aggregate IS the single item; hand it back unchanged.
+            if mm_idx_per_modality != 0:
+                raise ValueError(
+                    f"cannot slice sub-item {mm_idx_per_modality} of {modality!r} "
+                    "without *_grid_thw and spatial_merge_size"
+                )
+            return payload
+        grid_2d = _qwen3vl_grid_to_2d(grid)
+        # Raw patch rows per sub-item = t*h*w; pixel slice is the i-th block.
+        raw_rows = [int(t) * int(h) * int(w) for t, h, w in grid_2d.tolist()]
+        start = sum(raw_rows[:mm_idx_per_modality])
+        stop = start + raw_rows[mm_idx_per_modality]
+        sliced = dict(payload)
+        sliced[pixel_key] = payload[pixel_key][start:stop]
+        sliced[grid_key] = grid_2d[mm_idx_per_modality : mm_idx_per_modality + 1]
+        # An aggregate `num_tokens` (test convention) describes the whole blob,
+        # not this single sub-item; drop it so the sliced payload is not
+        # mis-sized by a stale count.
+        sliced.pop("num_tokens", None)
+        return sliced
+
+    def rows_for(
+        self,
+        param: MultimodalParams,
+        modality: str,
+        mm_idx_per_modality: int,
+        prompt_pos: int,
+    ) -> int:
+        payload = (param.multimodal_data or {})[modality]
+        grid = payload.get(_QWEN3VL_GRID_KEY[modality])
+        if self.spatial_merge_size is not None and grid is not None:
+            # Encoder-accurate per-sub-item post-merge count (the source of truth).
+            grid_2d = _qwen3vl_grid_to_2d(grid)
+            return _qwen3vl_grid_token_count(
+                grid_2d[mm_idx_per_modality : mm_idx_per_modality + 1],
+                self.spatial_merge_size,
+            )
+        # Test-convention / single-sub-item fallbacks (no grid+merge available).
+        if "num_tokens" in payload:
+            return int(payload["num_tokens"])
+        multimodal_data = param.multimodal_data or {}
+        embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
+        if embedding_lengths is not None and prompt_pos < len(embedding_lengths):
+            return int(embedding_lengths[prompt_pos])
+        runtime = getattr(param, "multimodal_runtime", None)
+        total = getattr(runtime, "total_embeds_in_request", None) if runtime else None
+        if total is not None:
+            return int(total)
+        raise ValueError(
+            "Cannot determine row count for Qwen3VL payload; needs *_grid_thw + "
+            "spatial_merge_size, num_tokens, multimodal_embedding_lengths, or "
+            "multimodal_runtime.total_embeds_in_request"
+        )
+
+
 def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[int] = None):
-    """Yield MultimodalItems for one Qwen3VL MultimodalParams.
+    """Yield one canonical `ModalityItem` per Qwen3VL prompt slot.
 
     Qwen3VL has only image and video modalities; no audio, no ghost items. The
-    extractor yields ONE aggregate item per present modality whose payload may
-    cover several sub-items (e.g. multiple images); its `token_count` must be the
-    TOTAL post-merge rows across all sub-items so the assembly's encoder-output
-    check and scatter cover the whole encoder output (a per-sub-item undercount
-    silently drops trailing sub-items' embeddings in `assemble_embeddings`).
-
-    Token counts come from:
-      1. payload["num_tokens"] if present (test convention / explicit).
-      2. grid-derived total from `*_grid_thw` + `spatial_merge_size` (the
-         encoder-accurate count; correct for multi-sub-item payloads).
-      3. multimodal_data["multimodal_embedding_lengths"] indexed by
-         multimodal_data["multimodal_item_order"] position (single sub-item).
-      4. param.multimodal_runtime.total_embeds_in_request (pure single-modality).
+    extractor walks `MultimodalPromptOrder` and emits one item per entry: each
+    owns its prompt rank (`prompt_pos`), slices its single-item payload out of the
+    aggregate `pixel_values`/`*_grid_thw` blob, and sizes its `rows` from the
+    per-grid post-merge count (the encoder-output row count == scatter footprint).
+    Interleaved repeated modalities (`image -> video -> image`) are just three
+    slots scattered by `prompt_pos`; no special case.
     """
     multimodal_data = param.multimodal_data or {}
-    modality_types = [m for m in _QWEN3VL_PLAN_MODALITIES if multimodal_data.get(m) is not None]
+    modality_types = [m for m in _QWEN_MODALITIES if multimodal_data.get(m) is not None]
     if not modality_types:
         return
 
-    embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
     # Normalize order metadata via MultimodalPromptOrder so dict-form entries
     # (`{"modality": ..., "index": ...}`, as the runtime registry emits) and
-    # tuple-form entries both resolve to `(modality, index)` keys. A raw
+    # tuple-form entries both resolve to `(modality, index)` pairs. A raw
     # `tuple(pair)` over dict entries would yield the dict keys and silently
     # collapse every item to default slot 0.
     item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
@@ -127,77 +220,19 @@ def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[i
         # Pure single-modality (no explicit prompt order metadata): each
         # present modality is the sole item at MultimodalPromptOrder rank 0.
         item_order = MultimodalPromptOrder((m, 0) for m in modality_types)
-    order_pos = {pair: pos for pos, pair in enumerate(item_order)}
 
-    # This extractor yields ONE aggregate item per modality at its `(modality, 0)`
-    # slot, so it can only represent a mixed request whose same-modality items are
-    # contiguous (one logical block per modality). A mixed prompt that INTERLEAVES
-    # a repeated modality (e.g. `image -> video -> image`, where item_order holds
-    # `(image, 0), (video, 0), (image, 1)`) cannot be scattered correctly here:
-    # the trailing image's rows would be folded into the leading image block
-    # instead of landing after the video. Reject it fail-loud rather than silently
-    # mis-scatter. Pure single-modality multi-item requests (one modality present)
-    # remain supported — they are a single contiguous block.
-    if len(modality_types) > 1:
-        modality_counts: Dict[str, int] = {}
-        for modality, _ in item_order:
-            modality_counts[modality] = modality_counts.get(modality, 0) + 1
-        repeated = sorted(m for m, count in modality_counts.items() if count > 1)
-        if repeated:
-            raise ValueError(
-                "Qwen3VL mixed-modality requests with an interleaved repeated "
-                f"modality are not supported (repeated: {repeated}); each modality "
-                "may appear at most once in a mixed request's prompt order."
-            )
-
-    for modality in modality_types:
-        payload = multimodal_data[modality]
-        pos = order_pos.get((modality, 0), 0)
-        token_count = _qwen3vl_payload_token_count(
-            payload, pos, embedding_lengths, param, modality, spatial_merge_size
-        )
+    slicer = Qwen3VLPayloadSlicer(spatial_merge_size=spatial_merge_size)
+    for prompt_pos, (modality, mm_idx) in enumerate(item_order):
+        if multimodal_data.get(modality) is None:
+            continue
         yield ModalityItem(
             src_param_idx=param_idx,
-            item_idx_in_param=pos,
             modality=modality,
-            token_count=token_count,
-            payload=payload,
+            mm_idx_per_modality=mm_idx,
+            prompt_pos=prompt_pos,
+            rows=slicer.rows_for(param, modality, mm_idx, prompt_pos),
+            payload=slicer.slice_payload(param, modality, mm_idx),
         )
-
-
-def _qwen3vl_payload_token_count(
-    payload, pos, embedding_lengths, param, modality=None, spatial_merge_size=None
-):
-    """Token-count fallback chain for a Qwen3VL modality payload.
-
-    The grid-derived total (when `spatial_merge_size` is known and the payload
-    carries `*_grid_thw`) is preferred over `multimodal_embedding_lengths[pos]`:
-    a payload may aggregate multiple sub-items, but `embedding_lengths[pos]` is
-    the post-merge count of only the FIRST sub-item, which undercounts the
-    encoder output for multi-image / multi-clip requests. The grid sum matches
-    the encoder's row count exactly. For a single sub-item the two agree, so this
-    is a no-op for single-image / single-video / mixed (one item per modality)
-    requests.
-    """
-    if "num_tokens" in payload:
-        return int(payload["num_tokens"])
-    grid_key = _QWEN3VL_GRID_KEY.get(modality)
-    if (
-        spatial_merge_size is not None
-        and grid_key is not None
-        and payload.get(grid_key) is not None
-    ):
-        return _qwen3vl_grid_token_count(payload[grid_key], spatial_merge_size)
-    if embedding_lengths is not None and pos < len(embedding_lengths):
-        return int(embedding_lengths[pos])
-    runtime = getattr(param, "multimodal_runtime", None)
-    total = getattr(runtime, "total_embeds_in_request", None) if runtime else None
-    if total is not None:
-        return int(total)
-    raise ValueError(
-        "Cannot determine token count for Qwen3VL payload; needs num_tokens, "
-        "multimodal_embedding_lengths, or multimodal_runtime.total_embeds_in_request"
-    )
 
 
 class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
@@ -468,14 +503,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
     ) -> int:
         merge = self.config.vision_config.spatial_merge_size
         if video_grid_thw is not None:
-            grid = torch.as_tensor(video_grid_thw)
-            if grid.ndim == 1:
-                grid = grid.reshape(1, 3)
-            if grid.ndim != 2 or grid.shape[1] != 3:
-                raise ValueError(
-                    f"video_grid_thw must have shape [3] or [N, 3], got {tuple(grid.shape)}"
-                )
-            return sum(int(t) * (int(h) // merge) * (int(w) // merge) for t, h, w in grid.tolist())
+            return _qwen3vl_grid_token_count(video_grid_thw, merge)
 
         # Must run the full processor: HF's Qwen3VLProcessor._get_num_multimodal_tokens
         # (what the base class default delegates to) raises on video-only calls
@@ -495,7 +523,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
                 "get_num_tokens_per_video: HF processor returned no "
                 "video_grid_thw for the provided video."
             )
-        return sum(int(t) * (int(h) // merge) * (int(w) // merge) for t, h, w in vgt.tolist())
+        return _qwen3vl_grid_token_count(vgt, merge)
 
     def _preprocess(
         self, text: Dict[str, Any], mm_data: Dict[str, Any], mm_processor_kwargs: Dict[str, Any]
@@ -1152,14 +1180,6 @@ class Qwen3VisionModelBase(nn.Module):
         grid = torch.cat([it.payload["video_grid_thw"] for it in items], dim=0)
         return self._encode_visual_inputs(pixel_values, grid)
 
-    def _plan_device(self) -> torch.device:
-        """Device the assembled embeddings are allocated on (visual encoder device)."""
-        return next(self.visual.parameters()).device
-
-    def _plan_dtype(self) -> torch.dtype:
-        """Dtype of the assembled visual embeddings."""
-        return self.model_dtype
-
     def _plan_hidden_dim(self) -> int:
         """Hidden width of the assembled visual embeddings.
 
@@ -1194,8 +1214,10 @@ class Qwen3VisionModelBase(nn.Module):
                 "video": self._adapter_video_bucket,
             },
             multimodal_params=multimodal_params,
-            device=self._plan_device(),
-            dtype=self._plan_dtype(),
+            # Allocate the assembled embeddings on the visual encoder's device,
+            # with its (model) dtype.
+            device=next(self.visual.parameters()).device,
+            dtype=self.model_dtype,
             hidden_dim=self._plan_hidden_dim(),
         )
         return [final]

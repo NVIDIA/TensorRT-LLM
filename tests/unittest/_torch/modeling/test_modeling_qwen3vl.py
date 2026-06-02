@@ -130,7 +130,11 @@ def _qwen_image_video_param(include_order=True, include_lengths=True):
     multimodal_data = {
         "image": {
             "pixel_values": torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
-            "image_grid_thw": torch.tensor([[1, 2, 4], [1, 2, 4]]),
+            # ONE image sub-grid whose post-merge row count is the source of
+            # truth: t*(h//m)*(w//m) = 1*(4//2)*(4//2) = 4, matching the 4-row
+            # pixel_values and num_tokens. (A 2-row grid would describe TWO
+            # images, but this param carries a single `(image, 0)` item.)
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
             "num_tokens": 4,
         },
         "video": {
@@ -178,10 +182,10 @@ def test_qwen3vl_mixed_image_video_requires_item_order_metadata():
     """A mixed request needs ordering metadata that disambiguates item slots.
 
     The extractor reads `multimodal_item_order` as `(modality, index)` pairs to
-    assign each modality item a distinct prompt position. When the ordering does
+    assign each modality item a distinct `prompt_pos`. When the ordering does
     not disambiguate the items - so the image and video items collapse onto the
     same prompt slot - the assembly build in `MixedModalityAssembly.from_params` rejects it with
-    a duplicate-position error rather than silently overlapping their embedding
+    a duplicate-`prompt_pos` error rather than silently overlapping their embedding
     ranges. This pins the invariant that a valid per-item ordering is required for
     a mixed request; the encoder does not fabricate one.
     """
@@ -189,16 +193,19 @@ def test_qwen3vl_mixed_image_video_requires_item_order_metadata():
     def _collapsing_extract(param_idx, p):
         # Model an order that fails to disambiguate the two mixed items by forcing
         # both onto prompt slot 0 (what an absent/degenerate order would yield).
+        # `mm_idx_per_modality` stays distinct per item so the collision trips the
+        # per-param `prompt_pos` uniqueness check rather than the modality-group one.
         for item in _qwen3vl_extract_items(param_idx, p):
             yield ModalityItem(
                 src_param_idx=item.src_param_idx,
-                item_idx_in_param=0,
                 modality=item.modality,
-                token_count=item.token_count,
+                mm_idx_per_modality=item.mm_idx_per_modality,
+                prompt_pos=0,
+                rows=item.rows,
                 payload=item.payload,
             )
 
-    with pytest.raises(ValueError, match="item_idx_in_param"):
+    with pytest.raises(ValueError, match="duplicate prompt_pos"):
         MixedModalityAssembly.from_params([_qwen_image_video_param()], _collapsing_extract)
 
 

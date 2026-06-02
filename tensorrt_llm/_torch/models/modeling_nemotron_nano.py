@@ -4,7 +4,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -412,227 +412,152 @@ def _get_modality_types(multimodal_data: Dict[str, Any]) -> List[str]:
     return [modality for modality in _NANO_MODALITIES if multimodal_data.get(modality) is not None]
 
 
-def _nano_resolve_payload_token_counts(
-    param: MultimodalParams,
-) -> Dict[Tuple[str, int], int]:
-    """Resolve per-item token counts from production preprocessing fields.
+class NanoPayloadSlicer:
+    """`PayloadSlicer` for Nano: carve one sub-item out of an aggregate payload.
 
-    Used by :func:`_nano_extract_items` when a per-modality payload does
-    not carry a ``num_tokens`` field (test convention). Returns a mapping
-    from ``(modality, idx_within_modality)`` → token_count, derived from:
-
-    1. **Multi-modality params** (more than one distinct modality present):
-       uses ``multimodal_data["multimodal_item_order"]`` for the ordering
-       and ``multimodal_data["multimodal_embedding_lengths"]`` for per-slot
-       counts. Each prompt-order slot becomes its own item.
-    2. **Single-modality params** (exactly one distinct modality, possibly
-       with multiple items — e.g. a multi-image MMMU request): uses
-       ``param.multimodal_runtime.total_embeds_in_request`` as the single
-       item's count. The Nano vision encoder emits one per-request tensor
-       spanning ALL of that modality's items concatenated, so the per-param
-       total is the authoritative encoder-output row count — NOT the
-       per-slot ``multimodal_embedding_lengths`` (which would only describe
-       the first slot and under-count multi-item requests). This mirrors the
-       pre-refactor ``_encode_multimodal`` single-modality path, which fed
-       the whole param to ``vision_encoder`` and split the cache by
-       ``total_embeds_in_request`` per param.
-
-    Returns an empty dict if neither source is populated. Ghost audio
-    items (audio embedded in a video payload) are not addressable through
-    these production fields; callers must fall back to
-    ``payload["num_tokens"]`` for those.
+    A mixed-modality Nano request stores one aggregate payload per modality
+    (e.g. all images' tiles in one `pixel_values` tensor). The per-item
+    extractor walks the prompt-order stream and asks this slicer for each
+    single item's encoder input, sliced from the aggregate blob. The actual
+    per-modality slicing lives on the model (`_nano_slice_payload`) so it can
+    consult `self.vision_encoder.num_image_token`; this wrapper just satisfies
+    the `multimodal_encoding.PayloadSlicer` shape.
     """
-    multimodal_data = param.multimodal_data or {}
-    counts: Dict[Tuple[str, int], int] = {}
 
-    modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
+    def __init__(self, model: "NemotronH_Nano_VL_V2"):
+        self._model = model
 
-    # Single-modality param: the vision/audio encoder emits one per-request
-    # tensor covering every item of that modality, so the per-param total
-    # (`total_embeds_in_request`) is the encoder-output row count. Prefer it
-    # over per-slot `multimodal_embedding_lengths`, which under-counts a
-    # multi-item (e.g. multi-image) request to just its first slot.
-    if len(modality_types) == 1:
-        runtime = getattr(param, "multimodal_runtime", None)
-        total = getattr(runtime, "total_embeds_in_request", None)
-        if total is not None:
-            counts[(modality_types[0], 0)] = int(total)
-        return counts
-
-    # Multi-modality param: per-slot counts in prompt order.
-    item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
-    embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-    if item_order is not None and embedding_lengths is not None:
-        if len(item_order) != len(embedding_lengths):
-            raise ValueError(
-                "multimodal_item_order length "
-                f"({len(item_order)}) != multimodal_embedding_lengths "
-                f"length ({len(embedding_lengths)})"
-            )
-        for (modality, idx), length in zip(item_order, embedding_lengths, strict=True):
-            counts[(modality, int(idx))] = int(length)
-    return counts
+    def slice_payload(
+        self,
+        param: MultimodalParams,
+        modality: str,
+        mm_idx_per_modality: int,
+        *,
+        rows: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._model._nano_slice_payload(param, modality, mm_idx_per_modality, rows=rows)
 
 
 def _nano_extract_items(
     param_idx: int,
     param: MultimodalParams,
-    audio_rows_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+    slicer: Optional["NanoPayloadSlicer"] = None,
 ):
     """Yield :class:`ModalityItem` instances for one Nano ``MultimodalParams``.
 
-    Pure single-modality params yield exactly one item with
-    ``item_idx_in_param == 0``. Mixed-modality params yield one item per
-    modality slot in prompt order, with ``item_idx_in_param`` set to the
-    item's MultimodalPromptOrder rank.
+    Two regimes, by how many distinct modalities the request carries:
 
-    Video payloads that carry an embedded audio track yield TWO items:
-    the real video item (non-ghost; ``token_count`` is post-interleave —
-    vision rows + interleaved audio rows) followed by a ghost audio item
-    (``item_idx_in_param == -1``; ``token_count`` is the audio rows the
-    audio encoder returns). This ordering — non-ghost first — satisfies
-    the ``assemble_embeddings`` scatter convention that ghosts trail
-    standalone items in each bucket.
+    * **Single-modality (AGGREGATE carve-out).** Exactly one distinct modality
+      present — e.g. a single image, or a multi-image MMMU request. Yields
+      exactly ONE item whose payload is the whole per-modality blob and whose
+      `rows` is ``multimodal_runtime.total_embeds_in_request`` (the Nano vision
+      encoder emits one per-request tensor spanning every sub-item, so the
+      per-param total is the authoritative encoder-output row count — NOT the
+      per-slot ``multimodal_embedding_lengths`` which under-counts a multi-item
+      request to its first slot). A test-only payload ``num_tokens`` short-circuits.
+      `prompt_pos` and `mm_idx_per_modality` are 0.
 
-    Per-item token counts are resolved using the following fallback chain,
-    applied per payload:
-
-    1. ``payload["num_tokens"]`` if present (test convention; cheapest).
-       For a video payload this is the VISION-ONLY row count.
-    2. Production-fields fallback (see
-       :func:`_nano_resolve_payload_token_counts`): mixed-param items use
-       ``multimodal_embedding_lengths`` indexed by ``multimodal_item_order``;
-       pure single-modality items use
-       ``multimodal_runtime.total_embeds_in_request``. For a video-with-audio
-       slot this production count is the POST-interleave total (vision +
-       audio), because the prompt placeholder budget
-       (``get_num_tokens_per_video(video_audio=...)``) already includes the
-       interleaved audio tokens.
-
-    The audio row count for a video's embedded audio track is resolved via
-    ``audio_rows_fn`` (which derives it from the production
-    ``feature_attention_mask`` using the encoder's sub-sampling, matching
-    the audio encoder output), falling back to the payload's ``num_tokens``.
-    This lets the extractor split a production post-interleave video count
-    into the vision-only encoder rows (for the bucket assertion) and size
-    the ghost audio item, without depending on a test-only payload field.
+    * **Multi-modality (PER-ITEM).** More than one distinct modality present —
+      the interleaving case (including a repeated modality and video-with-audio
+      hoisted to a first-class ``(audio, k)`` item by the input processor).
+      Yields ONE item per ``MultimodalPromptOrder`` entry: ``prompt_pos`` is the
+      rank, ``mm_idx_per_modality`` is the per-modality index, ``rows`` is the
+      per-slot ``multimodal_embedding_lengths`` entry, and ``payload`` is sliced
+      to that single sub-item by ``slicer``. There is no ghost audio and no
+      post-encode interleave — audio (standalone or hoisted) is just another item.
     """
     multimodal_data = param.multimodal_data or {}
     modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
     if not modality_types:
         return
 
-    item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
-    if item_order is None:
-        # Pure single-modality (no explicit prompt order metadata): each
-        # present modality is the sole item at MultimodalPromptOrder rank 0.
-        item_order = MultimodalPromptOrder((modality, 0) for modality in modality_types)
-    order_pos = {pair: pos for pos, pair in enumerate(item_order)}
-
-    # This extractor yields ONE aggregate item per modality at its `(modality, 0)`
-    # slot, so it can only represent a mixed request whose same-modality items are
-    # contiguous (one logical block per modality). A mixed prompt that INTERLEAVES
-    # a repeated modality (e.g. `image -> video -> image`, where item_order holds
-    # `(image, 0), (video, 0), (image, 1)`) cannot be scattered correctly here:
-    # the trailing image's rows would be folded into the leading image block
-    # instead of landing after the video. Reject it fail-loud rather than silently
-    # mis-scatter. Pure single-modality multi-item requests (one modality present)
-    # remain supported — they are a single contiguous block.
-    if len(modality_types) > 1:
-        modality_counts: Dict[str, int] = {}
-        for modality, _ in item_order:
-            modality_counts[modality] = modality_counts.get(modality, 0) + 1
-        repeated = sorted(m for m, count in modality_counts.items() if count > 1)
-        if repeated:
-            raise ValueError(
-                "Nano mixed-modality requests with an interleaved repeated "
-                f"modality are not supported (repeated: {repeated}); each modality "
-                "may appear at most once in a mixed request's prompt order."
-            )
-
-    # Resolve token counts from production fields once for the whole
-    # param; per-item lookups below prefer payload["num_tokens"] and fall
-    # back to this map.
-    production_counts = _nano_resolve_payload_token_counts(param)
-
-    def _lookup_count(modality: str, idx_within_modality: int, payload: Dict[str, Any]) -> int:
-        if "num_tokens" in payload:
-            return int(payload["num_tokens"])
-        key = (modality, idx_within_modality)
-        if key in production_counts:
-            return production_counts[key]
-        raise KeyError(
-            f"Cannot resolve per-item token count for modality={modality!r} "
-            f"at index {idx_within_modality} in param {param_idx}: payload has "
-            "no 'num_tokens' and no production-field fallback "
-            "(multimodal_embedding_lengths / multimodal_runtime) is available."
-        )
-
-    def _audio_rows(audio_payload: Dict[str, Any]) -> int:
-        if "num_tokens" in audio_payload:
-            return int(audio_payload["num_tokens"])
-        if audio_rows_fn is not None:
-            return int(audio_rows_fn(audio_payload))
-        raise KeyError(
-            f"Cannot resolve audio token count for embedded video audio in "
-            f"param {param_idx}: audio payload has no 'num_tokens' and no "
-            "audio_rows_fn (production feature_attention_mask resolver) was provided."
-        )
-
     for modality in modality_types:
         if modality not in _NANO_MODALITIES:
             raise ValueError(f"Unknown modality: {modality}")
+
+    if len(modality_types) == 1:
+        # AGGREGATE carve-out: one item, whole-blob payload, per-param total rows.
+        modality = modality_types[0]
         payload = multimodal_data.get(modality)
         if payload is None:
-            continue
-        item_pos = order_pos.get((modality, 0), 0)
-        own_count = _lookup_count(modality, 0, payload)
-        token_count = own_count
-        encoder_token_count: Optional[int] = None
-        if modality == "video":
-            audio_payload = payload.get("audio")
-            if audio_payload is not None:
-                # The video item's scatter destination spans vision + audio
-                # rows (post-interleave); the vision encoder only emits vision
-                # rows, which is what the encoder-bucket assertion checks.
-                #
-                # `own_count` is either:
-                #   - the test-only video `num_tokens` = VISION-ONLY rows, so
-                #     post-interleave = own_count + audio_rows; or
-                #   - the production `multimodal_embedding_lengths` video slot =
-                #     POST-interleave total (vision + audio already), so
-                #     vision-only = own_count - audio_rows.
-                audio_rows = _audio_rows(audio_payload)
-                if "num_tokens" in payload:
-                    encoder_token_count = own_count
-                    token_count = own_count + audio_rows
-                else:
-                    token_count = own_count
-                    encoder_token_count = own_count - audio_rows
+            return
+        rows = _nano_single_modality_rows(param, payload, modality, param_idx)
         yield ModalityItem(
             src_param_idx=param_idx,
-            item_idx_in_param=item_pos,
             modality=modality,
-            token_count=token_count,
+            mm_idx_per_modality=0,
+            prompt_pos=0,
+            rows=rows,
             payload=payload,
-            encoder_token_count=encoder_token_count,
         )
-        # Emit a ghost audio item for video payloads that carry an
-        # embedded audio track. The audio rows live in the audio
-        # encoder bucket but have no MultimodalPromptOrder slot of their own;
-        # the model-specific post-process step (video-audio interleave)
-        # consumes them.
-        if modality == "video":
-            audio_payload = payload.get("audio")
-            if audio_payload is not None:
-                yield ModalityItem(
-                    src_param_idx=param_idx,
-                    item_idx_in_param=-1,
-                    modality="audio",
-                    token_count=_audio_rows(audio_payload),
-                    payload=audio_payload,
-                    metadata={"paired_video_item_idx": item_pos},
-                )
+        return
+
+    # PER-ITEM: one ModalityItem per prompt-order slot, payload sliced per item.
+    item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
+    if item_order is None:
+        raise KeyError(
+            f"Nano multi-modality param {param_idx} is missing "
+            "'multimodal_item_order'; the per-item extractor needs the prompt "
+            "order to assign each item its slot."
+        )
+    embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
+    if embedding_lengths is None:
+        raise KeyError(
+            f"Nano multi-modality param {param_idx} is missing "
+            "'multimodal_embedding_lengths'; the per-item extractor needs the "
+            "per-slot row counts."
+        )
+    if len(item_order) != len(embedding_lengths):
+        raise ValueError(
+            "multimodal_item_order length "
+            f"({len(item_order)}) != multimodal_embedding_lengths length "
+            f"({len(embedding_lengths)})"
+        )
+
+    for prompt_pos, ((modality, mm_idx), length) in enumerate(
+        zip(item_order, embedding_lengths, strict=True)
+    ):
+        if modality not in _NANO_MODALITIES:
+            raise ValueError(f"Unknown modality: {modality}")
+        rows = int(length)
+        payload = (
+            slicer.slice_payload(param, modality, int(mm_idx), rows=rows)
+            if slicer is not None
+            else multimodal_data.get(modality)
+        )
+        yield ModalityItem(
+            src_param_idx=param_idx,
+            modality=modality,
+            mm_idx_per_modality=int(mm_idx),
+            prompt_pos=prompt_pos,
+            rows=rows,
+            payload=payload,
+        )
+
+
+def _nano_single_modality_rows(
+    param: MultimodalParams,
+    payload: Dict[str, Any],
+    modality: str,
+    param_idx: int,
+) -> int:
+    """Row count for the single-modality aggregate item.
+
+    Prefers the test-only ``num_tokens`` fast-path; otherwise uses
+    ``multimodal_runtime.total_embeds_in_request`` (the per-request encoder
+    output row count). Raises if neither source is available.
+    """
+    if isinstance(payload, dict) and "num_tokens" in payload:
+        return int(payload["num_tokens"])
+    runtime = getattr(param, "multimodal_runtime", None)
+    total = getattr(runtime, "total_embeds_in_request", None)
+    if total is not None:
+        return int(total)
+    raise KeyError(
+        f"Cannot resolve token count for single-modality {modality!r} in param "
+        f"{param_idx}: payload has no 'num_tokens' and no "
+        "multimodal_runtime.total_embeds_in_request is available."
+    )
 
 
 class SquaredReLU(nn.Module):
@@ -2216,8 +2141,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     evs_expansion.extend(self._img_end_token_ids)
 
             # If audio was extracted from this video, append <so_start><so_embedding>*M<so_end>
-            # so the prompt has placeholder slots for audio embeddings produced by
-            # _interleave_video_audio_embeddings at forward time. Reuse
+            # so the prompt has placeholder slots for the audio embeddings the
+            # encoder produces for the hoisted first-class `(audio, k)` item. Reuse
             # get_num_tokens_per_audio (which returns M + 2) and derive M; this keeps
             # the count consistent with get_num_tokens_per_video's accounting and avoids
             # an unnecessary librosa.resample (we only need the resampled length, not
@@ -2386,12 +2311,22 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return processed_images, input_ids
 
     def _process_images_dynamic(
-        self, images: List[Image.Image | torch.Tensor], text_prompt: str
+        self,
+        images: List[Image.Image | torch.Tensor],
+        text_prompt: str,
+        reserved_non_image_tokens: int = 0,
     ) -> Tuple[Dict[str, Any], torch.Tensor]:
         """Process images using dynamic resolution tiling.
 
         Converts images to raw tensors and computes target sizes; resize,
         normalize, and patch rearrangement are deferred to the vision encoder.
+
+        `reserved_non_image_tokens` is the post-expansion token cost of the other
+        modalities (video/audio) present in a mixed request. Their placeholders
+        are still single, un-expanded tokens in `text_prompt` at this point, so
+        without reserving their real expanded length the image tiler would treat
+        each as ~1 token and claim nearly all of `max_model_len`, overflowing the
+        sequence once those placeholders expand. See `_process_mixed_modalities`.
         """
         tiler = self.dynamic_tiler
 
@@ -2402,7 +2337,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         text_ids = self.tokenizer.encode(sans_images, add_special_tokens=False)
         text_prompt_length = len(text_ids)
 
-        budget = tiler.max_num_tokens_available(text_prompt_length)
+        # Reserve room for the expanded video/audio tokens (their placeholders
+        # are still counted as ~1 token each in `text_prompt_length`; reserving
+        # the full expanded count over-reserves by that handful of placeholder
+        # tokens, which only shrinks the image slightly and never overflows).
+        budget = tiler.max_num_tokens_available(text_prompt_length + reserved_non_image_tokens)
         params_list = tiler.compute_params(images, budget)
 
         raw_tensors = []
@@ -2682,11 +2621,21 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return num_tokens_per_frame_lst
 
     def _prepare_image_modality_data(
-        self, images: List[Image.Image | torch.Tensor], text_prompt: str
+        self,
+        images: List[Image.Image | torch.Tensor],
+        text_prompt: str,
+        reserved_non_image_tokens: int = 0,
     ) -> Dict[str, Any]:
-        """Preprocess Nano image items into the encoder input payload."""
+        """Preprocess Nano image items into the encoder input payload.
+
+        `reserved_non_image_tokens` reserves the post-expansion token cost of the
+        other modalities in a mixed request so the dynamic image tiler does not
+        over-allocate the sequence budget (see `_process_images_dynamic`).
+        """
         if self.dynamic_tiler is not None:
-            processed_data, _ = self._process_images_dynamic(images, text_prompt)
+            processed_data, _ = self._process_images_dynamic(
+                images, text_prompt, reserved_non_image_tokens
+            )
             modality_data = {
                 "pixel_values": processed_data["pixel_values"],
                 "num_patches": processed_data["num_patches"],
@@ -2702,42 +2651,24 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         modality_data["video_size"] = None
         return modality_data
 
-    def _prepare_video_audio_data(
-        self, video_audios: List[Optional[AudioData]]
-    ) -> Optional[Dict[str, Any]]:
-        """Preprocess audio tracks attached to video items when available."""
-        has_audio = [audio is not None for audio in video_audios]
-        audio_from_video = [
-            (audio.samples, audio.sample_rate) for audio in video_audios if audio is not None
-        ]
-        if not audio_from_video or self._audio_extractor is None:
-            return None
-        _, audio_data = self._prepare_audio_features(
-            self._sound_context_token * len(audio_from_video),
-            audio_from_video,
-        )
-        audio_data["has_audio"] = has_audio
-        return audio_data
-
     def _prepare_video_modality_data(self, videos: List[Any]) -> Dict[str, Any]:
-        """Preprocess Nano video items and any embedded audio tracks."""
-        video_frames, video_audios = (
-            [getattr(video_data, "frames", video_data) for video_data in videos],
-            [getattr(video_data, "audio", None) for video_data in videos],
-        )
+        """Preprocess Nano video frames into vision encoder features.
+
+        Vision-only: any embedded audio track is hoisted to a first-class
+        top-level audio item by `_hoist_video_embedded_audio` and prepared via
+        the standalone `_prepare_audio_modality_data` path, so it is not nested
+        under the video payload here.
+        """
+        video_frames = [getattr(video_data, "frames", video_data) for video_data in videos]
         processed_images = self._process_videos_frames(video_frames)
         pv = processed_images["pixel_values"]
-        modality_data = {
+        return {
             "pixel_values": (
                 [v.to(self.dtype) for v in pv] if isinstance(pv, list) else pv.to(self.dtype)
             ),
             "num_patches": processed_images["num_patches"].sum(dim=0, keepdim=True),
             "video_size": processed_images["video_size"],
         }
-        audio_data = self._prepare_video_audio_data(video_audios)
-        if audio_data is not None:
-            modality_data["audio"] = audio_data
-        return modality_data
 
     def _prepare_audio_modality_data(
         self, audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]]
@@ -2770,12 +2701,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             elif modality == "video":
                 video = getattr(item, "frames", item)
                 video_metadata = getattr(item, "metadata", None)
-                video_audio = getattr(item, "audio", None)
+                # VISION-ONLY budget: a video's embedded audio is hoisted to a
+                # first-class `(audio, k)` slot (see `_process_mixed_modalities`),
+                # so it gets its own `get_num_tokens_per_audio` entry. Passing
+                # `video_audio` here would double-count the audio (once in the
+                # video slot, once in the audio slot).
                 num_mm_tokens.append(
                     self.get_num_tokens_per_video(
                         video=video,
                         video_metadata=video_metadata,
-                        video_audio=video_audio,
                     )
                 )
             else:
@@ -2793,12 +2727,116 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         for modality, field_updates in mm_data_updates.items():
             multimodal_data.setdefault(modality, {}).update(field_updates)
 
+    def promote_nested_mm_data(self, mm_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Hoist video-embedded audio to a first-class top-level `audio` item.
+
+        A video that carries an embedded audio track (`VideoData.audio`) is
+        modeled as a separate `(audio, k)` prompt item rather than a nested
+        payload. This returns a shallow-copied `mm_data` that:
+
+          1. extends `mm_data["audio"]` with the video audios as
+             `(samples, sample_rate)` tuples (so the audio rides the existing
+             standalone-audio path / `(audio, k)` slot), and
+          2. vision-only-strips `.audio` off the video items, so the per-frame
+             video expansion does NOT also append a `<so_start>...<so_end>` run —
+             otherwise the audio is double-counted (once in the hoisted audio
+             slot, once on the video) and the prompt's multimodal-token count
+             exceeds the vision-only video budget.
+
+        Used by both the pre-tokenized path (`BaseMultimodalInputProcessor.
+        call_with_token_ids`, where the prompt already carries the
+        `<sound_context>` placeholder) and the text path (via
+        `_hoist_video_embedded_audio`, which additionally injects that
+        placeholder into the prompt text).
+
+        No-op (returns `mm_data` unchanged) when there is no video-embedded audio
+        or no audio extractor is configured. Mixing standalone audio with
+        video-embedded audio in one request is not supported (the prompt-order
+        index of the hoisted audio would be ambiguous); it raises.
+        """
+        videos = self._normalize_mm_data_items(mm_data, "video")
+        video_audios = [getattr(v, "audio", None) for v in videos]
+        if not any(a is not None for a in video_audios) or self._audio_extractor is None:
+            return mm_data
+
+        if mm_data.get("audio"):
+            raise NotImplementedError(
+                "Nano does not support mixing standalone audio with "
+                "video-embedded audio in one request; the hoisted audio's "
+                "prompt-order index would be ambiguous."
+            )
+
+        promoted = dict(mm_data)
+        promoted["audio"] = [
+            (audio.samples, audio.sample_rate) for audio in video_audios if audio is not None
+        ]
+        # Shallow-copy each audio-bearing video item and clear `.audio` so the
+        # originals (and their frames) are untouched.
+        videos_vision_only: List[Any] = []
+        for video in videos:
+            if getattr(video, "audio", None) is not None:
+                video = copy.copy(video)
+                video.audio = None
+            videos_vision_only.append(video)
+        promoted["video"] = videos_vision_only
+        return promoted
+
+    def _hoist_video_embedded_audio(
+        self,
+        text_prompt: str,
+        mm_data: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Text-path wrapper around `promote_nested_mm_data`.
+
+        The raw mixed prompt does NOT carry a `<sound_context>` run for
+        video-embedded audio (only the single-modality video path injects one),
+        so in addition to the data promotion done by `promote_nested_mm_data`
+        this injects a `<sound_context>` placeholder after each
+        video-with-audio placeholder in the text (mirroring
+        `_extract_audio_from_video`), so the downstream order scanner emits
+        `(video, k), (audio, k)`.
+
+        No-op (returns the inputs unchanged) when there is no video-embedded
+        audio or no audio extractor is configured.
+        """
+        videos = self._normalize_mm_data_items(mm_data, "video")
+        video_audios = [getattr(v, "audio", None) for v in videos]
+        if not any(a is not None for a in video_audios) or self._audio_extractor is None:
+            return text_prompt, mm_data
+
+        # Promote the embedded audio to a top-level `(audio, k)` item + vision-only
+        # video (shared with the token path); raises on standalone+embedded audio.
+        hoisted_mm_data = self.promote_nested_mm_data(mm_data)
+
+        # Inject <sound_context> after each <video> that carries audio (same
+        # rebuild as `_extract_audio_from_video`, but feature prep is deferred to
+        # the standalone audio path via the hoisted `mm_data["audio"]`).
+        parts = text_prompt.split(self.video_context_token)
+        if len(parts) - 1 != len(videos):
+            raise ValueError(
+                f"Number of {self.video_context_token} tokens ({len(parts) - 1}) "
+                f"doesn't match the number of videos ({len(videos)})"
+            )
+        rebuilt = [parts[0]]
+        for i, part in enumerate(parts[1:]):
+            rebuilt.append(self.video_context_token)
+            if video_audios[i] is not None:
+                rebuilt.append(self._sound_context_token)
+            rebuilt.append(part)
+        hoisted_text = "".join(rebuilt)
+        return hoisted_text, hoisted_mm_data
+
     def _process_mixed_modalities(
         self,
         text_prompt: str,
         mm_data: Dict[str, Any],
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """Preprocess one Nano request containing more than one raw modality."""
+        # Hoist any video-embedded audio to a first-class top-level audio item
+        # (injects `<sound_context>` + extends `mm_data["audio"]`) BEFORE the
+        # order scanner so it emits `(video, k), (audio, k)` at the right ranks.
+        text_prompt, mm_data = self._hoist_video_embedded_audio(text_prompt, mm_data)
+
         item_order = self._get_mm_item_order_from_text(text_prompt, mm_data)
         multimodal_data: Dict[str, Any] = {
             "modality_type": list(dict.fromkeys(modality for modality, _ in item_order)),
@@ -2807,11 +2845,25 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             ],
         }
 
+        # Per-item expanded token lengths in prompt order. Computed up front so
+        # the dynamic image tiler can reserve the real (post-expansion) cost of
+        # the non-image slots: at this point the `<video>`/`<sound_context>`
+        # placeholders are still single tokens, so without this reservation the
+        # tiler would treat them as ~1 token each and over-allocate the image
+        # against nearly all of `max_model_len`, overflowing once they expand.
+        num_mm_tokens = self._get_num_tokens_for_item_order(item_order, mm_data)
+        reserved_non_image_tokens = sum(
+            tokens
+            for (modality, _), tokens in zip(item_order, num_mm_tokens)
+            if modality != "image"
+        )
+
         images = mm_data.get("image")
         if images is not None:
             multimodal_data["image"] = self._prepare_image_modality_data(
                 self._normalize_mm_data_items(mm_data, "image"),
                 text_prompt,
+                reserved_non_image_tokens,
             )
 
         videos = mm_data.get("video")
@@ -2826,7 +2878,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 self._normalize_mm_data_items(mm_data, "audio")
             )
 
-        num_mm_tokens = self._get_num_tokens_for_item_order(item_order, mm_data)
         input_ids, mm_data_updates = self._expand_mixed_prompt_text_for_mm(
             text_prompt,
             num_mm_tokens,
@@ -2847,7 +2898,18 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         images = mm_data.get("image", None)
         videos = mm_data.get("video", None)
         audios = mm_data.get("audio", None)
-        if sum([images is not None, videos is not None, audios is not None]) > 1:
+        # A video carrying embedded audio is effectively a multi-modality
+        # (video + audio) request: the audio is hoisted to a first-class
+        # `(audio, k)` item by the mixed path. Route it there so the embedded
+        # audio is encoded and scattered as its own item (no nested payload, no
+        # post-encode interleave).
+        video_has_embedded_audio = videos is not None and any(
+            getattr(v, "audio", None) is not None for v in videos
+        )
+        if (
+            sum([images is not None, videos is not None, audios is not None]) > 1
+            or video_has_embedded_audio
+        ):
             return self._process_mixed_modalities(text_prompt, mm_data)
 
         if images is None and videos is None and audios is None:
@@ -3524,112 +3586,120 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             cursor += n_clips
         return results
 
-    def _audio_payload_clip_counts(self, audio_payload: Dict[str, Any]) -> List[int]:
-        """Per-clip audio token (row) counts for one audio payload.
-
-        Computed from the production ``feature_attention_mask`` via the same
-        sub-sampling math the encoder applies in :meth:`_encode_audio`
-        (``valid_input_lens -> _get_subsampling_output_length``). This is
-        deterministic and does not require running the encoder, so it can be
-        used at assembly-build time to size the audio item BEFORE encoding, and
-        it matches the per-clip counts :meth:`_encode_audio` returns by
-        construction (same mask, same sub-sampling).
-
-        Returns one int per clip, in clip order (clips of all the payload's
-        audio streams concatenated, matching ``input_audio_features`` row
-        order). Raises ``KeyError`` if the payload lacks the production
-        ``feature_attention_mask`` field.
-        """
-        mask = audio_payload.get("feature_attention_mask")
-        if mask is None:
-            raise KeyError(
-                "Nano audio payload is missing 'feature_attention_mask'; cannot "
-                "derive per-clip audio token counts."
-            )
-        valid_input_lens = mask.sum(dim=1)
-        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
-            valid_input_lens
-        )
-        return [int(x) for x in valid_output_lens.tolist()]
-
-    def _audio_payload_total_rows(self, audio_payload: Dict[str, Any]) -> int:
-        """Total audio encoder rows for one audio payload.
-
-        Prefers the test-only ``num_tokens`` fast-path; otherwise sums the
-        production-derived per-clip counts from :meth:`_audio_payload_clip_counts`.
-        Matches the audio encoder's actual output rows for the payload.
-        """
-        num_tokens = audio_payload.get("num_tokens")
-        if num_tokens is not None:
-            return int(num_tokens)
-        return sum(self._audio_payload_clip_counts(audio_payload))
-
-    def _interleave_video_audio_embeddings(
+    def _nano_slice_payload(
         self,
-        vision_emb: torch.Tensor,
-        audio_emb: torch.Tensor,
-        per_clip_audio_counts: List[int],
-        has_audio: List[bool],
-        audio_num_clips: torch.Tensor,
-        video_sizes: List[List[int]],
-        evs_num_tokens: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Interleave per-video vision and audio embeddings to match input_ids order.
+        param: MultimodalParams,
+        modality: str,
+        mm_idx_per_modality: int,
+        *,
+        rows: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Carve one sub-item out of an aggregate per-modality payload.
 
-        The vision encoder concatenates all videos' embeddings `[v1_vis, v2_vis, ...]`
-        and the audio encoder concatenates all clips `[v1_aud, v2_aud, ...]`.
-        `input_ids` expects them interleaved per-video:
-        `[v1_vis, v1_aud, v2_vis, v2_aud, ...]`.
+        Used by the per-item (multi-modality) extractor so each
+        `ModalityItem` carries a single-sub-item encoder input. Zero-copy where
+        the source already stores per-item lists; a tile-range or clip-range
+        slice otherwise.
+
+        * image, dynamic-resolution (`image_sizes` present): index element
+          `mm_idx_per_modality` of each per-image list; `num_patches` = [1].
+        * image, fixed-tile: the image owns `rows // num_image_token` tiles
+          (asserted to divide evenly); slice that tile-range out of the flat
+          `pixel_values` tensor and set `num_patches` to the tile count.
+        * video, temporal: index video `mm_idx_per_modality` (per-video list
+          layout) or slice its `t * tiles` tile-range (flat-tensor layout);
+          `video_size` keeps just that video's descriptor.
+        * audio: slice the clip-range for stream `mm_idx_per_modality` out of
+          `input_audio_features` / `feature_attention_mask` using
+          `audio_num_clips`; `audio_num_clips` becomes that stream's count.
         """
-        assert len(has_audio) == len(video_sizes), (
-            f"has_audio length ({len(has_audio)}) != video_sizes length ({len(video_sizes)})"
-        )
+        payload = (param.multimodal_data or {}).get(modality)
+        if payload is None:
+            raise KeyError(f"param has no {modality!r} payload to slice")
 
-        # Get per-video vision token counts.
-        vision_enc = self.vision_encoder
-        T = vision_enc.video_temporal_patch_size
+        if modality == "audio":
+            num_clips = payload["audio_num_clips"].tolist()
+            clip_start = int(sum(num_clips[:mm_idx_per_modality]))
+            clip_end = clip_start + int(num_clips[mm_idx_per_modality])
+            sliced = {
+                "input_audio_features": payload["input_audio_features"][clip_start:clip_end],
+                "feature_attention_mask": payload["feature_attention_mask"][clip_start:clip_end],
+                "audio_num_clips": payload["audio_num_clips"][
+                    mm_idx_per_modality : mm_idx_per_modality + 1
+                ],
+            }
+            return sliced
 
-        per_video_geom = [
-            vision_enc._video_tubelet_geometry(vs[0], T, vs[2], vs[3]) for vs in video_sizes
-        ]
+        if modality == "image" and "image_sizes" in payload:
+            # Dynamic-resolution image: per-image lists, zero-copy index.
+            sliced = {
+                "pixel_values": [payload["pixel_values"][mm_idx_per_modality]],
+                "image_sizes": [payload["image_sizes"][mm_idx_per_modality]],
+                "num_patches": torch.tensor([1]),
+                "video_size": None,
+            }
+            if "num_tokens_per_image" in payload:
+                sliced["num_tokens_per_image"] = [
+                    payload["num_tokens_per_image"][mm_idx_per_modality]
+                ]
+            return sliced
 
-        if evs_num_tokens is not None:
-            # EVS active: evs_num_tokens is a 1-D tensor of per-tubelet retained
-            # token counts across all videos. Split by tubelets-per-video and sum.
-            tubelets_per_video = [nt for nt, _ in per_video_geom]
-            vision_counts = [
-                int(chunk.sum().item()) for chunk in torch.split(evs_num_tokens, tubelets_per_video)
-            ]
+        if modality == "image":
+            # Fixed-tile image: `pixel_values` is a flat [total_tiles, 3, H, W]
+            # tensor. The image owns `rows // num_image_token` tiles; prior
+            # images' tiles set its offset.
+            num_image_token = self.vision_encoder.num_image_token
+            if rows is None or rows <= 0 or rows % num_image_token != 0:
+                raise ValueError(
+                    f"fixed-tile image rows ({rows}) is not a positive multiple of "
+                    f"num_image_token ({num_image_token}); cannot derive tile count"
+                )
+            tiles = rows // num_image_token
+            tile_start = self._nano_fixed_tile_offset(param, mm_idx_per_modality, num_image_token)
+            tile_end = tile_start + tiles
+            return {
+                "pixel_values": payload["pixel_values"][tile_start:tile_end],
+                "num_patches": torch.tensor([tiles]),
+                "video_size": None,
+            }
+
+        # video (temporal).
+        video_sizes = payload["video_size"]
+        pixel_values = payload["pixel_values"]
+        sliced_size = [video_sizes[mm_idx_per_modality]]
+        if isinstance(pixel_values, list):
+            sliced_pv = pixel_values[mm_idx_per_modality]
         else:
-            # No EVS: deterministic from video_size.
-            vision_counts = [
-                nt * vs[1] * wh for (nt, wh), vs in zip(per_video_geom, video_sizes, strict=True)
-            ]
+            # Flat tensor: slice the `t * tiles` tile-range for this video.
+            tile_start = sum(vs[0] * vs[1] for vs in video_sizes[:mm_idx_per_modality])
+            this = video_sizes[mm_idx_per_modality]
+            tile_end = tile_start + this[0] * this[1]
+            sliced_pv = pixel_values[tile_start:tile_end]
+        return {"pixel_values": sliced_pv, "video_size": sliced_size}
 
-        # Group per-clip audio counts into per-video audio token counts, since each audio stream
-        # may be split into multiple clips by the extractor.
-        # `audio_num_clips` tells us how many clips belong to each stream.
-        per_video_audio_counts: List[int] = []
-        clip_offset = 0
-        for num_clips in audio_num_clips.tolist():
-            per_video_audio_counts.append(
-                sum(per_clip_audio_counts[clip_offset : clip_offset + num_clips])
-            )
-            clip_offset += num_clips
+    def _nano_fixed_tile_offset(
+        self, param: MultimodalParams, mm_idx_per_modality: int, num_image_token: int
+    ) -> int:
+        """Tile offset of image `mm_idx_per_modality` in a flat fixed-tile payload.
 
-        # Split and interleave.
-        vision_parts = vision_emb.split(vision_counts)
-        audio_parts = audio_emb.split(per_video_audio_counts)
-
-        parts: List[torch.Tensor] = []
-        audio_idx = 0
-        for i, vision_part in enumerate(vision_parts):
-            parts.append(vision_part)
-            if has_audio[i]:
-                parts.append(audio_parts[audio_idx])
-                audio_idx += 1
-
-        return torch.cat(parts, dim=0)
+        The flat `pixel_values` packs each image's tiles back-to-back in
+        per-modality index order, so the offset is the prefix sum of the tile
+        counts of all earlier images. Each earlier image's tile count is its
+        per-slot `multimodal_embedding_lengths` entry divided by
+        `num_image_token` (the authoritative per-image row count). When no
+        per-slot lengths are available (a single image, or a stub), every image
+        is the legacy one-tile default and the offset is the index itself.
+        """
+        multimodal_data = param.multimodal_data or {}
+        item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
+        lengths = multimodal_data.get("multimodal_embedding_lengths")
+        if item_order is None or lengths is None:
+            return mm_idx_per_modality
+        offset = 0
+        for prompt_pos, (modality, idx) in enumerate(item_order):
+            if modality == "image" and idx < mm_idx_per_modality:
+                offset += int(lengths[prompt_pos]) // num_image_token
+        return offset
 
     def _adapter_vision_bucket(
         self,
@@ -3663,139 +3733,16 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
     ) -> torch.Tensor:
         """Run the audio encoder on one bucket of audio items.
 
-        Normalizes the legacy `_encode_audio` scalar-vs-list return into a
-        single cat'd tensor of shape (sum_token_counts, H) in bucket order.
-        Items in the bucket may be a mix of standalone audio
-        (`item_idx_in_param >= 0`) and ghost audio extracted from video
-        (`item_idx_in_param == -1`). Non-ghost items appear first in bucket
-        order per the extractor's contract.
-
-        The per-clip token counts `_encode_audio` returns are the authoritative
-        audio row counts (derived from the encoder's sub-sampling of the
-        feature mask). They are stashed on `self._nano_audio_clip_counts`
-        keyed by `(src_param_idx, item_idx_in_param)` so the video-audio
-        interleave in `_nano_post_encode` can use the encoder's actual per-clip
-        split instead of re-deriving it from a payload field.
+        `_encode_audio` always returns a list of `(embeddings, per_clip_counts)`
+        in input order (one entry per item); the adapter cats the per-item
+        embedding tensors into one bucket tensor of shape (sum_rows, H) in
+        bucket order. Audio (standalone or hoisted from video) is just another
+        item — there is no embedded-audio special case to re-place, so no
+        per-clip sidecar is threaded.
         """
         payloads = [item.payload for item in items]
         encoded = self._encode_audio(payloads)
-        if isinstance(encoded, list):
-            self._nano_audio_clip_counts = {
-                (item.src_param_idx, item.item_idx_in_param): list(counts)
-                for item, (_, counts) in zip(items, encoded, strict=True)
-            }
-            return torch.cat([t for t, _ in encoded], dim=0)
-        if len(items) == 1 and isinstance(encoded, torch.Tensor):
-            self._nano_audio_clip_counts = {
-                (items[0].src_param_idx, items[0].item_idx_in_param): [int(encoded.shape[0])]
-            }
-            return encoded
-        raise TypeError(
-            "_encode_audio must return a list of (embeddings, counts) for batched audio inputs"
-        )
-
-    def _nano_post_encode(
-        self,
-        bucket_outputs: Dict[str, torch.Tensor],
-        assembly: MixedModalityAssembly,
-        multimodal_params: List[MultimodalParams],
-    ) -> None:
-        """Interleave paired video-audio rows; truncate ghost-audio bucket rows.
-
-        Walks `assembly._modality_slots["video"]` in bucket order. For each
-        video item that has a paired ghost audio item (same
-        `src_param_idx`, with `item_idx_in_param == -1` in the audio
-        bucket), slice the matching rows out of `bucket_outputs["video"]`
-        (PRE-interleave) and `bucket_outputs["audio"]` (ghost portion),
-        call `self._interleave_video_audio_embeddings`, and emit the
-        result. After all videos are processed, replace
-        `bucket_outputs["video"]` with the assembled POST-interleave
-        tensor and truncate `bucket_outputs["audio"]` to drop ghost rows
-        (extractor convention: non-ghost items come first in bucket
-        order).
-
-        No-op if no video bucket is present.
-        """
-        if "video" not in bucket_outputs:
-            return
-
-        video_slots = assembly._modality_slots["video"].tolist()
-
-        # Index ghost audio items by source param idx. Carry the ghost item's
-        # identity `(src_param_idx, item_idx_in_param)` so the encoder's actual
-        # per-clip counts (stashed by `_adapter_audio_bucket`) can be looked up.
-        ghost_audio_by_param: Dict[int, Tuple[int, ModalityItem]] = {}
-        if "audio" in bucket_outputs:
-            audio_slots = assembly._modality_slots["audio"].tolist()
-            for slot_pos, flat_idx in enumerate(audio_slots):
-                item = assembly.items[flat_idx]
-                if item.item_idx_in_param == -1:
-                    ghost_audio_by_param[item.src_param_idx] = (slot_pos, item)
-
-        clip_counts_by_item = getattr(self, "_nano_audio_clip_counts", {}) or {}
-
-        # Build new video bucket by walking video items in bucket order.
-        # Each video item consumes its PRE-interleave (vision-only) rows from
-        # the original video bucket; if it has a paired ghost audio item, its
-        # rows are interleaved in to produce the POST-interleave chunk for that
-        # video.
-        new_video_chunks: List[torch.Tensor] = []
-        video_cursor = 0
-        audio_offsets_t = assembly._bucket_offsets.get("audio")
-        for flat_idx in video_slots:
-            item = assembly.items[flat_idx]
-            payload = item.payload
-            # Vision-only (pre-interleave) row count. `encoder_rows` is the
-            # encoder-output row count the assembly asserted against the vision
-            # encoder, resolved from production fields (or the test-only
-            # `num_tokens`) by the extractor — no need to re-read the payload.
-            pre_interleave_count = item.encoder_rows
-            video_chunk = bucket_outputs["video"][
-                video_cursor : video_cursor + pre_interleave_count
-            ]
-            video_cursor += pre_interleave_count
-
-            ghost = ghost_audio_by_param.get(item.src_param_idx)
-            if ghost is not None and audio_offsets_t is not None:
-                ghost_slot_pos, ghost_item = ghost
-                audio_data = ghost_item.payload
-                audio_start = int(audio_offsets_t[ghost_slot_pos].item())
-                audio_end = int(audio_offsets_t[ghost_slot_pos + 1].item())
-                audio_chunk = bucket_outputs["audio"][audio_start:audio_end]
-                # Prefer the encoder's actual per-clip counts (threaded by
-                # `_adapter_audio_bucket`); fall back to the production-mask
-                # derivation when unavailable (both use the same sub-sampling).
-                per_clip = clip_counts_by_item.get(
-                    (ghost_item.src_param_idx, ghost_item.item_idx_in_param)
-                )
-                if per_clip is None:
-                    per_clip = self._audio_payload_clip_counts(audio_data)
-                src = multimodal_params[item.src_param_idx]
-                src_mm_data = src.multimodal_data or {}
-                video_chunk = self._interleave_video_audio_embeddings(
-                    video_chunk,
-                    audio_chunk,
-                    per_clip,
-                    has_audio=audio_data.get("has_audio", []),
-                    audio_num_clips=audio_data.get("audio_num_clips"),
-                    video_sizes=payload.get("video_size", []),
-                    evs_num_tokens=src_mm_data.get("num_tokens_in_video"),
-                )
-            new_video_chunks.append(video_chunk)
-
-        if new_video_chunks:
-            bucket_outputs["video"] = torch.cat(new_video_chunks, dim=0)
-
-        # Truncate audio bucket to drop ghost rows. Non-ghost items come
-        # first in bucket order per the extractor's contract, so summing
-        # non-ghost token counts gives the prefix length to retain.
-        if "audio" in bucket_outputs:
-            n_non_ghost_rows = sum(
-                assembly.items[fi].token_count
-                for fi in assembly._modality_slots["audio"].tolist()
-                if assembly.items[fi].item_idx_in_param != -1
-            )
-            bucket_outputs["audio"] = bucket_outputs["audio"][:n_non_ghost_rows]
+        return torch.cat([t for t, _ in encoded], dim=0)
 
     @staticmethod
     def _build_single_modality_param(
@@ -3830,42 +3777,19 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         Per-request `num_tokens_in_video` (needed by EVS) is stashed on
         each video param's `multimodal_data` dict as a side-channel by
         `_adapter_vision_bucket`, identical to the pre-refactor behavior.
+
+        Audio (standalone or hoisted from a video by the input processor) is a
+        first-class `(audio, k)` item: there is no embedded-audio special case,
+        no ghost item, and no post-encode interleave — the assembly's per-item
+        scatter produces the canonical layout directly.
         """
         if not multimodal_params:
             return []
 
-        # When the model has no sound encoder, hide ghost audio items that
-        # come from video payloads — the original code only collected the
-        # embedded audio data ``if self.sound_encoder is not None``. We mask
-        # the audio sub-payload during extraction so the video token_count
-        # also stays at the vision-only count and no audio bucket is built.
-        # Per-clip counts threaded out of `_adapter_audio_bucket`; reset so a
-        # stale map from a prior call can't leak into this assembly's post-encode.
-        self._nano_audio_clip_counts = {}
-        # Resolve a video's embedded-audio row count from production fields
-        # (the audio feature mask via the encoder's sub-sampling) so the
-        # extractor doesn't need a test-only `num_tokens` payload field.
-        audio_rows_fn = self._audio_payload_total_rows
+        slicer = NanoPayloadSlicer(self)
 
-        if self.sound_encoder is None:
-
-            def extract(param_idx: int, param: MultimodalParams):
-                mm_data = param.multimodal_data or {}
-                video_payload = mm_data.get("video")
-                stashed_audio = None
-                if isinstance(video_payload, dict) and video_payload.get("audio") is not None:
-                    stashed_audio = video_payload["audio"]
-                    video_payload["audio"] = None
-                try:
-                    yield from _nano_extract_items(param_idx, param, audio_rows_fn)
-                finally:
-                    if stashed_audio is not None:
-                        video_payload["audio"] = stashed_audio
-
-        else:
-
-            def extract(param_idx: int, param: MultimodalParams):
-                yield from _nano_extract_items(param_idx, param, audio_rows_fn)
+        def extract(param_idx: int, param: MultimodalParams):
+            yield from _nano_extract_items(param_idx, param, slicer=slicer)
 
         assembly = MixedModalityAssembly.from_params(
             multimodal_params=multimodal_params,
@@ -3882,7 +3806,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 "audio": self._adapter_audio_bucket,
             },
             multimodal_params=multimodal_params,
-            post_process=self._nano_post_encode,
             device=self._encode_multimodal_device(),
             dtype=self._encode_multimodal_dtype(),
             hidden_dim=self._encode_multimodal_hidden_dim(),

@@ -3,14 +3,16 @@
 
 # Target-only randomized query accuracy for the audio-in-video mixed task: each
 # request contains an image and a video whose embedded audio track is extracted
-# (extract_video_audio=True). This drives the Nano post-encode video-audio
-# interleave + ghost-audio plan path. The mixed-vs-pure delta is gated by the
-# evaluator; this reference is the absolute target-accuracy floor.
+# (extract_video_audio=True). Nano hoists that embedded audio to a first-class
+# top-level (audio, k) item (no ghosts, no shared slots, no post-encode
+# re-placement). The mixed-vs-pure delta is gated by the evaluator; this
+# reference is the absolute target-accuracy floor.
 #
 # The reference mirrors the image/audio/video MixedModality omni task (same
-# model + datasets, image+video subset). Provisional pending a measured B100
-# run; update with the observed value once the gate runs green on a node that
-# can build the decode-attention CUDA graph.
+# model + datasets, image+video subset). These accuracy values are an interim
+# ref_accuracy used only to gate the mixed-vs-pure delta, not a measured run;
+# replace them with the observed accuracy once the gate runs green on a node
+# that can build the decode-attention CUDA graph.
 nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16:
   - accuracy: 70.00
     num_samples: 50

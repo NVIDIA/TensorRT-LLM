@@ -42,6 +42,37 @@ from .mixed_modality import (MODALITY_AUDIO, MODALITY_IMAGE, MODALITY_VIDEO,
                              MixedModalityEvaluator)
 from .video_mme import VideoMME as VideoMMEEvaluator
 
+_DEFAULT_MIXED_MOD_NUM_SAMPLES = 50
+
+
+def _env_num_samples(*env_vars: str,
+                     default: int = _DEFAULT_MIXED_MOD_NUM_SAMPLES) -> int:
+    """Read a positive sample count from the first set env var, else `default`.
+
+    Parsing happens lazily/defensively rather than at class-body import time: a
+    non-integer or non-positive value logs a warning and falls back to `default`
+    instead of raising `ValueError` during module import and taking down
+    unrelated test collection.
+    """
+    for env_var in env_vars:
+        raw = os.getenv(env_var)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning(
+                f"Ignoring non-integer {env_var}={raw!r}; using default {default}."
+            )
+            return default
+        if value <= 0:
+            logger.warning(
+                f"Ignoring non-positive {env_var}={value}; using default {default}."
+            )
+            return default
+        return value
+    return default
+
 
 def compute_theta(num_samples: int,
                   sigma: float,
@@ -324,7 +355,7 @@ class MixedModality(AccuracyTask):
     ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50.0
-    NUM_SAMPLES = int(os.getenv("TRTLLM_MIXED_MOD_NUM_SAMPLES", "50"))
+    NUM_SAMPLES = _env_num_samples("TRTLLM_MIXED_MOD_NUM_SAMPLES")
 
     MAX_BATCH_SIZE = 64
     MAX_INPUT_LEN = 32768
@@ -350,11 +381,11 @@ class MixedModalityVideoAudio(AccuracyTask):
 
     Like `MixedModality`, but the video items are loaded with their embedded
     audio track extracted (`extract_video_audio=True`), so each request mixes an
-    image with a video that carries audio. This drives the Nano post-encode
-    video-audio interleave path (`multimodal_data["video"]["audio"]` + the
-    ghost-audio item in the flat-item plan) end-to-end, which the standalone
-    image/audio/video `MixedModality` task never exercises. The mixed-vs-pure
-    gate is inherited from `MixedModalityEvaluator`.
+    image with a video that carries audio. Nano hoists that embedded audio to a
+    first-class top-level `(audio, k)` item (no ghosts, no shared slots, no
+    post-encode re-placement), driving the hoisted-audio path end-to-end, which
+    the standalone image/audio/video `MixedModality` task never exercises. The
+    mixed-vs-pure gate is inherited from `MixedModalityEvaluator`.
 
     NOTE: audio extraction needs PyAV (the evaluator sets `TRTLLM_ENABLE_PYAV=1`
     when `extract_video_audio` is enabled); the container must have `av`
@@ -368,11 +399,10 @@ class MixedModalityVideoAudio(AccuracyTask):
     ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50.0
-    NUM_SAMPLES = int(
-        os.getenv(
-            "TRTLLM_VIDEO_AUDIO_MIXED_MOD_NUM_SAMPLES",
-            os.getenv("TRTLLM_MIXED_MOD_NUM_SAMPLES", "50"),
-        ))
+    NUM_SAMPLES = _env_num_samples(
+        "TRTLLM_VIDEO_AUDIO_MIXED_MOD_NUM_SAMPLES",
+        "TRTLLM_MIXED_MOD_NUM_SAMPLES",
+    )
 
     MAX_BATCH_SIZE = 64
     MAX_INPUT_LEN = 32768

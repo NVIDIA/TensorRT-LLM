@@ -21,17 +21,17 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
     _compute_aspect_preserving_size,
-    _nano_extract_items,
     get_video_target_size_and_feature_size,
     video_to_pixel_values,
 )
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
+    MultimodalPromptOrder,
     MultimodalRuntimeData,
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
 )
-from tensorrt_llm.inputs.multimodal_data import AudioData
+from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 
 
 def make_tiler(**overrides):
@@ -197,9 +197,11 @@ def _make_nano_processor(*, sound_config, **overrides):
 
     tokenizer = mock.Mock()
     tokenizer.encode = mock.Mock(
-        side_effect=lambda text, **kw: torch.tensor(list(range(len(text)))).unsqueeze(0)
-        if kw.get("return_tensors") == "pt"
-        else list(range(len(text)))
+        side_effect=lambda text, **kw: (
+            torch.tensor(list(range(len(text)))).unsqueeze(0)
+            if kw.get("return_tensors") == "pt"
+            else list(range(len(text)))
+        )
     )
 
     config = mock.Mock()
@@ -368,6 +370,77 @@ class TestNanoV2VLInputProcessor:
         data_long, _ = processor._process_images_dynamic([img], long_prompt)
 
         assert data_short["num_tokens_per_image"][0] > data_long["num_tokens_per_image"][0]
+
+    def test_process_images_dynamic_reserves_non_image_tokens(self):
+        """Reserving non-image (video/audio) tokens shrinks the image budget.
+
+        Regression for the mixed-request over-allocation: in a mixed image +
+        video/audio request the video/audio placeholders are still single,
+        un-expanded tokens when the dynamic image tiler runs, so without
+        reserving their real post-expansion cost the image would claim nearly
+        all of max_model_len and the sequence would overflow once they expand.
+        A positive `reserved_non_image_tokens` must leave fewer tokens for the
+        image, exactly as a longer text prompt does.
+        """
+        processor = _make_processor(max_model_len=1000, max_num_patches=512, min_num_patches=4)
+        img = Image.new("RGB", (512, 512))
+        prompt = "A" + processor.img_context_token + "B"
+
+        # reserved=0 budget: (1000 - 2 - 4) * 4 = 3976 (image hits its natural cap);
+        # reserved=900 budget: (1000 - 2 - 4 - 900) * 4 = 376 (image is squeezed),
+        # mirroring how a 900-char-longer text prompt squeezes the image.
+        data_none, _ = processor._process_images_dynamic([img], prompt, reserved_non_image_tokens=0)
+        data_reserved, _ = processor._process_images_dynamic(
+            [img], prompt, reserved_non_image_tokens=900
+        )
+
+        assert data_reserved["num_tokens_per_image"][0] < data_none["num_tokens_per_image"][0]
+
+    def test_mixed_modalities_reserves_non_image_budget(self):
+        """The mixed path reserves the expanded audio/video cost for the image.
+
+        End-to-end regression for the headline mixed image+audio request: the
+        audio placeholder is still a single token when the dynamic image tiler
+        runs, so `_process_mixed_modalities` must compute the real expanded
+        audio length and hand it to `_prepare_image_modality_data` as the
+        non-image reservation. Without it the image would be budgeted against
+        nearly all of max_model_len and the sequence could overflow once the
+        audio placeholder expands.
+        """
+        proc = _make_audio_processor(max_model_len=1000, max_num_patches=512, min_num_patches=4)
+        img = Image.new("RGB", (512, 512))
+        audio = np.random.randn(16000).astype(np.float32)
+        mm_data = {"image": [img], "audio": [audio]}
+        prompt = f"{proc.img_context_token} then {AUDIO_PLACEHOLDER}"
+
+        # Expected reservation == the audio item's real expanded token count.
+        expected_reserved = proc.get_num_tokens_per_audio(audio=audio)
+        assert expected_reserved > 1  # audio expands to many tokens, not ~1
+
+        captured = {}
+        real_prepare_image = proc._prepare_image_modality_data
+
+        def _spy_prepare_image(images, text_prompt, reserved_non_image_tokens=0):
+            captured["reserved"] = reserved_non_image_tokens
+            return real_prepare_image(images, text_prompt, reserved_non_image_tokens)
+
+        with (
+            mock.patch.object(proc, "_prepare_image_modality_data", side_effect=_spy_prepare_image),
+            mock.patch.object(proc, "_prepare_audio_modality_data", return_value={}),
+            mock.patch.object(
+                proc,
+                "_expand_mixed_prompt_text_for_mm",
+                return_value=(torch.zeros(1, 4, dtype=torch.long), None),
+            ),
+            mock.patch(
+                "tensorrt_llm._torch.models.modeling_nemotron_nano."
+                "find_multimodal_embedding_lengths",
+                return_value=[],
+            ),
+        ):
+            proc._process_mixed_modalities(prompt, mm_data)
+
+        assert captured["reserved"] == expected_reserved
 
     def test_process_images_dynamic_mismatched_placeholders_raises(self):
         """Mismatch between <image> placeholders and image count should raise."""
@@ -1868,6 +1941,162 @@ class TestExpandPromptTokenIdsForMM:
         assert multimodal_data["multimodal_embedding_lengths"] == [3, 256, 3]
 
 
+class TestMixedModalityAudioHoist:
+    """The audio hoist: in a MIXED request, a video that carries embedded audio
+    is promoted to a first-class top-level `audio` item.
+
+    `_process_mixed_modalities` must, before running the order scanner:
+      1. inject a `<sound_context>` placeholder after each video-with-audio in
+         the text (the raw mixed prompt does NOT carry it — only the
+         single-modality video path injects via `_extract_audio_from_video`), and
+      2. register the extracted audio as a top-level `mm_data["audio"]` item,
+    so the scanner emits `(video, k), (audio, k)` at the right ranks and
+    `find_multimodal_embedding_lengths` splits the budget into separate
+    vision-only video + audio slots.
+    """
+
+    @staticmethod
+    def _video_with_audio(num_audio_samples=16000):
+        frames = [Image.new("RGB", (512, 512))]
+        audio = AudioData(
+            samples=np.random.randn(num_audio_samples).astype(np.float32),
+            sample_rate=16000,
+        )
+        return SimpleNamespace(frames=frames, metadata=None, audio=audio)
+
+    def _make_proc(self):
+        proc = _make_fast_path_audio_processor(video_target_num_patches=None)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
+        return proc
+
+    def test_primary_image_video_audio_interleave_order(self):
+        # PRIMARY: image -> video(+audio) -> image -> video(+audio). The raw
+        # prompt has NO <so_embedding>; the hoist must inject one per video and
+        # promote both video audios so the order is the plain interleave with
+        # the audio as a first-class slot AFTER each video.
+        proc = self._make_proc()
+
+        # vision-only video + audio per-slot counts the (mocked) ruler returns,
+        # in prompt order: img, vid, aud, img, vid, aud.
+        proc._get_num_tokens_for_item_order = mock.Mock(return_value=[5, 258, 5, 5, 258, 5])
+        proc._prepare_image_modality_data = mock.Mock(
+            return_value={"pixel_values": torch.ones(2, 3, 2, 2)}
+        )
+        proc._prepare_video_modality_data = mock.Mock(
+            return_value={"pixel_values": torch.ones(2, 3, 2, 2), "video_size": [[1, 1, 512, 512]]}
+        )
+        proc._prepare_audio_modality_data = mock.Mock(
+            return_value={"input_audio_features": torch.ones(2, 4, 2)}
+        )
+
+        v0 = self._video_with_audio()
+        v1 = self._video_with_audio()
+        prompt = "<image><video><image><video>"
+        mm_data = {"image": [object(), object()], "video": [v0, v1]}
+
+        _, extra = proc({"prompt": prompt, "multi_modal_data": mm_data}, None)
+        multimodal_data = extra["multimodal_data"]
+
+        # The hoist promoted both video audios into a first-class audio item, so
+        # the order is the plain flat interleave with audio after each video.
+        assert multimodal_data["multimodal_item_order"] == [
+            {"modality": "image", "index": 0},
+            {"modality": "video", "index": 0},
+            {"modality": "audio", "index": 0},
+            {"modality": "image", "index": 1},
+            {"modality": "video", "index": 1},
+            {"modality": "audio", "index": 1},
+        ]
+        assert multimodal_data["modality_type"] == ["image", "video", "audio"]
+        # An audio payload is present (built from the hoisted video audios).
+        assert "audio" in multimodal_data
+        # The audio ruler was invoked for two hoisted audio items.
+        prepared_audios = proc._prepare_audio_modality_data.call_args[0][0]
+        assert len(prepared_audios) == 2
+
+    def test_video_audio_budget_splits_into_separate_slots(self):
+        # The video slot must be VISION-ONLY and the audio its own slot:
+        # `_get_num_tokens_for_item_order` is passed video items WITHOUT the
+        # embedded-audio budget, and the audio slot carries the audio budget.
+        proc = self._make_proc()
+
+        # Spy ruler: capture the item_order it is asked to size so we can assert
+        # the (video, k) entry's video item carries NO embedded audio.
+        captured = {}
+
+        def spy_ruler(item_order, mm_data):
+            captured["item_order"] = list(item_order)
+            captured["mm_data_audio"] = mm_data.get("audio")
+            # Return a deterministic per-slot count list. The video slot budget
+            # is the full `get_num_tokens_per_video` count (256 context + 2 for
+            # the `<img>`/`</img>` specials = 258), matching what the per-frame
+            # video expansion emits; the audio slot is 4 (start + 2 context + end).
+            return [5, 258, 4, 5, 258, 4]
+
+        proc._get_num_tokens_for_item_order = mock.Mock(side_effect=spy_ruler)
+        proc._prepare_image_modality_data = mock.Mock(
+            return_value={"pixel_values": torch.ones(2, 3, 2, 2)}
+        )
+        proc._prepare_video_modality_data = mock.Mock(
+            return_value={"pixel_values": torch.ones(2, 3, 2, 2), "video_size": [[1, 1, 512, 512]]}
+        )
+        proc._prepare_audio_modality_data = mock.Mock(
+            return_value={"input_audio_features": torch.ones(2, 4, 2)}
+        )
+
+        v0 = self._video_with_audio()
+        v1 = self._video_with_audio()
+        prompt = "<image><video><image><video>"
+        mm_data = {"image": [object(), object()], "video": [v0, v1]}
+
+        _, extra = proc({"prompt": prompt, "multi_modal_data": mm_data}, None)
+        multimodal_data = extra["multimodal_data"]
+
+        # The ruler saw the audio hoisted into mm_data and the audio slots in the
+        # order it was asked to size (so the video slots are vision-only).
+        order_mods = [m for m, _ in captured["item_order"]]
+        assert order_mods == ["image", "video", "audio", "image", "video", "audio"]
+        assert captured["mm_data_audio"] is not None
+        assert len(captured["mm_data_audio"]) == 2
+        # Per-slot embedding lengths keep the vision video + audio split: 256
+        # video-context embeds (258 budget minus the 2 `<img>`/`</img>` specials)
+        # and 2 audio-context embeds (4 budget minus the 2 sound specials).
+        lengths = multimodal_data["multimodal_embedding_lengths"]
+        assert len(lengths) == 6
+
+    def test_no_hoist_when_video_has_no_audio(self):
+        # A mixed image+video with NO embedded audio must NOT synthesize an audio
+        # item or inject <so_embedding> (no phantom slot).
+        proc = self._make_proc()
+        # Video budget is the full `get_num_tokens_per_video` count (256 context
+        # + 2 `<img>`/`</img>` specials = 258), matching the per-frame expansion.
+        proc._get_num_tokens_for_item_order = mock.Mock(return_value=[5, 258])
+        proc._prepare_image_modality_data = mock.Mock(
+            return_value={"pixel_values": torch.ones(1, 3, 2, 2)}
+        )
+        proc._prepare_video_modality_data = mock.Mock(
+            return_value={"pixel_values": torch.ones(1, 3, 2, 2), "video_size": [[1, 1, 512, 512]]}
+        )
+        proc._prepare_audio_modality_data = mock.Mock()
+
+        video_no_audio = SimpleNamespace(
+            frames=[Image.new("RGB", (512, 512))], metadata=None, audio=None
+        )
+        mm_data = {"image": [object()], "video": [video_no_audio]}
+        _, extra = proc({"prompt": "<image><video>", "multi_modal_data": mm_data}, None)
+        multimodal_data = extra["multimodal_data"]
+
+        assert "audio" not in multimodal_data["modality_type"]
+        assert "audio" not in multimodal_data
+        proc._prepare_audio_modality_data.assert_not_called()
+        assert multimodal_data["multimodal_item_order"] == [
+            {"modality": "image", "index": 0},
+            {"modality": "video", "index": 0},
+        ]
+
+
 class TestGetNumTokensPerAudio:
     @pytest.mark.parametrize(
         "wrap_with_sample_rate",
@@ -2063,8 +2292,9 @@ class TestFastPathVideoWithExtractedAudio:
     video loader stores the extracted stream as `VideoData.audio`.
     The fast-path video branch must append `<so_start><so_embedding>*M<so_end>`
     after the per-video frame tokens so the prompt has placeholder slots for the
-    audio embeddings produced by `_interleave_video_audio_embeddings` at forward
-    time. `get_num_tokens_per_video` must include those tokens in its count so
+    audio embeddings. The audio is hoisted to a first-class `(audio, k)` item and
+    its embeddings are placed by the assembly's per-item scatter at forward time.
+    `get_num_tokens_per_video` must include those tokens in its count so
     `find_mm_token_lengths` reports a total that matches the actual mm-token
     count in the tokenized prompt (otherwise `_find_mm_token_start_pos_from_masks` asserts
     `sum(num_mm_tokens) == len(mm_positions)` and the request fails).
@@ -2257,13 +2487,15 @@ class TestFastPathVideoWithExtractedAudio:
 # `torch.compile` (used inside audio feature extraction) spins up a thread pool;
 # disable the leak check as the existing audio tests do (see TestAudioInputProcessor).
 @pytest.mark.threadleak(enabled=False)
-class TestVideoWithEmbeddedAudioProducesPlanItems:
-    """Light guard that the REAL Nano processor produces the audio-in-video plan
-    payload the e2e accuracy gate depends on, without model weights or a GPU:
-    `_prepare_video_modality_data` attaches real audio encoder features under
-    the video payload, and `_nano_extract_items` runs over that production-shaped
-    payload (heavy deps mocked, audio extractor real). The detailed ghost-item
-    field contract lives in test_nano_encode_extractor.py.
+class TestVideoWithEmbeddedAudioHoist:
+    """Light guard that the REAL Nano processor hoists video-embedded audio into
+    a first-class top-level audio item, without model weights or a GPU.
+
+    `_prepare_video_modality_data` is vision-only (no nested audio); a single
+    video-with-audio request routes through `_process_mixed_modalities`, which
+    injects `<sound_context>`, promotes the audio to a standalone audio payload,
+    and emits a `(video, 0), (audio, 0)` prompt order. The per-item extractor
+    contract over the resulting payload is pinned in test_nano_encode_extractor.py.
     """
 
     @staticmethod
@@ -2294,71 +2526,247 @@ class TestVideoWithEmbeddedAudioProducesPlanItems:
         )
         return SimpleNamespace(frames=frames, metadata=metadata, audio=audio)
 
-    def test_prepare_video_modality_data_populates_embedded_audio(self):
+    def test_prepare_video_modality_data_is_vision_only(self):
+        # The video payload no longer nests audio — the audio is hoisted to a
+        # top-level item, so the video modality data carries only vision fields.
         proc = self._make_proc()
         video = self._video_with_audio()
 
         modality_data = proc._prepare_video_modality_data([video])
 
-        # Vision side present.
         assert "pixel_values" in modality_data
         assert "video_size" in modality_data
-        # Embedded audio attached under the video payload (the structure the
-        # flat-item plan's ghost-audio path keys off).
-        assert "audio" in modality_data, "embedded video audio was not attached"
-        audio_payload = modality_data["audio"]
-        assert {"input_audio_features", "feature_attention_mask"} <= audio_payload.keys()
-        # has_audio marks which of the videos carried a track (here: the one).
-        assert audio_payload["has_audio"] == [True]
+        assert "audio" not in modality_data, "video payload must not nest audio (hoisted)"
 
-    def test_no_embedded_audio_when_video_has_none(self):
+    def test_hoist_injects_sound_context_and_builds_audio_list(self):
+        # `_hoist_video_embedded_audio` injects `<sound_context>` after the video
+        # placeholder and extends mm_data["audio"] with the video's audio.
+        proc = self._make_proc()
+        video = self._video_with_audio()
+        mm_data = {"video": [video]}
+
+        hoisted_text, hoisted_mm_data = proc._hoist_video_embedded_audio("<video>", mm_data)
+
+        assert hoisted_text == "<video>" + AUDIO_PLACEHOLDER
+        assert len(hoisted_mm_data["audio"]) == 1
+        # The original mm_data is not mutated.
+        assert "audio" not in mm_data
+
+    def test_no_hoist_when_video_has_none(self):
+        proc = self._make_proc()
+        video = self._video_with_audio()
+        video.audio = None
+        mm_data = {"video": [video]}
+
+        hoisted_text, hoisted_mm_data = proc._hoist_video_embedded_audio("<video>", mm_data)
+
+        assert hoisted_text == "<video>"
+        assert "audio" not in hoisted_mm_data
+
+    def test_full_pipeline_emits_video_audio_plan(self):
+        # End-to-end through the REAL processor __call__ with the REAL hoist: a
+        # single video-with-audio yields a (video, 0), (audio, 0) prompt order
+        # and a top-level audio payload. The heavy per-modality prep + token
+        # ruler are mocked (orthogonal to the hoist + order scanning under test).
+        proc = self._make_proc()
+        proc._prepare_video_modality_data = mock.Mock(
+            return_value={"pixel_values": torch.ones(2, 3, 2, 2), "video_size": [[1, 1, 512, 512]]}
+        )
+        proc._prepare_audio_modality_data = mock.Mock(
+            return_value={"input_audio_features": torch.ones(2, 4, 2)}
+        )
+        # Per-slot budgets must equal the multimodal-token count the REAL
+        # `_expand_mixed_prompt_text_for_mm` emits (the only un-mocked count path
+        # here), so `find_multimodal_embedding_lengths` reconciles. For this proc
+        # (`video_target_num_patches=256`, 2 frames) the video slot is 136 and the
+        # audio slot is 6. The video count is 132 vision tokens (2 tubelets x [64
+        # context + 2 `<img>`/`</img>` specials]) plus 4 from this suite's Mock
+        # tokenizer encoding the long per-frame separator strings to id ranges
+        # that happen to include the context-token ids (a test-tokenizer artifact,
+        # not production behavior); the real `get_num_tokens_per_video` /
+        # `_compute_token_numbers_per_video` agreement is pinned separately by
+        # `test_get_num_tokens_per_video_agrees_with_compute_token_numbers_per_video`.
+        proc._get_num_tokens_for_item_order = mock.Mock(return_value=[136, 6])
+
+        video = self._video_with_audio()
+        inputs = {"prompt": "<video>", "multi_modal_data": {"video": [video]}}
+
+        _, extra = proc(inputs, None)
+        multimodal_data = extra["multimodal_data"]
+
+        assert multimodal_data["modality_type"] == ["video", "audio"]
+        assert multimodal_data["multimodal_item_order"] == [
+            {"modality": "video", "index": 0},
+            {"modality": "audio", "index": 0},
+        ]
+        # An audio payload was built from the hoisted video audio.
+        assert "audio" in multimodal_data
+        # The hoisted audio was prepared via the standalone audio path.
+        prepared_audios = proc._prepare_audio_modality_data.call_args[0][0]
+        assert len(prepared_audios) == 1
+        # Two slots (video + audio) in the per-item embedding lengths.
+        assert len(multimodal_data["multimodal_embedding_lengths"]) == 2
+
+
+class TestTokenPathVideoEmbeddedAudioHoist:
+    """Close the pre-tokenized (`call_with_token_ids`) path for the video-embedded
+    audio hoist, so the feature is complete for BOTH the text and token paths.
+
+    The token-path contract mirrors the text path: the pre-tokenized prompt
+    carries a `<sound_context>` placeholder after each video-with-audio (the
+    natural analogue of the text path injecting one). `mm_data` still nests the
+    audio on the `VideoData` (not yet hoisted). The processor's
+    `promote_nested_mm_data` hook must, before `find_mm_token_lengths` and
+    `MultimodalPromptOrder.resolve` run:
+      1. register the embedded audio as a top-level `mm_data["audio"]` item, and
+      2. vision-only-strip `.audio` off the video items,
+    so the order scanner emits `(video, k), (audio, k)` and the budget splits
+    into a vision-only video slot + a separate audio slot — the SAME per-item
+    totals the text path produces (no double-counted audio on the video).
+    """
+
+    @staticmethod
+    def _make_proc():
+        # Shift the mock tokenizer's text-token id range to 1000+ so encoded
+        # frame-separator text never collides with the mm-token ids used here
+        # (20, 21, 30, 200, 201, 500, 501) — see TestFastPathVideoWithExtractedAudio.
+        proc = _make_fast_path_audio_processor(video_target_num_patches=None)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
+
+        def shifted_encode(text, **kw):
+            ids = [1000 + i for i in range(len(text))]
+            if kw.get("return_tensors") == "pt":
+                return torch.tensor(ids).unsqueeze(0)
+            return ids
+
+        proc.tokenizer.encode = mock.Mock(side_effect=shifted_encode)
+        return proc
+
+    @staticmethod
+    def _video_with_audio(num_frames=2, num_audio_samples=16000):
+        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
+        metadata = {
+            "total_num_frames": num_frames,
+            "fps": 30.0,
+            "duration": num_frames / 30.0,
+            "frames_indices": list(range(num_frames)),
+        }
+        audio = AudioData(
+            samples=np.random.randn(num_audio_samples).astype(np.float32),
+            sample_rate=16000,
+        )
+        # A real VideoData (not SimpleNamespace) so find_mm_token_lengths unwraps
+        # `.frames`/`.metadata`/`.audio` via its isinstance(item, VideoData) path.
+        return VideoData(frames=frames, metadata=metadata, audio=audio)
+
+    def test_video_embedded_audio_resolves_and_expands_via_token_ids(self):
+        # A video-with-embedded-audio request through `call_with_token_ids`:
+        #   (a) the resolved prompt order contains (video, 0) then (audio, 0), and
+        #   (b) the expanded MM-token count == vision-only video budget + the one
+        #       audio budget (the SAME total the text path produces).
+        proc = self._make_proc()
+        vid_ctx = proc.video_context_token_id
+        snd_ctx = proc._sound_context_token_id
+        img_ctx = proc.img_context_token_id
+        so_start = proc._sound_start_token_id
+        so_end = proc._sound_end_token_id
+
+        video = self._video_with_audio()
+        audio = video.audio
+        num_frames = len(video.frames)
+
+        # The vision-only video budget + the one-audio budget the REAL ruler
+        # reports once the audio is hoisted off the video (matches the text path).
+        vision_video_budget = proc.get_num_tokens_per_video(
+            video=video.frames, video_metadata=video.metadata, video_audio=None
+        )
+        audio_budget = proc.get_num_tokens_per_audio(audio=(audio.samples, audio.sample_rate))
+
+        # The pre-tokenized prompt carries `<video>` then `<sound_context>` (one
+        # placeholder per mm item, in prompt order — the token-path contract).
+        prompt_token_ids = [1, 2, vid_ctx, snd_ctx, 3]
+        # mm_data still NESTS the audio on the VideoData (pre-hoist), modality-major.
+        mm_data = {"video": [video]}
+
+        # The dummy-placeholder pass (`_process_multimodal_with_dummy_placeholders`)
+        # re-enters the text path on synthetic placeholder text; mock its heavy
+        # per-modality prep + ruler so it stays CPU-only and orthogonal to the
+        # token-path resolve/expand under test.
+        proc._prepare_video_modality_data = mock.Mock(
+            return_value={
+                "pixel_values": torch.ones(num_frames, 3, 2, 2),
+                "video_size": [[1, 1, 512, 512]],
+            }
+        )
+        proc._prepare_audio_modality_data = mock.Mock(
+            return_value={"input_audio_features": torch.ones(2, 4, 2)}
+        )
+        proc._get_num_tokens_for_item_order = mock.Mock(
+            return_value=[vision_video_budget, audio_budget]
+        )
+
+        # Capture the prompt order the token path resolves (assertion a).
+        resolved_orders = []
+        real_resolve = MultimodalPromptOrder.resolve.__func__
+
+        def capturing_resolve(cls, mm, input_processor, **kw):
+            order = real_resolve(cls, mm, input_processor, **kw)
+            resolved_orders.append(list(order))
+            return order
+
+        with mock.patch.object(
+            MultimodalPromptOrder,
+            "resolve",
+            classmethod(capturing_resolve),
+        ):
+            expanded_ids, _ = proc.call_with_token_ids(
+                {"prompt_token_ids": prompt_token_ids, "multi_modal_data": mm_data},
+                None,
+            )
+
+        # (a) The token path resolved the prompt order as video-then-audio, each
+        # a first-class item.
+        assert resolved_orders, "MultimodalPromptOrder.resolve was not called"
+        token_path_order = resolved_orders[-1]
+        assert token_path_order == [("video", 0), ("audio", 0)]
+
+        # (b) The expansion replaced the two placeholders with exactly the
+        # vision-only video budget + the one audio budget — the same total the
+        # text path produces. Count the mm-token ids in the expanded stream.
+        mm_token_ids = {img_ctx, snd_ctx, so_start, so_end, 500, 501}
+        actual_mm = sum(1 for t in expanded_ids if t in mm_token_ids)
+        assert actual_mm == vision_video_budget + audio_budget
+        # And exactly ONE audio run (no double-injection from the video path).
+        assert expanded_ids.count(so_start) == 1
+        assert expanded_ids.count(so_end) == 1
+        assert expanded_ids.count(snd_ctx) == audio_budget - 2
+        # Vision-only video region present; the `<video>` placeholder consumed.
+        assert expanded_ids.count(img_ctx) == vision_video_budget - num_frames * 2
+        assert expanded_ids.count(vid_ctx) == 0
+
+    def test_no_promotion_when_video_has_no_embedded_audio(self):
+        # Regression: a token-path video WITHOUT embedded audio must NOT
+        # synthesize a top-level audio item (the hook is a no-op).
         proc = self._make_proc()
         video = self._video_with_audio()
         video.audio = None
 
-        modality_data = proc._prepare_video_modality_data([video])
+        mm_data = {"video": [video]}
+        promoted = proc.promote_nested_mm_data(mm_data)
 
-        # No phantom audio payload when the video carries no track.
-        assert "audio" not in modality_data
+        assert "audio" not in promoted
+        # The original mm_data is returned unchanged (no copy needed).
+        assert promoted is mm_data
 
-    def test_extractor_runs_on_production_payload(self):
-        # Smoke that `_nano_extract_items` produces a sane video + ghost-audio
-        # split when fed a payload built by the REAL `_prepare_video_modality_data`
-        # (the detailed ghost-item field contract is pinned, on hand-built
-        # payloads, in test_nano_encode_extractor.py).
+    def test_promotion_rejects_standalone_plus_embedded_audio(self):
+        # Mixing standalone audio with video-embedded audio is ambiguous and must
+        # raise (mirrors the text-path `_hoist_video_embedded_audio` guard).
         proc = self._make_proc()
         video = self._video_with_audio()
+        standalone = AudioData(samples=np.random.randn(16000).astype(np.float32), sample_rate=16000)
+        mm_data = {"video": [video], "audio": [(standalone.samples, standalone.sample_rate)]}
 
-        modality_data = proc._prepare_video_modality_data([video])
-        audio_payload = modality_data["audio"]
-
-        # Derive a positive ghost row count from the real mask's valid lengths
-        # and the extractor's sub-sampling factor; pick a vision row count and
-        # make total_embeds the POST-interleave (vision + audio) total.
-        mask = audio_payload["feature_attention_mask"]
-        valid_lengths = mask.sum(dim=-1).to(torch.int64)
-        subsample = int(proc._audio_extractor.config.subsampling_factor)
-
-        def audio_rows_fn(_payload):
-            return int((valid_lengths // subsample).clamp(min=1).sum().item())
-
-        audio_rows = audio_rows_fn(audio_payload)
-        assert audio_rows > 0
-        vision_rows = 6
-        total_embeds = vision_rows + audio_rows
-        runtime = MultimodalRuntimeData(
-            past_seen_token_num=0,
-            chunk_end_pos=total_embeds,
-            embed_mask_cumsum=torch.arange(1, total_embeds + 1, dtype=torch.int64),
-        )
-        param = MultimodalParams(
-            multimodal_input=None,
-            multimodal_data={"video": modality_data, "modality_type": "video"},
-            multimodal_runtime=runtime,
-        )
-
-        items = list(_nano_extract_items(0, param, audio_rows_fn=audio_rows_fn))
-
-        assert [it.modality for it in items] == ["video", "audio"]
-        assert items[0].token_count == total_embeds
-        assert items[1].token_count == audio_rows
+        with pytest.raises(NotImplementedError, match="standalone audio"):
+            proc.promote_nested_mm_data(mm_data)

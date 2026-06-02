@@ -28,6 +28,7 @@ _SPEC.loader.exec_module(mixed_modality)
 MODALITY_AUDIO = mixed_modality.MODALITY_AUDIO
 MODALITY_IMAGE = mixed_modality.MODALITY_IMAGE
 MODALITY_VIDEO = mixed_modality.MODALITY_VIDEO
+MixedModalityEvaluator = mixed_modality.MixedModalityEvaluator
 MixedModalityInputSample = mixed_modality.MixedModalityInputSample
 MixedModalitySample = mixed_modality.MixedModalitySample
 MixedModalityTargetResult = mixed_modality.MixedModalityTargetResult
@@ -324,3 +325,77 @@ def test_deterministic_sample_selection_for_image_video_modalities():
     )
     assert all(tuple(sample.items) == (MODALITY_IMAGE, MODALITY_VIDEO) for sample in samples)
     assert all(MODALITY_AUDIO not in sample.items for sample in samples)
+
+
+def _dataset_paths(active_modalities: tuple[str, ...]) -> dict[str, str]:
+    return {modality: f"/tmp/{modality}" for modality in active_modalities}
+
+
+@pytest.mark.parametrize(
+    "num_samples, match",
+    [
+        pytest.param(0, "must be positive", id="zero"),
+        pytest.param(-3, "must be positive", id="negative"),
+        pytest.param(1, "at least the number of target", id="fewer_than_targets"),
+    ],
+)
+def test_evaluator_rejects_invalid_num_samples(num_samples, match):
+    """num_samples must be validated fail-fast in the evaluator constructor."""
+    active = (MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO)
+    with pytest.raises(ValueError, match=match):
+        MixedModalityEvaluator(
+            modality_dataset_paths=_dataset_paths(active),
+            active_modalities=active,
+            target_modalities=active,
+            num_samples=num_samples,
+        )
+
+
+@pytest.mark.parametrize(
+    "num_samples, match",
+    [
+        pytest.param(0, "must be positive", id="zero"),
+        pytest.param(-1, "must be positive", id="negative"),
+        pytest.param(1, "at least the number of target", id="fewer_than_targets"),
+    ],
+)
+def test_select_samples_rejects_invalid_num_samples(num_samples, match):
+    """select_mixed_modality_samples shares the same fail-fast num_samples gate."""
+    input_samples = _input_samples_by_modality((MODALITY_IMAGE, MODALITY_VIDEO), 4)
+    with pytest.raises(ValueError, match=match):
+        select_mixed_modality_samples(
+            input_samples,
+            num_samples=num_samples,
+            random_seed=0,
+            active_modalities=(MODALITY_IMAGE, MODALITY_VIDEO),
+            target_modalities=(MODALITY_IMAGE, MODALITY_VIDEO),
+        )
+
+
+def test_evaluator_empty_target_modalities_raises_not_defaults():
+    """An explicit empty target tuple must reach validation, not silently default.
+
+    Truthiness defaulting (`target_modalities or self.active_modalities`) would
+    swallow `()` and substitute the active set; the explicit-None check keeps an
+    empty tuple flowing into `_normalize_modalities`, which rejects it.
+    """
+    active = (MODALITY_IMAGE, MODALITY_VIDEO)
+    with pytest.raises(ValueError, match="at least 1 modality"):
+        MixedModalityEvaluator(
+            modality_dataset_paths=_dataset_paths(active),
+            active_modalities=active,
+            target_modalities=(),
+        )
+
+
+def test_select_samples_empty_target_modalities_raises_not_defaults():
+    """select_mixed_modality_samples also rejects an explicit empty target tuple."""
+    input_samples = _input_samples_by_modality((MODALITY_IMAGE, MODALITY_VIDEO), 4)
+    with pytest.raises(ValueError, match="at least 1 modality"):
+        select_mixed_modality_samples(
+            input_samples,
+            num_samples=2,
+            random_seed=0,
+            active_modalities=(MODALITY_IMAGE, MODALITY_VIDEO),
+            target_modalities=(),
+        )
