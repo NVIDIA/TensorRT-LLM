@@ -679,6 +679,8 @@ def create_py_executor(
                 f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "
                 f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
+            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                           False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         if kv_cache_config.enable_block_reuse and not (
@@ -689,6 +691,8 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
+            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                           False)
         if enable_chunked_context and sm_version not in [90, 100, 103, 120]:
             logger.warning(
                 "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
