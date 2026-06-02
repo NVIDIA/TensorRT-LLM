@@ -21,6 +21,7 @@ import os
 import random
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.request
 import zipfile
@@ -685,12 +686,17 @@ def test_wan22_t2v_lpips_against_golden(tmp_path):
 
 @pytest.fixture(scope="session")
 def wan_trtllm_video_path(_visual_gen_deps, llm_venv, llm_root):
-    """Generate input video via visual_gen_wan_t2v.py and return path to trtllm_output.mp4."""
+    """Generate input video via models/wan_t2v.py and return path to trtllm_output.mp4."""
     return _generate_wan_video(llm_venv, llm_root, WAN_T2V_MODEL_SUBPATH, "wan")
 
 
 def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
-    """Generate a video with visual_gen_wan_t2v.py for a given model checkpoint.
+    """Generate a video with examples/visual_gen/models/wan_t2v.py for a given checkpoint.
+
+    The slim example hardcodes prompt/H/W/frames (matching WAN_T2V_* constants
+    above), so this helper only synthesizes a VisualGenArgs YAML for engine
+    config (parallelism / attention / cuda graph) and passes it via
+    ``--visual_gen_args``.
 
     Returns the path to the generated .mp4, or calls pytest.skip if the model
     is not found under LLM_MODELS_ROOT.
@@ -707,25 +713,36 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
     output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
     if os.path.isfile(output_path):
         return output_path
-    script_path = os.path.join(llm_root, "examples", "visual_gen", "visual_gen_wan_t2v.py")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_t2v.py")
     assert os.path.isfile(script_path), f"Visual gen script not found: {script_path}"
+
+    cfg_size = 2 if torch.cuda.device_count() >= 2 else 1
+    visual_gen_args_yaml = os.path.join(out_dir, "visual_gen_args.yaml")
+    with open(visual_gen_args_yaml, "w") as f:
+        f.write(
+            textwrap.dedent(
+                f"""\
+                attention_config:
+                  backend: VANILLA
+                parallel_config:
+                  cfg_size: {cfg_size}
+                  ulysses_size: 1
+                cuda_graph_config:
+                  enable: false
+                """
+            )
+        )
+
     cmd = [
         script_path,
-        "--height",
-        str(WAN_T2V_HEIGHT),
-        "--width",
-        str(WAN_T2V_WIDTH),
-        "--num_frames",
-        str(WAN_T2V_NUM_FRAMES),
-        "--model_path",
+        "--model",
         model_path,
-        "--prompt",
-        WAN_T2V_PROMPT,
+        "--visual_gen_args",
+        visual_gen_args_yaml,
         "--output_path",
         output_path,
     ]
-    if torch.cuda.device_count() >= 2:
-        cmd.extend(["--cfg_size", "2"])
     venv_check_call(llm_venv, cmd)
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
     return output_path
@@ -755,9 +772,6 @@ def _linear_type_to_quant_config(linear_type):
 
 def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
     """Generate a video using the LTX-2 Python API directly.
-
-    Calls VisualGen / VisualGenArgs / VisualGenParams instead of shelling out
-    to examples/visual_gen/visual_gen_ltx2.py (which may be removed).
 
     Returns the path to the generated .mp4, or calls pytest.skip if the model
     or text encoder is not found under LLM_MODELS_ROOT.
@@ -1185,15 +1199,11 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
 
     This is a core example test: it validates that the per-model example script
     and the shared YAML config work together as documented in the README.
-    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint.
-
-    NOTE: If a strict-duplicate test exists elsewhere (same model, same quant,
-    same resolution, same prompt, same script invocation), consider removing
-    it in favour of this one.  As of this writing, the closest test is
-    test_vbench_dimension_score_wan22_a14b_nvfp4 which uses the same checkpoint
-    but invokes the *old* visual_gen_wan_t2v.py script (not models/wan_t2v.py)
-    with different resolution/prompt and additionally runs VBench scoring.
-    Not a strict duplicate.
+    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint and the shared
+    ``configs/wan2.2-t2v-fp4-1gpu.yaml`` (NVFP4 dynamic quant). The closest
+    overlapping test is ``test_vbench_dimension_score_wan22_a14b_nvfp4``,
+    which runs the same script but with a no-quant YAML synthesized at
+    runtime and additionally evaluates VBench scores.
     """
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)
