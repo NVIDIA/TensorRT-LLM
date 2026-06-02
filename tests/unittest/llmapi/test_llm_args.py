@@ -3,7 +3,7 @@ from collections import defaultdict
 from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Literal, get_args, get_origin
+from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 
 import pydantic_core
 import pytest
@@ -2367,7 +2367,7 @@ class TestSkipSoftmaxAttentionConfig:
 
     # The checkpoint calibration block documented under
     # ``sparse_attention_config.threshold_scale_factor``.
-    THRESHOLD_SCALE_FACTOR_CONFIG = {
+    THRESHOLD_SCALE_FACTOR_CONFIG: ClassVar[dict] = {
         "formula": "a * exp(b * target_sparsity)",
         "prefill": {
             "a": 100.0,

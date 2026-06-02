@@ -71,7 +71,7 @@ It is built around three layers:
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_framework.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_framework.png" alt="Framework support for sparse attention in TensorRT LLM" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Framework support for sparse attention in TensorRT LLM.</em></sub></p>
@@ -118,7 +118,7 @@ Algorithm implementations live under
 
 <div align="center">
 <figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_op.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/sparse_attention_op.png" alt="Sparse attention operator workflow in TensorRT LLM" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
