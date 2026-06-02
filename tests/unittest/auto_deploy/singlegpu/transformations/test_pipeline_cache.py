@@ -62,7 +62,11 @@ from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.structural import 
     load_module_structural,
     save_module_structural,
 )
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_weight_name, is_linear_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
+    WeightNode,
+    extract_weight_name,
+    is_linear_op,
+)
 from tensorrt_llm._torch.auto_deploy.utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 
 _COUNTERS = {
@@ -952,6 +956,52 @@ def test_hook_spec_round_trip_shard_tp():
     fresh = symbolic_trace(_ToyModule())
     reattach_hooks(fresh, specs)
     assert len(fresh._load_state_dict_pre_hooks) == 1
+
+
+def test_hook_spec_round_trip_sharding_ir_fp8_block_scale():
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import (
+        _fp8_block_scale_pipeline_cache_spec,
+        _shard_scale_and_hook,
+        _split_fp8_block_scale,
+    )
+
+    gm = symbolic_trace(_ToyModule())
+    scale = torch.arange(24 * 12, dtype=torch.float32).reshape(24, 12)
+    rank = 3
+    world_size = 8
+    dim = 0
+    f_split = partial(_split_fp8_block_scale, dim=dim, rank=rank, world_size=world_size)
+    sharded = f_split(scale)
+    sn = WeightNode(
+        node=next(iter(gm.graph.nodes)),
+        tensor=scale,
+        node_key="weight_scale_inv",
+        submod=gm,
+    )
+    _shard_scale_and_hook(
+        gm,
+        sn,
+        sharded,
+        f_split,
+        _fp8_block_scale_pipeline_cache_spec(sn, sharded, dim, rank, world_size),
+    )
+
+    specs, has_unknown = collect_hook_specs(gm)
+
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "shard_fp8_block_scale"
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    assert len(fresh._load_state_dict_pre_hooks) == 1
+
+    hook = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    hook_fn = hook.hook if hasattr(hook, "hook") else hook
+    state_dict = {"weight_scale_inv": scale.clone()}
+    hook_fn(state_dict, "", {}, True, [], [], [])
+    assert torch.equal(state_dict["weight_scale_inv"], sharded)
 
 
 def test_hook_spec_round_trip_post_load_hooks():

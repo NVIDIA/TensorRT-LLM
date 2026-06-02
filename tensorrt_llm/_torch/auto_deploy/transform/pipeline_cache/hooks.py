@@ -202,6 +202,44 @@ def _rebuild_shard_tp_hook(spec: dict[str, Any]) -> Callable:
     )
 
 
+def _rebuild_shard_fp8_block_scale_hook(spec: dict[str, Any]) -> Callable:
+    from ..library.sharding import _load_hook
+    from ..library.sharding_ir import _split_fp8_block_scale
+
+    f_split = partial(
+        _split_fp8_block_scale,
+        dim=spec["dim"],
+        rank=spec["rank"],
+        world_size=spec["world_size"],
+    )
+    return partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=spec["param_key"],
+        param_shape=torch.Size(spec["param_shape"]),
+    )
+
+
+def _rebuild_shard_fp4_weight_scale_hook(spec: dict[str, Any]) -> Callable:
+    from ..library.sharding import _load_hook, _shard_fp4_weight_scale
+
+    f_split = partial(
+        _shard_fp4_weight_scale,
+        original_uint8_weight_shape=torch.Size(spec["original_uint8_weight_shape"]),
+        dim=spec["dim"],
+        rank=spec["rank"],
+        world_size=spec["world_size"],
+        min_local_shape=spec["min_local_shape"],
+        fused_weight_dims=spec["fused_weight_dims"],
+    )
+    return partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=spec["param_key"],
+        param_shape=torch.Size(spec["param_shape"]),
+    )
+
+
 def _rebuild_dedup_hook(spec: dict[str, Any]) -> Callable:
     from ...export.export import _load_hook_for_deduplication
 
@@ -266,6 +304,8 @@ _HOOK_REBUILDERS = {
     "alias": _rebuild_alias_hook,
     "dedup": _rebuild_dedup_hook,
     "importable_load_hook": _rebuild_importable_hook,
+    "shard_fp4_weight_scale": _rebuild_shard_fp4_weight_scale_hook,
+    "shard_fp8_block_scale": _rebuild_shard_fp8_block_scale_hook,
     "shard_tp": _rebuild_shard_tp_hook,
 }
 

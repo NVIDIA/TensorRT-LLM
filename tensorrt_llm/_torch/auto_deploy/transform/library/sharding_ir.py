@@ -51,6 +51,7 @@ from ...utils.node_utils import (
     set_op_args,
     shape,
 )
+from ...utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -91,6 +92,7 @@ def _shard_scale_and_hook(
     sn: WeightNode,
     sharded_scale: torch.Tensor,
     f_split,
+    pipeline_cache_spec: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Register a sharded scale buffer and its corresponding load hook."""
     buf_name = sn.node_key.rsplit(".", 1)[-1]
@@ -101,7 +103,49 @@ def _shard_scale_and_hook(
         param_key=sn.node_key,
         param_shape=sharded_scale.shape,
     )
+    if pipeline_cache_spec is not None:
+        hook = mark_pipeline_cache_hook(hook, pipeline_cache_spec)
     gm._register_load_state_dict_pre_hook(hook)
+
+
+def _fp8_block_scale_pipeline_cache_spec(
+    sn: WeightNode,
+    sharded_scale: torch.Tensor,
+    dim: int,
+    rank: int,
+    world_size: int,
+) -> Dict[str, Any]:
+    return {
+        "type": "shard_fp8_block_scale",
+        "param_key": sn.node_key,
+        "param_shape": list(sharded_scale.shape),
+        "dim": int(dim),
+        "rank": rank,
+        "world_size": world_size,
+    }
+
+
+def _fp4_weight_scale_pipeline_cache_spec(
+    sn: WeightNode,
+    sharded_scale: torch.Tensor,
+    weight_shape: torch.Size,
+    dim: int,
+    rank: int,
+    world_size: int,
+    min_local_shape: int,
+    fused_weight_dims: Optional[Tuple[int, ...]] = None,
+) -> Dict[str, Any]:
+    return {
+        "type": "shard_fp4_weight_scale",
+        "param_key": sn.node_key,
+        "param_shape": list(sharded_scale.shape),
+        "original_uint8_weight_shape": list(weight_shape),
+        "dim": int(dim),
+        "rank": rank,
+        "world_size": world_size,
+        "min_local_shape": min_local_shape,
+        "fused_weight_dims": list(fused_weight_dims) if fused_weight_dims else None,
+    }
 
 
 _SHARDING_HINT_NAMES = frozenset(
@@ -323,7 +367,13 @@ class FineGrainedFP8LinearShardableNode(LinearShardableNode):
                 _split_fp8_block_scale, dim=dim, rank=dc.tp_rank, world_size=dc.tp_size
             )
             sharded = f_split(sn.tensor)
-            _shard_scale_and_hook(gm, sn, sharded, f_split)
+            _shard_scale_and_hook(
+                gm,
+                sn,
+                sharded,
+                f_split,
+                _fp8_block_scale_pipeline_cache_spec(sn, sharded, dim, dc.tp_rank, dc.tp_size),
+            )
 
 
 @ShardableNode.register(
@@ -348,7 +398,15 @@ class FP4LinearShardableNode(LinearShardableNode):
                 fused_weight_dims=fused,
             )
             sharded = f_split(sn.tensor)
-            _shard_scale_and_hook(gm, sn, sharded, f_split)
+            _shard_scale_and_hook(
+                gm,
+                sn,
+                sharded,
+                f_split,
+                _fp4_weight_scale_pipeline_cache_spec(
+                    sn, sharded, weight_shape, dim, dc.tp_rank, dc.tp_size, min_shape, fused
+                ),
+            )
 
 
 @ShardableNode.register(torch.ops.auto_deploy.view)
@@ -623,7 +681,14 @@ class FineGrainedFP8SwiGLUShardableNode(SwiGLUShardableNode):
             f_split = partial(
                 _split_fp8_block_scale, dim=dim, rank=dc.tp_rank, world_size=dc.tp_size
             )
-            _shard_scale_and_hook(gm, sn, f_split(sn.tensor), f_split)
+            sharded = f_split(sn.tensor)
+            _shard_scale_and_hook(
+                gm,
+                sn,
+                sharded,
+                f_split,
+                _fp8_block_scale_pipeline_cache_spec(sn, sharded, dim, dc.tp_rank, dc.tp_size),
+            )
 
 
 @ShardableNode.register(torch.ops.auto_deploy.torch_nvfp4_swiglu_mlp)
@@ -645,7 +710,16 @@ class FP4SwiGLUShardableNode(SwiGLUShardableNode):
                 min_local_shape=1,
                 fused_weight_dims=None,
             )
-            _shard_scale_and_hook(gm, sn, f_split(sn.tensor), f_split)
+            sharded = f_split(sn.tensor)
+            _shard_scale_and_hook(
+                gm,
+                sn,
+                sharded,
+                f_split,
+                _fp4_weight_scale_pipeline_cache_spec(
+                    sn, sharded, weight_shape, dim, dc.tp_rank, dc.tp_size, 1
+                ),
+            )
 
 
 @ShardableNode.register(
