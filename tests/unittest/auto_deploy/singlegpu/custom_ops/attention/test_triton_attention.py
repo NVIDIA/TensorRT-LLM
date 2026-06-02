@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for Triton Paged Attention.
+"""Unit tests for Triton Attention.
 
-Tests the Triton paged attention kernels and compares against FlashInfer for correctness.
+Tests the Triton attention kernels and compares against FlashInfer for correctness.
 """
 
 import math
@@ -31,10 +31,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not 
 
 
 @torch.inference_mode()
-def test_gemma4_prepare_multimodal_mask_can_drive_triton_paged_custom_mask():
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-        prepare_triton_paged_metadata,
-        triton_paged_mha_with_cache,
+def test_gemma4_prepare_multimodal_mask_can_drive_triton_custom_mask():
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+        prepare_triton_metadata,
+        triton_mha_with_cache,
     )
 
     n_heads, n_kv_heads, head_dim, page_size = 8, 2, 128, 16
@@ -61,7 +61,7 @@ def test_gemma4_prepare_multimodal_mask_can_drive_triton_paged_custom_mask():
     )
 
     position_ids = torch.arange(seq_len, device="cuda")
-    batch_indices, positions = prepare_triton_paged_metadata(
+    batch_indices, positions = prepare_triton_metadata(
         position_ids,
         batch_info_host,
         cu_seqlen_host.to("cuda", non_blocking=True),
@@ -77,7 +77,7 @@ def test_gemma4_prepare_multimodal_mask_can_drive_triton_paged_custom_mask():
         torch.tensor([0, 2], dtype=torch.int32),
     ).to("cuda")
 
-    output = triton_paged_mha_with_cache(
+    output = triton_mha_with_cache(
         q,
         k,
         v,
@@ -145,7 +145,7 @@ def create_page_table(
     return kv_indices, kv_indptr, kv_last_page_len
 
 
-class TestTritonPagedDecodeKernel:
+class TestTritonDecodeKernel:
     """Tests for the FlashDecoding paged decode kernel (stage1 + stage2)."""
 
     @pytest.mark.parametrize("batch_size", [1, 4, 8])
@@ -156,8 +156,8 @@ class TestTritonPagedDecodeKernel:
         self, batch_size: int, n_heads: int, n_kv_heads: int, head_dim: int, seq_len: int
     ):
         """Test decode kernel against PyTorch SDPA reference."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_decode,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_decode,
             update_paged_kv_cache,
         )
 
@@ -217,7 +217,7 @@ class TestTritonPagedDecodeKernel:
         sm_scale = 1.0 / math.sqrt(head_dim)
 
         # Run Triton kernel
-        output_triton = triton_paged_decode(
+        output_triton = triton_decode(
             q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale
         )
 
@@ -243,8 +243,54 @@ class TestTritonPagedDecodeKernel:
         # Compare
         torch.testing.assert_close(output_triton.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
 
+    def test_decode_kernel_supports_small_page_size(self):
+        """Regression test for page sizes below Triton's minimum dot K dimension."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_decode,
+            update_paged_kv_cache,
+        )
 
-class TestTritonPagedContextKernel:
+        batch_size, seq_len = 1, 8
+        n_heads, n_kv_heads, head_dim = 4, 2, 32
+        page_size = 4
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = num_pages_per_seq + 2
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        k_flat = k.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        v_flat = v.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        batch_indices = torch.zeros(batch_size * seq_len, dtype=torch.int32, device="cuda")
+        positions = torch.arange(seq_len, device="cuda", dtype=torch.int32)
+        kv_indptr = torch.tensor([0, num_pages_per_seq], dtype=torch.int32, device="cuda")
+        kv_indices = torch.arange(num_pages_per_seq, dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.tensor([page_size], dtype=torch.int32, device="cuda")
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+
+        update_paged_kv_cache(
+            k_flat, v_flat, batch_indices, positions, kv_cache, kv_indices, kv_indptr
+        )
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        output_triton = triton_decode(
+            q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale
+        )
+
+        q_ref = q.unsqueeze(2)
+        k_ref = k.transpose(1, 2).repeat_interleave(n_heads // n_kv_heads, dim=1)
+        v_ref = v.transpose(1, 2).repeat_interleave(n_heads // n_kv_heads, dim=1)
+        output_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False
+        ).squeeze(2)
+
+        torch.testing.assert_close(output_triton.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+
+class TestTritonContextKernel:
     """Tests for the context/prefill kernel."""
 
     @pytest.mark.parametrize("batch_size", [1, 2])
@@ -255,8 +301,8 @@ class TestTritonPagedContextKernel:
         self, batch_size: int, n_heads: int, n_kv_heads: int, head_dim: int, seq_len: int
     ):
         """Test context kernel against PyTorch SDPA reference."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
             update_paged_kv_cache,
         )
 
@@ -308,7 +354,7 @@ class TestTritonPagedContextKernel:
 
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-        output = triton_paged_context(
+        output = triton_context(
             q,
             kv_cache,
             qo_indptr,
@@ -338,9 +384,60 @@ class TestTritonPagedContextKernel:
 
         torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
 
+    def test_context_kernel_supports_small_page_size(self):
+        """Regression test for page sizes below Triton's minimum dot K dimension."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
+            update_paged_kv_cache,
+        )
+
+        batch_size, seq_len = 1, 8
+        n_heads, n_kv_heads, head_dim = 4, 2, 32
+        page_size = 4
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = num_pages_per_seq + 2
+        total_tokens = batch_size * seq_len
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        qo_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+        kv_indptr = torch.tensor([0, num_pages_per_seq], dtype=torch.int32, device="cuda")
+        kv_indices = torch.arange(num_pages_per_seq, dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.tensor([page_size], dtype=torch.int32, device="cuda")
+        seq_len_with_cache = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+        batch_indices = torch.zeros(total_tokens, dtype=torch.int32, device="cuda")
+        positions = torch.arange(seq_len, device="cuda", dtype=torch.int32)
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        output = triton_context(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+        )
+
+        q_ref = q.view(batch_size, seq_len, n_heads, head_dim).transpose(1, 2)
+        k_ref = k.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        v_ref = v.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        k_ref = k_ref.repeat_interleave(n_heads // n_kv_heads, dim=1)
+        v_ref = v_ref.repeat_interleave(n_heads // n_kv_heads, dim=1)
+        output_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, scale=sm_scale, is_causal=True
+        )
+        output_ref = output_ref.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
     def test_context_with_custom_bool_mask_matches_torch_attention(self):
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context_with_custom_mask,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context_with_custom_mask,
             update_paged_kv_cache,
         )
 
@@ -387,7 +484,7 @@ class TestTritonPagedContextKernel:
             (pos.unsqueeze(0) <= pos.unsqueeze(1)).unsqueeze(0) | media_mask
         ).unsqueeze(1)
 
-        output = triton_paged_context_with_custom_mask(
+        output = triton_context_with_custom_mask(
             q,
             kv_cache,
             qo_indptr,
@@ -411,8 +508,8 @@ class TestTritonPagedContextKernel:
         torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
 
     def test_context_with_custom_bool_mask_and_sliding_window_with_cache_prefix(self):
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context_with_custom_mask,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context_with_custom_mask,
             update_paged_kv_cache,
         )
 
@@ -480,7 +577,7 @@ class TestTritonPagedContextKernel:
         ).unsqueeze(1)
         custom_attn_mask = full_mask[:, :, -query_len:, :]
 
-        output = triton_paged_context_with_custom_mask(
+        output = triton_context_with_custom_mask(
             q,
             kv_cache,
             qo_indptr,
@@ -515,8 +612,8 @@ class TestTritonPagedContextKernel:
         torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
 
     def test_context_with_custom_bool_mask_and_sliding_window_matches_torch_attention(self):
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context_with_custom_mask,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context_with_custom_mask,
             update_paged_kv_cache,
         )
 
@@ -568,7 +665,7 @@ class TestTritonPagedContextKernel:
             (pos.unsqueeze(0) <= pos.unsqueeze(1)).unsqueeze(0) | media_mask
         ).unsqueeze(1)
 
-        output = triton_paged_context_with_custom_mask(
+        output = triton_context_with_custom_mask(
             q,
             kv_cache,
             qo_indptr,
@@ -599,7 +696,7 @@ class TestCacheUpdate:
 
     def test_cache_update_writes_correct_values(self):
         """Test that cache update writes K, V to correct locations."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
             update_paged_kv_cache,
         )
 
@@ -646,8 +743,8 @@ class TestCacheUpdate:
         torch.testing.assert_close(actual_v, expected_v)
 
 
-class TestTritonPagedMHAIntegration:
-    """Integration tests for triton_paged_mha_with_cache and prepare_triton_paged_metadata.
+class TestTritonMHAIntegration:
+    """Integration tests for triton_mha_with_cache and prepare_triton_metadata.
 
     These test the full integration layer including BatchInfo parsing,
     metadata preparation, KV cache update, and mixed prefill/decode dispatch.
@@ -680,14 +777,14 @@ class TestTritonPagedMHAIntegration:
         return bi
 
     def test_batch_info_12_element_format(self):
-        """Test that triton_paged_mha_with_cache handles 12-element batch_info_host.
+        """Test that triton_mha_with_cache handles 12-element batch_info_host.
 
         Regression test: batch_info_host changed from 3-element to 12-element tensor.
         The old code did `num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()`
         which would crash with ValueError: too many values to unpack.
         """
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_mha_with_cache,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_mha_with_cache,
         )
 
         n_heads, n_kv_heads, head_dim, page_size = 32, 8, 128, 16
@@ -717,12 +814,12 @@ class TestTritonPagedMHAIntegration:
         )
 
         # Prepare metadata (this also uses batch_info_host)
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            prepare_triton_paged_metadata,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            prepare_triton_metadata,
         )
 
         position_ids = torch.arange(seq_len, device="cuda")
-        batch_indices, positions = prepare_triton_paged_metadata(
+        batch_indices, positions = prepare_triton_metadata(
             position_ids,
             batch_info_host,
             cu_seqlen_host.to("cuda", non_blocking=True),
@@ -730,7 +827,7 @@ class TestTritonPagedMHAIntegration:
         )
 
         # Run the full MHA with cache (should not crash)
-        output = triton_paged_mha_with_cache(
+        output = triton_mha_with_cache(
             q,
             k,
             v,
@@ -755,8 +852,8 @@ class TestTritonPagedMHAIntegration:
 
     def test_context_prefill_honors_out_buffer(self):
         """The generic context prefill path must write through out= exactly."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_mha_with_cache,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_mha_with_cache,
         )
 
         torch.manual_seed(0)
@@ -786,7 +883,7 @@ class TestTritonPagedMHAIntegration:
         kv_cache = torch.zeros(
             num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=dtype, device="cuda"
         )
-        expected_from_op = triton_paged_mha_with_cache(
+        expected_from_op = triton_mha_with_cache(
             q,
             k,
             v,
@@ -807,7 +904,7 @@ class TestTritonPagedMHAIntegration:
 
         out = torch.full_like(q, float("nan"))
         kv_cache_with_out = torch.zeros_like(kv_cache)
-        returned = triton_paged_mha_with_cache(
+        returned = triton_mha_with_cache(
             q,
             k,
             v,
@@ -873,9 +970,9 @@ class TestTritonPagedMHAIntegration:
         The KV-cache transform passes scale/sliding_window positionally and
         custom_attn_mask by keyword. This should bind correctly.
         """
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            prepare_triton_paged_metadata,
-            triton_paged_mha_with_cache,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            prepare_triton_metadata,
+            triton_mha_with_cache,
         )
 
         n_heads, n_kv_heads, head_dim, page_size = 8, 2, 128, 16
@@ -902,7 +999,7 @@ class TestTritonPagedMHAIntegration:
         )
 
         position_ids = torch.arange(seq_len, device="cuda")
-        batch_indices, positions = prepare_triton_paged_metadata(
+        batch_indices, positions = prepare_triton_metadata(
             position_ids,
             batch_info_host,
             cu_seqlen_host.to("cuda", non_blocking=True),
@@ -910,7 +1007,7 @@ class TestTritonPagedMHAIntegration:
         )
         custom_attn_mask = torch.ones(1, 1, seq_len, seq_len, dtype=torch.bool, device="cuda")
 
-        output = triton_paged_mha_with_cache(
+        output = triton_mha_with_cache(
             q,
             k,
             v,
@@ -935,9 +1032,9 @@ class TestTritonPagedMHAIntegration:
         assert not torch.isinf(output).any(), "Output contains Inf"
 
     def test_prepare_metadata_with_12_element_batch_info(self):
-        """Test prepare_triton_paged_metadata with 12-element batch_info_host."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            prepare_triton_paged_metadata,
+        """Test prepare_triton_metadata with 12-element batch_info_host."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            prepare_triton_metadata,
         )
 
         batch_info_host = self._make_batch_info(num_prefill=1, num_prefill_tokens=7, num_decode=0)
@@ -946,7 +1043,7 @@ class TestTritonPagedMHAIntegration:
         seq_len_with_cache = torch.tensor([7], dtype=torch.int32, device="cuda")
 
         # Should not raise ValueError
-        batch_indices, positions = prepare_triton_paged_metadata(
+        batch_indices, positions = prepare_triton_metadata(
             position_ids, batch_info_host, cu_seqlen, seq_len_with_cache
         )
 
@@ -1011,8 +1108,8 @@ class TestSlidingWindow:
         sliding_window: int,
     ):
         """Test decode with sliding window against reference (seq_len > window)."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_decode,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_decode,
             update_paged_kv_cache,
         )
 
@@ -1065,7 +1162,7 @@ class TestSlidingWindow:
 
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-        output_triton = triton_paged_decode(
+        output_triton = triton_decode(
             q,
             kv_cache,
             kv_indices,
@@ -1105,8 +1202,8 @@ class TestSlidingWindow:
         sliding_window: int,
     ):
         """Test prefill with sliding window against manual reference (seq_len > window)."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
             update_paged_kv_cache,
         )
 
@@ -1155,7 +1252,7 @@ class TestSlidingWindow:
 
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-        output = triton_paged_context(
+        output = triton_context(
             q,
             kv_cache,
             qo_indptr,
@@ -1183,8 +1280,8 @@ class TestSlidingWindow:
 
     def test_no_sliding_window_unchanged(self):
         """Verify that sliding_window=None produces the same output as before."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_decode,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_decode,
             update_paged_kv_cache,
         )
 
@@ -1237,7 +1334,7 @@ class TestSlidingWindow:
 
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-        out_none = triton_paged_decode(
+        out_none = triton_decode(
             q,
             kv_cache,
             kv_indices,
@@ -1246,7 +1343,7 @@ class TestSlidingWindow:
             sm_scale,
             sliding_window=None,
         )
-        out_zero = triton_paged_decode(
+        out_zero = triton_decode(
             q,
             kv_cache,
             kv_indices,
@@ -1272,8 +1369,8 @@ class TestFlashInferComparison:
         """Compare decode output against FlashInfer."""
         import flashinfer
 
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_decode,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_decode,
             update_paged_kv_cache,
         )
 
@@ -1327,7 +1424,7 @@ class TestFlashInferComparison:
         update_paged_kv_cache(
             k_flat, v_flat, batch_indices, positions, kv_cache_triton, kv_indices, kv_indptr
         )
-        output_triton = triton_paged_decode(
+        output_triton = triton_decode(
             q, kv_cache_triton, kv_indices, kv_indptr, kv_last_page_len, sm_scale
         )
 
@@ -1384,8 +1481,8 @@ class TestFlashInferComparison:
         """Compare prefill output against FlashInfer."""
         import flashinfer
 
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
             update_paged_kv_cache,
         )
 
@@ -1437,7 +1534,7 @@ class TestFlashInferComparison:
         update_paged_kv_cache(
             k, v, batch_indices, positions, kv_cache_triton, kv_indices, kv_indptr
         )
-        output_triton = triton_paged_context(
+        output_triton = triton_context(
             q,
             kv_cache_triton,
             qo_indptr,
@@ -1486,7 +1583,7 @@ class TestFlashInferComparison:
 
 
 class TestSDPADispatch:
-    """Tests for the adaptive SDPA dispatch path in triton_paged_context.
+    """Tests for the adaptive SDPA dispatch path in triton_context.
 
     Covers: large head_dim forcing SDPA, variable-length sequence fallback
     to paged kernel, FP8 KV cache dtype casting, and oversized kv_indices buffers.
@@ -1501,12 +1598,12 @@ class TestSDPADispatch:
         page_size: int = 16,
         kv_cache_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run triton_paged_context and a PyTorch SDPA reference, return both outputs.
+        """Run triton_context and a PyTorch SDPA reference, return both outputs.
 
         Supports variable-length sequences within a batch.
         """
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
             update_paged_kv_cache,
         )
 
@@ -1567,7 +1664,7 @@ class TestSDPADispatch:
 
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-        output = triton_paged_context(
+        output = triton_context(
             q,
             kv_cache,
             qo_indptr,
@@ -1681,8 +1778,8 @@ class TestSDPADispatch:
 
         This protects the large-head-dim SDPA path for a cache-prefix context.
         """
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
             update_paged_kv_cache,
         )
 
@@ -1725,7 +1822,7 @@ class TestSDPADispatch:
         def run_with_tail(k_sentinel: float, v_sentinel: float) -> torch.Tensor:
             kv_cache[0, 0, :, kv_len:page_size, :].fill_(k_sentinel)
             kv_cache[0, 1, :, kv_len:page_size, :].fill_(v_sentinel)
-            return triton_paged_context(
+            return triton_context(
                 q,
                 kv_cache,
                 qo_indptr,
@@ -1766,8 +1863,8 @@ class TestSDPADispatch:
         """SDPA dispatch must mask page-tail padding and use absolute query positions."""
         from unittest.mock import patch
 
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
             update_paged_kv_cache,
         )
 
@@ -1821,7 +1918,7 @@ class TestSDPADispatch:
             kv_cache[last_page, 0, :, last_page_tail_start:page_size, :].fill_(k_sentinel)
             kv_cache[last_page, 1, :, last_page_tail_start:page_size, :].fill_(v_sentinel)
             with patch.object(torch.nn.functional, "scaled_dot_product_attention", tracking_sdpa):
-                return triton_paged_context(
+                return triton_context(
                     q,
                     kv_cache,
                     qo_indptr,
@@ -1865,8 +1962,8 @@ class TestSDPADispatch:
 
         Tests the pages_uniform fallback via kv_indptr when kv_indices is pre-allocated.
         """
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
             update_paged_kv_cache,
         )
 
@@ -1921,7 +2018,7 @@ class TestSDPADispatch:
         update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
 
         sm_scale = 1.0 / math.sqrt(head_dim)
-        output = triton_paged_context(
+        output = triton_context(
             q,
             kv_cache,
             qo_indptr,
@@ -1953,8 +2050,8 @@ class TestSDPADispatch:
     @pytest.mark.parametrize("seq_len", [512, 1024])
     def test_fp8_kv_cache_dtype_casting(self, batch_size: int, seq_len: int):
         """FP8 KV cache values are correctly cast to query dtype in both paths."""
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
             update_paged_kv_cache,
         )
 
@@ -2003,7 +2100,7 @@ class TestSDPADispatch:
 
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-        output = triton_paged_context(
+        output = triton_context(
             q,
             kv_cache_fp8,
             qo_indptr,

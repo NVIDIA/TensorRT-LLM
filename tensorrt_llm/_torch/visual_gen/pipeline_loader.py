@@ -152,6 +152,7 @@ class PipelineLoader:
             ring_size=self.args.parallel_config.ring_size,
             attn2d_row_size=attn2d_row,
             attn2d_col_size=attn2d_col,
+            tp_size=self.args.parallel_config.tp_size,
             parallel_vae_size=self.args.parallel_config.parallel_vae_size,
         )
         config.visual_gen_mapping = vgm

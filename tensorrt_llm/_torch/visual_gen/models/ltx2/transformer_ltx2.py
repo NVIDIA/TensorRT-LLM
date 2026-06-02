@@ -1019,6 +1019,9 @@ class LTXModel(nn.Module):
                 f"must be divisible by ulysses_size ({vgm.ulysses_size})"
             )
 
+        if self.model_config.mapping.tp_size > 1:
+            raise ValueError("LTX2 does not currently support TP.")
+
         self._audio_is_sharded = False
         self._audio_pad = 0  # set by configure_audio_ulysses
         self._cache_dit_video_args: Optional[TransformerArgs] = None
