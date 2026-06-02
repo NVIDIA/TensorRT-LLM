@@ -3643,19 +3643,6 @@ class PyExecutor:
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )[0]
             llm_request.is_attention_dp_dummy = True
-            # Seed py_draft_tokens so the dummy classifies as an EXTEND request
-            # (1 + max_total_draft_tokens) rather than a DECODE request (1 token).
-            # `_prepare_draft_requests` normally seeds these uniformly for active
-            # requests, but it is gated on `self.drafter is not None`; one-model
-            # spec decoders (e.g. MTP-eagle one-model, used by AutoDeploy) drive
-            # drafting from inside the model and pass `drafter=None`, in which
-            # case the dummy would otherwise be the only DECODE-shaped row in
-            # an otherwise EXTEND batch and break downstream batch-shape
-            # invariants. The values are placeholders; the actual draft tokens
-            # are produced inside the model.
-            if self.max_total_draft_tokens > 0:
-                llm_request.py_draft_tokens = [0] * self.max_total_draft_tokens
-                llm_request.py_draft_pages_allocated = self.max_total_draft_tokens
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
