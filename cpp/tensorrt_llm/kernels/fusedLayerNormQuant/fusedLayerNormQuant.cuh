@@ -81,16 +81,17 @@ struct FusedLayerNormQuantParams
 };
 
 // Launch the fused LayerNorm + FP4 quantization kernel.
+// v1 dispatches a fixed dim3(params.M) grid without occupancy tuning, so no
+// SM-count parameter is needed. Add one back if a future version starts
+// computing waves-per-SM or persistent-CTA layouts.
 template <typename T>
-void invokeFusedLayerNormQuant(FusedLayerNormQuantParams<T> const& params, int multiProcessorCount);
+void invokeFusedLayerNormQuant(FusedLayerNormQuantParams<T> const& params);
 
 // Explicit instantiations (defined in the .cu file).
-extern template void invokeFusedLayerNormQuant<half>(
-    FusedLayerNormQuantParams<half> const& params, int multiProcessorCount);
+extern template void invokeFusedLayerNormQuant<half>(FusedLayerNormQuantParams<half> const& params);
 
 #ifdef ENABLE_BF16
-extern template void invokeFusedLayerNormQuant<__nv_bfloat16>(
-    FusedLayerNormQuantParams<__nv_bfloat16> const& params, int multiProcessorCount);
+extern template void invokeFusedLayerNormQuant<__nv_bfloat16>(FusedLayerNormQuantParams<__nv_bfloat16> const& params);
 #endif
 
 } // namespace kernels

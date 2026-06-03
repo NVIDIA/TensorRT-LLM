@@ -1157,9 +1157,13 @@ def _register_fake():
         sf_scale: torch.Tensor,
         sf_vec_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # input: 2D tensor [M, N] (bf16 or fp16)
-        # output_fp4: [M, N/2] (packed FP4 values, 2 values per byte)
-        # output_sf: swizzled scale factors
+        """Fake/meta stub for ``trtllm::fused_gelu_tanh_quantize``.
+
+        Reports the FP4-packed output shape ``[M, N/2]`` (two FP4 values per
+        uint8 byte) and the swizzled scale-factor tensor shape so that
+        ``torch.compile`` / shape inference can trace through this op
+        without invoking the CUDA kernel.
+        """
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, is_swizzled_layout=True)
         output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
@@ -1178,9 +1182,14 @@ def _register_fake():
         eps: float = 1e-6,
         sf_vec_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # input: 2D tensor [M, N] (bf16 or fp16)
-        # output_fp4: [M, N/2] (packed FP4 values, 2 per byte)
-        # output_sf:  swizzled scale factors
+        """Fake/meta stub for ``trtllm::fused_layernorm_quantize``.
+
+        Same output-shape contract as ``fused_gelu_tanh_quantize``: a
+        ``[M, N/2]`` uint8 FP4-packed tensor plus the swizzled scale-factor
+        tensor. The optional ``ln_weight``/``ln_bias`` and
+        ``scale_msa``/``shift_msa`` arguments select between plain LN, affine
+        LN, and AdaLN (modulation) variants of the underlying kernel.
+        """
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, is_swizzled_layout=True)
         output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)

@@ -132,12 +132,6 @@ std::tuple<at::Tensor, at::Tensor> fused_layernorm_quantize(at::Tensor const& in
     at::Tensor output_sf = at::detail::empty_cuda({sfSize}, SF_DTYPE, input.device(), std::nullopt);
 
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-    // Re-query SM count every call. Function-static caching is unsafe in
-    // multi-GPU processes: the first call latches whatever device the
-    // process happens to be on, then subsequent calls from other devices
-    // see a stale value (different B200 variants in the same node, MIG
-    // partitions, etc.).
-    int const multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
 #define LAUNCH_FUSED_LAYERNORM_QUANT(T)                                                                                \
     do                                                                                                                 \
@@ -158,7 +152,7 @@ std::tuple<at::Tensor, at::Tensor> fused_layernorm_quantize(at::Tensor const& in
         params.has_modulation = has_modulation;                                                                        \
         params.eps = static_cast<float>(eps);                                                                          \
         params.stream = stream;                                                                                        \
-        tensorrt_llm::kernels::invokeFusedLayerNormQuant<T>(params, multiProcessorCount);                              \
+        tensorrt_llm::kernels::invokeFusedLayerNormQuant<T>(params);                                                   \
     } while (0)
 
     if (input.scalar_type() == at::ScalarType::Half)

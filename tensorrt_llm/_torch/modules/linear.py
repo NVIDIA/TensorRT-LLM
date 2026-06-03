@@ -1381,6 +1381,14 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        """Run the NVFP4 GEMM for ``module`` on ``input`` and add ``bias``.
+
+        Accepts a plain ``torch.Tensor`` (which is quantized internally) or an
+        already-quantized ``Fp4QuantizedTensor`` produced upstream by a fused
+        activation/LayerNorm + NVFP4 kernel. Multi-dim inputs (``ndim > 2``)
+        are flattened to 2D before the GEMM and the output is unflattened
+        back to ``(*input.shape[:-1], out_features)`` so prefix dims survive.
+        """
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # NVFP4 GEMM requires 2D mat1. We flatten three input shapes here:
         #   - plain torch.Tensor:        reshape to (-1, K)

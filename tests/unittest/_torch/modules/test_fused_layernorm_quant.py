@@ -37,10 +37,12 @@ from tests.unittest.utils.util import getSMVersion
 
 
 def fused_layernorm_quantize_available():
+    """Return True iff the ``trtllm::fused_layernorm_quantize`` op is registered."""
     return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_layernorm_quantize")
 
 
 def fp4_quantize_available():
+    """Return True iff the reference ``trtllm::fp4_quantize`` op is registered."""
     return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fp4_quantize")
 
 
@@ -216,3 +218,37 @@ def test_fused_layernorm_quantize_adaln(b, s, n, dtype):
     assert match_rate >= 0.99, (
         f"adaln match rate {match_rate:.4f} < 0.99 for B={b} S={s} N={n}, {dtype}"
     )
+
+
+def test_layernorm_falls_back_on_per_token_modulation():
+    """Per-token timestep produces ``scale_msa.shape == [B, S, N]`` with S>1.
+
+    The fused kernel only supports one modulation vector per batch (its
+    ``batch_idx = row / seq_len_per_batch`` indexing cannot represent S
+    distinct modulation vectors per batch), so the Python wrapper must
+    detect this case and route to ``_forward_unfused`` rather than raising
+    a shape ValueError or invoking the fused kernel with mis-sized inputs.
+
+    Runs on any device because it exercises only the Python dispatch path.
+    """
+    from tensorrt_llm._torch.modules.layer_norm import LayerNorm
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    b, s, n = 2, 3, 5120
+    ln = LayerNorm(hidden_size=n, eps=1e-6, quantize_type="nvfp4")
+    # Force the fast-path gate open even off Blackwell so the fallback
+    # decision is exercised in CI on any GPU/CPU host.
+    ln.is_nvfp4 = True
+    ln.nvfp4_scale = torch.tensor([1.0])
+
+    x = torch.randn(b, s, n)
+    scale_msa = torch.randn(b, s, n) * 0.1
+    shift_msa = torch.randn(b, s, n) * 0.05
+
+    out = ln.forward(x, scale_msa=scale_msa, shift_msa=shift_msa,
+                     seq_len_per_batch=s)
+
+    assert not isinstance(out, Fp4QuantizedTensor), (
+        "per-token modulation must fall back to the FP32 unfused path "
+        "instead of taking the fused NVFP4 kernel")
+    assert out.shape == x.shape

@@ -62,6 +62,13 @@ class LayerNorm(nn.Module):
         has_bias: bool = True,
         quantize_type: Optional[str] = None,
     ):
+        """Construct a LayerNorm with optional affine params and quantization hook.
+
+        Set ``quantize_type='nvfp4'`` to opt into the fused LayerNorm + NVFP4
+        kernel; the fused path additionally requires a calibrated
+        ``nvfp4_scale`` attribute attached at load time and SM100+. With
+        ``quantize_type=None`` the module behaves like a plain LayerNorm.
+        """
         super().__init__()
         if has_weights:
             self.weight = nn.Parameter(
@@ -161,25 +168,48 @@ class LayerNorm(nn.Module):
         # AdaLN contract the fused kernel enforces (see _validate_adaln_pair).
         scale_msa, shift_msa = self._validate_adaln_pair(scale_msa, shift_msa)
 
+        # The fused kernel assumes one modulation vector per (B,) row group
+        # of size `seq_len_per_batch`. A per-token timestep (temb.ndim==4 in
+        # the DiT pipeline) materializes scale_msa as [B, S, N] with S>1, in
+        # which case there are S distinct modulation vectors per batch and
+        # the fused kernel's batch_idx = row / seq_len_per_batch indexing
+        # cannot represent them. Fall back to the unfused FP32 path in that
+        # case rather than crashing. Currently unreachable in shipping Wan
+        # 2.2 NVFP4 configs (the 2-D-timestep TI2V-5B variant has no NVFP4
+        # checkpoint and a different hidden_size) but kept for robustness.
+        per_token_modulation = (
+            scale_msa is not None and scale_msa.ndim == 3
+            and scale_msa.shape[1] > 1)
+
         # Fused NVFP4 fast path. Triggered only when:
         #   1. nvfp4 quant is enabled and supported on this GPU,
         #   2. an `nvfp4_scale` has been attached to this module,
-        #   3. no residual (the fused kernel doesn't support residual yet).
+        #   3. no residual (the fused kernel doesn't support residual yet),
+        #   4. modulation (if any) is one vector per batch, not per-token.
         nvfp4_scale = getattr(self, "nvfp4_scale", None)
-        if (self.is_nvfp4 and nvfp4_scale is not None and residual is ...):
-            # Distinct NVTX label so the fused path shows up clearly in nsys
-            # (vs the auto-generated `LayerNorm.forward` range from
-            # `--enable_layerwise_nvtx_marker`). Counting these in
-            # `nsys stats --report nvtxsum` gives a per-block confirmation
-            # that the fast path actually fired.
+        if (self.is_nvfp4 and nvfp4_scale is not None and residual is ...
+                and not per_token_modulation):
+            # NVTX label kept only on the NVFP4 path so the unfused fallback
+            # is byte-identical to the pre-fusion baseline for the many
+            # non-NVFP4 LayerNorm callers (StarCoder2, Cohere2, Qwen3VL,
+            # Kimi-K2.5, Flux, Flux2, ...). The label is what lets
+            # `nsys stats --report nvtx_sum` confirm the fast path fired
+            # per block.
             with nvtx_range("LN+NVFP4 fused", color="green"):
                 return self._forward_nvfp4_fused(hidden_states, scale_msa,
                                                  shift_msa, seq_len_per_batch,
                                                  nvfp4_scale)
 
-        with nvtx_range("LN unfused", color="grey"):
-            return self._forward_unfused(hidden_states, residual, scale_msa,
-                                         shift_msa)
+        if self.is_nvfp4:
+            # Counterpart range only emitted when fusion was disabled via the
+            # kill switch on an NVFP4-configured layer (the A/B case). Plain
+            # LayerNorm users skip this entirely so no NVTX push/pop overhead
+            # leaks into the shared hot path.
+            with nvtx_range("LN unfused", color="grey"):
+                return self._forward_unfused(hidden_states, residual,
+                                             scale_msa, shift_msa)
+        return self._forward_unfused(hidden_states, residual, scale_msa,
+                                     shift_msa)
 
     @maybe_compile(dynamic=True)
     def _forward_unfused(
@@ -247,8 +277,22 @@ class LayerNorm(nn.Module):
         if scale_msa is not None and shift_msa is not None:
             # AdaLN case (norm1, norm3 in Wan 2.2): no LN affine, just modulation.
             # scale_msa / shift_msa typically arrive as [B, 1, N]; reshape to [B, N].
-            # Cast to input dtype (callers often keep modulation in FP32 for the
-            # unfused path's precision; the fused kernel reads bf16/fp16).
+            #
+            # Precision note: callers typically materialize scale_msa /
+            # shift_msa in FP32 (matching the unfused path's FP32 modulation
+            # step at lines ~241-243). The fused kernel reads bf16/fp16 so
+            # we down-cast here. This is an intentional precision delta
+            # between fused and unfused paths: the fused output sees
+            # bf16/fp16-rounded modulation feeding the FP4 quantizer, while
+            # _forward_unfused applies modulation in FP32. The numerical
+            # impact is one bf16-rounding step on top of FP4 quantization
+            # error and lands well inside the ``match_rate >= 0.99`` /
+            # ``cos >= 0.995`` tolerances exercised by the unit and
+            # integration tests; the Wan 2.2 reference Python pipeline
+            # itself runs LN modulation in bf16. If a future model needs
+            # full FP32 modulation precision, plumb scale_msa/shift_msa
+            # through the kernel signature as FP32 and update the kernel
+            # to broadcast-cast on read.
             s_2d = scale_msa.reshape(-1, n).to(hs_2d.dtype).contiguous()
             sh_2d = shift_msa.reshape(-1, n).to(hs_2d.dtype).contiguous()
             ln_w = None

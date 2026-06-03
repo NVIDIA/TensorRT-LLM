@@ -105,13 +105,17 @@ _UNIGNORED_BLOCK_INDICES = set(range(40)) - _IGNORED_BLOCK_INDICES
 
 
 def _checkpoint_path() -> str:
-    """Resolve the calibrated NVFP4 checkpoint path. Prefer the env var; fall
-    back to the conventional ``/models`` bind-mount used by the build
-    container, and finally the host scratch path."""
+    """Resolve the calibrated NVFP4 checkpoint path.
+
+    Prefer the env var ``WAN22_T2V_NVFP4_PATH``; fall back to the
+    conventional ``/models`` bind-mount used by the build container.
+    Per repo convention, shared test data also lives under
+    ``/home/scratch.trt_llm_data_ci/llm-models/`` on CI runners.
+    """
     candidates = [
         os.environ.get("WAN22_T2V_NVFP4_PATH"),
         "/models/Wan2.2-T2V-A14B-Diffusers-NVFP4",
-        "/home/scratch.anikaj_libs/trunk_08042025/models/Wan2.2-T2V-A14B-Diffusers-NVFP4",
+        "/home/scratch.trt_llm_data_ci/llm-models/Wan2.2-T2V-A14B-Diffusers-NVFP4",
     ]
     for c in candidates:
         if c and Path(c, "transformer", "config.json").exists():
@@ -130,6 +134,7 @@ skip_if_no_checkpoint = pytest.mark.skipif(
 
 
 def _has_sm100() -> bool:
+    """Return True iff a CUDA device with compute capability >= SM100 is visible."""
     if not torch.cuda.is_available():
         return False
     try:
@@ -414,6 +419,7 @@ def _snapshot_fusion_state(model):
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Return the scalar cosine similarity between two tensors, flattened to 1-D."""
     a = a.reshape(-1).float()
     b = b.reshape(-1).float()
     return torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()

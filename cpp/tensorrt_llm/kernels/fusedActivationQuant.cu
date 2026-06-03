@@ -31,32 +31,48 @@ namespace kernels
 
 constexpr int kEltsPerThread = 8;
 
-__device__ __forceinline__ float relu2_f32(float x)
+// --- Activation functors -----------------------------------------------------
+//
+// Each functor must define `static __device__ __forceinline__ float apply(float)`
+// so it can be instantiated into the templated fusedActQuantizeKernel below.
+// Adding a new fused activation = define one functor here + add one explicit
+// instantiation of fusedActQuantizeKernel at the bottom of the file.
+struct Relu2Activation
 {
-    float r = fmaxf(0.0f, x);
-    return r * r;
-}
+    static __device__ __forceinline__ float apply(float x)
+    {
+        float const r = fmaxf(0.0f, x);
+        return r * r;
+    }
+};
 
 // Numerically equivalent to PyTorch's F.gelu(x, approximate="tanh"):
 //   inner = sqrt(2/pi) * (x + 0.044715 * x^3)
 //   out   = 0.5 * x * (1 + tanh(inner))
-__device__ __forceinline__ float gelu_tanh_f32(float x)
+struct GeluTanhActivation
 {
-    constexpr float kBeta = 0.7978845608028654f;
-    constexpr float kKappa = 0.044715f;
-    float const inner = kBeta * (x + kKappa * x * x * x);
-    return 0.5f * x * (1.0f + tanhf(inner));
-}
+    static __device__ __forceinline__ float apply(float x)
+    {
+        constexpr float kBeta = 0.7978845608028654f;
+        constexpr float kKappa = 0.044715f;
+        float const inner = kBeta * (x + kKappa * x * x * x);
+        return 0.5f * x * (1.0f + tanhf(inner));
+    }
+};
 
-// Fused relu2 + NVFP4 quantization kernel.
+// Fused activation + NVFP4 quantization kernel.
 //
-// To match the unfused path (PyTorch relu2 -> cvt_warp_fp16_to_fp4), relu2 is
-// computed in f32 then rounded back to native precision (bf16/fp16) before
-// quantization. Absmax and scale-factor math follow cvt_warp_fp16_to_fp4 exactly.
-// Column padding to a multiple of (4 * kSfVecSize) matches quantize_with_block_size
-// for the swizzled SF layout.
-template <typename T>
-__global__ void fusedRelu2QuantizeKernel(T const* __restrict__ input, float const* __restrict__ sfScale,
+// To match the unfused path (PyTorch ${Act} -> cvt_warp_fp16_to_fp4), the
+// activation is computed in f32 then rounded back to native precision
+// (bf16/fp16) before quantization. Absmax and scale-factor math follow
+// cvt_warp_fp16_to_fp4 exactly. Column padding to a multiple of
+// (4 * kSfVecSize) matches quantize_with_block_size for the swizzled SF
+// layout. The activation is selected at compile time via the Act template
+// parameter, so the entire NVFP4 epilogue (absmax / shfl / SF swizzle /
+// FP4 packing / padded-column handling) lives in exactly one place; future
+// SF-layout or absmax fixes only need to be applied once.
+template <typename T, typename Act>
+__global__ void fusedActQuantizeKernel(T const* __restrict__ input, float const* __restrict__ sfScale,
     uint32_t* __restrict__ outputFp4, uint32_t* __restrict__ outputSf, int m, int n)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -86,8 +102,8 @@ __global__ void fusedRelu2QuantizeKernel(T const* __restrict__ input, float cons
 #pragma unroll
             for (int i = 0; i < kPackedPerThread; i++)
             {
-                float f0 = relu2_f32(static_cast<float>(input[inputOffset + i * 2]));
-                float f1 = relu2_f32(static_cast<float>(input[inputOffset + i * 2 + 1]));
+                float f0 = Act::apply(static_cast<float>(input[inputOffset + i * 2]));
+                float f1 = Act::apply(static_cast<float>(input[inputOffset + i * 2 + 1]));
                 if constexpr (std::is_same_v<T, half>)
                 {
                     packedVals[i] = __floats2half2_rn(f0, f1);
@@ -172,17 +188,28 @@ __global__ void fusedRelu2QuantizeKernel(T const* __restrict__ input, float cons
 #endif
 }
 
-template <typename T>
-void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
-    int m, int n, int sfVecSize, cudaStream_t stream)
+// Shared launcher: compute the same threads-per-block as before and dispatch
+// the templated kernel for the requested activation functor. Both relu2 and
+// gelu_tanh launches funnel through here, so the launch geometry stays in
+// lock-step automatically.
+template <typename T, typename Act>
+static void invokeFusedActQuantize(T const* input, float const* sfScale, std::uint8_t* outputFp4,
+    std::uint8_t* outputSf, int m, int n, cudaStream_t stream)
 {
     constexpr int kSfVecSize = 16;
     int const numColThreadsPadded = ((n + 4 * kSfVecSize - 1) / (4 * kSfVecSize)) * (4 * kSfVecSize) / kEltsPerThread;
     int threadsPerBlock = min(512, numColThreadsPadded);
     threadsPerBlock = max(32, ((threadsPerBlock + 31) / 32) * 32);
 
-    fusedRelu2QuantizeKernel<T><<<m, threadsPerBlock, 0, stream>>>(
+    fusedActQuantizeKernel<T, Act><<<m, threadsPerBlock, 0, stream>>>(
         input, sfScale, reinterpret_cast<uint32_t*>(outputFp4), reinterpret_cast<uint32_t*>(outputSf), m, n);
+}
+
+template <typename T>
+void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
+    int m, int n, int /*sfVecSize*/, cudaStream_t stream)
+{
+    invokeFusedActQuantize<T, Relu2Activation>(input, sfScale, outputFp4, outputSf, m, n, stream);
 }
 
 template void invokeFusedRelu2Quantize<half>(
@@ -193,140 +220,11 @@ template void invokeFusedRelu2Quantize<__nv_bfloat16>(
     __nv_bfloat16 const*, float const*, std::uint8_t*, std::uint8_t*, int, int, int, cudaStream_t);
 #endif
 
-// Fused gelu(tanh approx) + NVFP4 quantization kernel.
-//
-// Mirrors fusedRelu2QuantizeKernel exactly; only the elementwise activation
-// swaps relu2_f32 for gelu_tanh_f32. Activation is computed in f32 then rounded
-// back to native precision (bf16/fp16) so absmax / SF / FP4 packing math is
-// byte-for-byte identical to the relu2 kernel and to cvt_warp_fp16_to_fp4.
-template <typename T>
-__global__ void fusedGeluTanhQuantizeKernel(T const* __restrict__ input, float const* __restrict__ sfScale,
-    uint32_t* __restrict__ outputFp4, uint32_t* __restrict__ outputSf, int m, int n)
-{
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    constexpr int kSfVecSize = 16;
-    constexpr int kNumThreadsPerSf = kSfVecSize / kEltsPerThread;
-    constexpr int kPackedPerThread = kEltsPerThread / 2;
-
-    using PackedType = std::conditional_t<std::is_same_v<T, half>, __half2, __nv_bfloat162>;
-
-    float const SFScaleVal = sfScale[0];
-    int const numColThreads = n / kEltsPerThread;
-    int const numColVecs = n / kSfVecSize;
-    int const numColThreadsPadded = ((n + 4 * kSfVecSize - 1) / (4 * kSfVecSize)) * (4 * kSfVecSize) / kEltsPerThread;
-    int const rowIdx = blockIdx.x;
-
-    if (rowIdx >= m)
-        return;
-
-    for (int colIdx = threadIdx.x; colIdx < numColThreadsPadded; colIdx += blockDim.x)
-    {
-        bool const isValidCol = colIdx < numColThreads;
-        PackedType packedVals[kPackedPerThread];
-
-        if (isValidCol)
-        {
-            int const inputOffset = rowIdx * n + colIdx * kEltsPerThread;
-#pragma unroll
-            for (int i = 0; i < kPackedPerThread; i++)
-            {
-                float f0 = gelu_tanh_f32(static_cast<float>(input[inputOffset + i * 2]));
-                float f1 = gelu_tanh_f32(static_cast<float>(input[inputOffset + i * 2 + 1]));
-                if constexpr (std::is_same_v<T, half>)
-                {
-                    packedVals[i] = __floats2half2_rn(f0, f1);
-                }
-                else
-                {
-                    packedVals[i] = __floats2bfloat162_rn(f0, f1);
-                }
-            }
-        }
-        else
-        {
-#pragma unroll
-            for (int i = 0; i < kPackedPerThread; i++)
-            {
-                if constexpr (std::is_same_v<T, half>)
-                {
-                    packedVals[i] = __float2half2_rn(0.0f);
-                }
-                else
-                {
-                    packedVals[i] = __float2bfloat162_rn(0.0f);
-                }
-            }
-        }
-
-        // Absmax in native precision, then reduce across the SF group (2 threads).
-        auto localMax = cuda_abs(packedVals[0]);
-#pragma unroll
-        for (int i = 1; i < kPackedPerThread; i++)
-        {
-            localMax = cuda_max(localMax, cuda_abs(packedVals[i]));
-        }
-        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-        float vecMax = float(cuda_max(localMax.x, localMax.y));
-
-        // Scale-factor computation (identical to cvt_warp_fp16_to_fp4).
-        float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
-        __nv_fp8_e4m3 fp8SF = __nv_fp8_e4m3(SFValue);
-        uint8_t fp8SFVal = fp8SF.__x;
-        SFValue = static_cast<float>(fp8SF);
-
-        float outputScale
-            = vecMax != 0.0f ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
-
-        if (colIdx % kNumThreadsPerSf == 0)
-        {
-            auto sfOutPtr = cvt_quant_get_sf_out_offset<uint32_t, kNumThreadsPerSf>(std::nullopt, rowIdx, colIdx,
-                std::optional<int>(m), numColVecs, outputSf, QuantizationSFLayout::SWIZZLED);
-            if (sfOutPtr != nullptr)
-            {
-                *sfOutPtr = fp8SFVal;
-            }
-        }
-
-        if (isValidCol)
-        {
-            float2 fp2Vals[kPackedPerThread];
-#pragma unroll
-            for (int i = 0; i < kPackedPerThread; i++)
-            {
-                if constexpr (std::is_same_v<T, half>)
-                {
-                    fp2Vals[i] = __half22float2(packedVals[i]);
-                }
-                else
-                {
-                    fp2Vals[i] = __bfloat1622float2(packedVals[i]);
-                }
-                fp2Vals[i].x *= outputScale;
-                fp2Vals[i].y *= outputScale;
-            }
-
-            outputFp4[rowIdx * numColThreads + colIdx] = fp32_vec_to_e2m1(fp2Vals);
-        }
-    }
-#else
-    if (threadIdx.x == 0 && blockIdx.x == 0)
-    {
-        printf("FP4 quantization requires SM100 (Blackwell) or later!\n");
-    }
-#endif
-}
-
 template <typename T>
 void invokeFusedGeluTanhQuantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
-    int m, int n, int sfVecSize, cudaStream_t stream)
+    int m, int n, int /*sfVecSize*/, cudaStream_t stream)
 {
-    constexpr int kSfVecSize = 16;
-    int const numColThreadsPadded = ((n + 4 * kSfVecSize - 1) / (4 * kSfVecSize)) * (4 * kSfVecSize) / kEltsPerThread;
-    int threadsPerBlock = min(512, numColThreadsPadded);
-    threadsPerBlock = max(32, ((threadsPerBlock + 31) / 32) * 32);
-
-    fusedGeluTanhQuantizeKernel<T><<<m, threadsPerBlock, 0, stream>>>(
-        input, sfScale, reinterpret_cast<uint32_t*>(outputFp4), reinterpret_cast<uint32_t*>(outputSf), m, n);
+    invokeFusedActQuantize<T, GeluTanhActivation>(input, sfScale, outputFp4, outputSf, m, n, stream);
 }
 
 template void invokeFusedGeluTanhQuantize<half>(

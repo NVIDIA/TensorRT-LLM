@@ -31,7 +31,7 @@ def _ln_quant_type(quant_config, force_dynamic_quant: bool):
     silently (no ``nvfp4_scale`` attached -> LayerNorm uses _forward_unfused).
 
     A/B kill switch: ``TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION`` mirrors the
-    flag used by Llama (modeling_llama.py:673). Default is ``"1"`` (fusion
+    flag used by Llama (see ``modeling_llama.py``). Default is ``"1"`` (fusion
     disabled = safe default, behavior unchanged from main). Set ``"0"`` to
     enable the fused path on this Wan run; useful for nsys A/B profiling
     against the same calibrated checkpoint:
@@ -310,6 +310,15 @@ class WanTimeTextImageEmbedding(nn.Module):
 
 
 class WanBlock(nn.Module):
+    """A single Wan 2.2 Diffusion Transformer block.
+
+    Each block runs: AdaLN-modulated self-attention -> AdaLN-modulated cross-
+    attention -> AdaLN-modulated MLP, with the three norm sites optionally
+    fused with NVFP4 quantization when the downstream Linear carries a
+    calibrated ``input_scale`` and the kill switch
+    ``TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION`` permits it.
+    """
+
     def __init__(
         self,
         model_config: DiffusionModelConfig,

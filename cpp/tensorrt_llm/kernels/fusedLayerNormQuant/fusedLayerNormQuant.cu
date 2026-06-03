@@ -353,7 +353,7 @@ __launch_bounds__(BLOCK_SIZE, 4)
 }
 
 template <typename T>
-void invokeFusedLayerNormQuant(FusedLayerNormQuantParams<T> const& params, int /*multiProcessorCount*/)
+void invokeFusedLayerNormQuant(FusedLayerNormQuantParams<T> const& params)
 {
     constexpr int BLOCK_SIZE = 128;
 
@@ -414,10 +414,10 @@ void invokeFusedLayerNormQuant(FusedLayerNormQuantParams<T> const& params, int /
     sync_check_cuda_error(params.stream);
 }
 
-template void invokeFusedLayerNormQuant<half>(FusedLayerNormQuantParams<half> const&, int);
+template void invokeFusedLayerNormQuant<half>(FusedLayerNormQuantParams<half> const&);
 
 #ifdef ENABLE_BF16
-template void invokeFusedLayerNormQuant<__nv_bfloat16>(FusedLayerNormQuantParams<__nv_bfloat16> const&, int);
+template void invokeFusedLayerNormQuant<__nv_bfloat16>(FusedLayerNormQuantParams<__nv_bfloat16> const&);
 #endif
 
 } // namespace kernels

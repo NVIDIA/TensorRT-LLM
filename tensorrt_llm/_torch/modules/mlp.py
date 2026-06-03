@@ -14,6 +14,16 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 class MLP(nn.Module):
+    """Standard transformer MLP: ``down_proj(activation(up_proj(x)))``.
+
+    Supports an opt-in fused ``activation + NVFP4 quantize`` fast path for
+    static NVFP4 models: when the ``activation`` is recognized
+    (``F.relu`` -> relu^2 fused kernel, ``gelu_tanh`` sentinel -> GELU-tanh
+    fused kernel) AND ``down_proj`` carries a calibrated ``input_scale``
+    AND the fused kernel symbol is registered, ``forward`` routes the
+    intermediate activation through a single CUDA kernel that emits an
+    ``Fp4QuantizedTensor`` directly consumed by ``down_proj``'s GEMM.
+    """
 
     def __init__(
         self,
@@ -95,16 +105,26 @@ class MLP(nn.Module):
         self._use_fused_gelu_tanh_quant = False
 
     def create_weights(self):
+        """Allocate up_proj/down_proj weights and resolve the fused-fast-path gates.
+
+        Sets ``self._use_fused_relu2_quant`` / ``self._use_fused_gelu_tanh_quant``
+        based on (a) whether ``down_proj`` is configured for NVFP4 with a
+        calibrated ``input_scale`` Parameter, (b) whether the corresponding
+        CUDA kernel symbol is registered, and (c) which activation the MLP
+        was constructed with.
+        """
         self.up_proj.create_weights()
         self.down_proj.create_weights()
 
         has_nvfp4 = hasattr(self.down_proj,
                             'has_nvfp4') and self.down_proj.has_nvfp4
         has_kernel = hasattr(torch.ops.trtllm, 'fused_relu2_quantize')
-        # NVFP4LinearMethod.create_weights always allocates input_scale as a
-        # Parameter (linear.py:1295), but a layer that opts into dynamic quant
-        # at load time will reset it to None (linear.py:821). The fused kernel
-        # needs a real scalar tensor, so guard against the None case explicitly.
+        # For NVFP4 ``input_scale`` is always allocated as a Parameter by
+        # ``NVFP4LinearMethod.create_weights`` (it is the calibrated global
+        # activation scale), so for the layers this gate actually controls
+        # the ``is not None`` check is purely defensive against a future
+        # code path that might reset it. The fused kernel needs a real
+        # scalar tensor in any case.
         has_scale = getattr(self.down_proj, 'input_scale', None) is not None
         is_relu2 = self.activation is relu2
 
@@ -132,6 +152,15 @@ class MLP(nn.Module):
         x: torch.Tensor,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
+        """Run up_proj -> activation -> down_proj.
+
+        When a calibrated ``input_scale`` is present on ``down_proj`` and the
+        activation is relu^2 or GELU-tanh, the activation+NVFP4 quantization is
+        executed as a single fused kernel so that ``down_proj`` consumes an
+        already-quantized ``Fp4QuantizedTensor`` directly (saving one
+        BF16/FP16 read+write of the up_proj output). Otherwise the standard
+        unfused activation runs and the linear layer quantizes internally.
+        """
         if lora_params is not None:
             return self.forward_lora(x, lora_params=lora_params)
 
@@ -154,6 +183,11 @@ class MLP(nn.Module):
         return x_down
 
     def _fused_relu2_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        """Fused ``relu(x)^2 + NVFP4 quantize`` for the up_proj output.
+
+        Returns an ``Fp4QuantizedTensor`` with the same leading dims as ``x``;
+        the last dim is halved because two FP4 values are packed per byte.
+        """
         # Preserve the input rank so NVFP4LinearMethod.apply unflattens the
         # GEMM output to (*x.shape[:-1], out_features). With the original
         # 2D-only return, a [B, S, H] input came back from down_proj as
@@ -182,6 +216,11 @@ class MLP(nn.Module):
         )
 
     def _fused_gelu_tanh_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        """Fused ``GELU-tanh(x) + NVFP4 quantize`` for the up_proj output.
+
+        Returns an ``Fp4QuantizedTensor`` with the same leading dims as ``x``;
+        the last dim is halved because two FP4 values are packed per byte.
+        """
         orig_shape = x.shape
         x_flat = x.view(-1, x.shape[-1])
 
