@@ -740,6 +740,17 @@ class SequenceInfo:
         self._active_host_prep_args: Set[str] = set()
         ############################################################################################
 
+        # named_args cache (host-overhead optimization). Rebuilding the main dict (one get_arg
+        # call -- including a fresh truncated slice + unflatten -- per active arg) runs once per
+        # forward step. The cached dict holds views into the persistent input buffers, so the H2D
+        # copy that overwrites the buffer storage in place is automatically reflected on the next
+        # forward without rebuilding. The cache is keyed on a signature capturing every input to
+        # the per-arg shape computation (current_length of each active arg + the unflatten
+        # parameters). It is also explicitly invalidated whenever the underlying buffer views are
+        # recreated (resize/to) or the active-arg set changes.
+        self._cached_named_args_main: Optional[Dict[str, torch.Tensor]] = None
+        self._cached_named_args_sig: Optional[Tuple] = None
+
         # EXTRA TENSOR FIELDS ######################################################################
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
         ############################################################################################
@@ -830,14 +841,54 @@ class SequenceInfo:
             arg = self.unflatten(arg)
         return arg
 
+    def _named_args_signature(self) -> Tuple:
+        """Signature capturing everything the main named_args dict depends on for shape.
+
+        ``get_arg`` returns, for each active arg, a view truncated to that arg's current length
+        and then unflattened. The unflattened shape depends on ``_use_flattened_layout``,
+        ``is_generate_only``, ``is_extend_only``, ``total_num_tokens`` and ``num_sequences``
+        (see ``unflatten``). The truncation depends on each arg's current length. The active-arg
+        set itself is part of the signature so a newly activated arg forces a rebuild even if the
+        explicit invalidation hook were ever missed.
+        """
+        # Some active args (e.g. host-side batch_info_host) are not length-tracked in
+        # _current_lengths; use a stable None for those rather than KeyError-ing. Their
+        # views are fixed-shape and updated in place, so they need not force a rebuild.
+        _cur_len = self._input_buffer._current_lengths
+        lengths = tuple(_cur_len.get(k) for k in self._active_args)
+        return (
+            self._active_args,
+            lengths,
+            self._use_flattened_layout,
+            self.is_generate_only,
+            self.is_extend_only,
+            self.total_num_tokens,
+            self.num_sequences,
+        )
+
     def _named_args(self, include_extra_args: bool = True) -> Dict[str, torch.Tensor]:
-        args = {k: self.get_arg(k) for k in self._active_args}
+        sig = self._named_args_signature()
+        if self._cached_named_args_main is None or self._cached_named_args_sig != sig:
+            self._cached_named_args_main = {k: self.get_arg(k) for k in self._active_args}
+            self._cached_named_args_sig = sig
 
         # check other args to include
         if include_extra_args:
+            # Copy the cached dict and overlay extras; never mutate the cache in place since
+            # _extra_args is rebuilt every nest_sequences call.
+            args = dict(self._cached_named_args_main)
             args.update(self._extra_args)
+            return args
+        return dict(self._cached_named_args_main)
 
-        return args
+    def _invalidate_named_args_cache(self) -> None:
+        """Clear the named_args cache.
+
+        Call whenever the underlying buffer views are recreated (resize/to) so the cache cannot
+        return tensors that view stale storage.
+        """
+        self._cached_named_args_main = None
+        self._cached_named_args_sig = None
 
     @property
     def available_args(self) -> Set[str]:
@@ -929,6 +980,9 @@ class SequenceInfo:
             # Keep per-group cache_loc buffers in sync
             for group_idx in range(1, self.num_window_groups):
                 self._input_buffer.resize(f"cache_loc_g{group_idx}", estimated_capacity)
+            # resize() recreates the buffer views, so any cached named_args tensors now view
+            # stale storage and must be dropped.
+            self._invalidate_named_args_cache()
 
     def register_window_groups(self, window_sizes: List[int]) -> None:
         """Register KV window groups and create per-group cache tensors.
@@ -1041,6 +1095,10 @@ class SequenceInfo:
         for k, v in self._extra_args.items():
             if v is not None:
                 self._extra_args[k] = v.to(*args, **kwargs)
+
+        # A device move recreates the buffer views, so any cached named_args tensors now view
+        # stale storage and must be dropped.
+        self._invalidate_named_args_cache()
 
     def set_example_sequence(
         self,
@@ -1503,11 +1561,29 @@ class SequenceInfo:
 
         This function will assume that we are in a generate-only batch.
         """
-        torch.ops.auto_deploy.triton_utils_fused_gather_scatter(
-            ungathered_input=ungathered_input_ids,
-            gather_ids=self.get_arg("_gather_idx", truncate=True),
-            mask_indices=self.get_arg("_mask_scatter_indices", truncate=True),
-            out=self.get_arg("input_ids", truncate=True, unflatten=False),
+        # Bypass the torch.ops custom-op dispatcher at runtime. The op is registered with
+        # mutates_args=("out",), which forces PyTorch's tensor stream tracker to emit cross-stream
+        # cudaEvent {Create, Record, WaitEvent, Destroy} groups for each input on every call; the
+        # kernel itself is ~1 us but the dispatcher path is ~95 us/iter on this workload. Call the
+        # underlying triton kernel directly with the same arguments and grid as the registered op
+        # (see utils.triton_utils.fused_gather_scatter). The torch.ops wrapper plus its
+        # register_fake remain for graph-tracing paths that depend on the op schema; only this live
+        # runtime call is rerouted.
+        from .utils.triton_utils import _fused_gather_scatter_kernel
+
+        gather_ids = self.get_arg("_gather_idx", truncate=True)
+        mask_indices = self.get_arg("_mask_scatter_indices", truncate=True)
+        out = self.get_arg("input_ids", truncate=True, unflatten=False)
+        n = gather_ids.numel()
+        BLOCK_SIZE = 256
+        grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+        _fused_gather_scatter_kernel[grid](
+            ungathered_input_ids,
+            gather_ids,
+            mask_indices,
+            out,
+            n,
+            BLOCK_SIZE=BLOCK_SIZE,
         )
 
     # TODO: remove once https://github.com/NVIDIA/TensorRT-LLM/issues/9878 is fixed and

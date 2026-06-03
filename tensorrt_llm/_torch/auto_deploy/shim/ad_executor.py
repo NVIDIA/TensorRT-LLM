@@ -654,18 +654,25 @@ class ADEngine(ModelEngine):
         )
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
-        extend_requests = [
-            r for r in scheduled_requests.generation_requests if get_draft_token_length(r) > 0
-        ]
-        generation_requests = [
-            r for r in scheduled_requests.generation_requests if get_draft_token_length(r) == 0
-        ]
+        # Fast path: when spec dec is disabled, no request can have draft tokens, so the
+        # extend/generate split degenerates (every generation request lands in
+        # generation_requests). Skip the double scan over generation_requests.
+        if self.spec_config is None:
+            extend_requests = []
+            generation_requests = scheduled_requests.generation_requests
+        else:
+            extend_requests = [
+                r for r in scheduled_requests.generation_requests if get_draft_token_length(r) > 0
+            ]
+            generation_requests = [
+                r for r in scheduled_requests.generation_requests if get_draft_token_length(r) == 0
+            ]
 
-        # This sanity checks our one-model spec dec flow, where extend requests are only present when doing spec dec
-        # and take the place of generation requests.
-        # This also makes sure that dummy requests, which are at the end of schedulred_requests.generation_requests,
-        # end up at the end of gen_requests.
-        assert len(extend_requests) == 0 or len(generation_requests) == 0
+            # This sanity checks our one-model spec dec flow, where extend requests are only present when doing spec dec
+            # and take the place of generation requests.
+            # This also makes sure that dummy requests, which are at the end of schedulred_requests.generation_requests,
+            # end up at the end of gen_requests.
+            assert len(extend_requests) == 0 or len(generation_requests) == 0
 
         gen_requests = extend_requests + generation_requests
         ordered_requests = context_requests + gen_requests
