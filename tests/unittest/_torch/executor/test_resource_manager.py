@@ -12,8 +12,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             PeftCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager, KVCacheManagerV2, PeftCacheManager,
+    _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -24,6 +25,9 @@ from tensorrt_llm.bindings.internal.testing import \
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1,
+                                                KV_CACHE_HASH_ALGO_V2)
 from tensorrt_llm.sampling_params import SamplingParams
 
 DataType = tensorrt_llm.bindings.DataType
@@ -33,6 +37,144 @@ current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
 sys.path.append(str(root_dir / "tests" / "integration"))
+
+
+def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V2)
+
+    warning.assert_called_once()
+    assert KV_CACHE_HASH_ALGO_V1 in warning.call_args.args[0]
+    assert KV_CACHE_HASH_ALGO_V2 in warning.call_args.args[0]
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V1)
+
+    warning.assert_not_called()
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+            KV_CACHE_HASH_ALGO_AUTO)
+
+    warning.assert_not_called()
+
+
+def test_add_dummy_requests_returns_none_when_create_kv_cache_returns_none():
+    # Regression for the disagg crash:
+    #   File "resource_manager.py", line 2960, in add_dummy_requests
+    #     assert kv_cache.num_committed_tokens == 0
+    #   AttributeError: 'NoneType' object has no attribute 'num_committed_tokens'
+    # _create_kv_cache returns None when IndexMapper is saturated (e.g. all
+    # slots held by DISAGG_GENERATION_TRANS_IN_PROGRESS requests). The caller
+    # in cuda_graph_runner._get_padded_batch already handles a None return,
+    # so add_dummy_requests must propagate it instead of dereferencing.
+    mgr = object.__new__(KVCacheManagerV2)
+    mgr.kv_cache_map = {}
+    mgr._allocated_draft_lens = {}
+    mgr.num_extra_kv_tokens = 0
+
+    with patch.object(mgr, "_create_kv_cache",
+                      return_value=None) as create_kv_cache:
+        result = mgr.add_dummy_requests(
+            request_ids=[0],
+            is_gen=True,
+            max_num_draft_tokens=0,
+            max_beam_width=1,
+            prepare_resource=True,
+        )
+
+    assert result is None
+    create_kv_cache.assert_called_once()
+
+
+def test_kv_cache_creator_forwards_is_disagg():
+    # Regression: KvCacheCreator must forward is_disagg so the disagg-gen IndexMapper uses max_num_sequences*2+1, not *1+1.
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    creator = object.__new__(KvCacheCreator)
+    creator._is_disagg = True
+    creator._mapping = MagicMock()
+    creator._kv_cache_config = MagicMock()
+    creator._tokens_per_block = 128
+    creator._max_seq_len = 1024
+    creator._max_batch_size = 2
+    creator._speculative_config = None
+    creator._sparse_attention_config = None
+    creator._max_num_tokens = 8
+    creator._max_beam_width = 1
+    creator._llm_args = MagicMock(max_input_len=1024)
+    creator._kv_connector_manager = None
+    creator._execution_stream = None
+    creator._skip_est = True
+
+    model_engine = MagicMock()
+    model_engine.model.model_config.is_generation = True
+
+    with patch("tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+               return_value=None) as mod_create, patch.object(
+                   creator,
+                   "_get_model_kv_cache_manager_cls",
+                   return_value=KVCacheManagerV2), patch.object(
+                       creator,
+                       "_should_create_separate_draft_kv_cache",
+                       return_value=False):
+        creator._create_kv_cache_manager(model_engine)
+
+    assert mod_create.call_args.kwargs["is_disagg"] is True
+
+
+def test_kv_cache_creator_forwards_is_disagg_to_one_model_draft():
+    # Regression: same is_disagg propagation must hold for the one-model draft (MTP/Eagle) KV cache path.
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    creator = object.__new__(KvCacheCreator)
+    creator._is_disagg = True
+    creator._mapping = MagicMock()
+    creator._kv_cache_config = MagicMock()
+    creator._tokens_per_block = 128
+    creator._max_seq_len = 1024
+    creator._max_batch_size = 2
+    creator._speculative_config = MagicMock()
+    creator._speculative_config.spec_dec_mode.is_external_drafter.return_value = False
+    creator._max_num_tokens = 8
+    creator._max_beam_width = 1
+    creator._llm_args = MagicMock(max_input_len=1024)
+    creator._kv_connector_manager = None
+    creator._execution_stream = None
+    creator._skip_est = True
+
+    target_model_engine = MagicMock()
+    target_model_engine.model.model_config.pretrained_config.num_hidden_layers = 4
+    creator._model_engine = target_model_engine
+
+    draft_config = MagicMock()
+    draft_config.sparse_attention_config = None
+    draft_config.pretrained_config.torch_dtype = "bfloat16"
+
+    with patch.object(
+            creator, "_get_num_draft_layers", return_value=1
+    ), patch.object(
+            creator, "_get_effective_draft_config", return_value=draft_config
+    ), patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            return_value=KVCacheManagerV2
+    ), patch.object(creator, "_warn_if_unsupported_kv_cache_manager_v2"), patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+            return_value=None) as mod_create:
+        creator._create_one_model_draft_kv_cache_manager()
+
+    assert mod_create.call_args.kwargs["is_disagg"] is True
 
 
 class TestResourceManager(unittest.TestCase):
@@ -880,6 +1022,39 @@ class TestResourceManager(unittest.TestCase):
 
         # The PeftCacheManager should be created successfully with the provided stream
         self.assertTrue(peft_cache_manager.impl.enabled)
+
+
+def test_torch_sampler_args_overlap_doubles_slot_pool():
+    """Regression: under overlap + PP=1 the slot pool must be 2 * max_batch_size
+    so finished previous-iter requests holding slots cannot starve the next
+    iter's prepare_resources (nvbugs/disagg + max_batch_size=2 + ADP)."""
+    from tensorrt_llm._torch.pyexecutor._util import create_torch_sampler_args
+
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+
+    overlap_args = create_torch_sampler_args(
+        mapping,
+        max_seq_len=64,
+        max_batch_size=2,
+        speculative_config=None,
+        max_beam_width=1,
+        disable_overlap_scheduler=False,
+        disable_flashinfer_sampling=False,
+        enable_async_worker=False,
+    )
+    assert overlap_args.max_num_sequences == 4
+
+    no_overlap_args = create_torch_sampler_args(
+        mapping,
+        max_seq_len=64,
+        max_batch_size=2,
+        speculative_config=None,
+        max_beam_width=1,
+        disable_overlap_scheduler=True,
+        disable_flashinfer_sampling=False,
+        enable_async_worker=False,
+    )
+    assert no_overlap_args.max_num_sequences == 2
 
 
 if __name__ == "__main__":

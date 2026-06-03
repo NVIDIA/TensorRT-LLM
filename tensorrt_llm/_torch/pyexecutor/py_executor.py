@@ -422,9 +422,11 @@ class PyExecutor:
                                             KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
-            and self.kv_cache_manager.enable_partial_reuse)
+            and self.kv_cache_manager.enable_partial_reuse
+            and not isinstance(self.kv_cache_manager, KVCacheManagerV2))
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -481,6 +483,8 @@ class PyExecutor:
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
+        self.benchmark_fill_stall_timeout_s = float(
+            os.environ.get("TLLM_BENCHMARK_FILL_STALL_TIMEOUT_S", 60.0))
 
         # list of requests in each PP micro batch
         self.num_micro_batches = max(self.dist.pp_size,
@@ -2516,35 +2520,71 @@ class PyExecutor:
                     self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
-            # simultaneously because generation requests do not release their
-            # KV until the full benchmark batch can run. If the scheduler
-            # cannot fit any INIT request after all benchmark requests have
-            # been fetched, the fill gate would never open; raise an explicit
-            # error instead of hanging forever.
-            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
-                    and not fitting_disagg_gen_init_requests):
-                stuck_init_requests = [
-                    req for req in self.active_requests
-                    if req.is_disagg_generation_init_state
-                ]
-                # Only fail once all benchmark requests have been fetched
-                # so that _handle_errors covers every request and every
-                # client receives an error response.
-                if (stuck_init_requests and self.num_fetch_requests
-                        >= self.benchmark_req_queues_size):
-                    error_msg = (
-                        f"Insufficient KV cache for gen-only benchmark mode: "
-                        f"{len(stuck_init_requests)} request(s) are waiting for "
-                        f"KV cache allocation but the scheduler could not fit "
-                        f"any of them. Increase free_gpu_memory_fraction or "
-                        f"reduce TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
-                        f"{self.benchmark_req_queues_size}).")
-                    logger.error(error_msg)
-                    # Fail all active and waiting requests so every
-                    # client receives an error instead of hanging.
-                    self._handle_errors(error_msg,
-                                        requests=self.active_requests)
-                    return None, None
+            # simultaneously. If some requests are stuck in INIT state and the
+            # scheduler could not allocate KV for any of them, the benchmark
+            # will hang forever because in-progress generation requests won't
+            # release their KV cache.
+            #
+            # Only watch during the fill phase: once fill completes the count
+            # stays at its target value through the entire decode, which would
+            # otherwise look like a stall. With ADP, requests are sharded
+            # across TP ranks so the comparison must use the global count
+            # (allgather) against the global target.
+            if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
+                    and not self.is_warmup):
+                # NOTE: keep the gate condition free of any per-rank state
+                # (e.g. `fitting_disagg_gen_init_requests`).  The
+                # `tp_allgather` below is a collective and every ADP rank
+                # must participate together; otherwise ranks desync and a
+                # later allgather mixes payload shapes (list[int] from
+                # gather_all_rank_states vs int from the gate's
+                # _is_benchmark_disagg_fill_complete), producing TypeErrors
+                # like "argument after * must be an iterable, not int" or
+                # "unsupported operand type(s) for +: 'int' and 'list'".
+                # The per-rank "still has fitting requests" hint is folded
+                # into the same allgather so we can suppress the stall
+                # check globally when any rank is still making progress.
+                local_ready_gen = sum(
+                    1 for req in self.active_requests if req.state in (
+                        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+                        LlmRequestState.GENERATION_IN_PROGRESS,
+                    ))
+                local_has_fitting = 1 if fitting_disagg_gen_init_requests else 0
+                if self.enable_attention_dp:
+                    responses = self.dist.tp_allgather(
+                        [local_ready_gen, local_has_fitting])
+                    total_ready_gen = sum(r[0] for r in responses)
+                    any_rank_has_fitting = any(r[1] for r in responses)
+                else:
+                    total_ready_gen = local_ready_gen
+                    any_rank_has_fitting = bool(local_has_fitting)
+
+                if not any_rank_has_fitting:
+                    now = time.time()
+                    last_count = getattr(self, "_bench_disagg_last_gen_count",
+                                         None)
+                    last_change_time = getattr(
+                        self, "_bench_disagg_last_gen_count_time", None)
+                    if (last_count != total_ready_gen
+                            or last_change_time is None):
+                        self._bench_disagg_last_gen_count = total_ready_gen
+                        self._bench_disagg_last_gen_count_time = now
+                    elif (now - last_change_time
+                          > self.benchmark_fill_stall_timeout_s
+                          and total_ready_gen < self.benchmark_req_queues_size):
+                        error_msg = (
+                            f"Benchmark gen request count stalled at "
+                            f"{total_ready_gen} "
+                            f"for {now - last_change_time:.0f}s "
+                            f"(target {self.benchmark_req_queues_size}, "
+                            f"fetched={self.num_fetch_requests}). "
+                            f"Likely causes: KV transfer stuck, KV cache pool "
+                            f"too small, or transceiver deadlock. Aborting all "
+                            f"active requests.")
+                        logger.error(error_msg)
+                        self._handle_errors(error_msg,
+                                            requests=self.active_requests)
+                        return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -2711,6 +2751,10 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    if self._scheduler_manages_kv_suspend:
+                        for req in scheduled_batch.generation_requests:
+                            self.kv_cache_manager.revert_allocate_generation(
+                                req)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -2991,6 +3035,10 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    if self._scheduler_manages_kv_suspend:
+                        for req in scheduled_batch.generation_requests:
+                            self.kv_cache_manager.revert_allocate_generation(
+                                req)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -3789,8 +3837,9 @@ class PyExecutor:
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
                 logger.warning(
-                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
-                )
+                    f"Terminating {type} request {req.py_request_id} due to KV "
+                    f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
+                    f"kv_transfer_timeout_ms={timeout_ms}ms")
                 req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
@@ -3898,7 +3947,18 @@ class PyExecutor:
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
+            )
+            if llm_request is None:
+                # Slot allocation failed (e.g., all IndexMapper slots held by
+                # in-flight DISAGG_GENERATION_TRANS_IN_PROGRESS requests).
+                # Skip dummy insertion this iteration; this rank will then
+                # also skip forward, which other ranks tolerate when they
+                # detect a globally empty schedule.
+                logger.warning(
+                    "Skipping attention-DP dummy request: no free KV cache slot."
+                )
+                return
+            llm_request = llm_request[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)

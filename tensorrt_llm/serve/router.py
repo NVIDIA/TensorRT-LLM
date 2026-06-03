@@ -160,11 +160,12 @@ class KvCacheAwareServerState(ServerState):
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
 
-    async def poll_and_update(self):
+    async def poll_and_update(self, session=None):
         """Poll KV cache events and update block table. Called outside the critical path."""
         try:
-            assert self._session is not None, "session must be set on KvCacheAwareServerState"
-            events_raw = await self.poll_events(self._session)
+            session = session if session is not None else self._session
+            assert session is not None, "session must be provided to poll_and_update"
+            events_raw = await self.poll_events(session)
             async with self._lock:
                 if events_raw is not None:
                     self.update_with_events(events_raw)
@@ -372,7 +373,10 @@ class Router(ABC):
         '''Select server by request and return some intermediate information, exclude_server is a server to exclude from the selection'''
 
     @abstractmethod
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True):
         pass
 
     @property
@@ -617,8 +621,11 @@ class RoundRobinRouter(Router):
                     )
         return server, {"server_info": self._server_info.get(server, {})}
 
-    async def finish_request(self, request: OpenAIRequest):
-        pass
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True):
+        del request, session, success
 
 
 class LoadBalancingRouter(LoadBalancingMixin, Router):
@@ -656,7 +663,11 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
 
         return server, {"server_info": self._server_info.get(server, {})}
 
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True):
+        del session, success
         async with self._lock:
             await self._unregister_request(request)
 
@@ -777,6 +788,22 @@ class BlockHashMixin:
         block_hashes = self._compute_block_hashes(token_lists)
         return token_lists, block_hashes
 
+    def _tokenize_and_compute_block_hashes_by_algo(
+        self,
+        request: OpenAIRequest,
+        hash_algos: Iterable[str],
+        cache_salt_id: Optional[int] = None,
+    ) -> tuple[list[list[int]], dict[str, list[list[BlockHash]]]]:
+        """Synchronous tokenize + per-algorithm block hashes for thread offload."""
+        token_lists = self._tokenize(request)
+        return token_lists, {
+            hash_algo:
+            self._compute_block_hashes(token_lists,
+                                       hash_algo,
+                                       cache_salt_id=cache_salt_id)
+            for hash_algo in set(hash_algos)
+        }
+
     @staticmethod
     def _text_to_int_sequences(texts: list[str]) -> list[list[int]]:
         """Convert text strings to lists of unicode code points.
@@ -799,6 +826,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  max_batch_size: int = 64,
                  tokens_per_block: int = 32,
                  custom_tokenizer: Optional[str] = None,
+                 backfill_block_hashes_on_finish: bool = False,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -806,6 +834,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        # Opt-in workaround for the disagg-gen path that doesn't emit
+        # kv_cache_events. Stash hashes at routing, inject on finish.
+        self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish
+        self._pending_block_hashes: dict[int, tuple[list, str]] = {}
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
@@ -866,6 +898,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server = servers[winner]
         async with self._lock:
             await self._register_request(server, request)
+            if self._backfill_block_hashes_on_finish:
+                self._pending_block_hashes[id(request)] = (block_hashes,
+                                                           hash_algo)
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
             "token_lists": token_lists,  # list[list[int]]
@@ -873,13 +908,27 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             "server_info": self._server_info.get(server, {}),
         }
 
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True):
         async with self._lock:
             server = self._req_routing_table.pop(id(request), None)
+            # Pop unconditionally to avoid leaks; only use for backfill on success.
+            pending = self._pending_block_hashes.pop(id(request), None)
+            if not (self._backfill_block_hashes_on_finish and success):
+                pending = None
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
         if server is not None and server in self._server_state:
-            await self._server_state[server].poll_and_update()
+            # Inject just-served block_hashes into server state — see __init__ note.
+            if pending is not None:
+                block_hashes, hash_algo = pending
+                flat_hashes = (h for hash_list in block_hashes
+                               for h in hash_list)
+                self._server_state[server].add_blocks(flat_hashes,
+                                                      hash_algo=hash_algo)
+            await self._server_state[server].poll_and_update(session)
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
@@ -1335,7 +1384,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         return server, {"server_info": self._server_info.get(server, {})}
 
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True):
+        del session, success
         async with self._lock:
             server = await self._unregister_request(request)
             self._remove_content_load(server, request)

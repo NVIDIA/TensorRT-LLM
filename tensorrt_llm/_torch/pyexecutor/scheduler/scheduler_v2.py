@@ -436,15 +436,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
         """
-        if not self.kv_cache_manager.prepare_context(req):
-            logger.debug("prepare_context failed for disagg gen init request %s", req.py_request_id)
+        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
+            logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
-
-        if not self.kv_cache_manager.resize_context(
-            req, req.context_remaining_length + get_draft_token_length(req)
-        ):
-            return ScheduleAction.SKIP, 0
-
         return ScheduleAction.SCHEDULED, 0
 
     def _try_schedule_context(

@@ -2860,6 +2860,9 @@ class KVCacheManagerV2(BaseResourceManager):
         This method shrinks capacity back to undo that spurious growth
         so it does not accumulate across iterations and overflow the
         host page-index buffer.
+
+        Mirror the effective draft length used in _required_gen_capacity
+        so disagg-gen-trans-complete revert stays symmetric.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
@@ -2943,6 +2946,11 @@ class KVCacheManagerV2(BaseResourceManager):
         For subsequent chunks: verifies existing cache is active.
         Returns True on success, False if preparation failed.
         """
+        assert not req.is_disagg_generation_init_state, (
+            f"req {req.py_request_id}: use prepare_disagg_gen_init")
+        return self._prepare_context_impl(req)
+
+    def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
@@ -2984,10 +2992,6 @@ class KVCacheManagerV2(BaseResourceManager):
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
 
-        num_tokens is the number of tokens to be processed (i.e.,
-        context_remaining_length or a chunk thereof). The target capacity is
-        computed as context_current_position + num_tokens so that block reuse
-        overlaps with existing capacity are handled correctly.
         Returns True on success, False if resize failed (first chunk is
         suspended on failure).
 
@@ -2995,6 +2999,8 @@ class KVCacheManagerV2(BaseResourceManager):
         when growth happens so ``revert_allocate_context`` can undo it if
         delay batching defers the request.
         """
+        assert not req.is_disagg_generation_init_state, (
+            f"req {req.py_request_id}: use prepare_disagg_gen_init")
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -3003,7 +3009,8 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        if not kv_cache.resize(capacity):
+        success = kv_cache.resize(capacity)
+        if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
@@ -3012,6 +3019,46 @@ class KVCacheManagerV2(BaseResourceManager):
         # invalidates a stale snapshot from a prior iter on the same req.
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
+
+    def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
+        """Prepare KV cache for a disagg generation init request.
+
+        Allocates capacity for the full prompt (+ draft) and sets
+        ``kv_cache.history_length`` to ``prompt_len``. Returns True on
+        success, False if preparation or resize failed (cache is suspended
+        on resize failure).
+        """
+        if not self._prepare_context_impl(req):
+            return False
+
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+
+        # prompt_len is the full incoming prompt length, robust to block
+        # reuse (which may leave a non-zero context_current_position).
+        target = (req.prompt_len + get_draft_token_length(req) +
+                  self.num_extra_kv_tokens)
+        capacity = max(kv_cache.capacity, target)
+
+        success = kv_cache.resize(capacity, req.prompt_len)
+        if not success:
+            if req.is_first_context_chunk:
+                kv_cache.suspend()
+            return False
+        return True
+
+    def get_history_length(self, req: LlmRequest) -> int | None:
+        """Return the cache's current history_length, or None if no cache.
+
+        Exposes the per-request SWA history watermark so callers
+        (e.g., the disagg transceiver) can verify scheduler/cache contracts
+        without reaching into ``kv_cache_map`` directly.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return None
+        return kv_cache.history_length
 
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """Extend KV cache capacity for the CUDA-graph padding delta.
@@ -3245,6 +3292,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 # to None to avoid coupling synthetic data to any salted branch.
                 kv_cache = self._create_kv_cache(req.py_request_id,
                                                  req.lora_task_id, input_tokens)
+                # Saturated IndexMapper (e.g. disagg gen trans in progress) → None; retry next iter.
+                if kv_cache is None:
+                    release_resources(req)
+                    return None
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
@@ -3264,6 +3315,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
                         req.py_request_id, req.lora_task_id, input_tokens)
                     # Dummy path: see comment above, no salt.
+                    if draft_kv_cache is None:
+                        release_resources(req)
+                        return None
                     success = draft_kv_cache.resume(
                         draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
@@ -3301,6 +3355,22 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return requests
 
+    def release_index_slot(self, request_id: int) -> None:
+        """Release IndexMapper slot early while keeping KV cache blocks allocated.
+
+        After prefill completes on a context-only worker, the IndexMapper slot
+        (used for host_kv_cache_block_offsets during model forward) is no longer
+        needed.  Releasing it early allows new requests to be scheduled while
+        the KV cache blocks are still being transferred via NIXL/UCX.
+        """
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is not None:
+            for i in range(self.max_beam_width):
+                for pool_idx in range(self.num_pools):
+                    kv_cache.set_base_page_index_buf(i, pool_idx, None)
+        self.index_mapper.remove_sequence(request_id)
+        self._early_freed_index_requests.add(request_id)
+
     def try_commit_blocks_for_reuse(self, request: LlmRequest,
                                     kv_cache) -> None:
         if (self.enable_block_reuse and not self.is_draft
@@ -3314,17 +3384,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 end=request.context_current_position)
             kv_cache.commit(tokens)
             kv_cache.stop_committing()
-
-    def release_index_slot(self, request_id: int) -> None:
-        """Release IndexMapper slot early while keeping KV cache blocks allocated.
-
-        After prefill completes on a context-only worker, the IndexMapper slot
-        (used for host_kv_cache_block_offsets during model forward) is no longer
-        needed.  Releasing it early allows new requests to be scheduled while
-        the KV cache blocks are still being transferred via NIXL/UCX.
-        """
-        self.index_mapper.remove_sequence(request_id)
-        self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         self._allocated_draft_lens.pop(request.py_request_id, None)
