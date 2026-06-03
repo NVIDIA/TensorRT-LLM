@@ -234,7 +234,9 @@ class InputBuffer:
             Number of elements stored.
         """
         numel, dtype = self._tensor_specs[name]
-        host_view = self.get_host_view(name)
+        # Inline get_host_view(name) (truncate=False) to skip a method call + branch on
+        # the hot per-arg staging path.
+        host_view = self._host_views[name]
 
         if fill_value is not None:
             host_view.fill_(fill_value)
@@ -725,6 +727,10 @@ class SequenceInfo:
         # Create the InputBuffer that manages contiguous host and device memory
         # Starts on default device; use to() to move to target device
         self._input_buffer = InputBuffer(tensor_specs)
+        # Cache the host-suffix string/length so the hot _stage_arg path can strip it
+        # without going through the _host_suffix property on every call.
+        self._host_suffix_str = self._host_suffix
+        self._host_suffix_len = len(self._host_suffix_str)
         self._available_args = (
             set(self._input_buffer.tensor_names)
             | {name + self._host_suffix for name in self._input_buffer.tensor_names}
@@ -1239,17 +1245,20 @@ class SequenceInfo:
             data: List of values or a 1-D torch.Tensor to store.
             reset_val: Value to reset/fill the tensor with before writing data.
         """
-        # make sure it is provided if required
-        if self._is_required(name):
-            assert data is not None, f"data is required for {name}"
-
+        # Hot path: a value was provided. The required-ness check below only exists to
+        # raise when a required arg is missing, which is vacuously satisfied here, so it
+        # is skipped entirely (saves ~14 _is_required() calls / decode step at c=1).
         if data is None:
+            # make sure it is provided if required
+            assert not self._is_required(name), f"data is required for {name}"
             return None
 
-        with nvtx_range(f"ad_stage_{name}_on_host"):
-            # Store to the InputBuffer's pinned host memory
-            name = name.removesuffix(self._host_suffix)
-            self._input_buffer.stage(name, data, fill_value=reset_val)
+        # Store to the InputBuffer's pinned host memory. The per-arg nvtx range is dropped
+        # from the hot path: an f-string format plus an nvtx.annotate enter/exit per call,
+        # x14 args / step, is pure host overhead on the c=1 critical path.
+        if name.endswith(self._host_suffix_str):
+            name = name[: -self._host_suffix_len]
+        self._input_buffer.stage(name, data, fill_value=reset_val)
 
     def _store_extra_arg(
         self, name: str, tnsr_like: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]]
