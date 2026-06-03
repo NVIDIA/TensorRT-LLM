@@ -739,5 +739,36 @@ def torch_export_to_gm(
 
     # show exported graph
     ad_logger.debug("exported graph: " + str(egm))
-
+# === GRAFIA MODEL GRAPH EXPORTER FOR ISSUE #14153 ===
+    if getattr(torch, "_dynamo_grafia_enabled", False):
+        import json
+        ad_logger.info("Extracting computational graph for Grafia integration...")
+        
+        try:
+            grafia_graph = {"nodes": [], "edges": []}
+            
+            # Capture all execution nodes from the fx GraphModule
+            for node in egm.graph.nodes:
+                node_info = {
+                    "id": node.name,
+                    "op": str(node.op),
+                    "target": str(node.target)
+                }
+                grafia_graph["nodes"].append(node_info)
+                
+                # Map tracking dependencies (edges)
+                for user in node.users:
+                    grafia_graph["edges"].append({
+                        "source": node.name,
+                        "target": user.name
+                    })
+                    
+            # Write the payload to disk safely wrapped in exception handling
+            output_json_path = "./autodeploy_grafia_graph.json"
+            with open(output_json_path, "w") as f:
+                json.dump(grafia_graph, f, indent=4)
+            ad_logger.info(f"Grafia execution layout successfully exported to {output_json_path}")
+        except Exception as file_error:
+            # Prevent file I/O errors from cracking or stopping the main core model export
+            ad_logger.warning(f"Grafia graph visualization export skipped due to failure: {file_error}")
     return egm

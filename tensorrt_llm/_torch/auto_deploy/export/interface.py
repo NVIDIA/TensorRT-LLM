@@ -292,3 +292,20 @@ def apply_export_patches(
     )
 
     yield from _apply_patches(patches)
+
+# === GRAFIA HOOK FOR ISSUE #14153 ===
+@ExportPatchRegistry.register("grafia_visualizer")
+class GrafiaVisualizerPatch(DisabledBaseExportPatch):
+    """Export patch to enable tracing context for Grafia graph generation."""
+    def _apply_patch(self):
+        import torch
+        # Store original state if it exists, otherwise default to False
+        self.original_values["grafia_enabled"] = getattr(torch, "_dynamo_grafia_enabled", False)
+        torch._dynamo_grafia_enabled = True
+        ad_logger.info("Grafia Visualizer Context Patch Applied.")
+
+    def _revert_patch(self):
+        import torch
+        # Safely restore the original state without breaking other contexts
+        torch._dynamo_grafia_enabled = self.original_values.get("grafia_enabled", False)
+        ad_logger.info("Grafia Visualizer Context Patch Reverted.")
