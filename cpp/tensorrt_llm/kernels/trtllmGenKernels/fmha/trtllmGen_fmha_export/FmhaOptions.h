@@ -232,6 +232,13 @@ struct FmhaConfig {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Whether the output dtype produces per-block scale factors.
+inline bool hasOutputSfs(tg::Dtype dtype) {
+  return dtype == tg::Dtype::E2m1 || dtype == tg::Dtype::MxE4m3;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Check if the options are valid or not.
 inline void checkFmhaOptions(FmhaOptions const& options,
                              FmhaOptionsFromArgs const& optionsFromArgs) {
@@ -290,7 +297,8 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                        "Only headDimQk > headDimV MLA kernels have been verified for Hopper");
     } else {
       if (isContextKernel(options.mFmhaKernelType)) {
-        TLLM_CHECK_ERROR((headDimQk == 192 && headDimV == 128) || (headDimQk == 128 && headDimV == 64),
+        TLLM_CHECK_ERROR((headDimQk == 192 && headDimV == 128) ||
+                           (headDimQk == 128 && headDimV == 64),
                          "Only headDimQk = 192, headDimV = 128 (DeepSeek context MLA) or "
                          "headDimQk = 128, headDimV = 64 (Mistral Small 4 context MLA) kernels "
                          "have been verified");
@@ -387,17 +395,20 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                      "Chunked attention size must be power of 2");
   }
 
-  // Special options for FP4.
-  if (options.mDtypeOut == tg::Dtype::E2m1) {
-    // FP4 output only supports fuseEpilogueIntoCorr.
+  // Special options for block-scaled outputs.
+  if (fmha::hasOutputSfs(options.mDtypeOut)) {
     TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
-                     "FP4 output only supports fuseEpilogueIntoCorr");
-    // Make sure the number of sf per row can be divided by 4, required for interleaved SF layout.
-    // Details can be seen in DtypeUtils.h: E2m1Utils::getSfOffset.
-    int32_t hiddenDim = options.mNumHeadsQ * headDimQk;
-    auto kernelTraits = getKernelTraitsFromOptions(options);
-    TLLM_CHECK_ERROR((hiddenDim / kernelTraits.mNumEltsPerSf) % 4 == 0,
-                     "Current hiddenDim is not supported for FP4 output");
+                      "E2m1 / MxE4m3 output only supports fuseEpilogueIntoCorr");
+
+    // Make sure the number of SFs per row can be divided by 4, required for interleaved SF layout.
+    int32_t numEltsPerSfO = tg::dtypeNumEltsPerSf(options.mDtypeOut);
+    int32_t hiddenDim = options.mNumHeadsQ * options.mHeadDimV;
+    TLLM_CHECK_ERROR(options.mHeadDimV % numEltsPerSfO == 0,
+                     "headDimV must be divisible by the output SF group size");
+    TLLM_CHECK_ERROR(hiddenDim % numEltsPerSfO == 0,
+                     "hiddenDim must be divisible by the output SF group size");
+    TLLM_CHECK_ERROR((hiddenDim / numEltsPerSfO) % 4 == 0,
+                     "Current hiddenDim is not compatible with interleaved SF layout");
   }
 
   // If we decide to use Sage Attention, the number of elements per block must be a power-of-two.
