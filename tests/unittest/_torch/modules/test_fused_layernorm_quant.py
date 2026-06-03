@@ -258,10 +258,10 @@ def test_layernorm_falls_back_on_per_token_modulation():
     scale_msa = torch.randn(b, s, n) * 0.1
     shift_msa = torch.randn(b, s, n) * 0.05
 
-    out = ln.forward(x, scale_msa=scale_msa, shift_msa=shift_msa,
-                     seq_len_per_batch=s)
+    out = ln.forward(x, scale_msa=scale_msa, shift_msa=shift_msa, seq_len_per_batch=s)
 
     assert not isinstance(out, Fp4QuantizedTensor), (
         "per-token modulation must fall back to the FP32 unfused path "
-        "instead of taking the fused NVFP4 kernel")
+        "instead of taking the fused NVFP4 kernel"
+    )
     assert out.shape == x.shape

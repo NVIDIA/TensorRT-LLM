@@ -177,9 +177,8 @@ class LayerNorm(nn.Module):
         # case rather than crashing. Currently unreachable in shipping Wan
         # 2.2 NVFP4 configs (the 2-D-timestep TI2V-5B variant has no NVFP4
         # checkpoint and a different hidden_size) but kept for robustness.
-        per_token_modulation = (
-            scale_msa is not None and scale_msa.ndim == 3
-            and scale_msa.shape[1] > 1)
+        per_token_modulation = (scale_msa is not None and scale_msa.ndim == 3
+                                and scale_msa.shape[1] > 1)
 
         # Fused NVFP4 fast path. Triggered only when:
         #   1. nvfp4 quant is enabled and supported on this GPU,
@@ -206,8 +205,8 @@ class LayerNorm(nn.Module):
             # LayerNorm users skip this entirely so no NVTX push/pop overhead
             # leaks into the shared hot path.
             with nvtx_range("LN unfused", color="grey"):
-                return self._forward_unfused(hidden_states, residual,
-                                             scale_msa, shift_msa)
+                return self._forward_unfused(hidden_states, residual, scale_msa,
+                                             shift_msa)
         return self._forward_unfused(hidden_states, residual, scale_msa,
                                      shift_msa)
 
@@ -302,10 +301,9 @@ class LayerNorm(nn.Module):
             # Validate the row-to-batch ratio so the kernel's
             # batch_idx = row / seq_len_per_batch indexing is correct.
             if hs_2d.shape[0] != s_2d.shape[0] * seq_len_per_batch:
-                raise ValueError(
-                    f"hidden_states M={hs_2d.shape[0]} must equal "
-                    f"scale_msa B={s_2d.shape[0]} * "
-                    f"seq_len_per_batch={seq_len_per_batch}.")
+                raise ValueError(f"hidden_states M={hs_2d.shape[0]} must equal "
+                                 f"scale_msa B={s_2d.shape[0]} * "
+                                 f"seq_len_per_batch={seq_len_per_batch}.")
         else:
             # Plain LN case (norm2 in Wan 2.2): use learned weight and bias.
             s_2d = None
