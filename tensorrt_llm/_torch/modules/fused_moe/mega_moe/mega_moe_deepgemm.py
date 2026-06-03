@@ -606,7 +606,7 @@ class MegaMoEDeepGemm(MoE):
         #    fast meta-init path, where a ``c10d.barrier`` on a meta tensor
         #    raises ``MetaInitException`` — aborting meta-init and forcing the
         #    slow regular-init fallback that materializes every weight on host
-        #    RAM, OOM-killing small-host nodes (e.g. cmh GB300, ~900 GiB/node).
+        #    RAM, OOM-killing small-host nodes (e.g. GB300, ~900 GiB/node).
         #
         # ``post_load_weights`` runs in the same build-time lockstep window on
         # every EP rank, after MetaInitMode has exited and before any forward /

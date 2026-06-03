@@ -793,8 +793,8 @@ class DeepseekV4WeightLoader:
         # ConsumableWeightsDict: deletes mmap-backed source tensors right
         # after each module finishes consuming them. Drops the OS page cache
         # pressure on safetensors files during the per-module loop, which is
-        # the dominant host RSS contributor on tight Grace LPDDR nodes (lyris
-        # GB300, 240 GiB) where 4-rank MEGAMOE mnt=16k otherwise blows past
+        # the dominant host RSS contributor on tight Grace LPDDR nodes (GB300,
+        # 240 GiB/rank) where 4-rank MEGAMOE mnt=16k otherwise blows past
         # the host budget. Mirrors DSv3's pattern at modeling_deepseekv3.py.
         can_mark_consumed = hasattr(weights, "mark_consumed")
 
@@ -819,7 +819,7 @@ class DeepseekV4WeightLoader:
                 getattr(module, attr).data.copy_(weights[key][:])
             return True
 
-        # On host-memory-constrained nodes (e.g. cmh GB300: 900 GiB shared by 4
+        # On host-memory-constrained nodes (e.g. GB300: 900 GiB shared by 4
         # ranks), reading the 805 GiB safetensors during load faults the model
         # into the file-cache faster than it is reclaimed; 4 ranks' resident
         # file pages (~205-246 GiB/rank) cross the cgroup limit and OOM-kill the
