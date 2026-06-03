@@ -20,6 +20,77 @@ from ...distributed import AllReduce
 from ...utils import EventType
 from ..multi_stream_utils import do_multi_stream
 
+_MADV_DONTNEED = 4
+_MADV_PAGEOUT = 21
+_MADV_ADVICE_BY_MODE = {"dontneed": _MADV_DONTNEED, "pageout": _MADV_PAGEOUT}
+
+
+def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
+    """Issue ``madvise(addr, size, advice)`` over a page-aligned address range.
+
+    Low-level shared wrapper around the ``libc.madvise`` syscall. ``addr`` and
+    ``size`` must already be page-aligned -- both mmap regions (from
+    ``/proc/self/maps``) and the clipped tensor ranges computed by
+    ``advise_tensor_pageout`` satisfy this.
+
+    Parameters
+    ----------
+    addr : int
+        Start address of the range.
+    size : int
+        Length of the range in bytes. A non-positive size is a no-op.
+    mode : str, optional
+        "dontneed" -> MADV_DONTNEED (immediate discard, default)
+        "pageout"  -> MADV_PAGEOUT  (asynchronous pageout, Linux 4.5+)
+
+    Raises
+    ------
+    ValueError
+        If an invalid mode is given.
+    OSError
+        If the madvise() syscall fails (errno will be included).
+    """
+    if size <= 0:
+        return
+    try:
+        advice = _MADV_ADVICE_BY_MODE[mode]
+    except KeyError:
+        raise ValueError("mode must be 'pageout' or 'dontneed'.")
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    ret = libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(size),
+                       ctypes.c_int(advice))
+    if ret != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"madvise() failed with errno={err}")
+
+
+def pageout_file_backed_regions(path_substring: str,
+                                mode: str = "dontneed") -> None:
+    """``madvise`` every mmap region whose backing file path matches a substring.
+
+    Scans ``/proc/self/maps`` and advises ``MADV_DONTNEED`` / ``MADV_PAGEOUT``
+    on each mapped region whose path contains ``path_substring``. Used to bound
+    the resident file-cache of large read-only mmaps (e.g. the safetensors
+    shards) during weight load on host-memory-constrained nodes. mmap regions
+    are always page-aligned, so the raw ``[start, end)`` bounds parsed from the
+    maps file are passed straight to ``madvise_range``. Best-effort: per-region
+    failures are swallowed so a transient unmap cannot abort the caller.
+    """
+    try:
+        maps = open("/proc/self/maps")
+    except OSError:
+        return
+    with maps:
+        for line in maps:
+            if path_substring not in line:
+                continue
+            start_hex, end_hex = line.split()[0].split("-")
+            start = int(start_hex, 16)
+            try:
+                madvise_range(start, int(end_hex, 16) - start, mode)
+            except OSError:
+                pass
+
 
 def advise_tensor_pageout(tensor, mode: str = "dontneed"):
     """
@@ -51,10 +122,6 @@ def advise_tensor_pageout(tensor, mode: str = "dontneed"):
       It does NOT crash or corrupt data.
     """
 
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    MADV_PAGEOUT = 21
-    MADV_DONTNEED = 4
-
     if not tensor.device.type == "cpu":
         raise ValueError("Only CPU tensors are supported.")
 
@@ -70,30 +137,10 @@ def advise_tensor_pageout(tensor, mode: str = "dontneed"):
     start_aligned = (ptr + page_size - 1) & ~(page_size - 1)
 
     # Round down to the last complete page boundary inside the tensor
-    end_ptr = ptr + nbytes
-    end_aligned = end_ptr & ~(page_size - 1)
+    end_aligned = (ptr + nbytes) & ~(page_size - 1)
 
-    # Calculate the size of complete pages within the tensor
-    size = end_aligned - start_aligned
-
-    # If there are no complete pages within the tensor, skip madvise
-    if size <= 0:
-        return
-
-    # Choose advice mode
-    if mode == "pageout":
-        advice = MADV_PAGEOUT
-    elif mode == "dontneed":
-        advice = MADV_DONTNEED
-    else:
-        raise ValueError("mode must be 'pageout' or 'dontneed'.")
-
-    # Perform madvise() only on complete pages within the tensor
-    ret = libc.madvise(ctypes.c_void_p(start_aligned), ctypes.c_size_t(size),
-                       ctypes.c_int(advice))
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, f"madvise() failed with errno={err}")
+    # madvise only the complete pages fully inside the tensor's bounds.
+    madvise_range(start_aligned, end_aligned - start_aligned, mode)
 
 
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
