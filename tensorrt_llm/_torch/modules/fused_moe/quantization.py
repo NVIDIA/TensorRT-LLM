@@ -2756,10 +2756,18 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         orig_scale_dtype = weight_scale.dtype
         orig_scale_shape = weight_scale.shape
         orig_weight_device = weight.device
+        orig_scale_device = weight_scale.device
 
-        # Dequantize on whichever device is convenient and bf16-cast for
-        # numerical stability through the requant; the ops themselves run
-        # on CUDA.
+        # fp4_quantize requires a CUDA tensor. Regular experts live on this
+        # rank's GPU (cuda:local_rank); shared experts (online EPLB) are staged
+        # on CPU. Pick the weight's own CUDA device when available, otherwise
+        # the rank's active CUDA device -- never a bare .cuda() (== cuda:0),
+        # which would spill onto the wrong GPU under multi-GPU TP.
+        compute_device = weight.device if weight.is_cuda else torch.device(
+            'cuda', torch.cuda.current_device())
+
+        # Dequantize on the input's native device (the dequant op accepts CPU
+        # and CUDA) and bf16-cast for numerical stability through the requant.
         dequant_shape = (weight.shape[0], weight.shape[1] * 2)
         weight_dequant = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
             weight.contiguous(),
@@ -2768,12 +2776,13 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                 dequant_shape)
 
         weight_requant, weight_scale_requant = torch.ops.trtllm.fp4_quantize(
-            weight_dequant.cuda(), (1.0 / new_scale_2).cuda(), 16, False)
+            weight_dequant.to(compute_device),
+            (1.0 / new_scale_2).to(compute_device), 16, False)
 
         return (weight_requant.to(device=orig_weight_device,
                                   dtype=weight.dtype),
                 weight_scale_requant.reshape(orig_scale_shape).view(
-                    orig_scale_dtype).to(device=weight_scale.device))
+                    orig_scale_dtype).to(device=orig_scale_device))
 
     def _fuse_w3_w1_scale_2(self, module: torch.nn.Module):
         """Pre-fuse gate (w1) and up (w3) weight_scale_2 in-place by
@@ -2784,25 +2793,64 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         were calibrated against its own (smaller) sf2 -- so the effective
         dequant scale on that side is inflated by max_sf2/own_sf2.  See
         comment in _reconcile_and_compute_alphas for the assumption.
+
+        Regular and shared (online EPLB) experts are fused independently:
+        each set of experts has its own per-tensor sf2 dict and its own dst
+        weight/scale buffers, and both index local experts from slot 0. They
+        must not be merged -- the regular sf2 is unrelated to the shared one,
+        so fusing them in the same bucket would requantize shared weights
+        against the wrong scale and leave tmp_shared_weight_scale_2 untouched
+        (still mismatched, still warning).
         """
-        if (not hasattr(module, 'tmp_weight_scale_2')
-                or not hasattr(module, 'tmp_cutlass_w3_w1_weights')
+        if (not hasattr(module, 'tmp_cutlass_w3_w1_weights')
                 or not hasattr(module, 'tmp_cutlass_w3_w1_weight_scales')):
             return
 
-        # Build an index of (expert_idx -> list of (weight_entry, scale_entry))
-        # so we can update regular and shared-expert copies of the same expert
-        # in lockstep.
-        by_expert: Dict[int, List[Tuple[Dict, Dict]]] = {}
-        weight_buckets: Dict[int, List[Dict]] = {}
-        for (_, expert_idx), entry in module.tmp_cutlass_w3_w1_weights.items():
-            weight_buckets.setdefault(expert_idx, []).append(entry)
-        for (_, expert_idx), entry in (
-                module.tmp_cutlass_w3_w1_weight_scales.items()):
-            for w_entry in weight_buckets.get(expert_idx, []):
-                by_expert.setdefault(expert_idx, []).append((w_entry, entry))
+        # Regular experts: weights/scales destined for the module's own
+        # w3_w1 buffers, with per-tensor sf2 in tmp_weight_scale_2.
+        if hasattr(module, 'tmp_weight_scale_2'):
+            self._fuse_w3_w1_scale_2_for_dst(
+                module, module.tmp_weight_scale_2,
+                module.w3_w1_weight.data.storage().data_ptr(),
+                module.w3_w1_weight_scale.data.storage().data_ptr())
 
-        for expert_idx, scales in module.tmp_weight_scale_2.items():
+        # Shared experts (online EPLB): staged in the local_shared buffers
+        # with their own per-tensor sf2 in tmp_shared_weight_scale_2.
+        if (hasattr(module, 'tmp_shared_weight_scale_2')
+                and getattr(module, 'local_shared_w3_w1_tensors', None)
+                is not None and getattr(
+                    module, 'local_shared_w3_w1_scale_tensors', None)
+                is not None):
+            self._fuse_w3_w1_scale_2_for_dst(
+                module, module.tmp_shared_weight_scale_2,
+                module.local_shared_w3_w1_tensors.storage().data_ptr(),
+                module.local_shared_w3_w1_scale_tensors.storage().data_ptr())
+
+    def _fuse_w3_w1_scale_2_for_dst(self, module: torch.nn.Module,
+                                    sf2_by_expert: Dict[int, Dict],
+                                    weight_dst_base: int, scale_dst_base: int):
+        """Fuse w1/w3 sf2 for one set of experts (regular or shared).
+
+        ``weight_dst_base`` / ``scale_dst_base`` are the ``data_ptr()`` of the
+        destination weight / scale buffers for this set; the tmp dicts are
+        keyed on ``(dst_base, expert_idx)`` precisely so regular and shared
+        copies of the same local expert id can be told apart. We select only
+        the entries for this set, so each ``expert_idx`` maps to exactly one
+        weight entry and one scale entry.
+        """
+        weights_by_expert: Dict[int, Dict] = {
+            expert_idx: entry
+            for (base, expert_idx), entry in
+            module.tmp_cutlass_w3_w1_weights.items() if base == weight_dst_base
+        }
+        scales_by_expert: Dict[int, Dict] = {
+            expert_idx: entry
+            for (base, expert_idx), entry in
+            module.tmp_cutlass_w3_w1_weight_scales.items()
+            if base == scale_dst_base
+        }
+
+        for expert_idx, scales in sf2_by_expert.items():
             w1_sf2 = scales.get('w1')
             w3_sf2 = scales.get('w3')
             if w1_sf2 is None or w3_sf2 is None:
@@ -2811,7 +2859,9 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                 continue
 
             max_sf2 = torch.max(w1_sf2, w3_sf2)
-            for w_entry, s_entry in by_expert.get(expert_idx, []):
+            w_entry = weights_by_expert.get(expert_idx)
+            s_entry = scales_by_expert.get(expert_idx)
+            if w_entry is not None and s_entry is not None:
                 for half in ('w1', 'w3'):
                     old_sf2 = scales[half]
                     if torch.allclose(old_sf2, max_sf2):
