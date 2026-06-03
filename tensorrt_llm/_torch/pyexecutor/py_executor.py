@@ -79,12 +79,6 @@ from .scheduler.adp_router import ADPRouter
 _UNBOUNDED_STATS_MAX_LEN = -1
 
 
-def _normalize_stats_max_len(max_stats_len: int) -> int:
-    if max_stats_len == _UNBOUNDED_STATS_MAX_LEN:
-        return _UNBOUNDED_STATS_MAX_LEN
-    return max(max_stats_len, 1)
-
-
 def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
@@ -363,8 +357,7 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
-        self.max_stats_len = _normalize_stats_max_len(
-            self.llm_args.max_stats_len)
+        self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
