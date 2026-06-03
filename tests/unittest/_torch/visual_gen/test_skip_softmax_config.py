@@ -16,6 +16,12 @@ from tensorrt_llm.visual_gen.sparse_attention import (
     apply_skip_softmax_overrides,
 )
 
+
+def _scheduled_prefill_threshold(params):
+    assert params is not None
+    return params.scheduler.get_kernel_params().threshold_scale_factor_prefill
+
+
 # =============================================================================
 # SkipSoftmaxFormula — numexpr expression + named coefficients
 # =============================================================================
@@ -132,7 +138,7 @@ class TestSkipSoftmaxConfigConstruction:
         cfg = AttentionConfig(backend="VANILLA")
         assert cfg.sparse_attention_config is None
 
-    def test_standalone_from_llm_config(self):
+    def test_standalone_config_is_not_llm_config(self):
         cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
         # VG SkipSoftmaxAttentionConfig is intentionally decoupled from the LLM-side
         # SkipSoftmaxAttentionConfig: diffusion pipelines have no prefill/decode
@@ -638,7 +644,7 @@ class TestApplySkipSoftmaxOverrides:
 
         def make_mock_backend():
             mock = MagicMock(spec=TrtllmAttention)
-            mock.sparse_attention_config = None
+            mock.sparse_params = None
             return mock
 
         class MockAttentionModule(nn.Module):
@@ -670,19 +676,11 @@ class TestApplySkipSoftmaxOverrides:
         assert n == 3
 
         # block0: disabled (threshold=0 → None)
-        assert model.block0.attn.sparse_attention_config is None
+        assert model.block0.attn.sparse_params is None
         # block1: default threshold
-        assert model.block1.attn.sparse_attention_config is not None
-        assert (
-            model.block1.attn.sparse_attention_config.to_kernel_params().threshold_scale_factor_prefill
-            == 5000.0
-        )
+        assert _scheduled_prefill_threshold(model.block1.attn.sparse_params) == 5000.0
         # block2: overridden to 8000
-        assert model.block2.attn.sparse_attention_config is not None
-        assert (
-            model.block2.attn.sparse_attention_config.to_kernel_params().threshold_scale_factor_prefill
-            == 8000.0
-        )
+        assert _scheduled_prefill_threshold(model.block2.attn.sparse_params) == 8000.0
 
     def test_overrides_applied_to_compiled_module_names(self):
         from unittest.mock import MagicMock
@@ -695,7 +693,7 @@ class TestApplySkipSoftmaxOverrides:
             def __init__(self):
                 super().__init__()
                 self.attn = MagicMock(spec=TrtllmAttention)
-                self.attn.sparse_attention_config = None
+                self.attn.sparse_params = None
 
         class MockCompiledBlock(nn.Module):
             def __init__(self):
@@ -715,7 +713,7 @@ class TestApplySkipSoftmaxOverrides:
         )
         n = apply_skip_softmax_overrides(model, cfg)
         assert n == 1
-        assert model.blocks[0]._orig_mod.attn1.attn.sparse_attention_config is None
+        assert model.blocks[0]._orig_mod.attn1.attn.sparse_params is None
 
     def test_overrides_applied_to_component_relative_names(self):
         from unittest.mock import MagicMock
@@ -728,7 +726,7 @@ class TestApplySkipSoftmaxOverrides:
             def __init__(self):
                 super().__init__()
                 self.attn = MagicMock(spec=TrtllmAttention)
-                self.attn.sparse_attention_config = None
+                self.attn.sparse_params = None
 
         class MockCompiledBlock(nn.Module):
             def __init__(self):
@@ -754,8 +752,8 @@ class TestApplySkipSoftmaxOverrides:
         )
         n = apply_skip_softmax_overrides(model, cfg)
         assert n == 2
-        assert model.transformer.blocks[0]._orig_mod.attn1.attn.sparse_attention_config is None
-        assert model.transformer_2.blocks[0]._orig_mod.attn1.attn.sparse_attention_config is None
+        assert model.transformer.blocks[0]._orig_mod.attn1.attn.sparse_params is None
+        assert model.transformer_2.blocks[0]._orig_mod.attn1.attn.sparse_params is None
 
     def test_component_configs_apply_distinct_thresholds(self):
         from unittest.mock import MagicMock
@@ -768,7 +766,7 @@ class TestApplySkipSoftmaxOverrides:
             def __init__(self):
                 super().__init__()
                 self.attn = MagicMock(spec=TrtllmAttention)
-                self.attn.sparse_attention_config = None
+                self.attn.sparse_params = None
 
         class MockTransformer(nn.Module):
             def __init__(self):
@@ -802,15 +800,9 @@ class TestApplySkipSoftmaxOverrides:
         )
         n = apply_skip_softmax_overrides(model, cfg)
         assert n == 2
-        assert (
-            model.transformer.blocks[0]
-            .attn.sparse_attention_config.to_kernel_params()
-            .threshold_scale_factor_prefill
-            == pytest.approx(math.exp(-10.0 + 2.0 * 0.5))
-        )
-        assert (
-            model.transformer_2.blocks[0]
-            .attn.sparse_attention_config.to_kernel_params()
-            .threshold_scale_factor_prefill
-            == pytest.approx(math.exp(-20.0 + 4.0 * 0.5))
-        )
+        assert _scheduled_prefill_threshold(
+            model.transformer.blocks[0].attn.sparse_params
+        ) == pytest.approx(math.exp(-10.0 + 2.0 * 0.5))
+        assert _scheduled_prefill_threshold(
+            model.transformer_2.blocks[0].attn.sparse_params
+        ) == pytest.approx(math.exp(-20.0 + 4.0 * 0.5))

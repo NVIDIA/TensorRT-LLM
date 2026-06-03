@@ -194,21 +194,11 @@ class Attention(nn.Module):
             backend_num_heads = self.local_num_attention_heads
             backend_num_kv_heads = self.local_num_key_value_heads
 
-        # Resolve sparse attention config for TRTLLM backend
-        sparse_attention_config = None
+        # Resolve sparse attention params for TRTLLM backend
+        sparse_params = None
         ss_cfg = config.attention.sparse_attention_config
         if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name == "TRTLLM":
-            # Cache the resolved scalar on a private attr (idempotent across
-            # all Attention modules); does NOT mutate the source-of-truth
-            # `threshold_scale_factor` / `target_sparsity` fields. Subsequent
-            # callers — including `apply_skip_softmax_overrides` — read the
-            # cached value via `resolve_threshold(module_name)`.
-            threshold = ss_cfg.get_or_resolve_threshold()
-
-            if threshold is not None and threshold > 0:
-                sparse_attention_config = SkipSoftmaxAttentionConfig(
-                    threshold_scale_factor=threshold
-                )
+            sparse_params = ss_cfg.to_sparse_params()
 
         # Create compute backend
         self.attn = create_attention(
@@ -221,7 +211,7 @@ class Attention(nn.Module):
             dtype=self.dtype,
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
-            sparse_attention_config=sparse_attention_config,
+            sparse_params=sparse_params,
         )
 
         if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:

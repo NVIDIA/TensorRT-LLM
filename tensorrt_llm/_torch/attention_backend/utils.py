@@ -1,11 +1,8 @@
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Optional, Type, Union
 
 import torch
 
 from tensorrt_llm.logger import logger
-
-if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 from ...models.modeling_utils import QuantConfig
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -13,28 +10,40 @@ from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
 from .sparse import (get_flashinfer_sparse_attn_attention_backend,
                      get_trtllm_sparse_attn_attention_backend,
                      get_vanilla_sparse_attn_attention_backend)
+from .sparse.params import SparseParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import \
+        SparseAttentionConfig as LlmSparseAttentionConfig
+    from tensorrt_llm.visual_gen.args import \
+        SparseAttentionConfig as VisualGenSparseAttentionConfig
+
+    SparseAttentionConfig = Union[LlmSparseAttentionConfig,
+                                  VisualGenSparseAttentionConfig]
 
 
 def get_attention_backend(
     backend_name: str,
-    sparse_attn_config: Optional["SparseAttentionConfig"] = None
+    sparse_attention_config: Optional["SparseAttentionConfig"] = None,
 ) -> Type[AttentionBackend]:
     backend_name = backend_name.upper()
     if backend_name == "VANILLA":
-        if sparse_attn_config is not None:
-            return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
+        if sparse_attention_config is not None:
+            return get_vanilla_sparse_attn_attention_backend(
+                sparse_attention_config)
         return VanillaAttention
     elif backend_name == "TRTLLM":
-        if sparse_attn_config is not None:
-            return get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
+        if sparse_attention_config is not None:
+            return get_trtllm_sparse_attn_attention_backend(
+                sparse_attention_config)
         return TrtllmAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
-        if sparse_attn_config is not None:
+        if sparse_attention_config is not None:
             return get_flashinfer_sparse_attn_attention_backend(
-                sparse_attn_config)
+                sparse_attention_config)
         return FlashInferAttention
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
@@ -64,15 +73,19 @@ def create_attention(
     predicted_tokens_per_seq: Optional[int] = 1,
     skip_create_weights_in_init: bool = False,
     attention_chunk_size: Optional[int] = None,
-    sparse_attention_config: Optional["SparseAttentionConfig"] = None,
+    attn_cls: Optional[Type[AttentionBackend]] = None,
+    sparse_params: Optional[SparseParams] = None,
     dtype: Optional[torch.dtype] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
 ):
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
             f"Backend {backend_name} does not support chunked attention.")
+    if sparse_params is not None and attn_cls is None:
+        raise ValueError("attn_cls is required when sparse_params is set.")
 
-    attn_cls = get_attention_backend(backend_name, sparse_attention_config)
+    if attn_cls is None:
+        attn_cls = get_attention_backend(backend_name)
 
     if is_mla_enable:
         assert attn_cls.support_mla(
@@ -92,18 +105,23 @@ def create_attention(
     else:
         mla_params = None
 
-    return attn_cls(
-        layer_idx,
-        num_heads,
-        head_dim,
-        num_kv_heads,
+    kwargs = dict(
         quant_config=quant_config,
         q_scaling=q_scaling,
         pos_embd_params=pos_embd_params,
         mla_params=mla_params,
         skip_create_weights_in_init=skip_create_weights_in_init,
         attention_chunk_size=attention_chunk_size,
-        sparse_attention_config=sparse_attention_config,
         dtype=dtype,
         aux_stream=aux_stream,
+    )
+    if sparse_params is not None:
+        kwargs["sparse_params"] = sparse_params
+
+    return attn_cls(
+        layer_idx,
+        num_heads,
+        head_dim,
+        num_kv_heads,
+        **kwargs,
     )

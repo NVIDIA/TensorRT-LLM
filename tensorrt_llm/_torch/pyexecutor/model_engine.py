@@ -26,6 +26,7 @@ from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig,
                                           EncodeCudaGraphConfig,
+                                          SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -484,7 +485,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_backend = get_attention_backend(
             self.llm_args.attn_backend,
-            sparse_attn_config=self.sparse_attention_config)
+            sparse_attention_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
@@ -1260,8 +1261,8 @@ class PyTorchModelEngine(ModelEngine):
             effective_max_seq_len = self.max_seq_len // self.mapping.cp_size
 
         sparse_config = self.sparse_attention_config
-        if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(
-        ):
+        if (isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
+                and sparse_config.needs_separate_short_long_cuda_graphs()):
             # For short sequences, use the (seq_len_threshold - max_draft_len - 1) as the maximum sequence length
             # to make sure all of the past and current input tokens are within the sequence length threshold.
             # For long sequences, use the default maximum sequence length.
@@ -1662,11 +1663,17 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
+        metadata_cls = self.attn_backend.Metadata
+        sparse_metadata_params = (
+            self.sparse_attention_config.to_sparse_metadata_params(
+                pretrained_config=config)
+            if self.sparse_attention_config is not None else None)
+
         if kv_cache_manager is None:
             # Cache the no-cache metadata.
             if self.encoder_attn_metadata is not None:
                 return self.encoder_attn_metadata
-            self.encoder_attn_metadata = self.attn_backend.Metadata(
+            metadata_kwargs = dict(
                 max_num_requests=self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 max_num_sequences=self.batch_size * self.max_beam_width,
@@ -1677,8 +1684,9 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
-                sparse_attention_config=self.sparse_attention_config,
-                num_heads_per_kv=num_heads_per_kv)
+                num_heads_per_kv=num_heads_per_kv,
+                sparse_metadata_params=sparse_metadata_params)
+            self.encoder_attn_metadata = metadata_cls(**metadata_kwargs)
             self.encoder_attn_metadata.block_ids_per_seq = None
             self.encoder_attn_metadata.kv_block_ids_per_seq = None
             return self.encoder_attn_metadata
@@ -1689,7 +1697,7 @@ class PyTorchModelEngine(ModelEngine):
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
 
-        self.attn_metadata = self.attn_backend.Metadata(
+        metadata_kwargs = dict(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=self.batch_size * self.max_beam_width,
@@ -1700,9 +1708,10 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,
-            sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
+            sparse_metadata_params=sparse_metadata_params,
         )
+        self.attn_metadata = metadata_cls(**metadata_kwargs)
 
         return self.attn_metadata
 

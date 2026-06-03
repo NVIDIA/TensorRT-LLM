@@ -24,7 +24,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams, SparsePrediction,
                         merge_attention_forward_args)
-from .sparse.skip_softmax import SkipSoftmaxKernelParams
+from .sparse.params import SparseParams
+from .sparse.skip_softmax import SkipSoftmaxKernelParams, SkipSoftmaxParams
 
 # Enable TRTLLM-Gen attention backend by default. Set
 # TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
@@ -1131,6 +1132,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_params: Optional[MLAParams] = None,
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
+        sparse_params: Optional[SparseParams] = None,
         **kwargs,
     ):
         """
@@ -1149,6 +1151,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
+        self.sparse_params = sparse_params
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
@@ -1408,15 +1411,25 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def get_skip_softmax_kernel_params(
             self) -> Optional[SkipSoftmaxKernelParams]:
-        """Skip-softmax kernel params from the config, or ``None`` otherwise.
-
-        A method, not a property: ``sparse_attention_config`` can change after
-        construction (VG swaps it per layer), so this is recomputed per call.
-        """
-        cfg = self.sparse_attention_config
-        if getattr(cfg, 'algorithm', None) != 'skip_softmax':
+        """Skip-softmax kernel params from the layer scheduler."""
+        params = self.sparse_params
+        if not isinstance(params, SkipSoftmaxParams):
             return None
-        return cfg.to_kernel_params()
+        return params.scheduler.get_kernel_params()
+
+    @property
+    def skip_softmax_threshold_scale_factor_prefill(self) -> float:
+        params = self.get_skip_softmax_kernel_params()
+        if params is None:
+            return 0.0
+        return params.threshold_scale_factor_prefill
+
+    @property
+    def skip_softmax_threshold_scale_factor_decode(self) -> float:
+        params = self.get_skip_softmax_kernel_params()
+        if params is None:
+            return 0.0
+        return params.threshold_scale_factor_decode
 
     def _get_trtllm_gen_backend(
             self) -> trtllm_gen.FlashInferTrtllmGenAttention:
@@ -1668,10 +1681,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 v_head_dim=self.v_head_dim,
                 rope_append=self.rope_append,
                 attention_chunk_size=self.attention_chunk_size,
-                skip_softmax_threshold_scale_factor_prefill=forward_args.
-                skip_softmax_kernel_params.threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode=forward_args.
-                skip_softmax_kernel_params.threshold_scale_factor_decode,
+                skip_softmax_threshold_scale_factor_prefill=self.
+                skip_softmax_threshold_scale_factor_prefill,
+                skip_softmax_threshold_scale_factor_decode=self.
+                skip_softmax_threshold_scale_factor_decode,
                 skip_softmax_stat=self.skip_softmax_stat,
 
                 # --- Sparse-specific (AttentionForwardArgs.sparse_prediction) ---
@@ -1726,8 +1739,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
         # Force paged context FMHA so QKV preprocessing writes Q to q_buf_2_.
-        if (self.sparse_attention_config is not None and getattr(
-                self.sparse_attention_config, 'algorithm', None) == 'mqa_gqa'):
+        if (self.sparse_params is not None and getattr(
+                self.sparse_params, 'algorithm', None) == 'mqa_gqa'):
             metadata.use_paged_context_fmha = True
 
         if self.is_mla_enable:
@@ -1756,10 +1769,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                    and k is not None and v is not None)
 
         # RocketKV and DSA predict which blocks to keep, so build their sparse
-        # index tensors here. Skip-softmax needs no prediction; its thresholds
-        # are filled in below.
-        algorithm = getattr(self.sparse_attention_config, 'algorithm', None)
-        if algorithm is not None and algorithm != 'skip_softmax':
+        # index tensors here. Skip-softmax needs no prediction.
+        sparse_params = self.sparse_params
+        if (sparse_params is not None
+                and not isinstance(sparse_params, SkipSoftmaxParams)):
             kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
                                                     forward_args)
             at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
@@ -1769,17 +1782,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_kv_offsets=kv_off,
                 sparse_attn_indices=at_idx,
                 sparse_attn_offsets=at_off,
-                sparse_attn_indices_block_size=self.sparse_attention_config.
-                get_indices_block_size(),
+                sparse_attn_indices_block_size=sparse_params.indices_block_size,
             )
-
-        # Keep the kernel params (on ``forward_args``) separate from the
-        # ``sparse_attention_config`` (on ``self``) on purpose: today this just
-        # mirrors it, but the split leaves room for added logic here later,
-        # e.g. per-step threshold adjustment.
-        config_params = self.get_skip_softmax_kernel_params()
-        if config_params is not None:
-            forward_args.skip_softmax_kernel_params = config_params
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger

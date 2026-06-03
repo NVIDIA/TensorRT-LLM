@@ -24,14 +24,16 @@ kernel-facing :class:`SkipSoftmaxKernelParams` carrier that the shared
 pipelines.
 """
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Literal, Optional, Union
 
 import numexpr
 from pydantic import ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
+
+from .params import SparseParams
 
 _RESERVED_FORMULA_KEYS = frozenset({"formula", "target_sparsity"})
 
@@ -90,70 +92,50 @@ class SkipSoftmaxFormula(StrictBaseModel):
         )
         return float(result.item())
 
+    @classmethod
+    def parse_from_dict(
+        cls,
+        data: Optional[Dict[str, Any]],
+        *,
+        formula: Optional[str] = None,
+    ) -> Optional["SkipSoftmaxFormula"]:
+        """Build a formula from a coefficient dict plus a formula string."""
+        if not isinstance(data, dict):
+            return None
+        coefficients = {k: v for k, v in data.items() if k not in _RESERVED_FORMULA_KEYS}
+        if not formula:
+            nested = data.get("formula")
+            if isinstance(nested, str) and nested.strip():
+                formula = nested
+        if not formula or not coefficients:
+            return None
+        return cls(
+            formula=formula,
+            coefficients={k: float(v) for k, v in coefficients.items()},
+        )
 
-def parse_skip_softmax_formula_from_dict(
-    data: Optional[Dict[str, Any]],
-    *,
-    formula: Optional[str] = None,
-) -> Optional[SkipSoftmaxFormula]:
-    """Build a :class:`SkipSoftmaxFormula` from a coefficient dict + formula string.
-
-    ``formula`` may be passed explicitly or carried inside ``data``
-    under a ``formula`` key. It is required — there is no synthesized
-    fallback. Returns ``None`` when the block is *absent* (``data`` is
-    not a dict, or no formula / no coefficients). A block that *is*
-    present but malformed (un-parseable formula, missing coefficients)
-    raises from :class:`SkipSoftmaxFormula` validation rather than being
-    silently dropped. The reserved keys ``formula``/``target_sparsity``
-    are not treated as coefficients.
-    """
-    if not isinstance(data, dict):
-        return None
-    coefficients = {k: v for k, v in data.items() if k not in _RESERVED_FORMULA_KEYS}
-    if not formula:
-        nested = data.get("formula")
-        if isinstance(nested, str) and nested.strip():
-            formula = nested
-    if not formula or not coefficients:
-        return None
-    return SkipSoftmaxFormula(
-        formula=formula,
-        coefficients={k: float(v) for k, v in coefficients.items()},
-    )
-
-
-def parse_skip_softmax_formula_from_ckpt_config(
-    checkpoint_config: Dict[str, Any],
-    *,
-    coefficient_key: str = "prefill",
-) -> Optional[SkipSoftmaxFormula]:
-    """Lift the calibration formula out of a HuggingFace ``config.json`` dict.
-
-    Reads ``sparse_attention_config.threshold_scale_factor`` (the
-    ``formula`` string plus coefficients under ``coefficient_key``).
-    ``coefficient_key`` defaults to ``"prefill"`` (LLM convention);
-    pipelines without a prefill/decode split (e.g. visual generation)
-    pass a phase-neutral key like ``"coefficients"``. Returns ``None``
-    when the block is absent; a present-but-malformed block raises (see
-    :func:`parse_skip_softmax_formula_from_dict`).
-    """
-    sparse_cfg = checkpoint_config.get("sparse_attention_config")
-    if not isinstance(sparse_cfg, dict):
-        return None
-    tsf = sparse_cfg.get("threshold_scale_factor")
-    if not isinstance(tsf, dict):
-        return None
-    return parse_skip_softmax_formula_from_dict(
-        tsf.get(coefficient_key), formula=tsf.get("formula")
-    )
+    @classmethod
+    def parse_from_ckpt_config(
+        cls,
+        checkpoint_config: Dict[str, Any],
+        *,
+        coefficient_key: str = "prefill",
+    ) -> Optional["SkipSoftmaxFormula"]:
+        """Lift the calibration formula out of a HuggingFace config dict."""
+        sparse_cfg = checkpoint_config.get("sparse_attention_config")
+        if not isinstance(sparse_cfg, dict):
+            return None
+        tsf = sparse_cfg.get("threshold_scale_factor")
+        if not isinstance(tsf, dict):
+            return None
+        return cls.parse_from_dict(tsf.get(coefficient_key), formula=tsf.get("formula"))
 
 
 @dataclass
 class SkipSoftmaxKernelParams:
     """Skip-softmax thresholds for the attention backend.
 
-    The LLM and visual-generation ``SkipSoftmaxAttentionConfig`` classes
-    produce this via ``to_kernel_params()``.
+    ``SkipSoftmaxScheduler`` produces this per runtime step.
     """
 
     # The kernel divides this by the context length to get the skip threshold;
@@ -162,3 +144,116 @@ class SkipSoftmaxKernelParams:
     # Only autoregressive (LLM) decoding has a decode phase; diffusion and
     # visual generation leave this at zero.
     threshold_scale_factor_decode: float = 0.0
+
+
+class SkipSoftmaxScheduler:
+    """Layer runtime scheduler for skip-softmax kernel thresholds."""
+
+    def __init__(
+        self,
+        threshold_scale_factor_prefill: float = 0.0,
+        threshold_scale_factor_decode: float = 0.0,
+        warmup: Optional[int] = None,
+    ):
+        self.threshold_scale_factor_prefill = threshold_scale_factor_prefill
+        self.threshold_scale_factor_decode = threshold_scale_factor_decode
+        self.warmup = warmup
+
+    @staticmethod
+    def _phase(
+        value: Optional[Union[float, Dict[str, float]]],
+        phase: str,
+    ) -> Optional[float]:
+        if isinstance(value, dict):
+            return value.get(phase, None)
+        return value
+
+    @staticmethod
+    def _threshold_scale_factor_config(
+        checkpoint_config: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(checkpoint_config, dict):
+            return None
+        if "threshold_scale_factor" in checkpoint_config:
+            tsf = checkpoint_config.get("threshold_scale_factor")
+            return tsf if isinstance(tsf, dict) else None
+        sparse_cfg = checkpoint_config.get("sparse_attention_config")
+        if not isinstance(sparse_cfg, dict):
+            return None
+        tsf = sparse_cfg.get("threshold_scale_factor")
+        return tsf if isinstance(tsf, dict) else None
+
+    @classmethod
+    def from_threshold_scale_factor(
+        cls,
+        threshold_scale_factor: Optional[Union[float, Dict[str, float]]],
+        *,
+        warmup: Optional[int] = None,
+    ) -> "SkipSoftmaxScheduler":
+        prefill = cls._phase(threshold_scale_factor, "prefill")
+        decode = cls._phase(threshold_scale_factor, "decode")
+        return cls(
+            threshold_scale_factor_prefill=0.0 if prefill is None else prefill,
+            threshold_scale_factor_decode=0.0 if decode is None else decode,
+            warmup=warmup,
+        )
+
+    @classmethod
+    def from_target_sparsity(
+        cls,
+        target_sparsity: Optional[Union[float, Dict[str, float]]],
+        *,
+        checkpoint_config: Optional[Dict[str, Any]] = None,
+        warmup: Optional[int] = None,
+    ) -> "SkipSoftmaxScheduler":
+        """Build a scheduler by resolving target sparsity through checkpoint formula."""
+        if target_sparsity is None:
+            return cls(warmup=warmup)
+
+        threshold_config = cls._threshold_scale_factor_config(checkpoint_config)
+        shared_formula = (
+            threshold_config.get("formula") if isinstance(threshold_config, dict) else None
+        )
+
+        def _compute(phase: str, sparsity: Optional[float]) -> Optional[float]:
+            if sparsity is None:
+                return None
+            if threshold_config is None:
+                phase_formula = None
+            else:
+                phase_formula = SkipSoftmaxFormula.parse_from_dict(
+                    threshold_config.get(phase), formula=shared_formula
+                )
+            if phase_formula is None:
+                raise ValueError(
+                    f"SkipSoftmaxAttentionConfig: config.json must carry a "
+                    f"top-level 'formula' string and a '{phase}' coefficient "
+                    f"dictionary under sparse_attention_config.threshold_scale_factor "
+                    f"to resolve target_sparsity."
+                )
+            return phase_formula.compute_threshold_scale_factor(sparsity)
+
+        prefill = _compute("prefill", cls._phase(target_sparsity, "prefill"))
+        decode = _compute("decode", cls._phase(target_sparsity, "decode"))
+        return cls(
+            threshold_scale_factor_prefill=0.0 if prefill is None else prefill,
+            threshold_scale_factor_decode=0.0 if decode is None else decode,
+            warmup=warmup,
+        )
+
+    def get_kernel_params(self, *, step: Optional[int] = None):
+        """Return kernel params for the current runtime step."""
+        if self.warmup is not None and step is not None and step < self.warmup:
+            return SkipSoftmaxKernelParams()
+        return SkipSoftmaxKernelParams(
+            threshold_scale_factor_prefill=self.threshold_scale_factor_prefill,
+            threshold_scale_factor_decode=self.threshold_scale_factor_decode,
+        )
+
+
+@dataclass(frozen=True)
+class SkipSoftmaxParams(SparseParams):
+    """Skip-softmax backend parameters."""
+
+    algorithm: Literal["skip_softmax"] = field(init=False, default="skip_softmax")
+    scheduler: SkipSoftmaxScheduler = field(default_factory=SkipSoftmaxScheduler)

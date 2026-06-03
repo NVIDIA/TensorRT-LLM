@@ -46,6 +46,16 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     algorithm: str
 
+    def to_sparse_params(self, **kwargs):
+        """Lower user-facing config into SparseParams."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement SparseParams lowering."
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        """Lower user-facing config into SparseMetadataParams."""
+        return None
+
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """SkipSoftmax sparse attention configuration for visual generation.
@@ -141,20 +151,23 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             }
         return merged
 
-    def to_kernel_params(self):
-        """Resolve to the kernel-facing ``SkipSoftmaxKernelParams``.
-
-        Visual generation has no decode phase: the resolved scalar
-        threshold is the prefill value and decode stays 0.
-        """
+    def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-            SkipSoftmaxKernelParams,
+            SkipSoftmaxParams,
+            SkipSoftmaxScheduler,
         )
 
-        return SkipSoftmaxKernelParams(
-            threshold_scale_factor_prefill=self.threshold_scale_factor,
-            threshold_scale_factor_decode=0.0,
+        module_name = kwargs.get("module_name", None)
+        checkpoint_formula = kwargs.get("checkpoint_formula", None)
+        threshold = (
+            self.resolve_threshold(module_name)
+            if module_name is not None
+            else self.get_or_resolve_threshold(checkpoint_formula)
         )
+        if threshold is None or threshold <= 0:
+            return None
+        scheduler = SkipSoftmaxScheduler.from_threshold_scale_factor(threshold, warmup=self.warmup)
+        return SkipSoftmaxParams(scheduler=scheduler)
 
     def get_or_resolve_threshold(
         self,
@@ -237,13 +250,11 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if sparsity is None:
             return None
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-            parse_skip_softmax_formula_from_dict,
-        )
+        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxFormula
 
         formula = self._formula
         if formula is None and checkpoint_formula is not None:
-            formula = parse_skip_softmax_formula_from_dict(checkpoint_formula)
+            formula = SkipSoftmaxFormula.parse_from_dict(checkpoint_formula)
         if formula is None:
             raise ValueError(
                 "SkipSoftmaxAttentionConfig: target_sparsity requires calibration formula "
@@ -262,9 +273,7 @@ def _load_sparse_config_group_container(
     if not isinstance(config_groups, dict):
         return None
 
-    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-        parse_skip_softmax_formula_from_dict,
-    )
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxFormula
 
     for group in config_groups.values():
         if not isinstance(group, dict) or group.get("sparse_algo") != "softmax_skip":
@@ -273,7 +282,7 @@ def _load_sparse_config_group_container(
         tsf = group.get("threshold_scale_factor", {})
         coefficients = tsf.get("coefficients") if isinstance(tsf, dict) else None
         formula_str = tsf.get("formula") if isinstance(tsf, dict) else None
-        formula = parse_skip_softmax_formula_from_dict(coefficients, formula=formula_str)
+        formula = SkipSoftmaxFormula.parse_from_dict(coefficients, formula=formula_str)
         if formula is None:
             continue
 
@@ -344,11 +353,9 @@ def auto_detect_sparse_attention_config(
     ``sparse_attention_config.threshold_scale_factor`` (diffusion has
     no prefill / decode distinction).
     """
-    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-        parse_skip_softmax_formula_from_ckpt_config,
-    )
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxFormula
 
-    formula = parse_skip_softmax_formula_from_ckpt_config(
+    formula = SkipSoftmaxFormula.parse_from_ckpt_config(
         checkpoint_config, coefficient_key="coefficients"
     )
     if formula is None:
@@ -361,10 +368,8 @@ def apply_skip_softmax_overrides(
 ) -> int:
     """Apply component-specific skip-softmax calibration to constructed TRTLLM backends.
 
-    For each attention backend VG stores a per-layer
-    :class:`SkipSoftmaxAttentionConfig` carrying that layer's resolved
-    threshold (or ``None`` to disable). The backend later converts it
-    via ``to_kernel_params()``.
+    For each attention backend VG stores per-layer skip-softmax params carrying
+    that layer's resolved threshold, or ``None`` to disable the layer.
     """
     if skip_softmax._layer_overrides is None and skip_softmax._component_configs is None:
         return 0
@@ -383,12 +388,14 @@ def apply_skip_softmax_overrides(
             targets.append(inner)
 
         for target in targets:
-            if threshold is not None:
-                target.sparse_attention_config = SkipSoftmaxAttentionConfig(
-                    threshold_scale_factor=threshold
-                )
-            else:
-                target.sparse_attention_config = None
+            target.sparse_params = (
+                SkipSoftmaxAttentionConfig(
+                    threshold_scale_factor=threshold,
+                    warmup=skip_softmax.warmup,
+                ).to_sparse_params()
+                if threshold is not None
+                else None
+            )
             modified += 1
 
     return modified
