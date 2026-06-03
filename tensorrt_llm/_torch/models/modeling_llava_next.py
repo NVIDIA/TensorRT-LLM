@@ -1,5 +1,4 @@
 import copy
-import os
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -15,6 +14,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
 
@@ -33,8 +33,6 @@ from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_attached_multimodal_embeddings,
                                         get_multimodal_embeddings)
 from .modeling_utils import register_auto_model, register_vision_encoder
-
-DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
 class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
@@ -631,7 +629,7 @@ class LlavaNextModel(PreTrainedModel):
         super().__init__(config)
         if hasattr(self, "llm"):
             return
-        if not DISAGG:
+        if not _is_mm_disagg():
             self.mm_encoder = LlavaNextVisionModel(model_config)
         else:
             self.mm_encoder = None
@@ -706,7 +704,7 @@ class LlavaNextModel(PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
         if len(multimodal_params) > 0:
-            if not DISAGG:
+            if self.mm_encoder is not None:
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=multimodal_params[:num_context_requests])

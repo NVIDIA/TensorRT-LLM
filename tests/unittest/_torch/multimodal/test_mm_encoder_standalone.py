@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 import pytest
 import torch
@@ -64,6 +64,7 @@ def _create_llm(
     model_dir: Path,
     pd_disagg: bool,
     disable_overlap_scheduler: bool = False,
+    env_overrides: Optional[dict[str, str]] = None,
 ) -> LLM:
     cache_transceiver_cfg = CacheTransceiverConfig(
         backend="DEFAULT", max_tokens_in_buffer=10240) if pd_disagg else None
@@ -71,6 +72,9 @@ def _create_llm(
         enable_block_reuse=False,  # Disable for output 1:1 matching check
         free_gpu_memory_fraction=0.2,
     )
+    # env_overrides is applied inside the spawned executor worker (see
+    # executor/worker.py), so it is the only reliable way to override
+    # TLLM_MULTIMODAL_DISAGGREGATED=1 -> mm_encoder=None -> consumes handed-off embeddings.
     return LLM(
         model=model_dir,
         backend='pytorch',
@@ -80,6 +84,7 @@ def _create_llm(
         cache_transceiver_config=cache_transceiver_cfg,
         disable_overlap_scheduler=disable_overlap_scheduler,
         max_batch_size=1,  # fix batch size to reduce non-determinism in tests
+        env_overrides=env_overrides,
         **_get_fake_checkpoint_kwargs(model_dir),
     )
 
@@ -780,6 +785,7 @@ def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
 
 @pytest.mark.threadleak(enabled=False)
 def test_single_request_chat_multiple_images(
+    model_dir: Path,
     pd_disagg: bool,
     llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
 ):
@@ -787,8 +793,13 @@ def test_single_request_chat_multiple_images(
 
     This test verifies that encoder (pass mm_embeddings) + LLM API produces identical
     results to standard llm generation (pass raw image) by comparing outputs.
+
+    The disaggregated prefill is driven by a dedicated LLM built as a real E/P
+    prefill worker (TLLM_MULTIMODAL_DISAGGREGATED=1 -> mm_encoder=None), so the
+    prefill forward must consume the handed-off embeddings via the encoder-less
+    path. The fixture's encoder-loaded LLM is used only for the raw reference
     """
-    (llm, llm_decode), encoder = llms_and_encoder
+    (ref_llm, llm_decode), encoder = llms_and_encoder
 
     # Test configuration
     max_tokens = 64
@@ -801,10 +812,10 @@ def test_single_request_chat_multiple_images(
     sampling_params = SamplingParams(max_tokens=max_tokens)
 
     # Prepare multimodal inputs
-    inputs = _load_inputs(llm, prompts, media)
+    inputs = _load_inputs(ref_llm, prompts, media)
 
-    # Generate reference output with raw multimodal inputs
-    outputs_ref = llm.generate(inputs, sampling_params=sampling_params)
+    # Generate reference output with raw multimodal inputs (encoder-loaded path).
+    outputs_ref = ref_llm.generate(inputs, sampling_params=sampling_params)
 
     # Validate reference outputs
     assert outputs_ref is not None, "Reference generation returned None"
@@ -816,41 +827,49 @@ def test_single_request_chat_multiple_images(
             output.outputs
         ) > 0, f"Reference generation has no output text for input {i}"
 
-    # Prepare inputs for llm (pass mm_embeddings)
     # Process multimodal data using encoder (pass mm_embeddings)
     encoder_outputs = encoder.generate(inputs)
 
-    # Generate output using llm (pass mm_embeddings)
     ep_disaggregated_params = encoder_outputs[0].disaggregated_params
 
     assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
     ep_disaggregated_params.request_type = "context_and_generation" if not pd_disagg else "context_only"
 
-    outputs = llm.generate(inputs,
-                           sampling_params=sampling_params,
-                           disaggregated_params=ep_disaggregated_params)
-
-    if pd_disagg:
-        # Generation using llm_decode
-        assert len(outputs) == 1
-        pd_disaggregated_params = outputs[0].disaggregated_params
-
-        ep_handle = ep_disaggregated_params.mrope_position_ids_handle
-        pd_handle = pd_disaggregated_params.mrope_position_ids_handle
-        assert type(ep_handle) is type(pd_handle)
-        if ep_handle is not None:
-            _assert_handles_are_different(ep_handle, pd_handle)
-        pd_disaggregated_params.request_type = "generation_only"
-        sampling_params = SamplingParams(max_tokens=max_tokens)
-        # remove multimodal data from input as decoder worker doesn't need it
-        inputs[0]['multi_modal_data'] = None
-        # use prompt token ids from encoder output
-        inputs[0]['prompt_token_ids'] = outputs[0].prompt_token_ids
-
-        outputs = llm_decode.generate(
+    # Real E/P prefill worker: no local encoder, so forward() must consume the
+    # handed-off embeddings (get_attached_multimodal_embeddings) -- the path real
+    # serving uses, which the encoder-loaded fixture LLM would otherwise mask.
+    prefill_llm = _create_llm(
+        model_dir,
+        pd_disagg,
+        disable_overlap_scheduler=pd_disagg,
+        env_overrides={"TLLM_MULTIMODAL_DISAGGREGATED": "1"})
+    with prefill_llm:
+        outputs = prefill_llm.generate(
             inputs,
             sampling_params=sampling_params,
-            disaggregated_params=pd_disaggregated_params)
+            disaggregated_params=ep_disaggregated_params)
+
+        if pd_disagg:
+            # Generation using llm_decode
+            assert len(outputs) == 1
+            pd_disaggregated_params = outputs[0].disaggregated_params
+
+            ep_handle = ep_disaggregated_params.mrope_position_ids_handle
+            pd_handle = pd_disaggregated_params.mrope_position_ids_handle
+            assert type(ep_handle) is type(pd_handle)
+            if ep_handle is not None:
+                _assert_handles_are_different(ep_handle, pd_handle)
+            pd_disaggregated_params.request_type = "generation_only"
+            sampling_params = SamplingParams(max_tokens=max_tokens)
+            # remove multimodal data from input as decoder worker doesn't need it
+            inputs[0]['multi_modal_data'] = None
+            # use prompt token ids from encoder output
+            inputs[0]['prompt_token_ids'] = outputs[0].prompt_token_ids
+
+            outputs = llm_decode.generate(
+                inputs,
+                sampling_params=sampling_params,
+                disaggregated_params=pd_disaggregated_params)
 
     # Validate outputs
     assert len(outputs) == len(
