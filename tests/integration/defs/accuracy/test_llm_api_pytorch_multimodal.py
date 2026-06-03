@@ -251,6 +251,7 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=enable_chunked_prefill,
             max_num_tokens=max_num_tokens,
             kv_cache_config=self.kv_cache_config,
+            trust_remote_code=True,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(
