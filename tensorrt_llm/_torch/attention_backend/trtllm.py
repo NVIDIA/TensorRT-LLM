@@ -26,7 +26,6 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionSparseArgs, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams, merge_attention_forward_args)
-from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend by default. Set
 # TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
@@ -1673,7 +1672,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_offsets=forward_args.sparse.sparse_attn_offsets,
                 sparse_attn_indices_block_size=forward_args.sparse.
                 sparse_attn_indices_block_size,
-
                 sparse_mla_topk_lens=forward_args.sparse.sparse_mla_topk_lens,
                 compressed_kv_cache_pool_ptr=forward_args.sparse.
                 compressed_kv_cache_pool_ptr,

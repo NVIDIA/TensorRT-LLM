@@ -43,6 +43,16 @@ def test_load_agent_success():
 
 @pytest.mark.parametrize("use_py_nixl", ["0", "1"])
 def test_run_with_different_env(use_py_nixl):
+    if use_py_nixl == "1":
+        try:
+            __import__(
+                "tensorrt_llm._torch.disaggregation.nixl._agent_py",
+                fromlist=["NixlTransferAgent", "NixlTransferStatus"],
+                level=0,
+            )
+        except ImportError as e:
+            pytest.skip(f"pure Python NIXL agent is unavailable: {e}")
+
     os.environ["TRTLLM_USE_PY_NIXL_KVCACHE"] = use_py_nixl
     print(f"Running tests with TRTLLM_USE_PY_NIXL_KVCACHE={use_py_nixl}")
 

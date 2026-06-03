@@ -1264,16 +1264,22 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
-@pytest.mark.parametrize("backend", [
-    "deepgemm",
-    pytest.param(
-        "dsl",
-        marks=pytest.mark.skipif(
-            get_sm_version() not in (100, 103),
-            reason=(f"CuTe DSL FP4 Paged MQA Logits only supports SM 100/103, "
-                    f"got SM {get_sm_version()}"),
-        )),
-])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "deepgemm",
+        pytest.param(
+            "dsl",
+            marks=pytest.mark.skipif(
+                get_sm_version() not in (100, 103),
+                reason=(
+                    f"CuTe DSL FP4 Paged MQA Logits only supports SM 100/103, "
+                    f"got SM {get_sm_version()}"
+                ),
+            ),
+        ),
+    ],
+)
 def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     """FP4 indexer paged decode test (DeepGEMM + CuTe DSL backends).
 
@@ -1301,13 +1307,21 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     # gran_k=32, use_packed_ue8m0=True) is asserted by
     # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm, so
     # cast_back_from_fp4 can decode fused_cat_fp4's outputs directly.
-    from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
+    from _torch.attention.sparse.test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import \
-        _pick_dsl_expand
     from tensorrt_llm.deep_gemm import fp8_fp4_paged_mqa_logits
 
+    def _pick_dsl_expand(next_n, *, kernel_atoms, **kwargs):
+        if next_n in kernel_atoms:
+            return 1, next_n
+        for factor in range(2, next_n + 1):
+            if next_n % factor == 0 and next_n // factor in kernel_atoms:
+                return factor, next_n // factor
+        return next_n, 1
+
     use_dsl = backend == "dsl"
+    if use_dsl and not hasattr(torch.ops.trtllm, "cute_dsl_fp4_paged_mqa_logits"):
+        pytest.skip("cute_dsl_fp4_paged_mqa_logits op is not available")
 
     torch.manual_seed(123)
     random.seed(123)
@@ -1322,17 +1336,17 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     layer_idx = 0
 
     # Generate variable context lengths per sequence
-    context_lens_context = torch.randint(int(0.7 * avg_context_len),
-                                         int(1.4 * avg_context_len),
-                                         (batch_size, ),
-                                         dtype=torch.int32,
-                                         device="cpu")
+    context_lens_context = torch.randint(
+        int(0.7 * avg_context_len),
+        int(1.4 * avg_context_len),
+        (batch_size,),
+        dtype=torch.int32,
+        device="cpu",
+    )
     final_lens = context_lens_context + num_gen_tokens
 
     print("\n=== Test Config (FP4) ===")
-    print(
-        f"  Batch: {batch_size}, Next_N: {next_n}, Heads: {heads}, Head_dim: {head_dim}"
-    )
+    print(f"  Batch: {batch_size}, Next_N: {next_n}, Heads: {heads}, Head_dim: {head_dim}")
     print(f"  Context lengths: {context_lens_context.tolist()}")
     print(f"  Final lengths: {final_lens.tolist()}")
 
@@ -1348,24 +1362,19 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
 
     request_ids = list(range(batch_size))
-    cache_manager.add_dummy_requests(request_ids=request_ids,
-                                     token_nums=final_lens.tolist(),
-                                     is_gen=False,
-                                     prepare_resource=True)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False, prepare_resource=True
+    )
 
     total_context_tokens = context_lens_context.sum().item()
-    q = torch.randn((batch_size, next_n, heads, head_dim),
-                    device="cuda",
-                    dtype=torch.bfloat16)
-    weights = torch.randn((batch_size * next_n, heads),
-                          device="cuda",
-                          dtype=torch.float32)
-    k_context_bf16 = torch.randn((total_context_tokens, head_dim),
-                                 device="cuda",
-                                 dtype=torch.bfloat16)
-    k_gen_bf16 = torch.randn((batch_size * num_gen_tokens, head_dim),
-                             device="cuda",
-                             dtype=torch.bfloat16)
+    q = torch.randn((batch_size, next_n, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((batch_size * next_n, heads), device="cuda", dtype=torch.float32)
+    k_context_bf16 = torch.randn(
+        (total_context_tokens, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k_gen_bf16 = torch.randn(
+        (batch_size * num_gen_tokens, head_dim), device="cuda", dtype=torch.bfloat16
+    )
 
     def _force_direct_path(meta):
         """Reconfigure mock metadata so Indexer.prepare populates the direct
@@ -1383,7 +1392,8 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         """
         meta.use_expanded_buffers_for_mtp = False
         meta.scheduler_metadata_buffer_full_next_n = torch.zeros(
-            (meta.num_sms + 1, 2), device='cuda', dtype=torch.int32)
+            (meta.num_sms + 1, 2), device="cuda", dtype=torch.int32
+        )
 
     def _force_dsl_expand_setup(meta):
         """Mirror DSAtrtllmAttentionMetadata.prepare's `expand_for_dsl`
@@ -1401,7 +1411,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         next_n = 1 + meta.max_draft_tokens
         # FP4 kernel supports atoms ∈ {1, 2, 3}; matches dsa.py's
         # `kernel_atoms = (1, 2, 3) if use_fp4 else (1, 2, 3, 4)` path.
-        gen_kv_lens = meta.kv_lens[meta.num_contexts:meta.num_seqs]
+        gen_kv_lens = meta.kv_lens[meta.num_contexts : meta.num_seqs]
         max_ctx = int(gen_kv_lens.max().item()) if gen_kv_lens.numel() else 0
         factor, atom = _pick_dsl_expand(
             next_n,
@@ -1419,16 +1429,20 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(factor)
         meta.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
         meta.kv_lens_expanded_cuda[:num_tokens].copy_(
-            meta.kv_lens_expanded_host[:num_tokens], non_blocking=True)
+            meta.kv_lens_expanded_host[:num_tokens], non_blocking=True
+        )
         # block_table: repeat each row `factor` times.
         max_len = meta.host_indexer_k_cache_block_offsets.shape[1]
         gen_block_tensor = meta.host_indexer_k_cache_block_offsets[
-            meta.num_contexts:meta.num_seqs, :max_len]
+            meta.num_contexts : meta.num_seqs, :max_len
+        ]
         expanded_blocks = gen_block_tensor.repeat_interleave(factor, dim=0)
         meta.host_block_table_expanded[:num_tokens, :max_len].copy_(
-            expanded_blocks, non_blocking=True)
+            expanded_blocks, non_blocking=True
+        )
         meta.block_table_expanded[:num_tokens].copy_(
-            meta.host_block_table_expanded[:num_tokens], non_blocking=True)
+            meta.host_block_table_expanded[:num_tokens], non_blocking=True
+        )
         meta.block_table_expanded.clamp_(min=0)
 
     # ---- Phase 1: write context tokens as FP4 ----
@@ -1467,9 +1481,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         batch_size,
         num_contexts=0,
         num_generations=batch_size,
-        seq_lens=torch.tensor([num_gen_tokens] * batch_size,
-                              dtype=torch.int32,
-                              device='cpu'),
+        seq_lens=torch.tensor([num_gen_tokens] * batch_size, dtype=torch.int32, device="cpu"),
         kv_lens=final_lens.clone(),
         num_cached_tokens=context_lens_context.tolist(),
         cache_manager=cache_manager,
@@ -1492,8 +1504,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         k_gen_bf16[:, pe_dim:].contiguous(),
     )
     indexer._update_k_cache(k_gen_fp4, k_gen_scale, metadata_gen)
-    print(
-        f"✓ Wrote {batch_size * num_gen_tokens} FP4 generation tokens to cache")
+    print(f"✓ Wrote {batch_size * num_gen_tokens} FP4 generation tokens to cache")
 
     # ---- Quantize Q to FP4 ----
     q_flat = q.view(-1, head_dim)
@@ -1518,8 +1529,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         dsl_q = q_fp4.view(torch.uint8)
         dsl_sf_q = sf_q
         dsl_context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
-        dsl_block_table = metadata_gen.indexer_k_cache_block_offsets[
-            0:batch_size]
+        dsl_block_table = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
         dsl_schedule_meta = metadata_gen.scheduler_metadata_buffer
 
         if metadata_gen.dsl_expand_factor > 1:
@@ -1530,8 +1540,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
             dsl_sf_q = dsl_sf_q.reshape(exp_B, eff_next_n, heads)
             dsl_context_lens = metadata_gen.kv_lens_expanded_cuda[:exp_B]
             dsl_block_table = metadata_gen.block_table_expanded[:exp_B]
-            dsl_schedule_meta = (
-                metadata_gen.scheduler_metadata_buffer_expanded)
+            dsl_schedule_meta = metadata_gen.scheduler_metadata_buffer_expanded
 
         logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
             dsl_q,
@@ -1551,16 +1560,14 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         # next_n limit and is overly conservative for FP4; fixing it is
         # out of scope here.
         context_lens_2d = metadata_gen.kv_lens_cuda_2d[0:batch_size, 0:next_n]
-        block_table_kernel = metadata_gen.indexer_k_cache_block_offsets[
-            0:batch_size]
+        block_table_kernel = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
         # Schedule buffer: next_n=1 uses the base buffer (built from
         # (num_gen, 1)); next_n>1 uses the _full_next_n variant (built from
         # (num_gen, next_n) so num_next_n_atoms encodes the real next_n).
         if next_n == 1:
             scheduler_metadata = metadata_gen.scheduler_metadata_buffer
         else:
-            scheduler_metadata = (
-                metadata_gen.scheduler_metadata_buffer_full_next_n)
+            scheduler_metadata = metadata_gen.scheduler_metadata_buffer_full_next_n
 
         logits = fp8_fp4_paged_mqa_logits(
             (q_fp4, sf_q),
@@ -1601,9 +1608,9 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     # Use fp32 directly so the ref matmul stays in fp32; bf16 matmul noise
     # would dominate the FP4 quantization noise we're trying to cancel.
     num_blocks = kv_cache_fp4_pool.shape[0]
-    kv_cache_sim = torch.zeros((num_blocks, block_size, 1, head_dim),
-                               device="cuda",
-                               dtype=torch.float32)
+    kv_cache_sim = torch.zeros(
+        (num_blocks, block_size, 1, head_dim), device="cuda", dtype=torch.float32
+    )
     context_offset = 0
     gen_offset = 0
     for seq_idx in range(batch_size):
@@ -1612,19 +1619,23 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
             block_idx = token_pos // block_size
             pos_in_block = token_pos % block_size
             physical_block_id = metadata_gen.indexer_k_cache_block_offsets[
-                seq_idx, block_idx].item()
+                seq_idx, block_idx
+            ].item()
             if physical_block_id >= 0:
-                kv_cache_sim[physical_block_id, pos_in_block, 0, :] = \
-                    k_context_sim[context_offset + token_pos]
+                kv_cache_sim[physical_block_id, pos_in_block, 0, :] = k_context_sim[
+                    context_offset + token_pos
+                ]
         for gen_token_idx in range(num_gen_tokens):
             token_pos = seq_context_len + gen_token_idx
             block_idx = token_pos // block_size
             pos_in_block = token_pos % block_size
             physical_block_id = metadata_gen.indexer_k_cache_block_offsets[
-                seq_idx, block_idx].item()
+                seq_idx, block_idx
+            ].item()
             if physical_block_id >= 0:
-                kv_cache_sim[physical_block_id, pos_in_block, 0, :] = \
-                    k_gen_sim[gen_offset + gen_token_idx]
+                kv_cache_sim[physical_block_id, pos_in_block, 0, :] = k_gen_sim[
+                    gen_offset + gen_token_idx
+                ]
         context_offset += seq_context_len
         gen_offset += num_gen_tokens
 
@@ -1632,6 +1643,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
         q_simulated.float(),
         kv_cache_sim,
         weights,
+        metadata_gen.kv_lens_cuda_runtime[0:batch_size],
         metadata_gen.kv_lens_cuda_runtime[0:batch_size],
         metadata_gen.indexer_k_cache_block_offsets,
         max_model_len,
@@ -1644,8 +1656,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)
     row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
     next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n
-    query_end_positions = (context_lens_cuda[row_indices] - next_n +
-                           next_n_offset)
+    query_end_positions = context_lens_cuda[row_indices] - next_n + next_n_offset
     mask = positions <= query_end_positions.unsqueeze(1)
 
     diff = _calc_diff(
@@ -1655,12 +1666,9 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     # FP4 quantization noise dominates; kernel-layer FP4 test uses 0.02
     # cosine-style diff (test_cute_dsl_fp4_paged_mqa_logits.py:493).
     # Match that threshold here.
-    assert diff < 0.02, (
-        f"FP4 accuracy check failed ({backend}): diff={diff:.6f}")
+    assert diff < 0.02, f"FP4 accuracy check failed ({backend}): diff={diff:.6f}"
     print(f"✅ FP4 Test passed ({backend})! diff={diff:.6f} < 0.02")
-    print(
-        f"   Total cache tokens: {final_lens.sum().item()}, Avg: {final_lens.float().mean():.1f}"
-    )
+    print(f"   Total cache tokens: {final_lens.sum().item()}, Avg: {final_lens.float().mean():.1f}")
 
 
 def test_compute_cu_seqlen_bounds_nocache():

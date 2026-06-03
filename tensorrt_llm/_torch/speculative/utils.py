@@ -352,11 +352,16 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
-    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+
+    def _mode_matches(predicate_name: str) -> bool:
+        predicate = getattr(spec_config.spec_dec_mode, predicate_name, None)
+        return predicate is not None and predicate()
+
+    if _mode_matches("is_mtp_eagle_one_model"):
         return 1
-    if spec_config.spec_dec_mode.is_mtp_vanilla():
+    if _mode_matches("is_mtp_vanilla"):
         return spec_config.num_nextn_predict_layers
-    if spec_config.spec_dec_mode.is_eagle3_one_model():
+    if _mode_matches("is_eagle3_one_model"):
         num_eagle_layers = spec_config.num_eagle_layers
         return num_eagle_layers if num_eagle_layers is not None else 1
     return 0

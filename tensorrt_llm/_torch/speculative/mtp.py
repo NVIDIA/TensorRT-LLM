@@ -32,6 +32,19 @@ else:
 SampleStateMTP = SampleStateSpec
 
 
+def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+    if position_ids.dim() > 0 and position_ids.shape[0] == 1:
+        return position_ids.squeeze(0)
+    return position_ids
+
+
+def _select_mtp_position_ids(position_ids: torch.Tensor,
+                             token_indices) -> torch.Tensor:
+    if position_ids.dim() == 1:
+        return position_ids[token_indices]
+    return position_ids[..., token_indices]
+
+
 class MTPHiddenStatesManager(BaseResourceManager):
 
     def __init__(self,

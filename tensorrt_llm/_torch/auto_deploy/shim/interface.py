@@ -379,10 +379,10 @@ class CachedSequenceInterface:
             handler_dtype = torch_dtype_to_binding(handler.dtype)
             existing = pool_by_window.get(effective_window)
             if existing is not None:
-                if existing.head_dim != handler.head_dim:
+                if existing.size_per_head != handler.head_dim:
                     raise RuntimeError(
                         f"KV layer {name} has head_dim={handler.head_dim} but window "
-                        f"{effective_window} already has head_dim={existing.head_dim}. "
+                        f"{effective_window} already has head_dim={existing.size_per_head}. "
                         "The C++ KVCacheManager keys pools by window, so within a window all "
                         "layers must share head_dim. Place mixed-shape layers in "
                         "distinct windows (e.g. via sliding_window)."
@@ -398,7 +398,7 @@ class CachedSequenceInterface:
             else:
                 pool_by_window[effective_window] = PoolConfiguration(
                     window_size=effective_window,
-                    head_dim=handler.head_dim,
+                    size_per_head=handler.head_dim,
                     dtype=handler_dtype,
                 )
 
@@ -409,7 +409,7 @@ class CachedSequenceInterface:
         # path), more than one distinct pool is incompatible.
         if len(pool_configurations) > 1 and self._requires_uniform_kv_caches:
             pools_repr = ", ".join(
-                f"window={pc.window_size} head_dim={pc.head_dim} dtype={pc.dtype}"
+                f"window={pc.window_size} head_dim={pc.size_per_head} dtype={pc.dtype}"
                 for pc in pool_configurations
             )
             raise RuntimeError(
@@ -700,7 +700,7 @@ class CachedSequenceInterface:
             # Default head_dim: the largest across all pools, so any layer
             # that falls back to the scalar gets a safe upper bound.
             default_head_dim = (
-                max(pc.head_dim for pc in pool_configurations)
+                max(pc.size_per_head for pc in pool_configurations)
                 if pool_configurations
                 else ref_handler.head_dim
             )

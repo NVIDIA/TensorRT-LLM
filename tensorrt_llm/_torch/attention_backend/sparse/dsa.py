@@ -2714,7 +2714,6 @@ class DSATrtllmAttention(TrtllmAttention):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
-        sink_token_length = 0
         beam_width = 1
 
         torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
@@ -2733,11 +2732,9 @@ class DSATrtllmAttention(TrtllmAttention):
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             self.kv_scale_orig_quant,
-            self.kv_scale_quant_orig,
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
             beam_width,
             self.quant_mode,
         )

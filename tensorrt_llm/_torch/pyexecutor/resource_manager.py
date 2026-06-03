@@ -386,6 +386,7 @@ class KVCacheManager(BaseResourceManager):
         linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
         **kwargs,
     ) -> None:
+        pool_configurations = kwargs.pop("pool_configurations", [])
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -630,6 +631,7 @@ class KVCacheManager(BaseResourceManager):
             'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
             'indexer_k_cache_use_fp4': indexer_k_cache_use_fp4,
             'linear_attention_metadata': linear_attention_metadata,
+            'pool_configurations': pool_configurations,
         }
 
         if self.event_buffer_max_size > 0:
@@ -853,6 +855,7 @@ class KVCacheManager(BaseResourceManager):
         # has enough KV cache space to fit all of our draft tokens. During warmup, however,
         # we need to make the KV cache manager aware that multiple autoregressive steps will
         # occur.
+        kv_reserve_draft_tokens: int = 0,
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
     ):
@@ -3045,8 +3048,11 @@ class KVCacheManagerV2(BaseResourceManager):
             mm_offset = overlap_start - pos
             result_offset = overlap_start - start
             n = overlap_end - overlap_start
-            result[result_offset:result_offset + n] = gen_multimodal_cache_key_tokens(
-                self.vocab_size, digest, n, token_offset=mm_offset)
+            result[result_offset:result_offset +
+                   n] = gen_multimodal_cache_key_tokens(self.vocab_size,
+                                                        digest,
+                                                        n,
+                                                        token_offset=mm_offset)
         return result
 
     def _stats_window_size(self, window_size: Optional[int]) -> int:
@@ -3395,6 +3401,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_num_draft_tokens: int = 0,
             use_mrope: bool = False,
             max_beam_width: int = 1,
+            kv_reserve_draft_tokens: int = 0,
             num_extra_decoding_steps: int = 0,
             draft_kv_cache_manager: Optional['BaseResourceManager'] = None):
 
@@ -3457,7 +3464,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     release_resources(req)
                     return None
                 kv_cache.stop_committing()
-                dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
+                dummy_capacity = (token_num + self.num_extra_kv_tokens +
+                                  kv_reserve_draft_tokens +
+                                  num_extra_decoding_steps)
                 if is_gen:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block

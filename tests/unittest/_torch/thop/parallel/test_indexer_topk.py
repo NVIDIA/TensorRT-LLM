@@ -42,6 +42,13 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for indexer_topk tests", allow_module_level=True)
 
+
+def _has_trtllm_op(name):
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, name)
+
+
+_HAS_INDEXER_TOPK_DECODE_SCRATCH_BYTES = _has_trtllm_op("indexer_topk_decode_scratch_bytes")
+
 try:
     import scipy.stats as _scipy_stats
     from scipy.special import gamma as _gamma
@@ -220,6 +227,50 @@ def generate_seq_lens(batch_size, min_long_seq, num_tokens):
     return seq_lens
 
 
+def _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio):
+    """Run the decode equivalence check against torch.topk."""
+    torch.manual_seed(24)
+    torch.cuda.manual_seed(24)
+    num_gen_tokens = batch_size * next_n
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
+    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+
+    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    actual_kv_lens = seq_lens[row_indices] - next_n + next_n_offset + 1
+    row_ends = actual_kv_lens // compress_ratio
+
+    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
+    radix_aux_indices, radix_aux_logits = _build_radix_aux_buffers(num_gen_tokens, index_topk)
+
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=radix_aux_indices,
+        radix_aux_logits=radix_aux_logits,
+    )
+    torch.cuda.synchronize()
+
+    max_row_len = row_ends.max().item()
+    if max_row_len == 0:
+        return
+
+    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
+    mask_lo = torch_indices >= 0
+    mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
+    mask = mask_lo & mask_hi
+    torch_indices = torch_indices.masked_fill(~mask, -1)
+
+    assert compare_top_k_results(
+        logits, indices, torch_indices, row_starts, row_ends, index_topk
+    ), "CUDA top_k_per_row results don't match torch.topk"
+
+
 # ---------------------------------------------------------------------------
 # Original random-data decode test (verbatim from test_indexer_topk.py)
 # ---------------------------------------------------------------------------
@@ -352,6 +403,10 @@ def _run_opt_in_decode(batch_size, num_tokens, *, dtype, done_counter, scratch):
 
 @pytest.mark.parametrize("batch_size,num_tokens", [(1, 524288), (4, 262144), (16, 131072)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.skipif(
+    not _HAS_INDEXER_TOPK_DECODE_SCRATCH_BYTES,
+    reason="indexer_topk_decode_scratch_bytes op is not available",
+)
 def test_indexer_topk_decode_multi_pass_radix(batch_size, num_tokens, dtype):
     """Multi-pass radix path: shapes inside the low-bs / long-seq eligibility
     zone with a caller-allocated uint8 scratch buffer sized by
@@ -369,6 +424,10 @@ def test_indexer_topk_decode_multi_pass_radix(batch_size, num_tokens, dtype):
 
 @pytest.mark.parametrize("batch_size,num_tokens", [(4, 524288), (8, 262144), (16, 524288)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.skipif(
+    not _HAS_INDEXER_TOPK_DECODE_SCRATCH_BYTES,
+    reason="indexer_topk_decode legacy scratch API is not available",
+)
 def test_indexer_topk_decode_multi_pass_radix_via_legacy_api(batch_size, num_tokens, dtype):
     """Multi-pass radix tier reached through the legacy calling convention:
     the caller passes the deprecated `done_counter_scratch` and no `scratch`,
@@ -1661,9 +1720,18 @@ def test_indexer_topk_decode_gvr_heuristic(index_topk, batch_size, dtype):
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
     # heuristic_scratch dtype must match logits dtype; size >= numRows * index_topk.
     heuristic_scratch = torch.empty(num_gen_tokens * index_topk, dtype=dtype, device="cuda")
+    radix_aux_indices, radix_aux_logits = _build_radix_aux_buffers(num_gen_tokens, index_topk)
 
     torch.ops.trtllm.indexer_topk_decode(
-        logits, seq_lens, indices, next_n, index_topk, pre_idx, heuristic_scratch
+        logits,
+        seq_lens,
+        indices,
+        next_n,
+        index_topk,
+        pre_idx,
+        heuristic_scratch,
+        radix_aux_indices=radix_aux_indices,
+        radix_aux_logits=radix_aux_logits,
     )
     torch.cuda.synchronize()
 

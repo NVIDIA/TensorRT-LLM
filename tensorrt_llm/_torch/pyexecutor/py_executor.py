@@ -71,8 +71,8 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
-                            derive_attention_dp_per_rank_request_cap,
                             build_no_fitting_reqs_diagnostic,
+                            derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
                                ResourceManagerType, request_context)
@@ -440,8 +440,9 @@ class PyExecutor:
         # freed by suspend) or _pause_requests (V2's prepare_context
         # handles resume internally, so resetting to CONTEXT_INIT is
         # unnecessary).  Several revert/skip paths gate on this flag.
-        self._scheduler_manages_kv_suspend = isinstance(self.kv_cache_manager,
-                                                        KVCacheManagerV2)
+        self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
+                                            KVCacheManagerV2)
+        self._scheduler_manages_kv_suspend = self._is_kv_manager_v2
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.

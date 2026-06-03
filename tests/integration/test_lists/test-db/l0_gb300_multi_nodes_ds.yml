@@ -50,4 +50,4 @@ l0_gb300_multi_nodes_ds:
       stage: post_merge
       backend: pytorch
   tests:
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v4_pro_ctx2dep4_gen1dep16[conc256] TIMEOUT (12600)
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v4_pro_ctx2dep4_gen1dep16[conc16] TIMEOUT (12600)

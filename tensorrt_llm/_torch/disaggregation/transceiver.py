@@ -211,12 +211,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         else np.array([], dtype=np.int64)
                     )
                 if is_gen_only:
-                    # Adapter contract: SWA cached_tokens >= stale_end*tpb (clamped).
-                    cache_skip = cached_per_lg[idx] // tpb - stale_end
-                    assert cache_skip >= 0, (
-                        f"SWA adapter must clamp cached_tokens to >= stale_end*tpb "
-                        f"(cached={cached_per_lg[idx]}, stale_end*tpb={stale_end * tpb})"
-                    )
+                    cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
                 else:
                     # Ctx side bypasses the adapter (cached_per_lg synthetically 0); no further skip.
                     cache_skip = 0

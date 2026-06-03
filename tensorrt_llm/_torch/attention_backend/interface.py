@@ -813,9 +813,19 @@ class AttentionForwardArgs:
         raise ValueError(
             f"Unexpected attention mask type: {self.attention_mask!r}")
 
+    @property
+    def is_generation(self) -> bool:
+        return self.attention_input_type == AttentionInputType.generation_only
+
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
     AttentionForwardArgs.__dataclass_fields__)
+
+
+def _attention_input_type_from_is_generation(
+        is_generation: bool) -> AttentionInputType:
+    return (AttentionInputType.generation_only
+            if is_generation else AttentionInputType.context_only)
 
 
 def merge_attention_forward_args(
@@ -824,19 +834,43 @@ def merge_attention_forward_args(
 ) -> AttentionForwardArgs:
     """Merge legacy attention kwargs into explicit forward arguments."""
 
+    legacy_is_generation = kwargs.pop("is_generation", None)
+    if (legacy_is_generation is not None and forward_args is None
+            and "attention_input_type" not in kwargs):
+        kwargs[
+            "attention_input_type"] = _attention_input_type_from_is_generation(
+                bool(legacy_is_generation))
+
     unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_ARGS_FIELDS)
     if unknown_kwargs:
         raise ValueError(
             f"Unknown attention forward arguments: {unknown_kwargs}")
 
     if forward_args is not None:
+        if legacy_is_generation is not None:
+            attention_input_type = _attention_input_type_from_is_generation(
+                bool(legacy_is_generation))
+            if forward_args.attention_input_type != attention_input_type:
+                raise ValueError("Conflicting attention forward arguments: "
+                                 f"is_generation={legacy_is_generation} but "
+                                 f"forward_args.attention_input_type="
+                                 f"{forward_args.attention_input_type!r}")
         if kwargs:
             raise ValueError(
                 "Pass attention forward options either through forward_args "
                 f"or as legacy kwargs, not both: {sorted(kwargs)}")
         return forward_args
 
-    return AttentionForwardArgs(**kwargs)
+    result = AttentionForwardArgs(**kwargs)
+    if legacy_is_generation is not None:
+        attention_input_type = _attention_input_type_from_is_generation(
+            bool(legacy_is_generation))
+        if result.attention_input_type != attention_input_type:
+            raise ValueError(
+                "Conflicting attention forward arguments: "
+                f"is_generation={legacy_is_generation} but "
+                f"attention_input_type={result.attention_input_type!r}")
+    return result
 
 
 class AttentionBackend(Generic[TMetadata]):

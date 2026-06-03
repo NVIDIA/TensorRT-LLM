@@ -22,7 +22,11 @@ from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.pyexecutor._util import get_decoding_mode
+from tensorrt_llm._torch.pyexecutor._util import (
+    _create_kv_cache_manager,
+    get_decoding_mode,
+    get_kv_cache_manager_cls,
+)
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
@@ -48,10 +52,17 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     SimpleScheduler,
 )
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
+from tensorrt_llm.llmapi.llm_args import (
+    ContextChunkingPolicy,
+    EagleDecodingConfig,
+    KvCacheConfig,
+    LoadFormat,
+    SamplerType,
+    TorchLlmArgs,
+)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.mapping import Mapping
 
