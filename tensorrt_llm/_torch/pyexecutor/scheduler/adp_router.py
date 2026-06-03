@@ -192,6 +192,7 @@ class ADPRouter(ABC):
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
                 cold_start_warmup=attention_dp_config.kv_cache_routing_cold_start_warmup,
                 async_transfer_manager=async_transfer_manager,
+                account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
         return DefaultADPRouter(dist=dist)
@@ -451,6 +452,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         fair_share_multiplier: float = 2.0,
         cold_start_warmup: bool = False,
         async_transfer_manager=None,
+        account_for_in_transfer: bool = False,
     ):
         super().__init__(dist)
         self.kv_cache_manager = kv_cache_manager
@@ -464,7 +466,12 @@ class KVCacheAwareADPRouter(ADPRouter):
             set(range(self.dist.mapping.dp_size)) if cold_start_warmup else set()
         )
         # Requests still sending KV to GEN are invisible in active_requests;
-        # fold them back in via the transfer manager (see create_rank_state).
+        # when ``account_for_in_transfer`` is True, fold them back in via the
+        # transfer manager (see create_rank_state). Disabled by default
+        # because counting them inflates num_active_requests reported to the
+        # inference loop, which then skips the idle-fetch wait and yields
+        # empty fetch cycles.
+        self.account_for_in_transfer = account_for_in_transfer
         self.async_transfer_manager = async_transfer_manager
 
     def create_rank_state(
@@ -484,8 +491,11 @@ class KVCacheAwareADPRouter(ADPRouter):
         n_active_for_state = len(active_requests)
 
         # Fold in requests mid KV-transfer to GEN; they are removed from
-        # active_requests but still counted as per-rank load.
-        if self.async_transfer_manager is not None:
+        # active_requests but still counted as per-rank load. Gated behind
+        # ``account_for_in_transfer`` because the inflated active count
+        # makes the inference loop's idle-fetch wait expire even when no
+        # request is actually runnable, causing empty fetch cycles.
+        if self.account_for_in_transfer and self.async_transfer_manager is not None:
             in_transfer = self.async_transfer_manager.requests_in_transfer()
             num_active_tokens += sum(_active_tokens(r) for r in in_transfer.values())
             n_active_for_state += len(in_transfer)
