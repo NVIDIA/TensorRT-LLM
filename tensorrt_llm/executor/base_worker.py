@@ -1,4 +1,3 @@
-import copy
 import datetime
 import enum
 import json
@@ -431,7 +430,7 @@ class BaseWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
+        prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
