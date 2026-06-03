@@ -19,7 +19,7 @@ from typing import List, Optional
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from ..._compat import get_sm_version
 
 
 @torch.library.custom_op("auto_deploy::torch_linear_simple", mutates_args=())
