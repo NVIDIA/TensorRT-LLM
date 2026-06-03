@@ -1,0 +1,42 @@
+--- a/csrc/kernels/intranode.cu
++++ b/csrc/kernels/intranode.cu
+@@ -818,2 +818,5 @@
+-                    for (int j = 0; j < num_topk_ranks; ++ j)
+-                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
++                    // Avoid dynamically indexing the local Buffer array here. With the unrolled
++                    // combine loop, some target toolchains lower that pattern to a faulting local
++                    // pointer load; the base pointer plus explicit rank stride is address-equivalent.
++                    for (int j = 0; j < num_topk_ranks; ++ j)
++                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[0].buffer() + (topk_ranks[j] * num_recv_buffer_tokens + slot_indices[j]) * hidden_int4 + i);
+@@ -846,7 +846,9 @@
+                     // Wait TMA arrival
+                     if (lane_id == 0)
+                         tma_store_wait<kNumStages - 1>();
+-                    __syncwarp();
++                    // hidden_int4 is not always divisible by a warp. The final tile can have
++                    // only a subset of lanes active, so synchronize only currently active lanes.
++                    __syncwarp(__activemask());
+
+                     // Write into TMA buffer
+                     auto tma_stage_idx = (i / 32) % kNumStages;
+@@ -855,13 +857,13 @@
+
+                     // Issue TMA
+                     tma_store_fence();
+-                    __syncwarp();
++                    __syncwarp(__activemask());
+                     if (lane_id == 0) {
+                         auto tma_bytes = min(32, hidden_int4 - i) * static_cast<int>(sizeof(int4));
+                         tma_store_1d(reinterpret_cast<int4*>(tma_buffer) + tma_stage_idx * 32,
+                                      recv_int4 + token_idx * hidden_int4 + i, tma_bytes, false);
+                     }
+-                    __syncwarp();
++                    __syncwarp(__activemask());
+ #else
+                     recv_int4[token_idx * hidden_int4 + i] = out_int4;
+ #endif
+@@ -873,2 +875,2 @@
+-                    for (int i = 0; i < num_topk_ranks; ++ i)
+-                        value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
++                    for (int i = 0; i < num_topk_ranks; ++ i)
++                        value += ld_nc_global(channel_topk_weights_buffers[0].buffer() + (topk_ranks[i] * num_recv_buffer_tokens + slot_indices[i]) * num_topk + lane_id);
