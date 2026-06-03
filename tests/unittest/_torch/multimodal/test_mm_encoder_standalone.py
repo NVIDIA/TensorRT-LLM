@@ -679,6 +679,7 @@ def llms_and_encoder(
             MultimodalEncoder,
             model=model_dir,
             max_batch_size=encoder_max_batch_size,
+            trust_remote_code=True,
             **_get_fake_checkpoint_kwargs(model_dir),
         ))
     instances = _instantiate_models(*initializers)
