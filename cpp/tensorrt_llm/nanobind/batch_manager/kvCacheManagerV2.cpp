@@ -36,6 +36,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 #include <optional>
@@ -521,6 +522,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("cuda_stream") = nb::none())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
+        .def("prefetch", &kv::KvCache::prefetch, nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
+        .def("_debug_active_page_stats", &kv::KvCache::debugActivePageStats, nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",

@@ -659,6 +659,66 @@ void StorageManager::batchedMigrateToGpu(std::vector<BatchedLockTarget> const& t
         _batchedMigrate(key.second, kGpuLevel, key.first, pages, /*updateSrc=*/true);
 }
 
+void StorageManager::prefetch(CacheLevel dstLevel, std::vector<std::vector<std::vector<SharedPtr<Page>>>> const& pages)
+{
+    std::vector<int> numSlots(static_cast<size_t>(numPoolGroups()), 0);
+    std::vector<SharedPtr<Page>> scheduled;
+
+    struct ReschedulePagesGuard
+    {
+        StorageManager& storageManager;
+        std::vector<SharedPtr<Page>>& scheduled;
+
+        ~ReschedulePagesGuard()
+        {
+            for (auto const& page : scheduled)
+            {
+                storageManager.scheduleForEviction(*page);
+            }
+            scheduled.clear();
+        }
+    } reschedulePagesGuard{*this, scheduled};
+
+    for (int pgIdx = 0; pgIdx < static_cast<int>(pages.size()); ++pgIdx)
+    {
+        auto const& poolGroupPages = pages.at(static_cast<size_t>(pgIdx));
+        for (int lvl = 0; lvl < static_cast<int>(poolGroupPages.size()); ++lvl)
+        {
+            auto const& levelPages = poolGroupPages.at(static_cast<size_t>(lvl));
+            assert(lvl >= dstLevel || levelPages.empty());
+            for (auto const& page : levelPages)
+            {
+                if (page->scheduledForEviction())
+                {
+                    excludeFromEviction(*page);
+                    scheduled.push_back(page);
+                }
+                else if (isEvictable(*page, dstLevel))
+                {
+                    scheduled.push_back(page);
+                }
+                assert(lvl >= dstLevel);
+                if (lvl == dstLevel)
+                {
+                    continue;
+                }
+                numSlots.at(static_cast<size_t>(pgIdx)) += 1;
+            }
+        }
+    }
+
+    prepareFreeSlots(dstLevel, numSlots);
+    for (int pgIdx = 0; pgIdx < static_cast<int>(pages.size()); ++pgIdx)
+    {
+        auto const& poolGroupPages = pages.at(static_cast<size_t>(pgIdx));
+        for (int lvl = dstLevel + 1; lvl < numCacheLevels(); ++lvl)
+        {
+            _batchedMigrate(static_cast<PoolGroupIndex>(pgIdx), dstLevel, static_cast<CacheLevel>(lvl),
+                poolGroupPages.at(static_cast<size_t>(lvl)), /*updateSrc=*/true);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Query helpers
 // ---------------------------------------------------------------------------

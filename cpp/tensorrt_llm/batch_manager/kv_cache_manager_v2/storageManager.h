@@ -145,6 +145,9 @@ public:
     // Migrate a batch of pages to GPU (used by batchedLockToGpu).
     void batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, KvCache& kvCache);
 
+    // Best-effort migration of grouped pages to a destination cache level.
+    void prefetch(CacheLevel dstLevel, std::vector<std::vector<std::vector<SharedPtr<Page>>>> const& pages);
+
     // ---- Query helpers -----------------------------------------------------
 
     LifeCycleRegistry const& lifeCycles() const noexcept

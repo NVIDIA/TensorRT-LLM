@@ -182,6 +182,44 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
     return result;
 }
 
+SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const
+{
+    bool const isSsm = ordinal == kBadBlockOrdinal;
+    auto const ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    assert((ssmLcId.has_value() && lcId == *ssmLcId) == isSsm);
+    auto const& blockPage = isSsm
+        ? mSsmBlocks.at(static_cast<size_t>(beamIdx)).at(static_cast<size_t>(lcId))
+        : mBlocks.at(static_cast<size_t>(ordinal)).pages.at(static_cast<size_t>(beamIdx)).at(static_cast<size_t>(lcId));
+    return blockPageGetPage(blockPage);
+}
+
+KvCache::ActivePageStats KvCache::debugActivePageStats() const
+{
+    auto& storageMgr = mManager->storage();
+    int const numTiers = storageMgr.numCacheLevels();
+    std::vector<int> counts(static_cast<size_t>(numTiers), 0);
+    std::vector<int> unscheduledEvictable(static_cast<size_t>(numTiers), 0);
+
+    for (auto const& activePage : _activePages())
+    {
+        auto page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
+        if (!page)
+        {
+            continue;
+        }
+
+        CacheLevel const level = page->cacheLevel;
+        auto const levelIdx = static_cast<size_t>(level);
+        counts.at(levelIdx) += 1;
+        if (storageMgr.isEvictable(*page) && !page->scheduledForEviction())
+        {
+            unscheduledEvictable.at(levelIdx) += 1;
+        }
+    }
+
+    return {std::move(counts), std::move(unscheduledEvictable)};
+}
+
 void KvCache::activate()
 {
     assert(mStatus == Status::SUSPENDED);
@@ -429,6 +467,44 @@ bool KvCache::resume(std::optional<CUstream> stream)
     return true;
 }
 
+bool KvCache::prefetch(CacheLevel target)
+{
+    assert(mStatus == Status::SUSPENDED);
+    auto& storageMgr = mManager->storage();
+    int const numTiers = storageMgr.numCacheLevels();
+    assert(kGpuLevel <= target && target < numTiers);
+
+    int const numPoolGroups = storageMgr.numPoolGroups();
+    std::vector<std::vector<std::vector<SharedPtr<Page>>>> allPages(
+        static_cast<size_t>(numPoolGroups), std::vector<std::vector<SharedPtr<Page>>>(static_cast<size_t>(numTiers)));
+
+    for (auto const& activePage : _activePages())
+    {
+        auto page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
+        if (!page)
+        {
+            continue;
+        }
+        CacheLevel const level = page->cacheLevel;
+        if (level < target)
+        {
+            continue;
+        }
+        auto const pgIdx = static_cast<PoolGroupIndex>(storageMgr.getPoolGroupIndex(activePage.lcId));
+        allPages.at(static_cast<size_t>(pgIdx)).at(static_cast<size_t>(level)).push_back(std::move(page));
+    }
+
+    try
+    {
+        storageMgr.prefetch(target, allPages);
+    }
+    catch (OutOfPagesError const&)
+    {
+        return false;
+    }
+    return true;
+}
+
 void KvCache::suspend()
 {
     assert(mStatus == Status::ACTIVE);
@@ -630,8 +706,10 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
             if (enableScratch)
             {
-                int numScratchBlocks = scratchRanges[static_cast<size_t>(lc)].length();
-                int numNewNormalBlocks = (newNumBlocks - oldNumBlocks) - numScratchBlocks;
+                HalfOpenRange const newBlockRange{oldNumBlocks, newNumBlocks};
+                int const numNewBlocksUsingScratch
+                    = intersect(scratchRanges[static_cast<size_t>(lc)], newBlockRange).length();
+                int const numNewNormalBlocks = newBlockRange.length() - numNewBlocksUsingScratch;
                 numNewSlots[static_cast<size_t>(lc)] = numNewNormalBlocks * mBeamWidth;
             }
             else
@@ -1241,6 +1319,31 @@ void KvCache::_commitBlock(int ord, bool isLast)
     {
         // Can't commit and can't reuse existing block. Just stop committing.
         mCommitState = CommitState::VIRTUAL_STOP;
+    }
+
+    if (sb.isCommitted())
+    {
+        auto const& lifeCycles = mManager->lifeCycles();
+        for (int lcIdx = 0; lcIdx < numLc; ++lcIdx)
+        {
+            if (ssmLcId.has_value() && lcIdx == *ssmLcId)
+            {
+                continue;
+            }
+            LifeCycle const& lc = lifeCycles.getLifeCycle(static_cast<LifeCycleId>(lcIdx));
+            if (!std::holds_alternative<AttnLifeCycle>(lc))
+            {
+                continue;
+            }
+            auto const staleRange = _getStaleRange(mHistoryLength, lc);
+            if (staleRange.contains(ord))
+            {
+                for (auto& beamBlock : sb.pages)
+                {
+                    beamBlock[static_cast<size_t>(lcIdx)] = std::monostate{};
+                }
+            }
+        }
     }
 
     // Mirrors Python's tail of _commit_block:

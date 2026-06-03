@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -194,6 +195,9 @@ public:
     // Close: release all blocks back to KvCacheManager.
     void close();
 
+    // Best-effort prefetch active pages to the target cache level.
+    bool prefetch(CacheLevel target);
+
     // ---- Capacity / history ------------------------------------------------
 
     // Resize capacity and/or history_length.
@@ -261,6 +265,11 @@ public:
     {
         return mBlocks;
     }
+
+    using ActivePageStats = std::tuple<std::vector<int>, std::vector<int>>;
+
+    // Test/debug introspection: active pages and unscheduled evictable pages by cache level.
+    ActivePageStats debugActivePageStats() const;
 
     int numCommittedBlocks() const noexcept
     {
@@ -419,6 +428,7 @@ private:
     };
 
     std::vector<ActivePage> _activePages() const;
+    SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
 
     bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);

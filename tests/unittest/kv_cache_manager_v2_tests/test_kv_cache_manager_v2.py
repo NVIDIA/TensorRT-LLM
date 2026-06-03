@@ -1508,22 +1508,6 @@ class TestResizeQuota(TestKVCacheManagerV2):
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
 
-        def count_active_pages_by_level(kv_cache: _KVCache) -> list[int]:
-            counts = [0] * self.manager._storage.num_cache_levels
-            for ordinal, beam_idx, lc_idx in kv_cache._active_pages():
-                block_page = kv_cache._page(ordinal, beam_idx, lc_idx)
-                assert block_page is not None
-                counts[block_page.page.cache_level] += 1
-            return counts
-
-        def assert_prefetched_pages_are_evictable(kv_cache: _KVCache) -> None:
-            for ordinal, beam_idx, lc_idx in kv_cache._active_pages():
-                block_page = kv_cache._page(ordinal, beam_idx, lc_idx)
-                assert block_page is not None
-                page = block_page.page
-                if page.cache_level == HOST_LEVEL and self.manager._storage.is_evictable(page):
-                    self.assertTrue(page.scheduled_for_eviction)
-
         # First commit some blocks to fill all levels of cache. This helps test the case where shrinking
         # the quota will drop some pages from the last-level cache.
         for _ in range(11):
@@ -1579,18 +1563,21 @@ class TestResizeQuota(TestKVCacheManagerV2):
         success = self.manager.resize(HOST_LEVEL, 128 << 20)
         assert success
         prefetch_target = kv_cache_lst[1]
-        prefetch_counts_before = count_active_pages_by_level(prefetch_target)
+        # _debug_active_page_stats returns (active counts, unscheduled evictable counts) by cache level.
+        prefetch_counts_before, _ = prefetch_target._debug_active_page_stats()
         self.assertGreater(prefetch_counts_before[DISK_LEVEL], 0)
         success = prefetch_target.prefetch(HOST_LEVEL)
         self.assertEqual(success, True)
-        prefetch_counts_after = count_active_pages_by_level(prefetch_target)
+        prefetch_counts_after, unscheduled_evictable_after = (
+            prefetch_target._debug_active_page_stats()
+        )
         self.assertEqual(prefetch_counts_after[GPU_LEVEL], prefetch_counts_before[GPU_LEVEL])
         self.assertEqual(prefetch_counts_after[DISK_LEVEL], 0)
         self.assertEqual(
             prefetch_counts_after[HOST_LEVEL],
             prefetch_counts_before[HOST_LEVEL] + prefetch_counts_before[DISK_LEVEL],
         )
-        assert_prefetched_pages_are_evictable(prefetch_target)
+        self.assertEqual(unscheduled_evictable_after[HOST_LEVEL], 0)
         # Now both requests can resume
         for kv_cache in kv_cache_lst:
             success = kv_cache.resume(stream)
