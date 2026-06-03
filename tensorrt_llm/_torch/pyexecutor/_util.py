@@ -88,9 +88,15 @@ def get_kv_cache_manager_cls(
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
-    if sparse_attn_config is not None:
+    if (sparse_attn_config is not None
+            and not sparse_attn_config.is_behavior_layer_method):
+        # Legacy memory-layer dispatch (legacy RocketKV / DSA / skip_softmax
+        # own a sparse-aware cache manager subclass). Behavior-layer methods
+        # (RocketKV) fall through below; their
+        # algorithm runs inside a ``SparseAttentionExecutor`` constructed via
+        # ``create_sparse_attention_manager`` after PyExecutor instantiation.
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_hybrid_linear(config):
+    if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
         if model_config.get_num_mamba_layers() == 0:
@@ -256,7 +262,7 @@ class KvCacheCreator:
                         self._cache_transceiver_config is not None
                         and self._cache_transceiver_config.backend is not None):
                 # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
-                # split-pool layout. KVCacheManager (V1) coerces head_dim list
+                # split-pool layout. KVCacheManager coerces head_dim list
                 # to max(head_dim), changing per-layer KV byte sizes — which
                 # breaks correctness, not just efficiency. Fail fast here
                 # rather than silently producing wrong outputs.
@@ -272,7 +278,7 @@ class KvCacheCreator:
                     "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
                 )
                 cls = KVCacheManager
-        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
+        # The KVCacheManager-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
         # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
         # state in a separate cache that doesn't honor block reuse. Warn at
         # the routing site so users see the warning where the decision is
@@ -549,7 +555,10 @@ class KvCacheCreator:
         # heterogeneous layer_types) uses MambaHybridCacheManager and would
         # have its max_tokens estimate inflated incorrectly otherwise.
         num_pool_groups = 1
-        if self._kv_cache_manager_cls == KVCacheManagerV2:
+        # Use ``issubclass`` so RocketKV's V2-subclass (Pattern 3) also
+        # picks up the split-pool semantics.
+        if (self._kv_cache_manager_cls is not None
+                and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
             model_cfg = self._model_engine.model.model_config.pretrained_config
             layer_types = getattr(model_cfg, "layer_types", None)
             if isinstance(layer_types, (list, tuple)):
@@ -1014,10 +1023,10 @@ class KvCacheCreator:
                 and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
             draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
 
-        # Also split for V1 VSWA. The VSWA pool is sized directly from
-        # max_gpu_total_bytes and ignores max_tokens, so without splitting
+        # Also split for KVCacheManager VSWA. The VSWA pool is sized directly
+        # from max_gpu_total_bytes and ignores max_tokens, so without splitting
         # both target and draft each allocate the full combined budget.
-        # V1 non-VSWA does not need this: max_tokens caps the block count
+        # The non-VSWA case does not need this: max_tokens caps the block count
         # per model, giving each a proportional share of the budget.
         has_draft = (
             self._draft_model_engine is not None  # two-model
@@ -1043,7 +1052,7 @@ class KvCacheCreator:
                 assert draft_kv_cache_config is None, (
                     "KVCacheManagerV2 does not support two-model speculative "
                     "decoding with separate draft KV cache budget splitting.")
-            # For V1 VSWA, apply the draft's split budget temporarily
+            # For KVCacheManager VSWA, apply the draft's split budget temporarily
             if draft_kv_cache_config is not None:
                 saved_budget = self._kv_cache_config.max_gpu_total_bytes
                 self._kv_cache_config.max_gpu_total_bytes = draft_kv_cache_config.max_gpu_total_bytes
@@ -1409,7 +1418,7 @@ def _create_kv_cache_manager(
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
-        # Only needed for V1; V2 handles per-layer windows natively via life cycles.
+        # Only needed for KVCacheManager; KVCacheManagerV2 handles per-layer windows natively via life cycles.
         is_vswa = is_vswa_enabled(kv_cache_config)
         binding_model_config = None
         if is_vswa and kv_cache_manager_cls.__name__ == "KVCacheManager":
@@ -1418,7 +1427,7 @@ def _create_kv_cache_manager(
                 kv_cache_config=kv_cache_config,
                 spec_config=spec_config)
 
-        # KVCacheManager (V1) doesn't support per-layer head_dim lists;
+        # KVCacheManager doesn't support per-layer head_dim lists;
         # use max for estimation. KVCacheManagerV2 handles lists natively.
         effective_head_dim = (
             max(head_dim) if isinstance(head_dim, list)
@@ -1657,6 +1666,27 @@ def create_py_executor_instance(
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
+
+    # Build + register the KVCacheBehaviorCoordinator BEFORE py_executor
+    # instantiation. PyExecutor's __init__ runs warmup, which captures CUDA
+    # graphs through ``TrtllmAttention.forward``; that path reads
+    # ``metadata.coordinator`` to fire HOOK 2/4. If the coordinator is None at
+    # capture time, the captured graph bakes in DENSE attention and the hooks
+    # are absent from replay, so it must be registered here for warmup to see.
+    if llm_args.sparse_attention_config is not None:
+        # Create the coordinator iff this method provides a compression
+        # executor; create_sparse_attention_manager returns None otherwise.
+        # Independent of memory/behavior layer.
+        from ..attention_backend.sparse import (KVCacheBehaviorCoordinator,
+                                                create_sparse_attention_manager)
+        sparse_executor = create_sparse_attention_manager(
+            llm_args.sparse_attention_config, kv_cache_manager)
+        if sparse_executor is not None:
+            coordinator = KVCacheBehaviorCoordinator(
+                executors=[sparse_executor])
+            resource_manager.resource_managers[
+                ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR] = (
+                    coordinator)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.

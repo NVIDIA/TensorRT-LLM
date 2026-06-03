@@ -143,7 +143,7 @@ def _helix_post_process(
     (``head_dim`` for MHA, ``kv_lora_rank`` for MLA).
 
     When *aux_stream* and *ln_events* are provided the two
-    ``.contiguous()`` calls in the FIFO-v1 path are overlapped on
+    ``.contiguous()`` calls in the FIFO path are overlapped on
     separate CUDA streams for better performance.
     """
     if mapping.cp_config.get("use_nccl_for_alltoall", True):
@@ -572,7 +572,8 @@ class Attention(nn.Module):
             logger.info_once(f"Using sparse attention: {algo} {cfg_dump}",
                              key="sparse_attention_config")
 
-            if config.sparse_attention_config.algorithm == "rocket":
+            if config.sparse_attention_config.algorithm in ("rocket",
+                                                            "rocketkv"):
                 logger.warning_once("disable rope_fusion for RocketKV.",
                                     key="disable_rope_fusion_for_rocketkv")
                 self.rope_fusion = False

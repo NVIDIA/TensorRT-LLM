@@ -12,6 +12,7 @@ from typing_extensions import Self
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
+    from .sparse.coordinator import KVCacheBehaviorCoordinator
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -70,6 +71,11 @@ class AttentionMetadata:
     kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
     draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
+    # When set, ``TrtllmAttention.forward`` dispatches the per-attention
+    # sparse hooks (``on_context_attention`` / ``on_generation_attention``)
+    # to this coordinator. The coordinator's other lifecycle hooks fire from
+    # PyExecutor's BaseResourceManager callbacks and do not use this field.
+    coordinator: Optional["KVCacheBehaviorCoordinator"] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False

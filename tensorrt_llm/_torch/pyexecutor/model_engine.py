@@ -1575,10 +1575,11 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_draft_tokens = []
 
     def _set_up_attn_metadata(
-        self,
-        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
-        draft_kv_cache_manager: Optional[Union[KVCacheManager,
-                                               KVCacheManagerV2]] = None):
+            self,
+            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+            draft_kv_cache_manager: Optional[Union[KVCacheManager,
+                                                   KVCacheManagerV2]] = None,
+            resource_manager: Optional[ResourceManager] = None):
         enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
@@ -1601,6 +1602,16 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
+        # Retrieve the KVCacheBehaviorCoordinator from resource_manager so it
+        # can be passed to AttentionMetadata at construction time (no
+        # post-construction mutation). TrtllmAttention.forward reads
+        # metadata.coordinator to fire HOOK 2/4 (on_*_attention). Coordinator
+        # is None when no behavior-layer sparse method is configured, or when
+        # the caller did not pass resource_manager (e.g. the dummy/init path).
+        coordinator = (resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_BEHAVIOR_COORDINATOR)
+                       if resource_manager is not None else None)
+
         if kv_cache_manager is None:
             # Cache the no-cache metadata.
             if self.encoder_attn_metadata is not None:
@@ -1617,7 +1628,8 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
                 sparse_attention_config=self.sparse_attention_config,
-                num_heads_per_kv=num_heads_per_kv)
+                num_heads_per_kv=num_heads_per_kv,
+                coordinator=coordinator)
             self.encoder_attn_metadata.block_ids_per_seq = None
             self.encoder_attn_metadata.kv_block_ids_per_seq = None
             return self.encoder_attn_metadata
@@ -1641,6 +1653,7 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=cache_indirection,
             sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
+            coordinator=coordinator,
         )
 
         return self.attn_metadata
@@ -4401,8 +4414,10 @@ class PyTorchModelEngine(ModelEngine):
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
-                                                   draft_kv_cache_manager)
+        attn_metadata = self._set_up_attn_metadata(
+            kv_cache_manager,
+            draft_kv_cache_manager,
+            resource_manager=resource_manager)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
