@@ -819,7 +819,32 @@ class DeepseekV4WeightLoader:
                 getattr(module, attr).data.copy_(weights[key][:])
             return True
 
+        # On host-memory-constrained nodes (e.g. cmh GB300: 900 GiB shared by 4
+        # ranks), reading the 805 GiB safetensors during load faults the model
+        # into the file-cache faster than it is reclaimed; 4 ranks' resident
+        # file pages (~205-246 GiB/rank) cross the cgroup limit and OOM-kill the
+        # step. After each MoE layer we MADV_DONTNEED the whole set of
+        # safetensors mmap regions so the resident file-cache cannot accumulate
+        # (read-only mmap -> pages re-faulted on demand, data-safe). Always on:
+        # on large-host nodes it just re-reads a few pages (negligible), on
+        # small-host nodes it is what keeps the load under the cgroup limit.
+
+        def _pageout_safetensors():
+            import ctypes as _ct
+            torch.cuda.synchronize()
+            try:
+                _libc = _ct.CDLL("libc.so.6", use_errno=True)
+                for _ln in open("/proc/self/maps"):
+                    if ".safetensors" in _ln:
+                        _a, _b = _ln.split()[0].split("-")
+                        _libc.madvise(_ct.c_void_p(int(_a, 16)),
+                                      _ct.c_size_t(int(_b, 16) - int(_a, 16)), 4)  # MADV_DONTNEED
+            except Exception:
+                pass
+
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
+            if name.endswith("experts.backend"):
+                _pageout_safetensors()
             if name.startswith("draft_model"):
                 continue
             names = name.split(".")
