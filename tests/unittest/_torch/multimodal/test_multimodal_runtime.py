@@ -241,6 +241,33 @@ class TestFindInputMmEmbed:
         assert result[0].shape == (5, _EMBED_DIM)
         torch.testing.assert_close(result[0], mm_embeds[0][5:10])
 
+    def test_single_batch_chunked_prefill_regression(self):
+        """
+        Reproduce the NVILA-style case where a single request carries the full
+        image embedding cache, but only the current chunk should be fused.
+        The 3072 -> 781 split mirrors the reported failure mode:
+        3072 is the full image embedding length for the request, while 781 is
+        the active multimodal token span in the current chunk.
+        """
+        total_mm_tokens = 3072
+        num_mm_tokens_in_chunk = 781
+        num_unseen_mm_tokens = total_mm_tokens - num_mm_tokens_in_chunk
+
+        mm_embeds = [torch.randn(total_mm_tokens, _EMBED_DIM)]
+        multimodal_params = [
+            _make_multimodal_params(num_unseen_mm_tokens,
+                                    num_mm_tokens_in_chunk, [total_mm_tokens])
+        ]
+
+        result = find_input_mm_embeds(mm_embeds, multimodal_params)
+
+        assert len(result) == 1
+        assert result[0].shape == (num_mm_tokens_in_chunk, _EMBED_DIM)
+        torch.testing.assert_close(
+            result[0],
+            mm_embeds[0][num_unseen_mm_tokens:total_mm_tokens],
+        )
+
     def test_noncontiguous_individual_batching_mixed_gaps(self):
         """
         Non-contiguous: individual batching mode, three requests with
