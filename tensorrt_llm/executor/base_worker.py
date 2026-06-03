@@ -743,7 +743,7 @@ class BaseWorker(GenerationExecutor):
                 values; forwarded verbatim to each rank's VMM call.
         """
         from tensorrt_llm._torch.pyexecutor.py_executor import (
-            _SLEEP_WAKEUP_ACK_TAG, _SLEEP_WAKEUP_ACTION_TAG, _SleepWakeupAction)
+            _SleepWakeupAction, _SleepWakeupTag)
         from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                         release_with_tag)
 
@@ -768,7 +768,7 @@ class BaseWorker(GenerationExecutor):
             for dest in range(1, world_size):
                 sleep_wakeup_comm.send(msg,
                                        dest=dest,
-                                       tag=_SLEEP_WAKEUP_ACTION_TAG)
+                                       tag=_SleepWakeupTag.ACTION)
 
             # Execute locally on rank-0.  Only CUDA/VMM errors are captured
             # as local_error; unexpected exceptions bypass the except clause
@@ -800,7 +800,7 @@ class BaseWorker(GenerationExecutor):
                     errors.append(local_error)
                 for src in range(1, world_size):
                     ack = sleep_wakeup_comm.recv(source=src,
-                                                 tag=_SLEEP_WAKEUP_ACK_TAG)
+                                                 tag=_SleepWakeupTag.ACK)
                     if ack.get("status") != "ok":
                         errors.append(
                             ack.get("error")

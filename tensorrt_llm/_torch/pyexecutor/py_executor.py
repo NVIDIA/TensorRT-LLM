@@ -6,7 +6,9 @@ import threading
 import time
 import traceback
 from contextlib import contextmanager
-from enum import Enum, IntEnum
+from enum import IntEnum
+
+from strenum import StrEnum
 from queue import Queue
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -100,14 +102,19 @@ class PPCommTag(IntEnum):
     SAMPLE_STATE = 20003
 
 
-# Tags for the dedicated sleep/wakeup communicator used by multi-rank sleep/wakeup.
-# Because _sleep_wakeup_comm is a duplicated communicator isolated from all other
-# MPI traffic, small tag values are safe and do not conflict with PPCommTag.
-_SLEEP_WAKEUP_ACTION_TAG = 0  # rank-0 -> non-rank-0: sleep/wakeup/shutdown msg
-_SLEEP_WAKEUP_ACK_TAG = 1  # non-rank-0 -> rank-0: ACK after action completes
+class _SleepWakeupTag(IntEnum):
+    """MPI message tags for the dedicated sleep/wakeup communicator.
+
+    Because ``_sleep_wakeup_comm`` is a duplicated communicator isolated from
+    all other MPI traffic, small tag values are safe and do not conflict with
+    ``PPCommTag``.
+    """
+
+    ACTION = 0  # rank-0 -> non-rank-0: sleep/wakeup/shutdown msg
+    ACK = 1  # non-rank-0 -> rank-0: ACK after action completes
 
 
-class _SleepWakeupAction(str, Enum):
+class _SleepWakeupAction(StrEnum):
     """Action values carried in sleep/wakeup control messages."""
 
     SLEEP = "sleep"
@@ -981,7 +988,7 @@ class PyExecutor:
                         "tags": []
                     },
                     dest=dest,
-                    tag=_SLEEP_WAKEUP_ACTION_TAG,
+                    tag=_SleepWakeupTag.ACTION,
                 )
         self.worker_started = False
         # Release CUDA graphs before resource managers free their GPU memory.
@@ -2235,7 +2242,7 @@ class PyExecutor:
         try:
             while True:
                 msg = self._sleep_wakeup_comm.recv(source=0,
-                                                   tag=_SLEEP_WAKEUP_ACTION_TAG)
+                                                   tag=_SleepWakeupTag.ACTION)
                 # Check for shutdown before entering the ACK-guarded block so
                 # we can break cleanly without sending a spurious ACK.
                 if msg.get("action") == _SleepWakeupAction.SHUTDOWN:
@@ -2297,7 +2304,7 @@ class PyExecutor:
                             "error": error_msg
                         },
                         dest=0,
-                        tag=_SLEEP_WAKEUP_ACK_TAG,
+                        tag=_SleepWakeupTag.ACK,
                     )
         finally:
             set_thread_local_mpi_comm(None)
