@@ -479,6 +479,9 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+# Qwen3.5-MoE-VL is hybrid (Mamba + attention);
+# the FlashInfer GDN prefill kernel is sm90+ only.
+@skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
@@ -507,7 +510,6 @@ class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
-    @skip_pre_hopper
     def test_fp8_prequantized(self) -> None:
         model_path = f"{llm_models_root()}/Qwen3.5-35B-A3B-FP8"
         with self._make_llm(model_path) as llm:
