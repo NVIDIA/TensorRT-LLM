@@ -1084,7 +1084,22 @@ def create_input_processor_with_hash(
         cache identifier and returned in KV cache events instead of the content hash.
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
-        mm_data = inputs['multi_modal_data']
+        # Promote any modality payload nested inside another modality's items
+        # (e.g. Nano's video-embedded audio) to a first-class top-level item
+        # BEFORE hashes, lengths, and order resolution are derived. This mirrors
+        # call_with_token_ids and keeps the hashing path aligned with the
+        # processed `multimodal_item_order`, which references the promoted items
+        # (e.g. a hoisted `audio`). Resolving the order against the raw,
+        # un-promoted data would raise "order references modality ..." and
+        # silently disable multimodal hashing / block reuse. The base
+        # implementation is a no-op, so single-modality and non-promoting
+        # processors are unaffected.
+        promote_nested_mm_data = getattr(input_processor,
+                                         "promote_nested_mm_data", None)
+        if callable(promote_nested_mm_data):
+            mm_data = promote_nested_mm_data(inputs['multi_modal_data'])
+        else:
+            mm_data = inputs['multi_modal_data']
 
         # Extract optional UUIDs (can be None, or dict with same structure as mm_data)
         mm_uuids = inputs.get('multi_modal_uuids', None)

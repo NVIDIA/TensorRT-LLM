@@ -385,3 +385,166 @@ def test_call_with_token_ids_flattens_mixed_modalities_in_prompt_order():
     # Result is the (sentinel) expanded ids the hook returned.
     assert expanded_ids == [-1]
     assert "multimodal_data" in extra
+
+
+# --- Nano-style video-embedded-audio hoist through the hashing path ---------
+#
+# A video carrying an embedded audio track is modeled (Nano) as a separate
+# `(audio, k)` prompt item: the processor PROMOTES the embedded audio to a
+# top-level `audio` item and writes a `multimodal_item_order` that references
+# `audio`. The raw `inputs["multi_modal_data"]` the hashing wrapper sees is the
+# UN-promoted shape (`video` only, audio nested on the `VideoData`). The hashing
+# path must promote that raw data before order resolution / hashing so the
+# resolved order, hashes, and lengths all align with the promoted item set.
+_NANO_VIDEO_FEATURE_ID = 201
+_NANO_AUDIO_FEATURE_ID = 301
+_NANO_VIDEO_TOKENS = 4  # vision-only video budget (audio hoisted off)
+_NANO_AUDIO_TOKENS = 3
+# Per-item lengths in prompt order: video first, then the hoisted audio.
+_NANO_PROMPT_ORDER_TOKENS = [_NANO_VIDEO_TOKENS, _NANO_AUDIO_TOKENS]
+# Expanded stream: <pre> video-run <mid> audio-run <post>.
+_NANO_EXPANDED_IDS = (
+    [10]
+    + [_NANO_VIDEO_FEATURE_ID] * _NANO_VIDEO_TOKENS
+    + [11]
+    + [_NANO_AUDIO_FEATURE_ID] * _NANO_AUDIO_TOKENS
+    + [12]
+)
+
+
+class _FakeNanoVideoAudioProcessor(BaseMultimodalInputProcessor):
+    """Reproduce Nano's video-embedded audio hoist as seen by the hashing path.
+
+    The raw request carries a single `video` whose `VideoData` nests an audio
+    track. `promote_nested_mm_data` hoists that audio to a top-level `audio`
+    item (vision-only-stripping the video), and `call_with_text_prompt` returns
+    a `multimodal_item_order` of `[(video, 0), (audio, 0)]` — i.e. the processed
+    metadata references a modality (`audio`) that is absent from the raw,
+    un-promoted `multi_modal_data`.
+    """
+
+    def __init__(self):
+        # Bypass BaseMultimodalInputProcessor.__init__; set only the attributes
+        # the exercised path reads.
+        self._tokenizer = None
+        self._config = None
+        self._model_path = None
+        self._use_fast = True
+        self._trust_remote_code = True
+        self._multimodal_hashing_supported = None
+
+    # --- abstract members (unused by the exercised path, stubbed minimally) ---
+    @property
+    def processor(self):
+        return None
+
+    @property
+    def tokenizer(self):
+        return self._tokenizer
+
+    @property
+    def config(self):
+        return self._config
+
+    @property
+    def dtype(self):
+        return torch.float32
+
+    # --- the Nano hoist contract under test ---
+    def promote_nested_mm_data(self, mm_data):
+        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
+        video_audios = [getattr(v, "audio", None) for v in videos]
+        if not any(a is not None for a in video_audios):
+            return mm_data
+        promoted = dict(mm_data)
+        promoted["audio"] = [(a.samples, a.sample_rate) for a in video_audios if a is not None]
+        # Vision-only-strip the audio off the videos (originals untouched).
+        vision_only = []
+        for video in videos:
+            if getattr(video, "audio", None) is not None:
+                video = VideoData(frames=video.frames, metadata=video.metadata, audio=None)
+            vision_only.append(video)
+        promoted["video"] = vision_only
+        return promoted
+
+    def call_with_text_prompt(self, inputs, sampling_params):
+        # Mirror Nano's mixed path: promote the embedded audio, then emit an
+        # item order that references the promoted `audio` item.
+        mm_data = self.promote_nested_mm_data(inputs["multi_modal_data"])
+        assert "audio" in mm_data  # the hoist happened
+        item_order = [("video", 0), ("audio", 0)]
+        multimodal_data = {
+            "multimodal_item_order": [
+                {"modality": modality, "index": idx} for modality, idx in item_order
+            ],
+        }
+        return list(_NANO_EXPANDED_IDS), {"multimodal_data": multimodal_data}
+
+    def get_num_tokens_per_video(self, **kwargs):
+        return _NANO_VIDEO_TOKENS
+
+    def get_num_tokens_per_audio(self, *, audio, **kwargs):
+        return _NANO_AUDIO_TOKENS
+
+    def get_vocab_size(self):
+        return None
+
+    def get_mm_token_ids(self):
+        return torch.tensor([_NANO_VIDEO_FEATURE_ID, _NANO_AUDIO_FEATURE_ID])
+
+    def get_mm_special_token_ids(self):
+        return None
+
+
+def _nano_video_with_embedded_audio():
+    """A raw (un-promoted) request: one video whose VideoData nests audio."""
+    audio = AudioData(samples=torch.ones(16000), sample_rate=16000)
+    video = VideoData(
+        frames=[torch.zeros(3, 4, 4)],
+        metadata={"fps": 30.0},
+        audio=audio,
+    )
+    return {
+        "prompt": "video-with-audio prompt",
+        "multi_modal_data": {"video": [video]},
+        "multi_modal_uuids": {"video": ["vid-0"]},
+    }
+
+
+def test_hashing_path_promotes_video_embedded_audio_before_order_resolution():
+    """Hashing must promote video-embedded audio before resolving the item order.
+
+    The processor-emitted order references the hoisted `audio` item, so it must
+    validate against the (now promoted) mm_data.
+
+    Regression: previously the path resolved/validated the processed
+    `multimodal_item_order` (which references `audio`) against the UN-promoted
+    raw `multi_modal_data` (which has only `video`), raising an
+    order-references-modality-audio error and disabling multimodal hashing.
+    """
+    processor = _FakeNanoVideoAudioProcessor()
+    wrapper = create_input_processor_with_hash(processor)
+
+    prompt_token_ids, extra = wrapper(_nano_video_with_embedded_audio(), SamplingParams())
+
+    # Hashing succeeded: the wrapper did NOT mark hashing unsupported.
+    assert processor.multimodal_hashing_supported is True
+    # The expanded stream is forwarded as-is.
+    assert prompt_token_ids == list(_NANO_EXPANDED_IDS)
+
+    # The resolved order + per-item lengths span BOTH the video and the hoisted
+    # audio (prompt order: video, then audio).
+    multimodal_data = extra["multimodal_data"]
+    assert multimodal_data["multimodal_item_order"] == [
+        {"modality": "video", "index": 0},
+        {"modality": "audio", "index": 0},
+    ]
+    mm_input = extra["multimodal_input"]
+    assert mm_input.multimodal_lengths == _NANO_PROMPT_ORDER_TOKENS
+    # One hash per item, including the promoted audio item.
+    assert len(mm_input.multimodal_hashes) == 2
+    # The promoted audio item had no user-supplied UUID, so it falls back to
+    # content hashing (None); the video keeps its UUID.
+    assert mm_input.multimodal_uuids == ["vid-0", None]
+    # Positions land on the two mm-token runs in the expanded stream.
+    assert mm_input.multimodal_positions == [1, 6]
