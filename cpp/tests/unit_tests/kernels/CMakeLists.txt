@@ -113,3 +113,6 @@ endif()
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
+add_gtest(kimiMlaGroupedSelectionTest kimiMlaGroupedSelectionTest.cpp)
+# Enables the test-only kernel-selection probe in fmhaRunner.h / fmhaKernels.h.
+target_compile_definitions(kimiMlaGroupedSelectionTest PRIVATE TLLM_FMHA_TEST_HOOKS=1)
