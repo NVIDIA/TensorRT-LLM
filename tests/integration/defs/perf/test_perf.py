@@ -1077,8 +1077,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.model_name in HF_MODEL_PATH.keys():
             tokenizer_dir = HF_MODEL_PATH[self._config.model_name]
         else:
-            tokenizer_dir = os.path.join(llm_models_root(), "llama-models",
-                                         "llama-7b-hf")
+            tokenizer_dir = os.path.join(llm_models_root(), "llama-models-v2",
+                                         "TinyLlama-1.1B-Chat-v1.0")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
 

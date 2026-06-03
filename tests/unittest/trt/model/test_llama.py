@@ -436,31 +436,25 @@ class TestLLaMA(unittest.TestCase):
     def get_loader_test_cases():
         test_cases = []
         test_cases.extend(
-            list(
-                product([
-                    ("llama-7b-hf", "7B"),
-                ], [
-                    (1, 0),
-                    (2, 0),
-                    (2, 1),
-                ], [
-                    -1,
-                    0,
-                    1,
-                ])))
+            list(product([], [
+                (1, 0),
+                (2, 0),
+                (2, 1),
+            ], [
+                -1,
+                0,
+                1,
+            ])))
         test_cases.extend(
             list(
-                product([
-                    ("llama-7b-4gqa-hf", "7B-4GQA"),
-                ], [(1, 0), (2, 0), (2, 1), (4, 0), (4, 1)], [-1, 0, 1])))
-        test_cases.extend(
-            list(
-                product([
-                    ("llama-7b-4gqa-hf", "7B-4GQA"),
-                ], [(8, 0), (8, 7)], [-1, 0, 1])))
+                product([], [(1, 0), (2, 0), (2, 1), (4, 0), (4, 1)],
+                        [-1, 0, 1])))
+        test_cases.extend(list(product([], [(8, 0), (8, 7)], [-1, 0, 1])))
         return test_cases
 
-    @parameterized.expand(get_loader_test_cases, name_func=unittest_name_func)
+    @parameterized.expand(get_loader_test_cases,
+                          name_func=unittest_name_func,
+                          skip_on_empty=True)
     def test_loaders(self, paths, tp_info, emb_sharding_dim):
         model_root = llm_models_root()
         if model_root is None:

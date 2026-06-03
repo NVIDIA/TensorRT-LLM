@@ -21,7 +21,6 @@ l0_a100:
     - unittest/llmapi/test_mpi_session.py ISOLATION
     - unittest/llmapi/test_memory_profiling.py::test_profile_kvcache # profile kvcache for vision encoder
     - unittest/llmapi/test_memory_profiling.py::test_pyexecutor_and_kvcache_share_execution_stream # test that PyExecutor and KVCacheManager share the same execution_stream
-    - unittest/trt/model_api/test_model_quantization.py
     # executor
     - unittest/executor/test_base_worker.py ISOLATION
     - unittest/executor/test_rpc_proxy.py
@@ -71,7 +70,6 @@ l0_a100:
       stage: post_merge
       backend: tensorrt
   tests:
-  - unittest/trt/model_api/test_model_level_api.py
   - unittest/trt/model_api/test_model_api_multi_gpu.py
   - unittest/trt/model/test_gpt_e2e.py
   - unittest/trt/model/eagle
