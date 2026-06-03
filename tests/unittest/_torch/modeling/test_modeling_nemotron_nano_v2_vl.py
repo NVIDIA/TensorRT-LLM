@@ -604,7 +604,10 @@ class TestEncodeMultimodalAudioOrder:
 
         # vision_encoder is called once for the whole video bucket (both videos),
         # returning one embedding per item in bucket (= input) order.
-        vision_return = ([v0_emb, v1_emb], [list(range(v0_len)), list(range(v1_len))])
+        # Per-video EVS token counts are TENSORS (what the real vision_encoder /
+        # apply_evs_per_video returns), so the multi-video concat in
+        # `_adapter_vision_bucket` can `torch.cat` them.
+        vision_return = ([v0_emb, v1_emb], [torch.arange(v0_len), torch.arange(v1_len)])
         # `_encode_audio` is called once for the whole audio bucket, returning one
         # (emb, per_clip_counts) per item in order.
         audio_returns = [(a0_emb, [a0_len]), (a1_emb, [a1_len])]

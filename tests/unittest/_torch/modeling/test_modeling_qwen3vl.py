@@ -143,7 +143,13 @@ def _qwen_image_video_param(include_order=True, include_lengths=True):
     if include_order:
         # Prompt order: video item first, then image item.
         multimodal_data["multimodal_item_order"] = [("video", 0), ("image", 0)]
-    if not include_lengths:
+    if include_lengths:
+        # Per-item encoder rows in PROMPT order (video=3, then image=4), aligned
+        # with `multimodal_item_order`. The producer emits this key alongside the
+        # order, and the refactored extractor sources per-item rows from it (via
+        # `MixedModalEncodeContext.from_metadata`).
+        multimodal_data["multimodal_embedding_lengths"] = [3, 4]
+    else:
         # Drop the explicit per-item counts so the token-count fallback chain has
         # nothing to resolve (no num_tokens, no embedding lengths, no runtime).
         del multimodal_data["image"]["num_tokens"]
