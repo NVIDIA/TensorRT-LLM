@@ -28,6 +28,15 @@ from ..dsa import HAS_FAST_HADAMARD, DSAtrtllmAttentionMetadata, Indexer, rotate
 from ..kernel import deepseek_v4_local_to_global_indices
 from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
 
+# DIAGNOSTIC (2026-06-02): force SWA-only (no compressed long-range pool) to isolate whether the compressed pool is
+# the driver of the SM120 long-context reasoning degradation. Read once at import so it is a compile-time constant
+# inside the @maybe_compile'd index builder (no graph break). Set TRTLLM_DSV4_SM120_SWA_ONLY=1 to enable.
+_DSV4_SM120_SWA_ONLY = os.environ.get("TRTLLM_DSV4_SM120_SWA_ONLY", "0") == "1"
+# DIAGNOSTIC (2026-06-02): selectively disable ONE compressed sub-pool to localize the harm WITHIN the compressed
+# path. NO_HCA drops the ratio-128 heavily-compressed pool (keeps ratio-4 CSA); NO_CSA drops the ratio-4 compressed
+# pool (keeps ratio-128 HCA). Same compile-time-constant pattern as SWA-only. Both default off => no behavior change.
+_DSV4_SM120_NO_HCA = os.environ.get("TRTLLM_DSV4_SM120_NO_HCA", "0") == "1"  # ratio-128 (heavily-compressed) off
+_DSV4_SM120_NO_CSA = os.environ.get("TRTLLM_DSV4_SM120_NO_CSA", "0") == "1"  # ratio-4 (compressed-sparse) off
 # On SM120 there is no DeepGEMM lightning indexer, and its dense fallback is stale/wrong for kv > index_topk -> the
 # ratio-4/CSA layers gathered the wrong compressed tokens (the SM120 long-context accuracy bug). CSA's correct
 # selection while the compressed count (kv//4) <= index_topk (i.e. kv <= index_topk*4) is "attend ALL compressed
@@ -36,7 +45,13 @@ from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
 # NOTE kv > index_topk*4 attends only the OLDEST index_topk entries -- a stopgap until a real SM120 lightning-indexer
 # top-k is implemented.
 _DSV4_SM120_RATIO4_USE_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_RATIO4_USE_INDEXER", "0") == "1"
-
+# Item 2: run the REAL SM120 lightning-indexer top-k (torch scorers in dsa.py +
+# torch top-k) instead of the kv<=2048 sequential stopgap, so long context
+# (kv>2048) gets the correct learned selection. DEFAULT OFF -> the committed
+# stopgap remains the default; when set, un-gates the indexer prep + forward on
+# SM120. Pair with TRTLLM_DSV4_SM120_RATIO4_USE_INDEXER=1 so ratio-4 consumes the
+# real topk_indices. Mirrors dsa.py's _DSV4_SM120_REAL_INDEXER (same env var).
+_DSV4_SM120_REAL_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_REAL_INDEXER", "0") == "1"
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
@@ -542,7 +557,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # Hardcoded 128: compressed_local_indices only applies to ratio=128
         # layers. This is a design constraint — see compress_ratio_set
         # validation in __post_init__ which restricts ratios to {1, 4, 128}.
-        num_valid = (token_positions + 1) // 128
+        # SWA-only / NO_HCA diagnostic: zero ratio-128 compressed indices so the kernel gathers only the SWA window.
+        num_valid = (torch.zeros_like(token_positions) if (_DSV4_SM120_SWA_ONLY or _DSV4_SM120_NO_HCA)
+                     else (token_positions + 1) // 128)
         comp_col = torch.arange(max_compressed_indices_128, dtype=torch.int32, device=device)
         valid_mask = comp_col.unsqueeze(0) < num_valid.unsqueeze(1)
         comp_indices = torch.where(
@@ -564,15 +581,27 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For ratio>1, the SWA region always occupies exactly window_size (128)
         # slots. Invalid SWA positions are padded with -1 in the index buffer.
         kv_lens = token_positions + 1
+        swa_only_count = kv_lens.clamp(max=window_size)
         for compress_ratio in compress_ratios:
-            if compress_ratio == 1:
-                total_count = kv_lens.clamp(max=window_size)
+            if _DSV4_SM120_SWA_ONLY:
+                # SWA-only: attend just the local window, no compressed tokens (all ratios).
+                total_count = swa_only_count
+            elif compress_ratio == 1:
+                total_count = swa_only_count
             elif compress_ratio == 4:
-                compressed_count = (kv_lens // compress_ratio).clamp(max=sparse_mla_topk)
-                total_count = window_size + compressed_count
+                # NO_CSA diagnostic: drop the ratio-4 compressed pool (SWA window only for these layers).
+                if _DSV4_SM120_NO_CSA:
+                    total_count = swa_only_count
+                else:
+                    compressed_count = (kv_lens // compress_ratio).clamp(max=sparse_mla_topk)
+                    total_count = window_size + compressed_count
             elif compress_ratio == 128:
-                compressed_count = kv_lens // compress_ratio
-                total_count = window_size + compressed_count
+                # NO_HCA diagnostic: drop the ratio-128 heavily-compressed pool (SWA window only for these layers).
+                if _DSV4_SM120_NO_HCA:
+                    total_count = swa_only_count
+                else:
+                    compressed_count = kv_lens // compress_ratio
+                    total_count = window_size + compressed_count
             else:
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
             sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
@@ -644,7 +673,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # ("Unsupported architecture"). Skip the indexer K-cache + scheduler
         # metadata prep so init/warmup don't hit those kernels.
         has_sparse_layers = (DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
-                             and get_sm_version() != 120)
+                             and (get_sm_version() != 120
+                                  or _DSV4_SM120_REAL_INDEXER))
 
         # For block offsets
         self.prepare_for_block_tables()
@@ -1247,7 +1277,7 @@ class DeepseekV4Indexer(Indexer):
         # DeepGEMM _run_serial_indexer_prepare entirely (it rejects SM120).
         # NOTE: only correct while skip_indexer_for_{ctx,gen}_reqs hold (short seqs);
         # true long-context sparse selection on SM120 still needs DeepGEMM kernels.
-        if get_sm_version() == 120:
+        if get_sm_version() == 120 and not _DSV4_SM120_REAL_INDEXER:
             return metadata.topk_indices_buffer[: hidden_states.shape[0]]
 
         if do_multi_stream() and self.aux_stream is not None:
@@ -1275,6 +1305,10 @@ class DeepseekV4Indexer(Indexer):
                 k_fp8,
                 k_scale,
                 weights,
+                # SM120 has no DeepGEMM/cute-dsl indexer top-k kernel; use the
+                # arch-agnostic torch top-k fallback (logits.topk + masking).
+                use_custom_topk=not (get_sm_version() == 120
+                                     and _DSV4_SM120_REAL_INDEXER),
                 q_scale=q_scale,
                 update_k_cache=False,
             )
