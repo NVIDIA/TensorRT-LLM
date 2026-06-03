@@ -343,7 +343,9 @@ class TestNoBatching(TestKVCacheManagerV2):
             req_id, self.manager.create_kv_cache(reuse_scope, prompt), prompt, decode_len
         )
 
-    def run_request(self, req: Request, interval: int, refcheck: bool) -> float:
+    def run_request(
+        self, req: Request, interval: int, refcheck: bool, delay_commit: bool = False
+    ) -> float:
         req_id, kv_cache, prompt, decode_len = req
         assert kv_cache.status == _KVCache.Status.ACTIVE
         stream = kv_cache.cuda_stream
@@ -366,7 +368,8 @@ class TestNoBatching(TestKVCacheManagerV2):
         for _ in range(decode_len):
             required_capacity = len(history) + 1
             if required_capacity > capacity:
-                kv_cache.commit(history[kv_cache.history_length :])
+                if not delay_commit:
+                    kv_cache.commit(history[kv_cache.history_length :])
                 # workaround a mypyc bug: exception in property setter is not propagated
                 # kv_cache.capacity = round_up(required_capacity, interval)
                 if not kv_cache.resize(round_up(required_capacity, interval)):
@@ -391,6 +394,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         interval: int = 1,
         refcheck: bool = True,
         use_external_page_index_buf: bool = False,
+        delay_commit: bool = False,
     ) -> float:
         prompt_len = 1
         decode_len = seq_len - prompt_len
@@ -413,7 +417,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             kv_cache = req0.kv_cache
             success = kv_cache.resume(stream)
             assert success
-            time_taken = self.run_request(req0, interval, refcheck)
+            time_taken = self.run_request(req0, interval, refcheck, delay_commit)
 
         s.take_finish_event().synchronize()
         kv_cache.close()
@@ -576,9 +580,14 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertGreater(num_reused(None), 0)
         self.assertGreater(num_reused(default_scope), 0)
 
-    @parameterized.expand(list(itertools.product([False, True], repeat=2)))
+    @parameterized.expand(list(itertools.product([False, True], repeat=3)))
     # @assert_no_ref_cycle
-    def test_naive(self, use_external_page_index_buf: bool, use_block_quant: bool) -> None:
+    def test_naive(
+        self,
+        use_external_page_index_buf: bool,
+        use_block_quant: bool,
+        delay_commit: bool,
+    ) -> None:
         self.prepare(
             256 << 20,
             256 << 20,
@@ -588,7 +597,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             48,
             block_quant_buf_size=(1024 if use_block_quant else None),
         )
-        self.run_naive(512, 1, True, use_external_page_index_buf)
+        self.run_naive(512, 1, True, use_external_page_index_buf, delay_commit=delay_commit)
 
     @parameterized.expand([(2**i, False) for i in range(12)])
     # @parameterized.expand([(32, True)])
