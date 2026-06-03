@@ -167,24 +167,28 @@ def globalVars = [
 
 // QA verification (--qa-verify-only): when set, the normal build/test pipeline
 // is skipped and the QA function pipeline (LLM_FUNCTION_AUTO_V2C) is triggered
-// on the QA Jenkins server instead. The flag carries the target test case, e.g.
-//   /bot run --qa-verify-only test <case name>
+// on the QA Jenkins server instead. The flag may carry an optional customized
+// test list, e.g.
+//   /bot run --qa-verify-only test <customized test list>
 // Pre-conditions handled at trigger time (see launchQaVerify):
 //   1. nvbug id is parsed from the PR title (format: [https://nvbugs/<id>]...).
 //   2. fork (source repo) and branch are taken from the PR / merge request.
 def qaVerifyParam = gitlabParamsFromBot.get('qa_verify_only', null)
 boolean qaVerifyOnly = (qaVerifyParam != null && qaVerifyParam != false)
-String qaVerifyTestCase = (qaVerifyParam instanceof String && qaVerifyParam?.trim()) ?
+String qaVerifyTestList = (qaVerifyParam instanceof String && qaVerifyParam?.trim()) ?
     qaVerifyParam.trim() : gitlabParamsFromBot.get('qa_verify_test_case', null)
 
 // QA Jenkins configuration for --qa-verify-only.
-// NOTE: confirm these values match the QA Jenkins setup before enabling.
+// The remote URL and job path are stored as Jenkins "Secret text" credentials
+// (same approach as default-llm-repo / default-git-url) so internal
+// infrastructure details are not hardcoded in this public repository. These
+// credential IDs must be configured on the CI Jenkins controller before use.
 @Field
-def QA_VERIFY_REMOTE_JENKINS_URL = "https://prod.blsm.nvidia.com/swqa-tensorrt-qa-test/"
+def VERIFY_URL = "verify-remote-jenkins-url"
 @Field
-def QA_VERIFY_JOB = "view/TRT-LLM-Function-Pipelines/job/LLM_FUNCTION_AUTO_V2C"
+def VERIFY_JOB = "verify-job"
 @Field
-def QA_VERIFY_TOKEN_CREDENTIAL_ID = "qa-jenkins-remote-trigger-token"
+def VERIFY_CREDENTIAL = "remote-trigger-secret"
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 // GenPostMergeBuilds pipelines do not update GitLab status.
@@ -1170,15 +1174,10 @@ def extractNvbugId(prTitle)
 // QA Jenkins server for --qa-verify-only. Pre-conditions:
 //   1. nvbug id parsed from the PR title.
 //   2. fork (source repo) and branch taken from the PR / merge request.
-def launchQaVerify(pipeline, globalVars, qaVerifyTestCase)
+def launchQaVerify(pipeline, globalVars, qaVerifyTestList)
 {
     stage("QA Verify") {
-        // A target test case must be provided.
-        if (!qaVerifyTestCase?.trim()) {
-            error "QA verify requires a test case, e.g. /bot run --qa-verify-only test <case name>"
-        }
-
-        // Pre-condition 1: nvbug id from the PR title.
+        // Pre-condition 1: nvbug id from the PR title (required).
         def prTitle = getPrTitle(pipeline, globalVars)
         pipeline.echo("PR title: ${prTitle}")
         def nvbugId = extractNvbugId(prTitle)
@@ -1194,26 +1193,42 @@ def launchQaVerify(pipeline, globalVars, qaVerifyTestCase)
             error "QA verify could not determine the source branch from the PR."
         }
 
+        // Optional customized test list entries (one per line and/or
+        // comma-separated, "#" comments allowed); appended to the bug's
+        // waives/test_records result. Only applied in manual mode (nvbug_ids
+        // non-empty); blank means none.
+        def customizedTestList = qaVerifyTestList?.trim() ?: ""
+
         pipeline.echo(
-            "Triggering QA verify job '${QA_VERIFY_JOB}': " +
-            "nvbug=${nvbugId}, fork=${fork}, branch=${branch}, testCase=${qaVerifyTestCase}")
+            "Triggering QA verify job: " +
+            "nvbug_ids=${nvbugId}, fork=${fork}, branch=${branch}, " +
+            "customized_test_list=${customizedTestList}, dry_run_close=true")
 
         // NOTE: the parameter names below must match the LLM_FUNCTION_AUTO_V2C
         // job definition on the QA Jenkins server. Adjust if they differ.
+        // dry_run_close=true verifies the fix without auto-closing the nvbug.
         def qaParameters = [
-            "nvbug_id=${nvbugId}",
+            "nvbug_ids=${nvbugId}",
             "fork=${fork}",
             "branch=${branch}",
-            "test_case=${qaVerifyTestCase}",
+            "customized_test_list=${customizedTestList}",
+            "dry_run_close=true",
         ].join("\n")
 
-        triggerRemoteJob(
-            remoteJenkinsUrl: QA_VERIFY_REMOTE_JENKINS_URL,
-            job: QA_VERIFY_JOB,
-            parameters: qaParameters,
-            auth: CredentialsAuth(credentials: QA_VERIFY_TOKEN_CREDENTIAL_ID),
-            blockBuildUntilComplete: false,
-        )
+        // The remote URL and job path are kept out of source as secret-text
+        // credentials; Jenkins masks them in the build log.
+        withCredentials([
+            string(credentialsId: VERIFY_URL, variable: 'VERIFY_REMOTE_JENKINS_URL'),
+            string(credentialsId: VERIFY_JOB, variable: 'VERIFY_JOB'),
+        ]) {
+            triggerRemoteJob(
+                remoteJenkinsUrl: env.VERIFY_REMOTE_JENKINS_URL,
+                job: env.VERIFY_JOB,
+                parameters: qaParameters,
+                auth: CredentialsAuth(credentials: VERIFY_CREDENTIAL),
+                blockBuildUntilComplete: false,
+            )
+        }
     }
 }
 
@@ -1871,7 +1886,7 @@ pipeline {
             steps {
                 script {
                     if (qaVerifyOnly) {
-                        launchQaVerify(this, globalVars, qaVerifyTestCase)
+                        launchQaVerify(this, globalVars, qaVerifyTestList)
                     } else if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
