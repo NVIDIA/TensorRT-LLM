@@ -2246,7 +2246,13 @@ def test_disaggregated_deepseek_v4_pro_gen_only(disaggregated_test_root,
 @pytest.mark.timeout(12600)
 @pytest.mark.skip_less_mpi_world_size(24)
 @skip_pre_blackwell
-@pytest.mark.parametrize("concurrency", [256], ids=lambda x: f"conc{x}")
+# Keep the request count small (request_count == concurrency): each request
+# prefills 8192 tokens through the 2-ctx (TP4) instances, transfers its KV
+# cache, then decodes 1024 tokens on the gen (TP16) instance. At concurrency
+# 256 this 24-GPU, 6-node run did not finish inside the gb300-flex Slurm
+# wall-time; 16 still exercises ctx->gen routing, KV transfer and multi-node
+# decode while fitting the budget.
+@pytest.mark.parametrize("concurrency", [16], ids=lambda x: f"conc{x}")
 def test_disaggregated_deepseek_v4_pro_ctx2dep4_gen1dep16(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         concurrency):
