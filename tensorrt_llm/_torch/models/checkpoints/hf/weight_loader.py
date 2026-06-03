@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
-import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List
@@ -32,6 +31,12 @@ from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
                                  local_mpi_comm, local_mpi_rank, local_mpi_size)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+# Prefetch warms the OS page cache with a fixed-size reusable buffer instead of
+# materializing whole multi-GB shards in Python, and caps per-rank fanout so
+# LOCAL_MPI_SIZE * workers stays under networked-storage (NFS) in-flight limits.
+_PREFETCH_CHUNK_SIZE = 8 * 1024 * 1024
+_MAX_PREFETCH_WORKERS_PER_RANK = 2
 
 
 @register_checkpoint_weight_loader("MX")
@@ -162,8 +167,10 @@ class HfWeightLoader(BaseWeightLoader):
     def _prefetch_one_file(self, file_name):
         if os.path.exists(file_name):
             logger.info(f"Prefetching {file_name} to memory...")
+            buffer = bytearray(_PREFETCH_CHUNK_SIZE)
             with open(file_name, 'rb') as f:
-                f.read()
+                while f.readinto(buffer):
+                    pass
             logger.info(f"Finished prefetching {file_name}.")
 
     def prefetch_files(self, file_names: List[str]):
@@ -177,7 +184,6 @@ class HfWeightLoader(BaseWeightLoader):
         if len(local_file_names) == 0:
             return
 
-        max_workers = min(multiprocessing.cpu_count() * 2, 16,
-                          len(local_file_names))
+        max_workers = min(_MAX_PREFETCH_WORKERS_PER_RANK, len(local_file_names))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             list(executor.map(self._prefetch_one_file, local_file_names))

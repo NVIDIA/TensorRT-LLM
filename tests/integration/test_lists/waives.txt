@@ -276,11 +276,8 @@ perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20-gpus:2] SK
 perf/test_perf.py::test_perf[t5-bench-float16-maxbs:1-input_output_len:128,20-gpus:2] SKIP
 perf/test_perf.py::test_perf[t5_base-plugin-float16-bs:8-input_output_len:60,20] SKIP # (https://nvidia.slack.com/archives/C059LSY62BT/p1704525727177449)
 perf/test_perf.py::test_perf[whisper_large_v3-bench-float16-input_output_len:128,20] SKIP
-perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_k25_thinking_fp4_blackwell-k25_thinking_fp4_tep8_adp_2k1k] SKIP (https://nvbugs/6227472)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_2_nodes_grace_blackwell-k25_thinking_fp4_dep8_32k8k] SKIP (https://nvbugs/6236108)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_dep8_32k8k] SKIP (https://nvbugs/6236094)
-perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_dep8_8k1k] SKIP (https://nvbugs/6227472)
-perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_tep8_32k8k] SKIP (https://nvbugs/6227472)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-llama3_1_8b_fp8_ad_hopper-llama3_1_8b_ad_ws1_1k1k] SKIP (https://nvbugs/6244474)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] SKIP (https://nvbugs/6153575)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6215844)
