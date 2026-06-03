@@ -385,6 +385,15 @@ def test_call_with_token_ids_flattens_mixed_modalities_in_prompt_order():
     # Result is the (sentinel) expanded ids the hook returned.
     assert expanded_ids == [-1]
     assert "multimodal_data" in extra
+    # The token-id path bakes the resolved prompt order into metadata as the
+    # top-level `multimodal_item_order` key (same wire format the text path
+    # uses), so the hashing wrapper inherits the correct order instead of
+    # re-resolving it from a stale dummy-text scan.
+    assert extra["multimodal_data"]["multimodal_item_order"] == [
+        {"modality": "image", "index": 0},
+        {"modality": "audio", "index": 0},
+        {"modality": "image", "index": 1},
+    ]
 
 
 # --- Nano-style video-embedded-audio hoist through the hashing path ---------

@@ -2770,3 +2770,79 @@ class TestTokenPathVideoEmbeddedAudioHoist:
 
         with pytest.raises(NotImplementedError, match="standalone audio"):
             proc.promote_nested_mm_data(mm_data)
+
+
+class TestTokenPathBakesPromptItemOrder:
+    """The pre-tokenized (`call_with_token_ids`) path must bake the REAL
+    prompt-item order into `extra_processed_inputs["multimodal_data"]`.
+
+    The dummy-placeholder pass runs the text path on synthetic placeholder text
+    built modality-major by `get_text_with_mm_placeholders` (all images, then
+    videos, then audios). For a genuinely interleaved prompt that order is
+    wrong, so the token-id path must overwrite it with the order resolved from
+    the real prompt token IDs. Without that bake, the hashing wrapper inherits
+    the stale modality-major dummy order and the chunk layout no longer follows
+    the prompt.
+    """
+
+    @staticmethod
+    def _make_proc():
+        proc = _make_fast_path_audio_processor(video_target_num_patches=None)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
+
+        def shifted_encode(text, **kw):
+            ids = [1000 + i for i in range(len(text))]
+            if kw.get("return_tensors") == "pt":
+                return torch.tensor(ids).unsqueeze(0)
+            return ids
+
+        proc.tokenizer.encode = mock.Mock(side_effect=shifted_encode)
+        return proc
+
+    def test_interleaved_image_video_image_bakes_real_prompt_order(self):
+        # Real prompt: image, video, image -> [(image,0),(video,0),(image,1)].
+        # The modality-major dummy text would resolve [(image,0),(image,1),
+        # (video,0)] instead; the token-id bake must win.
+        proc = self._make_proc()
+        img_ctx = proc.img_context_token_id
+        vid_ctx = proc.video_context_token_id
+
+        frames = [Image.new("RGB", (64, 64)) for _ in range(2)]
+        metadata = {
+            "total_num_frames": 2,
+            "fps": 30.0,
+            "duration": 2 / 30.0,
+            "frames_indices": [0, 1],
+        }
+        video = VideoData(frames=frames, metadata=metadata, audio=None)
+        mm_data = {
+            "image": [Image.new("RGB", (64, 64)), Image.new("RGB", (64, 64))],
+            "video": [video],
+        }
+        prompt_token_ids = [1, img_ctx, 2, vid_ctx, 3, img_ctx, 4]
+
+        # Keep the dummy-placeholder pass CPU-only and orthogonal to the
+        # order-resolution under test.
+        proc._prepare_image_modality_data = mock.Mock(
+            return_value={"pixel_values": torch.ones(1, 3, 2, 2)}
+        )
+        proc._prepare_video_modality_data = mock.Mock(
+            return_value={
+                "pixel_values": torch.ones(2, 3, 2, 2),
+                "video_size": [[1, 1, 64, 64]],
+            }
+        )
+
+        _, extra = proc.call_with_token_ids(
+            {"prompt_token_ids": prompt_token_ids, "multi_modal_data": mm_data},
+            None,
+        )
+
+        multimodal_data = extra["multimodal_data"]
+        assert multimodal_data["multimodal_item_order"] == [
+            {"modality": "image", "index": 0},
+            {"modality": "video", "index": 0},
+            {"modality": "image", "index": 1},
+        ]

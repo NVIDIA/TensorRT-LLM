@@ -379,12 +379,22 @@ class BaseMultimodalInputProcessor(ABC):
             raise ValueError(
                 "call_with_token_ids: find_mm_token_lengths returned no token "
                 "lengths for the provided multi_modal_data.")
+        # The dummy-placeholder pass ran the text path on synthetic placeholder
+        # text built modality-major by `get_text_with_mm_placeholders`, which for
+        # a mixed request bakes a modality-major `multimodal_item_order` into the
+        # processed metadata. That order is stale w.r.t. the real (possibly
+        # interleaved) prompt, so drop it before resolving: otherwise
+        # `resolve_order` would short-circuit on the stale metadata instead of
+        # scanning the real `prompt_token_ids`.
+        dummy_multimodal_data = (extra_processed_inputs
+                                 or {}).get("multimodal_data")
+        if dummy_multimodal_data is not None:
+            dummy_multimodal_data.pop("multimodal_item_order", None)
         item_order = MixedModalEncodeContext.resolve_order(
             mm_data,
             self,
             prompt_token_ids=prompt_token_ids,
-            multimodal_data=(extra_processed_inputs
-                             or {}).get("multimodal_data"),
+            multimodal_data=dummy_multimodal_data,
         )
         num_mm_tokens = MixedModalEncodeContext.project_by_order(
             item_order, num_mm_tokens_by_key)
@@ -406,6 +416,16 @@ class BaseMultimodalInputProcessor(ABC):
                 "multimodal_data", {})
             for modality, field_updates in mm_data_updates.items():
                 mm_container.setdefault(modality, {}).update(field_updates)
+
+        # Bake the resolved prompt-item order into the processed metadata so the
+        # hashing wrapper (and any downstream consumer) inherits the order
+        # derived from the real prompt token IDs, matching the wire format the
+        # text path produces. Replaces the stale dummy-text order dropped above.
+        mm_container = extra_processed_inputs.setdefault("multimodal_data", {})
+        mm_container["multimodal_item_order"] = [{
+            "modality": modality,
+            "index": idx,
+        } for modality, idx in item_order]
 
         return expanded_ids, extra_processed_inputs
 
