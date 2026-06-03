@@ -178,7 +178,12 @@ def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
 
 
 def _invoke_update_iter_stats(
-    scheduled_batch, queued_items, *, num_ctx_tokens, enable_attention_dp=False
+    scheduled_batch,
+    queued_items,
+    *,
+    num_ctx_tokens,
+    enable_attention_dp=False,
+    iter_states=None,
 ):
     """Call real ``PyExecutor._update_iter_stats`` unbound; return the stats.
 
@@ -219,6 +224,7 @@ def _invoke_update_iter_stats(
             num_completed_requests=0,
             scheduled_batch=scheduled_batch,
             micro_batch_id=0,
+            iter_states=iter_states,
         )
     return stats
 
@@ -535,6 +541,34 @@ def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
     assert ifb.num_ctx_kv_tokens == 256
 
 
+def test_num_ctx_tokens_uses_batch_iter_states_not_model_engine_side_channel():
+    """Regression guard: num_ctx_tokens must come from the batch snapshot."""
+    ctx = [_StubRequest(context_chunk_size=744, context_current_position=256)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx),
+        [],
+        num_ctx_tokens=99999,
+        iter_states={"num_ctx_tokens": 744},
+    )
+
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_ctx_tokens == 744
+
+
+def test_num_gen_kv_tokens_uses_pre_forward_snapshot():
+    """Regression guard: decode KV must not include post-sample token growth."""
+    gen = [_StubRequest(num_tokens=1025)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=gen),
+        [],
+        num_ctx_tokens=0,
+        iter_states={"num_gen_kv_tokens": 1024},
+    )
+
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_gen_kv_tokens == 1024
+
+
 # ---------------------------------------------------------------------------
 # Attention-DP fanout tests: completed rank-local payloads are carried by the
 # next ADP allgather, then rank 0 appends one row per ADP rank.
@@ -583,6 +617,9 @@ def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
         ["req-stats"] if is_rank0 else None,
         kv_iter_stats={0: "pending-kv"} if is_rank0 else None,
         is_rank0=is_rank0,
+        host_step_time_ms=11.0 if is_rank0 else None,
+        prev_device_step_time_ms=9.0 if is_rank0 else None,
+        gpu_forward_time_ms=7.0 if is_rank0 else None,
     )
     return buffer
 
@@ -647,6 +684,9 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank0_ifb.num_queued_gen_kv_tokens == 800
     assert rank0_record.req_stats == ["req-stats"]
     assert rank0_record.kv_iter_stats == {0: "pending-kv"}
+    assert rank0_record.host_step_time_ms == 11.0
+    assert rank0_record.prev_device_step_time_ms == 9.0
+    assert rank0_record.gpu_forward_time_ms == 7.0
 
     rank1_record = records[1]
     rank1_row = rank1_record.stats
@@ -669,6 +709,9 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank1_ifb.num_queued_gen_kv_tokens == 0
     assert rank1_record.req_stats is None
     assert rank1_record.kv_iter_stats is None
+    assert rank1_record.host_step_time_ms == 11.0
+    assert rank1_record.prev_device_step_time_ms == 9.0
+    assert rank1_record.gpu_forward_time_ms == 7.0
 
     assert buffer._payloads == {}
     assert buffer.next_payload() is None
