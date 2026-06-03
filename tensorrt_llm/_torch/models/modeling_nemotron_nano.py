@@ -1736,6 +1736,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 raise ValueError(f"Prompt contains unexpected multimodal item {matched_item}.")
             modality, item_idx = matched_item
             num_tokens = lengths_by_item[matched_item]
+            # item_evs feeds the parallel EVS stream. For image/audio it equals the
+            # final expansion (EVS leaves them alone); for video it is the per-tubelet
+            # placeholder skeleton, deferred to forward-time EVS in merge_evs_mm_embeds.
             if modality == "image":
                 item_expansion = self._expand_image_placeholders_in_token_ids(
                     [self.img_context_token_id], [num_tokens]
@@ -1768,6 +1771,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             )
         if evs is None:
             return expanded, None
+        # evs is the full interleaved per-request sequence: text kept verbatim, image
+        # and audio fully expanded to their final context tokens, and video left as a
+        # per-tubelet placeholder skeleton (resolved later by merge_evs_mm_embeds, once
+        # forward-time EVS pruning is known). Store the SAME tensor under every modality
+        # key present so merge_evs_mm_embeds can read the whole layout from any slot.
         evs_tensor = torch.tensor(evs, dtype=torch.long)
         return expanded, {
             modality: {"evs_ids": evs_tensor}
@@ -3340,6 +3348,9 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             Full per-request token IDs with video placeholders replaced by the
             post-EVS number of image context tokens.
         """
+        # image/audio token IDs are already final after preprocessing (EVS never prunes
+        # them), so pass the full sequence through untouched. Only video needs its
+        # per-tubelet skeleton expanded to the post-EVS image-token counts below.
         if modality in ("image", "audio"):
             return evs_ids
         if modality != "video":
@@ -3466,6 +3477,11 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         Returns:
             Input ids with EVS and MM embeds merged.
+
+        Note:
+            The embeddings are already EVS-pruned at encode time (see `apply_evs`);
+            this only rewrites input_ids so its video-placeholder count matches the
+            pruned embedding rows -- it does not modify the embeddings themselves.
         """
         multimodal_data_lst = [
             multimodal_param.multimodal_data for multimodal_param in multimodal_params
@@ -3477,12 +3493,23 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if not any("video" in modalities for modalities in modality_groups):
             return input_ids
 
+        # merge_modalities holds ONE dispatch modality per param -- a per-param routing
+        # key, NOT a reduction of each request to a single modality. Mixed requests stay
+        # mixed and the embeddings keep every modality; for a mixed request
+        # _expand_mixed_prompt_token_ids_for_mm stores the SAME full-request evs_ids
+        # tensor under every modality key, so reading it from any one slot returns the
+        # whole interleaved image/video/audio token layout.
         evs_ids_lst = []
         merge_modalities = []
         for modalities, multimodal_data in zip(modality_groups, multimodal_data_lst, strict=True):
             unsupported = [modality for modality in modalities if modality not in _NANO_MODALITIES]
             if unsupported:
                 raise ValueError(f"Unsupported modality for EVS merge: {unsupported[0]}")
+            # Prefer "video" when present: only the video branch of
+            # _build_evs_adjusted_context_ids rewrites placeholders (image/audio pass
+            # through unchanged), so a video-bearing request MUST dispatch on "video" or
+            # its per-tubelet skeleton would survive into input_ids. The else-branch
+            # handles a non-video sibling request batched alongside a video one.
             modality = "video" if "video" in modalities else modalities[0]
             evs_ids = multimodal_data[modality].get("evs_ids")
             if evs_ids is None:
@@ -3720,10 +3747,22 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         ]
         embs, num_tokens = self.vision_encoder(bucket_params)
         if num_tokens is not None:
+            # A request may contain multiple videos (e.g. interleaved
+            # image->video->image->video); collect every video's per-tubelet EVS
+            # counts per source param and concatenate them in prompt order instead
+            # of overwriting, so the flat per-request tensor that
+            # _build_evs_adjusted_context_ids indexes spans all videos' tubelets.
+            per_param_counts = {}
             for item, item_num_tokens in zip(items, num_tokens, strict=True):
                 if item.modality == "video" and item_num_tokens is not None:
-                    src = multimodal_params[item.src_param_idx]
-                    src.multimodal_data["num_tokens_in_video"] = item_num_tokens
+                    per_param_counts.setdefault(item.src_param_idx, []).append(item_num_tokens)
+            for src_param_idx, counts in per_param_counts.items():
+                src = multimodal_params[src_param_idx]
+                # One video keeps its original tensor (no no-op cat); multiple videos
+                # in the same request concatenate in prompt order.
+                src.multimodal_data["num_tokens_in_video"] = (
+                    counts[0] if len(counts) == 1 else torch.cat(counts, dim=0)
+                )
         return torch.cat(embs, dim=0)
 
     def _adapter_audio_bucket(
@@ -3749,16 +3788,20 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         item: ModalityItem,
         source_param: MultimodalParams,
     ) -> MultimodalParams:
-        """Build a single-modality view of source_param for one bucket item."""
+        """Build a single-modality view of source_param for one bucket item.
+
+        The view's `multimodal_data` carries only what `self.vision_encoder`
+        reads -- the `modality_type` tag and the sliced per-item `payload`.
+        Item-order metadata (`multimodal_item_order`,
+        `multimodal_embedding_lengths`) is intentionally not copied: every
+        consumer of those keys reads them off the original `param` during
+        extraction (`_nano_extract_items`, `_nano_fixed_tile_offset`), never
+        off this ephemeral view.
+        """
         view_data = {
             "modality_type": item.modality,
             item.modality: item.payload,
         }
-        # Preserve item-order metadata so MultimodalPromptOrder consumers don't break
-        src_data = source_param.multimodal_data or {}
-        for k in ("multimodal_item_order", "multimodal_embedding_lengths"):
-            if k in src_data:
-                view_data[k] = src_data[k]
         return MultimodalParams(
             multimodal_input=getattr(source_param, "multimodal_input", None),
             multimodal_data=view_data,

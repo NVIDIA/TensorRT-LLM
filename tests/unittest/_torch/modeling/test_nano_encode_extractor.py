@@ -541,6 +541,42 @@ class TestNanoVisionBucketAdapter:
         torch.testing.assert_close(out[:5], emb0)
         torch.testing.assert_close(out[5:], emb1)
 
+    def test_evs_counts_grouped_per_param_and_concatenated_in_order(self):
+        # One video bucket spanning TWO requests: param 0 has two videos
+        # (interleaved video->video), param 1 has one. Each param must get its OWN
+        # per-tubelet counts concatenated in prompt order -- no overwrite within a
+        # param, and no bleed across params (the per-src_param_idx grouping). Tubelet
+        # counts have distinct lengths AND values so a wrong grouping/order/truncation
+        # cannot coincidentally pass.
+        items = [
+            ModalityItem(0, "video", 0, 0, 6, {"num_tokens": 6}),  # param 0, video 0
+            ModalityItem(0, "video", 1, 1, 2, {"num_tokens": 2}),  # param 0, video 1
+            ModalityItem(1, "video", 0, 0, 5, {"num_tokens": 5}),  # param 1, video 0
+        ]
+        params = [
+            _make_param({"video": items[0].payload, "modality_type": "video"}),
+            _make_param({"video": items[2].payload, "modality_type": "video"}),
+        ]
+        embs = [torch.randn(6, 4), torch.randn(2, 4), torch.randn(5, 4)]
+        num_tokens = [
+            torch.tensor([4, 2]),  # param 0, video 0: 2 tubelets
+            torch.tensor([2]),  # param 0, video 1: 1 tubelet
+            torch.tensor([3, 1, 1]),  # param 1, video 0: 3 tubelets
+        ]
+        model = self._make_model_stub((embs, num_tokens))
+        out = model._adapter_vision_bucket(items, params)
+        assert out.shape == (13, 4)
+        # param 0: video 0 ++ video 1, in prompt order (NOT [2] from an overwrite).
+        torch.testing.assert_close(
+            params[0].multimodal_data["num_tokens_in_video"],
+            torch.tensor([4, 2, 2]),
+        )
+        # param 1: its single video only -- untouched by param 0's videos.
+        torch.testing.assert_close(
+            params[1].multimodal_data["num_tokens_in_video"],
+            torch.tensor([3, 1, 1]),
+        )
+
 
 class TestNanoAudioBucketAdapter:
     """`_encode_audio` always returns a list of (embeddings, counts); the adapter
