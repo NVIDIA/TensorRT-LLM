@@ -122,6 +122,7 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa SKIP (ht
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype SKIP (https://nvbugs/5520319)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=False] SKIP (https://nvbugs/6162122)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=True] SKIP (https://nvbugs/6162122)
+accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=True-enable_gemm_allreduce_fusion=False] SKIP (https://nvbugs/6256531)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=True-enable_gemm_allreduce_fusion=True] SKIP (https://nvbugs/6211441)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4[torch_compile=True] SKIP (https://nvbugs/5821415)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4[torch_compile=True] SKIP (https://nvbugs/5821415)
