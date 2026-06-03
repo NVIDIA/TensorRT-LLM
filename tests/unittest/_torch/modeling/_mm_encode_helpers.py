@@ -4,7 +4,7 @@
 
 These helpers are imported by the per-model extractor suites
 (`test_nano_encode_extractor`, `test_qwen3vl_encode_extractor`) and the
-backend-agnostic assembly suite (`test_multimodal_encoding`) so the
+backend-agnostic scatter suite (`test_mixed_modal_encode`) so the
 `MultimodalParams` stub and the by-param item extractor stay defined in
 exactly one place.
 """
@@ -17,7 +17,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 def _identity_extractor(items_by_param):
     """Yield pre-built MultimodalItems keyed by source param index.
 
-    Mirrors the production extractor contract: `MixedModalityAssembly`
+    Mirrors the production extractor contract: `encode_by_modality_and_scatter`
     invokes `extract(param_idx, param)` once for every param index in the
     batch (`enumerate(multimodal_params)`), so a param that produces no
     items must yield nothing rather than raising. Returning `[]` for an

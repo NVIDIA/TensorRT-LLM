@@ -38,6 +38,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from .mixed_modal_encode import ModalityItem, encode_by_modality_and_scatter
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
@@ -47,7 +48,6 @@ from .modeling_multimodal_utils import (
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model
-from .multimodal_encoding import MixedModalityAssembly, ModalityItem, assemble_embeddings
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -3830,26 +3830,19 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         def extract(param_idx: int, param: MultimodalParams):
             yield from _nano_extract_items(param_idx, param, slice_payload=self._slice_payload)
 
-        assembly = MixedModalityAssembly.from_params(
+        final = encode_by_modality_and_scatter(
             multimodal_params=multimodal_params,
-            extract=extract,
-        )
-        if assembly.total_tokens == 0:
-            return []
-
-        final = assemble_embeddings(
-            assembly,
             encoders={
                 "image": self._adapter_vision_bucket,
                 "video": self._adapter_vision_bucket,
                 "audio": self._adapter_audio_bucket,
             },
-            multimodal_params=multimodal_params,
+            extract=extract,
             device=self._encode_multimodal_device(),
             dtype=self._encode_multimodal_dtype(),
             hidden_dim=self._encode_multimodal_hidden_dim(),
         )
-        return [final]
+        return [final] if final.shape[0] > 0 else []
 
     def _encode_multimodal_device(self) -> torch.device:
         return next(self.vision_encoder.parameters()).device

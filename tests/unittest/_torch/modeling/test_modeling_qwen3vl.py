@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
 
-import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
@@ -16,9 +15,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModelBase,
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
-    _qwen3vl_extract_items,
 )
-from tensorrt_llm._torch.models.multimodal_encoding import MixedModalityAssembly, ModalityItem
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -178,50 +175,12 @@ def test_qwen3vl_mixed_image_video_encoder_returns_single_tensor_in_prompt_order
     torch.testing.assert_close(embeddings[0], expected)
 
 
-def test_qwen3vl_mixed_image_video_requires_item_order_metadata():
-    """A mixed request needs ordering metadata that disambiguates item slots.
-
-    The extractor reads `multimodal_item_order` as `(modality, index)` pairs to
-    assign each modality item a distinct `prompt_pos`. When the ordering does
-    not disambiguate the items - so the image and video items collapse onto the
-    same prompt slot - the assembly build in `MixedModalityAssembly.from_params` rejects it with
-    a duplicate-`prompt_pos` error rather than silently overlapping their embedding
-    ranges. This pins the invariant that a valid per-item ordering is required for
-    a mixed request; the encoder does not fabricate one.
-    """
-
-    def _collapsing_extract(param_idx, p):
-        # Model an order that fails to disambiguate the two mixed items by forcing
-        # both onto prompt slot 0 (what an absent/degenerate order would yield).
-        # `mm_idx_per_modality` stays distinct per item so the collision trips the
-        # per-param `prompt_pos` uniqueness check rather than the modality-group one.
-        for item in _qwen3vl_extract_items(param_idx, p):
-            yield ModalityItem(
-                src_param_idx=item.src_param_idx,
-                modality=item.modality,
-                mm_idx_per_modality=item.mm_idx_per_modality,
-                prompt_pos=0,
-                rows=item.rows,
-                payload=item.payload,
-            )
-
-    with pytest.raises(ValueError, match="duplicate prompt_pos"):
-        MixedModalityAssembly.from_params([_qwen_image_video_param()], _collapsing_extract)
-
-
-def test_qwen3vl_mixed_image_video_requires_embedding_length_metadata():
-    """Without any token-count source the assembly build cannot size a mixed item.
-
-    Token counts come from `num_tokens`, then `multimodal_embedding_lengths`
-    indexed by prompt position, then `multimodal_runtime.total_embeds_in_request`.
-    When none is available the extractor's fallback raises, surfacing during assembly
-    build (here exercised directly via `MixedModalityAssembly.from_params`). The message
-    enumerates `multimodal_embedding_lengths` as one of the missing sources.
-    """
-    param = _qwen_image_video_param(include_lengths=False)
-
-    with pytest.raises(ValueError, match="multimodal_embedding_lengths"):
-        MixedModalityAssembly.from_params([param], _qwen3vl_extract_items)
+# NOTE: the per-request uniqueness (`duplicate prompt_pos`) and the
+# length-agreement invariants previously exercised here against
+# `MixedModalityAssembly.from_params` now live in
+# `MixedModalEncodeContext.__post_init__` and are covered by the context
+# construction tests (test_mixed_modal_encode_context.py) and the per-item
+# length-mismatch test in test_qwen3vl_encode_extractor.py.
 
 
 def test_qwen3vl_video_token_count_sums_multirow_grid():

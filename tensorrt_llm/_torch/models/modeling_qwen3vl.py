@@ -14,12 +14,11 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed as HFQwen3VLVisionPatchEmbed,
 )
 
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
-from tensorrt_llm._torch.models.multimodal_encoding import (
-    MixedModalityAssembly,
+from tensorrt_llm._torch.models.mixed_modal_encode import (
     ModalityItem,
-    assemble_embeddings,
+    encode_by_modality_and_scatter,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
@@ -1213,28 +1212,22 @@ class Qwen3VisionModelBase(nn.Module):
         # (multi-sub-item) image/video payloads to their full post-merge row
         # count via the grid, matching the visual encoder's output.
         spatial_merge_size = self.config.spatial_merge_size
-        assembly = MixedModalityAssembly.from_params(
+        final = encode_by_modality_and_scatter(
             multimodal_params=multimodal_params,
-            extract=lambda param_idx, param: _qwen3vl_extract_items(
-                param_idx, param, spatial_merge_size=spatial_merge_size
-            ),
-        )
-        if assembly.total_tokens == 0:
-            return []
-        final = assemble_embeddings(
-            assembly,
             encoders={
                 "image": self._adapter_image_bucket,
                 "video": self._adapter_video_bucket,
             },
-            multimodal_params=multimodal_params,
+            extract=lambda param_idx, param: _qwen3vl_extract_items(
+                param_idx, param, spatial_merge_size=spatial_merge_size
+            ),
             # Allocate the assembled embeddings on the visual encoder's device,
             # with its (model) dtype.
             device=next(self.visual.parameters()).device,
             dtype=self.model_dtype,
             hidden_dim=self._plan_hidden_dim(),
         )
-        return [final]
+        return [final] if final.shape[0] > 0 else []
 
 
 class Qwen3VLModelBase(PreTrainedModel):

@@ -24,13 +24,13 @@ import pytest
 import torch
 from _mm_encode_helpers import _make_param
 
+from tensorrt_llm._torch.models.mixed_modal_encode import ModalityItem
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModelBase,
     _qwen3vl_extract_items,
     _qwen3vl_grid_rows,
     _qwen3vl_slice_payload,
 )
-from tensorrt_llm._torch.models.multimodal_encoding import ModalityItem
 
 
 class TestQwen3VLPayloadSlicer:

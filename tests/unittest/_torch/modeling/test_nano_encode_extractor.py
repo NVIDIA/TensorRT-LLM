@@ -29,11 +29,11 @@ import pytest
 import torch
 from _mm_encode_helpers import _make_param
 
+from tensorrt_llm._torch.models.mixed_modal_encode import ModalityItem
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NemotronH_Nano_VL_V2,
     _nano_extract_items,
 )
-from tensorrt_llm._torch.models.multimodal_encoding import ModalityItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 
 

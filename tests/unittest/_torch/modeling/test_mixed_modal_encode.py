@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for tensorrt_llm._torch.models.multimodal_encoding.
+"""Unit tests for tensorrt_llm._torch.models.mixed_modal_encode.
 
-Covers the per-item-scatter assembly: every `ModalityItem` owns exactly one
-prompt slot (`prompt_pos`), its `rows` is both the encoder-output footprint and
-the scatter-destination footprint, and there are no ghosts. The assembly batches
-items per modality (one encoder launch per active modality) and scatters each
-item's `rows` rows into its source-param destination range at its prompt-order
-rank.
+Covers the demux -> encode -> mux pipeline: every `ModalityItem` owns exactly
+one prompt slot (`prompt_pos`), its `rows` is both the encoder-output footprint
+and the scatter-destination footprint, and there are no ghosts.
+`build_scatter_index` demultiplexes the flat item list into per-modality buckets
+(one encoder launch per active modality) and computes each item's destination
+range; `scatter_to_prompt_order` multiplexes the per-modality outputs back into
+the canonical prompt-ordered buffer.
 """
 
 from __future__ import annotations
@@ -15,12 +16,17 @@ from __future__ import annotations
 import pytest
 from _mm_encode_helpers import _identity_extractor
 
-from tensorrt_llm._torch.models.multimodal_encoding import MixedModalityAssembly, ModalityItem
+from tensorrt_llm._torch.models.mixed_modal_encode import (
+    ModalityItem,
+    build_scatter_index,
+    encode_by_modality_and_scatter,
+    scatter_to_prompt_order,
+)
 
 
 class _Runtime:
     """Minimal stand-in for `MultimodalParams.multimodal_runtime` exposing the
-    single `total_embeds_in_request` field the assembly cross-check reads."""
+    single `total_embeds_in_request` field the cross-check reads."""
 
     def __init__(self, total_embeds_in_request: int) -> None:
         self.total_embeds_in_request = total_embeds_in_request
@@ -74,7 +80,14 @@ class TestMultimodalItem:
         }
 
 
-def _interleaved_image_video_image_assembly():
+def _flatten_items(items_by_param, num_params):
+    """Run the identity extractor over `num_params` param indices and flatten
+    the yielded items, mirroring `encode_by_modality_and_scatter`'s flatten."""
+    extract = _identity_extractor(items_by_param)
+    return [item for param_idx in range(num_params) for item in extract(param_idx, None)]
+
+
+def _interleaved_image_video_image_index():
     """image -> video -> image interleaving within one param (repeated modality).
 
     param0 prompt order: img_A(pos0, 5) | vid_X(pos1, 8) | img_B(pos2, 5).
@@ -89,13 +102,10 @@ def _interleaved_image_video_image_assembly():
             ModalityItem(0, "image", 1, 2, 5, {"id": "img_B"}),
         ],
     }
-    return MixedModalityAssembly.from_params(
-        multimodal_params=[_ParamWithRuntime(18)],
-        extract=_identity_extractor(items_by_param),
-    )
+    return build_scatter_index(_flatten_items(items_by_param, 1), num_params=1)
 
 
-def _multi_video_audio_assembly():
+def _multi_video_audio_index():
     """PRIMARY new case: image -> video(+audio) -> image -> video(+audio).
 
     With the audio hoist, the embedded audio is a first-class `(audio, k)` item
@@ -116,55 +126,53 @@ def _multi_video_audio_assembly():
             ModalityItem(0, "audio", 1, 5, 3, {"id": "aud1"}),
         ],
     }
-    return MixedModalityAssembly.from_params(
-        multimodal_params=[_ParamWithRuntime(32)],
-        extract=_identity_extractor(items_by_param),
-    )
+    return build_scatter_index(_flatten_items(items_by_param, 1), num_params=1)
 
 
-class TestEncodingPlanPartition:
+class TestScatterIndexPartition:
     def test_empty_batch(self):
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[],
-            extract=lambda i, p: iter([]),
-        )
-        assert assembly.total_tokens == 0
-        assert assembly.active_modalities == []
-        assert len(assembly.items) == 0
+        index = build_scatter_index([], num_params=0)
+        assert index.total_tokens == 0
+        assert index.active_modalities == []
 
     def test_interleaved_image_video_image(self):
-        assembly = _interleaved_image_video_image_assembly()
-        assert assembly.total_tokens == 18
-        assert set(assembly.active_modalities) == {"image", "video"}
-        assert assembly._param_lengths.tolist() == [18]
+        index = _interleaved_image_video_image_index()
+        assert index.total_tokens == 18
+        assert set(index.active_modalities) == {"image", "video"}
+        assert index.param_lengths.tolist() == [18]
         # Image bucket holds img_A (flat 0) then img_B (flat 2); video holds vid_X.
-        assert assembly._modality_slots["image"].tolist() == [0, 2]
-        assert assembly._modality_slots["video"].tolist() == [1]
-        # Bucket offsets are the prefix sum of `rows` (single source of truth).
-        assert assembly._bucket_offsets["image"].tolist() == [0, 5, 10]
-        assert assembly._bucket_offsets["video"].tolist() == [0, 8]
+        assert index.modality_slots["image"].tolist() == [0, 2]
+        assert index.modality_slots["video"].tolist() == [1]
 
     def test_multi_video_audio_partition(self):
-        assembly = _multi_video_audio_assembly()
-        assert assembly.total_tokens == 32
-        assert set(assembly.active_modalities) == {"image", "video", "audio"}
-        assert assembly._param_lengths.tolist() == [32]
+        index = _multi_video_audio_index()
+        assert index.total_tokens == 32
+        assert set(index.active_modalities) == {"image", "video", "audio"}
+        assert index.param_lengths.tolist() == [32]
         # Each modality bucket holds its two items in append (prompt) order.
-        assert assembly._modality_slots["image"].tolist() == [0, 3]
-        assert assembly._modality_slots["video"].tolist() == [1, 4]
-        assert assembly._modality_slots["audio"].tolist() == [2, 5]
-        assert assembly._bucket_offsets["image"].tolist() == [0, 5, 10]
-        assert assembly._bucket_offsets["video"].tolist() == [0, 8, 16]
-        assert assembly._bucket_offsets["audio"].tolist() == [0, 3, 6]
+        assert index.modality_slots["image"].tolist() == [0, 3]
+        assert index.modality_slots["video"].tolist() == [1, 4]
+        assert index.modality_slots["audio"].tolist() == [2, 5]
 
 
 class TestRowsCrossCheck:
-    """`sum(rows)` for a param must equal its `total_embeds_in_request`."""
+    """`sum(rows)` for a param must equal its `total_embeds_in_request`.
+
+    The cross-check now lives in `encode_by_modality_and_scatter` (the
+    param<->context seam), so it is exercised through that orchestrator.
+    """
+
+    def _noop_encoders(self, hidden_dim):
+        def encoder(items, multimodal_params):
+            total_rows = sum(item.rows for item in items)
+            return torch.zeros((total_rows, hidden_dim), dtype=torch.float32)
+
+        return {m: encoder for m in ("image", "video", "audio")}
 
     def test_rows_sum_matches_total_embeds_in_request(self):
         # 5 + 8 + 5 == 18, matching _ParamWithRuntime(18); must not raise.
-        assembly = _interleaved_image_video_image_assembly()
-        assert assembly._param_lengths.tolist() == [18]
+        index = _interleaved_image_video_image_index()
+        assert index.param_lengths.tolist() == [18]
 
     def test_rows_sum_mismatch_raises(self):
         items_by_param = {
@@ -175,41 +183,39 @@ class TestRowsCrossCheck:
         }
         # Declared total (11) != sum(rows) (10) -> fail-loud cross-check.
         with pytest.raises(ValueError, match="total_embeds_in_request"):
-            MixedModalityAssembly.from_params(
+            encode_by_modality_and_scatter(
                 multimodal_params=[_ParamWithRuntime(11)],
+                encoders=self._noop_encoders(4),
                 extract=_identity_extractor(items_by_param),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                hidden_dim=4,
             )
 
     def test_cross_check_skipped_without_runtime(self):
         # Params lacking `multimodal_runtime` (plain stubs) must not trip the
-        # cross-check; the assembly still builds.
+        # cross-check; the index still builds.
         items_by_param = {0: [ModalityItem(0, "image", 0, 0, 5, {})]}
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[object()],
-            extract=_identity_extractor(items_by_param),
-        )
-        assert assembly.total_tokens == 5
+        index = build_scatter_index(_flatten_items(items_by_param, 1), num_params=1)
+        assert index.total_tokens == 5
 
 
-class TestEncodingPlanDstIndices:
+class TestScatterIndexDstIndices:
     def test_pure_image_single_param(self):
         items_by_param = {
             0: [ModalityItem(0, "image", 0, 0, 5, {"id": "img_A"})],
         }
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[_ParamWithRuntime(5)],
-            extract=_identity_extractor(items_by_param),
-        )
-        assert assembly._dst_indices["image"].tolist() == [0, 1, 2, 3, 4]
+        index = build_scatter_index(_flatten_items(items_by_param, 1), num_params=1)
+        assert index.dst_indices["image"].tolist() == [0, 1, 2, 3, 4]
 
     def test_interleaved_image_video_image_scatters_by_prompt_pos(self):
-        assembly = _interleaved_image_video_image_assembly()
+        index = _interleaved_image_video_image_index()
         # Destinations follow prompt_pos within the single param:
         #   img_A pos0 -> final[0:5]
         #   vid_X pos1 -> final[5:13]
         #   img_B pos2 -> final[13:18]   (AFTER the video, not contiguous w/ img_A)
         # Image bucket order is [img_A, img_B]; dst concatenates their ranges.
-        assert assembly._dst_indices["image"].tolist() == [
+        assert index.dst_indices["image"].tolist() == [
             0,
             1,
             2,
@@ -221,12 +227,12 @@ class TestEncodingPlanDstIndices:
             16,
             17,  # img_B pos2
         ]
-        assert assembly._dst_indices["video"].tolist() == [5, 6, 7, 8, 9, 10, 11, 12]
+        assert index.dst_indices["video"].tolist() == [5, 6, 7, 8, 9, 10, 11, 12]
 
     def test_multi_video_audio_scatters_by_prompt_pos(self):
-        assembly = _multi_video_audio_assembly()
+        index = _multi_video_audio_index()
         # prompt order: img0(0:5) vid0(5:13) aud0(13:16) img1(16:21) vid1(21:29) aud1(29:32)
-        assert assembly._dst_indices["image"].tolist() == [
+        assert index.dst_indices["image"].tolist() == [
             0,
             1,
             2,
@@ -238,7 +244,7 @@ class TestEncodingPlanDstIndices:
             19,
             20,  # img1 pos3
         ]
-        assert assembly._dst_indices["video"].tolist() == [
+        assert index.dst_indices["video"].tolist() == [
             5,
             6,
             7,
@@ -256,7 +262,7 @@ class TestEncodingPlanDstIndices:
             27,
             28,  # vid1 pos4
         ]
-        assert assembly._dst_indices["audio"].tolist() == [
+        assert index.dst_indices["audio"].tolist() == [
             13,
             14,
             15,  # aud0 pos2
@@ -265,39 +271,10 @@ class TestEncodingPlanDstIndices:
             31,  # aud1 pos5
         ]
 
-    def test_duplicate_prompt_pos_raises(self):
-        items_by_param = {
-            0: [
-                ModalityItem(0, "image", 0, 0, 5, {"id": "x"}),
-                ModalityItem(0, "image", 1, 0, 5, {"id": "y"}),  # same prompt_pos
-            ],
-        }
-        with pytest.raises(ValueError, match="duplicate prompt_pos"):
-            MixedModalityAssembly.from_params(
-                multimodal_params=[object()],
-                extract=_identity_extractor(items_by_param),
-            )
-
-    def test_duplicate_modality_group_raises(self):
-        items_by_param = {
-            0: [
-                ModalityItem(0, "image", 0, 0, 5, {"id": "x"}),
-                ModalityItem(0, "image", 0, 1, 5, {"id": "y"}),  # same (modality, idx)
-            ],
-        }
-        with pytest.raises(ValueError, match="duplicate.*mm_idx_per_modality"):
-            MixedModalityAssembly.from_params(
-                multimodal_params=[object()],
-                extract=_identity_extractor(items_by_param),
-            )
-
 
 import torch  # noqa: E402
 
-from tensorrt_llm._torch.models.multimodal_encoding import (  # noqa: E402
-    _expand_ranges,
-    assemble_embeddings,
-)
+from tensorrt_llm._torch.models.mixed_modal_encode import _expand_ranges  # noqa: E402
 
 
 def _loop_expand_reference(starts, lengths):
@@ -333,7 +310,34 @@ class TestExpandRangesVectorization:
         assert torch.equal(vec, ref), f"vec={vec.tolist()} ref={ref.tolist()}"
 
 
-class TestEncodeWithPlan:
+def test_build_scatter_index_matches_naive_reference():
+    # P0: image,video,image interleaved; P1: single image.
+    items = [
+        ModalityItem(0, "image", 0, 0, 2, {}),
+        ModalityItem(0, "video", 0, 1, 3, {}),
+        ModalityItem(0, "image", 1, 2, 2, {}),
+        ModalityItem(1, "image", 0, 0, 4, {}),
+    ]
+    idx = build_scatter_index(items, num_params=2)
+    # Reference: canonical order = sort by (src, prompt_pos); each item's start is
+    # the running row count before it.
+    order = sorted(range(len(items)), key=lambda i: (items[i].src_param_idx, items[i].prompt_pos))
+    start, ref_start = 0, {}
+    for i in order:
+        ref_start[i] = start
+        start += items[i].rows
+    assert idx.total_tokens == start
+    for m in idx.active_modalities:
+        slots = idx.modality_slots[m].tolist()
+        expected = (
+            torch.cat([torch.arange(ref_start[i], ref_start[i] + items[i].rows) for i in slots])
+            if slots
+            else torch.empty(0, dtype=torch.int64)
+        )
+        assert torch.equal(idx.dst_indices[m], expected)
+
+
+class TestEncodeByModalityAndScatter:
     def _make_fake_encoder(self, hidden_dim, call_log):
         """Returns a fake encoder: row i in bucket = [i, i, ..., i] (hidden_dim copies)."""
 
@@ -356,15 +360,11 @@ class TestEncodeWithPlan:
             0: [ModalityItem(0, "image", 0, 0, 5, {})],
             1: [ModalityItem(1, "image", 0, 0, 5, {})],
         }
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[_ParamWithRuntime(5), _ParamWithRuntime(5)],
-            extract=_identity_extractor(items_by_param),
-        )
         encoders = {"image": self._make_fake_encoder(H, call_log_image)}
-        final = assemble_embeddings(
-            assembly,
-            encoders,
-            multimodal_params=[object(), object()],
+        final = encode_by_modality_and_scatter(
+            multimodal_params=[_ParamWithRuntime(5), _ParamWithRuntime(5)],
+            encoders=encoders,
+            extract=_identity_extractor(items_by_param),
             device=torch.device("cpu"),
             dtype=torch.float32,
             hidden_dim=H,
@@ -385,15 +385,21 @@ class TestEncodeWithPlan:
         call_log_image: list = []
         call_log_video: list = []
         H = 4
-        assembly = _interleaved_image_video_image_assembly()
+        items_by_param = {
+            0: [
+                ModalityItem(0, "image", 0, 0, 5, {"id": "img_A"}),
+                ModalityItem(0, "video", 0, 1, 8, {"id": "vid_X"}),
+                ModalityItem(0, "image", 1, 2, 5, {"id": "img_B"}),
+            ],
+        }
         encoders = {
             "image": self._make_fake_encoder(H, call_log_image),
             "video": self._make_fake_encoder(H, call_log_video),
         }
-        final = assemble_embeddings(
-            assembly,
-            encoders,
-            multimodal_params=[object()],
+        final = encode_by_modality_and_scatter(
+            multimodal_params=[_ParamWithRuntime(18)],
+            encoders=encoders,
+            extract=_identity_extractor(items_by_param),
             device=torch.device("cpu"),
             dtype=torch.float32,
             hidden_dim=H,
@@ -418,16 +424,25 @@ class TestEncodeWithPlan:
         call_log_video: list = []
         call_log_audio: list = []
         H = 4
-        assembly = _multi_video_audio_assembly()
+        items_by_param = {
+            0: [
+                ModalityItem(0, "image", 0, 0, 5, {"id": "img0"}),
+                ModalityItem(0, "video", 0, 1, 8, {"id": "vid0"}),
+                ModalityItem(0, "audio", 0, 2, 3, {"id": "aud0"}),
+                ModalityItem(0, "image", 1, 3, 5, {"id": "img1"}),
+                ModalityItem(0, "video", 1, 4, 8, {"id": "vid1"}),
+                ModalityItem(0, "audio", 1, 5, 3, {"id": "aud1"}),
+            ],
+        }
         encoders = {
             "image": self._make_fake_encoder(H, call_log_image),
             "video": self._make_fake_encoder(H, call_log_video),
             "audio": self._make_fake_encoder(H, call_log_audio),
         }
-        final = assemble_embeddings(
-            assembly,
-            encoders,
-            multimodal_params=[object()],
+        final = encode_by_modality_and_scatter(
+            multimodal_params=[_ParamWithRuntime(32)],
+            encoders=encoders,
+            extract=_identity_extractor(items_by_param),
             device=torch.device("cpu"),
             dtype=torch.float32,
             hidden_dim=H,
@@ -446,15 +461,11 @@ class TestEncodeWithPlan:
         assert final[29, 0].item() == 3
         assert final[31, 0].item() == 5
 
-    def test_empty_plan_returns_zero_size(self):
-        assembly = MixedModalityAssembly.from_params(
+    def test_empty_batch_returns_zero_size(self):
+        final = encode_by_modality_and_scatter(
             multimodal_params=[],
-            extract=lambda i, p: iter([]),
-        )
-        final = assemble_embeddings(
-            assembly,
             encoders={},
-            multimodal_params=[],
+            extract=lambda i, p: iter([]),
             device=torch.device("cpu"),
             dtype=torch.float32,
             hidden_dim=4,
@@ -468,15 +479,11 @@ class TestEncodeWithPlan:
             return torch.zeros((1, H), dtype=torch.float32)  # wrong row count
 
         items_by_param = {0: [ModalityItem(0, "image", 0, 0, 5, {})]}
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[object()],
-            extract=_identity_extractor(items_by_param),
-        )
         with pytest.raises(AssertionError, match="image"):
-            assemble_embeddings(
-                assembly,
-                encoders={"image": broken_encoder},
+            encode_by_modality_and_scatter(
                 multimodal_params=[object()],
+                encoders={"image": broken_encoder},
+                extract=_identity_extractor(items_by_param),
                 device=torch.device("cpu"),
                 dtype=torch.float32,
                 hidden_dim=H,
@@ -486,7 +493,7 @@ class TestEncodeWithPlan:
         """Fake encoder: every row of item ``k`` (in bucket order) is filled with
         that item's ``payload["sentinel"]`` value (broadcast over hidden_dim).
 
-        Rows are emitted in ``_modality_slots[modality]`` order (the adapter
+        Rows are emitted in ``modality_slots[modality]`` order (the adapter
         contract), so the per-item sentinel block lets a test distinguish which
         item a scattered row originated from — unlike an ``arange`` encoder whose
         values track row POSITION rather than item identity.
@@ -519,18 +526,14 @@ class TestEncodeWithPlan:
                 ModalityItem(0, "image", 1, 2, 5, {"sentinel": IMG_B}),
             ]
         }
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[_ParamWithRuntime(14)],
-            extract=_identity_extractor(items_by_param),
-        )
         encoders = {
             "image": self._make_sentinel_encoder(H),
             "audio": self._make_sentinel_encoder(H),
         }
-        final = assemble_embeddings(
-            assembly,
-            encoders,
-            multimodal_params=[object()],
+        final = encode_by_modality_and_scatter(
+            multimodal_params=[_ParamWithRuntime(14)],
+            encoders=encoders,
+            extract=_identity_extractor(items_by_param),
             device=torch.device("cpu"),
             dtype=torch.float32,
             hidden_dim=H,
@@ -540,13 +543,24 @@ class TestEncodeWithPlan:
         assert torch.all(final[5:9] == AUD), f"final[5:9] should be audio ({AUD})"
         assert torch.all(final[9:14] == IMG_B), f"final[9:14] should be img_B ({IMG_B})"
 
+    def test_scatter_to_prompt_order_empty_index_returns_zero_size(self):
+        index = build_scatter_index([], num_params=0)
+        final = scatter_to_prompt_order(
+            index,
+            {},
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            hidden_dim=4,
+        )
+        assert final.shape == (0, 4)
 
-class TestEncodeWithPlanHighBatch:
+
+class TestEncodeByModalityHighBatch:
     def test_32_params_three_modalities_three_calls(self):
         """High-throughput guard: <=3 encoder calls regardless of pure/mixed mix.
 
         Direct regression guard against the per-mixed-param launch
-        anti-pattern. The assembly must collapse 32 source params into one
+        anti-pattern. The pipeline must collapse 32 source params into one
         encoder call per active modality.
         """
         H = 4
@@ -572,19 +586,15 @@ class TestEncodeWithPlanHighBatch:
                 ModalityItem(i, "image", 0, 0, 4, {}),
                 ModalityItem(i, "audio", 0, 1, 3, {}),
             ]
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[object()] * 32,
-            extract=_identity_extractor(items_by_param),
-        )
         encoders = {
             "image": fake(call_log_image),
             "audio": fake(call_log_audio),
             "video": fake(call_log_video),  # registered but no items -> no call
         }
-        assemble_embeddings(
-            assembly,
-            encoders,
+        encode_by_modality_and_scatter(
             multimodal_params=[object()] * 32,
+            encoders=encoders,
+            extract=_identity_extractor(items_by_param),
             device=torch.device("cpu"),
             dtype=torch.float32,
             hidden_dim=H,
