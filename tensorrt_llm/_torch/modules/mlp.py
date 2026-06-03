@@ -183,7 +183,7 @@ class MLP(nn.Module):
         return x_down
 
     def _fused_relu2_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
-        """Fused ``relu(x)^2 + NVFP4 quantize`` for the up_proj output.
+        """Run the fused ``relu(x)^2 + NVFP4 quantize`` op on the up_proj output.
 
         Returns an ``Fp4QuantizedTensor`` with the same leading dims as ``x``;
         the last dim is halved because two FP4 values are packed per byte.
@@ -216,7 +216,7 @@ class MLP(nn.Module):
         )
 
     def _fused_gelu_tanh_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
-        """Fused ``GELU-tanh(x) + NVFP4 quantize`` for the up_proj output.
+        """Run the fused ``GELU-tanh(x) + NVFP4 quantize`` op on the up_proj output.
 
         Returns an ``Fp4QuantizedTensor`` with the same leading dims as ``x``;
         the last dim is halved because two FP4 values are packed per byte.

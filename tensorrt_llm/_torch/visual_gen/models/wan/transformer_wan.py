@@ -24,7 +24,9 @@ from tensorrt_llm.quantization import QuantAlgo
 
 
 def _ln_quant_type(quant_config, force_dynamic_quant: bool):
-    """Return ``"nvfp4"`` if the model is configured for static (calibrated)
+    """Return the LayerNorm quantize_type for the current quant config.
+
+    Returns ``"nvfp4"`` if the model is configured for static (calibrated)
     NVFP4 quantization, otherwise ``None``. The fused LayerNorm + NVFP4
     quant fast path requires per-layer calibrated ``input_scale`` from the
     downstream Linear, so dynamic-quant runs fall back to the unfused path
@@ -55,8 +57,10 @@ def _ln_quant_type(quant_config, force_dynamic_quant: bool):
 
 
 def _try_attach_nvfp4_scale(norm: nn.Module, linear: nn.Module) -> bool:
-    """Attach the downstream Linear's calibrated ``input_scale`` to the
-    LayerNorm so the fused-path can find it via ``getattr(self, "nvfp4_scale")``.
+    """Attach the downstream Linear's calibrated input_scale to the LayerNorm.
+
+    Exposes the scale on the LayerNorm so the fused path can find it via
+    ``getattr(self, "nvfp4_scale")``.
 
     This is a no-op (and returns False) when any of the following hold:
       - ``norm`` is not a LayerNorm with ``is_nvfp4=True`` (e.g., nn.Identity,

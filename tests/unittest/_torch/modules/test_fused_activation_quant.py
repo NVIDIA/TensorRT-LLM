@@ -388,20 +388,19 @@ def test_mlp_uses_fused_gelu_tanh_quant_on_static_nvfp4():
 )
 @skip_unless_fused_gelu_tanh_and_fp4_quantize
 def test_fused_helpers_preserve_3d_prefix_dims(activation_sentinel, helper_name):
-    """Regression test for the B>1 shape-preservation contract that the
-    PR #14773 review (CodeRabbit comment) flagged.
+    """Verify the fused activation+quant helpers preserve the 3D prefix dims.
 
-    The fused activation+quant helpers in `MLP` flatten ``x`` to 2D before the
-    kernel call. Without re-inflating the packed FP4 output back to the
-    input rank, ``NVFP4LinearMethod.apply`` would only restore the original
-    shape on a torch.Tensor input (3D plain tensor), not on the
-    ``Fp4QuantizedTensor`` it actually receives here -- because the unflatten
-    branch in ``linear.py`` keys off ``fp4_tensor.dim() > 2``. With a 2D
-    return, the downstream ``down_proj`` would silently flatten ``[B, S, H]``
-    to ``[B*S, H]``; broadcasting in the residual add then only happens to
-    work when B==1 (the prior integration-test regime).
-
-    Verifies the fix preserves the prefix dims for B>1.
+    Regression test for the B>1 shape-preservation contract that the PR
+    #14773 review (CodeRabbit comment) flagged. The fused activation+quant
+    helpers in ``MLP`` flatten ``x`` to 2D before the kernel call. Without
+    re-inflating the packed FP4 output back to the input rank,
+    ``NVFP4LinearMethod.apply`` would only restore the original shape on a
+    ``torch.Tensor`` input (3D plain tensor), not on the
+    ``Fp4QuantizedTensor`` it actually receives here -- because the
+    unflatten branch in ``linear.py`` keys off ``fp4_tensor.dim() > 2``.
+    With a 2D return, the downstream ``down_proj`` would silently flatten
+    ``[B, S, H]`` to ``[B*S, H]``; broadcasting in the residual add then
+    only happens to work when B==1 (the prior integration-test regime).
     """
     torch.manual_seed(0)
     device = torch.device("cuda")

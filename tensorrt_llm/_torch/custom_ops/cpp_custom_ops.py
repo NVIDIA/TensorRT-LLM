@@ -1157,7 +1157,7 @@ def _register_fake():
         sf_scale: torch.Tensor,
         sf_vec_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fake/meta stub for ``trtllm::fused_gelu_tanh_quantize``.
+        """Return the FP4 output and SF tensor shapes for ``trtllm::fused_gelu_tanh_quantize``.
 
         Reports the FP4-packed output shape ``[M, N/2]`` (two FP4 values per
         uint8 byte) and the swizzled scale-factor tensor shape so that
@@ -1182,7 +1182,7 @@ def _register_fake():
         eps: float = 1e-6,
         sf_vec_size: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fake/meta stub for ``trtllm::fused_layernorm_quantize``.
+        """Return the FP4 output and SF tensor shapes for ``trtllm::fused_layernorm_quantize``.
 
         Same output-shape contract as ``fused_gelu_tanh_quantize``: a
         ``[M, N/2]`` uint8 FP4-packed tensor plus the swizzled scale-factor

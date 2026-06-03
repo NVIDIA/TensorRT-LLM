@@ -219,8 +219,10 @@ class LayerNorm(nn.Module):
         scale_msa: Optional[torch.Tensor],
         shift_msa: Optional[torch.Tensor],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Reference path. Mathematically equivalent to the fused path
-        (up to FP rounding). Used when NVFP4 is not enabled or supported.
+        """Apply the reference LayerNorm + AdaLN modulation path in FP32.
+
+        Mathematically equivalent to the fused path (up to FP rounding).
+        Used when NVFP4 is not enabled or supported.
         """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -262,7 +264,7 @@ class LayerNorm(nn.Module):
         seq_len_per_batch: int,
         nvfp4_scale: torch.Tensor,
     ) -> Fp4QuantizedTensor:
-        """Fused LayerNorm + (optional AdaLN modulation) + NVFP4 quantize.
+        """Run the fused LayerNorm + (optional AdaLN modulation) + NVFP4 quantize op.
 
         Dispatches to two configurations of the same CUDA kernel:
           - AdaLN: scale_msa/shift_msa provided, LN affine is None.
@@ -302,8 +304,8 @@ class LayerNorm(nn.Module):
             if hs_2d.shape[0] != s_2d.shape[0] * seq_len_per_batch:
                 raise ValueError(
                     f"hidden_states M={hs_2d.shape[0]} must equal "
-                    f"scale_msa B={s_2d.shape[0]} * seq_len_per_batch={seq_len_per_batch}."
-                )
+                    f"scale_msa B={s_2d.shape[0]} * "
+                    f"seq_len_per_batch={seq_len_per_batch}.")
         else:
             # Plain LN case (norm2 in Wan 2.2): use learned weight and bias.
             s_2d = None

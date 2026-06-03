@@ -71,7 +71,7 @@ from tensorrt_llm.quantization import QuantAlgo
 # See PR #14773 review feedback.
 @pytest.fixture(scope="module", autouse=True)
 def _wan22_fusion_test_env():
-    """Module-scoped env-var toggle for the fusion integration suite.
+    """Set module-scoped env-var toggles for the fusion integration suite.
 
     - TLLM_DISABLE_MPI=1 prevents the runtime from attempting MPI bring-up
       in single-process test environments.
@@ -221,9 +221,11 @@ def loaded_wan22_nvfp4():
 
 
 def _block_index_from_name(name: str) -> int:
-    """Extract the block index from a fully-qualified module name like
-    ``blocks.17.ffn.down_proj`` -- returns -1 if the module is not under a
-    transformer block."""
+    """Extract the block index from a fully-qualified module name.
+
+    For names like ``blocks.17.ffn.down_proj``, returns ``17``; returns
+    ``-1`` if the module is not under a transformer block.
+    """
     parts = name.split(".")
     if len(parts) >= 2 and parts[0] == "blocks":
         try:
@@ -234,8 +236,10 @@ def _block_index_from_name(name: str) -> int:
 
 
 def _is_ignored_by_modelopt(qual_name: str, ignore_patterns: list) -> bool:
-    """Mirror the ModelOpt ``ignore`` semantics used by NVFP4LinearMethod:
-    a Linear is excluded when its name matches any glob in the list."""
+    """Mirror the ModelOpt ``ignore`` semantics used by NVFP4LinearMethod.
+
+    A Linear is excluded when its name matches any glob in the list.
+    """
     for pat in ignore_patterns or []:
         if fnmatch.fnmatch(qual_name, pat):
             return True
@@ -251,7 +255,7 @@ def _is_ignored_by_modelopt(qual_name: str, ignore_patterns: list) -> bool:
 @skip_if_no_sm100
 @skip_if_no_fused_op
 def test_quant_config_resolves_static_nvfp4(loaded_wan22_nvfp4):
-    """Assertion #1: checkpoint resolves to static NVFP4."""
+    """Check that the checkpoint resolves to static NVFP4 (assertion #1)."""
     _model, model_config = loaded_wan22_nvfp4
     qc = model_config.quant_config
     assert qc.quant_algo == QuantAlgo.NVFP4
@@ -264,8 +268,11 @@ def test_quant_config_resolves_static_nvfp4(loaded_wan22_nvfp4):
 @skip_if_no_sm100
 @skip_if_no_fused_op
 def test_calibrated_input_scales_populated(loaded_wan22_nvfp4):
-    """Assertion #2: every unignored downstream Linear has a calibrated
-    input_scale (non-default value, populated by the ModelOpt loader)."""
+    """Check that calibrated input_scales are populated (assertion #2).
+
+    Every unignored downstream Linear must have a calibrated ``input_scale``
+    (a non-default value, populated by the ModelOpt loader).
+    """
     model, model_config = loaded_wan22_nvfp4
     ignore = list(model_config.quant_config.exclude_modules or [])
 
@@ -303,8 +310,11 @@ def test_calibrated_input_scales_populated(loaded_wan22_nvfp4):
 @skip_if_no_sm100
 @skip_if_no_fused_op
 def test_layernorm_nvfp4_scale_attached_on_unignored_blocks(loaded_wan22_nvfp4):
-    """Assertion #3: norm{1,2,3} have nvfp4_scale attached for every
-    unignored block and zero attached on ignored blocks."""
+    """Check that ``nvfp4_scale`` is attached on unignored blocks (assertion #3).
+
+    Every unignored block's ``norm{1,2,3}`` must have ``nvfp4_scale`` set,
+    and zero must be attached on ignored blocks.
+    """
     model, _ = loaded_wan22_nvfp4
 
     attached = {1: set(), 2: set(), 3: set()}
@@ -336,8 +346,11 @@ def test_layernorm_nvfp4_scale_attached_on_unignored_blocks(loaded_wan22_nvfp4):
 @skip_if_no_sm100
 @skip_if_no_fused_op
 def test_mlp_fused_gate_activates(loaded_wan22_nvfp4):
-    """Assertion #4a: at least one block's FFN has _use_fused_gelu_tanh_quant
-    set, and the count matches the unignored-block count exactly."""
+    """Check that the MLP fused gate activates (assertion #4a).
+
+    At least one block's FFN must have ``_use_fused_gelu_tanh_quant`` set,
+    and the count matches the unignored-block count exactly.
+    """
     model, _ = loaded_wan22_nvfp4
 
     fused, total_mlp = [], 0
@@ -363,8 +376,11 @@ def test_mlp_fused_gate_activates(loaded_wan22_nvfp4):
 @skip_if_no_sm100
 @skip_if_no_fused_op
 def test_layernorm_fused_path_advertised(loaded_wan22_nvfp4):
-    """Assertion #4b: at least one norm reports is_nvfp4 + nvfp4_scale, i.e.
-    the LayerNorm fused path will fire at forward time."""
+    """Check that the LayerNorm fused path is advertised (assertion #4b).
+
+    At least one norm must report ``is_nvfp4`` + ``nvfp4_scale``, i.e. the
+    LayerNorm fused path will fire at forward time.
+    """
     model, _ = loaded_wan22_nvfp4
 
     advertised = 0
@@ -384,10 +400,12 @@ def test_layernorm_fused_path_advertised(loaded_wan22_nvfp4):
 
 
 def _set_fusion_active(model, active: bool):
-    """Toggle every per-module signal that controls whether the fused
-    NVFP4 paths fire at forward time. Restoring requires the original
-    snapshot, which the caller is expected to capture via
-    ``_snapshot_fusion_state`` BEFORE calling with active=False."""
+    """Toggle every per-module signal that gates the fused NVFP4 paths.
+
+    Restoring requires the original snapshot, which the caller is expected
+    to capture via ``_snapshot_fusion_state`` BEFORE calling with
+    ``active=False``.
+    """
     for _, norm in model.named_modules():
         if isinstance(norm, LayerNorm):
             if active:
@@ -407,8 +425,11 @@ def _set_fusion_active(model, active: bool):
 
 
 def _snapshot_fusion_state(model):
-    """Record the original fused-path flags so a later _set_fusion_active(True)
-    call can restore them exactly. Idempotent if called twice."""
+    """Record the original fused-path flags for later restore.
+
+    A later ``_set_fusion_active(True)`` call can restore them exactly.
+    Idempotent if called twice.
+    """
     for _, norm in model.named_modules():
         if isinstance(norm, LayerNorm) and not hasattr(norm, "_is_nvfp4_orig"):
             norm._is_nvfp4_orig = getattr(norm, "is_nvfp4", False)
@@ -430,9 +451,9 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
 @skip_if_no_fused_op
 @torch.inference_mode()
 def test_fused_vs_unfused_output_matches(loaded_wan22_nvfp4):
-    """A/B regression guard: fused and unfused paths must produce the same
-    transformer output (cosine sim >= 0.995) on the calibrated checkpoint.
+    """Verify fused and unfused paths produce the same transformer output.
 
+    A/B regression guard: cosine sim >= 0.995 on the calibrated checkpoint.
     Same model, two forward passes:
       A. Force all fused paths OFF (``is_nvfp4=False`` on every LayerNorm
          and ``_use_fused_gelu_tanh_quant=False`` on every MLP). LayerNorm
@@ -507,10 +528,12 @@ def test_fused_vs_unfused_output_matches(loaded_wan22_nvfp4):
 @skip_if_no_fused_op
 @torch.inference_mode()
 def test_forward_smoke_runs_without_error(loaded_wan22_nvfp4):
-    """Run a single forward pass with a small latent + text condition to
-    confirm the fused kernels execute end-to-end without shape/dtype/CUDA
+    """Run a single forward pass to confirm the fused kernels execute end-to-end.
+
+    Uses a small latent + text condition to catch any shape/dtype/CUDA
     errors. We do NOT validate output values here -- that belongs in the
-    fused-vs-unfused A/B numerical test."""
+    fused-vs-unfused A/B numerical test.
+    """
     model, _ = loaded_wan22_nvfp4
 
     # 60x104 spatial latent -> sequence length 1 * 30 * 52 = 1560 (matches

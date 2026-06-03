@@ -64,8 +64,11 @@ def _quantize_reference(
     eps: float,
     sf_vec_size: int,
 ):
-    """Reference path: PyTorch LN -> optional affine -> optional modulation ->
-    cast to input dtype -> separate fp4_quantize. Returns (fp4, sf, sf_scale)."""
+    """Compute the high-precision PyTorch reference for the fused kernel.
+
+    Runs PyTorch LN -> optional affine -> optional modulation -> cast to input
+    dtype -> separate ``fp4_quantize``. Returns ``(fp4, sf, sf_scale)``.
+    """
     m, n = x.shape
     x_fp32 = x.float()
 
@@ -110,8 +113,11 @@ def _quantize_reference(
 @pytest.mark.parametrize("m,n", [(32, 5120), (128, 5120)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_layernorm_quantize_plain_ln(m, n, dtype):
-    """LN with no affine, no modulation. Mirrors what the kernel must do for
-    a vanilla `LayerNorm` followed by a downstream NVFP4 Linear."""
+    """Test the LN-only path (no affine, no modulation).
+
+    Mirrors what the kernel must do for a vanilla ``LayerNorm`` followed by
+    a downstream NVFP4 ``Linear``.
+    """
     torch.manual_seed(0)
     device = torch.device("cuda")
     x = torch.randn(m, n, dtype=dtype, device=device) * 0.5
@@ -143,8 +149,11 @@ def test_fused_layernorm_quantize_plain_ln(m, n, dtype):
 @pytest.mark.parametrize("m,n", [(32, 5120), (128, 5120)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_layernorm_quantize_ln_affine(m, n, dtype):
-    """LN with learned affine (weight + bias). This is the configuration used
-    by Wan 2.2's `norm2` (cross-attention input)."""
+    """Test the LN-with-affine path (learned weight and bias).
+
+    This is the configuration used by Wan 2.2's ``norm2`` (cross-attention
+    input).
+    """
     torch.manual_seed(1)
     device = torch.device("cuda")
     x = torch.randn(m, n, dtype=dtype, device=device) * 0.5
@@ -185,9 +194,12 @@ def test_fused_layernorm_quantize_ln_affine(m, n, dtype):
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_layernorm_quantize_adaln(b, s, n, dtype):
-    """AdaLN modulation path: LN(x) * (1 + scale_msa) + shift_msa, with
-    scale_msa/shift_msa broadcast across each batch's S sequence positions.
-    This is the configuration used by Wan 2.2's `norm1` and `norm3`."""
+    """Test the AdaLN modulation path: ``LN(x) * (1 + scale_msa) + shift_msa``.
+
+    ``scale_msa`` / ``shift_msa`` broadcast across each batch's S sequence
+    positions. This is the configuration used by Wan 2.2's ``norm1`` and
+    ``norm3``.
+    """
     torch.manual_seed(2)
     device = torch.device("cuda")
     m = b * s
@@ -221,8 +233,9 @@ def test_fused_layernorm_quantize_adaln(b, s, n, dtype):
 
 
 def test_layernorm_falls_back_on_per_token_modulation():
-    """Per-token timestep produces ``scale_msa.shape == [B, S, N]`` with S>1.
+    """Verify per-token timestep modulation falls back to the unfused path.
 
+    Per-token timestep produces ``scale_msa.shape == [B, S, N]`` with S>1.
     The fused kernel only supports one modulation vector per batch (its
     ``batch_idx = row / seq_len_per_batch`` indexing cannot represent S
     distinct modulation vectors per batch), so the Python wrapper must
