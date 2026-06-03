@@ -877,6 +877,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return (quota - size_per_batch) / context_size_per_token
 
         generation_size_per_token = non_sliding_attn_size_per_token + generation_swa_size_per_token
+        if generation_size_per_token <= 0:
+            return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
     def _build_cache_config(
