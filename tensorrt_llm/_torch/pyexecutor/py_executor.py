@@ -89,16 +89,6 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
 
-def _trim_stats_buffer(stats: list,
-                       max_stats_len: int,
-                       num_new_entries: int = 1) -> None:
-    if _stats_buffer_is_unbounded(max_stats_len):
-        return
-    overflow = max(0, len(stats) + num_new_entries - max_stats_len)
-    if overflow:
-        del stats[:overflow]
-
-
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
@@ -779,8 +769,11 @@ class PyExecutor:
         if not rank_dicts:
             return
         with self.stats_lock:
-            _trim_stats_buffer(self.stats, self.max_stats_len * tp_size,
-                               len(rank_dicts))
+            if not _stats_buffer_is_unbounded(self.max_stats_len):
+                cap = self.max_stats_len * tp_size
+                overflow = max(0, len(self.stats) + len(rank_dicts) - cap)
+                if overflow:
+                    del self.stats[:overflow]
             for d in rank_dicts:
                 self.stats.append(("per_rank_dict", d))
 
