@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,9 +24,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -47,11 +45,9 @@ DecoderXQARunner::DecoderXQARunner(
 {
     mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-    // TODO: needs both impls because medusa kernels haven't been migrated to JIT yet (which should be).
-    // mJITImpl/mPrecompiledImpl assignments must be the last lines of this constructor. DecoderXQAImpl::create() relies
-    // on *this being fully initialized.
-    mJITImpl = DecoderXQAImpl::create(this, DecoderXQAImpl::ImplType::kJIT);
-    mPrecompiledImpl = DecoderXQAImpl::create(this, DecoderXQAImpl::ImplType::kPrecompiled);
+    // This assignment must be the last line of this constructor. DecoderXQAImpl::create() relies on *this being fully
+    // initialized.
+    mJITImpl = DecoderXQAImpl::create(this);
 }
 
 DecoderXQARunner::~DecoderXQARunner() = default;
@@ -73,37 +69,26 @@ constexpr inline T roundUp(T a, T b)
 
 } // namespace
 
-DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams, bool for_configure_plugin)
+DecoderXQAImpl* DecoderXQARunner::getImpl()
 {
-    int const smVersion = tensorrt_llm::common::getSMVersion();
-
-    std::optional<bool> envEnableXQAJIT = tensorrt_llm::common::getEnvEnableXQAJIT();
-    if (envEnableXQAJIT.has_value())
-    {
-        return envEnableXQAJIT.value() ? mJITImpl.get() : mPrecompiledImpl.get();
-    }
-    else
-    {
-        // uses JIT by default
-        return mJITImpl.get();
-    }
+    return mJITImpl.get();
 }
 
 bool DecoderXQARunner::shouldUse(XQAParams const& xqa_params, bool for_configure_plugin)
 {
-    return getImplFromXQAParams(xqa_params, for_configure_plugin)->shouldUse(xqa_params, for_configure_plugin);
+    return getImpl()->shouldUse(xqa_params, for_configure_plugin);
 }
 
 void DecoderXQARunner::prepareForRun(XQAParams const& xqa_params)
 {
-    return getImplFromXQAParams(xqa_params, true)->prepare(xqa_params);
+    return getImpl()->prepare(xqa_params);
 }
 
 template <typename KVCacheBuffer>
 void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
 {
-    return getImplFromXQAParams(xqa_params, false)->run(xqa_params, kv_cache_buffer, stream);
+    return getImpl()->run(xqa_params, kv_cache_buffer, stream);
 }
 
 std::shared_ptr<DecoderXQARunnerResource> DecoderXQARunner::getResourceGlobal()

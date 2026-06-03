@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,9 +31,7 @@ class DecoderXQARunner;
 /**
  * The underlying XQA implementation called from DecoderXQARunner.
  *
- * We need this layer of abstraction for abstracting out implementation details. Two possible implementations:
- *   1. Precompiled, i.e. kernels are compiled and saved as cubins in advance.
- *   2. JIT, i.e. kernels are compiled on the fly via NVRTC.
+ * XQA kernels are compiled on the fly via NVRTC.
  */
 class DecoderXQAImpl
 {
@@ -51,13 +49,8 @@ public:
     template <typename KVCacheBuffer>
     void run(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
 
-    enum class ImplType
-    {
-        kPrecompiled = 0,
-        kJIT = 1,
-    };
     // Needs runner pointer for accessing resources in DecoderXQARunner class.
-    static std::unique_ptr<DecoderXQAImpl> create(DecoderXQARunner* runner, ImplType implType);
+    static std::unique_ptr<DecoderXQAImpl> create(DecoderXQARunner* runner);
 
     virtual ~DecoderXQAImpl() = default;
 

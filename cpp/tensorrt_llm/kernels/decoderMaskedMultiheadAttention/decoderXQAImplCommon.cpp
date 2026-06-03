@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Common utils to be shared between Precompiled and JIT implementation.
+ * Common utils for the JIT XQA implementation.
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include "tensorrt_llm/common/config.h"
@@ -23,14 +23,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-uint32_t getKernelMTileSize(
-    uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit, bool supportQGMMA, bool supportMLA)
+uint32_t getKernelMTileSize(uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool supportQGMMA, bool supportMLA)
 {
     if (!isSpecDec)
     {
         return headGrpSize;
     }
-    if (isXqaJit && (supportQGMMA || supportMLA)) // HMMA (mha.cu) goes to the heuristic below
+    if (supportQGMMA || supportMLA) // HMMA (mha.cu) goes to the heuristic below
     {
         return 64;
     }
@@ -38,7 +37,7 @@ uint32_t getKernelMTileSize(
     return gemmM < 16 ? 16 : 32;
 }
 
-XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, bool isXqaJit, int SM)
+XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, int SM)
 {
     unsigned int head_size = xqaParams.head_size;
     unsigned int num_q_heads = xqaParams.num_q_heads;
@@ -52,16 +51,14 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
     unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
     bool supportQGMMA = jit::supportConfigQGMMA(xqaParams, SM, true);
     bool supportMLA = jit::supportConfigMLA(xqaParams, SM, true);
-    unsigned int kernel_m_tilesize = getKernelMTileSize(
-        num_q_heads_over_kv, xqaParams.multi_query_tokens, qSeqLen, isXqaJit, supportQGMMA, supportMLA);
+    unsigned int kernel_m_tilesize
+        = getKernelMTileSize(num_q_heads_over_kv, xqaParams.multi_query_tokens, qSeqLen, supportQGMMA, supportMLA);
 
-    bool const includesRotaryDim = isXqaJit && jit::appliesRoPEInXqaKernel(xqaParams, supportQGMMA);
-    // precompiled XQA does not use is_fp8_output as hashing key
+    bool const includesRotaryDim = jit::appliesRoPEInXqaKernel(xqaParams, supportQGMMA);
     return {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, kernel_m_tilesize,
         xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0, xqaParams.paged_kv_cache,
-        xqaParams.multi_query_tokens, isXqaJit ? xqaParams.is_fp8_output : false,
-        isXqaJit ? std::optional(xqaParams.position_embedding_type) : std::nullopt,
-        includesRotaryDim ? std::optional<int>(xqaParams.rotary_embedding_dim) : std::nullopt};
+        xqaParams.multi_query_tokens, xqaParams.is_fp8_output, xqaParams.position_embedding_type,
+        includesRotaryDim ? xqaParams.rotary_embedding_dim : 0};
 }
 
 } // namespace kernels

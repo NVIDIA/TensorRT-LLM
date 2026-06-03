@@ -184,18 +184,6 @@ public:
             TLLM_LOG_INFO("TRTGptModel maxInputLen: %d = max_input_len (in trtllm-build args)", mMaxInputLen);
         }
 
-        // TODO: remove this when XQA JIT can be enabled for fp8 RNN models
-        if ((modelConfig.getQuantMode().hasFp8Qdq() || modelConfig.getQuantMode().hasFp8RowWise())
-            && modelConfig.isRnnBased())
-        {
-#if defined(_WIN32)
-            if (getenv("TRTLLM_ENABLE_XQA_JIT") == nullptr)
-                _putenv_s("TRTLLM_ENABLE_XQA_JIT", "0");
-#else
-            setenv("TRTLLM_ENABLE_XQA_JIT", "0", 0);
-#endif //_WIN32
-        }
-
         using tensorrt_llm::common::stl_utils::toString;
 
         TLLM_LOG_INFO("Capacity Scheduler Policy: %s",

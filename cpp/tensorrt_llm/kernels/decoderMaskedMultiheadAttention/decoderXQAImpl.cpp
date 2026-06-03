@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 #include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplPrecompiled.h"
 
 #include <cassert>
 #include <functional>
@@ -41,15 +40,9 @@ void DecoderXQAImpl::run(XQAParams const& xqa_params, KVBlockArray const& kv_blo
     runWithKVBlockArray(xqa_params, kv_block_array, stream);
 }
 
-std::unique_ptr<DecoderXQAImpl> DecoderXQAImpl::create(DecoderXQARunner* runner, ImplType implType)
+std::unique_ptr<DecoderXQAImpl> DecoderXQAImpl::create(DecoderXQARunner* runner)
 {
-    switch (implType)
-    {
-    case ImplType::kPrecompiled: return std::make_unique<DecoderXQAImplPrecompiled>(runner);
-    case ImplType::kJIT: return std::make_unique<DecoderXQAImplJIT>(runner);
-    }
-    // Shouldn't reach here.
-    TLLM_THROW("Unknown DecoderXQAImpl::ImplType");
+    return std::make_unique<DecoderXQAImplJIT>(runner);
 }
 
 } // namespace kernels

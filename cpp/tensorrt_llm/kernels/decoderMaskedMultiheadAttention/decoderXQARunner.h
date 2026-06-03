@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,9 +23,8 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/cubinObjRegistry.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplPrecompiled.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -71,6 +70,7 @@ struct XQADispatchHelper<__nv_bfloat16, KVBlockArray>
 #endif
 
 class DecoderXQARunnerResource;
+class DecoderXQAImplJIT;
 
 class DecoderXQARunner
 {
@@ -115,10 +115,9 @@ private:
     bool mMultiBlockMode;
     int mMultiProcessorCount;
 
-    std::unique_ptr<DecoderXQAImpl> mJITImpl, mPrecompiledImpl;
-    DecoderXQAImpl* getImplFromXQAParams(XQAParams const& params, bool for_configure_plugin);
+    std::unique_ptr<DecoderXQAImpl> mJITImpl;
+    DecoderXQAImpl* getImpl();
 
-    friend DecoderXQAImplPrecompiled;
     friend DecoderXQAImplJIT;
 };
 

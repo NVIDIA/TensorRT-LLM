@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Common utils to be shared between Precompiled and JIT implementation.
+ * Common utils for the JIT XQA implementation.
  */
 #pragma once
 #include "decoderXQAConstants.h"
@@ -69,12 +69,9 @@ struct XQAKernelRuntimeHashKey
     bool paged_kv_cache;
     bool multi_query_tokens;
     bool is_fp8_output;
-    std::optional<PositionEmbeddingType> position_embedding_type;
-    // Rotary embedding dim (head elements RoPE is applied to). Only meaningful for the JIT path,
-    // where it selects between full- and partial-rotary cubins (which bake ROPE_ELEMS in). Left as
-    // std::nullopt for the precompiled path, whose kernels never apply RoPE in-kernel and are thus
-    // rotary-agnostic (RoPE handled by invokeQKVPreprocessing).
-    std::optional<int> rotary_embedding_dim;
+    PositionEmbeddingType position_embedding_type;
+    // Number of head elements RoPE is applied to. A value of 0 means rotary dim is not part of this key.
+    int rotary_embedding_dim;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
@@ -87,10 +84,9 @@ struct XQAKernelRuntimeHashKey
     }
 };
 
-uint32_t getKernelMTileSize(
-    uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit, bool supportQGMMA, bool supportMLA);
+uint32_t getKernelMTileSize(uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool supportQGMMA, bool supportMLA);
 
-XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, bool isXqaJit, int SM);
+XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, int SM);
 
 struct XQAKernelRuntimeHasher
 {
@@ -113,10 +109,11 @@ struct XQAKernelRuntimeHasher
         key ^= s.multi_query_tokens;
         key <<= 1;  // 51
         key ^= s.is_fp8_output;
-        key <<= 8;
-        key ^= static_cast<int8_t>(s.position_embedding_type.value_or(static_cast<PositionEmbeddingType>(-1)));
-        key <<= 9; // rotary dims are <= 256; 0 distinguishes the std::nullopt (precompiled) case
-        key ^= static_cast<size_t>(s.rotary_embedding_dim.value_or(0));
+        key <<= 8;  // 59
+        key ^= static_cast<int8_t>(s.position_embedding_type);
+        // FIXME: overflow here
+        key <<= 9; // 68; rotary dims are <= 256, 0 means not used.
+        key ^= static_cast<size_t>(s.rotary_embedding_dim);
         return key;
     }
 };
