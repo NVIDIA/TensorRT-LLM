@@ -24,8 +24,9 @@ from .quantization import UnquantizedFusedMoEMethod
 # isort: off
 from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod,
-    INT8WoqPerChannelFusedMoEMethod, W4A16NVFP4CutlassFusedMoEMethod,
+    MoEWeightLoadingMode, MXFP8CutlassFusedMoEMethod,
+    NVFP4CutlassFusedMoEMethod, INT8WoqPerChannelFusedMoEMethod,
+    W4A16NVFP4CutlassFusedMoEMethod,
     W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
     WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
 # isort: on
@@ -110,6 +111,12 @@ class CutlassFusedMoE(MoE):
         # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
             "sm_constraint": ("in", {100, 103, 120, 121}),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # MXFP8 (W8A8 e4m3xe4m3 with UE8M0 1x32 block scales): SM in {100, 103}.
+        # M3.1 enables construction/load; the fused kernel is M3.2.
+        QuantAlgo.MXFP8: {
+            "sm_constraint": ("in", {100, 103}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
     }
@@ -501,7 +508,8 @@ class CutlassFusedMoE(MoE):
                     | self.quant_config.quant_mode.is_weight_only()
                     | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()
                     | self.quant_config.quant_mode.has_w4a16_mxfp4()
-                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()
+                    | self.quant_config.quant_mode.has_mxfp8()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -633,7 +641,10 @@ class CutlassFusedMoE(MoE):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False, True)
-            elif self.has_w4a8_mxfp4_mxfp8:
+            elif self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8:
+                # MXFP8 dynamic activation quantize. The MXFP8xMXFP8 path reuses
+                # the same activation quant kernel as W4A8 MXFP4xMXFP8 -- only
+                # the weight side differs (B element widens from fp4 to fp8).
                 if post_quant_comm:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(
                         x, False, alignment=self.quant_method.weight_alignment)
@@ -675,6 +686,8 @@ class CutlassFusedMoE(MoE):
                 return WFP4A16FusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
                 return W4A8MXFP4MXFP8CutlassFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_mxfp8():
+                return MXFP8CutlassFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -841,7 +854,10 @@ class CutlassFusedMoE(MoE):
             use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
             use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
             use_int8_woq_per_channel=self.has_int8_woq_per_channel,
-            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8,
+            # use_mxfp8_act_scaling drives dynamic MXFP8 activation quantization
+            # before the GEMM; required for both W4A8 MXFP4xMXFP8 and W8A8
+            # MXFP8xMXFP8 paths.
+            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8,
             min_latency_mode=False,
             use_fused_finalize=self.use_fused_finalize,
             tune_max_num_tokens=self.tune_max_num_tokens,
@@ -851,6 +867,10 @@ class CutlassFusedMoE(MoE):
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
             use_dynamic_fc2_scale=use_dynamic_fc2_scale,
+            # use_mxfp8_weight_scaling selects the MXFP8xMXFP8 block-scaled
+            # kernel path within the <e4m3, e4m3> CutlassMoeFCRunner template
+            # (per-tensor FP8 otherwise).
+            use_mxfp8_weight_scaling=self.has_mxfp8,
             **lora_kwargs,
         )
         # When moe_output is provided, the result is written in-place and

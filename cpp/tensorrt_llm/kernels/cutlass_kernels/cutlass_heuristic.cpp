@@ -449,10 +449,20 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(
     CutlassGemmConfig::CandidateConfigTypeParam const config, int sm)
 {
 #ifdef FAST_BUILD
-    // Fast build disables all configs except this one for SM100
-    return {CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B, MainloopScheduleType::AUTO,
-        EpilogueScheduleType::TMA, ClusterShape::ClusterShape_1x1x1, ClusterShape::Undefined, ClusterShape::Undefined,
-        sm}};
+    // Fast build limits the candidate set to a single CTA tile shape but
+    // keeps both 1SM (cluster 1x1x1) and 2SM (cluster 2x1x1) variants so
+    // the autotuner can profile both. Block-scaled paths (MXFP8xMXFP8,
+    // NVFP4) accept both; the 2SM variant is required as a candidate so
+    // FAST_BUILD doesn't accidentally exclude all 2SM kernels (needed for
+    // MMA M=256 configurations of the Mxf8f6f4 tensor-op).
+    return {
+        CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B, MainloopScheduleType::AUTO,
+            EpilogueScheduleType::TMA, ClusterShape::ClusterShape_1x1x1, ClusterShape::Undefined,
+            ClusterShape::Undefined, sm},
+        CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B, MainloopScheduleType::AUTO,
+            EpilogueScheduleType::TMA, ClusterShape::ClusterShape_2x1x1, ClusterShape::Undefined,
+            ClusterShape::Undefined, sm},
+    };
 #else
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {

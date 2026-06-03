@@ -73,8 +73,18 @@ namespace kernels::cutlass_kernels_oss
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
+// `IsMXFPX` selects the Mxf8f6f4 block-scaled tensor-op path. This template
+// parameter is set:
+//   - true  for WFP4AFP8 (e4m3 act x fp4 weight, MXFP4 block scaling),
+//   - true  for WMXFP8AMXFP8 (e4m3 act x e4m3 weight, MXFP8 block scaling
+//     -- the case added by M3.2: same Mxf8f6f4 tensor-op family, just
+//     widens the B element type),
+//   - false otherwise (per-tensor FP8, NVFP4, BF16/FP16, etc.).
+// `is_block_scaled` extends the legacy "contains FP4 element" check to also
+// cover the MXFP8xMXFP8 case so that the block-scaled epilogue constraint
+// (TMA epilogue required) applies to the new path.
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
-    EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool is_wfp4afp8>
+    EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool IsMXFPX>
 auto getDispatchFunctionForSM100(
     cutlass_extensions::EpilogueScheduleType epilogue_schedule, bool dynamic_cga, bool swap_ab)
 {
@@ -82,19 +92,22 @@ auto getDispatchFunctionForSM100(
     {
         auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga_t)
         {
-            constexpr bool is_block_scaled
+            constexpr bool is_fp4_block_scaled
                 = std::is_same_v<T, __nv_fp4_e2m1> || std::is_same_v<WeightType, __nv_fp4_e2m1>;
+            constexpr bool is_mxfp8_mxfp8_block_scaled
+                = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3> && IsMXFPX;
+            constexpr bool is_block_scaled = is_fp4_block_scaled || is_mxfp8_mxfp8_block_scaled;
             if constexpr ((!is_block_scaled || Arch::kMinComputeCapability == 103)
                 && FUSION != EpilogueFusion::FINALIZE)
             {
                 auto func_map = std::array{
                     &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
                         WeightType, OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized, EpilogueTag, FUSION,
-                        TileShape, ClusterShape, is_wfp4afp8, decltype(dynamic_cga_t)::value, false,
+                        TileShape, ClusterShape, IsMXFPX, decltype(dynamic_cga_t)::value, false,
                         decltype(swap_ab_t)::value>,
                     &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
                         WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION,
-                        TileShape, ClusterShape, is_wfp4afp8, decltype(dynamic_cga_t)::value, false,
+                        TileShape, ClusterShape, IsMXFPX, decltype(dynamic_cga_t)::value, false,
                         decltype(swap_ab_t)::value>
 
                 };
@@ -109,7 +122,7 @@ auto getDispatchFunctionForSM100(
                     "No Smem epilogue schedule is not supported for block scaled types or finalize fusion");
                 return &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
                     WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION,
-                    TileShape, ClusterShape, is_wfp4afp8, decltype(dynamic_cga_t)::value, false,
+                    TileShape, ClusterShape, IsMXFPX, decltype(dynamic_cga_t)::value, false,
                     decltype(swap_ab_t)::value>;
             }
         };
@@ -167,11 +180,20 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
     {
         constexpr static bool is_wfp4afp8
             = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+        // W8A8 MXFP8 x MXFP8: both A and B are e4m3 with UE8M0 1x32 block scales.
+        // The runtime opts into this by passing fpX_block_scaling_type = MXFPX.
+        constexpr static bool is_wfp8afp8
+            = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
         if constexpr (is_wfp4afp8)
         {
             TLLM_CHECK_WITH_INFO(
                 hopper_input.fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
                 "MXFPX is the only supported scaling type for WFP4AFP8");
+        }
+        else if constexpr (is_wfp8afp8)
+        {
+            // For W8A8 e4m3xe4m3 we accept either NONE (per-tensor FP8 path) or MXFPX (MXFP8 block scaled).
+            // No additional check needed -- the launcher selects the right collective via IsMXFPX.
         }
         else
         {
@@ -191,10 +213,56 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
             auto cluster_shape_cute_fallback = cute::Shape<int32_t, int32_t, cute::_1>{
                 std::get<0>(cluster_shape_fallback), std::get<1>(cluster_shape_fallback), cute::_1{}};
 
-            auto selected_func = getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
-                TileShape, ClusterShape, is_wfp4afp8>(gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
-            selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
-                cluster_shape_cute, cluster_shape_cute_fallback);
+            // <e4m3, e4m3> compiles BOTH the per-tensor FP8 (IsMXFPX=false) and
+            // the MXFP8 block-scaled (IsMXFPX=true) launchers, then selects at
+            // runtime based on hopper_input.fpX_block_scaling_type. All other
+            // type combinations have a single compile-time-fixed IsMXFPX.
+            //
+            // The IsMXFPX=true launcher is only instantiated for shapes
+            // legal for the Mxf8f6f4 block-scaled tensor-op: TileM=128 and
+            // TileN in {64,128,192,256}. Mirror the FP4 block-scaled shape
+            // constraints. The compile-time guard below matches the filter
+            // in generate_kernels.py::is_gemm_op_valid_sm100 so the
+            // dispatcher never emits a call to a non-existent launcher.
+            constexpr int kTileM_mx = cute::size<0>(TileShape{});
+            constexpr int kTileN_mx = cute::size<1>(TileShape{});
+            constexpr bool is_mxfp8_shape_supported
+                = (kTileM_mx == 128) && (kTileN_mx == 64 || kTileN_mx == 128 || kTileN_mx == 192 || kTileN_mx == 256);
+            if constexpr (is_wfp8afp8)
+            {
+                bool const use_mxfp8 = hopper_input.fpX_block_scaling_type
+                    == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+                if (use_mxfp8)
+                {
+                    if constexpr (is_mxfp8_shape_supported)
+                    {
+                        auto selected_func = getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag,
+                            FUSION, TileShape, ClusterShape, true>(gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
+                        selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy,
+                            workspace_size, cluster_shape_cute, cluster_shape_cute_fallback);
+                    }
+                    else
+                    {
+                        TLLM_THROW(
+                            "MXFP8xMXFP8 MoE only supports TileShape M=128 with N in {64,128,192,256}. "
+                            "Requested tile is not a valid MXFP8 block-scaled grouped GEMM shape.");
+                    }
+                }
+                else
+                {
+                    auto selected_func = getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag,
+                        FUSION, TileShape, ClusterShape, false>(gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
+                    selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
+                        cluster_shape_cute, cluster_shape_cute_fallback);
+                }
+            }
+            else
+            {
+                auto selected_func = getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
+                    TileShape, ClusterShape, is_wfp4afp8>(gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
+                selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
+                    cluster_shape_cute, cluster_shape_cute_fallback);
+            }
         }
         else if constexpr (Arch::kMinComputeCapability >= 120 || Arch::kMinComputeCapability == 90)
         {
