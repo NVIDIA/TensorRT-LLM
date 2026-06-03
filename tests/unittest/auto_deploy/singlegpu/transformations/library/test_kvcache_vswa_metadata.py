@@ -209,5 +209,22 @@ def test_vswa_each_layer_routes_to_its_groups_extra_metadata():
     )
 
 
+@pytest.mark.parametrize(
+    "backend, expected_cyclic",
+    [("triton_paged", False), ("trtllm", True)],
+)
+def test_vswa_sets_kernel_handles_cyclic_swa(backend, expected_cyclic):
+    """The transform records the backend's cyclic-SWA capability on the interface.
+
+    trtllm's kernel masks the sliding window internally (cyclic), so the
+    executor must pass full block tables + global lengths; triton must not.
+    """
+    gm, info, cm = _run_transform(backend=backend)
+    assert info.num_matches == 2
+    assert cm.kernel_handles_cyclic_swa is expected_cyclic
+    # Both backends still register two window groups regardless of cyclic-ness.
+    assert len(cm.kv_group_windows) == 2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

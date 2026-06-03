@@ -429,8 +429,18 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     ### UTILITY METHODS ############################################################################
     @property
     def requires_uniform_kv_caches(self) -> bool:
-        """Whether CachedSequenceInterface must enforce a uniform KV cache mapping."""
-        return self.attn_backend.lower() == "trtllm"
+        """Whether CachedSequenceInterface must enforce a uniform KV cache mapping.
+
+        No attention backend currently requires this. The trtllm backend used to
+        return ``True`` here to force a single KV pool, but it now supports
+        multiple KV cache memory pools for non-uniform sliding-window models
+        (e.g. gpt-oss) -- the kernel applies the sliding-window mask internally
+        via cyclic indexing, so per-window pools route correctly. The flag is
+        kept (defaulting to ``False``) so the uniformity enforcement in
+        ``CachedSequenceInterface`` remains available should a future backend
+        need it.
+        """
+        return False
 
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.

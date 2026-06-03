@@ -302,6 +302,40 @@ def _compute_window_local_view(
     return active_indices, extra_page, active_token_count, last_page_len
 
 
+def _compute_cyclic_full_view(
+    all_indices: Sequence[int],
+    end_compute_i: int,
+    tokens_per_block: int,
+) -> Tuple[List[int], int, int, int]:
+    """Compute the metadata view for a cyclic-SWA kernel (trtllm).
+
+    Unlike ``_compute_window_local_view`` (which slices the block table down to
+    the live sliding window for kernels that cannot cyclic-index), the trtllm
+    ``thop.attention`` kernel applies the sliding-window mask itself by wrapping
+    KV reads modulo the attention window. It therefore needs:
+
+      * the FULL per-window block table (``all_indices`` verbatim, including any
+        stale front-evicted entries -- the kernel's modulo indexing skips them),
+        and
+      * the GLOBAL (un-window-capped) KV length ``end_compute_i``.
+
+    This mirrors the PyTorch backend, which copies the manager's full block list
+    from index 0 and passes ``host_past_key_value_lengths == total KV length``.
+
+    Returns the same 4-tuple shape as ``_compute_window_local_view``:
+    ``(active_indices, extra_page, seq_len_with_cache, last_page_len)``.
+    ``extra_page`` is always -1: the full table already contains the next page,
+    so the overlap scheduler needs no deferred-page insertion.
+    """
+    active_indices = list(all_indices)
+    seq_len_with_cache = end_compute_i
+    if seq_len_with_cache > 0:
+        last_page_len = (seq_len_with_cache - 1) % tokens_per_block + 1
+    else:
+        last_page_len = 0
+    return active_indices, -1, seq_len_with_cache, last_page_len
+
+
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
@@ -770,6 +804,12 @@ class ADEngine(ModelEngine):
         # on SequenceInfo).  Per-window queries on the manager route to the
         # correct C++ pool via mLayerToWindowSize.
         kv_group_windows = self.cache_seq_interface.kv_group_windows
+        # When the attention kernel applies the sliding-window mask itself via
+        # cyclic KV indexing (trtllm), the executor must hand it the full
+        # per-window block table and a global (un-window-capped) KV length --
+        # the same contract as the PyTorch backend. Otherwise (triton /
+        # flashinfer) host-slice the block table to the live window below.
+        cyclic_swa = self.cache_seq_interface.kernel_handles_cyclic_swa
         # Cache hot lookups so the per-request loop avoids repeated C++
         # dispatch / hasattr calls.
         _tokens_per_block = kv_cache_manager.tokens_per_block
@@ -809,40 +849,56 @@ class ADEngine(ModelEngine):
 
             for pool_idx, group_window in enumerate(kv_group_windows):
                 all_indices = batch_cache_indices_per_pool[pool_idx][i]
-                # SWA front-eviction: get_batch_cache_indices returns the FULL
-                # historical page list including front-evicted entries (the
-                # C++ side bumps a counter rather than popping mCacheBlockIds).
-                # _compute_window_local_view slices it down to the live window
-                # in window-local coords.
-                front_removed = kv_cache_manager.get_num_front_blocks_removed(
-                    request.py_request_id, window_size=group_window
-                )
-                (
-                    active_indices,
-                    extra_page,
-                    active_token_count,
-                    lpl_i,
-                ) = _compute_window_local_view(
-                    all_indices,
-                    front_removed=front_removed,
-                    end_compute_i=end_compute_i,
-                    group_window=group_window,
-                    tokens_per_block=_tokens_per_block,
-                )
-                num_active = len(active_indices)
+                if cyclic_swa:
+                    # Cyclic-SWA kernels (trtllm) want the FULL per-window block
+                    # table and the GLOBAL KV length; the kernel masks the window
+                    # internally. No front-eviction slicing, so the
+                    # get_num_front_blocks_removed C++ dispatch is skipped here.
+                    (
+                        active_indices,
+                        extra_page,
+                        active_token_count,
+                        lpl_i,
+                    ) = _compute_cyclic_full_view(
+                        all_indices,
+                        end_compute_i=end_compute_i,
+                        tokens_per_block=_tokens_per_block,
+                    )
+                    num_active = len(active_indices)
+                else:
+                    # SWA front-eviction: get_batch_cache_indices returns the FULL
+                    # historical page list including front-evicted entries (the
+                    # C++ side bumps a counter rather than popping mCacheBlockIds).
+                    # _compute_window_local_view slices it down to the live window
+                    # in window-local coords.
+                    front_removed = kv_cache_manager.get_num_front_blocks_removed(
+                        request.py_request_id, window_size=group_window
+                    )
+                    (
+                        active_indices,
+                        extra_page,
+                        active_token_count,
+                        lpl_i,
+                    ) = _compute_window_local_view(
+                        all_indices,
+                        front_removed=front_removed,
+                        end_compute_i=end_compute_i,
+                        group_window=group_window,
+                        tokens_per_block=_tokens_per_block,
+                    )
+                    num_active = len(active_indices)
 
                 cache_loc_per_pool[pool_idx].extend(active_indices)
                 cu_num_pages_per_pool[pool_idx].append(
                     cu_num_pages_per_pool[pool_idx][i] + num_active
                 )
                 extra_page_per_seq_per_pool[pool_idx].append(extra_page)
-                # Window-local seq_len_with_cache / last_page_len for every
-                # pool (including 0).  For full-attention pools the helper
-                # returns the unclamped global value (group_window equals
-                # max_seq_len, no clamping kicks in), so this is identical to
-                # the legacy single-pool path for non-SWA models.  For SWA
-                # pools (whether pool 0 or pool 1+), it carries the
-                # window-local coords the kernel needs under front-eviction.
+                # seq_len_with_cache / last_page_len per pool (including 0).
+                # Cyclic-SWA (trtllm): the global KV length for every pool.
+                # Host-sliced (triton/flashinfer): the unclamped global value for
+                # full-attention pools (window == max_seq_len, no clamping), and
+                # the window-local coords for SWA pools under front-eviction --
+                # identical to the legacy single-pool path for non-SWA models.
                 seq_len_with_cache_per_pool[pool_idx].append(active_token_count)
                 last_page_len_per_pool[pool_idx].append(lpl_i)
 
