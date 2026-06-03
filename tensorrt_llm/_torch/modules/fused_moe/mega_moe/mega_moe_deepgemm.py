@@ -590,31 +590,6 @@ class MegaMoEDeepGemm(MoE):
     def create_weights(self):
         if self._weights_created:
             return
-        # The DG NVLink SymmBuffer is allocated in ``post_load_weights`` rather
-        # than here. Two reasons make deferral the only safe option:
-        #
-        # 1. EPLB sizing: ConfigurableMoE syncs the EPLB-derived attributes
-        #    (``num_slots``, ``expert_size_per_partition``, ...) onto the
-        #    backend AFTER ``__init__`` returns. Sizing the SymmBuffer any
-        #    earlier would use the placeholder ``num_slots = num_experts`` and
-        #    break EPLB at forward time (DeepGEMM asserts ``num_experts ==
-        #    num_experts_per_rank * num_ranks`` in ``mega.hpp``).
-        #
-        # 2. MetaInitMode: the rendezvous (``symm_mem.rendezvous`` + EP
-        #    ``barrier`` inside ``get_symm_buffer_for_mega_moe``) is a real
-        #    collective. ``create_weights`` runs under ``MetaInitMode`` on the
-        #    fast meta-init path, where a ``c10d.barrier`` on a meta tensor
-        #    raises ``MetaInitException`` — aborting meta-init and forcing the
-        #    slow regular-init fallback that materializes every weight on host
-        #    RAM, OOM-killing small-host nodes (e.g. GB300, ~900 GiB/node).
-        #
-        # ``post_load_weights`` runs in the same build-time lockstep window on
-        # every EP rank, after MetaInitMode has exited and before any forward /
-        # CUDA-graph capture, so deferring there unconditionally keeps the
-        # rendezvous safety invariant intact while sidestepping both hazards.
-        # Same unconditional-deferral idiom as the vision/sound encoders in
-        # ``modeling_nemotron_nano.py`` (constructed in ``load_weights``,
-        # outside MetaInitMode; see ``NemotronH_Nano_VL_V2.load_weights``).
         self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
         self._weights_created = True
@@ -627,13 +602,24 @@ class MegaMoEDeepGemm(MoE):
     def post_load_weights(self) -> None:
         if self.quant_method is None:
             self.create_weights()
-        # Allocate the SymmBuffer and run its EP rendezvous now -- this is the
-        # sole allocation site (``create_weights`` deliberately defers it; see
-        # that method for the EPLB-sizing and MetaInitMode rationale). The model
-        # loader invokes this hook for every module in deterministic order on
-        # all EP ranks (lockstep), after MetaInitMode has exited and before
-        # forward / CUDA-graph capture. Idempotent — a no-op once the buffer
-        # exists.
+        # Allocate the DG NVLink SymmBuffer and run its EP rendezvous here
+        # rather than in create_weights, for two reasons:
+        #   1. EPLB sizing: ConfigurableMoE syncs the EPLB-derived attributes
+        #      (num_slots, expert_size_per_partition, ...) onto the backend only
+        #      after __init__. Sizing the buffer earlier would use the
+        #      placeholder num_slots = num_experts and break EPLB at forward
+        #      time (DeepGEMM asserts num_experts == num_experts_per_rank *
+        #      num_ranks in mega.hpp).
+        #   2. MetaInitMode: the rendezvous (symm_mem.rendezvous + EP barrier
+        #      inside get_symm_buffer_for_mega_moe) is a real collective, but
+        #      create_weights runs under MetaInitMode where a c10d.barrier on a
+        #      meta tensor raises MetaInitException — aborting meta-init and
+        #      forcing the slow regular-init fallback that materializes every
+        #      weight on host RAM and OOM-kills small-host nodes (e.g. GB300,
+        #      ~900 GiB/node).
+        # The loader invokes this hook for every module in deterministic order
+        # on all EP ranks (lockstep), after MetaInitMode has exited and before
+        # forward / CUDA-graph capture. Idempotent — a no-op once allocated.
         self._alloc_symm_buffer()
         self.quant_method.post_load_weights(self)
 
