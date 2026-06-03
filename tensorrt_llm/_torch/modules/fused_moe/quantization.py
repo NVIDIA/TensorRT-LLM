@@ -2913,6 +2913,12 @@ class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
+    def create_weights(self, module: torch.nn.Module):
+        super().create_weights(module)
+        # Fail fast at construction time if a module with online EPLB
+        # attached lands here.
+        self._online_eplb_not_supported(module)
+
     def process_weights_after_loading(self, module: torch.nn.Module):
         super().process_weights_after_loading(module)
 
