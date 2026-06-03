@@ -1042,6 +1042,9 @@ class OpenAIServer(_VideoRoutesMixin):
             post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             chat_response = post_processor(promise, args)
 
+        if disaggregated_params is not None and disaggregated_params.request_type == "context_only":
+            chat_response.prompt_token_ids = promise.prompt_token_ids
+
         if disaggregated_params is not None and chat_response.choices[
                 0].disaggregated_params is None:
             raise ValueError(
