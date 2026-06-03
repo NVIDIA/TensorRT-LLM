@@ -49,6 +49,8 @@ def _make_mock_kv_iter_stats(
     window_size=16,
     primary_used=10,
     primary_max=20,
+    primary_peak_used=None,
+    secondary_peak_used=0,
     reused=5,
     full_reused=4,
     partial_reused=1,
@@ -56,13 +58,17 @@ def _make_mock_kv_iter_stats(
     gen_alloc=2,
 ):
     """Create a mock KvCacheIterationStats nanobind object."""
+    if primary_peak_used is None:
+        primary_peak_used = primary_used
     s = SimpleNamespace(
         primary_max_num_blocks=primary_max,
         primary_free_num_blocks=primary_max - primary_used,
         primary_used_num_blocks=primary_used,
+        primary_peak_used_num_blocks=primary_peak_used,
         secondary_max_num_blocks=0,
         secondary_free_num_blocks=0,
         secondary_used_num_blocks=0,
+        secondary_peak_used_num_blocks=secondary_peak_used,
         iter_alloc_total_blocks=reused + missed,
         iter_alloc_new_blocks=missed,
         iter_reused_blocks=reused,
@@ -79,6 +85,36 @@ def _make_mock_kv_iter_stats(
         iter_intra_device_copy_bytes=8192,
     )
     return {window_size: s}
+
+
+class _FakeStorageStatistics(SimpleNamespace):
+    @property
+    def unavailable(self):
+        return self.total - self.available
+
+
+class _FakePeakStorage:
+    num_pool_groups = 2
+    num_cache_levels = 2
+
+    def __init__(self):
+        self._levels = []
+        self.primary_stats = [
+            _FakeStorageStatistics(total=10, available=8),
+            _FakeStorageStatistics(total=10, available=9),
+        ]
+        self.secondary_stats = [
+            _FakeStorageStatistics(total=5, available=4),
+            _FakeStorageStatistics(total=5, available=5),
+        ]
+
+    def get_statistics(self, level):
+        if int(level) == 0:
+            return self.primary_stats
+        return self.secondary_stats
+
+    def destroy(self):
+        pass
 
 
 class TestStatsSerializer:
@@ -123,6 +159,8 @@ class TestStatsSerializer:
         assert ws_stats["primaryMaxNumBlocks"] == 20
         assert ws_stats["primaryUsedNumBlocks"] == 10
         assert ws_stats["primaryFreeNumBlocks"] == 10
+        assert ws_stats["primaryPeakUsedNumBlocks"] == 10
+        assert ws_stats["secondaryPeakUsedNumBlocks"] == 0
         assert ws_stats["iterReusedBlocks"] == 5
         assert ws_stats["iterFullReusedBlocks"] == 4
         assert ws_stats["iterPartialReusedBlocks"] == 1
@@ -209,6 +247,7 @@ class TestStatsSerializer:
             window_size=16,
             primary_used=10,
             primary_max=20,
+            primary_peak_used=15,
             reused=5,
             full_reused=4,
             partial_reused=1,
@@ -219,6 +258,7 @@ class TestStatsSerializer:
             window_size=16,
             primary_used=10,
             primary_max=20,
+            primary_peak_used=15,
             reused=0,
             full_reused=0,
             partial_reused=0,
@@ -260,11 +300,13 @@ class TestStatsSerializer:
         d = json.loads(result)
 
         assert d["kvCacheIterationStats"]["16"]["iterReusedBlocks"] == 5
+        assert d["kvCacheIterationStats"]["16"]["primaryPeakUsedNumBlocks"] == 15
         assert "kvCacheIterationStatsByPoolGroup" in d
         pool_group = d["kvCacheIterationStatsByPoolGroup"]["7"]
         assert pool_group["poolGroupId"] == 7
         assert pool_group["slotSize"] == [2 << 20]
         assert pool_group["windowSizes"] == [16, 64]
+        assert pool_group["primaryPeakUsedNumBlocks"] == 15
         assert pool_group["iterGenAllocBlocks"] == 2
         assert "iterReusedBlocks" not in pool_group
         assert "iterMissedBlocks" not in pool_group
@@ -278,3 +320,30 @@ class TestStatsSerializer:
         assert life_cycle["iterReusedBlocks"] == 5
         assert life_cycle["iterMissedBlocks"] == 3
         assert "iterGenAllocBlocks" not in life_cycle
+
+    def test_v2_peak_used_blocks_reset_tracks_interval_peak(self):
+        """Peak used blocks should cover the interval since the previous reset."""
+        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache_manager import KVCacheManager
+
+        storage = _FakePeakStorage()
+        manager = object.__new__(KVCacheManager)
+        manager._storage = storage
+        manager._radix_tree = SimpleNamespace(clear=lambda: [])
+        manager._reset_iteration_peak_used_num_blocks()
+
+        # Usage rises above the reset baseline, then falls before drain.
+        storage.primary_stats[0].available = 5  # primary used = 5
+        storage.primary_stats[1].available = 6  # primary used = 4
+        storage.secondary_stats[0].available = 2  # secondary used = 3
+        manager._update_iteration_peak_used_num_blocks()
+        storage.primary_stats[0].available = 7  # primary used = 3
+        storage.secondary_stats[0].available = 4  # secondary used = 1
+
+        primary_peak, secondary_peak = manager.get_and_reset_iteration_peak_used_num_blocks()
+        assert list(primary_peak) == [5, 4]
+        assert list(secondary_peak) == [3, 0]
+
+        # The next interval starts from current usage, not zero.
+        primary_peak, secondary_peak = manager.get_and_reset_iteration_peak_used_num_blocks()
+        assert list(primary_peak) == [3, 4]
+        assert list(secondary_peak) == [1, 0]

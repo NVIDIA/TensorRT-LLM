@@ -247,8 +247,8 @@ struct KvCacheStats
     std::size_t allocatedBytes{};
 };
 
-/// @brief Per-iteration KV cache statistics. All delta counters represent changes since the last call to
-/// getIterationStats(). Gauges are instantaneous snapshots.
+/// @brief Per-iteration KV cache statistics. All delta counters and peak gauges represent values since the last call
+/// to getIterationStats(). Snapshot gauges are instantaneous.
 struct KvCacheIterationStats
 {
     // --- Instantaneous gauges ---
@@ -259,6 +259,7 @@ struct KvCacheIterationStats
     // Cached-but-unpinned blocks in the primary pool. Distinct from primaryUsedNumBlocks,
     // which also counts blocks pinned during onboard memcpy windows.
     SizeType32 primaryEvictableNumBlocks{0};
+    SizeType32 primaryPeakUsedNumBlocks{0};
     // Secondary (host) pool
     SizeType32 secondaryMaxNumBlocks{0};
     SizeType32 secondaryFreeNumBlocks{0};
@@ -267,6 +268,7 @@ struct KvCacheIterationStats
     // host cache"; secondaryUsedNumBlocks only counts pinned blocks during the sub-ms
     // onboard memcpy window so it cannot answer that question on its own.
     SizeType32 secondaryEvictableNumBlocks{0};
+    SizeType32 secondaryPeakUsedNumBlocks{0};
 
     // --- Per-iteration deltas (reset on each read) ---
     // Context phase: block allocation and reuse

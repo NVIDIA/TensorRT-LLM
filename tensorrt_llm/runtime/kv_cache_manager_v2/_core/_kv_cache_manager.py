@@ -211,6 +211,8 @@ class KVCacheManager:
         "_stats_enabled",
         "_committed_stats",
         "_iteration_stats_by_life_cycle",
+        "_iteration_primary_peak_used_num_blocks",
+        "_iteration_secondary_peak_used_num_blocks",
         "_dirty_stats_kv_cache_ids",
         "_stats_excluded_kv_cache_ids",
     )
@@ -239,6 +241,8 @@ class KVCacheManager:
     _stats_enabled: bool
     _committed_stats: KVCacheStatsDelta
     _iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
+    _iteration_primary_peak_used_num_blocks: TypedIndexList[PoolGroupIndex, int]
+    _iteration_secondary_peak_used_num_blocks: TypedIndexList[PoolGroupIndex, int]
     _dirty_stats_kv_cache_ids: set[int]
     _stats_excluded_kv_cache_ids: set[int]
 
@@ -278,6 +282,7 @@ class KVCacheManager:
         self._stats_enabled = config.enable_stats
         self._committed_stats = KVCacheStatsDelta()
         self._iteration_stats_by_life_cycle = {}
+        self._reset_iteration_peak_used_num_blocks()
         self._dirty_stats_kv_cache_ids = set()
         self._stats_excluded_kv_cache_ids = set()
 
@@ -470,6 +475,50 @@ class KVCacheManager:
             allocated_bytes=self.get_quota(cache_level),
         )
 
+    def _current_used_num_blocks_by_pool_group(
+        self, cache_levels: Iterable[CacheLevel]
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        used = filled_list(0, self._storage.num_pool_groups)
+        for cache_level in cache_levels:
+            for pool_group_index, stats in typed_enumerate(
+                self._storage.get_statistics(cache_level)
+            ):
+                used[pool_group_index] += stats.unavailable
+        return used
+
+    def _current_primary_used_num_blocks_by_pool_group(
+        self,
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        return self._current_used_num_blocks_by_pool_group((GPU_LEVEL,))
+
+    def _current_secondary_used_num_blocks_by_pool_group(
+        self,
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        return self._current_used_num_blocks_by_pool_group(
+            CacheLevel(level) for level in range(1, int(self._storage.num_cache_levels))
+        )
+
+    def _reset_iteration_peak_used_num_blocks(self) -> None:
+        self._iteration_primary_peak_used_num_blocks = (
+            self._current_primary_used_num_blocks_by_pool_group()
+        )
+        self._iteration_secondary_peak_used_num_blocks = (
+            self._current_secondary_used_num_blocks_by_pool_group()
+        )
+
+    def _update_iteration_peak_used_num_blocks(self) -> None:
+        primary_used = self._current_primary_used_num_blocks_by_pool_group()
+        secondary_used = self._current_secondary_used_num_blocks_by_pool_group()
+        for pool_group_index in typed_range(self._storage.num_pool_groups):
+            self._iteration_primary_peak_used_num_blocks[pool_group_index] = max(
+                self._iteration_primary_peak_used_num_blocks[pool_group_index],
+                primary_used[pool_group_index],
+            )
+            self._iteration_secondary_peak_used_num_blocks[pool_group_index] = max(
+                self._iteration_secondary_peak_used_num_blocks[pool_group_index],
+                secondary_used[pool_group_index],
+            )
+
     def commit_stats(
         self,
         stats: KVCacheStatsDelta,
@@ -477,6 +526,7 @@ class KVCacheManager:
     ) -> None:
         if not self._stats_enabled:
             return
+        self._update_iteration_peak_used_num_blocks()
         self._committed_stats.add(stats)
         if iteration_stats_by_life_cycle is None:
             return
@@ -500,7 +550,26 @@ class KVCacheManager:
         self._iteration_stats_by_life_cycle.clear()
         return stats
 
+    def get_and_reset_iteration_peak_used_num_blocks(
+        self,
+    ) -> tuple[TypedIndexList[PoolGroupIndex, int], TypedIndexList[PoolGroupIndex, int]]:
+        self._update_iteration_peak_used_num_blocks()
+        primary = make_typed(
+            lambda pool_group_index: self._iteration_primary_peak_used_num_blocks[pool_group_index],
+            self._storage.num_pool_groups,
+        )
+        secondary = make_typed(
+            lambda pool_group_index: self._iteration_secondary_peak_used_num_blocks[
+                pool_group_index
+            ],
+            self._storage.num_pool_groups,
+        )
+        self._reset_iteration_peak_used_num_blocks()
+        return primary, secondary
+
     def mark_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if self._stats_enabled:
+            self._update_iteration_peak_used_num_blocks()
         if kv_cache_id is not None:
             self._dirty_stats_kv_cache_ids.add(kv_cache_id)
 

@@ -3125,6 +3125,8 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_group_ids: Iterable[int],
         primary_stats,
         secondary_stats_by_level,
+        primary_peak_used_blocks_by_pool_group,
+        secondary_peak_used_blocks_by_pool_group,
         delta,
         field_names=KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     ):
@@ -3140,6 +3142,9 @@ class KVCacheManagerV2(BaseResourceManager):
         stats.primary_evictable_num_blocks = sum(
             primary_stats[pool_group_id].evictable
             for pool_group_id in pool_group_ids)
+        stats.primary_peak_used_num_blocks = sum(
+            primary_peak_used_blocks_by_pool_group[pool_group_id]
+            for pool_group_id in pool_group_ids)
         stats.secondary_max_num_blocks = sum(
             level_stats[pool_group_id].total
             for level_stats in secondary_stats_by_level
@@ -3153,6 +3158,9 @@ class KVCacheManagerV2(BaseResourceManager):
         stats.secondary_evictable_num_blocks = sum(
             level_stats[pool_group_id].evictable
             for level_stats in secondary_stats_by_level
+            for pool_group_id in pool_group_ids)
+        stats.secondary_peak_used_num_blocks = sum(
+            secondary_peak_used_blocks_by_pool_group[pool_group_id]
             for pool_group_id in pool_group_ids)
         self._apply_iteration_stats_delta(stats, delta, field_names)
         return stats
@@ -3197,6 +3205,8 @@ class KVCacheManagerV2(BaseResourceManager):
         windows_by_pool_group: dict[int, tuple[int, ...]],
         primary_stats,
         secondary_stats_by_level,
+        primary_peak_used_blocks_by_pool_group,
+        secondary_peak_used_blocks_by_pool_group,
         pool_group_delta,
         reuse_delta,
     ):
@@ -3208,6 +3218,8 @@ class KVCacheManagerV2(BaseResourceManager):
             pool_group_ids,
             primary_stats,
             secondary_stats_by_level,
+            primary_peak_used_blocks_by_pool_group,
+            secondary_peak_used_blocks_by_pool_group,
             pool_group_delta,
             KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
         )
@@ -3221,6 +3233,8 @@ class KVCacheManagerV2(BaseResourceManager):
         windows_by_pool_group: dict[int, tuple[int, ...]],
         primary_stats,
         secondary_stats_by_level,
+        primary_peak_used_blocks_by_pool_group,
+        secondary_peak_used_blocks_by_pool_group,
         pool_group_delta,
     ) -> KVCacheV2PoolGroupIterationStats:
         return KVCacheV2PoolGroupIterationStats(
@@ -3231,6 +3245,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 (pool_group_id, ),
                 primary_stats,
                 secondary_stats_by_level,
+                primary_peak_used_blocks_by_pool_group,
+                secondary_peak_used_blocks_by_pool_group,
                 pool_group_delta,
                 KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
             ),
@@ -3242,6 +3258,8 @@ class KVCacheManagerV2(BaseResourceManager):
         storage,
         primary_stats,
         secondary_stats_by_level,
+        primary_peak_used_blocks_by_pool_group,
+        secondary_peak_used_blocks_by_pool_group,
         reuse_delta,
     ) -> KVCacheV2LifeCycleIterationStats:
         typed_life_cycle_id = LifeCycleId(life_cycle_id)
@@ -3257,6 +3275,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 (),
                 primary_stats,
                 secondary_stats_by_level,
+                primary_peak_used_blocks_by_pool_group,
+                secondary_peak_used_blocks_by_pool_group,
                 reuse_delta,
                 KV_CACHE_ITERATION_STATS_REUSE_FIELDS,
             ),
@@ -3309,6 +3329,10 @@ class KVCacheManagerV2(BaseResourceManager):
         windows_by_pool_group = self._windows_by_pool_group(
             pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
+        (
+            primary_peak_used_blocks_by_pool_group,
+            secondary_peak_used_blocks_by_pool_group,
+        ) = self.impl.get_and_reset_iteration_peak_used_num_blocks()
         (reuse_deltas_by_window, reuse_deltas_by_life_cycle,
          pool_group_deltas_by_window,
          pool_group_deltas) = self._collect_iteration_stats_deltas(
@@ -3331,6 +3355,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 windows_by_pool_group,
                 primary_stats,
                 secondary_stats_by_level,
+                primary_peak_used_blocks_by_pool_group,
+                secondary_peak_used_blocks_by_pool_group,
                 pool_group_deltas_by_window.get(window_size),
                 reuse_deltas_by_window.get(window_size),
             )
@@ -3346,6 +3372,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 windows_by_pool_group,
                 primary_stats,
                 secondary_stats_by_level,
+                primary_peak_used_blocks_by_pool_group,
+                secondary_peak_used_blocks_by_pool_group,
                 pool_group_deltas.get(pool_group_id),
             )
             for pool_group_id in pool_group_ids
@@ -3358,6 +3386,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 storage,
                 primary_stats,
                 secondary_stats_by_level,
+                primary_peak_used_blocks_by_pool_group,
+                secondary_peak_used_blocks_by_pool_group,
                 reuse_delta,
             )
             for life_cycle_id, reuse_delta in sorted(
