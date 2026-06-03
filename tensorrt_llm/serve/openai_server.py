@@ -1494,6 +1494,12 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 prompts = request.prompt
 
+            stream_response_id = None
+            stream_created = None
+            if request.stream and len(prompts) > 1:
+                stream_response_id = f"cmpl-{uuid.uuid4().hex}"
+                stream_created = int(time.time())
+
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
@@ -1516,6 +1522,8 @@ class OpenAIServer(_VideoRoutesMixin):
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx
+                postproc_args.stream_response_id = stream_response_id
+                postproc_args.stream_created = stream_created
                 if request.echo:
                     postproc_args.prompt = prompt
                 postproc_params = PostprocParams(
