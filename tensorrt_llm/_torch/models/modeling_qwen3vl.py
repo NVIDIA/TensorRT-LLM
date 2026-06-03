@@ -37,7 +37,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import MultimodalParams, MultimodalPromptOrder
+from ...inputs.multimodal import MixedModalEncodeContext, MultimodalParams, MultimodalPromptOrder
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -198,31 +198,45 @@ def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[i
     """Yield one canonical `ModalityItem` per Qwen3VL prompt slot.
 
     Qwen3VL has only image and video modalities; no audio, no ghost items. The
-    extractor walks `MultimodalPromptOrder` and emits one item per entry: each
-    owns its prompt rank (`prompt_pos`), slices its single-item payload out of the
-    aggregate `pixel_values`/`*_grid_thw` blob, and sizes its `rows` from the
-    per-grid post-merge count (the encoder-output row count == scatter footprint).
-    Interleaved repeated modalities (`image -> video -> image`) are just three
-    slots scattered by `prompt_pos`; no special case.
+    extractor parses the two wire keys (`multimodal_item_order` +
+    `multimodal_embedding_lengths`) into one validated typed view at the point of
+    use via `MixedModalEncodeContext.from_metadata`, then walks `ctx.order` and
+    emits one item per entry: each owns its prompt rank (`prompt_pos`), slices its
+    single-item payload out of the aggregate `pixel_values`/`*_grid_thw` blob, and
+    sizes its `rows` from the per-grid post-merge count (the encoder-output row
+    count == scatter footprint). Interleaved repeated modalities
+    (`image -> video -> image`) are just three slots scattered by `prompt_pos`; no
+    special case.
+
+    Option Y: no `MultimodalParams` field is added and the dict keys stay the wire
+    format; the context is built transiently here and lives only inside the
+    extractor. `from_metadata` returns None for pure single-modality requests (no
+    `multimodal_item_order` key); the modality-major default order is synthesized
+    in that case so each present modality is the sole item at prompt rank 0.
     """
     multimodal_data = param.multimodal_data or {}
     modality_types = [m for m in _QWEN_MODALITIES if multimodal_data.get(m) is not None]
     if not modality_types:
         return
 
-    # Normalize order metadata via MultimodalPromptOrder so dict-form entries
-    # (`{"modality": ..., "index": ...}`, as the runtime registry emits) and
-    # tuple-form entries both resolve to `(modality, index)` pairs. A raw
-    # `tuple(pair)` over dict entries would yield the dict keys and silently
-    # collapse every item to default slot 0.
-    item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
-    if item_order is None:
-        # Pure single-modality (no explicit prompt order metadata): each
-        # present modality is the sole item at MultimodalPromptOrder rank 0.
-        item_order = MultimodalPromptOrder((m, 0) for m in modality_types)
+    # Build the transient encode context from the wire keys. `from_metadata`
+    # normalizes dict-form order entries (`{"modality": ..., "index": ...}`, as
+    # the runtime registry emits) and tuple-form entries alike to `(modality,
+    # index)` pairs, and validates length agreement with
+    # `multimodal_embedding_lengths`. A raw `tuple(pair)` over dict entries would
+    # yield the dict keys and silently collapse every item to default slot 0.
+    ctx = MixedModalEncodeContext.from_metadata(
+        multimodal_data, multimodal_data.get("multimodal_embedding_lengths")
+    )
+    if ctx is not None:
+        order = ctx.order
+    else:
+        # Pure single-modality (no explicit prompt order metadata): each present
+        # modality is the sole item at prompt rank 0.
+        order = tuple((m, 0) for m in modality_types)
 
     slicer = Qwen3VLPayloadSlicer(spatial_merge_size=spatial_merge_size)
-    for prompt_pos, (modality, mm_idx) in enumerate(item_order):
+    for prompt_pos, (modality, mm_idx) in enumerate(order):
         if multimodal_data.get(modality) is None:
             continue
         yield ModalityItem(

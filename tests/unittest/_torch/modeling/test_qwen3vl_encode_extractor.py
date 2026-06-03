@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Qwen3VL multimodal item extractor and bucket adapters.
 
-The extractor walks one `MultimodalParams` in `MultimodalPromptOrder` order and
-yields one canonical six-field `ModalityItem` per prompt slot. A `ModalityItem`
-owns exactly one slot (`prompt_pos`); its `rows` is both the encoder-output row
-count and its scatter footprint. Per-item payload slicing (one image / one video
-out of an aggregate `pixel_values` + `*_grid_thw` blob) goes through
-`Qwen3VLPayloadSlicer`, whose `rows_for` is the per-grid post-merge token count.
+The extractor parses the two wire keys (`multimodal_item_order` +
+`multimodal_embedding_lengths`) into one transient `MixedModalEncodeContext` via
+`from_metadata`, walks `ctx.order`, and yields one canonical six-field
+`ModalityItem` per prompt slot. A `ModalityItem` owns exactly one slot
+(`prompt_pos`); its `rows` is both the encoder-output row count and its scatter
+footprint. Per-item payload slicing (one image / one video out of an aggregate
+`pixel_values` + `*_grid_thw` blob) goes through `Qwen3VLPayloadSlicer`, whose
+`rows_for` is the per-grid post-merge token count. A pure single-modality request
+carries no `multimodal_item_order` key, so `from_metadata` returns None and the
+extractor synthesizes the modality-major default order.
 """
 
 from __future__ import annotations
@@ -177,6 +181,11 @@ class TestQwen3VLExtractItems:
                     {"modality": "video", "index": 0},
                     {"modality": "image", "index": 1},
                 ],
+                # The transient MixedModalEncodeContext requires the per-slot row
+                # counts alongside the order (length-agreement is validated in
+                # `__post_init__`). Rows still come from the grid via `rows_for`
+                # until Task 5b sources them from the context; these match.
+                "multimodal_embedding_lengths": [16, 32, 4],
             }
         )
         items = list(_qwen3vl_extract_items(0, param, spatial_merge_size=merge))
@@ -195,6 +204,35 @@ class TestQwen3VLExtractItems:
         assert items[2].payload["pixel_values"].shape[0] == 64
         assert items[0].payload["image_grid_thw"].tolist() == [[1, 16, 16]]
         assert items[0].payload["pixel_values"].shape[0] == 256
+
+    def test_mixed_order_length_mismatch_raises(self):
+        # The extractor now builds a transient MixedModalEncodeContext from the
+        # two wire keys, so a `multimodal_item_order` whose length disagrees with
+        # `multimodal_embedding_lengths` is rejected at construction time (the
+        # context's `__post_init__` length-agreement check). The old
+        # `MultimodalPromptOrder.from_metadata` path ignored the lengths entirely
+        # and would have yielded items, so this guards the substitution.
+        payload_image = {
+            "pixel_values": torch.randn(20, 1176),
+            "image_grid_thw": torch.tensor([[1, 16, 16]]),
+            "num_tokens": 5,
+        }
+        payload_video = {
+            "pixel_values_videos": torch.randn(32, 1176),
+            "video_grid_thw": torch.tensor([[2, 16, 16]]),
+            "num_tokens": 8,
+        }
+        param = _make_param(
+            {
+                "image": payload_image,
+                "video": payload_video,
+                # 2-entry order, 1-entry lengths -> the typed view rejects it.
+                "multimodal_item_order": [("video", 0), ("image", 0)],
+                "multimodal_embedding_lengths": [8],
+            }
+        )
+        with pytest.raises(ValueError, match="embedding_lengths"):
+            list(_qwen3vl_extract_items(0, param))
 
 
 class TestQwen3VLBucketAdapters:
