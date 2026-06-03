@@ -4435,6 +4435,12 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
 
     auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
     auto const tokensPerBlock = getTokensPerBlock();
+    // Count full blocks from uniqueTokens.size() (NOT getUsableUniqueTokenCountForReuse).
+    // This is intentional: the connector chain front-runs storeBlocks, committing a block's
+    // hash the moment the block fills -- including a trailing block that lands exactly on a
+    // block boundary. getUsableUniqueTokenCountForReuse subtracts the final unmaterialized
+    // token, which would drop that just-filled trailing block and silently disable
+    // front-running. See KVCacheManagerTest.CommitAndGetBlockHashesFrontRunsTrailingFullBlock.
     auto const numFullTokenBlocks = static_cast<SizeType32>(uniqueTokens.size()) / tokensPerBlock;
     auto const numAllocatedBlocks = static_cast<SizeType32>(blockIds.size());
     // The allocator may have allocated a (partial) trailing block; clip to whichever count is

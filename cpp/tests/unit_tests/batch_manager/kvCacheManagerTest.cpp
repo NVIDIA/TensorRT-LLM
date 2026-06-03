@@ -4609,6 +4609,90 @@ TEST_F(KVCacheManagerTest, CommitAndGetBlockHashesForRequest)
     }
 }
 
+TEST_F(KVCacheManagerTest, CommitAndGetBlockHashesFrontRunsTrailingFullBlock)
+{
+    // Regression guard for the front-running contract: when a block fills *exactly* on a block
+    // boundary so that it is the sequence's trailing block (no partial block follows it),
+    // commitAndGetBlockHashesForRequest must still commit and return that block's hash in the
+    // same step. The sibling test CommitAndGetBlockHashesForRequest only covers a just-filled
+    // block that is followed by a partial block, so it would still pass if the implementation
+    // switched to getUsableUniqueTokenCountForReuse (which subtracts the final unmaterialized
+    // token and would drop the trailing full block). This test pins the exact-boundary case so
+    // that regression fails loudly: with tokensPerBlock=4 and 8 tokens, the usable-count path
+    // would yield (8 - 1) / 4 = 1 block, whereas the correct front-running chain has 2.
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr numBlocks = 8;
+    auto constexpr maxAttentionWindow = 32;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    SizeType32 constexpr maxNewTokens = 8;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {numBlocks, 0}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dtype, 0, stream, maxAttentionWindow,
+        maxAttentionWindow, /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt);
+    kvCacheManager.allocatePools(false);
+
+    // Chain BlockKeyHasher over the request's full token blocks (keyed by uniqueTokens.size()),
+    // mirroring the front-running chain the connector expects.
+    auto const expectedChain = [&](LlmRequest const& req)
+    {
+        auto const& uniqueTokens = req.getUniqueTokens(beamIdx);
+        auto const numFull = static_cast<SizeType32>(uniqueTokens.size()) / tokensPerBlock;
+        std::vector<tle::IdType> expected;
+        std::size_t parentHash = 0;
+        for (SizeType32 b = 0; b < numFull; ++b)
+        {
+            VecUniqueTokens slice(
+                uniqueTokens.begin() + b * tokensPerBlock, uniqueTokens.begin() + (b + 1) * tokensPerBlock);
+            BlockKey const blockKey(/*usesExtraIds=*/false, /*loraTaskId=*/std::nullopt, std::move(slice));
+            auto const hash = BlockKeyHasher::hash(blockKey, parentHash);
+            expected.push_back(static_cast<tle::IdType>(hash));
+            parentHash = hash;
+        }
+        return expected;
+    };
+
+    // 6 context tokens -> block 0 full (10..13), block 1 partial (14, 15).
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{10, 11, 12, 13, 14, 15});
+    auto llmRequest = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch(
+        {{{0, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+
+    auto contextHashes = kvCacheManager.commitAndGetBlockHashesForRequest(*llmRequest, maxAttentionWindow);
+    ASSERT_EQ(contextHashes.size(), 1u); // block 1 is still partial here.
+
+    // Generate exactly tokens 16, 17 so block 1 (tokens 14..17) fills and becomes the *trailing*
+    // block -- no further (partial) block is started. The just-filled trailing block must be
+    // committed via the "set" branch in this same step.
+    for (auto const token : {16, 17})
+    {
+        llmRequest->addNewToken(token, beamIdx);
+        kvCacheManager.addToken(0);
+    }
+
+    auto hashes = kvCacheManager.commitAndGetBlockHashesForRequest(*llmRequest, maxAttentionWindow);
+    auto expected = expectedChain(*llmRequest);
+    ASSERT_EQ(expected.size(), 2u);
+    // The crux: 2 hashes, not 1. A usable-count implementation would drop the trailing block.
+    EXPECT_EQ(hashes, expected);
+    // Front-running only appends; block 0's hash is unchanged from the context-only call.
+    EXPECT_EQ(hashes.front(), contextHashes.front());
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    (void) kvCacheManager.removeSequence(0, llmRequest);
+}
+
 TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksBasicNoPartial)
 {
     using namespace tensorrt_llm::batch_manager::kv_cache_manager;

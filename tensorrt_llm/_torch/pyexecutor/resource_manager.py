@@ -1505,7 +1505,12 @@ class KVCacheManager(BaseResourceManager):
         only; the connector enforces this at startup.
         """
         if window_size is None:
-            if len(self.max_attention_window_vec) > 1:
+            # ``is_vswa`` (distinct window sizes) is the real VSWA signal; a
+            # uniform per-layer vector such as ``[4096, 4096, ...]`` has
+            # ``len > 1`` yet a single effective window, so keying off the
+            # length would spuriously reject it for connector callers that omit
+            # ``window_size``.
+            if self.is_vswa:
                 raise ValueError("window_size must be provided for VSWA")
             window_size = self.max_attention_window_vec[0]
 
