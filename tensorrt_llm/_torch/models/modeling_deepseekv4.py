@@ -830,10 +830,7 @@ class DeepseekV4WeightLoader:
         # small-host nodes it is what keeps the load under the cgroup limit.
 
         def _pageout_safetensors():
-            # Local import mirrors base_weight_loader's madvise call site and
-            # avoids importing the MoE load balancer at module import time.
-            from ..modules.fused_moe.moe_load_balancer import \
-                pageout_file_backed_regions
+            from ..mmap_utils import pageout_file_backed_regions
 
             torch.cuda.synchronize()
             pageout_file_backed_regions(".safetensors", mode="dontneed")
