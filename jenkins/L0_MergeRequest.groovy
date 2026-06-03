@@ -1100,6 +1100,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
         // 2. Parallel: Rerun Report, Test Coverage, and AI Failure Analysis
         def parallelTasks = [:]
         parallelTasks["Rerun Report"] = {
+            try {
             timeout(time: 10, unit: 'MINUTES') {
             stage("Rerun Report") {
                 sh "rm -rf rerun && mkdir -p rerun"
@@ -1129,9 +1130,13 @@ def collectTestResults(pipeline, testFilter, globalVars)
                 }
             } // Rerun report stage
             } // timeout 10 min
+            } catch (Exception e) {
+                echo "Rerun Report failed or timed out: ${e.toString()}"
+            }
         }
         parallelTasks["Test Coverage"] = {
-            timeout(time: 15, unit: 'MINUTES') {
+            try {
+            timeout(time: 10, unit: 'MINUTES') {
             try {
                 stage("Test Coverage") {
                     sh "ls"
@@ -1173,11 +1178,15 @@ def collectTestResults(pipeline, testFilter, globalVars)
             {
                 pipeline.echo("Test coverage failed execution.")
             }
-            } // timeout 15 min
+            } // timeout 10 min
+            } catch (Exception e) {
+                echo "Test Coverage failed or timed out: ${e.toString()}"
+            }
         }
         if (currentBuild.currentResult == 'FAILURE') {
             parallelTasks["AI Failure Analysis"] = {
-                timeout(time: 15, unit: 'MINUTES') {
+                try {
+                timeout(time: 10, unit: 'MINUTES') {
                 stage("AI Failure Analysis") {
                     try {
                         def prNumber = null
@@ -1261,7 +1270,10 @@ def collectTestResults(pipeline, testFilter, globalVars)
                         // Analysis is best-effort; do not fail the pipeline
                     }
                 }
-                } // timeout 15 min
+                } // timeout 10 min
+                } catch (Exception e) {
+                    echo "AI Failure Analysis failed or timed out: ${e.toString()}"
+                }
             }
         }
         parallel parallelTasks
