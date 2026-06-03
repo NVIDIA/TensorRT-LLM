@@ -30,16 +30,25 @@ class FakePretrainedConfig:
     """Minimal stand-in for a HF pretrained config."""
 
     def __init__(
-        self, architectures: Sequence[str] = ("LlamaForCausalLM",), torch_dtype: str = "bf16"
+        self,
+        architectures: Sequence[str] = ("LlamaForCausalLM",),
+        torch_dtype: str = "bf16",
+        **attrs,
     ):
         self.architectures = list(architectures)
         self.torch_dtype = torch_dtype
+        for name, value in attrs.items():
+            setattr(self, name, value)
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "architectures": self.architectures,
             "torch_dtype": self.torch_dtype,
         }
+        payload.update(
+            {name: value for name, value in self.__dict__.items() if name not in payload}
+        )
+        return payload
 
 
 class FakeQuantConfig:
@@ -54,6 +63,26 @@ class FakeQuantConfig:
             "quant_algo": self.quant_algo,
             "kv_cache_quant_algo": self.kv_cache_quant_algo,
         }
+
+
+class FakeQuantConfigWithPythonOnlyField(FakeQuantConfig):
+    """Quant config whose JSON dump fails but Python dump succeeds."""
+
+    def __init__(
+        self,
+        quant_algo: str = "FP8",
+        kv_cache_quant_algo: Optional[str] = None,
+        dtype: object = "torch.float16",
+    ):
+        super().__init__(quant_algo=quant_algo, kv_cache_quant_algo=kv_cache_quant_algo)
+        self.dtype = dtype
+
+    def model_dump(self, mode: str = "json") -> dict:
+        if mode == "json":
+            raise TypeError("Unable to serialize unknown type: torch.dtype")
+        payload = super().model_dump(mode=mode)
+        payload["dtype"] = self.dtype
+        return payload
 
 
 class FakeMapping:

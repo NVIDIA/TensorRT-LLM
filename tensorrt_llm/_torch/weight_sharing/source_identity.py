@@ -14,29 +14,26 @@
 # limitations under the License.
 """Backend-agnostic source identity for weight-sharing receivers.
 
-A :class:`SourceIdentity` is a serializable fingerprint of every configuration
-choice that affects how a model's weights are laid out in memory. It exists so
-that a *receiver* of pre-laid-out weights (e.g. MX peer-to-peer transfer, or a
-GMS read-only materialize) can verify, **before** it consumes shared weights,
+A :class:`SourceIdentity` is a serializable fingerprint of configuration choices
+that affect how a model's weights are laid out in memory. It exists so that a
+*receiver* of pre-laid-out weights (e.g. MX peer-to-peer transfer, or a GMS
+read-only materialize) can verify, **once a producer identity is available**,
 that the producer ("source") and the consumer agree on every layout-affecting
-choice. If they disagree, the receiver must not consume the shared weights and
-should fall back (e.g. plain disk loading).
+choice before the receiver consumes shared weights.
 
 The identity is intentionally decoupled from any specific weight-sharing
 technology (neither MX nor GMS appears here). Both consume it identically::
 
-    local = SourceIdentity.from_model_config(model_config, rank=mapping.rank)
+    local = SourceIdentity.from_model_config(model_config)
     decision = check_source_identity(local, source_identity, policy)
     if decision.should_share:
         ...  # pull / materialize shared weights
     else:
         ...  # fall back to disk loading
 
-Intended (out-of-tree, not wired here) integration points:
-  * MX checkpoint loader: build the local identity and compare it against the
-    publisher's stored identity *before* starting the P2P transfer.
-  * GMS read-only reader: compare against the catalog's stored identity
-    *before* ``materialize_module``.
+The current MX and GMS call sites build the local receiver identity and expose a
+single fetch seam for publisher metadata. Until those publisher metadata seams
+are wired to real stored identities, the comparison is not enforced.
 
 Layered design
 --------------
@@ -71,6 +68,30 @@ if TYPE_CHECKING:
 # never match.
 SOURCE_IDENTITY_FORMAT_VERSION = 1
 
+# Pretrained-config fields that directly affect parameter shapes, module
+# topology, or dtype for common TRT-LLM model families. Keep this projection
+# intentionally narrow: unrelated HF config metadata must not block sharing.
+_MODEL_LAYOUT_FIELDS = (
+    "architectures",
+    "model_type",
+    "torch_dtype",
+    "vocab_size",
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "tie_word_embeddings",
+    "num_experts",
+    "num_local_experts",
+    "num_experts_per_tok",
+    "n_routed_experts",
+    "n_shared_experts",
+    "moe_intermediate_size",
+    "decoder_sparse_step",
+)
+
 
 def _canonical_hash(obj: Any) -> str:
     """Compute a stable SHA-256 hash of an arbitrary JSON-able object.
@@ -104,7 +125,7 @@ def _quant_to_dict(quant_config: Any) -> Any:
         return None
     model_dump = getattr(quant_config, "model_dump", None)
     if callable(model_dump):
-        return model_dump(mode="json")
+        return model_dump(mode="python")
     to_dict = getattr(quant_config, "to_dict", None)
     if callable(to_dict):
         return to_dict()
@@ -178,7 +199,6 @@ class SourceIdentity:
         cls,
         model_config: "ModelConfig",
         *,
-        rank: Optional[int] = None,
         model_name: Optional[str] = None,
     ) -> "SourceIdentity":
         """Build an identity from a torch-backend :class:`ModelConfig`.
@@ -186,22 +206,20 @@ class SourceIdentity:
         Args:
             model_config: The resolved torch-backend ``ModelConfig`` whose
                 layout-affecting choices are fingerprinted.
-            rank: The rank to fingerprint. Defaults to
-                ``model_config.mapping.rank``; pass explicitly to build an
-                identity for a rank other than the current one.
             model_name: Human-readable model identity used by discovery layers
                 (e.g. the MX server's source catalog). Does not affect the
                 compatibility fingerprints.
 
         Returns:
-            A fully populated :class:`SourceIdentity` for ``rank``.
+            A fully populated :class:`SourceIdentity` for
+            ``model_config.mapping.rank``.
         """
         mapping = model_config.mapping
-        if rank is None:
-            rank = getattr(mapping, "rank", 0)
+        rank = getattr(mapping, "rank", 0)
 
         pretrained = getattr(model_config, "pretrained_config", None)
-        dtype = str(getattr(pretrained, "torch_dtype", None))
+        torch_dtype = getattr(pretrained, "torch_dtype", None)
+        dtype = None if torch_dtype is None else str(torch_dtype)
 
         return cls(
             format_version=SOURCE_IDENTITY_FORMAT_VERSION,
@@ -210,7 +228,7 @@ class SourceIdentity:
             backend_fingerprint=cls._build_backend_fingerprint(model_config),
             parallel_fingerprint=cls._build_parallel_fingerprint(mapping),
             rank=rank,
-            shard_fingerprint=cls._build_shard_fingerprint(mapping, rank),
+            shard_fingerprint=cls._build_shard_fingerprint(mapping),
             model_name=model_name,
             tp_size=getattr(mapping, "tp_size", 1),
             pp_size=getattr(mapping, "pp_size", 1),
@@ -220,27 +238,25 @@ class SourceIdentity:
 
     @staticmethod
     def _build_model_fingerprint(model_config: "ModelConfig") -> str:
-        """Hash the model architecture, config, and dtype.
+        """Hash layout-affecting model architecture fields.
 
         Args:
             model_config: The resolved torch-backend ``ModelConfig``.
 
         Returns:
-            A hex digest covering the pretrained config, architectures, and
-            ``torch_dtype``.
+            A hex digest covering a narrow allowlist of pretrained-config
+            fields that affect parameter layout.
         """
         pretrained = getattr(model_config, "pretrained_config", None)
         if pretrained is None:
             return _canonical_hash(None)
-        payload: dict = {}
-        to_dict = getattr(pretrained, "to_dict", None)
-        if callable(to_dict):
-            try:
-                payload["config"] = to_dict()
-            except Exception:  # noqa: BLE001 - config dumping is best-effort
-                payload["config"] = str(pretrained)
-        payload["architectures"] = getattr(pretrained, "architectures", None)
-        payload["torch_dtype"] = str(getattr(pretrained, "torch_dtype", None))
+        payload = {name: getattr(pretrained, name, None) for name in _MODEL_LAYOUT_FIELDS}
+        get_text_config = getattr(pretrained, "get_text_config", None)
+        if callable(get_text_config):
+            text_config = get_text_config()
+            payload["text_config"] = {
+                name: getattr(text_config, name, None) for name in _MODEL_LAYOUT_FIELDS
+            }
         return _canonical_hash(payload)
 
     @staticmethod
@@ -331,17 +347,16 @@ class SourceIdentity:
         return _canonical_hash(payload)
 
     @staticmethod
-    def _build_shard_fingerprint(mapping: "Mapping", rank: int) -> str:
+    def _build_shard_fingerprint(mapping: "Mapping") -> str:
         """Hash the per-rank slice this rank owns of the parallel layout.
 
         Args:
             mapping: The deployment ``Mapping``.
-            rank: The rank whose shard is fingerprinted.
 
         Returns:
             A hex digest covering the rank's TP/PP/CP/EP rank indices.
         """
-        payload = {"rank": rank}
+        payload = {"rank": getattr(mapping, "rank", 0)}
         for attr in ("tp_rank", "pp_rank", "cp_rank", "moe_tp_rank", "moe_ep_rank"):
             try:
                 payload[attr] = getattr(mapping, attr, None)

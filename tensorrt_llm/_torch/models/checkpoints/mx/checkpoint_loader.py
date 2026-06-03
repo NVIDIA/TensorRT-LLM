@@ -356,7 +356,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         Returns:
             ``True`` to proceed with P2P -- when no local identity was supplied
             (legacy callers), the publisher's identity cannot be fetched yet
-            (disk fallback still guards correctness), or the identities are
+            (publisher metadata is not wired yet), or the identities are
             compatible. ``False`` only on a verified mismatch.
         """
         local_identity = self._local_source_identity
@@ -367,8 +367,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
         if source_identity is None:
             logger.warning_once(
                 "MX source SourceIdentity unavailable; proceeding with P2P "
-                "without a pre-transfer compatibility check (disk fallback "
-                "still guards correctness). Tracked by SOURCE-IDENTITY/MX-2.",
+                "without SourceIdentity enforcement. Publisher metadata is "
+                "not wired yet; tracked by SOURCE-IDENTITY/MX-2.",
                 key="mx_source_identity_unavailable",
             )
             return True
@@ -392,7 +392,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
         Returns:
             The publisher's identity, or ``None`` when it cannot be fetched
-            yet (the gate is then inert; disk fallback guards correctness).
+            yet (the gate is then inert).
         """
         # TODO(SOURCE-IDENTITY/MX-2): read the publisher's identity from the MX
         # metadata channel (get_metadata / WorkerMetadata) once upstream
@@ -440,8 +440,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
             return
 
         try:
-            from modelexpress.trtllm_live_transfer import (  # type: ignore[import-not-found]
-                publish_model_params,
+            from modelexpress.trtllm_live_transfer import (
+                publish_model_params,  # type: ignore[import-not-found]
             )
         except ImportError:
             logger.debug("modelexpress library not installed; skipping MX publish.")

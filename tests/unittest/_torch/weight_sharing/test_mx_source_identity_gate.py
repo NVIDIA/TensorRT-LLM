@@ -64,7 +64,7 @@ def test_gate_proceeds_when_no_local_identity():
 
 def test_gate_proceeds_when_source_identity_unavailable():
     # Publisher identity not yet fetchable (upstream metadata channel pending);
-    # gate is inert and the transfer proceeds (disk fallback guards correctness).
+    # gate is inert and the transfer proceeds without SourceIdentity enforcement.
     local = _identity()
     loader = _new_loader(local, None, fetched=False)
     assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is True

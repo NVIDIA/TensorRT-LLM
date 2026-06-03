@@ -336,16 +336,6 @@ class ModelLoader:
                                                 checkpoint_loader)
         load_format = self.llm_args.load_format
 
-        # Receiver's local SourceIdentity, built once from the resolved
-        # ModelConfig + Mapping. The authority for every weight-sharing
-        # compatibility gate (MX P2P, GMS RO) downstream.
-        self._source_identity = SourceIdentity.from_model_config(
-            config,
-            rank=self.mapping.rank,
-            model_name=str(
-                getattr(self.llm_args, "model", None) or checkpoint_dir),
-        )
-
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
             try:
@@ -361,6 +351,15 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
+
+            # Receiver's local SourceIdentity, built once from the final
+            # ModelConfig after model construction has applied any in-place
+            # layout-affecting config mutations.
+            self._source_identity = SourceIdentity.from_model_config(
+                config,
+                model_name=str(
+                    getattr(self.llm_args, "model", None) or checkpoint_dir),
+            )
 
             memo = dict()
 
@@ -701,8 +700,9 @@ class ModelLoader:
                         else:
                             logger.warning(
                                 "GMS RO: writer SourceIdentity unavailable; "
-                                "materializing without a compatibility check. "
-                                "Tracked by SOURCE-IDENTITY/GMS.")
+                                "materializing without SourceIdentity "
+                                "enforcement. Publisher metadata is not wired "
+                                "yet; tracked by SOURCE-IDENTITY/GMS.")
 
                         gms_backend.materialize_module(model)
 

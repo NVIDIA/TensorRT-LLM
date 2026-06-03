@@ -21,7 +21,13 @@ attributes that the fingerprint projection reads.
 import copy
 
 import pytest
-from _source_identity_fakes import FakeMapping, FakeModelConfig, FakeQuantConfig
+from _source_identity_fakes import (
+    FakeMapping,
+    FakeModelConfig,
+    FakePretrainedConfig,
+    FakeQuantConfig,
+    FakeQuantConfigWithPythonOnlyField,
+)
 
 from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy,
@@ -54,6 +60,28 @@ def test_backend_mismatch_flags_global():
     assert "backend_fingerprint" in result.mismatched_fields
 
 
+def test_model_layout_field_mismatch_flags_global():
+    a = SourceIdentity.from_model_config(
+        FakeModelConfig(pretrained_config=FakePretrainedConfig(hidden_size=4096))
+    )
+    b = SourceIdentity.from_model_config(
+        FakeModelConfig(pretrained_config=FakePretrainedConfig(hidden_size=8192))
+    )
+    result = a.matches(b)
+    assert not result.matched
+    assert "model_fingerprint" in result.mismatched_fields
+
+
+def test_non_layout_model_metadata_does_not_affect_match():
+    a = SourceIdentity.from_model_config(
+        FakeModelConfig(pretrained_config=FakePretrainedConfig(repository_url="old"))
+    )
+    b = SourceIdentity.from_model_config(
+        FakeModelConfig(pretrained_config=FakePretrainedConfig(repository_url="new"))
+    )
+    assert a.matches(b).matched
+
+
 def test_quant_mismatch_flags_global():
     a = SourceIdentity.from_model_config(
         FakeModelConfig(quant_config=FakeQuantConfig(quant_algo="FP8"))
@@ -64,6 +92,13 @@ def test_quant_mismatch_flags_global():
     result = a.matches(b)
     assert not result.matched
     assert "quant_fingerprint" in result.mismatched_fields
+
+
+def test_quant_model_dump_uses_python_mode():
+    identity = SourceIdentity.from_model_config(
+        FakeModelConfig(quant_config=FakeQuantConfigWithPythonOnlyField())
+    )
+    assert identity.quant_fingerprint
 
 
 def test_parallel_size_mismatch_flags_global():
