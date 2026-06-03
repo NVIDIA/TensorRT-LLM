@@ -1569,12 +1569,11 @@ class LTXModel(nn.Module):
                 audio_context, audio_context_mask, audio_positions, dtype
             )
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
-            # Extend audio PE to padded length once at cache-build time.
-            # seq_dim per rope type: SPLIT cos [B,H,T,D] → 2, INTERLEAVED [B,T,D] → 1.
+            # cos/sin are token-major: token axis is dim 1 for both SPLIT and
+            # INTERLEAVED rope, matching `_make_pe_local`'s `cos[:, s:e]` shard.
             if self._audio_pad > 0:
-                pe_seq_dim = 2 if (a_pe is not None and a_pe[0].ndim == 4) else 1
-                a_pe = self._pad_pe(a_pe, self._audio_pad, seq_dim=pe_seq_dim)
-                a_cross_pe = self._pad_pe(a_cross_pe, self._audio_pad, seq_dim=pe_seq_dim)
+                a_pe = self._pad_pe(a_pe, self._audio_pad, seq_dim=1)
+                a_cross_pe = self._pad_pe(a_cross_pe, self._audio_pad, seq_dim=1)
 
         # Build sharded-local PE in the form the attention consumer expects.
         # fuse_qk_norm_rope=True (LTX-2 default) -> 2D [T_local, H*D] contiguous,
