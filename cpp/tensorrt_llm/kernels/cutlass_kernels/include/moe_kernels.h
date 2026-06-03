@@ -551,6 +551,12 @@ public:
 
     bool is_profiler = false;
     bool use_fused_finalize_ = true;
+    // When the activation/weight pair is <e4m3, e4m3>, this flag selects
+    // between the per-tensor FP8 path (false, default) and the MXFP8xMXFP8
+    // block-scaled path (true). It is read by getScalingType() in subclasses
+    // to choose the runtime FpXBlockScalingType. Ignored for other type
+    // combinations -- their scaling type is fully determined at compile time.
+    bool use_mxfp8_weight_scaling_ = false;
 };
 
 // Assumes inputs activations are row major. Weights need to be preprocessed by th_op/weight_quantize.cc .
@@ -796,13 +802,17 @@ private:
         bool min_latency_mode, MoeMinLatencyParams& min_latency_params, bool use_lora, int start_expert,
         MOEParallelismConfig parallelism_config, cudaStream_t stream);
 
-    static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
-    computeStridesTmaWarpSpecialized(int64_t const* expert_first_token_offset,
-        TmaWarpSpecializedGroupedGemmInput layout_info1, TmaWarpSpecializedGroupedGemmInput layout_info2,
-        int64_t num_tokens, int64_t expanded_num_tokens, int64_t gemm1_n, int64_t gemm1_k, int64_t gemm2_n,
-        int64_t gemm2_k, int const num_experts_per_node, T const* gemm1_in, T const* gemm2_in,
-        WeightType const* weights1, WeightType const* weights2, float const* alpha_scale_flat1,
-        float const* alpha_scale_flat2, TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
+    // Non-static so it can read use_mxfp8_weight_scaling_ via getScalingType()
+    // when picking the runtime FpXBlockScalingType for the <e4m3, e4m3>
+    // template. The only caller (in moe_kernels.cu) is already inside an
+    // instance method, so this is a no-op for existing call sites.
+    std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput> computeStridesTmaWarpSpecialized(
+        int64_t const* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput layout_info1,
+        TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens, int64_t expanded_num_tokens,
+        int64_t gemm1_n, int64_t gemm1_k, int64_t gemm2_n, int64_t gemm2_k, int const num_experts_per_node,
+        T const* gemm1_in, T const* gemm2_in, WeightType const* weights1, WeightType const* weights2,
+        float const* alpha_scale_flat1, float const* alpha_scale_flat2,
+        TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
         ScaleBiasType const* bias1, ScaleBiasType const* bias2, UnfusedGemmOutputType* gemm1_output,
         UnfusedGemmOutputType* gemm2_output, float const* router_scales, int const* permuted_row_to_unpermuted_row,
@@ -857,11 +867,29 @@ private:
     }
 
     // TODO: This should eventually take the quant params to give more flexibility
-    static auto getScalingType()
+    // Instance method (not static) because the <e4m3, e4m3> template
+    // instantiation serves BOTH per-tensor FP8 and MXFP8xMXFP8 paths, with
+    // selection driven by the runtime flag use_mxfp8_weight_scaling_.
+    auto getScalingType() const
     {
-        return use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
-            : use_fp4       ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+        if constexpr (use_wfp4afp8)
+        {
+            return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+        }
+        else if constexpr (use_fp4)
+        {
+            return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+        }
+        else if constexpr (use_fp8 && std::is_same_v<T, WeightType>)
+        {
+            // <e4m3, e4m3>: per-tensor FP8 (NONE) or MXFP8 block-scaled (MXFPX).
+            return use_mxfp8_weight_scaling_ ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+                                             : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+        }
+        else
+        {
+            return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+        }
     }
 
     bool setupLoraWorkspace(int64_t expanded_num_rows, int64_t num_rows, int64_t inter_size, int64_t hidden_size,

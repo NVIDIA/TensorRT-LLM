@@ -3179,7 +3179,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     // NOTE: We alias these, but if we fuse the quantization for GEMM2 into GEMM1 they will need separated
     fc1_fp4_act_scale_ = nullptr;
     fc2_fp4_act_scale_ = nullptr;
-    if (use_block_scaling)
+    // <e4m3, e4m3> MoE serves both per-tensor FP8 (no SF buffer needed) and
+    // MXFP8xMXFP8 (needs the per-expert SF workspace). The constexpr
+    // `use_block_scaling = use_fp4 || use_wfp4afp8` is false for our
+    // template instantiation, so without the runtime check below the SF
+    // buffer pointer is left nullptr and the kernel reads garbage SF
+    // descriptors -> cudaErrorIllegalInstruction. Confirmed via a device
+    // printf in setupFP4BlockScalingFactors that showed sf_act_ptr=(nil).
+    if (use_block_scaling || use_mxfp8_weight_scaling_)
     {
         fc1_fp4_act_scale_ = getWsPtr(TmaWarpSpecializedGroupedGemmInput::ElementSF{}, "fp4_act_scale");
         fc2_fp4_act_scale_ = getWsPtr(TmaWarpSpecializedGroupedGemmInput::ElementSF{}, "fp4_act_scale");
@@ -4119,8 +4126,12 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         TLLM_CHECK_WITH_INFO(fc1_fp8_dequant == nullptr && fc2_fp8_quant == nullptr && fc2_fp8_dequant == nullptr,
             "FP8 scales are provided for integer quantization");
     }
-    else if (fp8_scales_required && !use_deepseek_fp8_block_scale)
+    else if (fp8_scales_required && !use_deepseek_fp8_block_scale && !use_mxfp8_weight_scaling_)
     {
+        // Per-tensor FP8 path. MXFP8xMXFP8 (same dtype pair) doesn't carry
+        // fp8 dequant scalars -- the UE8M0 1x32 block scales live in
+        // quant_params.fp8_mxfp4.* and are routed via the block-scaled
+        // mainloop, so skip the per-tensor scale null-pointer checks.
         TLLM_CHECK_WITH_INFO(
             fc1_fp8_dequant != nullptr, "FP8 scales expected but dequant scale for FC1 is a null pointer");
         TLLM_CHECK_WITH_INFO(fc2_fp8_quant != nullptr, "FP8 scales expected but quant scale for FC2 is a null pointer");
