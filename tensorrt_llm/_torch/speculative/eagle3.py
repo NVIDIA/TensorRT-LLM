@@ -772,9 +772,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
-        draft_logits_list = []
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        position_ids = inputs["position_ids"]
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
@@ -862,33 +860,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                                 d2t,
                                                                 draft_step=i)
 
-                # Sample the next draft token.
-                # MTP Eagle: TP-aware sampler; when ADP+LM-head-TP is active
-                #   logits are padded to max_num_requests across TP ranks, so
-                #   the result must be trimmed back to token_count.
-                # Eagle3: simple greedy sampling; d2t remaps vocab indices when
-                #   the draft model uses a compressed vocabulary.
-                if self.is_mtp_eagle:
-                    if use_lm_head_tp_in_adp:
-                        mapping_lm_head_tp = draft_model.mtp_layers[
-                            0].shared_head.mapping_lm_head_tp
-                        new_draft_token = self.draft_sampler(
-                            logits, mapping_lm_head_tp)
-                        new_draft_token = new_draft_token[:token_count]
-                    else:
-                        new_draft_token = self.draft_sampler(logits)
-                else:
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    new_draft_token = self._draft_sampler_greedy(logits, d2t)
-
-                # Stash unpadded Eagle3 draft logits for rejection sampling on
-                # the next iteration. MTP Eagle's logits may be ADP-padded to
-                # max_num_requests, so we skip them here.
-                if not self.is_mtp_eagle and spec_metadata.use_rejection_sampling:
-                    draft_logits_list.append(logits.clone())
-
-                new_draft_token = self.draft_decoder(logits, draft_model,
-                                                     spec_metadata, batch_size)
+                new_draft_token = self.draft_decoder(logits,
+                                                     draft_model,
+                                                     spec_metadata,
+                                                     batch_size,
+                                                     draft_step=i)
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
@@ -954,19 +930,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 gen_draft_tokens)
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
-        # Skip when the whole batch is greedy: _can_use_rejection_sampling will
-        # bypass the rejection path anyway, so computing draft probs is wasted.
-        if (spec_metadata.use_rejection_sampling and draft_logits_list
-                and not spec_metadata.is_all_greedy_sample):
-            d2t_param = getattr(draft_model.model, "d2t", None)
-            spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
-            self._compute_and_store_draft_probs(draft_logits_list,
-                                                spec_metadata, batch_size)
-        elif spec_metadata.use_rejection_sampling:
-            # No draft probs were written this iter (all-greedy or empty draft
-            # loop). Invalidate the buffer so the next iter does not read stale
-            # data if it transitions back to a non-greedy mix.
-            spec_metadata.draft_probs_valid = False
+        # Probs were already scattered into the slot-indexed buffer by
+        # _draft_sampler_advanced_for_rejection on each draft step (non-greedy
+        # batches only). All-greedy batches skip storage — rejection sampling
+        # will be bypassed by _can_use_rejection_sampling. Finalize the validity
+        # flag and d2t for next-iter target-side verification.
+        if spec_metadata.use_rejection_sampling:
+            if not spec_metadata.is_all_greedy_sample:
+                d2t_param = getattr(draft_model.model, "d2t", None)
+                spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
+                spec_metadata.draft_probs_valid = True
+            else:
+                spec_metadata.draft_probs_valid = False
 
         return next_draft_tokens
 
@@ -1190,11 +1165,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         draft_model: nn.Module,
         spec_metadata: Optional[Eagle3OneModelSpecMetadata] = None,
         batch_size: Optional[int] = None,
+        draft_step: Optional[int] = None,
     ):
         '''
         Sample draft tokens. When spec_metadata + batch_size are provided, use
         the target's per-request sampling params (temperature/top_k/top_p);
         otherwise fall back to argmax.
+
+        When rejection sampling is enabled and draft_step is provided, take the
+        single-pass path that also scatters the draft prob distribution into the
+        slot-indexed buffer (avoids a redundant softmax later).
 
         Args:
             logits: [batch_size, vocab_size] - Draft model logits.
@@ -1202,10 +1182,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata: Carries per-request sampling param tensors. When
                 None, sampling is forced greedy.
             batch_size: Active requests, used to slice per-request tensors.
+            draft_step: Current draft step index (0..max_draft_len-1). Required
+                for the rejection-sampling code path so probs are written to
+                the correct slice of spec_metadata.draft_probs.
         '''
 
         d2t = getattr(draft_model.model, "d2t", None)
         if spec_metadata is not None and batch_size is not None:
+            if (spec_metadata.use_rejection_sampling and draft_step is not None
+                    and not spec_metadata.is_all_greedy_sample):
+                return self._draft_sampler_advanced_for_rejection(
+                    logits, spec_metadata, batch_size, d2t, draft_step)
             return self._draft_sampler_advanced(logits, spec_metadata,
                                                 batch_size, d2t)
         return self._draft_sampler_greedy(logits, d2t)
