@@ -158,7 +158,7 @@ def gvr_topk_decode(
     compress_ratio: int = 1,
     max_seq_len: Optional[int] = None,
     return_output_values: bool = False,
-    cluster_size: int = 1,
+    cluster_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -207,6 +207,56 @@ def gvr_topk_decode(
 
     N_cols = logits.shape[1]
     N_dec = max_seq_len if max_seq_len is not None else N_cols
+
+    # ---------- cluster_size auto-dispatch ----------
+    # Synth-bundle sweep on B200 SXM5 (n_iters=20, bf16/fp16/fp32, K=1024)
+    # gives the following CL/V5 ratios:
+    #
+    #             N=32K     N=65K    N=131K
+    #  BS=1      ~1.00       0.83-   0.73-0.85
+    #  BS=4      ~1.00       0.85-   0.74-0.86
+    #  BS=16     ~1.00       0.87-   0.75-0.87
+    #  BS=64     ~1.00       0.88-   0.78-0.88
+    #  BS=128    1.5x SLOW   1.5x    1.3x  <-- cluster=2 ALREADY multi-wave
+    #  BS=256    1.5x        1.3x    1.0-1.2
+    #
+    # cluster=4 wins where it fits a single wave (BS*4 <= num_sms) AND
+    # N is large enough to recoup the deeper cluster sync overhead.
+    # Outside the single-wave fit the cluster API serialises waves and
+    # the kernel loses by 1.3-3.6x; in some configs cs=4 even crashes
+    # at BS=256+ (CUDA unspecified launch failure during multi-wave
+    # cluster scheduling).
+    #
+    # Dispatch:
+    #   N < 65K              -> cluster_size=1 (cluster sync + DSMEM
+    #                           gather overhead is ~3-4us; Phase 2 work
+    #                           below N=65K is small enough that the
+    #                           50-50 split doesn't recoup that, and on
+    #                           bf16/fp16 cluster nets ~+5% slower.
+    #                           Initial sweep used N>=32K but empirical
+    #                           data flipped the threshold up to 65K.)
+    #   BS * cs > num_sms    -> cluster_size=1 (multi-wave penalty:
+    #                           clusters serialised across waves, kernel
+    #                           ends up 1.5-3.6x slower than V5)
+    #   N >= 65K, BS <= 16   -> cluster_size=4 (deepest win, e.g.
+    #                           42% faster at fp32 N=131K BS=1; the
+    #                           cluster grid stays a single GPC wave
+    #                           because 16*4 = 64 <= num_sms)
+    #   N >= 65K, BS <= 64   -> cluster_size=2 (single-wave fit at
+    #                           64*2 = 128 <= num_sms; 15-27% faster
+    #                           than V5 for fp32 / bf16)
+    #   else                 -> cluster_size=1
+    # Caller can still pin a specific cluster_size by passing it
+    # explicitly (any value 1..16); we only auto-pick when None.
+    if cluster_size is None:
+        if N_dec < 65536:
+            cluster_size = 1
+        elif num_rows <= 16 and num_rows * 4 <= num_sms:
+            cluster_size = 4
+        elif num_rows * 2 <= num_sms:
+            cluster_size = 2
+        else:
+            cluster_size = 1
     if num_threads_per_block is None:
         if max_seq_len is not None and logits.dtype != torch.float32:
             n_thresh_t = 131072
