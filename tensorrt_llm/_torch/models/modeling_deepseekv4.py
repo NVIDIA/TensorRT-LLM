@@ -831,14 +831,16 @@ class DeepseekV4WeightLoader:
 
         def _pageout_safetensors():
             import ctypes as _ct
+
             torch.cuda.synchronize()
             try:
                 _libc = _ct.CDLL("libc.so.6", use_errno=True)
                 for _ln in open("/proc/self/maps"):
                     if ".safetensors" in _ln:
                         _a, _b = _ln.split()[0].split("-")
-                        _libc.madvise(_ct.c_void_p(int(_a, 16)),
-                                      _ct.c_size_t(int(_b, 16) - int(_a, 16)), 4)  # MADV_DONTNEED
+                        _libc.madvise(
+                            _ct.c_void_p(int(_a, 16)), _ct.c_size_t(int(_b, 16) - int(_a, 16)), 4
+                        )  # MADV_DONTNEED
             except Exception:
                 pass
 
