@@ -112,6 +112,37 @@ class TestQwen3VLExtractItems:
         assert items[0].rows == expected_rows
         assert items[0].src_param_idx == 0
 
+    def test_pure_single_modality_multi_item_enumerates_all(self):
+        # A SINGLE modality (image) carrying TWO sub-items, with NO
+        # `multimodal_item_order` key (a plain 2-image prompt on the
+        # direct/non-hashing path). `from_metadata` returns None, so the
+        # extractor synthesizes the modality-major default order. That default
+        # must enumerate EVERY sub-item (one per `*_grid_thw` row), not collapse
+        # to a single `(image, 0)` entry — otherwise the 2nd image is never
+        # sliced or encoded.
+        merge = 4
+        # grids [1,16,16] -> 16 post-merge rows (256 raw patches) and
+        #       [1, 8, 8] ->  4 post-merge rows ( 64 raw patches).
+        payload = {
+            "pixel_values": torch.randn(256 + 64, 1176),
+            "image_grid_thw": torch.tensor([[1, 16, 16], [1, 8, 8]]),
+        }
+        param = _make_param({"image": payload})
+        items = list(_qwen3vl_extract_items(0, param, spatial_merge_size=merge))
+        assert len(items) == 2
+        assert [(it.modality, it.mm_idx_per_modality, it.prompt_pos) for it in items] == [
+            ("image", 0, 0),
+            ("image", 1, 1),
+        ]
+        # Per-grid post-merge row counts (grid-driven fallback, no context).
+        assert [it.rows for it in items] == [16, 4]
+        # Each item carries its own sliced single-grid payload, so the bucket
+        # adapter re-concatenation reproduces the original aggregate.
+        assert items[0].payload["image_grid_thw"].tolist() == [[1, 16, 16]]
+        assert items[0].payload["pixel_values"].shape[0] == 256
+        assert items[1].payload["image_grid_thw"].tolist() == [[1, 8, 8]]
+        assert items[1].payload["pixel_values"].shape[0] == 64
+
     @pytest.mark.parametrize(
         "item_order",
         [

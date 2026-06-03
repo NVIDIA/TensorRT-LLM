@@ -186,6 +186,21 @@ def _qwen3vl_grid_rows(
     )
 
 
+def _qwen3vl_item_count(param: MultimodalParams, modality: str) -> int:
+    """Number of sub-items packed into a Qwen3VL aggregate modality payload.
+
+    The `*_grid_thw` grid carries one row per sub-item, so its row count is the
+    sub-item count (e.g. a 2-image prompt has a `[2, 3]` `image_grid_thw`).
+    Falls back to 1 when no grid is present (the test-convention single-item
+    payload carrying an explicit `num_tokens`).
+    """
+    payload = (param.multimodal_data or {})[modality]
+    grid = payload.get(_QWEN3VL_GRID_KEY[modality])
+    if grid is None:
+        return 1
+    return _qwen3vl_grid_to_2d(grid).shape[0]
+
+
 def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[int] = None):
     """Yield one canonical `ModalityItem` per Qwen3VL prompt slot.
 
@@ -204,7 +219,8 @@ def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[i
     format; the context is built transiently here and lives only inside the
     extractor. `from_metadata` returns None for pure single-modality requests (no
     `multimodal_item_order` key); the modality-major default order is synthesized
-    in that case so each present modality is the sole item at prompt rank 0.
+    in that case over the real per-modality sub-item counts, so a multi-item
+    single-modality request (e.g. 2 images) enumerates every sub-item.
     """
     multimodal_data = param.multimodal_data or {}
     modality_types = [m for m in _QWEN_MODALITIES if multimodal_data.get(m) is not None]
@@ -223,9 +239,14 @@ def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[i
     if ctx is not None:
         order = ctx.order
     else:
-        # Pure single-modality (no explicit prompt order metadata): each present
-        # modality is the sole item at prompt rank 0.
-        order = tuple((m, 0) for m in modality_types)
+        # Pure single-modality (no explicit prompt order metadata): synthesize
+        # the modality-major default order over the real per-modality sub-item
+        # counts (the `*_grid_thw` row count). A multi-item single-modality
+        # request (e.g. 2 images) must enumerate EVERY sub-item; a flat
+        # `(m, 0)` per modality would silently drop the 2nd+ item.
+        order = tuple(
+            (m, idx) for m in modality_types for idx in range(_qwen3vl_item_count(param, m))
+        )
 
     for prompt_pos, (modality, mm_idx) in enumerate(order):
         if multimodal_data.get(modality) is None:
