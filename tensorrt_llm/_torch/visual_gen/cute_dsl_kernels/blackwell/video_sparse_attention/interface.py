@@ -112,6 +112,15 @@ def block_sparse_attn_from_indices_cute(
             "cutlass-dsl is not importable."
         )
 
+    num_q_blk = variable_block_sizes.shape[0]
+    if num_q_blk > VideoSparseAttentionForward.MAX_INDICES:
+        raise ValueError(
+            f"variable_block_sizes has {num_q_blk} entries but the CuTe kernel "
+            f"supports at most {VideoSparseAttentionForward.MAX_INDICES} "
+            "(SMEM-allocated sVariable_block_sizes buffer). Lower video "
+            "resolution/length or fall back to dense SDPA."
+        )
+
     B, H, T, D = q.shape
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)

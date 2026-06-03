@@ -698,6 +698,11 @@ def _build_vsa_setup(sparsity: float, batch_size: int, seed: int):
     integrated = Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=cfg_vsa).to(
         device
     )
+    # Fail loudly if the VSA path silently fell back to dense (which would set
+    # attn_backend to "VANILLA") instead of selecting the CUTEDSL/VSA backend.
+    assert integrated.attn_backend == "CUTEDSL", (
+        f"Expected CUTEDSL (VSA) backend, got {integrated.attn_backend!r}"
+    )
     copy_weights_self_attention(naive, integrated)
     naive.eval()
     integrated.eval()

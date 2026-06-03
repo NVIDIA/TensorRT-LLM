@@ -368,6 +368,7 @@ class WanBlock(nn.Module):
         )
         if _is_vsa:
             q_dim = num_heads * head_dim
+            gate_tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
             self.to_gate_compress = Linear(
                 hidden_size,
                 q_dim,
@@ -377,6 +378,8 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=gate_tp_mode,
+                reduce_output=False,
             )
             self.to_gate_fine = Linear(
                 hidden_size,
@@ -387,6 +390,8 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=gate_tp_mode,
+                reduce_output=False,
             )
 
         # I2V: Additional K/V projections for image embeddings.

@@ -20,6 +20,7 @@ otherwise the dense cubin path (with optional QK16PV8 quantization).
 Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
 """
 
+import contextvars
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -198,22 +199,22 @@ class VSAMetadataBuilder:
         )
 
 
-_vsa_forward_context: Optional[VSAMetadata] = None
+_vsa_forward_context_var: contextvars.ContextVar[Optional[VSAMetadata]] = contextvars.ContextVar(
+    "_vsa_forward_context", default=None
+)
 
 
 @contextmanager
 def set_vsa_forward_context(metadata: VSAMetadata):
-    global _vsa_forward_context
-    prev = _vsa_forward_context
-    _vsa_forward_context = metadata
+    token = _vsa_forward_context_var.set(metadata)
     try:
         yield
     finally:
-        _vsa_forward_context = prev
+        _vsa_forward_context_var.reset(token)
 
 
 def get_vsa_forward_context() -> Optional[VSAMetadata]:
-    return _vsa_forward_context
+    return _vsa_forward_context_var.get(None)
 
 
 def _mean_pool_cubes(
@@ -525,7 +526,10 @@ class CuTeDSLAttention(AttentionBackend):
         o_c = torch.einsum("bhnm,bmhd->bnhd", attn_probs_c, v_c)
 
         use_cute = (
-            _vsa_import_error is None and is_cute_supported(q) and (q.dtype == k.dtype == v.dtype)
+            _vsa_import_error is None
+            and is_cute_supported(q)
+            and (q.dtype == k.dtype == v.dtype)
+            and num_cubes <= VSA_KERNEL_MAX_CUBES
         )
         topk_indices = attn_probs_c.topk(cur_topk, dim=-1).indices.to(torch.int32)
 
@@ -534,11 +538,6 @@ class CuTeDSLAttention(AttentionBackend):
         )
 
         if use_cute:
-            assert num_cubes <= VSA_KERNEL_MAX_CUBES, (
-                f"VSA CuTe kernel supports at most {VSA_KERNEL_MAX_CUBES} cubes "
-                f"(SMEM-allocated variable_block_sizes buffer); got num_cubes={num_cubes}. "
-                "Lower video resolution/length or fall back to dense SDPA."
-            )
             q_hnd = q_t.transpose(1, 2).contiguous()
             k_hnd = k_t.transpose(1, 2).contiguous()
             v_hnd = v_t.transpose(1, 2).contiguous()

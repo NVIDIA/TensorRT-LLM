@@ -455,7 +455,7 @@ class Attention(nn.Module):
         seq_len_kv = k.shape[1] if k is not None else seq_len
 
         def _reshape_gate(gate: torch.Tensor) -> torch.Tensor:
-            gate = gate.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+            gate = gate.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
             if backend_layout == AttentionTensorLayout.HND:
                 gate = gate.transpose(1, 2)
             return gate

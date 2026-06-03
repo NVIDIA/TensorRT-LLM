@@ -515,6 +515,16 @@ class WanAttentionPerformanceBenchmark:
             )
             hidden_states, freqs = self.create_test_data(batch_size, seq_len, hidden_size, head_dim)
 
+            # Fail fast if the requested backend silently resolved to something
+            # else (e.g. CUTEDSL/VSA downgraded to VANILLA dense for an
+            # unsupported config).
+            resolved_backend = getattr(model, "attn_backend", backend)
+            if vsa_sparsity is not None:
+                assert resolved_backend == "CUTEDSL", (
+                    f"VSA run requested CUTEDSL but the attention module resolved to "
+                    f"{resolved_backend!r}; refusing to report VSA timings for a dense fallback."
+                )
+
             # VSA needs an active forward context + a zero gate_compress; other
             # backends use neither.
             vsa_metadata = None
@@ -572,6 +582,7 @@ class WanAttentionPerformanceBenchmark:
                 "p99_ms": torch.quantile(times_tensor, 0.99).item(),
                 "times_ms": times,
                 "uses_sage": _is_sage_attention_enabled(model),
+                "resolved_backend": resolved_backend,
             }
 
             # Calculate throughput (approximate TOPS)
@@ -587,6 +598,9 @@ class WanAttentionPerformanceBenchmark:
 
             return stats
 
+        except AssertionError:
+            # Backend-resolution / fail-fast checks are genuine test failures.
+            raise
         except Exception as e:
             if verbose:
                 print(f"  {backend}: ERROR - {e}")
@@ -1224,6 +1238,9 @@ class TestVsaVsVanillaWan22T2v14bModulePerformance:
             backend="CUTEDSL", vsa_sparsity=sparsity, latent_shape=self._LATENT_SHAPE, **common
         )
         assert vanilla is not None and vsa is not None, "benchmark returned None (skipped/failed)"
+        assert vsa["resolved_backend"] == "CUTEDSL", (
+            f"VSA timings came from {vsa['resolved_backend']!r}, not the CUTEDSL/VSA path"
+        )
         assert vanilla["avg_ms"] > 0 and vsa["avg_ms"] > 0
 
         speedup = vanilla["avg_ms"] / vsa["avg_ms"]

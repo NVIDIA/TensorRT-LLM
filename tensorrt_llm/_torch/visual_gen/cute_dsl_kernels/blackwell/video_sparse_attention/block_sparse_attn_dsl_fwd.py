@@ -62,6 +62,8 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
     Q1  0  S1 O1
     """
 
+    MAX_INDICES = 4 * 1024
+
     def __init__(
         self,
         block_m: int,
@@ -413,7 +415,7 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
             (2, self.mma_tiler_qk[0], self.scale_buffers), (0, 1, 2)
         )
 
-        self.max_indices = 4 * 1024
+        self.max_indices = self.MAX_INDICES
 
         @cute.struct
         class SharedStorage:
