@@ -66,15 +66,13 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
     except KeyError:
         raise ValueError("mode must be 'pageout' or 'dontneed'.")
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    ret = libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(size),
-                       ctypes.c_int(advice))
+    ret = libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(size), ctypes.c_int(advice))
     if ret != 0:
         err = ctypes.get_errno()
         raise OSError(err, f"madvise() failed with errno={err}")
 
 
-def pageout_file_backed_regions(path_substring: str,
-                                mode: str = "dontneed") -> None:
+def pageout_file_backed_regions(path_substring: str, mode: str = "dontneed") -> None:
     """``madvise`` every mmap region whose backing file path matches a substring.
 
     Scans ``/proc/self/maps`` and advises ``MADV_DONTNEED`` / ``MADV_PAGEOUT``
