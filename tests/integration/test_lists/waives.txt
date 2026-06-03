@@ -300,7 +300,6 @@ test_e2e.py::test_multi_nodes_eval[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-t
 test_e2e.py::test_openai_chat_example[trt] SKIP (https://nvbugs/5477444)
 test_e2e.py::test_openai_completions_example[trt] SKIP (https://nvbugs/5701450)
 test_e2e.py::test_openai_disagg_multi_nodes_completion[ctx_tp1pp2-gen_tp1pp2] SKIP (https://nvbugs/6190759)
-test_e2e.py::test_openai_disagg_multi_nodes_completion_service_discovery[etcd] SKIP (https://nvbugs/6211193)
 test_e2e.py::test_openai_kv_cache_contamination SKIP (https://nvbugs/6227203)
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus[DeepSeek-R1-W4AFP8-DeepSeek-R1/DeepSeek-R1-W4AFP8] SKIP (https://nvbugs/5836830)
 test_e2e.py::test_trtllm_bench_iteration_log[TRT-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B] SKIP (https://nvbugs/5448523)
