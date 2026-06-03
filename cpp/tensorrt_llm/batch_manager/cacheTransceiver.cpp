@@ -429,6 +429,11 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
 
+    // Stamp transfer-start eagerly so the deadline observation in
+    // checkGenTransferStatus sees a valid elapsed time even before the
+    // worker thread runs. The worker re-stamps later.
+    llmRequest->setKvCacheTransferStart(std::chrono::steady_clock::now());
+
     if (std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
             [llmRequest](auto const& pair) { return pair.first->mRequestId == llmRequest->mRequestId; })
         != mRequesterFutures.end())
@@ -541,10 +546,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
-    // If blockAll is true, we want to block and not use a timeout
-    if (!blockAll && mCacheTransceiverConfig.has_value())
+    // Overall transfer deadline observation, applied in both polling and
+    // block-all modes so a stuck sender is flagged regardless of mode.
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
     {
-        senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+        // If blockAll is true, we want to block and not use a per-iteration timeout
+        if (!blockAll)
+        {
+            senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        }
     }
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
@@ -602,6 +614,27 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
+        // Per-request deadline observation, deduped via mTimedOutSenderIds
+        // so a hung request produces at most one warning. Observe-only;
+        // the request is left in mSenderFutures so natural completion
+        // is still detected.
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value())
+            {
+                bool const firstTimeout = mTimedOutSenderIds.insert(request->mRequestId).second;
+                if (firstTimeout)
+                {
+                    TLLM_LOG_WARNING(
+                        "Context KV cache transfer for request %ld exceeded total timeout: "
+                        "elapsed %ld ms > limit %d ms. Observe-only; continuing to wait.",
+                        request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                }
+            }
+        }
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
             try
@@ -616,6 +649,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     {
                         request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
                     }
+                    mTimedOutSenderIds.erase(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
@@ -631,6 +665,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     requestsStatus.errorRequestIds.insert(request->mRequestId);
+                    mTimedOutSenderIds.erase(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
             }
@@ -640,6 +675,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                 requestsStatus.errorRequestIds.insert(request->mRequestId);
+                mTimedOutSenderIds.erase(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
@@ -655,6 +691,14 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
+    // Overall transfer deadline observation, symmetric with the
+    // checkContextTransferStatus implementation; mTimedOutRequesterIds
+    // dedups warnings.
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
+    {
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+    }
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
     for (auto&& [request, future] : mRequesterFutures)
     {
@@ -767,6 +811,25 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     }
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
+        // Per-request deadline observation; symmetric with
+        // checkContextTransferStatus, deduped via mTimedOutRequesterIds.
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - it->first->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value())
+            {
+                bool const firstTimeout = mTimedOutRequesterIds.insert(it->first->mRequestId).second;
+                if (firstTimeout)
+                {
+                    TLLM_LOG_WARNING(
+                        "Generation KV cache transfer for request %ld exceeded total timeout: "
+                        "elapsed %ld ms > limit %d ms. Observe-only; continuing to wait.",
+                        it->first->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                }
+            }
+        }
         if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())
         {
             try
@@ -799,6 +862,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
                     it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
             }
+            mTimedOutRequesterIds.erase(it->first->mRequestId);
             it = mRequesterFutures.erase(it);
         }
         else

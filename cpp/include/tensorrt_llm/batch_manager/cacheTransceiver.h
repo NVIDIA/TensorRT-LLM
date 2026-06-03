@@ -35,6 +35,7 @@
 #include <torch/custom_class.h>
 #include <torch/python.h>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -278,6 +279,10 @@ private:
     std::unique_ptr<CacheReceiver> mCacheReceiver;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
+    // Per-rank dedup sets so a hung request produces at most one timeout
+    // warning. Erased on request completion.
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
