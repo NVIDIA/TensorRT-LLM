@@ -35,12 +35,13 @@ from typing import Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.mla.trtllm_mla import _TRTLLM_MLA_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+
+_TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
 
 # At post_load_fusion, only the backend-agnostic torch_rope_* IR ops are
 # present (optimize_rope has not yet replaced them with flashinfer_rope).
@@ -231,8 +232,10 @@ def _compute_rotary_cos_sin_from_config(
 
     max_position = getattr(model_config, "max_position_embeddings", 8192)
     half_dim = qk_rope_head_dim // 2
+    # Match the custom model's expression order; fused MLA is sensitive to RoPE table drift.
+    dim_indices = torch.arange(0, qk_rope_head_dim, 2, dtype=torch.float32)
 
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, half_dim, dtype=torch.float32) / half_dim))
+    inv_freq = 1.0 / (rope_theta ** (dim_indices / qk_rope_head_dim))
 
     # Handle YaRN scaling if present
     rope_scaling = getattr(model_config, "rope_scaling", None)
@@ -255,7 +258,7 @@ def _compute_rotary_cos_sin_from_config(
             # The model's softmax_scale already includes mscale^2, so the
             # cos/sin table must NOT duplicate it.
             numerator = _yarn_get_mscale(factor, mscale_factor)
-            denominator = _yarn_get_mscale(factor, mscale_all_dim) if mscale_all_dim else 1.0
+            denominator = _yarn_get_mscale(factor, mscale_all_dim)
             mscale = numerator / denominator if denominator != 0 else 1.0
             original_max = rope_scaling.get("original_max_position_embeddings", max_position)
             beta_fast = rope_scaling.get("beta_fast", 32)
@@ -277,15 +280,16 @@ def _compute_rotary_cos_sin_from_config(
             if low == high:
                 high += 0.001
 
-            smooth = (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low)
-            smooth = smooth.clamp(0, 1)
-            freq_extra = inv_freq
-            freq_inter = inv_freq / factor
-            inv_freq = freq_inter * smooth + freq_extra * (1 - smooth)
+            inv_freq_mask = 1.0 - torch.clamp(
+                (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low), 0, 1
+            )
+            freq_extra = 1.0 / (rope_theta ** (dim_indices / qk_rope_head_dim))
+            freq_inter = 1.0 / (factor * rope_theta ** (dim_indices / qk_rope_head_dim))
+            inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
 
     t = torch.arange(max_position, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
-    emb = torch.cat([freqs, freqs], dim=-1)
+    emb = torch.cat((freqs, freqs), dim=-1)
     cos_vals = emb.cos() * mscale
     sin_vals = emb.sin() * mscale
     result = torch.stack([cos_vals, sin_vals], dim=-1)

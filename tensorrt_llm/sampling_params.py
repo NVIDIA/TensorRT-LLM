@@ -85,6 +85,12 @@ class LogprobParams(NamedTuple):
     drop_context_logits: bool = False
     # Drop the geneation_logits once the logprobs are computed
     drop_generation_logits: bool = False
+    # Return generation logprobs as `list[float]` instead of the default
+    # `list[dict[int, Logprob]]`. Only valid when logprobs == 0.
+    logprobs_simple_format: bool = False
+    # Return prompt logprobs as `list[float]` instead of the default
+    # `list[dict[int, Logprob]]`. Only valid when prompt_logprobs == 0.
+    prompt_logprobs_simple_format: bool = False
 
 
 class LogprobMode(StrEnum):
@@ -228,8 +234,10 @@ class SamplingParams:
         logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
                                   When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
         logprobs_mode (LogprobMode): The mode of log probabilities to return. Defaults to LogprobMode.RAW.
+        logprobs_simple_format (bool): If True (and `logprobs == 0`), return generation logprobs as a flat `list[float]` (one logprob per generated token) instead of the default `list[dict[int, Logprob]]` format. Reduces per-token allocation overhead when only the sampled-token logprob is needed. Incompatible with `logprobs is None or logprobs > 0` and with beam search. Defaults to False.
         prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. When set to 0, return only the actual prompt token's log probability.
                                   When set to K>0, return top-K log probabilities + the actual prompt token's log probability (last entry) if it's not in the Top-K. Defaults to None.
+        prompt_logprobs_simple_format (bool): If True (and `prompt_logprobs == 0`), return prompt logprobs as a flat `list[float]` instead of the default `list[dict[int, Logprob]]` format. Incompatible with `prompt_logprobs is None or prompt_logprobs > 0`. Defaults to False.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
@@ -301,6 +309,8 @@ class SamplingParams:
     # Keep the below fields in sync with tllme.OutputConfig
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
+    logprobs_simple_format: bool = False
+    prompt_logprobs_simple_format: bool = False
     return_context_logits: bool = False
     return_generation_logits: bool = False
     exclude_input_from_output: bool = True
@@ -398,6 +408,18 @@ class SamplingParams:
             self.logprobs = 0
         check_logprobs_limit("logprobs", self.logprobs)
         check_logprobs_limit("prompt_logprobs", self.prompt_logprobs)
+
+        if self.logprobs_simple_format and self.logprobs != 0:
+            raise ValueError(
+                f"logprobs_simple_format=True requires logprobs == 0, got logprobs={self.logprobs}"
+            )
+        if self.prompt_logprobs_simple_format and self.prompt_logprobs != 0:
+            raise ValueError(
+                "prompt_logprobs_simple_format=True requires prompt_logprobs == 0, got "
+                f"prompt_logprobs={self.prompt_logprobs}"
+            )
+        if self.logprobs_simple_format and self.use_beam_search:
+            raise ValueError("logprobs_simple_format is not supported with beam search")
 
     # NB: Static, because downstream code only holds instances of
     #     bindings.SamplingConfig (not SamplingParams).
