@@ -1,4 +1,0 @@
-max_batch_size: 4
-max_seq_len: 66560
-moe_config:
-  backend: CUTLASS
