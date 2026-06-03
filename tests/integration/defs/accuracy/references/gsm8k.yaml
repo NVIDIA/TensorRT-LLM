@@ -214,8 +214,7 @@ Qwen/Qwen3.5-9B:
   - spec_dec_algo: MTP
     accuracy: 92.82
 Qwen/Qwen3.5-35B-A3B:
-  - dtype: bfloat16
-    accuracy: 89.196
+  - accuracy: 89.196
   - extra_acc_spec: h20
     accuracy: 83.9
   - spec_dec_algo: MTP
