@@ -1052,13 +1052,20 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 self._trtllm_gen_fmha_jit_warmup = previous
 
-        logger.info("Running TRTLLM-Gen FMHA JIT warmup...")
+        logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
         warmup_requests_configs = []
-        warmup_requests_configs.append(
-            (1 + self.max_total_draft_tokens, 1))  # one generation request
+        if not self.is_draft_model and self.guided_decoder is None:
+            # doesn't support warmup for 2-model speculative decoding like eagle3
+            warmup_requests_configs.append(
+                (1 + self.max_total_draft_tokens, 1))  # one generation request
+        else:
+            logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Gen kernels")
+
         if can_run_general_warmup:
             warmup_requests_configs.append((1, 0))  # one context token
+        else:
+            logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Ctx kernels")
 
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(
