@@ -343,6 +343,13 @@ class CachedSequenceInterface:
             # Effective window: full-attention layers (sliding_window == 0) use
             # max_seq_len so the C++ side gets a single concrete window key.
             effective_window = handler.sliding_window if handler.sliding_window > 0 else max_seq_len
+            # A window wider than max_seq_len is meaningless since at most
+            # max_seq_len tokens are ever cached. Clamp so sliding- and
+            # full-attention layers that both reach/exceed max_seq_len collapse
+            # into a single concrete pool key (e.g. Ministral's 512 SWA + 32768
+            # full layers under max_seq_len=512), instead of producing two
+            # distinct pools that violate the uniform-KV-cache requirement.
+            effective_window = min(effective_window, max_seq_len)
 
             kv_managed[name] = handler
 
