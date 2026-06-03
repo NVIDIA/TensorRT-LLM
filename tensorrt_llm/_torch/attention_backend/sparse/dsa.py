@@ -2155,12 +2155,20 @@ class Indexer(nn.Module):
                     # DSL FP4 kernel natively supports next_n ∈ {1, 2, 3}.
                     # The wave-aware picker in `_pick_dsl_expand` is run
                     # once per metadata prepare and the result cached on
-                    # `metadata.dsl_{expand_factor, atom}`. Trigger expand
-                    # whenever the picker decided to split (factor > 1),
-                    # regardless of next_n — this lets next_n ∈ {2, 3} also
-                    # benefit from atom-split when low-batch leaves SMs idle,
-                    # in addition to the mandatory next_n=4 case.
-                    if metadata.dsl_expand_factor > 1:
+                    # `metadata.dsl_{expand_factor, atom}` with the invariant
+                    # `factor * atom == 1 + max_draft_tokens` (the target/
+                    # verify-time next_n). MTPEagle reuses the same metadata
+                    # for the multi-step draft loop: after iteration i=0 it
+                    # mutates `seq_lens` to 1 so subsequent iterations run
+                    # 1-token incremental decode (next_n=1). The atom-split
+                    # reshape `(num_gen, next_n, ...) -> (num_gen*factor,
+                    # atom, ...)` is only valid when the caller actually
+                    # supplies `next_n == factor * atom` tokens per request;
+                    # gate on this so the i≥1 draft calls fall back to the
+                    # kernel-native next_n=1 path (atom-split has no benefit
+                    # for 1 token/request anyway — there's nothing to split).
+                    if metadata.dsl_expand_factor > 1 and \
+                            next_n == metadata.dsl_expand_factor * metadata.dsl_atom:
                         factor = metadata.dsl_expand_factor
                         eff_next_n = metadata.dsl_atom
                         exp_B = num_generations * factor
@@ -2184,12 +2192,18 @@ class Indexer(nn.Module):
                     # split (factor > 1) — typically benefits small-batch /
                     # low-ntask configs by raising SM utilization at the cost
                     # of factor× KV HBM re-reads. Picker decision was cached
-                    # on metadata.{dsl_expand_factor, dsl_atom} during prepare.
+                    # on metadata.{dsl_expand_factor, dsl_atom} during prepare
+                    # with invariant `factor * atom == 1 + max_draft_tokens`.
+                    # Same guard as the FP4 path above: skip the reshape when
+                    # the caller's `next_n` doesn't match the picker's
+                    # assumption (MTPEagle i≥1 draft iterations supply
+                    # `next_n=1` after the post-i=0 metadata mutation).
                     dsl_q = q_decode
                     fp8_ctx_lens = dsl_context_lens
                     fp8_block_table = block_table
                     fp8_schedule_meta = metadata.scheduler_metadata_buffer
-                    if metadata.dsl_expand_factor > 1:
+                    if metadata.dsl_expand_factor > 1 and \
+                            next_n == metadata.dsl_expand_factor * metadata.dsl_atom:
                         factor = metadata.dsl_expand_factor
                         atom = metadata.dsl_atom
                         exp_B = num_generations * factor
