@@ -1012,8 +1012,11 @@ def maybe_compute_mm_embed_cumsum(
     """
     if extra_processed_inputs is None:
         return
-    mm_data = extra_processed_inputs.get("multimodal_data")
-    if mm_data is None:
+    # The processed multimodal_data dict (NOT the raw multi_modal_data payload
+    # that `mm_data` denotes elsewhere); name it accordingly to avoid the
+    # same-name-opposite-meaning trap.
+    multimodal_data = extra_processed_inputs.get("multimodal_data")
+    if multimodal_data is None:
         return
 
     # Always backfill the bidirectional-MM gate first (cheap; instance attr
@@ -1025,12 +1028,12 @@ def maybe_compute_mm_embed_cumsum(
     # get_flashinfer_attention_mask's `cached_token_lens == 0` assert on
     # 26B/31B once an image block is split across chunks. Gemma4 sets this
     # per-instance from text_config.use_bidirectional_attention.
-    mm_data.setdefault(
+    multimodal_data.setdefault(
         "mm_bidirectional_blocks",
         bool(getattr(input_processor, "mm_bidirectional_blocks", False)),
     )
 
-    if "multimodal_embed_mask_cumsum" in mm_data:
+    if "multimodal_embed_mask_cumsum" in multimodal_data:
         return
 
     vocab_size = input_processor.get_vocab_size()
@@ -1049,7 +1052,7 @@ def maybe_compute_mm_embed_cumsum(
         mm_special_token_ids=input_processor.get_mm_special_token_ids(),
     )
     # Cache the int64 cumsum; request-invariant, read once per chunk.
-    mm_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
+    multimodal_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
         0, dtype=torch.int64)
 
 
