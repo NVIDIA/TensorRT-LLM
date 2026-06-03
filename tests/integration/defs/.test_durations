@@ -662,7 +662,7 @@
     "test_unittests.py::test_unittests_v2[unittest/trt/model_api/test_model_quantization.py]": 493.8186915554106,
     "test_unittests.py::test_unittests_v2[unittest/trt/quantization/test_weight_only_groupwise_quant_matmul.py]": 214.35422350093722,
     "test_unittests.py::test_unittests_v2[unittest/trt/quantization/test_weight_only_quant_matmul.py]": 100.81762219779193,
-    "test_unittests.py::test_unittests_v2[unittest/trt/quantization]": 673.2582192085683
+    "test_unittests.py::test_unittests_v2[unittest/trt/quantization]": 673.2582192085683,
    "cpp/test_e2e.py::test_model[-eagle-86]": 467.31710943579674,
    "cpp/test_e2e.py::test_model[-medusa-86]": 559.4042182117701,
    "test_fmha.py::test_fmha": 1843.8030557027087,
