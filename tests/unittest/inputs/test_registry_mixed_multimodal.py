@@ -5,7 +5,7 @@ from typing import ClassVar
 
 import torch
 
-from tensorrt_llm.inputs.multimodal import MultimodalPromptOrder, find_mm_token_lengths
+from tensorrt_llm.inputs.multimodal import MixedModalEncodeContext, find_mm_token_lengths
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalInputProcessor,
@@ -50,10 +50,10 @@ class _FakeMixedProcessor:
         # then consumes the already-expanded ids.
         if prompt_token_ids and mm_data:
             lengths_by_key = find_mm_token_lengths(mm_data, self)
-            item_order = MultimodalPromptOrder.resolve(
+            item_order = MixedModalEncodeContext.resolve_order(
                 mm_data, self, prompt_token_ids=prompt_token_ids
             )
-            num_mm_tokens = item_order.flatten(lengths_by_key)
+            num_mm_tokens = MixedModalEncodeContext.project_by_order(item_order, lengths_by_key)
             prompt_token_ids, _ = self.expand_prompt_token_ids_for_mm(
                 prompt_token_ids,
                 num_mm_tokens,

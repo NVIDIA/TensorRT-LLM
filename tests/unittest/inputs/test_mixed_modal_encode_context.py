@@ -59,3 +59,185 @@ def test_from_metadata_pairs_order_with_lengths():
     assert ctx.order == (("image", 0), ("video", 0))
     assert ctx.embedding_lengths == (32, 48)
     assert MixedModalEncodeContext.from_metadata({}, ()) is None
+
+
+# ---------------------------------------------------------------------------
+# Order resolution / normalization (absorbed from the deleted MultimodalPromptOrder).
+# `resolve_order` returns a bare prompt-order tuple; `resolve` pairs it with
+# `embedding_lengths`. `_normalize`, `from_raw_entries`, `order_from_metadata`,
+# and `validate_order` are the self-contained internals the producer drives.
+# ---------------------------------------------------------------------------
+
+
+class TestOrderConstructors:
+    """Order-only constructors on MixedModalEncodeContext (no embedding lengths)."""
+
+    def test_default_order_single_modality(self):
+        a, b, c = object(), object(), object()
+        assert MixedModalEncodeContext.default_order({"image": [a, b, c]}) == (
+            ("image", 0),
+            ("image", 1),
+            ("image", 2),
+        )
+
+    def test_default_order_empty_returns_empty(self):
+        assert MixedModalEncodeContext.default_order({}) == ()
+
+    def test_from_raw_entries_dict_form(self):
+        assert MixedModalEncodeContext.from_raw_entries(
+            [{"modality": "image", "index": 1}, {"type": "video"}], source="x"
+        ) == (("image", 1), ("video", 0))
+
+    def test_from_raw_entries_tuple_form(self):
+        assert MixedModalEncodeContext.from_raw_entries(
+            [("image", 0), ("video", 2)], source="x"
+        ) == (("image", 0), ("video", 2))
+
+    def test_from_raw_entries_rejects_unsupported_types(self):
+        with pytest.raises(ValueError):
+            MixedModalEncodeContext.from_raw_entries([3.5], source="x")
+        with pytest.raises(ValueError):
+            MixedModalEncodeContext.from_raw_entries([7], source="x")
+
+    def test_order_from_metadata_prefers_multimodal_item_order(self):
+        order = MixedModalEncodeContext.order_from_metadata(
+            {
+                "multimodal_item_order": [
+                    {"modality": "image", "index": 1},
+                    {"type": "video"},
+                    ("image", 0),
+                ]
+            }
+        )
+        assert order == (("image", 1), ("video", 0), ("image", 0))
+
+    def test_order_from_metadata_returns_none_when_absent(self):
+        assert MixedModalEncodeContext.order_from_metadata(None) is None
+        assert MixedModalEncodeContext.order_from_metadata({}) is None
+        assert MixedModalEncodeContext.order_from_metadata({"other": 1}) is None
+
+
+class TestNormalize:
+    """`_normalize` lifts modality payloads into list form for ordering."""
+
+    def test_normalize_wraps_scalars_and_drops_non_modalities(self):
+        a, b = object(), object()
+        assert MixedModalEncodeContext._normalize(
+            {
+                "image": a,
+                "video": [b],
+                "extra": "ignored",
+                "audio": None,
+            }
+        ) == {"image": [a], "video": [b]}
+
+
+class TestResolveOrder:
+    """`resolve_order` mirrors the old MultimodalPromptOrder.resolve contract."""
+
+    def test_uses_metadata_when_present(self):
+        class PoisonProcessor:
+            def get_mm_item_order(self, *args, **kwargs):
+                raise AssertionError("get_mm_item_order must not be called")
+
+        a, b, c = object(), object(), object()
+        order = MixedModalEncodeContext.resolve_order(
+            {"image": [a, b], "video": [c]},
+            PoisonProcessor(),
+            prompt_token_ids=[1, 2, 3],
+            multimodal_data={
+                "multimodal_item_order": [
+                    {"modality": "video", "index": 0},
+                    {"modality": "image", "index": 0},
+                    {"modality": "image", "index": 1},
+                ]
+            },
+        )
+        assert order == (("video", 0), ("image", 0), ("image", 1))
+
+    def test_uses_default_for_single_modality(self):
+        class NoHookProcessor:
+            pass
+
+        a, b = object(), object()
+        assert MixedModalEncodeContext.resolve_order({"image": [a, b]}, NoHookProcessor()) == (
+            ("image", 0),
+            ("image", 1),
+        )
+
+    def test_uses_input_processor_protocol_for_multi_modality(self):
+        a, b = object(), object()
+
+        class OrderingProcessor:
+            def get_mm_item_order(self, prompt_token_ids, mm_data):
+                return [("video", 0), ("image", 0)]
+
+        assert MixedModalEncodeContext.resolve_order(
+            {"image": [a], "video": [b]}, OrderingProcessor(), prompt_token_ids=[1, 2]
+        ) == (("video", 0), ("image", 0))
+
+    def test_falls_back_to_default_when_processor_lacks_hook(self):
+        class NoHookProcessor:
+            pass
+
+        a, b = object(), object()
+        assert MixedModalEncodeContext.resolve_order(
+            {"image": [a], "video": [b]}, NoHookProcessor(), prompt_token_ids=[1, 2]
+        ) == (("image", 0), ("video", 0))
+
+
+class TestValidateOrder:
+    """`validate_order` is the static coverage check used by `resolve_order`."""
+
+    def test_rejects_unknown_modality(self):
+        a = object()
+        with pytest.raises(ValueError, match="modality 'audio'"):
+            MixedModalEncodeContext.validate_order((("audio", 0),), {"image": [a]})
+
+    def test_rejects_out_of_bounds_index(self):
+        a = object()
+        with pytest.raises(ValueError, match=r"image\[5\]"):
+            MixedModalEncodeContext.validate_order((("image", 5),), {"image": [a]})
+
+    def test_rejects_coverage_mismatch(self):
+        a, b = object(), object()
+        with pytest.raises(ValueError, match="expected 2"):
+            MixedModalEncodeContext.validate_order((("image", 0),), {"image": [a, b]})
+
+    def test_rejects_duplicate_index(self):
+        a, b = object(), object()
+        with pytest.raises(ValueError, match=r"references image\[0\] more than once"):
+            MixedModalEncodeContext.validate_order((("image", 0), ("image", 0)), {"image": [a, b]})
+
+
+class TestStaticProjections:
+    """Static projections drive the producer (which holds a bare order tuple)."""
+
+    def test_project_by_order_reorders_by_key(self):
+        assert MixedModalEncodeContext.project_by_order(
+            (("image", 0), ("video", 0), ("image", 1)), {"image": [10, 11], "video": [20]}
+        ) == [10, 20, 11]
+
+    def test_project_uuids_by_order_passes_through_none(self):
+        assert MixedModalEncodeContext.project_uuids_by_order((("image", 0),), None) is None
+
+    def test_project_uuids_by_order_handles_missing_modality(self):
+        assert MixedModalEncodeContext.project_uuids_by_order(
+            (("image", 0), ("video", 0)), {"image": ["a"]}
+        ) == ["a", None]
+
+
+def test_resolve_pairs_order_with_lengths():
+    """Full-context `resolve` runs `resolve_order` then pairs embedding lengths."""
+
+    class NoHookProcessor:
+        pass
+
+    a, b = object(), object()
+    ctx = MixedModalEncodeContext.resolve(
+        {"image": [a, b]},
+        NoHookProcessor(),
+        embedding_lengths=(7, 9),
+    )
+    assert ctx.order == (("image", 0), ("image", 1))
+    assert ctx.embedding_lengths == (7, 9)

@@ -20,9 +20,8 @@ from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
 # yapf: disable
-from .multimodal import (_SUPPORTED_HASHING_MODALITIES, MultimodalInput,
-                         MultimodalPromptOrder, _as_cpu_tensor,
-                         _compute_mm_masks,
+from .multimodal import (_SUPPORTED_HASHING_MODALITIES, MixedModalEncodeContext,
+                         MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
@@ -302,7 +301,7 @@ class BaseMultimodalInputProcessor(ABC):
         carries one modality embedded inside another (e.g. Nano's video-embedded
         audio, modeled as a separate `(audio, k)` prompt item) override this to
         hoist the nested payload so that both `find_mm_token_lengths` and
-        `MultimodalPromptOrder.resolve` see the promoted items. Called once at
+        `MixedModalEncodeContext.resolve_order` see the promoted items. Called once at
         the top of `call_with_token_ids`; the promoted `mm_data` is reused for
         length computation, order resolution, and placeholder expansion alike.
         """
@@ -380,14 +379,15 @@ class BaseMultimodalInputProcessor(ABC):
             raise ValueError(
                 "call_with_token_ids: find_mm_token_lengths returned no token "
                 "lengths for the provided multi_modal_data.")
-        item_order = MultimodalPromptOrder.resolve(
+        item_order = MixedModalEncodeContext.resolve_order(
             mm_data,
             self,
             prompt_token_ids=prompt_token_ids,
             multimodal_data=(extra_processed_inputs
                              or {}).get("multimodal_data"),
         )
-        num_mm_tokens = item_order.flatten(num_mm_tokens_by_key)
+        num_mm_tokens = MixedModalEncodeContext.project_by_order(
+            item_order, num_mm_tokens_by_key)
 
         expanded_ids, mm_data_updates = self.expand_prompt_token_ids_for_mm(
             prompt_token_ids,
@@ -1112,14 +1112,15 @@ def create_input_processor_with_hash(
         # Mixed-modality: resolve logical prompt-item order, then flatten the
         # per-modality token-length lists into one prompt-ordered list
         # (supersedes the single-modality next(iter(...)) assumption).
-        item_order = MultimodalPromptOrder.resolve(
+        item_order = MixedModalEncodeContext.resolve_order(
             mm_data,
             input_processor,
             prompt_token_ids=prompt_token_ids,
             multimodal_data=(extra_processed_inputs
                              or {}).get("multimodal_data"),
         )
-        num_mm_tokens = item_order.flatten(num_mm_tokens_by_key)
+        num_mm_tokens = MixedModalEncodeContext.project_by_order(
+            item_order, num_mm_tokens_by_key)
         if len(num_mm_tokens) <= 0:
             raise ValueError("multimodal hashing produced an empty multimodal "
                              "token-length list.")
@@ -1176,8 +1177,10 @@ def create_input_processor_with_hash(
                ) > 0 and mm_special_token_ids is not None:
             multimodal_data[
                 "special_token_offsets"] = start_special_token_positions
-        mm_hashes_flat = item_order.flatten(mm_hashes)
-        mm_uuid_list = item_order.flatten_uuids(mm_uuids)
+        mm_hashes_flat = MixedModalEncodeContext.project_by_order(
+            item_order, mm_hashes)
+        mm_uuid_list = MixedModalEncodeContext.project_uuids_by_order(
+            item_order, mm_uuids)
         validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
                            num_mm_tokens)
         mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat

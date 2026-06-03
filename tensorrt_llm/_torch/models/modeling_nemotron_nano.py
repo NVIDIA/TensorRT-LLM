@@ -17,7 +17,6 @@ from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import (
     MixedModalEncodeContext,
     MultimodalParams,
-    MultimodalPromptOrder,
     find_multimodal_embedding_lengths,
 )
 
@@ -435,8 +434,8 @@ def _nano_extract_items(
     * **Multi-modality (PER-ITEM).** More than one distinct modality present —
       the interleaving case (including a repeated modality and video-with-audio
       hoisted to a first-class ``(audio, k)`` item by the input processor).
-      Yields ONE item per ``MultimodalPromptOrder`` entry: ``prompt_pos`` is the
-      rank, ``mm_idx_per_modality`` is the per-modality index, ``rows`` is the
+      Yields ONE item per ``MixedModalEncodeContext`` order entry: ``prompt_pos``
+      is the rank, ``mm_idx_per_modality`` is the per-modality index, ``rows`` is the
       per-slot ``multimodal_embedding_lengths`` entry, and ``payload`` is sliced
       to that single sub-item by the ``slice_payload`` callable (the model's
       bound ``_slice_payload`` in production). There is no ghost audio and no
@@ -1553,7 +1552,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def get_mm_item_order(
         self, prompt_token_ids: List[int], mm_data: Dict[str, Any]
-    ) -> MultimodalPromptOrder:
+    ) -> List[Tuple[str, int]]:
         """Return `(modality, item_index)` entries in prompt placeholder order."""
         token_order = self._get_mm_item_order_from_token_ids(prompt_token_ids, mm_data)
         if token_order is not None:
@@ -1561,23 +1560,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         text_prompt = self.tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
         return self._get_mm_item_order_from_text(text_prompt, mm_data)
 
-    @staticmethod
-    def _normalize_mm_data_items(mm_data: Dict[str, Any], modality: str) -> List[Any]:
-        """Return a modality payload as a list for placeholder counting.
-
-        Nano prompt-order recovery needs stable per-item indexes, while callers
-        may pass either a scalar item or a list for each modality.
-        """
-        items = mm_data.get(modality)
-        if items is None:
-            return []
-        if isinstance(items, (list, tuple)):
-            return list(items)
-        return [items]
-
     def _get_mm_item_order_from_text(
         self, text_prompt: str, mm_data: Dict[str, Any]
-    ) -> MultimodalPromptOrder:
+    ) -> List[Tuple[str, int]]:
         """Infer Nano item order by scanning decoded placeholder text."""
         expected_counts = {
             modality: self._count_mm_items(mm_data, modality) for modality in _NANO_MODALITIES
@@ -1588,7 +1573,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "audio": self._sound_context_token,
         }
         actual_counts = {modality: 0 for modality in _NANO_MODALITIES}
-        item_order: MultimodalPromptOrder = MultimodalPromptOrder()
+        item_order: List[Tuple[str, int]] = []
         cursor = 0
         while cursor < len(text_prompt):
             next_match: Optional[Tuple[int, str]] = None
@@ -1615,13 +1600,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def _get_mm_item_order_from_token_ids(
         self, prompt_token_ids: List[int], mm_data: Dict[str, Any]
-    ) -> Optional[MultimodalPromptOrder]:
+    ) -> Optional[List[Tuple[str, int]]]:
         """Infer Nano item order directly from placeholder token IDs when possible."""
         expected_counts = {
             modality: self._count_mm_items(mm_data, modality) for modality in _NANO_MODALITIES
         }
         actual_counts = {modality: 0 for modality in _NANO_MODALITIES}
-        item_order: MultimodalPromptOrder = MultimodalPromptOrder()
+        item_order: List[Tuple[str, int]] = []
         video_pattern = self._video_placeholder_token_ids
         video_pattern_len = len(video_pattern)
 
@@ -1672,9 +1657,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         lengths_by_item = {
             item: length for item, length in zip(item_order, num_mm_tokens_per_placeholder)
         }
-        image_items = self._normalize_mm_data_items(mm_data, "image")
-        video_items = self._normalize_mm_data_items(mm_data, "video")
-        audio_items = self._normalize_mm_data_items(mm_data, "audio")
+        normalized = MixedModalEncodeContext._normalize(mm_data)
+        image_items = normalized.get("image", [])
+        video_items = normalized.get("video", [])
+        audio_items = normalized.get("audio", [])
 
         expanded: List[int] = []
         evs: Optional[List[int]] = [] if self.video_pruning_rate > 0 else None
@@ -1779,7 +1765,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         lengths_by_item = {
             item: length for item, length in zip(item_order, num_mm_tokens_per_placeholder)
         }
-        video_items = self._normalize_mm_data_items(mm_data, "video")
+        video_items = MixedModalEncodeContext._normalize(mm_data).get("video", [])
         placeholder_by_modality = {
             "image": self.img_context_token,
             "video": self.video_context_token,
@@ -2676,13 +2662,14 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def _get_num_tokens_for_item_order(
         self,
-        item_order: MultimodalPromptOrder,
+        item_order: List[Tuple[str, int]],
         mm_data: Dict[str, Any],
     ) -> List[int]:
         """Compute per-item multimodal token lengths in prompt order."""
         num_mm_tokens: List[int] = []
+        normalized = MixedModalEncodeContext._normalize(mm_data)
         for modality, item_idx in item_order:
-            item = self._normalize_mm_data_items(mm_data, modality)[item_idx]
+            item = normalized[modality][item_idx]
             if modality == "image":
                 num_mm_tokens.append(self.get_num_tokens_per_image(image=item))
             elif modality == "audio":
@@ -2743,7 +2730,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         video-embedded audio in one request is not supported (the prompt-order
         index of the hoisted audio would be ambiguous); it raises.
         """
-        videos = self._normalize_mm_data_items(mm_data, "video")
+        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
         video_audios = [getattr(v, "audio", None) for v in videos]
         if not any(a is not None for a in video_audios) or self._audio_extractor is None:
             return mm_data
@@ -2788,7 +2775,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         No-op (returns the inputs unchanged) when there is no video-embedded
         audio or no audio extractor is configured.
         """
-        videos = self._normalize_mm_data_items(mm_data, "video")
+        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
         video_audios = [getattr(v, "audio", None) for v in videos]
         if not any(a is not None for a in video_audios) or self._audio_extractor is None:
             return text_prompt, mm_data
@@ -2847,10 +2834,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             if modality != "image"
         )
 
+        normalized = MixedModalEncodeContext._normalize(mm_data)
         images = mm_data.get("image")
         if images is not None:
             multimodal_data["image"] = self._prepare_image_modality_data(
-                self._normalize_mm_data_items(mm_data, "image"),
+                normalized.get("image", []),
                 text_prompt,
                 reserved_non_image_tokens,
             )
@@ -2858,13 +2846,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         videos = mm_data.get("video")
         if videos is not None:
             multimodal_data["video"] = self._prepare_video_modality_data(
-                self._normalize_mm_data_items(mm_data, "video")
+                normalized.get("video", [])
             )
 
         audios = mm_data.get("audio")
         if audios is not None:
             multimodal_data["audio"] = self._prepare_audio_modality_data(
-                self._normalize_mm_data_items(mm_data, "audio")
+                normalized.get("audio", [])
             )
 
         input_ids, mm_data_updates = self._expand_mixed_prompt_text_for_mm(
@@ -3716,7 +3704,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         is the legacy one-tile default and the offset is the index itself.
         """
         multimodal_data = param.multimodal_data or {}
-        item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
+        item_order = MixedModalEncodeContext.order_from_metadata(multimodal_data)
         lengths = multimodal_data.get("multimodal_embedding_lengths")
         if item_order is None or lengths is None:
             return mm_idx_per_modality
@@ -3811,7 +3799,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         Returns a single-element `List[torch.Tensor]` whose tensor holds
         all per-request embeddings concatenated in input-param order, with
-        each param's slice in MultimodalPromptOrder order. Conforms to the contract
+        each param's slice in MixedModalEncodeContext order. Conforms to the contract
         expected by `get_multimodal_embeddings`, which enables
         chunked-prefill caching.
 

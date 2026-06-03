@@ -268,47 +268,77 @@ class MultimodalInput:
 _SUPPORTED_HASHING_MODALITIES = ("image", "video", "audio")
 
 
-def _normalize_mm_items(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
-    """Return modality payloads in list form for item-order validation.
+@dataclass(frozen=True)
+class MixedModalEncodeContext:
+    """Per-request mixed-modality encode bookkeeping (Python-only).
 
-    `multi_modal_data` accepts both a single item and a list of items for a
-    modality, while ordering logic needs item counts and stable indexing. This
-    is not only defensive: it is the canonical boundary between flexible user
-    payload shape and the internal `(modality, item_index)` ordering contract.
-    Non-modality metadata entries are intentionally ignored.
-    """
-    return {
-        modality: items if isinstance(items, list) else [items]
-        for modality, items in mm_data.items()
-        if modality in _SUPPORTED_HASHING_MODALITIES and items is not None
-    }
+    Holds the prompt-order spine and each item's encoder-output footprint, and
+    owns the full order lifecycle: parse (`order_from_metadata` /
+    `from_raw_entries`), resolve (`resolve_order` / `resolve`), validate
+    (`validate_order` + the order-only `__post_init__` checks), normalize
+    payload shape (`_normalize`), and project per-modality collections into
+    prompt order (`project_by_order` / `project_uuids_by_order`, with the
+    instance `flatten` / `flatten_uuids` delegating to them).
 
+    `MultimodalInput` owns the token-space layout that crosses to C++; this
+    owns the encode-space layout that stays in Python. Not a general bag:
+    exactly `order` + `embedding_lengths` belong on the instance. The prompt
+    position of item i is its index in `order`. Producers that only have the
+    bare prompt order (no per-item lengths yet) call the classmethods/
+    staticmethods directly and never build an instance.
 
-class MultimodalPromptOrder(list):  # list[tuple[str, int]]
-    """Prompt-order sequence of multimodal items as (modality, item_index) pairs.
-
-    A request can carry multiple modalities and multiple items per modality,
-    but the executor needs them in a single prompt-order stream. This type
-    carries that ordering and the projections (flatten / flatten_uuids)
-    that reorder per-modality collections (token lengths, UUIDs) into
-    prompt order.
-
-    Named for its discriminator 'prompt': this subsystem has three distinct
-    orders (prompt, modality-grouped encode, per-request cache), and this is
-    the prompt one.
+    Named for its discriminator 'prompt'-order spine: this subsystem has three
+    distinct orders (prompt, modality-grouped encode, per-request cache); the
+    `order` field is the prompt one.
     """
 
-    # ---- Constructors ----
+    order: Tuple[Tuple[str, int], ...]
+    embedding_lengths: Tuple[int, ...]
 
-    @classmethod
-    def default(cls, mm_items: Dict[str, List[Any]]) -> "MultimodalPromptOrder":
+    def __post_init__(self):
+        if len(self.order) != len(self.embedding_lengths):
+            raise ValueError(
+                f"order length ({len(self.order)}) != embedding_lengths length "
+                f"({len(self.embedding_lengths)})")
+        seen: set = set()
+        for modality, idx in self.order:
+            if (modality, idx) in seen:
+                raise ValueError(
+                    f"order references {modality}[{idx}] more than once; each "
+                    "item must be referenced exactly once")
+            seen.add((modality, idx))
+
+    # ---- Payload normalization ----
+
+    @staticmethod
+    def _normalize(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
+        """Return modality payloads in list form for item-order validation.
+
+        `multi_modal_data` accepts both a single item and a list of items for a
+        modality, while ordering logic needs item counts and stable indexing.
+        This is not only defensive: it is the canonical boundary between
+        flexible user payload shape and the internal `(modality, item_index)`
+        ordering contract. Non-modality metadata entries are intentionally
+        ignored.
+        """
+        return {
+            modality: items if isinstance(items, list) else [items]
+            for modality, items in mm_data.items()
+            if modality in _SUPPORTED_HASHING_MODALITIES and items is not None
+        }
+
+    # ---- Order constructors (bare prompt-order tuples) ----
+
+    @staticmethod
+    def default_order(
+            mm_items: Dict[str, List[Any]]) -> Tuple[Tuple[str, int], ...]:
         """Return deterministic modality-major order when no explicit order exists."""
-        return cls((modality, idx) for modality, items in mm_items.items()
-                   for idx in range(len(items)))
+        return tuple((modality, idx) for modality, items in mm_items.items()
+                     for idx in range(len(items)))
 
-    @classmethod
-    def from_raw_entries(cls, entries: Iterable[Any], *,
-                         source: str) -> "MultimodalPromptOrder":
+    @staticmethod
+    def from_raw_entries(entries: Iterable[Any], *,
+                         source: str) -> Tuple[Tuple[str, int], ...]:
         """Normalize order metadata to `(modality, item_index)` pairs.
 
         Accepted metadata shapes are `(modality, index)` pairs and dicts.
@@ -334,13 +364,13 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
             item_index = int(item_index)
             item_order.append((modality, item_index))
             counters[modality] = max(counters.get(modality, 0), item_index + 1)
-        return cls(item_order)
+        return tuple(item_order)
 
     @classmethod
-    def from_metadata(
+    def order_from_metadata(
         cls, multimodal_data: Optional[Dict[str, Any]]
-    ) -> Optional["MultimodalPromptOrder"]:
-        """Extract explicit multimodal item order from processed metadata.
+    ) -> Optional[Tuple[Tuple[str, int], ...]]:
+        """Extract the explicit prompt order from processed metadata.
 
         Returns `None` when no ordering key is present, so callers can
         distinguish 'absent' from 'empty'.
@@ -354,51 +384,97 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
         return None
 
     @classmethod
-    def resolve(
+    def resolve_order(
         cls,
         mm_data: Dict[str, Any],
         input_processor: "BaseMultimodalInputProcessor",
         *,
         prompt_token_ids: Optional[List[int]] = None,
         multimodal_data: Optional[Dict[str, Any]] = None,
-    ) -> "MultimodalPromptOrder":
+    ) -> Tuple[Tuple[str, int], ...]:
         """Resolve the prompt order for every multimodal item in a request.
 
         Explicit metadata wins, model-specific prompt parsing is the fallback
         for mixed requests, and single-modality requests keep the historical
-        modality-major ordering.
+        modality-major ordering. Returns a bare `(modality, index)` tuple; the
+        producer pairs it with per-item lengths separately (Option Y: the dict
+        keys remain the wire format and a full context is built only at the
+        point of use).
         """
-        mm_items = _normalize_mm_items(mm_data)
-        metadata_order = cls.from_metadata(multimodal_data)
+        mm_items = cls._normalize(mm_data)
+        metadata_order = cls.order_from_metadata(multimodal_data)
         if metadata_order is not None:
-            metadata_order.validate(mm_items)
+            cls.validate_order(metadata_order, mm_items)
             return metadata_order
         if len(mm_items) <= 1:
-            item_order = cls.default(mm_items)
-            item_order.validate(mm_items)
-            return item_order
+            order = cls.default_order(mm_items)
+            cls.validate_order(order, mm_items)
+            return order
         if prompt_token_ids is not None:
             get_mm_item_order = getattr(input_processor, "get_mm_item_order",
                                         None)
             if callable(get_mm_item_order):
-                item_order = cls.from_raw_entries(
+                order = cls.from_raw_entries(
                     get_mm_item_order(prompt_token_ids, mm_data),
                     source=f"{type(input_processor).__name__}.get_mm_item_order",
                 )
-                item_order.validate(mm_items)
-                return item_order
-        item_order = cls.default(mm_items)
-        item_order.validate(mm_items)
-        return item_order
+                cls.validate_order(order, mm_items)
+                return order
+        order = cls.default_order(mm_items)
+        cls.validate_order(order, mm_items)
+        return order
+
+    @classmethod
+    def resolve(
+        cls,
+        mm_data: Dict[str, Any],
+        input_processor: "BaseMultimodalInputProcessor",
+        embedding_lengths: Iterable[int],
+        *,
+        prompt_token_ids: Optional[List[int]] = None,
+        multimodal_data: Optional[Dict[str, Any]] = None,
+    ) -> "MixedModalEncodeContext":
+        """Resolve the prompt order and pair it with per-item embedding lengths."""
+        order = cls.resolve_order(mm_data,
+                                  input_processor,
+                                  prompt_token_ids=prompt_token_ids,
+                                  multimodal_data=multimodal_data)
+        return cls(order=order,
+                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
+
+    @classmethod
+    def default(cls, mm_items: Dict[str, List[Any]],
+                embedding_lengths: Iterable[int]) -> "MixedModalEncodeContext":
+        """Modality-major default context paired with per-item lengths."""
+        return cls(order=cls.default_order(mm_items),
+                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
+
+    @classmethod
+    def from_metadata(
+        cls, multimodal_data: Optional[Dict[str, Any]],
+        embedding_lengths: Iterable[int]
+    ) -> Optional["MixedModalEncodeContext"]:
+        """Pair the explicit prompt order (if any) with per-item lengths.
+
+        Returns `None` when no `multimodal_item_order` key is present, so the
+        per-item extractors can fall back to a synthesized default order.
+        """
+        order = cls.order_from_metadata(multimodal_data)
+        if order is None:
+            return None
+        return cls(order=order,
+                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
 
     # ---- Validation ----
 
-    def validate(self, mm_items: Dict[str, List[Any]]) -> None:
-        """Verify that this order references every multimodal item exactly once."""
+    @staticmethod
+    def validate_order(order: Tuple[Tuple[str, int], ...],
+                       mm_items: Dict[str, List[Any]]) -> None:
+        """Verify `order` references every multimodal item exactly once."""
         # Track the distinct indices seen per modality (a set, not a count) so a
         # repeated reference cannot masquerade as full coverage.
         seen: Dict[str, set] = {modality: set() for modality in mm_items}
-        for modality, idx in self:
+        for modality, idx in order:
             if modality not in mm_items:
                 raise ValueError(
                     f"Multimodal item order references modality '{modality}', "
@@ -421,101 +497,32 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
                     f"Multimodal item order covers {len(seen[modality])} "
                     f"{modality} item(s), expected {len(items)}")
 
+    def validate_coverage(self, mm_items: Dict[str, List[Any]]) -> None:
+        """Verify this context's order references every multimodal item once.
+
+        Coverage needs the actual item lists, so it is a method (not
+        `__post_init__`).
+        """
+        self.validate_order(self.order, mm_items)
+
     # ---- Projections ----
 
-    def flatten(self, values_by_key: Dict[str, List[Any]]) -> List[Any]:
-        """Flatten per-modality values using this prompt item order."""
-        return [values_by_key[modality][idx] for modality, idx in self]
+    @staticmethod
+    def project_by_order(order: Tuple[Tuple[str, int], ...],
+                         values_by_key: Dict[str, List[Any]]) -> List[Any]:
+        """Project per-modality values into prompt order (bare-order form)."""
+        return [values_by_key[modality][idx] for modality, idx in order]
 
-    def flatten_uuids(
-        self,
+    @staticmethod
+    def project_uuids_by_order(
+        order: Tuple[Tuple[str, int], ...],
         mm_uuids: Optional[Dict[str, List[Optional[str]]]],
     ) -> Optional[List[Optional[str]]]:
-        """Flatten optional per-modality UUIDs using this item order."""
-        if mm_uuids is None:
-            return None
-        ordered_uuids: List[Optional[str]] = []
-        for modality, idx in self:
-            modality_uuids = mm_uuids.get(modality)
-            if modality_uuids is None:
-                ordered_uuids.append(None)
-                continue
-            if not isinstance(modality_uuids, list):
-                modality_uuids = [modality_uuids]
-            ordered_uuids.append(modality_uuids[idx])
-        return ordered_uuids
-
-
-@dataclass(frozen=True)
-class MixedModalEncodeContext:
-    """Per-request mixed-modality encode bookkeeping (Python-only).
-
-    Holds the prompt-order spine and each item's encoder-output footprint.
-    `MultimodalInput` owns the token-space layout that crosses to C++; this
-    owns the encode-space layout that stays in Python. Not a general bag:
-    exactly `order` + `embedding_lengths` belong here. The prompt position of
-    item i is its index in `order`.
-    """
-
-    order: Tuple[Tuple[str, int], ...]
-    embedding_lengths: Tuple[int, ...]
-
-    def __post_init__(self):
-        if len(self.order) != len(self.embedding_lengths):
-            raise ValueError(
-                f"order length ({len(self.order)}) != embedding_lengths length "
-                f"({len(self.embedding_lengths)})")
-        seen: set = set()
-        for modality, idx in self.order:
-            if (modality, idx) in seen:
-                raise ValueError(
-                    f"order references {modality}[{idx}] more than once; each "
-                    "item must be referenced exactly once")
-            seen.add((modality, idx))
-
-    @classmethod
-    def resolve(
-        cls,
-        mm_data: Dict[str, Any],
-        input_processor: "BaseMultimodalInputProcessor",
-        embedding_lengths: Iterable[int],
-        *,
-        prompt_token_ids: Optional[List[int]] = None,
-        multimodal_data: Optional[Dict[str, Any]] = None,
-    ) -> "MixedModalEncodeContext":
-        order = MultimodalPromptOrder.resolve(mm_data,
-                                              input_processor,
-                                              prompt_token_ids=prompt_token_ids,
-                                              multimodal_data=multimodal_data)
-        return cls(order=tuple(order),
-                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
-
-    @classmethod
-    def default(cls, mm_items: Dict[str, List[Any]],
-                embedding_lengths: Iterable[int]) -> "MixedModalEncodeContext":
-        order = MultimodalPromptOrder.default(mm_items)
-        return cls(order=tuple(order),
-                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
-
-    @classmethod
-    def from_metadata(cls, multimodal_data, embedding_lengths):
-        order = MultimodalPromptOrder.from_metadata(multimodal_data)
-        if order is None:
-            return None
-        return cls(order=tuple(order),
-                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
-
-    def flatten(self, values_by_key: Dict[str, List[Any]]) -> List[Any]:
-        """Project per-modality values into prompt order."""
-        return [values_by_key[modality][idx] for modality, idx in self.order]
-
-    def flatten_uuids(
-        self, mm_uuids: Optional[Dict[str, List[Optional[str]]]]
-    ) -> Optional[List[Optional[str]]]:
+        """Project optional per-modality UUIDs into prompt order (bare-order form)."""
         if mm_uuids is None:
             return None
         ordered: List[Optional[str]] = []
-        for modality, idx in self.order:
+        for modality, idx in order:
             modality_uuids = mm_uuids.get(modality)
             if modality_uuids is None:
                 ordered.append(None)
@@ -525,13 +532,15 @@ class MixedModalEncodeContext:
             ordered.append(modality_uuids[idx])
         return ordered
 
-    def validate_coverage(self, mm_items: Dict[str, List[Any]]) -> None:
-        """Verify the order references every multimodal item exactly once.
+    def flatten(self, values_by_key: Dict[str, List[Any]]) -> List[Any]:
+        """Project per-modality values into this context's prompt order."""
+        return self.project_by_order(self.order, values_by_key)
 
-        Coverage needs the actual item lists, so it is a method (not
-        `__post_init__`). Delegates to the existing order validator.
-        """
-        MultimodalPromptOrder(self.order).validate(mm_items)
+    def flatten_uuids(
+        self, mm_uuids: Optional[Dict[str, List[Optional[str]]]]
+    ) -> Optional[List[Optional[str]]]:
+        """Project optional per-modality UUIDs into this context's prompt order."""
+        return self.project_uuids_by_order(self.order, mm_uuids)
 
 
 @dataclass

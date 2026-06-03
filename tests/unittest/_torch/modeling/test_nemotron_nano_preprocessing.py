@@ -25,8 +25,8 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     video_to_pixel_values,
 )
 from tensorrt_llm.inputs.multimodal import (
+    MixedModalEncodeContext,
     MultimodalParams,
-    MultimodalPromptOrder,
     MultimodalRuntimeData,
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
@@ -2617,7 +2617,7 @@ class TestTokenPathVideoEmbeddedAudioHoist:
     natural analogue of the text path injecting one). `mm_data` still nests the
     audio on the `VideoData` (not yet hoisted). The processor's
     `promote_nested_mm_data` hook must, before `find_mm_token_lengths` and
-    `MultimodalPromptOrder.resolve` run:
+    `MixedModalEncodeContext.resolve_order` run:
       1. register the embedded audio as a top-level `mm_data["audio"]` item, and
       2. vision-only-strip `.audio` off the video items,
     so the order scanner emits `(video, k), (audio, k)` and the budget splits
@@ -2709,7 +2709,7 @@ class TestTokenPathVideoEmbeddedAudioHoist:
 
         # Capture the prompt order the token path resolves (assertion a).
         resolved_orders = []
-        real_resolve = MultimodalPromptOrder.resolve.__func__
+        real_resolve = MixedModalEncodeContext.resolve_order.__func__
 
         def capturing_resolve(cls, mm, input_processor, **kw):
             order = real_resolve(cls, mm, input_processor, **kw)
@@ -2717,8 +2717,8 @@ class TestTokenPathVideoEmbeddedAudioHoist:
             return order
 
         with mock.patch.object(
-            MultimodalPromptOrder,
-            "resolve",
+            MixedModalEncodeContext,
+            "resolve_order",
             classmethod(capturing_resolve),
         ):
             expanded_ids, _ = proc.call_with_token_ids(
@@ -2728,7 +2728,7 @@ class TestTokenPathVideoEmbeddedAudioHoist:
 
         # (a) The token path resolved the prompt order as video-then-audio, each
         # a first-class item.
-        assert resolved_orders, "MultimodalPromptOrder.resolve was not called"
+        assert resolved_orders, "MixedModalEncodeContext.resolve_order was not called"
         token_path_order = resolved_orders[-1]
         assert token_path_order == [("video", 0), ("audio", 0)]
 

@@ -34,7 +34,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import MixedModalEncodeContext, MultimodalParams, MultimodalPromptOrder
+from ...inputs.multimodal import MixedModalEncodeContext, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -300,33 +300,18 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         """Return the vocab size of the model."""
         return self.config.text_config.vocab_size
 
-    @staticmethod
-    def _normalize_mm_data_items(mm_data: Dict[str, Any], modality: str) -> List[Any]:
-        """Return a modality payload as a list for item-order bookkeeping.
-
-        Qwen processors may receive either one item or a list per modality.
-        Mixed image/video support needs stable per-item indexes when deriving
-        `multimodal_item_order` from prompt placeholders.
-        """
-        items = mm_data.get(modality)
-        if items is None:
-            return []
-        if isinstance(items, (list, tuple)):
-            return list(items)
-        return [items]
-
     def _get_mm_item_order_from_text(
         self,
         text_prompt: str,
         mm_data: Dict[str, Any],
-    ) -> MultimodalPromptOrder:
+    ) -> List[Tuple[str, int]]:
         """Infer Qwen image/video item order from placeholder order in text."""
+        normalized = MixedModalEncodeContext._normalize(mm_data)
         expected_counts = {
-            modality: len(self._normalize_mm_data_items(mm_data, modality))
-            for modality in _QWEN_MODALITIES
+            modality: len(normalized.get(modality, [])) for modality in _QWEN_MODALITIES
         }
         actual_counts = {modality: 0 for modality in _QWEN_MODALITIES}
-        item_order: MultimodalPromptOrder = MultimodalPromptOrder()
+        item_order: List[Tuple[str, int]] = []
         cursor = 0
 
         while cursor < len(text_prompt):
@@ -613,11 +598,8 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             processed_inputs = self._preprocess(text_prompt, mm_data, mm_processor_kwargs)
 
         multimodal_data = {}
-        modalities = [
-            modality
-            for modality in _QWEN_MODALITIES
-            if self._normalize_mm_data_items(mm_data, modality)
-        ]
+        normalized_mm_data = MixedModalEncodeContext._normalize(mm_data)
+        modalities = [modality for modality in _QWEN_MODALITIES if normalized_mm_data.get(modality)]
         if len(modalities) > 1:
             multimodal_data["multimodal_item_order"] = [
                 {"modality": modality, "index": idx}
