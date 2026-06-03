@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
 from ...custom_ops.mamba.cuda_backend_causal_conv import cuda_cached_causal_conv1d_wrapper
+from ...custom_ops.mamba.triton_backend_causal_conv import triton_cached_causal_conv1d_wrapper
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
@@ -36,20 +37,21 @@ def _match_causal_conv_activation_pattern(
     Match the causal_conv + activation pattern in the graph.
 
     The pattern corresponds to:
-        conv_out = cuda_cached_causal_conv1d(...)
+        conv_out = cuda_cached_causal_conv1d(...)  OR triton_cached_causal_conv1d(...)
         out = activation(conv_out)
 
     Args:
         graph: The graph module to search
-        target_op: The target causal conv op to match
+        target_op: The target causal conv op to match (or a tuple/list of ops)
 
     Returns:
         A list of tuples (conv_node, activation_node, activation_name) for each match
     """
+    target_ops = target_op if isinstance(target_op, (list, tuple)) else [target_op]
     matches = []
 
     for node in graph.nodes:
-        if not is_op(node, target_op):
+        if not any(is_op(node, op) for op in target_ops):
             continue
 
         # Check if this node has exactly one user and it's an activation
@@ -101,22 +103,29 @@ class FuseCausalConvActivation(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
 
-        target_op = cuda_cached_causal_conv1d_wrapper
+        # Match both the CUDA-backed and Triton-backed causal conv wrappers.
+        # fuse_causal_conv_activation previously only matched the CUDA wrapper,
+        # leaving the Triton wrapper's activation (e.g. silu(conv_out)) as a
+        # separate FX node that landed between the conv and SSM kernels in the
+        # CUDA graph stream, blocking the PDL chain.
+        target_ops = [cuda_cached_causal_conv1d_wrapper, triton_cached_causal_conv1d_wrapper]
 
         # Step 1: Identify causal_conv + activation pattern
         matches = _match_causal_conv_activation_pattern(
             graph,
-            target_op=target_op,
+            target_op=target_ops,
         )
 
         # Step 2: Replace matched patterns with fused version
         for conv_node, activation_node, activation_name in matches:
+            # Determine which wrapper was matched so the replacement uses the same op
+            conv_target_op = conv_node.target
             with graph.inserting_after(conv_node):
                 # Create new call with fused activation
                 # Replace the last arg (activation=None) with activation_name
                 new_args = list(conv_node.args[:-1]) + [activation_name]
                 fused_node = graph.call_function(
-                    target_op,
+                    conv_target_op,
                     args=tuple(new_args),
                 )
 
