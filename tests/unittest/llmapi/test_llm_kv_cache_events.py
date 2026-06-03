@@ -20,7 +20,8 @@ from tensorrt_llm.bindings.internal.testing import \
 from tensorrt_llm.inputs.multimodal import (MultimodalInput,
                                             _find_mm_token_runs_from_mask,
                                             apply_mm_hashes)
-from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
+from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
+                                                 serialize_item)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
