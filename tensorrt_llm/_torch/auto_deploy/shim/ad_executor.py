@@ -393,7 +393,10 @@ class ADEngine(ModelEngine):
         self.llm_args.print_iter_log = reporting_info.print_log
         self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
-        self.llm_args.stream_interval = 1
+        # Honor the user's stream_interval (yaml) instead of forcing per-token
+        # streaming. interval=1 emits a response every decode step -> per-token
+        # detok/postprocess/HTTP overhead that inflates ITL at high concurrency.
+        self.llm_args.stream_interval = ad_config.stream_interval if ad_config is not None else 1
         self.llm_args.attention_dp_config = None
         self.llm_args.batch_wait_timeout_ms = 0
         self.llm_args.batch_wait_timeout_iters = 0
