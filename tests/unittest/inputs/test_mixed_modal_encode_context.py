@@ -41,11 +41,9 @@ def test_flatten_uuids_handles_none():
     assert ctx.flatten_uuids({"image": ["u0"]}) == ["u0"]
 
 
-def test_default_is_modality_major():
-    ctx = MixedModalEncodeContext.default(
-        {"image": ["a", "b"], "video": ["c"]}, embedding_lengths=(1, 1, 1)
-    )
-    assert ctx.order == (("image", 0), ("image", 1), ("video", 0))
+def test_default_order_is_modality_major():
+    order = MixedModalEncodeContext.default_order({"image": ["a", "b"], "video": ["c"]})
+    assert order == (("image", 0), ("image", 1), ("video", 0))
 
 
 def test_from_metadata_pairs_order_with_lengths():
@@ -63,9 +61,10 @@ def test_from_metadata_pairs_order_with_lengths():
 
 # ---------------------------------------------------------------------------
 # Order resolution / normalization (absorbed from the deleted MultimodalPromptOrder).
-# `resolve_order` returns a bare prompt-order tuple; `resolve` pairs it with
-# `embedding_lengths`. `_normalize`, `from_raw_entries`, `order_from_metadata`,
-# and `validate_order` are the self-contained internals the producer drives.
+# `resolve_order` returns a bare prompt-order tuple; `from_metadata` pairs an
+# explicit order with `embedding_lengths`. `_normalize`, `from_raw_entries`,
+# `order_from_metadata`, and `validate_order` are the self-contained internals
+# the producer drives.
 # ---------------------------------------------------------------------------
 
 
@@ -227,17 +226,15 @@ class TestStaticProjections:
         ) == ["a", None]
 
 
-def test_resolve_pairs_order_with_lengths():
-    """Full-context `resolve` runs `resolve_order` then pairs embedding lengths."""
+def test_resolve_order_for_single_modality():
+    """`resolve_order` returns the bare prompt-order tuple for a single modality."""
 
     class NoHookProcessor:
         pass
 
     a, b = object(), object()
-    ctx = MixedModalEncodeContext.resolve(
+    order = MixedModalEncodeContext.resolve_order(
         {"image": [a, b]},
         NoHookProcessor(),
-        embedding_lengths=(7, 9),
     )
-    assert ctx.order == (("image", 0), ("image", 1))
-    assert ctx.embedding_lengths == (7, 9)
+    assert order == (("image", 0), ("image", 1))

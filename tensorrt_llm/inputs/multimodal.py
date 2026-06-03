@@ -274,7 +274,7 @@ class MixedModalEncodeContext:
 
     Holds the prompt-order spine and each item's encoder-output footprint, and
     owns the full order lifecycle: parse (`order_from_metadata` /
-    `from_raw_entries`), resolve (`resolve_order` / `resolve`), validate
+    `from_raw_entries`), resolve (`resolve_order`), validate
     (`validate_order` + the order-only `__post_init__` checks), normalize
     payload shape (`_normalize`), and project per-modality collections into
     prompt order (`project_by_order` / `project_uuids_by_order`, with the
@@ -423,31 +423,6 @@ class MixedModalEncodeContext:
         order = cls.default_order(mm_items)
         cls.validate_order(order, mm_items)
         return order
-
-    @classmethod
-    def resolve(
-        cls,
-        mm_data: Dict[str, Any],
-        input_processor: "BaseMultimodalInputProcessor",
-        embedding_lengths: Iterable[int],
-        *,
-        prompt_token_ids: Optional[List[int]] = None,
-        multimodal_data: Optional[Dict[str, Any]] = None,
-    ) -> "MixedModalEncodeContext":
-        """Resolve the prompt order and pair it with per-item embedding lengths."""
-        order = cls.resolve_order(mm_data,
-                                  input_processor,
-                                  prompt_token_ids=prompt_token_ids,
-                                  multimodal_data=multimodal_data)
-        return cls(order=order,
-                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
-
-    @classmethod
-    def default(cls, mm_items: Dict[str, List[Any]],
-                embedding_lengths: Iterable[int]) -> "MixedModalEncodeContext":
-        """Modality-major default context paired with per-item lengths."""
-        return cls(order=cls.default_order(mm_items),
-                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
 
     @classmethod
     def from_metadata(
