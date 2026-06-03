@@ -160,10 +160,9 @@ def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
     Per-request aggregation reads:
       * ``executor_request_queue.get_request_queue().queue`` — source for
         ``num_queued_context_requests`` / ``num_queued_ctx_tokens``
-      * ``model_engine.iter_states`` — stubbed but not read by the
-        request-aggregate fields under test here; the regression test
-        ``test_num_ctx_kv_tokens_ignores_iter_states_side_channel``
-        verifies the populate block does not read it
+      * ``model_engine.iter_states`` — stubbed as the post-forward side
+        channel so regression tests can verify ``_update_iter_stats`` uses
+        the explicit batch snapshot argument instead.
     """
     fake = MagicMock()
     fake.max_num_active_requests = 64
@@ -197,16 +196,23 @@ def _invoke_update_iter_stats(
     scheduled_batch : _StubScheduledBatch
     queued_items    : list[_StubQueueItem]
     num_ctx_tokens  : int | None
-        If int, wired into ``model_engine.iter_states = {"num_ctx_tokens": num_ctx_tokens}``.
-        If None, ``iter_states`` is set to None. The populate block under
-        test does not consume this value; it is plumbed so regression
-        tests can verify the side channel remains unread.
+        If int, wired into the fake ``model_engine.iter_states`` side channel.
+    iter_states     : dict | None
+        Explicit batch snapshot passed to ``_update_iter_stats``. When None,
+        defaults to the same ``num_ctx_tokens`` snapshot used by older tests.
     """
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    iter_states = None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
+    model_engine_iter_states = (
+        None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
+    )
+    batch_iter_states = model_engine_iter_states if iter_states is None else iter_states
 
-    fake_self = _build_fake_self(queued_items, iter_states, enable_attention_dp=enable_attention_dp)
+    fake_self = _build_fake_self(
+        queued_items,
+        model_engine_iter_states,
+        enable_attention_dp=enable_attention_dp,
+    )
 
     stats = IterationStats()
     # The method reads ``stats.inflight_batching_stats.*`` unconditionally;
@@ -224,7 +230,7 @@ def _invoke_update_iter_stats(
             num_completed_requests=0,
             scheduled_batch=scheduled_batch,
             micro_batch_id=0,
-            iter_states=iter_states,
+            iter_states=batch_iter_states,
         )
     return stats
 

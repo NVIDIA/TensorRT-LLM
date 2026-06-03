@@ -154,6 +154,7 @@ class BatchState:
         default_factory=dict)
     gpu_forward_start_event: Optional[torch.cuda.Event] = None
     gpu_forward_end_event: Optional[torch.cuda.Event] = None
+    gpu_forward_events_from_iter_pool: bool = False
 
 
 @dataclasses.dataclass
@@ -483,6 +484,8 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
+        self._iter_timing_event_pool: List[Tuple[torch.cuda.Event,
+                                                 torch.cuda.Event]] = []
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
 
@@ -1289,6 +1292,15 @@ class PyExecutor:
         return (torch.cuda.Event(enable_timing=True),
                 torch.cuda.Event(enable_timing=True))
 
+    def _get_iter_timing_events(self):
+        if self._iter_timing_event_pool:
+            return self._iter_timing_event_pool.pop()
+        return self._create_iter_timing_events()
+
+    def _release_iter_timing_events(self, start_event, end_event):
+        if start_event is not None and end_event is not None:
+            self._iter_timing_event_pool.append((start_event, end_event))
+
     @staticmethod
     def _compute_gpu_forward_time_ms(start_event, end_event) -> Optional[float]:
         if start_event is None or end_event is None:
@@ -1835,6 +1847,10 @@ class PyExecutor:
         # consumers which interpretation applies.
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
+            if batch_state.gpu_forward_events_from_iter_pool:
+                self._release_iter_timing_events(
+                    batch_state.gpu_forward_start_event,
+                    batch_state.gpu_forward_end_event)
             return
 
         # Snapshot the per-loop CPU and GPU timings captured by the most
@@ -1844,9 +1860,15 @@ class PyExecutor:
         # ride along with the IterationStats through any ADP fanout delay.
         host_step_time_ms = self._latest_host_step_time_ms
         prev_device_step_time_ms = self._latest_prev_device_step_time_ms
-        gpu_forward_time_ms = self._compute_gpu_forward_time_ms(
-            batch_state.gpu_forward_start_event,
-            batch_state.gpu_forward_end_event)
+        try:
+            gpu_forward_time_ms = self._compute_gpu_forward_time_ms(
+                batch_state.gpu_forward_start_event,
+                batch_state.gpu_forward_end_event)
+        finally:
+            if batch_state.gpu_forward_events_from_iter_pool:
+                self._release_iter_timing_events(
+                    batch_state.gpu_forward_start_event,
+                    batch_state.gpu_forward_end_event)
 
         req_stats = self._populate_req_stats(
             finished_requests, active_requests,
@@ -2113,9 +2135,11 @@ class PyExecutor:
                                    if self.enable_iter_perf_stats else {})
                     gpu_forward_start = None
                     gpu_forward_end = None
+                    gpu_forward_events_from_iter_pool = False
                     if self.enable_iter_perf_stats:
-                        gpu_forward_start, gpu_forward_end = self._create_iter_timing_events(
+                        gpu_forward_start, gpu_forward_end = self._get_iter_timing_events(
                         )
+                        gpu_forward_events_from_iter_pool = True
 
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
@@ -2185,6 +2209,8 @@ class PyExecutor:
                         iter_states=iter_states,
                         gpu_forward_start_event=gpu_forward_start,
                         gpu_forward_end_event=gpu_forward_end,
+                        gpu_forward_events_from_iter_pool=
+                        gpu_forward_events_from_iter_pool,
                         microbatch_id=microbatch_id,
                     )
 
@@ -2849,6 +2875,7 @@ class PyExecutor:
                 iter_states = {}
                 gpu_forward_start = None
                 gpu_forward_end = None
+                gpu_forward_events_from_iter_pool = False
 
                 can_queue, _ = self._can_queue(scheduled_batch)
 
@@ -2916,8 +2943,9 @@ class PyExecutor:
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
                     if self.enable_iter_perf_stats and gpu_forward_start is None:
-                        gpu_forward_start, gpu_forward_end = self._create_iter_timing_events(
+                        gpu_forward_start, gpu_forward_end = self._get_iter_timing_events(
                         )
+                        gpu_forward_events_from_iter_pool = True
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
@@ -3000,7 +3028,9 @@ class PyExecutor:
                                    iter_start_time=iter_start_time,
                                    iter_states=iter_states,
                                    gpu_forward_start_event=gpu_forward_start,
-                                   gpu_forward_end_event=gpu_forward_end))
+                                   gpu_forward_end_event=gpu_forward_end,
+                                   gpu_forward_events_from_iter_pool=
+                                   gpu_forward_events_from_iter_pool))
 
                 self.iter_counter += 1
 
@@ -3135,6 +3165,7 @@ class PyExecutor:
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
+                gpu_forward_events_from_iter_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
 
@@ -3239,8 +3270,9 @@ class PyExecutor:
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
                     if self.enable_iter_perf_stats and gpu_forward_start is None:
-                        gpu_forward_start, gpu_forward_end = self._create_iter_timing_events(
+                        gpu_forward_start, gpu_forward_end = self._get_iter_timing_events(
                         )
+                        gpu_forward_events_from_iter_pool = True
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
@@ -3329,7 +3361,9 @@ class PyExecutor:
                         iter_stats=iter_stats,
                         iter_states=iter_states,
                         gpu_forward_start_event=gpu_forward_start,
-                        gpu_forward_end_event=gpu_forward_end)
+                        gpu_forward_end_event=gpu_forward_end,
+                        gpu_forward_events_from_iter_pool=
+                        gpu_forward_events_from_iter_pool)
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
