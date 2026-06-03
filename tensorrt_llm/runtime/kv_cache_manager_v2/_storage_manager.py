@@ -331,6 +331,7 @@ class StorageManager:
             )
 
         num_levels = CacheLevel(len(config.cache_tiers))
+        logger.info("[KVCachePoolRatio]", f"init_ratio={[f'{r:.6f}' for r in init_ratio]}")
         self._levels = cast(
             TypedIndexList,
             [
