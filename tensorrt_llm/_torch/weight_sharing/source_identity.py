@@ -39,9 +39,10 @@ Layered design
 --------------
 The fingerprint is split so comparison can be selective:
 
-* **global fingerprint** -- model revision/architecture/dtype, quantization,
-  backend selection, fusion flags, and the parallel *sizes* (TP/PP/EP/CP).
-  This part must be identical across every rank of a deployment.
+* **global fingerprint** -- the realized parameter/buffer ``(shape, dtype)``
+  layout plus architecture identity, quantization, backend selection, fusion
+  flags, and the parallel *sizes* (TP/PP/EP/CP). This part must be identical
+  across every rank of a deployment.
 * **shard fingerprint** -- this rank's TP/PP/EP/CP *rank* slice. Receiver rank
   ``N`` must align with the source rank that produced shard ``N``.
 
@@ -60,6 +61,8 @@ from typing import TYPE_CHECKING, Any, List, Optional
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
+    from torch import nn
+
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.mapping import Mapping
 
@@ -68,29 +71,36 @@ if TYPE_CHECKING:
 # never match.
 SOURCE_IDENTITY_FORMAT_VERSION = 1
 
-# Pretrained-config fields that directly affect parameter shapes, module
-# topology, or dtype for common TRT-LLM model families. Keep this projection
-# intentionally narrow: unrelated HF config metadata must not block sharing.
-_MODEL_LAYOUT_FIELDS = (
-    "architectures",
-    "model_type",
-    "torch_dtype",
-    "vocab_size",
-    "hidden_size",
-    "intermediate_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "head_dim",
-    "tie_word_embeddings",
-    "num_experts",
-    "num_local_experts",
-    "num_experts_per_tok",
-    "n_routed_experts",
-    "n_shared_experts",
-    "moe_intermediate_size",
-    "decoder_sparse_step",
-)
+
+def _named_tensor_layout(model: Optional["nn.Module"]) -> Optional[dict]:
+    """Project a module's realized parameter/buffer layout for hashing.
+
+    The realized ``(shape, dtype)`` of every parameter and buffer *is* the
+    ground truth for how a model's weights are laid out in memory -- far more
+    reliable than a hand-maintained allowlist of config fields, and naturally
+    backend-agnostic. It also captures runtime dtype overrides (which a
+    pretrained-config projection would miss) since it reads the constructed
+    module's actual tensors.
+
+    Args:
+        model: The constructed (pre- or post-load) ``nn.Module``, or ``None``.
+
+    Returns:
+        A mapping of tensor name to ``[shape, dtype]``, or ``None`` when no
+        module is available.
+    """
+    if model is None:
+        return None
+    layout: dict = {}
+    for accessor in ("named_parameters", "named_buffers"):
+        iter_fn = getattr(model, accessor, None)
+        if not callable(iter_fn):
+            continue
+        for name, tensor in iter_fn():
+            if tensor is None:
+                continue
+            layout[name] = [list(tensor.shape), str(tensor.dtype)]
+    return layout
 
 
 def _canonical_hash(obj: Any) -> str:
@@ -198,6 +208,7 @@ class SourceIdentity:
     def from_model_config(
         cls,
         model_config: "ModelConfig",
+        model: Optional["nn.Module"] = None,
         *,
         model_name: Optional[str] = None,
     ) -> "SourceIdentity":
@@ -205,7 +216,14 @@ class SourceIdentity:
 
         Args:
             model_config: The resolved torch-backend ``ModelConfig`` whose
-                layout-affecting choices are fingerprinted.
+                quantization, backend, and parallel choices are fingerprinted.
+            model: The constructed ``nn.Module``. Its realized parameter and
+                buffer ``(shape, dtype)`` map is the layout ground truth for
+                the model fingerprint. Both producer and consumer must build
+                the identity at the same lifecycle point (model construction,
+                before weight load) so the projection is comparable. When
+                ``None``, the model fingerprint degrades to architecture
+                metadata only.
             model_name: Human-readable model identity used by discovery layers
                 (e.g. the MX server's source catalog). Does not affect the
                 compatibility fingerprints.
@@ -223,7 +241,7 @@ class SourceIdentity:
 
         return cls(
             format_version=SOURCE_IDENTITY_FORMAT_VERSION,
-            model_fingerprint=cls._build_model_fingerprint(model_config),
+            model_fingerprint=cls._build_model_fingerprint(model_config, model),
             quant_fingerprint=cls._build_quant_fingerprint(model_config),
             backend_fingerprint=cls._build_backend_fingerprint(model_config),
             parallel_fingerprint=cls._build_parallel_fingerprint(mapping),
@@ -237,26 +255,33 @@ class SourceIdentity:
         )
 
     @staticmethod
-    def _build_model_fingerprint(model_config: "ModelConfig") -> str:
-        """Hash layout-affecting model architecture fields.
+    def _build_model_fingerprint(model_config: "ModelConfig", model: Optional["nn.Module"]) -> str:
+        """Hash the realized weight layout plus a model-identity guard.
+
+        The layout is taken from the constructed module's parameter and buffer
+        ``(shape, dtype)`` map -- the ground truth for how weights are laid out
+        in memory. ``architectures``/``model_type`` are folded in as a cheap
+        guard so two unrelated models that happen to share identical tensor
+        shapes (a layout collision) still fingerprint differently.
 
         Args:
             model_config: The resolved torch-backend ``ModelConfig``.
+            model: The constructed ``nn.Module`` (may be ``None``).
 
         Returns:
-            A hex digest covering a narrow allowlist of pretrained-config
-            fields that affect parameter layout.
+            A hex digest covering the realized parameter/buffer layout and the
+            model's architecture identity.
         """
         pretrained = getattr(model_config, "pretrained_config", None)
-        if pretrained is None:
-            return _canonical_hash(None)
-        payload = {name: getattr(pretrained, name, None) for name in _MODEL_LAYOUT_FIELDS}
-        get_text_config = getattr(pretrained, "get_text_config", None)
-        if callable(get_text_config):
-            text_config = get_text_config()
-            payload["text_config"] = {
-                name: getattr(text_config, name, None) for name in _MODEL_LAYOUT_FIELDS
-            }
+        payload = {
+            "architectures": (
+                list(getattr(pretrained, "architectures", None) or [])
+                if pretrained is not None
+                else None
+            ),
+            "model_type": getattr(pretrained, "model_type", None) if pretrained else None,
+            "params": _named_tensor_layout(model),
+        }
         return _canonical_hash(payload)
 
     @staticmethod

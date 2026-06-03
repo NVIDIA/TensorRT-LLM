@@ -353,10 +353,13 @@ class ModelLoader:
                 is_meta_init = False
 
             # Receiver's local SourceIdentity, built once from the final
-            # ModelConfig after model construction has applied any in-place
-            # layout-affecting config mutations.
+            # ModelConfig and the freshly constructed module. The module's
+            # realized parameter/buffer (shape, dtype) map is the layout ground
+            # truth; building it here (post-construction, pre-weight-load)
+            # gives producer and consumer a common, comparable lifecycle point.
             self._source_identity = SourceIdentity.from_model_config(
                 config,
+                model,
                 model_name=str(
                     getattr(self.llm_args, "model", None) or checkpoint_dir),
             )
@@ -690,19 +693,7 @@ class ModelLoader:
                         # Pre-materialize compatibility gate. GMS has no
                         # disk-fallback path, so a mismatch raises under STRICT
                         # rather than falling back.
-                        source_identity = gms_backend.get_source_identity()
-                        if source_identity is not None:
-                            check_source_identity(
-                                self._source_identity,
-                                source_identity,
-                                IdentityCheckPolicy.STRICT,
-                            )
-                        else:
-                            logger.warning(
-                                "GMS RO: writer SourceIdentity unavailable; "
-                                "materializing without SourceIdentity "
-                                "enforcement. Publisher metadata is not wired "
-                                "yet; tracked by SOURCE-IDENTITY/GMS.")
+                        self._check_gms_source_identity(gms_backend)
 
                         gms_backend.materialize_module(model)
 
@@ -771,6 +762,36 @@ class ModelLoader:
             torch.cuda.current_stream().synchronize()
 
         return model, moe_load_balancer
+
+    def _check_gms_source_identity(self, gms_backend) -> None:
+        """Pre-materialize SourceIdentity gate for the GMS read-only path.
+
+        GMS has no disk-fallback path, so a verified mismatch raises under
+        ``STRICT`` rather than falling back. When the writer's identity is not
+        available (publisher metadata not wired yet), the gate is inert and
+        materialization proceeds without enforcement.
+
+        Args:
+            gms_backend: The connected GMS backend (RO role) exposing
+                ``get_source_identity()``.
+
+        Raises:
+            SourceIdentityMismatchError: When the writer's identity is
+                available and incompatible with this receiver's identity.
+        """
+        source_identity = gms_backend.get_source_identity()
+        if source_identity is None:
+            logger.warning(
+                "GMS RO: writer SourceIdentity unavailable; materializing "
+                "without SourceIdentity enforcement. Publisher metadata is "
+                "not wired yet; tracked by SOURCE-IDENTITY/GMS.")
+            return
+
+        check_source_identity(
+            self._source_identity,
+            source_identity,
+            IdentityCheckPolicy.STRICT,
+        )
 
     @staticmethod
     def _setup_aliases(model: DecoderModelForCausalLM) -> None:

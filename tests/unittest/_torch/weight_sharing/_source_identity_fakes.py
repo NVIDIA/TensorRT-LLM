@@ -167,9 +167,53 @@ class FakeModelConfig:
         self.use_cute_dsl_bf16_gemm = False
 
 
+class _FakeTensor:
+    """Stand-in for a parameter/buffer exposing only ``shape`` and ``dtype``."""
+
+    def __init__(self, shape: Sequence[int], dtype: str):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+
+
+class FakeModel:
+    """Minimal stand-in for an ``nn.Module`` exposing named tensors.
+
+    Parameter shapes are derived from the pretrained config so that
+    layout-affecting fields (``hidden_size`` etc.) change the realized layout
+    fingerprint, mirroring how real modules behave. ``dtype`` models a runtime
+    compute-dtype override that a config-only projection would miss.
+    """
+
+    def __init__(self, pretrained_config: FakePretrainedConfig, *, dtype: str = "torch.bfloat16"):
+        hidden = int(getattr(pretrained_config, "hidden_size", 4096))
+        vocab = int(getattr(pretrained_config, "vocab_size", 32000))
+        intermediate = int(getattr(pretrained_config, "intermediate_size", 11008))
+        self._params = {
+            "embed_tokens.weight": _FakeTensor((vocab, hidden), dtype),
+            "mlp.gate_proj.weight": _FakeTensor((intermediate, hidden), dtype),
+            "mlp.down_proj.weight": _FakeTensor((hidden, intermediate), dtype),
+        }
+        self._buffers = {
+            "rotary.inv_freq": _FakeTensor((hidden // 2,), "torch.float32"),
+        }
+
+    def named_parameters(self):
+        return list(self._params.items())
+
+    def named_buffers(self):
+        return list(self._buffers.items())
+
+
+def identity_from(config: FakeModelConfig, *, model_name: Optional[str] = None) -> SourceIdentity:
+    """Build a :class:`SourceIdentity` from a fake config and derived model."""
+    return SourceIdentity.from_model_config(
+        config, FakeModel(config.pretrained_config), model_name=model_name
+    )
+
+
 def make_identity(
     *, attn_backend: str = "TRTLLM", rank: int = 0, model_name: str = "m"
 ) -> SourceIdentity:
     """Build a :class:`SourceIdentity` from a fake config for ``rank``."""
     cfg = FakeModelConfig(mapping=FakeMapping(rank=rank, tp_rank=rank), attn_backend=attn_backend)
-    return SourceIdentity.from_model_config(cfg, model_name=model_name)
+    return identity_from(cfg, model_name=model_name)
