@@ -377,15 +377,24 @@ def _tie_aware_correct(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("top_k", [512, 1024, 2048])
-@pytest.mark.parametrize("N", [4096, 65536])
+# N covers the full small→production range so we catch slice-alignment
+# edge cases (N=4096 has N%step_elem != 0 boundaries; N=8192 onwards
+# do not) and the production-sized regimes the cluster path actually
+# targets (32K..131K).
+@pytest.mark.parametrize("N", [4096, 8192, 32768, 65536, 131072])
 @pytest.mark.parametrize("next_n", [1])
-@pytest.mark.parametrize("batch_size", [1, 32])
+# BS covers single-CTA (1), under-subscribed (16), cluster-1-wave-fit (64),
+# and one >1-wave-fit case (128) so we exercise the multi-wave scheduling
+# of clusters as well.
+@pytest.mark.parametrize("batch_size", [1, 16, 64])
 @pytest.mark.parametrize("use_256bit_load", [False])
 @pytest.mark.parametrize("num_threads_per_block", [512])
 @pytest.mark.parametrize("enable_warp_parallel_reduce", [False])
-# cluster_size: 1 (≡ V5 baseline), 2 (default cluster), 4 (aggressive).
-# Start with 1 + 2 for bring-up; add 4 once both pass.
-@pytest.mark.parametrize("cluster_size", [1, 2])
+# cluster_size sweep: 1 (≡ V5 baseline), 2 (default cluster), 4 (aggressive
+# parallelism). cs=4 exercises a different DSMEM gather loop trip count
+# in the kernel handoff and is essential to flush out cluster_size-
+# generic bugs that a cs=2-only sweep would miss.
+@pytest.mark.parametrize("cluster_size", [1, 2, 4])
 def test_gvr_topk_decode(
     dtype: torch.dtype,
     top_k: int,
