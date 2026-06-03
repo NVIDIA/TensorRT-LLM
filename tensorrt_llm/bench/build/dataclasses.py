@@ -310,7 +310,9 @@ class NemotronHybridConfig(ModelConfig):
                                                    or model_hf_name,
                                                    trust_remote_code=True)
         hf_config = pretrained_config.to_dict()
-        param_count = cls.get_param_count(model_hf_name, hf_model_path)
+        param_count, checkpoint_size_in_gb = (
+            cls.get_param_count_and_checkpoint_size(model_hf_name,
+                                                    hf_model_path))
 
         # HuggingFace PretrainedConfig.to_dict() only serializes attributes known to
         # the base class; custom configs (e.g. NemotronHConfig) have num_hidden_layers
@@ -335,7 +337,10 @@ class NemotronHybridConfig(ModelConfig):
                 if value is not None:
                     hf_config[key] = value
 
-        return cls(name=model_hf_name, param_count=param_count, **hf_config)
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   checkpoint_size_in_gb=checkpoint_size_in_gb,
+                   **hf_config)
 
 
 class Qwen3HybridConfig(ModelConfig):
@@ -358,7 +363,9 @@ class Qwen3HybridConfig(ModelConfig):
                                                    or model_hf_name,
                                                    trust_remote_code=True)
         hf_config = pretrained_config.to_dict()
-        param_count = cls.get_param_count(model_hf_name, hf_model_path)
+        param_count, checkpoint_size_in_gb = (
+            cls.get_param_count_and_checkpoint_size(model_hf_name,
+                                                    hf_model_path))
 
         layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
         hf_config.setdefault("num_attention_layers",
@@ -366,7 +373,10 @@ class Qwen3HybridConfig(ModelConfig):
         hf_config.setdefault("num_linear_attention_layers",
                              layer_types.count("linear_attention"))
 
-        return cls(name=model_hf_name, param_count=param_count, **hf_config)
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   checkpoint_size_in_gb=checkpoint_size_in_gb,
+                   **hf_config)
 
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
         d_inner = self.linear_value_head_dim * self.linear_num_value_heads

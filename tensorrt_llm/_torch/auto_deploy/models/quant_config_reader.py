@@ -25,12 +25,28 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
-from tensorrt_llm.quantization.modelopt_config import (
-    is_modelopt_quant_config,
-    read_modelopt_quant_config,
-)
-
+from .._compat import TRTLLM_AVAILABLE
 from ..utils.logger import ad_logger
+
+# Importing ``tensorrt_llm.quantization.modelopt_config`` triggers
+# ``tensorrt_llm.quantization.__init__`` which pulls in ``tensorrt_llm.mapping``
+# and thus ``tensorrt_llm._torch.device_mesh``; none of these exist in the
+# standalone llmc package. Gate the import so this module loads cleanly when
+# TRT-LLM is absent; the ModelOPT reader path itself is unreachable in that case.
+if TRTLLM_AVAILABLE:
+    from tensorrt_llm.quantization.modelopt_config import (
+        is_modelopt_quant_config,
+        read_modelopt_quant_config,
+    )
+else:
+
+    def is_modelopt_quant_config(raw: Any) -> bool:
+        return False
+
+    def read_modelopt_quant_config(raw: Any) -> Dict[str, Any]:
+        raise NotImplementedError(
+            "ModelOPT quant config parsing requires TensorRT-LLM; not available in standalone mode."
+        )
 
 
 class QuantConfigReader(ABC):
