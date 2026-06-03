@@ -1435,10 +1435,11 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
         router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
 
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
+    # Hidden must be padded to the kernel's 512-aligned expected width. The mxfp8 path's
+    # mxfp8_quantize(alignment=512) already pads internally (2880->3072), so only the
+    # bf16 path needs an explicit F.pad (applied in that branch) — skipping the redundant
+    # per-token pad kernel on the mxfp8 decode path.
     expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
-    pad_size = expected_hidden - int(x2d.shape[-1])
-    if pad_size > 0:
-        x2d = torch.nn.functional.pad(x2d, (0, pad_size))
 
     num_experts_total = int(router_weight.shape[0])
     if local_num_experts < 0:
@@ -1484,6 +1485,10 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
             topk_ids=None,
         )
     elif act_dtype == "bf16":
+        # bf16 runner takes the activation directly, so pad hidden to 512-aligned here.
+        pad_size = expected_hidden - int(x2d.shape[-1])
+        if pad_size > 0:
+            x2d = torch.nn.functional.pad(x2d, (0, pad_size))
         result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
             router_logits,
             None,  # routing_bias
