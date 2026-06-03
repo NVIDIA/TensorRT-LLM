@@ -665,6 +665,23 @@ class SpecMetadata:
         self.is_all_greedy_sample = (self.skip_temperature and self.skip_top_k
                                      and self.skip_top_p)
 
+        # Warmup-time override (set via runtime attribute by the model engine):
+        # force the advanced-sampling code path so the CUDA graph for the
+        # (is_all_greedy_sample=False) key gets captured. Dummy warmup requests
+        # carry no sampling params, so the natural detection above always
+        # returns True; this branch substitutes synthetic non-greedy scalars
+        # into the per-request data and lets Phase 2 run normally to populate
+        # the GPU buffers used by the captured kernels.
+        if getattr(self, '_force_non_greedy_for_capture', False):
+            self.skip_temperature = False
+            self.skip_top_k = False
+            self.skip_top_p = False
+            self.is_all_greedy_sample = False
+            per_request_normalized = [
+                (0.7, 50, 0.9, num_tokens)
+                for (_, _, _, num_tokens) in per_request_normalized
+            ]
+
         tokens_per_request = (self.max_total_draft_tokens + 1 if
                               self.is_spec_dec_tree else self.max_draft_len + 1)
         required_flat_size = tokens_per_request * self.max_num_requests
