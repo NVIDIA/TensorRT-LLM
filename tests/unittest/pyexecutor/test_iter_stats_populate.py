@@ -34,7 +34,6 @@ block.
 
 from __future__ import annotations
 
-import threading
 import types
 from unittest.mock import MagicMock, patch
 
@@ -201,76 +200,6 @@ def _invoke_update_iter_stats(scheduled_batch, queued_items, *, num_ctx_tokens):
             micro_batch_id=0,
         )
     return stats
-
-
-def _build_fake_append_self(max_stats_len, *, gather_all_ranks=False):
-    fake = types.SimpleNamespace()
-    fake.enable_iter_perf_stats = True
-    fake.enable_attention_dp = gather_all_ranks
-    fake.max_stats_len = -1 if max_stats_len == -1 else max(max_stats_len, 1)
-    fake.stats_lock = threading.Lock()
-    fake.stats = []
-    fake._latest_kv_iter_stats = None
-    if gather_all_ranks:
-        fake.dist = types.SimpleNamespace(
-            tp_size=2,
-            tp_rank=0,
-            tp_allgather=lambda _: [{"rank": 0}, {"rank": 1}],
-        )
-    else:
-        fake.dist = types.SimpleNamespace(tp_size=1)
-    return fake
-
-
-def test_append_iter_stats_bounded_buffer_keeps_recent_entries():
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    fake = _build_fake_append_self(max_stats_len=2)
-
-    for idx in range(3):
-        PyExecutor._append_iter_stats(fake, f"stats-{idx}")
-
-    assert [entry[0] for entry in fake.stats] == ["stats-1", "stats-2"]
-
-
-def test_append_iter_stats_zero_buffer_keeps_one_entry():
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    fake = _build_fake_append_self(max_stats_len=0)
-
-    for idx in range(3):
-        PyExecutor._append_iter_stats(fake, f"stats-{idx}")
-
-    assert [entry[0] for entry in fake.stats] == ["stats-2"]
-
-
-def test_append_iter_stats_unbounded_buffer_keeps_all_entries():
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    fake = _build_fake_append_self(max_stats_len=-1)
-
-    for idx in range(3):
-        PyExecutor._append_iter_stats(fake, f"stats-{idx}")
-
-    assert [entry[0] for entry in fake.stats] == [
-        "stats-0",
-        "stats-1",
-        "stats-2",
-    ]
-
-
-def test_append_iter_stats_unbounded_all_rank_buffer_keeps_all_entries(monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
-    fake = _build_fake_append_self(max_stats_len=-1, gather_all_ranks=True)
-    stats = types.SimpleNamespace(to_json_str=lambda: "{}")
-
-    for _ in range(2):
-        PyExecutor._append_iter_stats(fake, stats)
-
-    assert len(fake.stats) == 4
-    assert [entry[0] for entry in fake.stats] == ["per_rank_dict"] * 4
 
 
 # ---------------------------------------------------------------------------

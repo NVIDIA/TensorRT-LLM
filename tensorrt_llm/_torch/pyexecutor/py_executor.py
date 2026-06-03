@@ -1516,7 +1516,9 @@ class PyExecutor:
 
         # Legacy path: rank-0-only (single-rank or iter stats disabled).
         with self.stats_lock:
-            _trim_stats_buffer(self.stats, self.max_stats_len)
+            if (not _stats_buffer_is_unbounded(self.max_stats_len)
+                    and len(self.stats) > self.max_stats_len):
+                self.stats.pop(0)
             self.stats.append((stats, req_stats, self._latest_kv_iter_stats))
 
     def _process_iter_stats(
