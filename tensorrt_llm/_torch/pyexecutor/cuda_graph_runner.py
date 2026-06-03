@@ -7,6 +7,7 @@ import torch
 
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...inputs.multimodal import MultimodalParams
@@ -374,18 +375,28 @@ class CUDAGraphRunner:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
         graph = torch.cuda.CUDAGraph()
-        with with_multi_stream(True), piecewise_cuda_graph(False):
-            for _ in range(self.WARMUP_STEPS):
-                _setup_spec_decoding_and_forward(key, forward_fn,
-                                                 capture_inputs)
+        try:
+            with with_multi_stream(True), piecewise_cuda_graph(False):
+                for _ in range(self.WARMUP_STEPS):
+                    _setup_spec_decoding_and_forward(key, forward_fn,
+                                                     capture_inputs)
+                    if postprocess_fn is not None:
+                        postprocess_fn(capture_inputs)
+
+                with torch.cuda.graph(graph, pool=self.memory_pool):
+                    output = _setup_spec_decoding_and_forward(
+                        key, forward_fn, capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
-
-            with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = _setup_spec_decoding_and_forward(
-                    key, forward_fn, capture_inputs)
-            if postprocess_fn is not None:
-                postprocess_fn(capture_inputs)
+        except Exception:
+            # Reset the partially-captured graph now, while the CUDA generator
+            # state is still valid. Otherwise this orphaned graph (it was never
+            # stored in self.graphs) is destroyed later during GC, when the
+            # generator state may already be gone, and ~CUDAGraph()'s
+            # unregister_graph can abort the process via terminate(), masking
+            # the real capture-time error.
+            self._safe_reset_graph(graph, "after a capture failure")
+            raise
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
@@ -551,10 +562,22 @@ class CUDAGraphRunner:
                 scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
                                                                                                 -padding_size]
 
+    @staticmethod
+    def _safe_reset_graph(graph: torch.cuda.CUDAGraph, context: str):
+        # graph.reset() can raise (e.g. a stale CUDA generator state inside
+        # ~CUDAGraph()); swallow it so one failing reset cannot abort the rest
+        # of the teardown or mask an earlier, more relevant error.
+        try:
+            graph.reset()
+        except Exception:
+            logger.warning("Failed to reset CUDA graph %s.", context)
+
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        # Reset each graph independently so a failure tearing down one graph
+        # does not abort cleanup of the remaining graphs.
         for graph in self.graphs.values():
-            graph.reset()
+            self._safe_reset_graph(graph, "during cleanup")
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
