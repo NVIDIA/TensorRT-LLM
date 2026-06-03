@@ -342,8 +342,6 @@ struct TllmGenFmhaRunnerParams
     // When seqlensQPtr[i] < mPackedMaskMaxSeqLenQ, the packed mask tensor has
     // row stride ceilDiv(mPackedMaskMaxSeqLenQ, 32) rather than ceilDiv(seqLenQ, 32).
     int32_t mPackedMaskMaxSeqLenQ = 0;
-    // Dynamic-tree bounds used by FMHA kernel selection.
-    int32_t mSpecDecodingMaxDraftTokens = 0;
     int32_t mSpecDecodingTargetMaxGenLen = 0;
 
     // set the attention mask type
