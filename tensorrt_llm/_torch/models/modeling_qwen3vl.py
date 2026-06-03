@@ -34,7 +34,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import MixedModalEncodeContext, MultimodalParams
+from ...inputs.multimodal import MixedModalEncodeContext, MultimodalParams, scan_prompt_order
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -331,41 +331,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         expected_counts = {
             modality: len(normalized.get(modality, [])) for modality in _QWEN_MODALITIES
         }
-        actual_counts = {modality: 0 for modality in _QWEN_MODALITIES}
-        item_order: List[Tuple[str, int]] = []
-        cursor = 0
-
-        while cursor < len(text_prompt):
-            next_match: Optional[Tuple[int, int, str]] = None
-            for modality, placeholders in _QWEN_PLACEHOLDERS.items():
-                if actual_counts[modality] >= expected_counts[modality]:
-                    continue
-                for placeholder in placeholders:
-                    position = text_prompt.find(placeholder, cursor)
-                    if position < 0:
-                        continue
-                    if (
-                        next_match is None
-                        or position < next_match[0]
-                        or (position == next_match[0] and len(placeholder) > next_match[1])
-                    ):
-                        next_match = (position, len(placeholder), modality)
-
-            if next_match is None:
-                break
-
-            position, placeholder_len, modality = next_match
-            item_order.append((modality, actual_counts[modality]))
-            actual_counts[modality] += 1
-            cursor = position + placeholder_len
-
-        for modality, expected_count in expected_counts.items():
-            if actual_counts[modality] != expected_count:
-                raise ValueError(
-                    f"Qwen3-VL prompt contains {actual_counts[modality]} "
-                    f"{modality} placeholder(s), expected {expected_count}."
-                )
-        return item_order
+        return scan_prompt_order(text_prompt, _QWEN_PLACEHOLDERS, expected_counts)
 
     @classmethod
     def get_rope_index(

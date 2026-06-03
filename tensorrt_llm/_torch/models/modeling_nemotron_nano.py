@@ -18,6 +18,7 @@ from tensorrt_llm.inputs.multimodal import (
     MixedModalEncodeContext,
     MultimodalParams,
     find_multimodal_embedding_lengths,
+    scan_prompt_order,
 )
 
 from ...inputs import (
@@ -1572,31 +1573,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "video": self.video_context_token,
             "audio": self._sound_context_token,
         }
-        actual_counts = {modality: 0 for modality in _NANO_MODALITIES}
-        item_order: List[Tuple[str, int]] = []
-        cursor = 0
-        while cursor < len(text_prompt):
-            next_match: Optional[Tuple[int, str]] = None
-            for modality, placeholder in placeholder_by_modality.items():
-                if not placeholder or actual_counts[modality] >= expected_counts[modality]:
-                    continue
-                pos = text_prompt.find(placeholder, cursor)
-                if pos >= 0 and (next_match is None or pos < next_match[0]):
-                    next_match = (pos, modality)
-            if next_match is None:
-                break
-            pos, modality = next_match
-            item_order.append((modality, actual_counts[modality]))
-            actual_counts[modality] += 1
-            cursor = pos + len(placeholder_by_modality[modality])
-
-        for modality, expected in expected_counts.items():
-            if actual_counts[modality] != expected:
-                raise ValueError(
-                    f"Expected {expected} {modality} placeholder(s), found "
-                    f"{actual_counts[modality]} while resolving prompt order."
-                )
-        return item_order
+        return scan_prompt_order(text_prompt, placeholder_by_modality, expected_counts)
 
     def _get_mm_item_order_from_token_ids(
         self, prompt_token_ids: List[int], mm_data: Dict[str, Any]

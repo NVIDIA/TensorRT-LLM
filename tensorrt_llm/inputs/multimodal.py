@@ -47,6 +47,74 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
         mm_data['mrope_config'] = {'mrope_position_deltas': mrope_deltas}
 
 
+def scan_prompt_order(
+    text: str,
+    placeholder_by_modality: Dict[str, Union[str, Iterable[str]]],
+    expected_counts: Dict[str, int],
+) -> List[Tuple[str, int]]:
+    """Walk a decoded prompt left-to-right and return its multimodal item order.
+
+    Shared scanner behind the per-model `_get_mm_item_order_from_text` hooks
+    (Nano and Qwen3VL): both compute item order from placeholder positions in the
+    decoded prompt; only the placeholder strings differ.
+
+    From a moving cursor, repeatedly pick the nearest next placeholder among
+    modalities still below `expected_counts`, append `(modality, running_index)`,
+    and advance the cursor past that placeholder. A modality may register several
+    placeholder spellings (e.g. a fused long form and a bare short form); on a
+    position tie the longer placeholder wins so the cursor clears the whole long
+    form rather than re-matching its short substring. Falsy placeholder strings
+    are skipped. At the end, raise `ValueError` if any modality's observed count
+    differs from its expected count.
+
+    Args:
+        text: The decoded prompt string to scan.
+        placeholder_by_modality: Maps each modality to one placeholder string or
+            an iterable of placeholder strings.
+        expected_counts: Maps each modality to the number of items expected.
+
+    Returns:
+        The `(modality, item_index)` entries in prompt placeholder order.
+    """
+    placeholders_by_modality: Dict[str, Tuple[str, ...]] = {}
+    for modality, placeholders in placeholder_by_modality.items():
+        if isinstance(placeholders, str):
+            placeholders = (placeholders, )
+        placeholders_by_modality[modality] = tuple(p for p in placeholders if p)
+
+    actual_counts = {modality: 0 for modality in expected_counts}
+    item_order: List[Tuple[str, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        # Best match so far as (position, placeholder_len, modality); a smaller
+        # position wins, and a longer placeholder breaks a position tie.
+        next_match: Optional[Tuple[int, int, str]] = None
+        for modality, placeholders in placeholders_by_modality.items():
+            if actual_counts[modality] >= expected_counts.get(modality, 0):
+                continue
+            for placeholder in placeholders:
+                position = text.find(placeholder, cursor)
+                if position < 0:
+                    continue
+                if (next_match is None or position < next_match[0]
+                        or (position == next_match[0]
+                            and len(placeholder) > next_match[1])):
+                    next_match = (position, len(placeholder), modality)
+        if next_match is None:
+            break
+        position, placeholder_len, modality = next_match
+        item_order.append((modality, actual_counts[modality]))
+        actual_counts[modality] += 1
+        cursor = position + placeholder_len
+
+    for modality, expected in expected_counts.items():
+        if actual_counts[modality] != expected:
+            raise ValueError(
+                f"Expected {expected} {modality} placeholder(s), found "
+                f"{actual_counts[modality]} while resolving prompt order.")
+    return item_order
+
+
 @dataclass
 class MultimodalInput:
     """Per-logical-unit multimodal metadata for KV-cache hashing (C++ layer).
