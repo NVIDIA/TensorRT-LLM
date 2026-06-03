@@ -34,11 +34,11 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
+from ...mmap_utils import advise_tensor_pageout
 from ...utils import (ActivationType, replace_parameter_and_save_metadata,
                       swizzle_sf, unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
-from .moe_load_balancer import advise_tensor_pageout
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
