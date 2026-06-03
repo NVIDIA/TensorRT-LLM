@@ -25,7 +25,6 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     video_to_pixel_values,
 )
 from tensorrt_llm.inputs.multimodal import (
-    MixedModalEncodeContext,
     MultimodalParams,
     MultimodalRuntimeData,
     _compute_mm_masks,
@@ -2616,8 +2615,8 @@ class TestTokenPathVideoEmbeddedAudioHoist:
     carries a `<sound_context>` placeholder after each video-with-audio (the
     natural analogue of the text path injecting one). `mm_data` still nests the
     audio on the `VideoData` (not yet hoisted). The processor's
-    `promote_nested_mm_data` hook must, before `find_mm_token_lengths` and
-    `MixedModalEncodeContext.resolve_order` run:
+    `promote_nested_mm_data` hook must, before `find_mm_token_lengths` and the
+    token-path order resolution (the model's `get_mm_item_order`) run:
       1. register the embedded audio as a top-level `mm_data["audio"]` item, and
       2. vision-only-strip `.audio` off the video items,
     so the order scanner emits `(video, k), (audio, k)` and the budget splits
@@ -2707,19 +2706,22 @@ class TestTokenPathVideoEmbeddedAudioHoist:
             return_value=[vision_video_budget, audio_budget]
         )
 
-        # Capture the prompt order the token path resolves (assertion a).
+        # Capture the prompt order the token path resolves (assertion a). The
+        # framework `resolve_order` is now metadata-only, so the token-id fast
+        # path derives the interleaved order from the model's own
+        # `get_mm_item_order` hook; capture there.
         resolved_orders = []
-        real_resolve = MixedModalEncodeContext.resolve_order.__func__
+        real_get_order = type(proc).get_mm_item_order
 
-        def capturing_resolve(cls, mm, input_processor, **kw):
-            order = real_resolve(cls, mm, input_processor, **kw)
-            resolved_orders.append(list(order))
+        def capturing_get_order(self, prompt_token_ids, mm):
+            order = real_get_order(self, prompt_token_ids, mm)
+            resolved_orders.append([tuple(entry) for entry in order])
             return order
 
         with mock.patch.object(
-            MixedModalEncodeContext,
-            "resolve_order",
-            classmethod(capturing_resolve),
+            type(proc),
+            "get_mm_item_order",
+            capturing_get_order,
         ):
             expanded_ids, _ = proc.call_with_token_ids(
                 {"prompt_token_ids": prompt_token_ids, "multi_modal_data": mm_data},
@@ -2728,7 +2730,7 @@ class TestTokenPathVideoEmbeddedAudioHoist:
 
         # (a) The token path resolved the prompt order as video-then-audio, each
         # a first-class item.
-        assert resolved_orders, "MixedModalEncodeContext.resolve_order was not called"
+        assert resolved_orders, "model get_mm_item_order was not called"
         token_path_order = resolved_orders[-1]
         assert token_path_order == [("video", 0), ("audio", 0)]
 

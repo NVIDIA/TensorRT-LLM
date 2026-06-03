@@ -50,9 +50,10 @@ class _FakeMixedProcessor:
         # then consumes the already-expanded ids.
         if prompt_token_ids and mm_data:
             lengths_by_key = find_mm_token_lengths(mm_data, self)
-            item_order = MixedModalEncodeContext.resolve_order(
-                mm_data, self, prompt_token_ids=prompt_token_ids
-            )
+            # The processor computes its own prompt-item order from the tokens
+            # (via its model-internal `get_mm_item_order` hook), mirroring how the
+            # real token-id fast path resolves order before expansion.
+            item_order = self.get_mm_item_order(prompt_token_ids, mm_data)
             num_mm_tokens = MixedModalEncodeContext.project_by_order(item_order, lengths_by_key)
             prompt_token_ids, _ = self.expand_prompt_token_ids_for_mm(
                 prompt_token_ids,

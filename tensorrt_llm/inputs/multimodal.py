@@ -455,40 +455,24 @@ class MixedModalEncodeContext:
     def resolve_order(
         cls,
         mm_data: Dict[str, Any],
-        input_processor: "BaseMultimodalInputProcessor",
         *,
-        prompt_token_ids: Optional[List[int]] = None,
         multimodal_data: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Tuple[str, int], ...]:
         """Resolve the prompt order for every multimodal item in a request.
 
-        Explicit metadata wins, model-specific prompt parsing is the fallback
-        for mixed requests, and single-modality requests keep the historical
-        modality-major ordering. Returns a bare `(modality, index)` tuple; the
-        producer pairs it with per-item lengths separately (Option Y: the dict
-        keys remain the wire format and a full context is built only at the
-        point of use).
+        Every mixed preprocess path bakes an explicit `multimodal_item_order`
+        into the processed metadata (the text paths always did; the token-id
+        fast path does after expanding from the real prompt token IDs), so this
+        is purely `metadata | default_order`: the baked order wins when present,
+        otherwise the deterministic modality-major default applies. Returns a
+        bare `(modality, index)` tuple; the producer pairs it with per-item
+        lengths separately (Option Y: the dict keys remain the wire format and a
+        full context is built only at the point of use).
         """
         mm_items = cls._normalize(mm_data)
-        metadata_order = cls.order_from_metadata(multimodal_data)
-        if metadata_order is not None:
-            cls.validate_order(metadata_order, mm_items)
-            return metadata_order
-        if len(mm_items) <= 1:
+        order = cls.order_from_metadata(multimodal_data)
+        if order is None:
             order = cls.default_order(mm_items)
-            cls.validate_order(order, mm_items)
-            return order
-        if prompt_token_ids is not None:
-            get_mm_item_order = getattr(input_processor, "get_mm_item_order",
-                                        None)
-            if callable(get_mm_item_order):
-                order = cls.from_raw_entries(
-                    get_mm_item_order(prompt_token_ids, mm_data),
-                    source=f"{type(input_processor).__name__}.get_mm_item_order",
-                )
-                cls.validate_order(order, mm_items)
-                return order
-        order = cls.default_order(mm_items)
         cls.validate_order(order, mm_items)
         return order
 

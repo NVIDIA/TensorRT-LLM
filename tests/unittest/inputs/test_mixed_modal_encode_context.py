@@ -132,18 +132,19 @@ class TestNormalize:
 
 
 class TestResolveOrder:
-    """`resolve_order` mirrors the old MultimodalPromptOrder.resolve contract."""
+    """`resolve_order` reads explicit metadata when present, else the default order.
+
+    Every mixed preprocess path now bakes `multimodal_item_order` into the
+    processed metadata (the text paths always did; the token-id path does after
+    the Nano-token-id bake), so `resolve_order` no longer parses prompts: it is
+    purely `metadata | default_order`. There is no duck-typed `get_mm_item_order`
+    hook on the framework seam.
+    """
 
     def test_uses_metadata_when_present(self):
-        class PoisonProcessor:
-            def get_mm_item_order(self, *args, **kwargs):
-                raise AssertionError("get_mm_item_order must not be called")
-
         a, b, c = object(), object(), object()
         order = MixedModalEncodeContext.resolve_order(
             {"image": [a, b], "video": [c]},
-            PoisonProcessor(),
-            prompt_token_ids=[1, 2, 3],
             multimodal_data={
                 "multimodal_item_order": [
                     {"modality": "video", "index": 0},
@@ -155,33 +156,32 @@ class TestResolveOrder:
         assert order == (("video", 0), ("image", 0), ("image", 1))
 
     def test_uses_default_for_single_modality(self):
-        class NoHookProcessor:
-            pass
-
         a, b = object(), object()
-        assert MixedModalEncodeContext.resolve_order({"image": [a, b]}, NoHookProcessor()) == (
+        assert MixedModalEncodeContext.resolve_order({"image": [a, b]}) == (
             ("image", 0),
             ("image", 1),
         )
 
-    def test_uses_input_processor_protocol_for_multi_modality(self):
+    def test_uses_metadata_for_multi_modality(self):
         a, b = object(), object()
-
-        class OrderingProcessor:
-            def get_mm_item_order(self, prompt_token_ids, mm_data):
-                return [("video", 0), ("image", 0)]
-
+        # Multi-modality with explicit metadata: the baked order wins over the
+        # modality-major default (which would be image-then-video).
         assert MixedModalEncodeContext.resolve_order(
-            {"image": [a], "video": [b]}, OrderingProcessor(), prompt_token_ids=[1, 2]
+            {"image": [a], "video": [b]},
+            multimodal_data={
+                "multimodal_item_order": [
+                    {"modality": "video", "index": 0},
+                    {"modality": "image", "index": 0},
+                ]
+            },
         ) == (("video", 0), ("image", 0))
 
-    def test_falls_back_to_default_when_processor_lacks_hook(self):
-        class NoHookProcessor:
-            pass
-
+    def test_falls_back_to_default_when_metadata_absent(self):
         a, b = object(), object()
+        # No `multimodal_item_order` in metadata: fall back to the modality-major
+        # default order.
         assert MixedModalEncodeContext.resolve_order(
-            {"image": [a], "video": [b]}, NoHookProcessor(), prompt_token_ids=[1, 2]
+            {"image": [a], "video": [b]}, multimodal_data=None
         ) == (("image", 0), ("video", 0))
 
 
@@ -228,13 +228,6 @@ class TestStaticProjections:
 
 def test_resolve_order_for_single_modality():
     """`resolve_order` returns the bare prompt-order tuple for a single modality."""
-
-    class NoHookProcessor:
-        pass
-
     a, b = object(), object()
-    order = MixedModalEncodeContext.resolve_order(
-        {"image": [a, b]},
-        NoHookProcessor(),
-    )
+    order = MixedModalEncodeContext.resolve_order({"image": [a, b]})
     assert order == (("image", 0), ("image", 1))

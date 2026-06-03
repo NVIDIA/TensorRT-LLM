@@ -300,10 +300,10 @@ class BaseMultimodalInputProcessor(ABC):
         no-op (returns `mm_data` unchanged). Models whose raw `multi_modal_data`
         carries one modality embedded inside another (e.g. Nano's video-embedded
         audio, modeled as a separate `(audio, k)` prompt item) override this to
-        hoist the nested payload so that both `find_mm_token_lengths` and
-        `MixedModalEncodeContext.resolve_order` see the promoted items. Called once at
-        the top of `call_with_token_ids`; the promoted `mm_data` is reused for
-        length computation, order resolution, and placeholder expansion alike.
+        hoist the nested payload so that both `find_mm_token_lengths` and the
+        prompt-item order resolution see the promoted items. Called once at the
+        top of `call_with_token_ids`; the promoted `mm_data` is reused for length
+        computation, order resolution, and placeholder expansion alike.
         """
         return mm_data
 
@@ -381,21 +381,28 @@ class BaseMultimodalInputProcessor(ABC):
                 "lengths for the provided multi_modal_data.")
         # The dummy-placeholder pass ran the text path on synthetic placeholder
         # text built modality-major by `get_text_with_mm_placeholders`, which for
-        # a mixed request bakes a modality-major `multimodal_item_order` into the
-        # processed metadata. That order is stale w.r.t. the real (possibly
-        # interleaved) prompt, so drop it before resolving: otherwise
-        # `resolve_order` would short-circuit on the stale metadata instead of
-        # scanning the real `prompt_token_ids`.
+        # a mixed request bakes a stale modality-major `multimodal_item_order`
+        # into the processed metadata. Drop it: the real (possibly interleaved)
+        # order is derived below from the actual prompt token IDs and re-baked.
         dummy_multimodal_data = (extra_processed_inputs
                                  or {}).get("multimodal_data")
         if dummy_multimodal_data is not None:
             dummy_multimodal_data.pop("multimodal_item_order", None)
-        item_order = MixedModalEncodeContext.resolve_order(
-            mm_data,
-            self,
-            prompt_token_ids=prompt_token_ids,
-            multimodal_data=dummy_multimodal_data,
-        )
+        # Resolve the prompt-item order directly from the real prompt token IDs.
+        # Single-modality requests keep the deterministic modality-major order;
+        # mixed requests delegate to the model's own `get_mm_item_order` hook
+        # (the same scan the expand step uses), which walks the placeholder
+        # layout of the real prompt. The framework `resolve_order` is metadata-
+        # only, so it cannot derive this interleaved order — the model must.
+        mm_items = MixedModalEncodeContext._normalize(mm_data)
+        if len(mm_items) <= 1:
+            item_order = MixedModalEncodeContext.default_order(mm_items)
+        else:
+            item_order = MixedModalEncodeContext.from_raw_entries(
+                self.get_mm_item_order(prompt_token_ids, mm_data),
+                source=f"{type(self).__name__}.get_mm_item_order",
+            )
+        MixedModalEncodeContext.validate_order(item_order, mm_items)
         num_mm_tokens = MixedModalEncodeContext.project_by_order(
             item_order, num_mm_tokens_by_key)
 
@@ -1149,11 +1156,11 @@ def create_input_processor_with_hash(
                 "lengths for the provided input.")
         # Mixed-modality: resolve logical prompt-item order, then flatten the
         # per-modality token-length lists into one prompt-ordered list
-        # (supersedes the single-modality next(iter(...)) assumption).
+        # (supersedes the single-modality next(iter(...)) assumption). The order
+        # is read from the processed metadata, which every preprocess path now
+        # bakes (text paths and the token-id fast path alike).
         item_order = MixedModalEncodeContext.resolve_order(
             mm_data,
-            input_processor,
-            prompt_token_ids=prompt_token_ids,
             multimodal_data=(extra_processed_inputs
                              or {}).get("multimodal_data"),
         )
