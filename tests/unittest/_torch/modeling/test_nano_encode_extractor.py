@@ -286,6 +286,21 @@ class TestNanoExtractMultiModalityPerItem:
         with pytest.raises(ValueError, match="multimodal_embedding_lengths"):
             list(_nano_extract_items(0, param, slicer=_StubSlicer()))
 
+    def test_multi_modality_requires_encode_context(self):
+        # A multi-modality param with NO multimodal_item_order key cannot build a
+        # transient MixedModalEncodeContext (from_metadata returns None), so the
+        # per-item extractor raises a clear error naming both the typed view it
+        # could not build and the missing wire key it needs.
+        param = _make_param(
+            {
+                "modality_type": ["image", "audio"],
+                "image": {"pixel_values": "imgs"},
+                "audio": {"input_audio_features": "auds"},
+            }
+        )
+        with pytest.raises(KeyError, match="MixedModalEncodeContext.*multimodal_item_order"):
+            list(_nano_extract_items(0, param, slicer=_StubSlicer()))
+
 
 # ---------------------------------------------------------------------------
 # NanoPayloadSlicer: per-modality single-item payload slicing (sec 3.4).

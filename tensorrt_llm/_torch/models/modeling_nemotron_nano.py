@@ -15,6 +15,7 @@ from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import (
+    MixedModalEncodeContext,
     MultimodalParams,
     MultimodalPromptOrder,
     find_multimodal_embedding_lengths,
@@ -493,29 +494,34 @@ def _nano_extract_items(
         return
 
     # PER-ITEM: one ModalityItem per prompt-order slot, payload sliced per item.
-    item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
-    if item_order is None:
-        raise KeyError(
-            f"Nano multi-modality param {param_idx} is missing "
-            "'multimodal_item_order'; the per-item extractor needs the prompt "
-            "order to assign each item its slot."
-        )
+    # Parse the two wire keys (`multimodal_item_order` +
+    # `multimodal_embedding_lengths`) into one validated typed view at the point
+    # of use. `from_metadata` returns None when the order key is absent.
     embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-    if embedding_lengths is None:
+    if embedding_lengths is None and "multimodal_item_order" in multimodal_data:
         raise KeyError(
             f"Nano multi-modality param {param_idx} is missing "
             "'multimodal_embedding_lengths'; the per-item extractor needs the "
             "per-slot row counts."
         )
-    if len(item_order) != len(embedding_lengths):
+    item_order = multimodal_data.get("multimodal_item_order")
+    if item_order is not None and len(item_order) != len(embedding_lengths):
         raise ValueError(
             "multimodal_item_order length "
             f"({len(item_order)}) != multimodal_embedding_lengths length "
             f"({len(embedding_lengths)})"
         )
+    ctx = MixedModalEncodeContext.from_metadata(multimodal_data, embedding_lengths)
+    if ctx is None:
+        raise KeyError(
+            f"Nano multi-modality param {param_idx} cannot build a "
+            "MixedModalEncodeContext: 'multimodal_item_order' metadata is "
+            "missing; the per-item extractor needs the prompt order to assign "
+            "each item its slot."
+        )
 
     for prompt_pos, ((modality, mm_idx), length) in enumerate(
-        zip(item_order, embedding_lengths, strict=True)
+        zip(ctx.order, ctx.embedding_lengths, strict=True)
     ):
         if modality not in _NANO_MODALITIES:
             raise ValueError(f"Unknown modality: {modality}")
