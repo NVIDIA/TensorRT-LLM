@@ -28,7 +28,8 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
@@ -595,6 +596,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         # see MixedMambaHybridCacheManager.
         self._padding_slot: int = self.mamba_cache_free_blocks.pop()
 
+        # Reserved slot for the attention-DP padding dummy. Keep it out of the
+        # free pool so dummy insertion never consumes real-request capacity.
+        self._attention_dp_dummy_slot: Optional[int] = (
+            self.mamba_cache_free_blocks.pop()
+            if mapping.enable_attention_dp else None)
+
         # save intermediate state indices for requests
         self.intermediate_state_indices = torch.arange(max_batch_size,
                                                        dtype=torch.int32,
@@ -681,6 +688,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                 continue
             if self._is_padding_sentinel(r):
                 self.mamba_cache_index[r] = self._padding_slot
+            elif (r == ATTENTION_DP_DUMMY_REQUEST_ID
+                  and self._attention_dp_dummy_slot is not None):
+                self.mamba_cache_index[r] = self._attention_dp_dummy_slot
             else:
                 if len(self.mamba_cache_free_blocks) == 0:
                     raise RuntimeError("run out of mamba cache blocks")
@@ -692,8 +702,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         if request_id not in self.mamba_cache_index:
             return
         block = self.mamba_cache_index.pop(request_id)
-        # _padding_slot stays reserved; only non-sentinel blocks return.
-        if not self._is_padding_sentinel(request_id):
+        # Reserved slots must not re-enter the real-request free pool.
+        if block != self._padding_slot and \
+                block != self._attention_dp_dummy_slot:
             self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self, request_ids: List[int],
@@ -985,6 +996,19 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     """
 
 
+def _get_mamba_hybrid_pool_size(max_batch_size: int, mapping: Mapping) -> int:
+    """Return the internal Mamba state pool size for MixedMambaHybridCacheManager."""
+    pool_size = max_batch_size
+    # One permanent slot is shared by every CUDA-graph padding sentinel.
+    pool_size += 1
+    if mapping.enable_attention_dp:
+        # Attention-DP can insert a transient dummy request on an otherwise
+        # idle rank. Keep this headroom internal so scheduler-visible
+        # max_batch_size still limits real requests.
+        pool_size += 1
+    return pool_size
+
+
 class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                                    MambaHybridCacheManager):
     """Hybrid cache manager combining separate KVCacheManager and MambaCacheManager.
@@ -1037,10 +1061,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
-        # +1 headroom for PythonMambaCacheManager._padding_slot, which
-        # is shared by every CUDA-graph padding sentinel regardless of
-        # max_draft_len.
-        pool_size = max_batch_size + 1
+        pool_size = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
 
         MambaCacheManager.__init__(
             self,
