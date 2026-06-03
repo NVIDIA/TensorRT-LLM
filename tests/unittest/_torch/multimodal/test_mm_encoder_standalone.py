@@ -33,6 +33,7 @@ _QWEN_2_5_VL_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 _QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
 _QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
 ) / "Qwen3" / "Qwen3-VL-30B-A3B-Instruct-FP8"
+_NANO_V2_VL_FP8_DIR = llm_models_root() / "NVIDIA-Nemotron-Nano-12B-v2-VL-FP8"
 
 _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL = "qwen3_vl_30b_a3b_fp8_fake"
 _FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
@@ -128,8 +129,9 @@ def _create_mm_disagg_llm(
 def _get_encoder_max_batch_size(model_dir: Path) -> int:
     # Qwen2.5/3 VL and LLaVA's vision encoder seems to output different embeddings based on this value.
     # The test only passes with this set to 1.
-    if (model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR, _LLAVA_DIR]
-            or _is_fake_checkpoint(model_dir)):
+    if (model_dir in [
+            _QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR, _LLAVA_DIR, _NANO_V2_VL_FP8_DIR
+    ] or _is_fake_checkpoint(model_dir)):
         return 1
     return 3
 
@@ -272,6 +274,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         pytest.param(_QWEN_3_VL_DIR, id="qwen3_2b"),
         pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
                      id="qwen3_30b_a3b_fp8"),
+        pytest.param(_NANO_V2_VL_FP8_DIR, id="nemotron_nano_v2_vl_fp8"),
     ],
 )
 def model_dir(request, tmp_path_factory: pytest.TempPathFactory) -> Path:
@@ -666,6 +669,8 @@ def llms_and_encoder(
     pd_disagg: bool,
 ) -> Generator[tuple[tuple[LLM, LLM | None], MultimodalEncoder], None, None]:
     """Get LLM instances and a multimodal encoder, initialized in parallel."""
+    if model_dir == _NANO_V2_VL_FP8_DIR and get_sm_version() < 90:
+        pytest.skip("Nemotron-Nano-12B-v2-VL FP8 requires Hopper+ (SM90)")
     # Several tests need these instances live together; building them as one fixture lets setup overlap.
     encoder_max_batch_size = _get_encoder_max_batch_size(model_dir)
     initializers = _create_llm_initializers(model_dir, pd_disagg)
