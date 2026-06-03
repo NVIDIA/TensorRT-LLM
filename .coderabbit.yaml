@@ -50,7 +50,7 @@ reviews:
     - path: "tests/integration/test_lists/test-db/**"
       instructions: |
         Files here drive the auto-run CI test-db (per-GPU l0_*.yml tiers).
-        Adding or removing entries here changes what CI runs every PR.
+        Adding or removing entries here changes what CI runs either in every PR (pre-merge) or three times a day (post-merge).
         Do NOT suggest cross-syncing with the QA lists under
         tests/integration/test_lists/qa/.
 knowledge_base:
