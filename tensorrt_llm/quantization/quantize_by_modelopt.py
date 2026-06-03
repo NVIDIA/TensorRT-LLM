@@ -500,6 +500,17 @@ def get_model_type(model):
     return None
 
 
+def _is_cnn_dailymail_local_repo(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    # The loader only uses the "3.0.0" config.
+    if os.path.isdir(os.path.join(path, "3.0.0")):
+        return True
+    if os.path.isfile(os.path.join(path, "cnn_dailymail.py")):
+        return True
+    return False
+
+
 def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
@@ -526,7 +537,8 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                    split="train",
                                    trust_remote_code=True)
         dataset = dataset.select(range(calib_size))
-    elif "cnn_dailymail" in dataset_name_or_dir:
+    elif "cnn_dailymail" in dataset_name_or_dir or _is_cnn_dailymail_local_repo(
+            dataset_name_or_dir):
         dataset = load_dataset(
             dataset_name_or_dir,
             name="3.0.0",
@@ -1140,7 +1152,8 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                split="train",
                                trust_remote_code=True)
         text_column = "text"
-    elif "cnn_dailymail" in dataset_name_or_dir:
+    elif "cnn_dailymail" in dataset_name_or_dir or _is_cnn_dailymail_local_repo(
+            dataset_name_or_dir):
         dataset = load_dataset(dataset_name_or_dir,
                                name="3.0.0",
                                split="train",

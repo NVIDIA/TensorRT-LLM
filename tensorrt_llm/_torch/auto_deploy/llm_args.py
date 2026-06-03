@@ -332,6 +332,35 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def extend_default_cuda_graph_config_to_max_batch_size(self):
+        """Auto-extend the default cuda_graph_config to cover the top-level max_batch_size.
+
+        ``CudaGraphConfig.validate_cuda_graph_config`` falls back to a hard-coded
+        max of 128 when neither ``cuda_graph_config.batch_sizes`` nor
+        ``cuda_graph_config.max_batch_size`` is set. This silently leaves any
+        ``LlmArgs.max_batch_size > 128`` running in eager mode for the larger
+        batches, which roughly doubles ITL at those batch sizes.
+
+        When the user hasn't explicitly set ``cuda_graph_config`` we rebuild it
+        with ``max_batch_size`` matching the top-level value so the heuristic
+        re-generates the batch_sizes list up to the actual max.
+        """
+        # Skip if the user explicitly configured cuda_graph_config (any field set).
+        if "cuda_graph_config" in self.model_fields_set:
+            return self
+        cg = self.cuda_graph_config
+        if cg is None or cg.max_batch_size >= self.max_batch_size:
+            return self
+        # Re-validate a fresh CudaGraphConfig with the correct max_batch_size to
+        # trigger heuristic regeneration of batch_sizes.
+        cg_cls = type(cg)
+        self.cuda_graph_config = cg_cls(
+            max_batch_size=self.max_batch_size,
+            enable_padding=cg.enable_padding,
+        )
+        return self
+
+    @model_validator(mode="after")
     def sync_cuda_graph_batch_sizes_to_compile_config(self):
         """Propagate cuda_graph_config.batch_sizes into compile_model transform config.
 

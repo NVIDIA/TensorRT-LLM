@@ -34,6 +34,7 @@ l0_sanity_check:
     - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[UCX-mha-ctx_fp16_gen_fp16]
     - unittest/others/test_kv_cache_transceiver.py::test_cancel_request_in_transmission[mha]
     - unittest/others/test_kv_cache_transceiver.py::test_cancel_request_in_transmission[mla]
+    - unittest/_torch/pyexecutor/test_model_loader_mx.py
 - condition:
     ranges:
       system_gpu_count:

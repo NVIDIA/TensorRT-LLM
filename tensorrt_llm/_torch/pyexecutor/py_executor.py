@@ -44,6 +44,7 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
 
 from ..distributed import Distributed
+from ..distributed.communicator import ReduceOp
 from ..expert_statistic import ExpertStatistic
 from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -61,13 +62,15 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
-from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, get_draft_token_length)
+from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
+                          LlmRequest, LlmRequestState, LlmResponse,
+                          get_draft_token_length)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
+                            derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
                                ResourceManagerType, request_context)
@@ -416,6 +419,15 @@ class PyExecutor:
         self.response_cv = threading.Condition(self.response_lock)
         self.responses = {}
         self.result_wait_queues = {}
+        # If the event-loop thread (PyExecutor._event_loop_wrapper) raises
+        # an exception (e.g. KV cache OOM), it is stashed here and read by
+        # two local consumers so they can surface it instead of hanging:
+        #   - _await_single_response re-raises it as a RuntimeError, and
+        #   - BaseWorker.AwaitResponseHelper (the bridge between this
+        #     engine and per-request GenerationResult queues) reads it to
+        #     broadcast an ErrorResponse to every pending request, waking
+        #     callers parked in queue.get() / aqueue.get().
+        self._event_loop_error: Optional[BaseException] = None
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -439,6 +451,28 @@ class PyExecutor:
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
+        # nvbug-6133201: under attention DP, tighten the per-rank request
+        # cap so per-rank gen-phase step-token load cannot exceed
+        # max_num_tokens. No-op for correctly-sized configs.
+        if self.enable_attention_dp:
+            derived_cap = derive_attention_dp_per_rank_request_cap(
+                base_cap=self.max_num_active_requests,
+                max_num_tokens=self.max_num_tokens,
+                max_total_draft_tokens=self.max_total_draft_tokens,
+            )
+            if derived_cap < self.max_num_active_requests:
+                step_tokens_per_req = 1 + max(self.max_total_draft_tokens, 0)
+                required_max_num_tokens = (self.max_num_active_requests *
+                                           step_tokens_per_req)
+                logger.warning(
+                    f"[PyExecutor] enable_attention_dp: max_num_tokens="
+                    f"{self.max_num_tokens} cannot fit max_batch_size="
+                    f"{self.max_num_active_requests} at {step_tokens_per_req} "
+                    f"step-tokens each; capping per-rank max_num_active_requests "
+                    f"to {derived_cap}. Raise max_num_tokens to "
+                    f"{required_max_num_tokens} to run at the declared "
+                    f"max_batch_size.")
+            self.max_num_active_requests = derived_cap
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
@@ -622,6 +656,10 @@ class PyExecutor:
         # normal dummy add-forward-terminate lifecycle handles taper-down.
         # Only relevant in benchmark disagg mode; False otherwise.
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
+        # Slow-start admission cap for benchmark disagg fill (see
+        # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
+        # seeds it to tp_size and each subsequent iter doubles it.
+        self._fill_admit_cap: int = 0
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -811,6 +849,14 @@ class PyExecutor:
         except Exception as e:
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
+            # Stash the original error so local consumers
+            # (_await_single_response and BaseWorker.AwaitResponseHelper)
+            # can surface it instead of letting callers hang. We do NOT
+            # call _handle_errors / _enqueue_responses here: they trigger
+            # tp_gather / allgather collectives that would deadlock when
+            # only this rank crashed. The is_shutdown notification in
+            # _executor_loop_cleanup is enough to wake local waiters.
+            self._event_loop_error = e
             raise e
         finally:
             self._executor_loop_cleanup()
@@ -1008,6 +1054,16 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
+        # also invoked mid-init by configure_kv_cache_capacity() in
+        # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
+        # shutdown() and then immediately reads model_engine.model.model_config
+        # to compute kv_cache_max_memory. cleanup() would set
+        # model_engine.model = None, breaking that read with
+        # `'NoneType' object has no attribute 'model_config'`.
+        # The engine's __del__ still calls cleanup() at terminal teardown
+        # (when the executor's reference is dropped), which is sufficient for
+        # the GMS daemon registry eviction the cleanup hook was added for.
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
@@ -1773,17 +1829,28 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms)
 
     def _executor_loop_cleanup(self):
-
-        for i in range(self.num_micro_batches):
-            self.wait_on_pp_send_handles(self.send_handles, i)
-            self.wait_on_pp_send_handles(self.send_schedule_handles, i)
-            self.wait_on_pp_send_handles(self.send_expected_batch_num_handles,
-                                         i)
-
+        # Wake any waiters in await_responses BEFORE potentially-blocking
+        # work below. If wait_on_pp_send_handles hangs (e.g. after a
+        # crash leaves PP send handles in a bad state), the await loop
+        # must not hang with it.
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+
+        for i in range(self.num_micro_batches):
+            try:
+                self.wait_on_pp_send_handles(self.send_handles, i)
+                self.wait_on_pp_send_handles(self.send_schedule_handles, i)
+                self.wait_on_pp_send_handles(
+                    self.send_expected_batch_num_handles, i)
+            except Exception:
+                # PP send handles may be in a broken state after an
+                # event-loop crash. Log and continue; the waiters have
+                # already been notified above.
+                logger.error(
+                    f"Error waiting on PP send handles during cleanup: "
+                    f"{traceback.format_exc()}")
 
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
@@ -1928,16 +1995,26 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                        if not all_gen_first:
+                    # [disagg-ctx-deadlock-fix] Mirror of the OR-gated entry in
+                    # _executor_loop: ensure every TP rank either calls
+                    # _check_disagg_ctx_cache_transfer_status together or skips
+                    # it together, so the internal allgather in
+                    # CacheTransceiver::checkContextTransferStatus always has
+                    # full quorum. With PP > 1 the schedule is broadcast from
+                    # rank 0 so num_fitting_reqs should already be uniform, but
+                    # has_any_inflight_requests is rank-local and could
+                    # otherwise diverge.
+                    local_need_check = (num_fitting_reqs == 0 and
+                                        not fitting_disagg_gen_init_requests)
+                    any_need_check = self.dist.allreduce(int(local_need_check),
+                                                         op=ReduceOp.MAX)
+                    if any_need_check > 0:
+                        if local_need_check and not all_gen_first:
                             logger.warning(
                                 "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                             )
                             self._check_disagg_ctx_cache_transfer_status(1)
-                        elif self.async_transfer_manager.has_any_inflight_requests(
-                        ):
-                            # Non-blocking cleanup of completed/timed-out
-                            # transfers to free KV blocks (see _executor_loop).
+                        else:
                             self._check_disagg_ctx_cache_transfer_status(0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
@@ -2573,18 +2650,36 @@ class PyExecutor:
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
-            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                if not all_gen_first:
+            # [disagg-ctx-deadlock-fix] _check_disagg_ctx_cache_transfer_status
+            # internally invokes a TP-wide allgather inside
+            # CacheTransceiver::checkContextTransferStatus. Gating the call on
+            # rank-local `num_fitting_reqs` (which can drift between ranks by
+            # one block due to per-rank UCX/CUDA-event-sync timing variance)
+            # lets some ranks enter the allgather while others skip ahead to
+            # model_forward / kv_connector → cross-rank collective-mismatch
+            # deadlock. OR the decision across TP ranks: if ANY rank wants the
+            # call, ALL ranks call it. Ranks that don't locally need it use the
+            # non-blocking variant so the collective stays in sync without
+            # holding any individual rank.
+            local_need_check = (num_fitting_reqs == 0
+                                and not fitting_disagg_gen_init_requests)
+            any_need_check = self.dist.allreduce(int(local_need_check),
+                                                 op=ReduceOp.MAX)
+            if any_need_check > 0:
+                if local_need_check and not all_gen_first:
                     logger.warning(
                         "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                     )
+                    # Local conditions warrant a blocking wait for at least one
+                    # in-flight transfer to complete so KV blocks can be freed.
                     self._check_disagg_ctx_cache_transfer_status(1)
-                elif self.async_transfer_manager.has_any_inflight_requests():
-                    # Non-blocking cleanup of completed/timed-out transfers
-                    # to free KV blocks. We avoid the blocking check because
-                    # gen-first requests may be waiting for peer info (which
-                    # would block indefinitely), but completed transfers must
-                    # still be reaped so that KV cache can be reclaimed.
+                else:
+                    # Either (a) a peer rank needed the call but we didn't, or
+                    # (b) all active requests are gen-first so we don't
+                    # actively block. In both cases the non-blocking variant
+                    # still runs the internal allgather (keeping all ranks in
+                    # sync) and reaps any already-completed transfers without
+                    # blocking on un-finished ones.
                     self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
@@ -2750,6 +2845,7 @@ class PyExecutor:
                 scheduled_batch)
             if can_forward:
                 self._benchmark_fill_phase_active = False
+                self._fill_admit_cap = 0
             else:
                 time.sleep(0.1)
                 return can_forward, True
@@ -3486,15 +3582,14 @@ class PyExecutor:
 
         max_new_requests = total_max - total_num_active_requests
 
-        # Benchmark disagg fill-phase admission throttle: a preloaded queue
-        # (concurrency == total_max) would otherwise pop all requests into
-        # DISAGG_GENERATION_INIT in one iter, tripping PR #12206's fail-fast
-        # under ADP-router imbalance and growing the recv-buffer fallback
-        # faster than transfers drain.  Cap at `tp_size` (≈ pre-#12208
-        # blocking fill rate).  Verified on Kimi-K2 8k1k ctx8/gen1 con=8192.
+        # Benchmark disagg fill-phase admission throttle (slow-start ramp).
         if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
                 and not self.is_warmup):
-            max_new_requests = min(max_new_requests, self.dist.tp_size)
+            if self._fill_admit_cap == 0:
+                self._fill_admit_cap = self.dist.tp_size
+            else:
+                self._fill_admit_cap = min(self._fill_admit_cap * 2, total_max)
+            max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
         return get_from_waiting_queue(
             waiting_queue,
@@ -3964,8 +4059,9 @@ class PyExecutor:
         # Other ranks have work but this rank is idle — insert a dummy so
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
+            dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
             llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=[0],
+                request_ids=dummy_request_ids,
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
@@ -3974,7 +4070,7 @@ class PyExecutor:
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests([0])
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
             self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")
@@ -4844,12 +4940,31 @@ class PyExecutor:
         with self.response_cv:
 
             def key_has_response():
-                return id in self.responses.keys()
+                # Wake on shutdown too so that an event-loop crash
+                # cannot trap callers here forever (nvbug 6038228).
+                return id in self.responses or self.is_shutdown
 
             self.response_cv.wait_for(key_has_response, timeout=timeout)
-            response = self.responses[id]
-            self.responses.pop(id)
-            return response
+            if id in self.responses:
+                return self.responses.pop(id)
+            if self.is_shutdown:
+                # The event-loop thread terminated before producing a
+                # response for this request. Re-raise the original
+                # exception (if any) so callers see a meaningful error
+                # instead of hanging here or hitting a KeyError below.
+                error = self._event_loop_error
+                if error is not None:
+                    raise RuntimeError(
+                        f"Event loop terminated with error: {error}") from error
+                raise RuntimeError(
+                    f"Event loop shut down before a response was received "
+                    f"for request {id}.")
+            # Timed out without shutdown. Return [] to match the
+            # documented timeout contract used by _await_any_response and
+            # the other executor-API timeouts; the pre-fix code raised a
+            # bare KeyError on this path, which all known callers had to
+            # defend against anyway.
+            return []
 
     def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.

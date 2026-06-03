@@ -360,9 +360,11 @@ class BaseWorker(GenerationExecutor):
         it_result_queue.aqueue = None
 
     def return_queue(self, client_id: int):
-        """ If a centralized result queue is registered (used for communication with the proxy)
-            send the message there.
-            Otherwise, push the result directly in the GenerationResult queue.
+        """Return the queue used to deliver responses for ``client_id``.
+
+        If a centralized result queue is registered (used for communication
+        with the proxy) send the message there. Otherwise, push the result
+        directly in the GenerationResult queue.
         """
         if self.result_queue is not None:
             return self.result_queue
@@ -613,6 +615,8 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
+            executor_request.py_logprobs_simple_format = (
+                request.sampling_params.logprobs_simple_format)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
@@ -1063,8 +1067,19 @@ class AwaitResponseHelper:
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
         timeout = timeout or 0.1
-        responses = self.worker.engine.await_responses(
-            timeout=datetime.timedelta(seconds=timeout))
+        try:
+            responses = self.worker.engine.await_responses(
+                timeout=datetime.timedelta(seconds=timeout))
+        except Exception as e:
+            # Defensive: with id=None, PyExecutor.await_responses routes
+            # to _await_any_response, which does not raise on event-loop
+            # crash — it returns [] silently and we detect the crash
+            # via engine._event_loop_error after this block. But any
+            # unexpected exception out of await_responses (e.g. from a
+            # different engine implementation, or a future change to
+            # _await_any_response) is also a clear signal to broadcast
+            # and stop the thread.
+            return self._broadcast_event_loop_error(e)
         # filter since The _engine_response_callback may return None
         responses = list(
             filter(
@@ -1079,7 +1094,80 @@ class AwaitResponseHelper:
                               color="red",
                               category="Worker"):
             self.responses_handler(responses)
+
+        # Even when await_responses returned normally (e.g. via
+        # _await_any_response, whose predicate already includes
+        # is_shutdown but does not raise), an event-loop crash leaves
+        # _event_loop_error stashed on the engine. Broadcast and stop the
+        # thread in that case too — see nvbug 6038228.
+        error = getattr(self.worker.engine, "_event_loop_error", None)
+        if error is not None:
+            return self._broadcast_event_loop_error(error)
         return True
+
+    def _broadcast_event_loop_error(self, error: BaseException) -> bool:
+        """Wake every pending ``GenerationResult`` after an event-loop crash.
+
+        Inject an ``ErrorResponse`` into every pending ``GenerationResult``
+        queue so callers parked in ``queue.get()`` / ``aqueue.get()``
+        (``LLM.generate``, ``generate_async`` + ``aresult``,
+        ``trtllm-bench``) wake up with a meaningful error instead of
+        hanging when the PyExecutor event loop dies.
+
+        Returns ``False`` so the calling ``ManagedThread`` exits — there
+        is no point polling a dead engine.
+
+        Scope: single-process worker (the path that backs ``LLM.generate``
+        and the bench async client). The IPC / proxy path tracks pending
+        results on a different side of the boundary and would need a
+        separate poison-pill on ``self.worker.result_queue``; that is left
+        as a follow-up consistent with the PyExecutor-side fix.
+        """
+        error_msg = f"Event loop terminated with error: {error}"
+        pending_client_ids = list(self.worker._results.keys())
+        if not pending_client_ids:
+            logger.error(
+                f"Event-loop error with no pending results to wake: {error}")
+            return False
+
+        logger.error(
+            f"Broadcasting event-loop error to {len(pending_client_ids)} "
+            f"pending request(s): {error}")
+
+        event_loop = None
+        async_queues: List[_SyncQueue] = []
+        for client_id in pending_client_ids:
+            try:
+                queue = self.worker.return_queue(client_id)
+            except KeyError:
+                continue
+            err_resp = ErrorResponse(
+                client_id=client_id,
+                error_msg=error_msg,
+                request_id=client_id,
+            )
+            try:
+                if isinstance(queue, _SyncQueue):
+                    queue.put_nowait(err_resp)
+                    async_queues.append(queue)
+                    event_loop = event_loop or queue.loop
+                else:
+                    queue.put(err_resp)
+            except Exception as put_error:
+                logger.error(f"Failed to push ErrorResponse for client_id="
+                             f"{client_id}: {put_error}")
+                continue
+            self.worker._pop_result(client_id)
+
+        if async_queues:
+            try:
+                _SyncQueue.notify_many(event_loop, async_queues)
+            except Exception as notify_error:
+                logger.error(
+                    f"Failed to notify async queues on event-loop error: "
+                    f"{notify_error}")
+
+        return False
 
     def handle_for_worker(self, responses: List[tllm.Response]) -> None:
         ''' Return the responses to asyncio.event_loop. '''
@@ -1183,9 +1271,15 @@ def _compute_pytorch_prompt_logprobs(
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
 
-    logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
-                                       context_logits, None, None,
-                                       prompt_token_ids)
+    logprobs_result = compute_logprobs(
+        logprob_params.prompt_logprobs,
+        None,
+        context_logits,
+        None,
+        None,
+        prompt_token_ids,
+        simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
+    )
     if generation_result._streaming:
         generation_result._cached_prompt_logprobs = logprobs_result.prompt
 
@@ -1224,11 +1318,15 @@ def _get_logprobs(worker,
                 return logprobs_result
 
         # TRT backend: compute both prompt and generation logprobs from logits
-        logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
-                                           logprob_params.logprobs,
-                                           response.result.context_logits,
-                                           response.result.generation_logits,
-                                           response.result.output_token_ids[0])
+        logprobs_result = compute_logprobs(
+            logprob_params.prompt_logprobs,
+            logprob_params.logprobs,
+            response.result.context_logits,
+            response.result.generation_logits,
+            response.result.output_token_ids[0],
+            simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
+            simple_logprobs=logprob_params.logprobs_simple_format,
+        )
 
         if logprob_params.drop_context_logits:
             response.clear_context_logits()
