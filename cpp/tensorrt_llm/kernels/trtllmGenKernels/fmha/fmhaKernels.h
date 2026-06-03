@@ -91,6 +91,31 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM)
     return gpuSM == kernelSM;
 }
 
+#if defined(TLLM_FMHA_TEST_HOOKS)
+// Result of TllmGenFmhaKernel::probeKernelSelectionForTesting (forwarded by
+// TllmGenFmhaRunner::probeKernelSelectionForTesting). Test-only POD that
+// captures the autotuner's selection outcome (the cubin function name the
+// runtime would launch) without launching the kernel. Guarded behind
+// TLLM_FMHA_TEST_HOOKS so production builds do not expose the probe symbol;
+// the test target defines this macro in its CMakeLists.
+struct TllmGenFmhaSelectedKernel
+{
+    // Name of the cubin function the hash lookup resolved to. Empty when
+    // mFound is false.
+    std::string mFuncName;
+    // True when mFunctions.find(hashId) succeeded for the resolved options.
+    bool mFound = false;
+    // True when shouldUseNvrtc(options) returned true, so the autotuner's
+    // intended path is NVRTC rather than a precompiled cubin. In that case
+    // mFound stays false and mFuncName stays empty.
+    bool mUsedNvrtc = false;
+    // Grouping flags read from the matched kernelMeta (mirrors the copy-back
+    // run() does just before setKernelParams).
+    bool mGroupsHeadsQ = false;
+    bool mGroupsTokensHeadsQ = false;
+};
+#endif // TLLM_FMHA_TEST_HOOKS
+
 class TllmGenFmhaKernel
 {
 
@@ -286,6 +311,64 @@ public:
 
         return std::make_pair(true, info);
     }
+
+#if defined(TLLM_FMHA_TEST_HOOKS)
+    // Test-only: re-run the same option-construction path checkIfKernelExist
+    // and run() use, and report which kernelMeta the hash lookup resolved to
+    // (or whether the autotuner chose NVRTC instead). Does NOT launch the
+    // kernel or modify any GPU state.
+    //
+    // Guarded behind TLLM_FMHA_TEST_HOOKS so production builds do not expose
+    // this method or its result struct; the test target defines the macro in
+    // its CMakeLists.
+    TllmGenFmhaSelectedKernel probeKernelSelectionForTesting(RunnerParams const& params) const
+    {
+        TllmGenFmhaSelectedKernel result;
+        if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
+        {
+            return result;
+        }
+        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
+            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+        {
+            return result;
+        }
+        int32_t ctaDim = 512;
+        FmhaOptions options;
+        FmhaOptionsFromArgs optionsFromArgs;
+        parseOptionsFromRunnerParams(params, options);
+        options.mCudaArch = intToCudaArch(mSM);
+
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        checkFmhaOptions(options, optionsFromArgs);
+        updateFmhaOptions(options, optionsFromArgs);
+
+        computeNumCtas(options, params.mMultiProcessorCount);
+
+        if (shouldUseNvrtc(options))
+        {
+            result.mUsedNvrtc = true;
+            return result;
+        }
+
+        algoFilterForCubinPath(options);
+        auto [hashId, info] = hashFromFmhaOptions(options);
+
+        auto const findIter = mFunctions.find(hashId);
+        if (findIter == mFunctions.end())
+        {
+            return result;
+        }
+        auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+        result.mFound = true;
+        result.mFuncName = kernelMeta.mFuncName != nullptr ? std::string(kernelMeta.mFuncName) : std::string{};
+        result.mGroupsHeadsQ = kernelMeta.mGroupsHeadsQ;
+        result.mGroupsTokensHeadsQ = kernelMeta.mGroupsTokensHeadsQ;
+        return result;
+    }
+#endif // TLLM_FMHA_TEST_HOOKS
 
     void algoFilterForCubinPath(FmhaOptions& options) const
     {
