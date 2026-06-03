@@ -60,8 +60,9 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
-from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, get_draft_token_length)
+from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
+                          LlmRequest, LlmRequestState, LlmResponse,
+                          get_draft_token_length)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -3918,8 +3919,9 @@ class PyExecutor:
         # Other ranks have work but this rank is idle — insert a dummy so
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
+            dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
             llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=[0],
+                request_ids=dummy_request_ids,
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
@@ -3928,7 +3930,7 @@ class PyExecutor:
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests([0])
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
             self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")

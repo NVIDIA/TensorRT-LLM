@@ -1042,6 +1042,9 @@ class OpenAIServer(_VideoRoutesMixin):
             post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             chat_response = post_processor(promise, args)
 
+        if disaggregated_params is not None and disaggregated_params.request_type == "context_only":
+            chat_response.prompt_token_ids = promise.prompt_token_ids
+
         if disaggregated_params is not None and chat_response.choices[
                 0].disaggregated_params is None:
             raise ValueError(
@@ -1494,6 +1497,12 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 prompts = request.prompt
 
+            stream_response_id = None
+            stream_created = None
+            if request.stream and len(prompts) > 1:
+                stream_response_id = f"cmpl-{uuid.uuid4().hex}"
+                stream_created = int(time.time())
+
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
@@ -1516,6 +1525,8 @@ class OpenAIServer(_VideoRoutesMixin):
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx
+                postproc_args.stream_response_id = stream_response_id
+                postproc_args.stream_created = stream_created
                 if request.echo:
                     postproc_args.prompt = prompt
                 postproc_params = PostprocParams(

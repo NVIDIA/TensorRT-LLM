@@ -44,7 +44,7 @@ else
     ENCODER_INPUT_FEATURES_DTYPE="TYPE_FP16"
 fi
 
-if [ "$MODEL" = "gpt" ] || [ "$MODEL" = "opt" ] || [ "$MODEL" = "llama" ] || [ "$MODEL" = "gptj" ] || [ "$MODEL" = "mistral" ]; then
+if [ "$MODEL" = "gpt" ] || [ "$MODEL" = "opt" ] || [ "$MODEL" = "gptj" ] || [ "$MODEL" = "mistral" ]; then
     rm -rf ${TRITON_REPO}
     cp -R all_models/gpt ${TRITON_REPO}
 

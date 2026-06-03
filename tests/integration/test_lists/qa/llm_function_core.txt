@@ -103,9 +103,6 @@ accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[u
 accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
 accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
 accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
-accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-False]
-accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-True]
-accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_nvfp4[False]
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_attention_dp[4]
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[torch-True-1]
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton-False-1]
@@ -442,7 +439,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[b
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-v2_kv_cache=True]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True-v2_kv_cache=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True-v2_kv_cache=True]
-accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_chunked_prefill_reuse
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_chunked_prefill_without_reuse
@@ -460,14 +456,6 @@ accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized[t
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_vswa_reuse
 accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized
-accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_2_model_mtp[2model]
-accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_2_model_mtp[2model_trtllm]
-accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_multi_gpus[throughput]
-accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_multi_gpus[throughput_trtllm]
-accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_2_model_mtp[2model]
-accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_2_model_mtp[2model_trtllm]
-accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_multi_gpus[throughput]
-accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_multi_gpus[throughput_trtllm]
 accuracy/test_llm_api_pytorch.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-one_model-overlap_scheduler]

@@ -864,6 +864,45 @@ class ModelLoader:
                 if hasattr(config.pretrained_config, sub_config):
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers_override
+
+        # Shared-weights vanilla MTP: build extra MTP layer instances beyond
+        # what the checkpoint provides (one ckpt MTP layer, multiple draft
+        # tokens, one KV cache per draft position) by sharing the single
+        # ckpt MTP layer's weights via mod-indexing in
+        # DeepseekV3WeightLoader. We expand
+        # pretrained_config.num_nextn_predict_layers to max_draft_len before
+        # model construction and preserve the original ckpt count as
+        # `_ckpt_num_nextn_predict_layers` for downstream mod-indexing.
+        #
+        # NOTE: this is a very special MTP mode that has not been used in
+        # any real-world workload to date; only DeepSeek has indicated they
+        # want to keep the path alive for their model. We therefore only
+        # support it on DeepSeek model_types for now. Other MTP-capable
+        # model families don't need this mode -- when their users request
+        # vanilla with max_draft_len > ckpt count, the natural
+        # `min(max_draft_len, ckpt_nextn)` clamp inside MTPForCausalLM
+        # silently caps the draft length to ckpt_nextn, which is the
+        # expected behavior for them.
+        _DEEPSEEK_MTP_MODEL_TYPES = {"deepseek_v3", "deepseek_v32"}
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+        spec_config = self.spec_config
+        if (isinstance(spec_config, MTPDecodingConfig)
+                and spec_config.use_mtp_vanilla
+                and spec_config.max_draft_len is not None
+                and getattr(config.pretrained_config, 'model_type',
+                            None) in _DEEPSEEK_MTP_MODEL_TYPES
+                and getattr(config.pretrained_config,
+                            'num_nextn_predict_layers', None)):
+            ckpt_nextn = config.pretrained_config.num_nextn_predict_layers
+            if spec_config.max_draft_len > ckpt_nextn:
+                config.pretrained_config._ckpt_num_nextn_predict_layers = ckpt_nextn
+                config.pretrained_config.num_nextn_predict_layers = \
+                    spec_config.max_draft_len
+                logger.warning(
+                    f"MTP vanilla: expanding num_nextn_predict_layers from "
+                    f"{ckpt_nextn} to {spec_config.max_draft_len} to match "
+                    f"max_draft_len. Extra MTP layer instances will share "
+                    f"checkpoint weights via mod-indexing.")
         return config
 
     def _call_load_weights(self,
