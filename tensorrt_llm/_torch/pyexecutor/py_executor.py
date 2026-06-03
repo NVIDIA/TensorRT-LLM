@@ -3180,9 +3180,23 @@ class PyExecutor:
                 new_requests.extend(
                     self.executor_request_queue.get_from_request_queue(timeout))
 
-        # Broadcast requests and handle Python objects
-        new_requests, py_request_objects = self.request_broadcaster.broadcast(
-            new_requests)
+        # Probe rank 0's count via a small scalar broadcast so all ranks can
+        # symmetrically skip the heavy pickle broadcast when there is nothing
+        # to send. Matches the self.dist.broadcast(int, root=0) idiom already
+        # used elsewhere in PyExecutor.
+        if self.dist.rank == 0:
+            _new_request_count = len(new_requests)
+        else:
+            _new_request_count = 0
+        _new_request_count = self.dist.broadcast(_new_request_count, root=0)
+
+        if _new_request_count == 0:
+            new_requests = []
+            py_request_objects = None
+        else:
+            # Broadcast requests and handle Python objects
+            new_requests, py_request_objects = self.request_broadcaster.broadcast(
+                new_requests)
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
