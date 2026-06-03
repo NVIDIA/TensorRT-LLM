@@ -51,6 +51,38 @@ from tensorrt_llm.plugin import PluginConfig
 from .test_llm import llama_model_path
 
 
+def test_iter_stats_buffer_limits_allow_unbounded_sentinel():
+    args = TorchLlmArgs(model="/tmp/test",
+                        iter_stats_max_iterations=-1,
+                        request_stats_max_iterations=-1,
+                        max_stats_len=-1)
+    assert args.iter_stats_max_iterations == -1
+    assert args.request_stats_max_iterations == -1
+    assert args.max_stats_len == -1
+
+    zero_args = TorchLlmArgs(model="/tmp/test",
+                             iter_stats_max_iterations=0,
+                             request_stats_max_iterations=0,
+                             max_stats_len=0)
+    assert zero_args.iter_stats_max_iterations == 0
+    assert zero_args.request_stats_max_iterations == 0
+    assert zero_args.max_stats_len == 0
+
+    for kwargs in (
+        {
+            "iter_stats_max_iterations": -2
+        },
+        {
+            "request_stats_max_iterations": -2
+        },
+        {
+            "max_stats_len": -2
+        },
+    ):
+        with pytest.raises(ValidationError):
+            TorchLlmArgs(model="/tmp/test", **kwargs)
+
+
 def test_LookaheadDecodingConfig():
     # from constructor
     config = LookaheadDecodingConfig(max_window_size=4,

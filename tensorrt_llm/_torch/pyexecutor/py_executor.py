@@ -76,6 +76,29 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
 
+_UNBOUNDED_STATS_MAX_LEN = -1
+
+
+def _normalize_stats_max_len(max_stats_len: int) -> int:
+    if max_stats_len == _UNBOUNDED_STATS_MAX_LEN:
+        return _UNBOUNDED_STATS_MAX_LEN
+    return max(max_stats_len, 1)
+
+
+def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
+    return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
+
+
+def _trim_stats_buffer(stats: list,
+                       max_stats_len: int,
+                       num_new_entries: int = 1) -> None:
+    if _stats_buffer_is_unbounded(max_stats_len):
+        return
+    overflow = max(0, len(stats) + num_new_entries - max_stats_len)
+    if overflow:
+        del stats[:overflow]
+
+
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
@@ -350,7 +373,8 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
-        self.max_stats_len = max(self.llm_args.max_stats_len, 1)
+        self.max_stats_len = _normalize_stats_max_len(
+            self.llm_args.max_stats_len)
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
@@ -755,11 +779,10 @@ class PyExecutor:
         if not rank_dicts:
             return
         with self.stats_lock:
+            _trim_stats_buffer(self.stats, self.max_stats_len * tp_size,
+                               len(rank_dicts))
             for d in rank_dicts:
                 self.stats.append(("per_rank_dict", d))
-            cap = self.max_stats_len * tp_size
-            if len(self.stats) > cap:
-                del self.stats[:len(self.stats) - cap]
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1493,8 +1516,7 @@ class PyExecutor:
 
         # Legacy path: rank-0-only (single-rank or iter stats disabled).
         with self.stats_lock:
-            if len(self.stats) > self.max_stats_len:
-                self.stats.pop(0)
+            _trim_stats_buffer(self.stats, self.max_stats_len)
             self.stats.append((stats, req_stats, self._latest_kv_iter_stats))
 
     def _process_iter_stats(
