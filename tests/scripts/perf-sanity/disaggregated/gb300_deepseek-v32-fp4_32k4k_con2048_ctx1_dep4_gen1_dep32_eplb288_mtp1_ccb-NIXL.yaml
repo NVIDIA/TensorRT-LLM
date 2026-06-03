@@ -17,7 +17,7 @@ slurm:
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: false
-  multi_round: 5
+  multi_round: 2
   benchmark_ratio: 0.0
   streaming: true
   concurrency_list: '2048'
@@ -69,6 +69,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 32832
       backend: NIXL
+      kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     speculative_config: &id001
       decoding_type: MTP
@@ -105,5 +106,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 32832
       backend: NIXL
+      kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     speculative_config: *id001

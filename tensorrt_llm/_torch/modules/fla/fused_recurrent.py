@@ -74,7 +74,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        p_h0 = h0 + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
+        # Pool layout [N, HV, V, K] with K innermost: offset v*K + k.
+        p_h0 = h0 + i_nh * V * K + o_k[:, None] + o_v[None, :] * K
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for _ in range(0, T):
@@ -110,7 +111,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     if STORE_FINAL_STATE:
-        p_ht = ht + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
+        # Pool layout [N, HV, V, K].
+        p_ht = ht + i_nh * V * K + o_k[:, None] + o_v[None, :] * K
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
@@ -137,7 +139,8 @@ def fused_recurrent_gated_delta_rule_fwd(
 
     o = q.new_empty(NK, *v.shape)
     if output_final_state:
-        final_state = q.new_empty(N, HV, K, V, dtype=torch.float32)
+        # Pool layout: [N, HV, V, K] (K innermost).
+        final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
     else:
         final_state = None
 
@@ -240,11 +243,11 @@ def fused_recurrent_gated_delta_rule(
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, HV, K, V]` for `N` input sequences.
+            Initial state of shape `[N, HV, V, K]` for `N` input sequences.
             For equal-length input sequences, `N` equals the batch size `B`.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, HV, K, V]`. Default: `False`.
+            Whether to output the final state of shape `[N, HV, V, K]`. Default: `False`.
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
@@ -252,7 +255,7 @@ def fused_recurrent_gated_delta_rule(
         o (torch.Tensor):
             Outputs of shape `[B, T, HV, V]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, HV, K, V]` if `output_final_state=True` else `None`.
+            Final state of shape `[N, HV, V, K]` if `output_final_state=True` else `None`.
     Examples::
         >>> import torch
         >>> import torch.nn.functional as F
@@ -265,7 +268,7 @@ def fused_recurrent_gated_delta_rule(
         >>> v = torch.randn(B, T, HV, V, device='cuda')
         >>> g = F.logsigmoid(torch.rand(B, T, HV, device='cuda'))
         >>> beta = torch.rand(B, T, HV, device='cuda').sigmoid()
-        >>> h0 = torch.randn(B, HV, K, V, device='cuda')
+        >>> h0 = torch.randn(B, HV, V, K, device='cuda')
         >>> o, ht = fused_gated_recurrent_delta_rule(
             q, k, v, g, beta,
             initial_state=h0,
@@ -387,8 +390,9 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         idx = tl.load(h0_indices + i_n)
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
-            p_h0 = (h0_source + idx * HV * K * V + i_hv * K * V +
-                    o_k[:, None] * V + o_v[None, :])
+            # Pool layout [slots, HV, V, K], K innermost (stride 1).
+            p_h0 = (h0_source + idx * HV * V * K + i_hv * V * K + o_k[:, None] +
+                    o_v[None, :] * K)
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     # Prepare intermediate state cache variables if enabled
@@ -427,12 +431,12 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         # store intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
             if cache_idx >= 0:
-                # Compute cache pointer for this step
-                step_offset = step_idx * HV * K * V
+                # Match the SSM pool layout [slots, HV, V, K] with K innermost.
+                step_offset = step_idx * HV * V * K
                 cache_ptr = (intermediate_states_buffer +
-                             cache_idx * cache_steps * HV * K * V +
-                             step_offset + i_hv * K * V + o_k[:, None] * V +
-                             o_v[None, :])
+                             cache_idx * cache_steps * HV * V * K +
+                             step_offset + i_hv * V * K + o_k[:, None] +
+                             o_v[None, :] * K)
                 tl.store(cache_ptr,
                          b_h.to(cache_ptr.dtype.element_ty),
                          mask=mask_h)
@@ -447,12 +451,12 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     # Store final state back to h0_source with bounds checking
-    # ssm states
+    # ssm states (pool layout [slots, HV, V, K], K innermost).
     if not DISABLE_STATE_UPDATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:  # Add bounds checking
-            p_h0 = (h0_source + idx * HV * K * V + i_hv * K * V +
-                    o_k[:, None] * V + o_v[None, :])
+            p_h0 = (h0_source + idx * HV * V * K + i_hv * V * K + o_k[:, None] +
+                    o_v[None, :] * K)
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 

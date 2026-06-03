@@ -33,6 +33,8 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
+| `Qwen/Qwen-Image` | Text-to-Image |
+| `Qwen/Qwen-Image-2512` | Text-to-Image |
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
@@ -45,8 +47,11 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
+| **Qwen-Image** [^2] | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
+
+[^2]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required. 
 
 ## Quick Start
 
