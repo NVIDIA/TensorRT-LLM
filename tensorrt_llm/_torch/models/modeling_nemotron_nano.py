@@ -4,7 +4,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -413,36 +413,10 @@ def _get_modality_types(multimodal_data: Dict[str, Any]) -> List[str]:
     return [modality for modality in _NANO_MODALITIES if multimodal_data.get(modality) is not None]
 
 
-class NanoPayloadSlicer:
-    """`PayloadSlicer` for Nano: carve one sub-item out of an aggregate payload.
-
-    A mixed-modality Nano request stores one aggregate payload per modality
-    (e.g. all images' tiles in one `pixel_values` tensor). The per-item
-    extractor walks the prompt-order stream and asks this slicer for each
-    single item's encoder input, sliced from the aggregate blob. The actual
-    per-modality slicing lives on the model (`_nano_slice_payload`) so it can
-    consult `self.vision_encoder.num_image_token`; this wrapper just satisfies
-    the `multimodal_encoding.PayloadSlicer` shape.
-    """
-
-    def __init__(self, model: "NemotronH_Nano_VL_V2"):
-        self._model = model
-
-    def slice_payload(
-        self,
-        param: MultimodalParams,
-        modality: str,
-        mm_idx_per_modality: int,
-        *,
-        rows: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        return self._model._nano_slice_payload(param, modality, mm_idx_per_modality, rows=rows)
-
-
 def _nano_extract_items(
     param_idx: int,
     param: MultimodalParams,
-    slicer: Optional["NanoPayloadSlicer"] = None,
+    slice_payload: Optional[Callable[..., Dict[str, Any]]] = None,
 ):
     """Yield :class:`ModalityItem` instances for one Nano ``MultimodalParams``.
 
@@ -464,7 +438,8 @@ def _nano_extract_items(
       Yields ONE item per ``MultimodalPromptOrder`` entry: ``prompt_pos`` is the
       rank, ``mm_idx_per_modality`` is the per-modality index, ``rows`` is the
       per-slot ``multimodal_embedding_lengths`` entry, and ``payload`` is sliced
-      to that single sub-item by ``slicer``. There is no ghost audio and no
+      to that single sub-item by the ``slice_payload`` callable (the model's
+      bound ``_slice_payload`` in production). There is no ghost audio and no
       post-encode interleave — audio (standalone or hoisted) is just another item.
     """
     multimodal_data = param.multimodal_data or {}
@@ -527,8 +502,8 @@ def _nano_extract_items(
             raise ValueError(f"Unknown modality: {modality}")
         rows = int(length)
         payload = (
-            slicer.slice_payload(param, modality, int(mm_idx), rows=rows)
-            if slicer is not None
+            slice_payload(param, modality, int(mm_idx), rows=rows)
+            if slice_payload is not None
             else multimodal_data.get(modality)
         )
         yield ModalityItem(
@@ -3619,6 +3594,23 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             cursor += n_clips
         return results
 
+    def _slice_payload(
+        self,
+        param: MultimodalParams,
+        modality: str,
+        mm_idx_per_modality: int,
+        *,
+        rows: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Per-item slice-payload entry point for the Nano extractor.
+
+        The per-item (multi-modality) extractor invokes this bound method
+        directly (the previous `NanoPayloadSlicer` wrapper was dissolved). The
+        actual per-modality tensor slicing lives in `_nano_slice_payload` so it
+        can consult `self.vision_encoder.num_image_token`.
+        """
+        return self._nano_slice_payload(param, modality, mm_idx_per_modality, rows=rows)
+
     def _nano_slice_payload(
         self,
         param: MultimodalParams,
@@ -3835,10 +3827,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if not multimodal_params:
             return []
 
-        slicer = NanoPayloadSlicer(self)
-
         def extract(param_idx: int, param: MultimodalParams):
-            yield from _nano_extract_items(param_idx, param, slicer=slicer)
+            yield from _nano_extract_items(param_idx, param, slice_payload=self._slice_payload)
 
         assembly = MixedModalityAssembly.from_params(
             multimodal_params=multimodal_params,

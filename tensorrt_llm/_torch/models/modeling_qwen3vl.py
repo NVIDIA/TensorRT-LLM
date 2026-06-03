@@ -1,7 +1,6 @@
 import copy
 import re
 from collections.abc import Mapping as AbcMapping
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -19,7 +18,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm._torch.models.multimodal_encoding import (
     MixedModalityAssembly,
     ModalityItem,
-    PayloadSlicer,
     assemble_embeddings,
 )
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -102,96 +100,91 @@ def _qwen3vl_grid_token_count(grid_thw, spatial_merge_size: int) -> int:
     return sum(int(t) * (int(h) // m) * (int(w) // m) for t, h, w in grid.tolist())
 
 
-@dataclass(frozen=True)
-class Qwen3VLPayloadSlicer(PayloadSlicer):
-    """Per-item payload slicer for Qwen3VL (image / video).
+def _qwen3vl_slice_payload(
+    param: MultimodalParams,
+    modality: str,
+    mm_idx_per_modality: int,
+    spatial_merge_size: Optional[int] = None,
+) -> AbcMapping[str, Any]:
+    """Carve one sub-item out of a Qwen3VL aggregate payload (image / video).
 
     A Qwen3VL modality payload is an AGGREGATE: `pixel_values` (resp.
     `pixel_values_videos`) is every sub-item's patches concatenated, and
-    `*_grid_thw` is the `[N, 3]` grid describing those `N` sub-items. This slicer
-    carves out one sub-item:
-
-    - `rows_for` is the per-grid post-merge token count `t*(h//m)*(w//m)` (the
-      encoder-output row count == scatter footprint), the Qwen3VL source of truth.
-    - `slice_payload` slices `pixel_values` by the raw-patch prefix sum
-      `Sigma prod(grid_thw[:i])` (raw rows per sub-item are `t*h*w`) and pairs the
-      slice with that sub-item's single-row grid, so a bucket adapter's
-      re-concatenation reproduces the original aggregate.
+    `*_grid_thw` is the `[N, 3]` grid describing those `N` sub-items. This slices
+    `pixel_values` by the raw-patch prefix sum `Sigma prod(grid_thw[:i])` (raw
+    rows per sub-item are `t*h*w`) and pairs the slice with that sub-item's
+    single-row grid, so a bucket adapter's re-concatenation reproduces the
+    original aggregate.
 
     When `spatial_merge_size` is unset (test-convention payloads carrying an
-    explicit `num_tokens`, or pure single-modality requests), a single-sub-item
-    payload is returned whole and its rows fall back to `num_tokens` /
-    `multimodal_embedding_lengths` / `total_embeds_in_request`. Slicing a
-    multi-sub-item payload requires the grid + merge size.
+    explicit `num_tokens`, or pure single-modality requests), the single-sub-item
+    payload is returned whole; slicing a multi-sub-item payload requires the grid
+    + merge size.
     """
-
-    spatial_merge_size: Optional[int] = None
-
-    def slice_payload(
-        self,
-        param: MultimodalParams,
-        modality: str,
-        mm_idx_per_modality: int,
-    ) -> AbcMapping[str, Any]:
-        payload = (param.multimodal_data or {})[modality]
-        pixel_key = _QWEN3VL_PIXEL_KEY[modality]
-        grid_key = _QWEN3VL_GRID_KEY[modality]
-        grid = payload.get(grid_key)
-        if grid is None or self.spatial_merge_size is None:
-            # No grid (or no merge size): single-sub-item / test-convention path.
-            # The aggregate IS the single item; hand it back unchanged.
-            if mm_idx_per_modality != 0:
-                raise ValueError(
-                    f"cannot slice sub-item {mm_idx_per_modality} of {modality!r} "
-                    "without *_grid_thw and spatial_merge_size"
-                )
-            return payload
-        grid_2d = _qwen3vl_grid_to_2d(grid)
-        # Raw patch rows per sub-item = t*h*w; pixel slice is the i-th block.
-        raw_rows = [int(t) * int(h) * int(w) for t, h, w in grid_2d.tolist()]
-        start = sum(raw_rows[:mm_idx_per_modality])
-        stop = start + raw_rows[mm_idx_per_modality]
-        sliced = dict(payload)
-        sliced[pixel_key] = payload[pixel_key][start:stop]
-        sliced[grid_key] = grid_2d[mm_idx_per_modality : mm_idx_per_modality + 1]
-        # An aggregate `num_tokens` (test convention) describes the whole blob,
-        # not this single sub-item; drop it so the sliced payload is not
-        # mis-sized by a stale count.
-        sliced.pop("num_tokens", None)
-        return sliced
-
-    def rows_for(
-        self,
-        param: MultimodalParams,
-        modality: str,
-        mm_idx_per_modality: int,
-        prompt_pos: int,
-    ) -> int:
-        payload = (param.multimodal_data or {})[modality]
-        grid = payload.get(_QWEN3VL_GRID_KEY[modality])
-        if self.spatial_merge_size is not None and grid is not None:
-            # Encoder-accurate per-sub-item post-merge count (the source of truth).
-            grid_2d = _qwen3vl_grid_to_2d(grid)
-            return _qwen3vl_grid_token_count(
-                grid_2d[mm_idx_per_modality : mm_idx_per_modality + 1],
-                self.spatial_merge_size,
+    payload = (param.multimodal_data or {})[modality]
+    pixel_key = _QWEN3VL_PIXEL_KEY[modality]
+    grid_key = _QWEN3VL_GRID_KEY[modality]
+    grid = payload.get(grid_key)
+    if grid is None or spatial_merge_size is None:
+        # No grid (or no merge size): single-sub-item / test-convention path.
+        # The aggregate IS the single item; hand it back unchanged.
+        if mm_idx_per_modality != 0:
+            raise ValueError(
+                f"cannot slice sub-item {mm_idx_per_modality} of {modality!r} "
+                "without *_grid_thw and spatial_merge_size"
             )
-        # Test-convention / single-sub-item fallbacks (no grid+merge available).
-        if "num_tokens" in payload:
-            return int(payload["num_tokens"])
-        multimodal_data = param.multimodal_data or {}
-        embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-        if embedding_lengths is not None and prompt_pos < len(embedding_lengths):
-            return int(embedding_lengths[prompt_pos])
-        runtime = getattr(param, "multimodal_runtime", None)
-        total = getattr(runtime, "total_embeds_in_request", None) if runtime else None
-        if total is not None:
-            return int(total)
-        raise ValueError(
-            "Cannot determine row count for Qwen3VL payload; needs *_grid_thw + "
-            "spatial_merge_size, num_tokens, multimodal_embedding_lengths, or "
-            "multimodal_runtime.total_embeds_in_request"
+        return payload
+    grid_2d = _qwen3vl_grid_to_2d(grid)
+    # Raw patch rows per sub-item = t*h*w; pixel slice is the i-th block.
+    raw_rows = [int(t) * int(h) * int(w) for t, h, w in grid_2d.tolist()]
+    start = sum(raw_rows[:mm_idx_per_modality])
+    stop = start + raw_rows[mm_idx_per_modality]
+    sliced = dict(payload)
+    sliced[pixel_key] = payload[pixel_key][start:stop]
+    sliced[grid_key] = grid_2d[mm_idx_per_modality : mm_idx_per_modality + 1]
+    # An aggregate `num_tokens` (test convention) describes the whole blob,
+    # not this single sub-item; drop it so the sliced payload is not
+    # mis-sized by a stale count.
+    sliced.pop("num_tokens", None)
+    return sliced
+
+
+def _qwen3vl_grid_rows(
+    param: MultimodalParams,
+    modality: str,
+    mm_idx_per_modality: int,
+    spatial_merge_size: Optional[int] = None,
+) -> int:
+    """Per-grid post-merge row count for one Qwen3VL sub-item.
+
+    `t*(h//m)*(w//m)` (the encoder-output row count == scatter footprint), the
+    Qwen3VL source of truth. Used as the fallback row source when the extractor
+    has no `MixedModalEncodeContext` (pure single-modality); when a context is
+    present, per-item rows come from `ctx.embedding_lengths` instead. Falls back
+    to a test-convention `num_tokens` or `multimodal_runtime.total_embeds_in_request`
+    when the grid + merge size are unavailable.
+    """
+    payload = (param.multimodal_data or {})[modality]
+    grid = payload.get(_QWEN3VL_GRID_KEY[modality])
+    if spatial_merge_size is not None and grid is not None:
+        # Encoder-accurate per-sub-item post-merge count (the source of truth).
+        grid_2d = _qwen3vl_grid_to_2d(grid)
+        return _qwen3vl_grid_token_count(
+            grid_2d[mm_idx_per_modality : mm_idx_per_modality + 1],
+            spatial_merge_size,
         )
+    # Test-convention / single-sub-item fallbacks (no grid+merge available).
+    if "num_tokens" in payload:
+        return int(payload["num_tokens"])
+    runtime = getattr(param, "multimodal_runtime", None)
+    total = getattr(runtime, "total_embeds_in_request", None) if runtime else None
+    if total is not None:
+        return int(total)
+    raise ValueError(
+        "Cannot determine row count for Qwen3VL payload; needs *_grid_thw + "
+        "spatial_merge_size, num_tokens, or "
+        "multimodal_runtime.total_embeds_in_request"
+    )
 
 
 def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[int] = None):
@@ -235,17 +228,24 @@ def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[i
         # modality is the sole item at prompt rank 0.
         order = tuple((m, 0) for m in modality_types)
 
-    slicer = Qwen3VLPayloadSlicer(spatial_merge_size=spatial_merge_size)
     for prompt_pos, (modality, mm_idx) in enumerate(order):
         if multimodal_data.get(modality) is None:
             continue
+        # Per-item rows come from the encode context's per-slot
+        # `embedding_lengths` (the single source of truth); the grid-derived
+        # count is the fallback for pure single-modality requests with no context.
+        rows = (
+            int(ctx.embedding_lengths[prompt_pos])
+            if ctx is not None
+            else _qwen3vl_grid_rows(param, modality, mm_idx, spatial_merge_size)
+        )
         yield ModalityItem(
             src_param_idx=param_idx,
             modality=modality,
             mm_idx_per_modality=mm_idx,
             prompt_pos=prompt_pos,
-            rows=slicer.rows_for(param, modality, mm_idx, prompt_pos),
-            payload=slicer.slice_payload(param, modality, mm_idx),
+            rows=rows,
+            payload=_qwen3vl_slice_payload(param, modality, mm_idx, spatial_merge_size),
         )
 
 

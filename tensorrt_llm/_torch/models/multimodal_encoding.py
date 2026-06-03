@@ -30,7 +30,7 @@ by the plain per-item scatter — no post-process re-placement.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Protocol, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Tuple
 
 import torch
 
@@ -70,41 +70,6 @@ class ModalityItem:
 
 
 ItemExtractor = Callable[[int, MultimodalParams], Iterable[ModalityItem]]
-
-
-class PayloadSlicer(Protocol):
-    """Per-model contract for turning a `MultimodalParams` into per-item slices.
-
-    A model's extractor walks the prompt-order stream and, for each entry, asks
-    its slicer for that single item's encoder payload (already sliced from the
-    aggregate `multimodal_data[modality]` blob) and the row count that payload
-    produces. The concrete `NanoPayloadSlicer` / `Qwen3VLPayloadSlicer`
-    implementations live in their respective model files; this module only
-    declares the shape they satisfy so the extractor + assembly stay
-    model-agnostic.
-    """
-
-    def slice_payload(
-        self,
-        param: MultimodalParams,
-        modality: str,
-        mm_idx_per_modality: int,
-    ) -> Mapping[str, Any]:
-        """Return the single-item encoder input for the `mm_idx_per_modality`-th
-        blob of `modality` in `param` (zero-copy where the source already stores
-        per-item lists)."""
-        ...
-
-    def rows_for(
-        self,
-        param: MultimodalParams,
-        modality: str,
-        mm_idx_per_modality: int,
-        prompt_pos: int,
-    ) -> int:
-        """Return the encoder-output row count for that single item (its scatter
-        footprint)."""
-        ...
 
 
 @dataclass

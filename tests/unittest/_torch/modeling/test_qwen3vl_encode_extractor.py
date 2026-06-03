@@ -8,10 +8,12 @@ The extractor parses the two wire keys (`multimodal_item_order` +
 `ModalityItem` per prompt slot. A `ModalityItem` owns exactly one slot
 (`prompt_pos`); its `rows` is both the encoder-output row count and its scatter
 footprint. Per-item payload slicing (one image / one video out of an aggregate
-`pixel_values` + `*_grid_thw` blob) goes through `Qwen3VLPayloadSlicer`, whose
-`rows_for` is the per-grid post-merge token count. A pure single-modality request
-carries no `multimodal_item_order` key, so `from_metadata` returns None and the
-extractor synthesizes the modality-major default order.
+`pixel_values` + `*_grid_thw` blob) goes through `_qwen3vl_slice_payload`; the
+per-grid post-merge token count is `_qwen3vl_grid_rows`. When the extractor has a
+`MixedModalEncodeContext`, rows come from `ctx.embedding_lengths`; the grid-row
+helper is the fallback for pure single-modality requests that carry no
+`multimodal_item_order` key (so `from_metadata` returns None and the extractor
+synthesizes the modality-major default order).
 """
 
 from __future__ import annotations
@@ -24,17 +26,19 @@ from _mm_encode_helpers import _make_param
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModelBase,
-    Qwen3VLPayloadSlicer,
     _qwen3vl_extract_items,
+    _qwen3vl_grid_rows,
+    _qwen3vl_slice_payload,
 )
 from tensorrt_llm._torch.models.multimodal_encoding import ModalityItem
 
 
 class TestQwen3VLPayloadSlicer:
-    """The slicer is the per-model source of truth for Qwen3VL: it slices the
-    aggregate `pixel_values` (+ `*_grid_thw`) blob into per-item encoder inputs by
-    the raw-patch prefix sum `Sigma prod(grid_thw[:i])`, and `rows_for` reports the
-    per-grid post-merge token count `t * (h // merge) * (w // merge)`.
+    """The grid-row + slice helpers are the per-model source of truth for
+    Qwen3VL: `_qwen3vl_slice_payload` slices the aggregate `pixel_values` (+
+    `*_grid_thw`) blob into per-item encoder inputs by the raw-patch prefix sum
+    `Sigma prod(grid_thw[:i])`, and `_qwen3vl_grid_rows` reports the per-grid
+    post-merge token count `t * (h // merge) * (w // merge)`.
     """
 
     def test_rows_for_is_per_grid_post_merge_count(self):
@@ -45,9 +49,8 @@ class TestQwen3VLPayloadSlicer:
             "image_grid_thw": torch.tensor([[1, 16, 16], [1, 8, 8]]),
         }
         param = _make_param({"image": payload})
-        slicer = Qwen3VLPayloadSlicer(spatial_merge_size=4)
-        assert slicer.rows_for(param, "image", 0, prompt_pos=0) == 16
-        assert slicer.rows_for(param, "image", 1, prompt_pos=1) == 4
+        assert _qwen3vl_grid_rows(param, "image", 0, spatial_merge_size=4) == 16
+        assert _qwen3vl_grid_rows(param, "image", 1, spatial_merge_size=4) == 4
 
     def test_slice_payload_slices_pixels_by_raw_patch_prefix_sum(self):
         # Raw-patch rows per grid = t*h*w: 256 then 64. The first item's pixel
@@ -59,10 +62,9 @@ class TestQwen3VLPayloadSlicer:
             "image_grid_thw": torch.tensor([[1, 16, 16], [1, 8, 8]]),
         }
         param = _make_param({"image": payload})
-        slicer = Qwen3VLPayloadSlicer(spatial_merge_size=4)
 
-        s0 = slicer.slice_payload(param, "image", 0)
-        s1 = slicer.slice_payload(param, "image", 1)
+        s0 = _qwen3vl_slice_payload(param, "image", 0, spatial_merge_size=4)
+        s1 = _qwen3vl_slice_payload(param, "image", 1, spatial_merge_size=4)
         torch.testing.assert_close(s0["pixel_values"], pv[0:256])
         torch.testing.assert_close(s1["pixel_values"], pv[256:320])
         assert s0["image_grid_thw"].tolist() == [[1, 16, 16]]
@@ -75,13 +77,12 @@ class TestQwen3VLPayloadSlicer:
             "video_grid_thw": torch.tensor([[1, 8, 8]]),
         }
         param = _make_param({"video": payload})
-        slicer = Qwen3VLPayloadSlicer(spatial_merge_size=4)
 
-        s0 = slicer.slice_payload(param, "video", 0)
+        s0 = _qwen3vl_slice_payload(param, "video", 0, spatial_merge_size=4)
         torch.testing.assert_close(s0["pixel_values_videos"], pv[0:64])
         assert s0["video_grid_thw"].tolist() == [[1, 8, 8]]
         # merge=4 -> 1*(8//4)*(8//4) = 4 post-merge rows.
-        assert slicer.rows_for(param, "video", 0, prompt_pos=0) == 4
+        assert _qwen3vl_grid_rows(param, "video", 0, spatial_merge_size=4) == 4
 
 
 class TestQwen3VLExtractItems:
