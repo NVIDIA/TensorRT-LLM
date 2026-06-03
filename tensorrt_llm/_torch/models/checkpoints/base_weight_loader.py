@@ -99,7 +99,7 @@ class ConsumableWeightsDict:
                 try:
                     import torch
 
-                    from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import \
+                    from tensorrt_llm._torch.mmap_utils import \
                         advise_tensor_pageout
                     torch.cuda.synchronize()
                     for k in keys_to_delete:

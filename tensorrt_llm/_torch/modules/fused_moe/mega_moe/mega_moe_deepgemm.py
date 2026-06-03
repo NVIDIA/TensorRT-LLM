@@ -53,6 +53,7 @@ __all__ = ["MegaMoEDeepGemm"]
 # a key would race on the same scratch buffers.
 _MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, object] = {}
 
+
 # ---- Fused MXFP8 per-token quant backends --------------------------------
 # We want: BF16 (m, H) → FP8 E4M3 (m, H) + packed-UE8M0 SF (m, H/32/4) int32.
 # Three candidates, in preference order:
@@ -589,20 +590,6 @@ class MegaMoEDeepGemm(MoE):
     def create_weights(self):
         if self._weights_created:
             return
-        # Allocate the DG NVLink SymmBuffer here (lazily) rather than from
-        # ``__init__`` because ConfigurableMoE only syncs the EPLB-derived
-        # attributes (``num_slots``, ``expert_size_per_partition``, ...)
-        # onto the backend AFTER backend ``__init__`` returns, just before
-        # calling ``backend.create_weights()``. Sizing the SymmBuffer in
-        # ``__init__`` would therefore use the placeholder
-        # ``num_slots = num_experts`` and break EPLB at forward time
-        # (DeepGEMM asserts ``num_experts == num_experts_per_rank *
-        # num_ranks`` in ``mega.hpp``). Both call sites (the
-        # ConfigurableMoE-driven path and the standalone
-        # ``init_load_balancer=True`` path that runs ``create_weights``
-        # from ``__init__``) reach this point on every EP rank in
-        # lockstep, preserving the rendezvous safety invariant.
-        self._alloc_symm_buffer()
         self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
         self._weights_created = True
@@ -615,6 +602,25 @@ class MegaMoEDeepGemm(MoE):
     def post_load_weights(self) -> None:
         if self.quant_method is None:
             self.create_weights()
+        # Allocate the DG NVLink SymmBuffer and run its EP rendezvous here
+        # rather than in create_weights, for two reasons:
+        #   1. EPLB sizing: ConfigurableMoE syncs the EPLB-derived attributes
+        #      (num_slots, expert_size_per_partition, ...) onto the backend only
+        #      after __init__. Sizing the buffer earlier would use the
+        #      placeholder num_slots = num_experts and break EPLB at forward
+        #      time (DeepGEMM asserts num_experts == num_experts_per_rank *
+        #      num_ranks in mega.hpp).
+        #   2. MetaInitMode: the rendezvous (symm_mem.rendezvous + EP barrier
+        #      inside get_symm_buffer_for_mega_moe) is a real collective, but
+        #      create_weights runs under MetaInitMode where a c10d.barrier on a
+        #      meta tensor raises MetaInitException — aborting meta-init and
+        #      forcing the slow regular-init fallback that materializes every
+        #      weight on host RAM and OOM-kills small-host nodes (e.g. GB300,
+        #      ~900 GiB/node).
+        # The loader invokes this hook for every module in deterministic order
+        # on all EP ranks (lockstep), after MetaInitMode has exited and before
+        # forward / CUDA-graph capture. Idempotent — a no-op once allocated.
+        self._alloc_symm_buffer()
         self.quant_method.post_load_weights(self)
 
     # ------------------------------------------------------------------
@@ -659,9 +665,9 @@ class MegaMoEDeepGemm(MoE):
         dg = self._dg
         buf = self._symm_buffer
         assert buf is not None, (
-            "MegaMoE SymmBuffer not allocated — _alloc_symm_buffer should "
-            "run unconditionally in __init__; check for a subclass that "
-            "skipped the parent constructor."
+            "MegaMoE SymmBuffer not allocated — _alloc_symm_buffer runs in "
+            "post_load_weights; ensure the model loader's post_load_weights "
+            "pass ran before forward (and was not skipped by _weights_removed)."
         )
         num_tokens = x.shape[0]
         assert num_tokens <= self.max_num_tokens, (
