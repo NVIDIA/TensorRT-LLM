@@ -49,7 +49,6 @@ __all__ = [
     "GenerationExecutorProxy",
 ]
 
-
 # Methods that are explicitly implemented for multi-rank MPI/IPC executor
 # deployments and may be called via collective_rpc even when world_size > 1.
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
@@ -617,8 +616,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError(
                 "RPC client is not initialised — collective_rpc() cannot be "
                 "called before the executor workers have started.")
-        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
-                                    target_ranks, method=method)
+        _check_collective_rpc_guard(self.model_world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
         kwargs = kwargs or {}
         remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
         if non_block:

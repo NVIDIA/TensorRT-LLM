@@ -230,8 +230,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                 ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
                 are provided.
         """
-        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
-                                    target_ranks, method=method)
+        _check_collective_rpc_guard(self.model_world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
         kwargs = kwargs or {}
         remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
         if non_block:

@@ -7,12 +7,11 @@ import time
 import traceback
 from contextlib import contextmanager
 from enum import IntEnum
-
-from strenum import StrEnum
 from queue import Queue
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+from strenum import StrEnum
 
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds

@@ -398,11 +398,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         because error_msg is still None when the exception bypasses the except
         clause — leaving rank-0 with an inconsistent view of the operation.
         """
-        import sys
         from types import SimpleNamespace
         from unittest.mock import patch
-
-        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         sent_acks = []
 
@@ -423,10 +420,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
 
         with (
             patch("torch.cuda.set_device"),
-            patch(
-                "tensorrt_llm.runtime.generation.CUASSERT"),
-            patch(
-                "tensorrt_llm._utils.set_thread_local_mpi_comm"),
+            patch("tensorrt_llm.runtime.generation.CUASSERT"),
+            patch("tensorrt_llm._utils.set_thread_local_mpi_comm"),
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
                 side_effect=MemoryError("simulated OOM outside except list"),
@@ -445,8 +440,7 @@ class TestListenerUncaughtExceptionSendsErrorAck:
                     raise StopIteration
                 return {"action": "sleep", "tags": ["kv_cache"]}
 
-            executor._sleep_wakeup_comm.recv = lambda source, tag: _recv_once(
-                None, source, tag)
+            executor._sleep_wakeup_comm.recv = lambda source, tag: _recv_once(None, source, tag)
 
             try:
                 executor._sleep_wakeup_listener_loop()

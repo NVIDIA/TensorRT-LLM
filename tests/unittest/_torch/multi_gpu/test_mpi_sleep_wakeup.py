@@ -33,8 +33,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
-_LLAMA_MODEL_PATH = str(
-    llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+_LLAMA_MODEL_PATH = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
 
 _PROMPTS = [
     "Hello, my name is",
@@ -65,8 +64,8 @@ def _per_device_gpu_memory() -> dict:
 
     root_pid = os.getpid()
     targets = frozenset(
-        [root_pid] +
-        [p.pid for p in psutil.Process(root_pid).children(recursive=True)])
+        [root_pid] + [p.pid for p in psutil.Process(root_pid).children(recursive=True)]
+    )
 
     result: dict = {}
     device_count = pynvml.nvmlDeviceGetCount()
@@ -74,10 +73,8 @@ def _per_device_gpu_memory() -> dict:
         handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
         try:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-            result[idx] = sum(
-                p.usedGpuMemory for p in procs if p.pid in targets)
-        except (pynvml.NVMLError_NotSupported,
-                pynvml.NVMLError_NoPermission):
+            result[idx] = sum(p.usedGpuMemory for p in procs if p.pid in targets)
+        except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_NoPermission):
             # Device not queryable (e.g. MIG slice or insufficient permissions);
             # treat as zero rather than failing the whole probe.
             result[idx] = 0
