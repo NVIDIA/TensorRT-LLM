@@ -446,6 +446,94 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
         return ordered_uuids
 
 
+@dataclass(frozen=True)
+class MixedModalEncodeContext:
+    """Per-request mixed-modality encode bookkeeping (Python-only).
+
+    Holds the prompt-order spine and each item's encoder-output footprint.
+    `MultimodalInput` owns the token-space layout that crosses to C++; this
+    owns the encode-space layout that stays in Python. Not a general bag:
+    exactly `order` + `embedding_lengths` belong here. The prompt position of
+    item i is its index in `order`.
+    """
+
+    order: Tuple[Tuple[str, int], ...]
+    embedding_lengths: Tuple[int, ...]
+
+    def __post_init__(self):
+        if len(self.order) != len(self.embedding_lengths):
+            raise ValueError(
+                f"order length ({len(self.order)}) != embedding_lengths length "
+                f"({len(self.embedding_lengths)})")
+        seen: set = set()
+        for modality, idx in self.order:
+            if (modality, idx) in seen:
+                raise ValueError(
+                    f"order references {modality}[{idx}] more than once; each "
+                    "item must be referenced exactly once")
+            seen.add((modality, idx))
+
+    @classmethod
+    def resolve(
+        cls,
+        mm_data: Dict[str, Any],
+        input_processor: "BaseMultimodalInputProcessor",
+        embedding_lengths: Iterable[int],
+        *,
+        prompt_token_ids: Optional[List[int]] = None,
+        multimodal_data: Optional[Dict[str, Any]] = None,
+    ) -> "MixedModalEncodeContext":
+        order = MultimodalPromptOrder.resolve(mm_data,
+                                              input_processor,
+                                              prompt_token_ids=prompt_token_ids,
+                                              multimodal_data=multimodal_data)
+        return cls(order=tuple(order),
+                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
+
+    @classmethod
+    def default(cls, mm_items: Dict[str, List[Any]],
+                embedding_lengths: Iterable[int]) -> "MixedModalEncodeContext":
+        order = MultimodalPromptOrder.default(mm_items)
+        return cls(order=tuple(order),
+                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
+
+    @classmethod
+    def from_metadata(cls, multimodal_data, embedding_lengths):
+        order = MultimodalPromptOrder.from_metadata(multimodal_data)
+        if order is None:
+            return None
+        return cls(order=tuple(order),
+                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
+
+    def flatten(self, values_by_key: Dict[str, List[Any]]) -> List[Any]:
+        """Project per-modality values into prompt order."""
+        return [values_by_key[modality][idx] for modality, idx in self.order]
+
+    def flatten_uuids(
+        self, mm_uuids: Optional[Dict[str, List[Optional[str]]]]
+    ) -> Optional[List[Optional[str]]]:
+        if mm_uuids is None:
+            return None
+        ordered: List[Optional[str]] = []
+        for modality, idx in self.order:
+            modality_uuids = mm_uuids.get(modality)
+            if modality_uuids is None:
+                ordered.append(None)
+                continue
+            if not isinstance(modality_uuids, list):
+                modality_uuids = [modality_uuids]
+            ordered.append(modality_uuids[idx])
+        return ordered
+
+    def validate_coverage(self, mm_items: Dict[str, List[Any]]) -> None:
+        """Verify the order references every multimodal item exactly once.
+
+        Coverage needs the actual item lists, so it is a method (not
+        `__post_init__`). Delegates to the existing order validator.
+        """
+        MultimodalPromptOrder(self.order).validate(mm_items)
+
+
 @dataclass
 class MultimodalRuntimeData:
     """Runtime data for tracking multimodal embedding caching and reuse per request sequence.
