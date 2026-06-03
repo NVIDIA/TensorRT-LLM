@@ -4636,8 +4636,17 @@ def update_llm_args_with_extra_dict(
             llm_args_dict['telemetry_config'] = merged
 
     # Drop YAML keys claimed by explicit CLI flags so the outer merge below
-    # cannot overwrite them.
+    # cannot overwrite them. Warn only when the CLI value actually differs from
+    # the YAML value, so users who relied on the previous "YAML wins" behavior
+    # are notified that CLI now takes precedence.
     if explicit_cli_keys:
+        overridden = sorted(
+            k for k in llm_args_dict
+            if k in explicit_cli_keys and llm_args.get(k) != llm_args_dict[k])
+        if overridden:
+            logger.warning(
+                f"Explicit CLI flag(s) {overridden} override the value(s) set "
+                f"in the YAML config; CLI takes precedence.")
         llm_args_dict = {
             k: v
             for k, v in llm_args_dict.items() if k not in explicit_cli_keys
@@ -4674,13 +4683,23 @@ def update_llm_args_with_extra_dict(
             llm_args["build_config"] = BuildConfig(**llm_args["build_config"])
 
         # Propagate dual-location scalars into build_config: explicit CLI flag
-        # wins; otherwise YAML's top-level scalar; otherwise leave alone.
+        # wins; otherwise YAML's top-level scalar; otherwise leave alone. Warn
+        # only when the explicit CLI value actually differs from the YAML
+        # build_config value being replaced (a genuine override).
         for key in build_config_dual_loc_keys:
             if key in explicit_cli_keys and key in llm_args:
+                # Warn only on a genuine override of a YAML build_config value;
+                # otherwise just record where the value came from.
+                if getattr(llm_args["build_config"], key) != llm_args[key]:
+                    logger.warning(
+                        f"Explicit CLI flag --{key}={llm_args[key]} overrides "
+                        f"the value set in the YAML build_config; CLI takes "
+                        f"precedence.")
+                else:
+                    logger.info(
+                        f"build_config.{key} set to {llm_args[key]} from explicit CLI flag"
+                    )
                 setattr(llm_args["build_config"], key, llm_args[key])
-                logger.info(
-                    f"build_config.{key} set to {llm_args[key]} from explicit CLI flag"
-                )
             elif key in llm_args_dict:
                 setattr(llm_args["build_config"], key, llm_args_dict[key])
                 logger.info(
