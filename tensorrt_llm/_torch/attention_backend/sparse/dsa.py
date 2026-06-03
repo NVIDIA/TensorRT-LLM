@@ -1490,6 +1490,10 @@ class Indexer(nn.Module):
                  aux_stream: Optional[torch.cuda.Stream] = None):
         """Initialize indexer with projection weights, norms, and TopK configuration."""
         super().__init__()
+        # On-device E2M1 (MXFP4) magnitude LUT, lazily built + cached on first
+        # _dequant_mxfp4 use (during eager prefill warmup, before any CUDA-graph
+        # capture) so the captured decode forward never does a host->device copy.
+        self._mxfp4_e2m1_table = None
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
         self.rope_dim = mla_params.qk_rope_head_dim
@@ -2107,8 +2111,17 @@ class Indexer(nn.Module):
         codes = torch.stack([low, high], dim=-1).reshape(*lead, head_dim)
         value_idx = (codes & 0x07).to(torch.int64)
         sign = (codes & 0x08) != 0
-        table = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.],
-                             device=packed_u8.device, dtype=torch.float32)
+        # On-device E2M1 magnitude LUT, cached on first use. Building it via
+        # torch.tensor([...]) is a host->device copy that is illegal inside a
+        # CUDA-graph capture; the cache is populated during the eager prefill
+        # warmup that precedes capture, so the captured decode forward only
+        # indexes into it (capture-safe). The rebuild branch fires only on a
+        # cold cache / device change, never inside a capture.
+        table = self._mxfp4_e2m1_table
+        if table is None or table.device != packed_u8.device:
+            table = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.],
+                                 device=packed_u8.device, dtype=torch.float32)
+            self._mxfp4_e2m1_table = table
         vals = table[value_idx]
         vals = torch.where(sign & (value_idx != 0), -vals, vals)
         n_blocks = head_dim // 32
@@ -2509,9 +2522,15 @@ class Indexer(nn.Module):
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
-            max_decode_len = gen_seq_lens.max().item()
-            min_decode_len = gen_seq_lens.min().item()
-            assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
+            # The max==min equal-length check requires a device->host sync
+            # (.item()), which is illegal during CUDA-graph capture and
+            # invalidates it. The SM120 real-indexer path is bs1
+            # (num_generations==1 => max==min trivially), so skip the
+            # validating sync there to stay capture-safe; keep it elsewhere.
+            if not (_DSV4_SM120_REAL_INDEXER and get_sm_version() == 120):
+                max_decode_len = gen_seq_lens.max().item()
+                min_decode_len = gen_seq_lens.min().item()
+                assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
