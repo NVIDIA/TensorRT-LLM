@@ -2222,9 +2222,21 @@ class Indexer(nn.Module):
         device = q.device
 
         tokens_per_block = k_cache.shape[1]
-        data_bytes = last  # bytes of quantized k data per token
-        kc = k_cache.view(torch.uint8).reshape(k_cache.shape[0], tokens_per_block,
-                                               -1)  # [num_blocks, tpb, per_token]
+        data_bytes = last   # quantized-k bytes/token (fp4: hd//2; fp8: hd)
+        scale_bytes = 4     # fp4: 4 UE8M0 bytes; fp8: one float32 -- both 4 bytes
+        # BLOCK-CONTIGUOUS cache layout (matches compressor_postprocess_scatter +
+        # the DeepGEMM kernel): per physical block the bytes are [tpb tokens of
+        # data][tpb tokens of scale], NOT per-token-interleaved [data|scale]. A
+        # naive reshape(nb, tpb, per_token) mis-groups them (only token 0 aligns;
+        # others read neighbouring data bytes as their scale -> garbage). Split
+        # the flat block into the data and scale regions explicitly.
+        kc = k_cache.view(torch.uint8).reshape(k_cache.shape[0], -1)  # [nb, blk]
+        data_region = kc[:, :tokens_per_block * data_bytes].reshape(
+            k_cache.shape[0], tokens_per_block, data_bytes)          # [nb, tpb, db]
+        scale_region = kc[:, tokens_per_block * data_bytes:tokens_per_block *
+                          (data_bytes + scale_bytes)].reshape(
+                              k_cache.shape[0], tokens_per_block,
+                              scale_bytes)                            # [nb, tpb, sb]
 
         # Absolute kv positions [0, max_seq_len) -> (block-in-seq, pos-in-block).
         pos = torch.arange(max_seq_len, device=device)
@@ -2232,12 +2244,12 @@ class Indexer(nn.Module):
         pos_in_blk = pos % tokens_per_block
         block_ids = block_table[:, blk_in_seq].to(torch.int64)  # [G, S]
         pos_in_blk_g = pos_in_blk.unsqueeze(0).expand(num_gen, -1)  # [G, S]
-        rows = kc[block_ids, pos_in_blk_g]  # [G, S, per_token] uint8
+        kdata = data_region[block_ids, pos_in_blk_g]   # [G, S, db] uint8
+        kscl = scale_region[block_ids, pos_in_blk_g]   # [G, S, sb] uint8
 
         if self.use_fp4:
             # MXFP4: dequant k from the cache + q from its per-head UE8M0 scale.
-            k_f = self._dequant_mxfp4(rows[..., :data_bytes].contiguous(),
-                                      rows[..., data_bytes:data_bytes + 4], hd)
+            k_f = self._dequant_mxfp4(kdata.contiguous(), kscl, hd)
             q_f = self._dequant_mxfp4(
                 q.contiguous().view(torch.uint8),
                 q_scale.reshape(num_gen, self.n_heads, 1), hd)  # [G, H, D]
@@ -2245,10 +2257,9 @@ class Indexer(nn.Module):
             logits = (weights_decode.reshape(num_gen, self.n_heads).float()
                       .unsqueeze(-1) * accum.clamp_min(0)).sum(dim=1)
         else:
-            k_f = rows[..., :data_bytes].contiguous().view(
-                torch.float8_e4m3fn).float()  # [G, S, D]
-            k_scale = rows[..., data_bytes:data_bytes + 4].contiguous().view(
-                torch.float32).reshape(num_gen, max_seq_len)  # [G, S]
+            k_f = kdata.contiguous().view(torch.float8_e4m3fn).float()  # [G,S,D]
+            k_scale = kscl.contiguous().view(torch.float32).reshape(
+                num_gen, max_seq_len)  # [G, S]
             accum = torch.einsum('ghd,gsd->ghs', q.float(), k_f)
             logits = (weights_decode.reshape(num_gen, self.n_heads).float()
                       .unsqueeze(-1) * accum.clamp_min(0)).sum(dim=1)  # [G, S]
