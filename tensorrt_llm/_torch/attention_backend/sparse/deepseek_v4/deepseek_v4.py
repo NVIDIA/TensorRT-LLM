@@ -52,6 +52,13 @@ _DSV4_SM120_RATIO4_USE_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_RATIO4_USE_IN
 # SM120. Pair with TRTLLM_DSV4_SM120_RATIO4_USE_INDEXER=1 so ratio-4 consumes the
 # real topk_indices. Mirrors dsa.py's _DSV4_SM120_REAL_INDEXER (same env var).
 _DSV4_SM120_REAL_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_REAL_INDEXER", "0") == "1"
+# Item 2 perf (step 1): on the SM120 real-indexer path, route the top-k through
+# the arch-agnostic C++ CUDA op (torch.ops.trtllm.indexer_topk_{prefill,decode},
+# guarded only by __CUDA_ARCH__>=900, so it runs on SM120) instead of the
+# unfused torch logits.topk fallback. DEFAULT OFF -> the validated torch.topk
+# path stays the default; set TRTLLM_DSV4_SM120_CXX_TOPK=1 to A/B the C++ op
+# (the eventual perf default once validated). Only meaningful with REAL_INDEXER.
+_DSV4_SM120_CXX_TOPK = os.environ.get("TRTLLM_DSV4_SM120_CXX_TOPK", "0") == "1"
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
@@ -1305,10 +1312,16 @@ class DeepseekV4Indexer(Indexer):
                 k_fp8,
                 k_scale,
                 weights,
-                # SM120 has no DeepGEMM/cute-dsl indexer top-k kernel; use the
-                # arch-agnostic torch top-k fallback (logits.topk + masking).
-                use_custom_topk=not (get_sm_version() == 120
-                                     and _DSV4_SM120_REAL_INDEXER),
+                # SM120 has no DeepGEMM/cute-dsl indexer top-k kernel. By
+                # default use the arch-agnostic torch top-k fallback
+                # (logits.topk + masking). The C++ indexer_topk_{prefill,decode}
+                # CUDA op IS arch-agnostic (guarded only by __CUDA_ARCH__>=900),
+                # so opt into it on SM120 via TRTLLM_DSV4_SM120_CXX_TOPK=1 (the
+                # eventual perf default) -- it fuses the top-k and is
+                # CUDA-graph-capturable (has its own pre-capture warmup).
+                use_custom_topk=(not (get_sm_version() == 120
+                                      and _DSV4_SM120_REAL_INDEXER))
+                or _DSV4_SM120_CXX_TOPK,
                 q_scale=q_scale,
                 update_k_cache=False,
             )
