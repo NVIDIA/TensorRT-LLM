@@ -23,6 +23,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     MetadataServerConfig,
     ServerRole,
     get_global_disagg_request_id,
+    rewrite_usage_response_from_ctx,
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import ClusterStorage, WatchEventType
@@ -499,4 +500,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
             )
             responses = await asyncio.gather(*tasks)
-            return responses[-1]
+            gen_response = responses[-1]
+            if need_ctx:
+                # The generation worker treats the whole transferred prompt as
+                # cached, so its usage accounting over-reports cached_tokens.
+                # Adopt the context worker's accounting, mirroring the
+                # context-first path which propagates ctx_usage to the gen
+                # worker (not possible here since both requests run concurrently).
+                rewrite_usage_response_from_ctx(gen_response, responses[0].usage)
+            return gen_response
