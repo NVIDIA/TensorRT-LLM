@@ -26,7 +26,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams, merge_attention_forward_args)
 
-# Enable TRTLLM-Gen attention backend via environment variable (default: on).
+# Enable TRTLLM-Gen attention backend by default. Set
+# TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
@@ -1421,6 +1422,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
+        # Propagate the KV cache manager's SWA window to the FMHA kernel when
+        # the model does not specify one, so paged-context attention does not
+        # read stale page-table entries (BAD_PAGE_INDEX).
+        if forward_args.attention_window_size is None and metadata.kv_cache_manager is not None:
+            window_vec = getattr(metadata.kv_cache_manager,
+                                 'max_attention_window_vec', None)
+            if window_vec:
+                window = window_vec[self.local_layer_idx % len(window_vec)]
+                if window is not None:
+                    forward_args.attention_window_size = window
         if forward_args.attention_window_size is None:
             forward_args.attention_window_size = metadata.max_seq_len
 
@@ -1732,14 +1743,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and metadata.num_ctx_cached_tokens > 0
                 and metadata.runtime_features.chunked_prefill)
 
-    def is_chunked_prefill_mla_context_for_warmup(
+    def has_cached_kv_for_mla_context_warmup(
         self,
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
-        """Chunked prefill MLA context check for warmup; does not check num_ctx_cached_tokens."""
+        """KV cache reuse / chunked prefill MLA context check for warmup, do not check num_ctx_cached_tokens."""
         return (self.is_mla_enable and metadata.kv_cache_manager is not None
-                and metadata.enable_context_mla_with_cached_kv
-                and metadata.runtime_features.chunked_prefill)
+                and metadata.enable_context_mla_with_cached_kv)
 
     def load_paged_kv_cache_for_mla(
         self,

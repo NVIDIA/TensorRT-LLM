@@ -1324,7 +1324,7 @@ def _persistent_main_impl(
             else:
                 RAND_DIVISOR: tl.constexpr = 1  # unreachable; keeps constexpr initialized
 
-            rand_seed = tl.load(rand_seed_ptr)
+            rand_seed = tl.load(rand_seed_ptr + cache_batch_idx)
             base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
             # Number of unique randoms per row = dstate / RAND_DIVISOR.
             # randint4x emits 4 randoms per offset, so use that / 4 offsets.
@@ -3535,11 +3535,14 @@ def replay_selective_state_update(
         z: (batch, T, nheads, dim) optional silu gate.
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
         state_batch_indices: (batch,) optional cache slot mapping.
-        rand_seed: optional single-element int64 CUDA tensor for Philox PRNG seed.
-            When provided, state is stochastically rounded on store.  Supported
-            for state.dtype in (fp16, int8, int16, fp8_e4m3fn). fp16+SR and
-            fp8+SR both require sm_100a (Blackwell B200+) — wrapper asserts
-            this loudly.
+        rand_seed: optional (cache_size,) int64 CUDA tensor of per-cache-slot
+            Philox PRNG seeds.  The caller bumps this tensor in-place for each
+            replay invocation so CUDA graph replay still gets fresh draws.  The
+            kernel indexes it by cache_batch_idx.  When provided, state is
+            stochastically rounded on store. Supported for state.dtype in
+            (fp16, int8, int16, fp8_e4m3fn). fp16+SR and fp8+SR both require
+            sm_100a (Blackwell B200+) — wrapper asserts this loudly.
+            When None, standard deterministic rounding is used.
         philox_rounds: number of Philox PRNG rounds (default 10).
         state_scales: required when state.dtype in (int8, int16, fp8_e4m3fn).
             Shape (cache_size, nheads, dim), fp32.  Per-(head, dim) channel
@@ -3847,6 +3850,19 @@ def replay_selective_state_update(
     assert prev_num_accepted_tokens.dtype == torch.int32, (
         f"prev_num_accepted_tokens must be int32, got {prev_num_accepted_tokens.dtype}"
     )
+    if rand_seed is not None:
+        assert rand_seed.dtype == torch.int64, (
+            f"rand_seed dtype must be int64, got {rand_seed.dtype}"
+        )
+        assert rand_seed.dim() == 1, (
+            f"rand_seed must be a 1D tensor; got shape {tuple(rand_seed.shape)}"
+        )
+        if rand_seed.shape[0] == 1 and cache_size > 1:
+            rand_seed = rand_seed.expand(cache_size).contiguous()
+        assert rand_seed.shape[0] >= cache_size, (
+            f"rand_seed must have length 1 or >= cache_size ({cache_size}); "
+            f"got shape {tuple(rand_seed.shape)}"
+        )
 
     tie_hdim = (
         A.stride(-1) == 0
@@ -3877,8 +3893,7 @@ def replay_selective_state_update(
     decay_vec = torch.empty(batch, nheads, BLOCK_SIZE_T, device=device, dtype=torch.float32)
 
     z_strides = (
-        (z.stride(0), z.stride(1), z.stride(2), z.stride(3))
-        if z is not None else (0, 0, 0, 0)
+        (z.stride(0), z.stride(1), z.stride(2), z.stride(3)) if z is not None else (0, 0, 0, 0)
     )
 
     heads_per_group = nheads // ngroups
@@ -3912,12 +3927,8 @@ def replay_selective_state_update(
             "persistent_main requires _num_loop_stages_nowrite tuning"
         )
     assert _heads_per_block is not None, "replay default tuning requires _heads_per_block"
-    assert _precompute_num_warps is not None, (
-        "replay default tuning requires _precompute_num_warps"
-    )
-    BLOCK_SIZE_M = (
-        _block_size_m if _block_size_m is not None else _block_size_m_nowrite
-    )
+    assert _precompute_num_warps is not None, "replay default tuning requires _precompute_num_warps"
+    BLOCK_SIZE_M = _block_size_m if _block_size_m is not None else _block_size_m_nowrite
     num_warps = _num_warps if _num_warps is not None else _num_warps_nowrite
     precompute_num_warps = _precompute_num_warps
     heads_per_block = int(_heads_per_block)

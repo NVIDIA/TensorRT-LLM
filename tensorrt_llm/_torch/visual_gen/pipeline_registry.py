@@ -4,7 +4,7 @@
 
 Follows: VisualGenArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
 
-All pipelines (Wan, Flux, Flux2, LTX2) register via @register_pipeline decorator.
+All pipelines (Wan, Flux, Flux2, LTX2, QwenImage) register via @register_pipeline decorator.
 
 The registry value is a private ``_PipelineEntry`` dataclass that carries
 the pipeline class plus three pieces of per-family metadata:
@@ -181,6 +181,8 @@ class AutoPipeline:
                 return "Flux2Pipeline"
             if "Flux" in class_name:
                 return "FluxPipeline"
+            if "QwenImage" in class_name:
+                return "QwenImagePipeline"
 
             if "Cosmos3" in class_name:
                 return "Cosmos3OmniMoTPipeline"

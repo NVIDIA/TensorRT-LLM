@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +30,13 @@ template <uint32_t size>
 __device__ inline void copyAsync(
     void* dst, void const* src, uint32_t srcSize = size) // srcSize == 0 means filling with zeros.
 {
+    // FIXME: there are probably some race condition or compiler issue and needs further investigation.
+    // Without this conditional assignment the code might read global memory even if srcSize = 0.
+    if (srcSize == 0)
+    {
+        src = nullptr;
+    }
+
     static_assert(size == 4 || size == 8 || size == 16);
     if constexpr (size == 16)
     {

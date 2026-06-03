@@ -32,6 +32,10 @@ l0_a10:
   - unittest/_torch/executor/test_kv_cache_estimation.py
   - unittest/_torch/executor/test_kv_cache_budget_split.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
+  - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
+  - unittest/_torch/modules/dwdp/test_dwdp_manager.py
+  - unittest/_torch/modules/dwdp/test_dwdp_mapping.py
+  - unittest/_torch/modules/dwdp/test_dwdp_peer_ranges.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
@@ -215,9 +219,6 @@ l0_a10:
   - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
   - unittest/trt/model/test_mistral.py
   - unittest/trt/model/test_llama.py
-  - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
-  - llmapi/test_llm_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
-  - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command_with_lora[llama-llama-models-v2/llama-v2-7b-hf]
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_e2e.py::test_llmapi_exit
   - llmapi/test_llm_examples.py::test_llmapi_server_example

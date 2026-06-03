@@ -630,21 +630,21 @@ class Qwen3_5MoeMLP(nn.Module):
             self.gate_proj.weight,
             self.gate_proj.bias,
             tp_mode="colwise",
-            layer_type="moe",
+            layer_type="shared_expert",
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
             tp_mode="colwise",
-            layer_type="moe",
+            layer_type="shared_expert",
         )
         return torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
             tp_mode="rowwise",
-            layer_type="moe",
+            layer_type="shared_expert",
         )
 
 
@@ -765,8 +765,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             layer_type="moe",
         )
 
-        expert_output = expert_output + shared_expert_output
+        # The shared expert is replicated (excluded from TP sharding), so all-reduce
+        # the sharded routed-expert output first, then add the replicated shared
+        # output; adding before would scale it by the TP world size.
         expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
+        expert_output = expert_output + shared_expert_output
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
         return expert_output
