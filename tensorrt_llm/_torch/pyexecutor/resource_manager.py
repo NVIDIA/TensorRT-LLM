@@ -7,7 +7,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional,
                     Sequence, Set, Tuple, Union)
 
@@ -679,6 +679,18 @@ class KVCacheManager(BaseResourceManager):
             num_layers=num_layers,
             layer_mask=layer_mask,
         )
+
+        # _resolve_max_attention_window_vec clamps each window to max_seq_len (a
+        # sliding window wider than the sequence never slides, so it degenerates
+        # to full attention).  Mirror that clamp onto the per-pool window_size so
+        # pool keys stay consistent with max_attention_window_vec; otherwise
+        # _build_layer_to_pool_idx can't map a layer whose window was clamped
+        # down (e.g. Ministral sliding_window=32768 with max_seq_len=512).
+        if self.pool_configurations:
+            self.pool_configurations = [
+                replace(pc, window_size=min(pc.window_size, self.max_seq_len))
+                for pc in self.pool_configurations
+            ]
 
         # Now that max_attention_window_vec is known, build layer -> pool_idx
         # from the (pre-clamp) pool_configurations.  Stays valid through the
