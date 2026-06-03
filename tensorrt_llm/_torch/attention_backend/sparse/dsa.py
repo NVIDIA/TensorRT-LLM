@@ -2,8 +2,8 @@
 import math
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -34,15 +34,17 @@ from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
                                     fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
                                     fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
-from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from .params import SparseMetadataParams, SparseParams
+
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                              SparseAttentionConfig)
 
 # Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
 try:
@@ -58,6 +60,40 @@ except ImportError:
 # the same parameters during model construction.
 _HEURISTIC_TOPK_WARMUP_DONE: Set[Tuple[int, int, int, int]] = set()
 _HEURISTIC_TOPK_WARMUP_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class DSAMetadataParams(SparseMetadataParams):
+    """DSA metadata settings derived from user config."""
+
+    indexer_max_chunk_size: int
+    max_sparse_topk: Optional[int]
+    enable_indexer_skip: bool
+    enable_heuristic_topk: bool
+    use_cute_dsl_paged_mqa_logits: bool
+    q_split_threshold: int
+
+
+@dataclass(frozen=True)
+class DSAParams(SparseParams):
+    """DSA sparse attention backend parameters."""
+
+    algorithm: Literal["dsa"] = field(init=False, default="dsa")
+    index_n_heads: Optional[int] = None
+    index_head_dim: Optional[int] = None
+    index_topk: Optional[int] = None
+    indexer_max_chunk_size: Optional[int] = None
+    skip_indexer_for_short_seqs: bool = True
+    use_cute_dsl_topk: bool = False
+    use_cute_dsl_paged_mqa_logits: bool = False
+    q_split_threshold: int = 8192
+    indexer_rope_interleave: bool = False
+    enable_heuristic_topk: bool = False
+    indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
+
+    @property
+    def indices_block_size(self) -> int:
+        return 1
 
 
 def warmup_heuristic_topk_decode(top_k: int = 2048,
@@ -436,9 +472,11 @@ class IndexerPrefillChunkMetadata:
     k_token_end: int  # K token end index in batch
 
 
+@dataclass(init=False)
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
+    sparse_metadata_params: Optional[DSAMetadataParams] = None
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
@@ -491,10 +529,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
         super().__init__(*args, **kwargs)
-        if self.sparse_attention_config.indexer_max_chunk_size is not None:
-            self.indexer_max_chunk_size = self.sparse_attention_config.indexer_max_chunk_size
-        else:
-            self.indexer_max_chunk_size = 32768  # Default to 32K tokens for the indexer
+        sparse_metadata_params = self.sparse_metadata_params
+        if not isinstance(sparse_metadata_params, DSAMetadataParams):
+            raise ValueError("DSA sparse attention metadata params are not set")
+        self.indexer_max_chunk_size = (
+            sparse_metadata_params.indexer_max_chunk_size)
 
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
@@ -502,8 +541,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         assert isinstance(self.kv_cache_manager, DSACacheManager), \
             f"DSAtrtllmAttentionMetadata requires DSACacheManager, got {type(self.kv_cache_manager)}"
 
-        self.num_sparse_topk = self.sparse_attention_config.index_topk
-        self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
+        sparse_metadata_params = self.sparse_metadata_params
+        if not isinstance(sparse_metadata_params, DSAMetadataParams):
+            raise ValueError("DSA sparse attention metadata params are not set")
+        self.num_sparse_topk = sparse_metadata_params.max_sparse_topk
+        self.enable_indexer_skip = (sparse_metadata_params.enable_indexer_skip)
         capture_graph = self.is_cuda_graph
 
         self.indexer_k_cache_block_offsets = self.get_empty(
@@ -680,7 +722,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # The graph captures reads/writes on these stable-address buffers;
         # each replay's write becomes the next replay's read (feedback loop).
         self.enable_heuristic_topk = (
-            self.sparse_attention_config.enable_heuristic_topk
+            sparse_metadata_params.enable_heuristic_topk
             and get_sm_version() >= 100)
         if self.enable_heuristic_topk:
             num_local_layers = self.kv_cache_manager.num_local_layers
@@ -1087,7 +1129,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # TODO:
         # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
         # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
-        _use_dsl = self.sparse_attention_config.use_cute_dsl_paged_mqa_logits
+        metadata_params = self.sparse_metadata_params
+        _use_dsl = metadata_params.use_cute_dsl_paged_mqa_logits
         self.use_expanded_buffers_for_mtp = (not _use_dsl and (
             (self.max_draft_tokens > 1 and get_sm_version() == 90) or
             ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
@@ -1374,7 +1417,7 @@ class Indexer(nn.Module):
                  pos_embd_params: Optional[PositionalEmbeddingParams],
                  mla_params: Optional[MLAParams],
                  skip_create_weights_in_init: bool,
-                 sparse_attention_config: "SparseAttentionConfig",
+                 sparse_params: DSAParams,
                  dtype: Optional[torch.dtype],
                  layer_idx: int = 0,
                  aux_stream: Optional[torch.cuda.Stream] = None):
@@ -1383,9 +1426,9 @@ class Indexer(nn.Module):
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
         self.rope_dim = mla_params.qk_rope_head_dim
-        self.n_heads = sparse_attention_config.index_n_heads  # 64
-        self.head_dim = sparse_attention_config.index_head_dim  # 128
-        self.index_topk = sparse_attention_config.index_topk  # 2048
+        self.n_heads = sparse_params.index_n_heads  # 64
+        self.head_dim = sparse_params.index_head_dim  # 128
+        self.index_topk = sparse_params.index_topk  # 2048
         self.layer_idx = layer_idx
 
         self.wq_b = Linear(
@@ -1418,8 +1461,7 @@ class Indexer(nn.Module):
         # Maps to TF32 tensor cores on Ampere+.
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
 
-        indexer_rope_interleave = getattr(sparse_attention_config,
-                                          'indexer_rope_interleave', False)
+        indexer_rope_interleave = sparse_params.indexer_rope_interleave
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.rope_dim,
@@ -1433,19 +1475,18 @@ class Indexer(nn.Module):
         # fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels only dispatch
         # to FP4xFP4 or FP8xFP8 (no mixed-precision variant). The DeepGEMM
         # kernel asserts SM100 + head_dim=128 at launch time under FP4.
-        self.use_fp4 = sparse_attention_config.indexer_k_dtype == "fp4"
+        self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-        self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
+        self.use_cute_dsl_topk = (sparse_params.use_cute_dsl_topk
                                   and IS_CUTLASS_DSL_AVAILABLE)
         self.use_cute_dsl_paged_mqa_logits = (
-            sparse_attention_config.use_cute_dsl_paged_mqa_logits
+            sparse_params.use_cute_dsl_paged_mqa_logits
             and IS_CUTLASS_DSL_AVAILABLE)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
-        self._enable_heuristic_topk = (
-            sparse_attention_config.enable_heuristic_topk
-            and get_sm_version() >= 100)
+        self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
+                                       and get_sm_version() >= 100)
 
         if (self.use_cute_dsl_topk
                 or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
@@ -1950,8 +1991,8 @@ class Indexer(nn.Module):
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
 
-                # Default to 8192 if sparse_attention_config is not available (e.g., in unit tests)
-                q_split_threshold = metadata.sparse_attention_config.q_split_threshold if metadata.sparse_attention_config is not None else 8192
+                q_split_threshold = (
+                    metadata.sparse_metadata_params.q_split_threshold)
                 q_split_eligible = q_split_threshold >= 0 and metadata.mapping is not None and not metadata.mapping.enable_attention_dp and metadata.mapping.tp_size > 1
 
                 if q_split_eligible:
@@ -2422,33 +2463,32 @@ class DSATrtllmAttention(TrtllmAttention):
 
     Metadata = DSAtrtllmAttentionMetadata
 
-    def __init__(
-            self,
-            layer_idx: int,
-            num_heads: int,
-            head_dim: int,
-            num_kv_heads: Optional[int] = None,
-            quant_config: Optional[QuantConfig] = None,
-            q_scaling: Optional[float] = None,
-            pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-            mla_params: Optional[MLAParams] = None,
-            skip_create_weights_in_init: bool = False,
-            attention_chunk_size: Optional[int] = None,
-            sparse_attention_config: Optional["SparseAttentionConfig"] = None,
-            dtype: Optional[torch.dtype] = None,
-            aux_stream: Optional[torch.cuda.Stream] = None,
-            **kwargs):
+    def __init__(self,
+                 layer_idx: int,
+                 num_heads: int,
+                 head_dim: int,
+                 num_kv_heads: Optional[int] = None,
+                 quant_config: Optional[QuantConfig] = None,
+                 q_scaling: Optional[float] = None,
+                 pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+                 mla_params: Optional[MLAParams] = None,
+                 skip_create_weights_in_init: bool = False,
+                 attention_chunk_size: Optional[int] = None,
+                 sparse_params: Optional[DSAParams] = None,
+                 dtype: Optional[torch.dtype] = None,
+                 aux_stream: Optional[torch.cuda.Stream] = None,
+                 **kwargs):
         """Initialize DSA attention with an Indexer sub-module for sparse TopK selection."""
-        if sparse_attention_config is None:
+        if sparse_params is None:
             raise ValueError(
-                "sparse_attention_config is required for DSATrtllmAttention and cannot be None"
+                "sparse_params is required for DSATrtllmAttention and cannot be None"
             )
         TrtllmAttention.__init__(
             self,
             layer_idx,
             num_heads,
             head_dim,
-            sparse_attention_config=sparse_attention_config,
+            sparse_params=sparse_params,
             num_kv_heads=num_kv_heads,
             quant_config=quant_config,
             q_scaling=q_scaling,
@@ -2459,9 +2499,8 @@ class DSATrtllmAttention(TrtllmAttention):
             **kwargs)
 
         self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
-                               skip_create_weights_in_init,
-                               sparse_attention_config, dtype, layer_idx,
-                               aux_stream)
+                               skip_create_weights_in_init, sparse_params,
+                               dtype, layer_idx, aux_stream)
 
     def sparse_attn_predict(
         self,
@@ -2566,16 +2605,24 @@ class DSACacheManager(KVCacheManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
-        sparse_attn_config: "SparseAttentionConfig",
+        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
+        pretrained_config=None,
         **kwargs,
     ) -> None:
         """Initialize cache manager with indexer K-cache pool per layer."""
+        if sparse_attention_config is None:
+            raise ValueError(
+                "sparse_attention_config is required for DSA cache")
+        sparse_params = sparse_attention_config.to_sparse_params(
+            pretrained_config=pretrained_config)
+        if not isinstance(sparse_params, DSAParams):
+            raise ValueError("DSA cache requires DSA sparse parameters")
         self.quant_block_size = 128
-        self.index_head_dim = sparse_attn_config.index_head_dim
+        self.index_head_dim = sparse_params.index_head_dim
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.
-        self.use_fp4 = sparse_attn_config.indexer_k_dtype == "fp4"
+        self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
 
         super().__init__(
             kv_cache_config,
@@ -2632,14 +2679,21 @@ class DSACacheManager(KVCacheManager):
                                  **kwargs):
         """Estimate total cache bytes per token including indexer K-cache overhead."""
         config = model_config.pretrained_config
-        sparse_attn_config = model_config.sparse_attention_config
-        index_head_dim = sparse_attn_config.index_head_dim
+        sparse_attention_config = model_config.sparse_attention_config
+        if sparse_attention_config is None:
+            raise ValueError(
+                "sparse_attention_config is required for DSA cache")
+        sparse_params = sparse_attention_config.to_sparse_params(
+            pretrained_config=model_config.pretrained_config)
+        if not isinstance(sparse_params, DSAParams):
+            raise ValueError("DSA cache requires DSA sparse parameters")
+        index_head_dim = sparse_params.index_head_dim
         quant_block_size = 128
         # Under FP4 the indexer stores two E2M1 codes per byte, so the
         # per-token data footprint halves (132 B -> 68 B at index_head_dim=128);
         # the scale bytes are unchanged (4 per token, one int32 holding four
         # UE8M0 exponents at quant_block_size=32 after packing).
-        use_fp4 = sparse_attn_config.indexer_k_dtype == "fp4"
+        use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
 
         # get kv cache dtype bytes

@@ -15,6 +15,7 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.kernel import (
     triton_convert_req_index_to_global_index,
 )
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -105,10 +106,13 @@ class SparseGenerationScenario(SparseScenario):
         return self.num_generations
 
 
-class MockSparseAttentionConfig:
+class MockSparseParams(SparseParams):
+    """Sparse params stub used to exercise generic sparse attention plumbing."""
+
     algorithm: str = "mqa_gqa"
 
-    def get_indices_block_size(self) -> int:
+    @property
+    def indices_block_size(self) -> int:
         return 1
 
 
@@ -131,7 +135,7 @@ class TestSparseAttention(TrtllmAttention):
         sparse_attn_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        kwargs["sparse_attention_config"] = MockSparseAttentionConfig()
+        kwargs["sparse_params"] = MockSparseParams()
         kwargs["pos_embd_params"] = None
         super().__init__(*args, **kwargs)
 

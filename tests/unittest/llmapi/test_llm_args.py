@@ -2387,7 +2387,8 @@ class TestSkipSoftmaxAttentionConfig:
             "prefill": 1000.0,
             "decode": 500.0
         })
-        params = cfg.to_kernel_params()
+        sparse_params = cfg.to_sparse_params()
+        params = sparse_params.scheduler.get_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
         assert params.threshold_scale_factor_decode == pytest.approx(500.0)
 
@@ -2396,7 +2397,8 @@ class TestSkipSoftmaxAttentionConfig:
         from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
         cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
-        params = cfg.to_kernel_params()
+        sparse_params = cfg.to_sparse_params()
+        params = sparse_params.scheduler.get_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
         assert params.threshold_scale_factor_decode == pytest.approx(1000.0)
 
@@ -2410,8 +2412,9 @@ class TestSkipSoftmaxAttentionConfig:
             "prefill": 0.5,
             "decode": 0.5
         })
-        params = cfg.resolve_from_ckpt_config(
-            self.THRESHOLD_SCALE_FACTOR_CONFIG).to_kernel_params()
+        params = cfg.to_sparse_params(
+            checkpoint_config=self.THRESHOLD_SCALE_FACTOR_CONFIG
+        ).scheduler.get_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.5))
         assert params.threshold_scale_factor_decode == pytest.approx(
@@ -2423,8 +2426,9 @@ class TestSkipSoftmaxAttentionConfig:
         from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
         cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
-        params = cfg.resolve_from_ckpt_config(
-            self.THRESHOLD_SCALE_FACTOR_CONFIG).to_kernel_params()
+        params = cfg.to_sparse_params(
+            checkpoint_config=self.THRESHOLD_SCALE_FACTOR_CONFIG
+        ).scheduler.get_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.3))
         assert params.threshold_scale_factor_decode == pytest.approx(
@@ -2436,9 +2440,10 @@ class TestSkipSoftmaxAttentionConfig:
 
         cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0,
                                          target_sparsity=0.5)
-        assert cfg.resolve_from_ckpt_config(
-            self.THRESHOLD_SCALE_FACTOR_CONFIG) is cfg
-        assert cfg.to_kernel_params().threshold_scale_factor_prefill == 1000.0
+        params = cfg.to_sparse_params(
+            checkpoint_config=self.THRESHOLD_SCALE_FACTOR_CONFIG
+        ).scheduler.get_kernel_params()
+        assert params.threshold_scale_factor_prefill == 1000.0
 
     def test_resolve_without_formula_raises(self):
         # Doc: target_sparsity is unusable if the checkpoint ships no formula.
@@ -2446,4 +2451,9 @@ class TestSkipSoftmaxAttentionConfig:
 
         cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
         with pytest.raises(ValueError, match="formula"):
-            cfg.resolve_from_ckpt_config({"prefill": {"a": 1.0, "b": 2.0}})
+            cfg.to_sparse_params(checkpoint_config={
+                "prefill": {
+                    "a": 1.0,
+                    "b": 2.0
+                }
+            }).scheduler.get_kernel_params()

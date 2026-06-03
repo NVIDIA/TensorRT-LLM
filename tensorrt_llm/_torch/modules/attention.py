@@ -10,7 +10,6 @@ from torch import nn
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -535,28 +534,13 @@ class Attention(nn.Module):
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
 
-        # ``target_sparsity`` is resolved to a ``threshold_scale_factor`` via
-        # the checkpoint's calibration formula. A directly-set
-        # ``threshold_scale_factor`` wins and skips this resolution.
         sparse_attn_cfg = config.sparse_attention_config
-        if (isinstance(sparse_attn_cfg, SkipSoftmaxAttentionConfig)
-                and sparse_attn_cfg.target_sparsity is not None):
-            hf_sparse = getattr(config.pretrained_config,
-                                'sparse_attention_config', None)
-            if not isinstance(hf_sparse, dict):
-                raise ValueError(
-                    "sparse_attention_config with target_sparsity requires formula "
-                    "coefficients in the model's config.json "
-                    "(sparse_attention_config.threshold_scale_factor.{prefill,decode}.{a,b}), "
-                    "but sparse_attention_config was not found or was not dict type in config.json."
-                )
-            threshold_scale_factor_config = hf_sparse.get(
-                'threshold_scale_factor', {})
-            sparse_attn_cfg = sparse_attn_cfg.resolve_from_ckpt_config(
-                threshold_scale_factor_config)
+        sparse_params = (sparse_attn_cfg.to_sparse_params(
+            pretrained_config=config.pretrained_config)
+                         if sparse_attn_cfg is not None else None)
 
-        attn_cls = get_attention_backend(self.attn_backend,
-                                         sparse_attn_config=sparse_attn_cfg)
+        attn_cls = get_attention_backend(
+            self.attn_backend, sparse_attention_config=sparse_attn_cfg)
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -625,7 +609,8 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
-            sparse_attention_config=sparse_attn_cfg,
+            attn_cls=attn_cls,
+            sparse_params=sparse_params,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -1310,14 +1295,18 @@ class MLA(nn.Module):
                 self)
             self.register_to_config = True
 
+        config = config or ModelConfig()
+        sparse_params = (config.sparse_attention_config.to_sparse_params(
+            pretrained_config=config.pretrained_config) if
+                         config.sparse_attention_config is not None else None)
+
         # Currently only DSA sparse attention is supported.
-        if config is not None and config.sparse_attention_config is not None and config.sparse_attention_config.algorithm == "dsa":
+        if getattr(sparse_params, "algorithm", None) == "dsa":
             self.is_dsa = True
         else:
             self.is_dsa = False
 
         # tensor parallel
-        config = config or ModelConfig()
         if mapping_with_cp is not None:
             logger.warning_once(
                 "[MLA::__init__] Overriding mapping with CP detected.",
@@ -1484,6 +1473,9 @@ class MLA(nn.Module):
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
         q_scaling = 1.0 / (mscale * mscale)
 
+        mqa_cls = get_attention_backend(
+            config.attn_backend,
+            sparse_attention_config=config.sparse_attention_config)
         self.mqa = create_attention(
             config.attn_backend,
             self.layer_idx,
@@ -1502,7 +1494,8 @@ class MLA(nn.Module):
             hidden_size=self.hidden_size,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            sparse_attention_config=config.sparse_attention_config,
+            attn_cls=mqa_cls,
+            sparse_params=sparse_params,
             dtype=dtype,
             aux_stream=aux_stream,
         )
@@ -1541,6 +1534,10 @@ class MLA(nn.Module):
         _short_seq_mha = (self.is_dsa and self.short_seq_mha_threshold > 0
                           and not self.apply_rotary_emb)
         if not self.is_dsa or _short_seq_mha:
+            mha_sparse_config = (None if _short_seq_mha else
+                                 config.sparse_attention_config)
+            mha_cls = get_attention_backend(
+                config.attn_backend, sparse_attention_config=mha_sparse_config)
             self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
@@ -1558,8 +1555,8 @@ class MLA(nn.Module):
                 v_head_dim=self.v_head_dim,
                 predicted_tokens_per_seq=self.predicted_tokens_per_seq,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                sparse_attention_config=(None if _short_seq_mha else
-                                         config.sparse_attention_config),
+                attn_cls=mha_cls,
+                sparse_params=(None if _short_seq_mha else sparse_params),
             )
         else:
             self.mha = None
