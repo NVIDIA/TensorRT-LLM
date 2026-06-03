@@ -3929,9 +3929,8 @@ class PyExecutor:
             f"target_tokens={target_tokens:.1f} "
             f"timeout_ms={self.batch_wait_delay_timeout_ms}",
             all_ranks=True)
-        # Keep the expired deadline until the global delay-batch decision is
-        # known. Another attention-DP rank can still force a global skip; if
-        # that happens this rank must stay timeout-ready in the next iter.
+        # Keep the expired deadline until _schedule applies the synchronized
+        # delay-batch decision. A global run will clear it in one place.
         return context_requests, False
 
     def _sync_delay_batch_skip(self, local_skip_iteration: bool) -> bool:
@@ -3939,10 +3938,13 @@ class PyExecutor:
                 or getattr(self.dist, "world_size", 1) == 1):
             return local_skip_iteration
         all_skip_flags = self.dist.tp_allgather(int(local_skip_iteration))
-        skip_iteration = any(all_skip_flags)
+        skip_iteration = all(all_skip_flags)
         if skip_iteration:
             self._delay_batch_log(
                 f"global skip enabled all_rank_delay_flags={all_skip_flags}")
+        elif any(all_skip_flags):
+            self._delay_batch_log(f"global run forced by ready rank "
+                                  f"all_rank_delay_flags={all_skip_flags}")
         return skip_iteration
 
     def _clear_scheduled_requests_for_skip(
@@ -4000,6 +4002,7 @@ class PyExecutor:
             self._log_delay_batch_generation_sources(
                 scheduler_output.generation_requests, "scheduler_candidate")
         if delay_batch_runtime_enabled:
+            delay_candidate_context_requests = scheduled_context_requests
             scheduled_context_requests, local_skip_iteration = (
                 self._waiting_context_requests_with_timeout(
                     scheduled_context_requests))
@@ -4021,6 +4024,10 @@ class PyExecutor:
 
         skip_iteration = (self._sync_delay_batch_skip(local_skip_iteration)
                           if delay_batch_runtime_enabled else False)
+        forced_run_iteration = (delay_batch_runtime_enabled
+                                and local_skip_iteration and not skip_iteration)
+        if forced_run_iteration:
+            scheduled_context_requests = delay_candidate_context_requests
 
         if delay_batch_runtime_enabled:
             self._delay_batch_log(
@@ -4028,14 +4035,14 @@ class PyExecutor:
                 f"decision={'skip' if skip_iteration else 'run'} "
                 f"local_skip={local_skip_iteration} "
                 f"global_skip={skip_iteration} "
+                f"forced_run={forced_run_iteration} "
                 f"ctx_original={len(original_ctx_requests)} "
                 f"ctx_selected={len(scheduled_context_requests)} "
                 f"gen={len(scheduler_output.generation_requests)} "
                 f"fetched_all_ctx={self._delay_batch_fetched_all_ctx_runtime_enabled}",
                 all_ranks=True)
 
-        if (delay_batch_runtime_enabled and not local_skip_iteration
-                and not skip_iteration):
+        if delay_batch_runtime_enabled and not skip_iteration:
             self.batch_wait_deadline_s = None
 
         if skip_iteration:
