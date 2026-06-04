@@ -935,6 +935,19 @@ class BlockHashMixin:
         cache_salt = getattr(request, "cache_salt", None)
         return None if cache_salt is None else get_cache_salt_id(cache_salt)
 
+    @staticmethod
+    def _get_conversation_id(request: OpenAIRequest) -> Optional[str]:
+        """Return the explicit conversation id when present.
+
+        Populated upstream from session headers (``X-Session-ID``,
+        ``X-Correlation-ID``, ...) by
+        ``OpenAIDisaggServer._extract_conversation_id``.  Returns ``None``
+        when the client sent no session header.
+        """
+        if request.disaggregated_params is not None:
+            return request.disaggregated_params.conversation_id
+        return None
+
 
 class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
@@ -949,6 +962,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  max_batch_size: int = 64,
                  tokens_per_block: int = 32,
                  custom_tokenizer: Optional[str] = None,
+                 max_sessions: int = 100000,
                  backfill_block_hashes_on_finish: bool = False,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
@@ -961,6 +975,30 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # kv_cache_events. Stash hashes at routing, inject on finish.
         self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish
         self._pending_block_hashes: dict[int, tuple[list, str]] = {}
+
+        # Conversation ids already routed by this instance, LRU-ordered.
+        # Membership lets us flag the first turn of a multi-turn session,
+        # mirroring ConversationRouter's session-table semantics.  Bounded
+        # so a long run does not grow this map without limit.
+        self._max_sessions = max_sessions
+        self._seen_conversations: OrderedDict[str, None] = OrderedDict()
+
+    def _record_conversation_turn(self, conv_id: Optional[str]) -> bool:
+        """Record *conv_id* and report whether this is its first turn.
+
+        Returns ``True`` the first time a non-empty conversation id is seen
+        by this router instance, ``False`` for subsequent turns or when no
+        conversation id is available.  Must be called while holding
+        ``self._lock``.
+        """
+        if not conv_id:
+            return False
+        is_first_turn = conv_id not in self._seen_conversations
+        self._seen_conversations[conv_id] = None
+        self._seen_conversations.move_to_end(conv_id)
+        while len(self._seen_conversations) > self._max_sessions:
+            self._seen_conversations.popitem(last=False)
+        return is_first_turn
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
@@ -984,6 +1022,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if not servers:
                 raise ValueError(
                     f"No available servers after excluding {exclude_server}")
+        conv_id = self._get_conversation_id(request)
         cache_salt_id = self._get_request_cache_salt_id(request)
         hash_algo_by_server = {
             server: await self._get_server_hash_algo(server)
@@ -1033,15 +1072,19 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         hash_algo = hash_algo_by_server[server]
         block_hashes = block_hashes_by_algo[hash_algo]
         async with self._lock:
+            is_first_turn = self._record_conversation_turn(conv_id)
             await self._register_request(server, request)
             if self._backfill_block_hashes_on_finish:
                 self._pending_block_hashes[id(request)] = (block_hashes,
                                                            hash_algo)
+        logger.debug(f"KvCacheAwareRouter: conv_id={conv_id} "
+                     f"is_first_turn={is_first_turn} -> server={server}")
         return server, {
             "block_hashes": block_hashes,  # list[list[int | str]]
             "hash_algo": hash_algo,
             "token_lists": token_lists,  # list[list[int]]
             "matches": matches,  # list[int]
+            "is_first_turn": is_first_turn,
             "server_info": self._server_info.get(server, {}),
         }
 
@@ -1394,11 +1437,6 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
     # ── routing helpers ──
 
-    def _get_conversation_id(self, request: OpenAIRequest) -> Optional[str]:
-        if request.disaggregated_params is not None:
-            return request.disaggregated_params.conversation_id
-        return None
-
     def _generate_implicit_id(self) -> str:
         self._implicit_id_counter += 1
         return f"conv_id:{self._disagg_node_id}_{self._implicit_id_counter}"
@@ -1442,6 +1480,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         async with self._lock:
 
+            # First turn iff we have an explicit conversation id that this
+            # router instance has not routed before.  Computed before any
+            # session-table mutation so the three return paths agree.
+            is_first_turn = bool(conv_id) and conv_id not in self._session_table
+
             # 1. Explicit conversation_id — sticky routing.
             #    Always honour session affinity when the server is alive
             #    and not explicitly excluded.  No overload gate — the
@@ -1470,6 +1513,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                         f"-> server={sticky_server}, "
                         f"content_loads={loads}, weight={weight}")
                     return sticky_server, {
+                        "is_first_turn": is_first_turn,
                         "server_info": self._server_info.get(sticky_server, {})
                     }
             elif conv_id:
@@ -1498,6 +1542,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                         f"conv_id={matched_id} -> server={sticky_server}, "
                         f"content_loads={loads}, weight={weight}")
                     return sticky_server, {
+                        "is_first_turn": is_first_turn,
                         "server_info": self._server_info.get(sticky_server, {})
                     }
 
@@ -1517,9 +1562,13 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             loads = {s: self._get_content_load(s) for s in self._servers}
             logger.debug(
                 f"ConversationRouter: FALLBACK conv_id={conv_id} "
-                f"-> server={server}, content_loads={loads}, weight={weight}")
+                f"is_first_turn={is_first_turn} -> server={server}, "
+                f"content_loads={loads}, weight={weight}")
 
-        return server, {"server_info": self._server_info.get(server, {})}
+        return server, {
+            "is_first_turn": is_first_turn,
+            "server_info": self._server_info.get(server, {})
+        }
 
     async def finish_request(self,
                              request: OpenAIRequest,
