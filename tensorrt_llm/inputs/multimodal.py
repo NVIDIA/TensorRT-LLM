@@ -23,6 +23,10 @@ _MULTIMODAL_RUN_METADATA_KEYS = (
     "multimodal_run_lengths",
 )
 
+# Versioned tag prefixed to every content hash so the canonical, self-describing
+# serialization scheme can evolve without silently reusing stale cache keys.
+_HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
+
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     """Clear `mm_data` in place, retaining only `mrope_config.mrope_position_deltas`.
@@ -953,21 +957,10 @@ class MultimodalServerConfig():
 
 def _update_hash(hasher, item: object) -> None:
     """Hash the content of a multimodal item into the provided hasher."""
+    hasher.update(_HASH_SCHEME_TAG)
     if isinstance(item, BaseModalityData):
         item.update_hash(hasher)
         return
-    if isinstance(item, torch.Tensor):
-        item = item.detach().cpu().contiguous()
-        hasher.update(serialize_item(item))
-        return
-    if isinstance(item, list):
-        for element in item:
-            hasher.update(b"<frame>")
-            if isinstance(element, torch.Tensor):
-                element = element.detach().cpu().contiguous()
-            hasher.update(serialize_item(element))
-        return
-
     hasher.update(serialize_item(item))
 
 
@@ -998,7 +991,6 @@ def apply_mm_hashes(
 
     def _hash_item(item):
         """Hash only the content of a multimodal item (no UUID)."""
-        # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
         hasher = hash_lib()
         _update_hash(hasher, item)
         return hasher.hexdigest()

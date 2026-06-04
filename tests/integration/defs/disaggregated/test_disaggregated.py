@@ -298,12 +298,14 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
         "deepseek_r1_v2_fp4_mtp_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm_mtp.yaml",
-        "gpt_oss_120b_stress":
+        "gpt_oss_120b_trtllm_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
-        "gpt_oss_120b_eagle_stress":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm_eagle.yaml",
-        "gpt_oss_120b_cutlass_stress":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm_cutlass.yaml",
+        "gpt_oss_120b_eagle_triton_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_triton.yaml",
+        "gpt_oss_120b_eagle_trtllm_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_trtllm.yaml",
+        "gpt_oss_120b_triton_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_triton.yaml",
         "qwen3_5_4b_fp8_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_qwen3_5_4b_fp8_tllm.yaml",
         "gpt_oss_120b_harmony":
@@ -2297,7 +2299,7 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                             cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
     pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
-                            test_desc='gpt_oss_120b_stress',
+                            test_desc='gpt_oss_120b_trtllm_stress',
                             request_count=60000,
                             accuracy_threshold=0.42,
                             cancellation_rate=10,
@@ -2306,22 +2308,34 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     pytest.param(
         TestConfig(
             model_path='gpt_oss/gpt-oss-120b',
-            test_desc='gpt_oss_120b_eagle_stress',
+            test_desc='gpt_oss_120b_eagle_triton_stress',
             request_count=60000,
             accuracy_threshold=0.42,
             speculative_model_path='gpt_oss/gpt-oss-120b-Eagle3',
             cancellation_rate=10,
             cancellation_delay=0.5,
         ),
-        marks=(pytest.mark.skip_less_device(8), skip_pre_hopper),
+        marks=(pytest.mark.skip_less_device(8), skip_no_hopper),
+    ),
+    pytest.param(
+        TestConfig(
+            model_path='gpt_oss/gpt-oss-120b',
+            test_desc='gpt_oss_120b_eagle_trtllm_stress',
+            request_count=60000,
+            accuracy_threshold=0.42,
+            speculative_model_path='gpt_oss/gpt-oss-120b-Eagle3',
+            cancellation_rate=10,
+            cancellation_delay=0.5,
+        ),
+        marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell),
     ),
     pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
-                            test_desc='gpt_oss_120b_cutlass_stress',
-                            request_count=60000,
+                            test_desc='gpt_oss_120b_triton_stress',
+                            request_count=30000,
                             accuracy_threshold=0.42,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
-                 marks=(pytest.mark.skip_less_device(4), skip_pre_hopper)),
+                 marks=(pytest.mark.skip_less_device(4), skip_no_hopper)),
     pytest.param(TestConfig(model_path='Qwen3.5-4B-FP8',
                             test_desc='qwen3_5_4b_fp8_stress',
                             request_count=3000,

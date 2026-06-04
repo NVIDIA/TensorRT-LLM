@@ -1,8 +1,10 @@
+import copy
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
 
+import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
@@ -10,6 +12,7 @@ from transformers import Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModelBase,
@@ -18,6 +21,8 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
 )
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 QWEN3_VL_8B_CONFIG = {
     "architectures": ["Qwen3VLForConditionalGeneration"],
@@ -459,3 +464,27 @@ class TestQwen3VL(TestModelingMultimodal):
                 hf_model_state_dict=self.hf_model.state_dict(),
                 disable_fuse_rope=True,
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_qwen3vl_init_preserves_caller_quant_config():
+    """Building Qwen3VLModel must not mutate the caller's quant_config."""
+    hf_config = Qwen3VLConfig.from_dict(copy.deepcopy(QWEN3_VL_8B_CONFIG))
+    quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    model_config = ModelConfig(
+        pretrained_config=hf_config,
+        quant_config=quant_config,
+        skip_create_weights_in_init=True,
+    )
+
+    model = Qwen3VLModel(model_config)
+
+    # Outer LLM keeps the caller's quant_config unchanged (same object, same FP8 KV-cache setting).
+    assert model.model_config.quant_config is quant_config
+    assert model.model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+    # Vision encoder operates on an independent copy whose quant settings have been reset to the
+    # defaults (no quantization).
+    assert model.mm_encoder.model_config.quant_config is not quant_config
+    assert model.mm_encoder.model_config.quant_config.kv_cache_quant_algo is None
+    assert model.mm_encoder.model_config.quant_config.quant_algo is None

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import json
 import math
 import os
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Union
 
 import pytest
 import scipy
+import torch
 import yaml
 
 import tensorrt_llm.evaluate
@@ -1134,6 +1136,19 @@ class LlmapiAccuracyTestHarness:
         logger.set_level("info")
         yield
         logger.set_level(original_level)
+
+    @pytest.fixture(autouse=True)
+    def _cleanup_cuda_between_tests(self):
+        # Force Python GC + CUDA cache release after each test method.
+        # The LLM context manager's __exit__ schedules destruction of CUDA
+        # resources (streams, graph captures, KV cache pools), but objects in
+        # reference cycles aren't reclaimed until the next GC cycle. Without
+        # this teardown, a leftover CUDA stream/graph from a previous test can
+        # land in the next test's allocations and corrupt them, producing
+        # cross-test IMA reports that look like the current test crashed.
+        yield
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def get_accuracy_task(dataset_name: str):

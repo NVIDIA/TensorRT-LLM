@@ -68,7 +68,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc2048_gpu8
-  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2"
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -175,7 +175,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_8192_conc512_gpu8
-  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2"
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario

@@ -303,7 +303,7 @@ class DefaultADPRouter(ADPRouter):
 
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-            if scheduling_params is None:
+            if scheduling_params is None or scheduling_params.attention_dp_rank is None:
                 return True
             val = scheduling_params.attention_dp_relax
             return True if val is None else val
@@ -587,7 +587,7 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-            if scheduling_params is None:
+            if scheduling_params is None or scheduling_params.attention_dp_rank is None:
                 return True
             val = scheduling_params.attention_dp_relax
             return True if val is None else val
