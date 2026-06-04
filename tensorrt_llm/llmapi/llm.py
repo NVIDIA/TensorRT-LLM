@@ -1463,6 +1463,32 @@ class _TorchLLM(BaseLLM):
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
 
+    @set_api_status("beta")
+    def reset_prefix_cache(self) -> None:
+        """Reset local KV prefix-cache reuse state.
+
+        This invalidates local prefix-cache metadata in the PyTorch backend. It
+        does not abort or preempt running requests, and it does not reset
+        connector-managed external or offloaded cache state.
+        """
+        if self._encode_only:
+            raise RuntimeError("reset_prefix_cache() is not available when "
+                               "encode_only=True.")
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError("reset_prefix_cache() requires an active "
+                               "executor.")
+
+        if hasattr(self._executor, "collective_rpc"):
+            self._collective_rpc("reset_prefix_cache")
+            return
+
+        reset_prefix_cache = getattr(self._executor, "reset_prefix_cache", None)
+        if reset_prefix_cache is None:
+            raise NotImplementedError(
+                "reset_prefix_cache() is only supported by the PyTorch backend."
+            )
+        reset_prefix_cache()
+
     def _build_model(self):
         super()._build_model()
         assert self._engine_dir is None

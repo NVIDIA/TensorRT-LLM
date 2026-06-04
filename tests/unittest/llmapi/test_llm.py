@@ -2708,6 +2708,90 @@ class _FakeRawRequest:
         return True
 
 
+class _FakeResetExecutor:
+
+    def __init__(self):
+        self.num_reset_calls = 0
+
+    def reset_prefix_cache(self):
+        self.num_reset_calls += 1
+
+    def shutdown(self):
+        pass
+
+
+class _FakeCollectiveResetExecutor:
+
+    def __init__(self):
+        self.calls = []
+
+    def collective_rpc(self, method, args, kwargs, non_block,
+                       unique_reply_rank, target_ranks):
+        self.calls.append((method, args, kwargs, non_block, unique_reply_rank,
+                           target_ranks))
+        return [None]
+
+    def shutdown(self):
+        pass
+
+
+class _FakeUnsupportedResetExecutor:
+
+    def shutdown(self):
+        pass
+
+
+def test_llm_reset_prefix_cache_dispatches_to_executor() -> None:
+    llm = object.__new__(LLM_torch)
+    llm._encode_only = False
+    llm._executor = _FakeResetExecutor()
+
+    llm.reset_prefix_cache()
+
+    assert llm._executor.num_reset_calls == 1
+
+
+def test_llm_reset_prefix_cache_uses_collective_rpc() -> None:
+    llm = object.__new__(LLM_torch)
+    llm._encode_only = False
+    llm._executor = _FakeCollectiveResetExecutor()
+
+    llm.reset_prefix_cache()
+
+    assert llm._executor.calls == [("reset_prefix_cache", (), None, False,
+                                    None, None)]
+
+
+def test_llm_reset_prefix_cache_rejects_unsupported_executor() -> None:
+    llm = object.__new__(LLM_torch)
+    llm._encode_only = False
+    llm._executor = _FakeUnsupportedResetExecutor()
+
+    with pytest.raises(NotImplementedError,
+                       match="only supported by the PyTorch backend"):
+        llm.reset_prefix_cache()
+
+
+def test_openai_reset_prefix_cache_endpoint() -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = _FakeResetExecutor()
+
+    response = asyncio.run(server.reset_prefix_cache())
+
+    assert response.status_code == 200
+    assert server.generator.num_reset_calls == 1
+
+
+def test_openai_reset_prefix_cache_endpoint_rejects_unsupported_generator(
+) -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = object()
+
+    response = asyncio.run(server.reset_prefix_cache())
+
+    assert response.status_code == 501
+
+
 def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
 
     async def run_request():
