@@ -93,7 +93,6 @@ def Field(default: Any = ...,
     Returns:
         A Pydantic FieldInfo object with the status added to json_schema_extra if provided
     """
-
     if status is not None:
         json_schema_extra = kwargs.get('json_schema_extra', {})
         if isinstance(json_schema_extra, dict):
@@ -261,8 +260,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     )
 
     def supports_backend(self, backend: str) -> bool:
-        """
-        Override if the sparse attention algorithm does not support
+        """Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -271,13 +269,75 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         return 1
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """
-        Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
+        """Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
         If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).
         If False, capture a single unified CUDA graph for all sequences regardless of length.
         The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
         """
         return False
+
+
+class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
+    """Configuration for MiniMax-M3 block-sparse attention.
+
+    Drives the two-step sparse attention used by MiniMax-M3 layers 3..N:
+
+      1. An index attention branch projects a per-head Q vector and a
+         **single replicated** K vector, scores main K/V cache blocks,
+         and selects the top-``topk`` blocks per ``(num_kv_heads, q_token)``
+         pair (with ``init_blocks`` forced at the head and ``local_blocks``
+         forced at the tail).
+      2. A sparse GQA attention runs only over the selected blocks.
+
+    The selected backend at runtime uses
+    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.MiniMaxM3SparseAttention`
+    on top of a :class:`MiniMaxM3KVCacheManagerV2` that allocates a
+    paged side index-K cache (``[num_slots, 1, sparse_index_dim]``)
+    parallel to the main K/V cache. The M3 checkpoint sets
+    ``disable_index_value=True`` on every sparse layer so no index V
+    cache is allocated for the bring-up.
+    """
+
+    algorithm: Literal["minimax_m3"] = "minimax_m3"
+    sparse_num_index_heads: int = Field(
+        default=4,
+        description="Number of index-attention heads (per TP rank's view).",
+    )
+    sparse_index_dim: int = Field(
+        default=128,
+        description="Per-head index Q/K dimension.",
+    )
+    sparse_block_size: int = Field(
+        default=128,
+        description="Block size used by per-block scoring + top-k selection.",
+    )
+    sparse_topk_blocks: int = Field(
+        default=16,
+        description="Number of top-k blocks per (kv_head, q_token).")
+    sparse_init_blocks: int = Field(
+        default=0,
+        description=
+        "Number of leading blocks forced into the top-k regardless of score.",
+    )
+    sparse_local_blocks: int = Field(
+        default=1,
+        description=
+        "Number of trailing blocks forced into the top-k regardless of score.",
+    )
+    sparse_score_type: Literal["max"] = Field(
+        default="max",
+        description="Per-block score reduction; the M3 checkpoint sets 'max'.",
+    )
+    sparse_disable_index_value: bool = Field(
+        default=True,
+        description="If True, skip the index V branch (M3 checkpoint default).",
+    )
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def get_indices_block_size(self) -> int:
+        return self.sparse_block_size
 
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
@@ -388,8 +448,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """
-        Whether to capture separate CUDA graphs for short and long sequences.
+        """Whether to capture separate CUDA graphs for short and long sequences.
         Use seq_len_threshold to determine the threshold for separating short and long sequences.
         """
         self.seq_len_threshold = self.index_topk
@@ -476,8 +535,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
-    """
-    Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
+    """Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
 
     This model holds configuration data (`num_slots`, etc.) as well as
     runtime state (`_ep_rank`, `_ep_size`) which must be set via the
@@ -496,8 +554,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
     # --- Methods ---
 
     def setup(self, ep_rank: int, ep_size: int) -> None:
-        """
-        Initializes the runtime state of the configuration.
+        """Initializes the runtime state of the configuration.
         This must be called before accessing properties like `num_local_slots`.
         """
         self._ep_rank = ep_rank
@@ -1004,8 +1061,7 @@ class DecodingBaseConfig(StrictBaseModel):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        """
-        Override if the speculation algorithm does not support
+        """Override if the speculation algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -1034,8 +1090,7 @@ class DecodingBaseConfig(StrictBaseModel):
 
 
 class KvCacheConnectorConfig(StrictBaseModel):
-    """
-    Configuration for the KV Cache Connector.
+    """Configuration for the KV Cache Connector.
 
     Can be configured either by specifying a named preset via ``connector``
     (e.g. ``"lmcache"``), or by providing explicit ``connector_module``,
@@ -1313,8 +1368,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
-        """
-        Returns the number of layers to capture of the target model.
+        """Returns the number of layers to capture of the target model.
         If eagle3_layers_to_capture is not None, return the length of the set.
         Otherwise, assume Eagle3 base set and return 3.
         """
@@ -1430,8 +1484,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self):
-        """
-        Returns the number of layers to save.
+        """Returns the number of layers to save.
         The following hidden states are saved:
         - If eagle3_layers_to_capture is None, save the eagle3 base set plus
         the post norm last hidden state.
@@ -1806,8 +1859,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for auto speculative decoding.
+    """Configuration for auto speculative decoding.
 
     This config will automatically select a good, draft-model free
     speculation algorithm with some heuristic.
@@ -1827,8 +1879,7 @@ class AutoDecodingConfig(DecodingBaseConfig):
 
 
 class PrometheusMetricsConfig(StrictBaseModel):
-    """
-    Configuration for Prometheus metrics collection.
+    """Configuration for Prometheus metrics collection.
 
     Groups all Prometheus-related parameters including custom histogram bucket
     boundaries for latency metrics.
@@ -1908,8 +1959,7 @@ class PrometheusMetricsConfig(StrictBaseModel):
 
 
 class RayPlacementConfig(StrictBaseModel):
-    """
-    Configuration for Ray GPU workers placement.
+    """Configuration for Ray GPU workers placement.
     Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
@@ -1975,8 +2025,8 @@ class RayPlacementConfig(StrictBaseModel):
 class ExecutorMemoryType(StrEnum):
     """Types of GPU memory used by executor.
 
-     These are used by the sleep/wakeup feature to target specific type of memory.
-     """
+    These are used by the sleep/wakeup feature to target specific type of memory.
+    """
     SAMPLER = "sampler"
     DRAFTER = "drafter"
     GUIDED_DECODER = "guided_decoder"
@@ -2096,9 +2146,9 @@ class SleepConfig(StrictBaseModel):
 
 
 class PybindMirror(ABC):
-    ''' A class containing the utilities for mirroring Python classes to
+    """A class containing the utilities for mirroring Python classes to
     pybind classes.
-    '''
+    """
 
     @abstractmethod
     def _to_pybind(self):
@@ -2114,8 +2164,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def mirror_pybind_fields(pybind_class):
-        """
-        Class decorator that ensures Python class fields mirror those of a C++ class.
+        """Class decorator that ensures Python class fields mirror those of a C++ class.
 
         Args:
             pybind_class: The C++ class whose fields should be mirrored
@@ -2144,7 +2193,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def get_pybind_enum_fields(pybind_class):
-        ''' Get all the enum fields from the pybind class. '''
+        """Get all the enum fields from the pybind class."""
         return [
             f for f in pybind_class.__members__.keys()
             if not f.startswith('_') and not callable(getattr(pybind_class, f))
@@ -2152,7 +2201,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def mirror_pybind_enum(pybind_class):
-        ''' Mirror the enum fields from the pybind class to the Python class. '''
+        """Mirror the enum fields from the pybind class to the Python class."""
 
         def decorator(cls):
             assert issubclass(cls, Enum)
@@ -2170,7 +2219,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def get_pybind_variable_fields(config_cls):
-        ''' Get all the variable fields from the pybind class. '''
+        """Get all the variable fields from the pybind class."""
         return [
             f for f in dir(config_cls)
             if not f.startswith('_') and not callable(getattr(config_cls, f))
@@ -2178,7 +2227,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def pybind_equals(obj0, obj1):
-        ''' Check if two pybind objects are equal. '''
+        """Check if two pybind objects are equal."""
         assert type(obj0) is type(obj1)
         for field in PybindMirror.get_pybind_variable_fields(type(obj0)):
             if getattr(obj0, field) != getattr(obj1, field):
@@ -2271,7 +2320,7 @@ class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
 
 @PybindMirror.mirror_pybind_enum(_ContextChunkingPolicy)
 class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
-    ''' Context chunking policy. '''
+    """Context chunking policy."""
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
     FORCE_CHUNK = "FORCE_CHUNK"
@@ -2477,6 +2526,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
+        MiniMaxM3SparseAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]
@@ -3560,12 +3610,11 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_model_format_misc(self):
-        '''
-        Load the model format, and do the following:
+        """Load the model format, and do the following:
 
         1. Load the build_config if got an engine.
         2. Load the parallel_config if got a checkpoint.
-        '''
+        """
         model_obj = _ModelWrapper(self.model)
 
         if model_obj.is_local_model and self.backend not in [
@@ -4372,7 +4421,7 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
-                f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+                "ray_worker_extension_cls is only supported with orchestrator_type='ray'"
             )
         return self
 
@@ -4507,7 +4556,7 @@ def update_llm_args_with_extra_options(llm_args: Dict,
 
 def get_model_format(model_dir: str,
                      trust_remote_code: bool = False) -> _ModelFormatKind:
-    ''' Get the format of the model.  '''
+    """Get the format of the model."""
     if not (Path(model_dir) / 'config.json').exists():
         raise ValueError(
             f"Failed to infer model format because no config.json exists in {model_dir}"
