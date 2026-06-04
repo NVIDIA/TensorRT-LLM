@@ -3031,6 +3031,9 @@ class PyExecutor:
                                    gpu_forward_end_event=gpu_forward_end,
                                    gpu_forward_events_from_iter_pool=
                                    gpu_forward_events_from_iter_pool))
+                elif gpu_forward_events_from_iter_pool:
+                    self._release_iter_timing_events(gpu_forward_start,
+                                                     gpu_forward_end)
 
                 self.iter_counter += 1
 
