@@ -14,8 +14,7 @@ slurm:
   account: "<account>"
   job_time: "00:30:00"
   job_name: "kvxfer_tune"
-  # Optional extra raw "#SBATCH" argument lines, e.g. ["--exclusive"].
-  extra_sbatch: []
+  extra_args: "" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
 
 hardware:
   # GPUs per node. N = gpus_per_node is the per-instance world size (ctx and gen
@@ -109,5 +108,12 @@ run:
   # set. Default 180 = 3 minutes (a healthy sweep finishes in ~1 min; raise this
   # if you add many cases/sweeps or use slow links).
   max_sweep_s: 180
-  # Set UCX_PROTO_INFO=used to capture the selected transport in stderr logs.
+  # Controls UCX_PROTO_INFO (the per-transfer transport shown as
+  # selected_transport in results.json). Accepts:
+  #   true  -> UCX_PROTO_INFO=used: compact/quiet (default). Keeps rank logs
+  #            small; on current UCX builds prints little, so selected_transport
+  #            is usually empty.
+  #   false -> do not set UCX_PROTO_INFO at all.
+  #   "y"   -> UCX_PROTO_INFO=y: full per-size protocol tables. Fills
+  #            selected_transport but is very verbose (~50x larger rank logs).
   capture_proto_info: true

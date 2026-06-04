@@ -34,8 +34,11 @@ PLACEHOLDER_PREFIX = "<"
 def parse_args():
     ap = argparse.ArgumentParser(description="Submit KV cache transceiver test")
     ap.add_argument("-c", "--config", required=True, help="Path to config YAML")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Validate and print the sbatch command without submitting")
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and print the sbatch command without submitting",
+    )
     return ap.parse_args()
 
 
@@ -56,8 +59,9 @@ def validate(cfg):
         errors.append("environment.container_image must be set")
     if not env.get("work_dir") or _is_placeholder(env.get("work_dir")):
         errors.append("environment.work_dir must be set")
-    if env.get("build_wheel") and (not env.get("trtllm_repo")
-                                   or _is_placeholder(env.get("trtllm_repo"))):
+    if env.get("build_wheel") and (
+        not env.get("trtllm_repo") or _is_placeholder(env.get("trtllm_repo"))
+    ):
         errors.append("environment.trtllm_repo must be set when build_wheel is true")
 
     n = cfg["hardware"]["gpus_per_node"]
@@ -67,19 +71,24 @@ def validate(cfg):
     if par["gen_tp"] * par["gen_pp"] != n:
         errors.append(f"gen_tp*gen_pp ({par['gen_tp']}*{par['gen_pp']}) != gpus_per_node ({n})")
     if par["ctx_tp"] != par["gen_tp"] or par["ctx_pp"] != par["gen_pp"]:
-        errors.append("layout must be symmetric (ctx_tp==gen_tp and ctx_pp==gen_pp) "
-                      "for the harness's local verification")
+        errors.append(
+            "layout must be symmetric (ctx_tp==gen_tp and ctx_pp==gen_pp) "
+            "for the harness's local verification"
+        )
 
     kv = cfg["kv_cache"]
     if kv["num_kv_heads"] % par["ctx_tp"] != 0:
-        errors.append(f"num_kv_heads ({kv['num_kv_heads']}) must be divisible by "
-                      f"tensor parallel size ({par['ctx_tp']})")
+        errors.append(
+            f"num_kv_heads ({kv['num_kv_heads']}) must be divisible by "
+            f"tensor parallel size ({par['ctx_tp']})"
+        )
     if kv["dtype"].upper() not in ("FP8", "HALF", "BF16"):
         errors.append(f"kv_cache.dtype must be FP8|HALF|BF16, got {kv['dtype']}")
     for rl in cfg["test_matrix"]["request_lengths"]:
         if rl > kv["max_tokens_in_buffer"]:
-            errors.append(f"request_length {rl} > max_tokens_in_buffer "
-                          f"({kv['max_tokens_in_buffer']})")
+            errors.append(
+                f"request_length {rl} > max_tokens_in_buffer ({kv['max_tokens_in_buffer']})"
+            )
 
     # RequestID encoding (shared with report.decode_rid):
     #   rid = case_idx*1_000_000 + reqlen_idx*10_000 + request_index
@@ -88,14 +97,18 @@ def validate(cfg):
     # alias across cases and bandwidth buckets get silently cross-contaminated.
     tm = cfg["test_matrix"]
     if len(tm["request_lengths"]) > 100:
-        errors.append(f"len(request_lengths) ({len(tm['request_lengths'])}) "
-                      f"must be <= 100 (RequestID encoding limit)")
+        errors.append(
+            f"len(request_lengths) ({len(tm['request_lengths'])}) "
+            f"must be <= 100 (RequestID encoding limit)"
+        )
     reqs_per_len = tm.get("warmup_requests", 0) + tm.get("num_requests_per_length", 0)
     if reqs_per_len >= 10_000:
-        errors.append(f"warmup_requests + num_requests_per_length ({reqs_per_len}) "
-                      f"must be < 10000 (RequestID encoding limit)")
+        errors.append(
+            f"warmup_requests + num_requests_per_length ({reqs_per_len}) "
+            f"must be < 10000 (RequestID encoding limit)"
+        )
 
-    for combination in (cfg["test_matrix"].get("combinations") or cfg["test_matrix"]["combos"]):
+    for combination in cfg["test_matrix"].get("combinations") or cfg["test_matrix"]["combos"]:
         rt = combination.get("runtime")
         be = combination.get("backend")
         if rt not in ("CPP", "PYTHON"):
@@ -112,9 +125,11 @@ def validate(cfg):
     per_cell = run.get("timeout_per_cell_s", 60)
     max_sweep = run.get("max_sweep_s", 300)
     if max_sweep <= per_cell:
-        errors.append(f"run.max_sweep_s ({max_sweep}) must be > "
-                      f"run.timeout_per_cell_s ({per_cell}) so a per-cell "
-                      f"hang is caught (and recorded) before the sweep cap")
+        errors.append(
+            f"run.max_sweep_s ({max_sweep}) must be > "
+            f"run.timeout_per_cell_s ({per_cell}) so a per-cell "
+            f"hang is caught (and recorded) before the sweep cap"
+        )
 
     if errors:
         print("Config validation failed:", file=sys.stderr)
@@ -159,15 +174,17 @@ def main():
         f"--job-name={slurm['job_name']}",
         "--nodes=2",
         f"--ntasks-per-node={n}",
-        f"--gres=gpu:{n}",
         # Keep the batch-level log in work_dir/logs alongside the per-rank logs,
         # CSVs and results.json. Omit --error so sbatch merges stderr into
         # --output (one combined ctt-%j.log). Overrides launch.slurm's #SBATCH
         # --output/--error, which cannot expand work_dir at parse time.
         f"--output={os.path.join(work_dir, 'logs', 'ctt-%j.log')}",
     ]
-    for extra in slurm.get("extra_sbatch", []) or []:
-        sbatch_cmd.append(extra)
+
+    slurm.setdefault("extra_args", "")
+    for arg in slurm["extra_args"].split():
+        if arg:
+            sbatch_cmd.append(arg)
     # Reset TMPDIR to a path that exists on the compute nodes. --export=ALL
     # propagates the submitting shell's TMPDIR, which may point at a login-node
     # -only temp dir; enroot/pyxis (GNU parallel) then fails to import the image
