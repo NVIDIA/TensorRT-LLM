@@ -19,6 +19,7 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
+from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
@@ -206,7 +207,7 @@ class CUDAGraphRunner:
             batch: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
             spec_resource_manager: Optional[BaseResourceManager] = None,
-            spec_metadata: Optional[Any] = None):
+            spec_metadata: Optional[SpecMetadata] = None):
         batch_size = batch.batch_size
 
         # Get the sequence length mode.
@@ -248,7 +249,7 @@ class CUDAGraphRunner:
         batch: ScheduledRequests,
         enable_spec_decode: bool,
         attn_metadata: Any,
-        spec_metadata: Optional[Any] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         draft_tokens_cuda: Optional[torch.Tensor] = None,
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
