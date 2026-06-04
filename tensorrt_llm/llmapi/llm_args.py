@@ -108,7 +108,6 @@ def Field(default: Any = ...,
     Returns:
         A Pydantic FieldInfo object with the status added to json_schema_extra if provided
     """
-
     if status is not None:
         json_schema_extra = kwargs.get('json_schema_extra', {})
         if isinstance(json_schema_extra, dict):
@@ -456,6 +455,69 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
         """
         return False
+
+
+class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
+    """Configuration for MiniMax-M3 block-sparse attention.
+
+    Drives the two-step sparse attention used by MiniMax-M3 layers 3..N:
+
+      1. An index attention branch projects a per-head Q vector and a
+         **single replicated** K vector, scores main K/V cache blocks,
+         and selects the top-``topk`` blocks per ``(num_kv_heads, q_token)``
+         pair (with ``init_blocks`` forced at the head and ``local_blocks``
+         forced at the tail).
+      2. A sparse GQA attention runs only over the selected blocks.
+
+    The selected backend at runtime uses
+    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.MiniMaxM3SparseAttention`
+    on top of a :class:`MiniMaxM3KVCacheManagerV2` that allocates a
+    paged side index-K cache (``[num_slots, 1, sparse_index_dim]``)
+    parallel to the main K/V cache. The M3 checkpoint sets
+    ``disable_index_value=True`` on every sparse layer so no index V
+    cache is allocated for the bring-up.
+    """
+
+    algorithm: Literal["minimax_m3"] = "minimax_m3"
+    sparse_num_index_heads: int = Field(
+        default=4,
+        description="Number of index-attention heads (per TP rank's view).",
+    )
+    sparse_index_dim: int = Field(
+        default=128,
+        description="Per-head index Q/K dimension.",
+    )
+    sparse_block_size: int = Field(
+        default=128,
+        description="Block size used by per-block scoring + top-k selection.",
+    )
+    sparse_topk_blocks: int = Field(
+        default=16,
+        description="Number of top-k blocks per (kv_head, q_token).")
+    sparse_init_blocks: int = Field(
+        default=0,
+        description=
+        "Number of leading blocks forced into the top-k regardless of score.",
+    )
+    sparse_local_blocks: int = Field(
+        default=1,
+        description=
+        "Number of trailing blocks forced into the top-k regardless of score.",
+    )
+    sparse_score_type: Literal["max"] = Field(
+        default="max",
+        description="Per-block score reduction; the M3 checkpoint sets 'max'.",
+    )
+    sparse_disable_index_value: bool = Field(
+        default=True,
+        description="If True, skip the index V branch (M3 checkpoint default).",
+    )
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def get_indices_block_size(self) -> int:
+        return self.sparse_block_size
 
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
@@ -2653,6 +2715,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
+        MiniMaxM3SparseAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]
