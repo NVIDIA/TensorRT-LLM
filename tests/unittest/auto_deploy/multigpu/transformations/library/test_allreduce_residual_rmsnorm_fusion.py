@@ -83,9 +83,9 @@ class AllreduceResidualNorm2(torch.nn.Module):
 class ARResidualNormReshape(torch.nn.Module):
     """AR+residual+RMSNorm with a reshape between the all-reduce and the residual add.
 
-    ``x`` is provided 3D ``[B, S, H]`` and the all-reduce output is reshaped to the 2D
-    residual ``[B*S, H]`` before the add (e.g. a TP linear output flattened onto a 2D
-    residual stream).
+    ``x`` is provided 2D ``[B*S, H]`` and the all-reduce output is reshaped (expanded) to
+    the 3D residual ``[B, S, H]`` before the add (e.g. a TP MLP/MoE output that is
+    all-reduced flat and reshaped back onto the 3D residual stream).
     """
 
     def __init__(self, hidden_size, dtype, strategy, add_order):
@@ -118,8 +118,8 @@ def _test_allreduce_fusion_variant(
     try:
         dtype = torch.float16
         hidden = 16
-        x = torch.randn(2, 8, hidden).to(dtype).cuda()
-        residual = torch.randn(16, hidden).to(dtype).cuda()
+        x = torch.randn(16, hidden).to(dtype).cuda()
+        residual = torch.randn(2, 8, hidden).to(dtype).cuda()
 
         model = ARResidualNormReshape(hidden, dtype, strategy, add_order)
         args = (x, residual)
