@@ -237,6 +237,8 @@ full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp
 full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=True] SKIP (https://nvbugs/5961814)
 full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False] SKIP (https://nvbugs/5961814)
 full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True] SKIP (https://nvbugs/5929339)
+full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=True-enable_gemm_allreduce_fusion=False] SKIP (https://nvbugs/6262407)
+full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4[torch_compile=False] SKIP (https://nvbugs/6262407)
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugs/5161074)
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugs/5161074)
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:w4a8_awq] SKIP (https://nvbugs/5161074)
