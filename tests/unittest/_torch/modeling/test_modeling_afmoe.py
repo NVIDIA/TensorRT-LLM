@@ -86,17 +86,15 @@ AFMOE_CONFIG = {
 }
 
 
-def _synthetic_tp_mapping(tp_size: int, enable_attention_dp: bool = False) -> Mapping:
+def _force_mpi_topology_mapping():
     # These tests inspect module TP attributes in one pytest process.  Force
     # the lightweight MPI-topology Mapping even when TLLM_DISABLE_MPI=1 would
     # otherwise require an initialized torch.distributed DeviceMesh.
-    with patch("tensorrt_llm.mapping.mpi_disabled", return_value=False):
-        return Mapping(
-            world_size=tp_size,
-            tp_size=tp_size,
-            rank=0,
-            enable_attention_dp=enable_attention_dp,
-        )
+    return patch("tensorrt_llm.mapping.mpi_disabled", return_value=False)
+
+
+def _force_mpi_collectives():
+    return patch("tensorrt_llm._torch.distributed.ops.mpi_disabled", return_value=False)
 
 
 def _shutdown_kv_cache_manager(kv_cache_manager: KVCacheManager) -> None:
@@ -288,10 +286,16 @@ class TestAfmoeSanity(unittest.TestCase):
         config_dict = deepcopy(AFMOE_CONFIG)
         afmoe_config = AfmoeConfig.from_dict(config_dict)
 
-        model_config = ModelConfig(pretrained_config=afmoe_config, quant_config=QuantConfig())
         dtype = afmoe_config.torch_dtype
         device = torch.device("cuda")
-        model = AfmoeForCausalLM(model_config).to(device)
+        with _force_mpi_topology_mapping():
+            mapping = Mapping(world_size=1, tp_size=1, rank=0)
+            model_config = ModelConfig(
+                pretrained_config=afmoe_config,
+                quant_config=QuantConfig(),
+                mapping=mapping,
+            )
+            model = AfmoeForCausalLM(model_config).to(device)
 
         input_ids = torch.tensor(
             [100, 200, 300, 100, 200, 100, 400, 500], dtype=torch.int, device=device
@@ -319,7 +323,6 @@ class TestAfmoeSanity(unittest.TestCase):
         else:
             raise ValueError("Invalid dtype")
 
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
@@ -358,7 +361,7 @@ class TestAfmoeSanity(unittest.TestCase):
         position_ids = torch.cat(position_ids).unsqueeze(0)
 
         try:
-            with torch.inference_mode():
+            with torch.inference_mode(), _force_mpi_collectives():
                 attn_metadata.prepare()
                 logits = model.forward(
                     input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
@@ -442,20 +445,27 @@ class TestAfmoeTPAttributes(unittest.TestCase):
     def _build_model(self, tp_size):
         config_dict = deepcopy(AFMOE_CONFIG)
         afmoe_config = AfmoeConfig.from_dict(config_dict)
-        mapping = _synthetic_tp_mapping(tp_size)
-        model_config = ModelConfig(
-            pretrained_config=afmoe_config, mapping=mapping, allreduce_strategy="NCCL"
-        )
-        return AfmoeForCausalLM(model_config)
+        with _force_mpi_topology_mapping():
+            mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=0)
+            model_config = ModelConfig(
+                pretrained_config=afmoe_config, mapping=mapping, allreduce_strategy="NCCL"
+            )
+            return AfmoeForCausalLM(model_config)
 
     def _build_attention_dp_model(self, tp_size):
         config_dict = deepcopy(AFMOE_CONFIG)
         afmoe_config = AfmoeConfig.from_dict(config_dict)
-        mapping = _synthetic_tp_mapping(tp_size, enable_attention_dp=True)
-        model_config = ModelConfig(
-            pretrained_config=afmoe_config, mapping=mapping, allreduce_strategy="NCCL"
-        )
-        return AfmoeForCausalLM(model_config)
+        with _force_mpi_topology_mapping():
+            mapping = Mapping(
+                world_size=tp_size,
+                tp_size=tp_size,
+                rank=0,
+                enable_attention_dp=True,
+            )
+            model_config = ModelConfig(
+                pretrained_config=afmoe_config, mapping=mapping, allreduce_strategy="NCCL"
+            )
+            return AfmoeForCausalLM(model_config)
 
     def test_qkv_is_column_parallel_with_output_gate(self):
         model = self._build_model(tp_size=1)
@@ -619,8 +629,10 @@ class TestAfmoeAllCloseToHF(unittest.TestCase):
             norm_topk_prob=self.HF_CONFIG["route_norm"],
         )
         afmoe_config = AfmoeConfig.from_dict(trt_config_dict)
-        model_config = ModelConfig(pretrained_config=afmoe_config)
-        model = AfmoeForCausalLM(model_config).to(dtype).to(device)
+        with _force_mpi_topology_mapping():
+            mapping = Mapping(world_size=1, tp_size=1, rank=0)
+            model_config = ModelConfig(pretrained_config=afmoe_config, mapping=mapping)
+            model = AfmoeForCausalLM(model_config).to(dtype).to(device)
 
         weights = self._convert_hf_experts(
             hf_model.state_dict(), self.HF_CONFIG["moe_intermediate_size"]
@@ -648,7 +660,7 @@ class TestAfmoeAllCloseToHF(unittest.TestCase):
             tokens_per_block=tokens_per_block,
             max_seq_len=num_blocks * tokens_per_block,
             max_batch_size=1,
-            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            mapping=mapping,
             dtype=tensorrt_llm.bindings.DataType.BF16,
         )
         kv_cache_manager.add_dummy_requests([0], [input_len])
@@ -666,7 +678,7 @@ class TestAfmoeAllCloseToHF(unittest.TestCase):
 
         try:
             hf_position_ids = position_ids.to(torch.long)
-            with torch.inference_mode():
+            with torch.inference_mode(), _force_mpi_collectives():
                 attn_metadata.prepare()
                 logits = model.forward(
                     input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
