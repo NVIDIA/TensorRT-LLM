@@ -789,6 +789,7 @@ accuracy/test_llm_api_pytorch.py::TestQwen3NextThinking::test_auto_dtype[tp4ep4]
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_auto_dtype[tp_size=8-ep_size=8] TIMEOUT (90)
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=0] TIMEOUT (90)
+accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] TIMEOUT (90)
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4] TIMEOUT (90)
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encode_matches_huggingface_classification[bert-yelp]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encode_matches_huggingface_per_token_reward[qwen2.5-prm-7b]
