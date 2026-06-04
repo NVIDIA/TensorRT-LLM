@@ -28,23 +28,27 @@ from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CalibConfig, ContextChunkingPolicy,
-                                          CudaGraphConfig, DecodingBaseConfig,
+                                          CudaGraphConfig,
+                                          DecodeCudaGraphConfig,
+                                          DecodingBaseConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
+                                          EncodeCudaGraphConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
-                                          PeftCacheConfig, PybindMirror,
-                                          RayPlacementConfig, SleepConfig,
-                                          SpeculativeConfig, StrictBaseModel,
-                                          TorchCompileConfig, TorchLlmArgs,
-                                          TrtLlmArgs,
+                                          MTPDecodingConfig, PeftCacheConfig,
+                                          PybindMirror, RayPlacementConfig,
+                                          SleepConfig, SpeculativeConfig,
+                                          StrictBaseModel, TorchCompileConfig,
+                                          TorchLlmArgs, TrtLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from tensorrt_llm.plugin import PluginConfig
@@ -77,6 +81,21 @@ def test_LookaheadDecodingConfig():
     assert pybind_config.max_window_size == 4
     assert pybind_config.max_ngram_size == 3
     assert pybind_config.max_verification_set_size == 4
+
+
+def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
+    config = MTPDecodingConfig()
+
+    # Unset max_draft_len stays None (the "use the model's
+    # num_nextn_predict_layers" sentinel) until resolved at model load.
+    assert config.max_draft_len is None
+    assert config.max_total_draft_tokens is None
+    assert "max_draft_len" not in config.model_fields_set
+
+    explicit_config = MTPDecodingConfig(max_draft_len=1)
+    assert explicit_config.max_draft_len == 1
+    assert explicit_config.max_total_draft_tokens == 1
+    assert "max_draft_len" in explicit_config.model_fields_set
 
 
 class TestYaml:
@@ -315,7 +334,6 @@ def test_KvCacheConfig_declaration():
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
                            max_attention_window=[1024, 1024, 1024],
-                           sink_token_length=32,
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
                            cross_kv_cache_fraction=0.5,
@@ -329,7 +347,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_block_reuse == True
     assert pybind_config.max_tokens == 1024
     assert pybind_config.max_attention_window == [1024, 1024, 1024]
-    assert pybind_config.sink_token_length == 32
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.cross_kv_cache_fraction == 0.5
@@ -764,6 +781,55 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.batch_sizes == CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, True)
         assert args.cuda_graph_config.max_batch_size == 128
+
+    def test_cuda_graph_config_legacy_alias_uses_decode_config(self):
+        config = CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True)
+
+        assert isinstance(config, DecodeCudaGraphConfig)
+        assert config.mode == "decode"
+        assert config.batch_sizes == [1, 2, 4]
+
+    def test_cuda_graph_config_accepts_encoder_config(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            cuda_graph_config=EncodeCudaGraphConfig(
+                                batch_sizes=[1, 4],
+                                num_tokens=[16, 64],
+                                seq_lens=[8, 32],
+                                enable_padding=True,
+                            ))
+
+        assert isinstance(args.cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.cuda_graph_config.mode == "encode"
+        assert args.cuda_graph_config.num_tokens == [16, 64]
+        assert args.cuda_graph_config.max_num_token == 64
+        assert args.cuda_graph_config.seq_lens == [8, 32]
+        assert args.cuda_graph_config.max_seq_len == 32
+
+    def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            cuda_graph_config={
+                "batch_sizes": [1, 4],
+                "num_tokens": [16, 64],
+                "seq_lens": [8, 32],
+                "enable_padding": True,
+            },
+        )
+
+        assert isinstance(args.cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.cuda_graph_config.mode == "encode"
+
+    def test_cuda_graph_config_infers_decode_mode_from_raw_dict(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            cuda_graph_config={
+                "batch_sizes": [1, 4],
+                "enable_padding": True,
+            },
+        )
+
+        assert isinstance(args.cuda_graph_config, DecodeCudaGraphConfig)
+        assert args.cuda_graph_config.mode == "decode"
 
     @pytest.mark.parametrize("max_batch_size", [64, 129, 320])
     def test_generate_cuda_graph_batch_sizes_padding_edge_cases(
@@ -1317,6 +1383,37 @@ class TestStrictBaseModelArbitraryArgs:
             TorchCompileConfig(enable_fullgraph=True,
                                invalid_flag="should_fail")
         assert "invalid_flag" in str(exc_info.value)
+
+    def test_encode_only_rejects_piecewise_cuda_graph(self):
+        """Test that encode_only rejects unsupported piecewise CUDA graphs."""
+        with pytest.raises(
+                ValueError,
+                match="encode_only does not support piecewise CUDA graph"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                encode_only=True,
+                torch_compile_config=TorchCompileConfig(
+                    enable_piecewise_cuda_graph=True),
+            )
+
+    def test_encode_only_rejects_mm_encoder_only(self):
+        """Test that encode_only and mm_encoder_only cannot both be enabled."""
+        with pytest.raises(
+                ValueError,
+                match="encode_only and mm_encoder_only are mutually exclusive"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                encode_only=True,
+                mm_encoder_only=True,
+            )
+
+    def test_multimodal_encoder_rejects_encode_only(self):
+        """Test that MultimodalEncoder owns mm_encoder_only mode internally."""
+        encoder = object.__new__(MultimodalEncoder)
+        with pytest.raises(
+                ValueError,
+                match="MultimodalEncoder does not support encode_only"):
+            encoder._validate_mm_args_for_torch_backend({"encode_only": True})
 
     def test_trt_llm_args_arbitrary_args(self):
         """Test that TrtLlmArgs rejects arbitrary arguments."""

@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
+from tensorrt_llm.serve.visual_gen_metrics import build_visual_gen_timing_headers
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
 from tensorrt_llm.visual_gen.params import VisualGenParams
 
@@ -79,11 +80,15 @@ class _VideoRoutesMixin:
                 frame_rate=output.frame_rate or request.fps or params.frame_rate,
             )
             latency = time.perf_counter() - sync_video_start  # seconds
+            metrics = output.metrics
+            generation = metrics.generation if metrics is not None else 0.0
+            denoise = metrics.denoise if metrics is not None else 0.0
             logger.info(
                 f"Video {video_id} generated and encoded: "
-                f"latency={latency:.3f}s generation={getattr(output.metrics, 'generation', 0.0):.3f}s "
-                f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s"
+                f"latency={latency:.3f}s generation={generation:.3f}s "
+                f"denoise={denoise:.3f}s"
             )
+            headers = build_visual_gen_timing_headers(metrics)
 
             # TODO(TRTLLM-11579): the OpenAI Videos API does not yet define a
             # multi-file response, so we return only the first video as a file
@@ -96,6 +101,7 @@ class _VideoRoutesMixin:
                 actual_output_path,
                 media_type=media_type,
                 filename=actual_path.name,
+                headers=headers,
             )
 
         except ValueError as e:
@@ -271,15 +277,20 @@ class _VideoRoutesMixin:
                 frame_rate=output.frame_rate or request.fps or params.frame_rate,
             )
             latency = time.perf_counter() - background_start  # seconds
+            metrics = output.metrics
+            generation = metrics.generation if metrics is not None else 0.0
+            denoise = metrics.denoise if metrics is not None else 0.0
             logger.info(
                 f"Video {video_id} async-generated and encoded: "
-                f"latency={latency:.3f}s generation={getattr(output.metrics, 'generation', 0.0):.3f}s "
-                f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s"
+                f"latency={latency:.3f}s generation={generation:.3f}s "
+                f"denoise={denoise:.3f}s"
             )
             job = await VIDEO_STORE.get(video_id)
             if job:
                 job.status = "completed"
                 job.completed_at = int(time.time())
+                # TODO: Expose VisualGen timing metrics for async jobs once the
+                # OpenAI video job metadata contract includes server timings.
                 # Store the first path on output_path for single-video
                 # compatibility, and the full list on output_paths.
                 job.output_path = str(saved_paths[0])

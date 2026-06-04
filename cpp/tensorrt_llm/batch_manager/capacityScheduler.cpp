@@ -525,7 +525,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
                     crossKvCacheManager->schedulingRemoveSequence((*lastStartedReqIt)->mRequestId);
                 }
                 pausedRequests.emplace_back(*lastStartedReqIt);
-                TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
+                TLLM_LOG_INFO("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
                 reqItEnd = std::next(lastStartedReqIt).base();
             }
             else

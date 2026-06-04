@@ -50,6 +50,14 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
     config.draft_vocab_size = config.vocab_size
 
 
+def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
+                             num_tokens: int) -> Optional[torch.Tensor]:
+    """Slice speculative position IDs along the token dimension."""
+    if position_ids is None:
+        return None
+    return position_ids[..., :num_tokens]
+
+
 class Eagle3Attention(Attention):
 
     def __init__(
@@ -394,53 +402,65 @@ class Eagle3DraftModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        assert self.embed_tokens is not None
+        # When ``all_rank_num_tokens`` is supplied the caller wants this draft
+        # forward to run with a different attention-DP token distribution
+        # (e.g. the worker's per-step value); restore the original on exit so
+        # the next call sees the same attn_metadata it had on entry.
+        previous_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
+        try:
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
+            if inputs_embeds is None:
+                assert self.embed_tokens is not None
+                inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
-        assert hidden_states is not None
-        # NOTE: If hidden states from the target model have to be concatenated,
-        # ideally, we expect that to happen outside the model definition. This
-        # helps us avoid data-dependent control flow and gives us better CUDA
-        # graph coverage.
-        if self._eh_proj_before_attn:
-            input_embeds = self.enorm(inputs_embeds)
-            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-            hidden_states = self.eh_proj(hidden_states)
+            assert hidden_states is not None
+            # NOTE: If hidden states from the target model have to be concatenated,
+            # ideally, we expect that to happen outside the model definition. This
+            # helps us avoid data-dependent control flow and gives us better CUDA
+            # graph coverage.
+            if self._eh_proj_before_attn:
+                input_embeds = self.enorm(inputs_embeds)
+                hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+                hidden_states = self.eh_proj(hidden_states)
 
-        residual = None
-        if self.num_layers > 1:
-            for layer in self.midlayer:
-                if residual is not None:
-                    hidden_states = hidden_states + residual
-                hidden_states, residual = layer(
+            residual = None
+            if self.num_layers > 1:
+                for layer in self.midlayer:
+                    if residual is not None:
+                        hidden_states = hidden_states + residual
+                    hidden_states, residual = layer(
+                        position_ids=position_ids,
+                        embeds=inputs_embeds,
+                        hidden_states=hidden_states,
+                        attn_metadata=attn_metadata,
+                        spec_metadata=spec_metadata,
+                    )
+            else:
+                hidden_states, residual = self.midlayer(
                     position_ids=position_ids,
                     embeds=inputs_embeds,
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
                 )
-        else:
-            hidden_states, residual = self.midlayer(
-                position_ids=position_ids,
-                embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-            )
 
-        hidden_states, hidden_states_to_save = self.norm(
-            hidden_states, residual)
-        if self._return_hidden_post_norm:
-            return hidden_states, hidden_states
-        return hidden_states, hidden_states_to_save
+            hidden_states, hidden_states_to_save = self.norm(
+                hidden_states, residual)
+            if self._return_hidden_post_norm:
+                return hidden_states, hidden_states
+            return hidden_states, hidden_states_to_save
+        finally:
+            if all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
 
 # We use Llama3 as the base architecture for EAGLE3 draft layers
@@ -624,14 +644,13 @@ class MistralLarge3DraftModel(DecoderModel):
         spec_metadata: SpecMetadata | None = None,
         hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert self.embed_tokens is not None
-
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
         if inputs_embeds is None:
+            assert self.embed_tokens is not None
             inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
         assert hidden_states is not None
@@ -1412,9 +1431,12 @@ class MTPForCausalLM(nn.Module):
             case "nemotron_h" | "nemotron_h_puzzle":
                 from .modeling_nemotron_h import NemotronHMTP
                 mtp_layer = NemotronHMTP
-            case "qwen3_next":
+            case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+            case "step3p7" | "step3p5":
+                from .modeling_step3p7 import Step3p7MTP
+                mtp_layer = Step3p7MTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -1750,9 +1772,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     # Slice along the first dimension
                     spec_input_ids = input_ids[:attn_metadata.num_tokens]
                 if position_ids is not None:
-                    # Slice along the last dimension
-                    spec_position_ids = position_ids[:, :attn_metadata.
-                                                     num_tokens]
+                    spec_position_ids = _slice_spec_position_ids(
+                        position_ids, attn_metadata.num_tokens)
 
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=spec_input_ids,

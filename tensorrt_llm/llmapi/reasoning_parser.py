@@ -96,7 +96,17 @@ class BaseReasoningParser(ABC):
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
+@register_reasoning_parser("laguna")
 @register_reasoning_parser("qwen3")
+# Qwen3.5 (and forced-thinking Qwen3 variants) use a chat template that
+# pre-injects `<think>\n` into the assistant prompt prefix, so the model
+# output begins inside the reasoning block with no opening tag to search
+# for. That requires `reasoning_at_start=True`. The existing `qwen3` key
+# keeps `reasoning_at_start=False` for back-compat, and `parse()` is
+# binary on this flag (it either requires `<think>` to be present in the
+# output, or assumes the output begins at the start of reasoning) - so
+# the two behaviors must be registered under separate keys.
+@register_reasoning_parser("qwen3_5", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
@@ -196,8 +206,9 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
-    "nemotron_h": "nano-v3",
-    "nemotron_h_puzzle": "nano-v3",
+    "laguna": "laguna",
+    "nemotron_h": "nemotron-v3",
+    "nemotron_h_puzzle": "nemotron-v3",
     "gemma4": "gemma4",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",
@@ -290,6 +301,7 @@ def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
     return MODEL_TYPE_TO_REASONING_PARSER.get(model_type)
 
 
+@register_reasoning_parser("nemotron-v3")
 @register_reasoning_parser("nano-v3")
 class NemotronV3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for Nemotron Nano v3.

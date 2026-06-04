@@ -67,8 +67,9 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
 
 
 def _set_quant_config(llm, model_id: str) -> None:
-    """Set quant_config on *llm* based on *model_id* so the accuracy harness
-    can resolve the correct thresholds.
+    """Set quant_config on *llm* based on *model_id*.
+
+    This lets the accuracy harness resolve the correct thresholds.
     """
     QUANT_ALGO_BY_MODEL_ID = {
         "fp8": {
@@ -148,19 +149,18 @@ def low_memory_overrides(config,
                          max_batch_size=32,
                          free_gpu_memory_fraction=0.4,
                          max_seq_len=8192,
-                         max_num_tokens=8192,
-                         cuda_graph_batch_sizes=None):
+                         max_num_tokens=8192):
     """Update and return config that reduce memory footprint for unquantized (bf16) runs."""
-    if cuda_graph_batch_sizes is None:
-        cuda_graph_batch_sizes = [
-            s for s in [1, 2, 4, 8, 16, 32, 64, 128] if s <= max_batch_size
-        ]
+    cuda_graph_batch_sizes = [
+        s for s in [1, 2, 4, 8, 16, 32, 64, 128] if s <= max_batch_size
+    ]
     config.update({
         "max_batch_size": max_batch_size,
         "max_seq_len": max_seq_len,
         "max_num_tokens": max_num_tokens,
         "cuda_graph_config": {
-            "batch_sizes": cuda_graph_batch_sizes
+            "batch_sizes": cuda_graph_batch_sizes,
+            "max_batch_size": max_batch_size,
         },
     })
     kv_cache_config = config.setdefault("kv_cache_config", {})
@@ -222,7 +222,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_seq_len": 2048,
             "compile_backend": "torch-simple",
         },
-        "triton_paged": {
+        "triton": {
             "max_batch_size": 128,
             "max_seq_len": 8192,
             "compile_backend": "torch-cudagraph",
@@ -294,7 +294,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             # For batch_size=32: 8.25 GiB KV + ~15 GiB weights ~= 23.3 GiB.
             # If batch size is increased, this parameterization must be gated at a higher memory threshold.
             "torch",
-            "triton_paged",
+            "triton",
         ],
     )
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
@@ -311,8 +311,10 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                 task.evaluate(llm, sampling_params=sampling_params)
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("world_size", [2, 4])
+    @pytest.mark.parametrize("world_size", [
+        pytest.param(2, marks=pytest.mark.skip_less_device(2)),
+        pytest.param(4, marks=pytest.mark.skip_less_device(4)),
+    ])
     def test_attention_dp(self, world_size):
         """Test attention data parallelism mode where TP sharding is disabled."""
         kwargs = self.get_default_kwargs(enable_chunked_prefill=True)
@@ -338,6 +340,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
 
     def get_default_kwargs(self, attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,
@@ -349,14 +352,13 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         compile_backend = "torch-cudagraph" if attn_backend == "trtllm" else "torch-simple"
 
         kwargs = {
+            "yaml_extra": yaml_paths,
             "attn_backend": attn_backend,
             "compile_backend": compile_backend,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "max_batch_size": 128,
             "max_seq_len": 8192,
             "max_num_tokens": 8192,
-            "skip_loading_weights": False,
             "enable_iter_perf_stats": True,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7
@@ -406,7 +408,9 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
                            attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         config = {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "attn_backend": attn_backend,
@@ -421,7 +425,6 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             "max_seq_len": 8192,
             # Set explicitly to match default build_config behavior
             "max_num_tokens": 8192,
-            "skip_loading_weights": False,
             "transforms": {
                 "compile_model": {
                     "backend": "torch-cudagraph",
@@ -458,6 +461,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
+                           world_size=1,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -494,7 +498,7 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
         task = GSM8K(self.MODEL_NAME)
         task.evaluate(llm)
 
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     def test_auto_dtype(self, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
@@ -706,30 +710,65 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize(
-        "world_size",
+        "model_id, world_size",
         [
             pytest.param(
+                "bf16",
                 4,
-                marks=pytest.mark.skip_less_device_memory(180000),
-                id="ws4_180gb",
+                marks=[
+                    pytest.mark.skip_less_device(4),
+                    pytest.mark.skip_less_device_memory(180000),
+                ],
+                id="bf16_ws4_180gb",
             ),
             pytest.param(
+                "fp8",
+                4,
+                marks=[
+                    pytest.mark.skip_less_device(4),
+                    pytest.mark.skip_less_device_memory(80000),
+                ],
+                id="fp8_ws4_80gb",
+            ),
+            pytest.param(
+                "nvfp4",
+                4,
+                marks=[
+                    pytest.mark.skip_less_device(4),
+                    pytest.mark.skip_less_device_memory(80000),
+                    skip_pre_blackwell,
+                ],
+                id="nvfp4_ws4_80gb",
+            ),
+            pytest.param(
+                "fp8",
                 8,
-                marks=pytest.mark.skip_less_device_memory(80000),
-                id="ws8_80gb",
+                marks=[
+                    pytest.mark.skip_less_device(8),
+                    pytest.mark.skip_less_device_memory(80000),
+                ],
+                id="fp8_ws8_80gb",
+            ),
+            pytest.param(
+                "nvfp4",
+                8,
+                marks=[
+                    pytest.mark.skip_less_device(8),
+                    pytest.mark.skip_less_device_memory(80000),
+                    skip_pre_blackwell,
+                ],
+                id="nvfp4_ws8_80gb",
             ),
         ],
     )
-    def test_mtp(self, world_size, attn_backend):
-        if get_device_count() < world_size:
-            pytest.skip(f"Not enough devices for world_size={world_size}")
+    def test_mtp(self, world_size, attn_backend, model_id):
 
-        model_path = self.MODEL_PATHS["bf16"]
+        model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
+        # TODO: gate for bf16 only after replay lands
         low_memory_overrides(
             kwargs,
             max_batch_size=8,
-            cuda_graph_batch_sizes=[1, 2, 4, 8],
         )
         kwargs["attn_backend"] = attn_backend
 
@@ -740,8 +779,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             kwargs["compile_backend"] = "torch-simple"
 
         print(
-            f"SuperV3 MTP params: world_size={world_size}, model_path={model_path}"
-        )
+            f"SuperV3 MTP params: model_id={model_id}, world_size={world_size}, "
+            f"model_path={model_path}")
         print(f"kwargs: {kwargs}")
 
         mtp_yaml = str(
@@ -759,9 +798,17 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 enable_iter_perf_stats=True,
                 **kwargs,
         ) as llm:
+            _set_quant_config(llm, model_id)
+            if model_id == "nvfp4":
+                llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            print_memory_usage("after engine build")
+
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            self.check_acceptance_rate(llm, min_acceptance_rate=0.45)
+            # bf16 acceptance is stable; fp8/nvfp4 have higher variance due to
+            # arithmetic rounding, so use a lower threshold for quantized models.
+            min_rate = 0.50 if model_id == "bf16" else 0.40
+            self.check_acceptance_rate(llm, min_acceptance_rate=min_rate)
 
         print_memory_usage("after evaluation")
 
@@ -826,7 +873,7 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for GLM-4.7-Flash variants"""
+    """Accuracy regression tests for GLM-4.7-Flash variants."""
 
     MODEL_NAME = "GLM-4.7-Flash"
     MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
@@ -840,7 +887,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
                            attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra("zai-org/GLM-4.7-Flash")
         config = {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "attn_backend": attn_backend,
@@ -859,28 +908,20 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16"
-            },
-            "transforms": {
-                "fuse_nvfp4_moe": {
-                    "allow_different_input_scales": True,
-                },
-                "multi_stream_moe": {
-                    "stage": "compile",
-                    "enabled": True,
-                },
-                "multi_stream_mla_attn": {
-                    "stage": "compile",
-                    "enabled": True,
-                },
             }
         }
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
             config[
                 "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
+            config.setdefault("transforms", {})
             config["transforms"]["compile_model"] = {
                 "piecewise_enabled": True,
             }
+        else:
+            # Keep the original non-chunked variant behavior even when
+            # registry defaults enable chunked prefill.
+            config["enable_chunked_prefill"] = False
         return config
 
     def get_default_sampling_params(self):
@@ -891,6 +932,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
@@ -933,10 +975,11 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
     def get_default_kwargs(self):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         return {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "skip_loading_weights": False,
             "enable_chunked_prefill": True,
             "max_batch_size": 64,
             "max_seq_len": 4096,
@@ -1109,10 +1152,12 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
     def get_default_kwargs(self):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         return {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "skip_loading_weights": False,
+            "attn_backend": "trtllm",
             "compile_backend": "torch-cudagraph",
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7,
@@ -1123,9 +1168,6 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": True,
             "cuda_graph_config": {
                 "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64]
-            },
-            "model_kwargs": {
-                "torch_dtype": "bfloat16",
             },
         }
 

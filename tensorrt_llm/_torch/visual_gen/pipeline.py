@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from pydantic import Field
 
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
@@ -15,7 +16,6 @@ from tensorrt_llm.mapping import Mapping
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
-from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 
@@ -171,10 +171,10 @@ class BasePipeline(nn.Module):
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
-        if not self.model_config.cuda_graph.enable_cuda_graph:
+        if not self.model_config.cuda_graph.enable:
             return
 
-        if self.model_config.torch_compile.enable_torch_compile:
+        if self.model_config.torch_compile.enable:
             logger.warning(
                 "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
             )
@@ -708,8 +708,7 @@ class BasePipeline(nn.Module):
         ulysses_size = vgm.ulysses_size if vgm else 1
         attn2d_row_size = vgm.attn2d_row_size if vgm else 1
         attn2d_col_size = vgm.attn2d_col_size if vgm else 1
-        attn2d_size = attn2d_row_size * attn2d_col_size
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
 
         is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
@@ -722,10 +721,9 @@ class BasePipeline(nn.Module):
                 if attn2d_row_size * attn2d_col_size > 1:
                     logger.info(
                         f"CFG Parallel: cfg_size={cfg_size}, "
-                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}"
+                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}, "
+                        f"ulysses_size={ulysses_size}"
                     )
-                else:
-                    logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
 
             # Split main embeddings
             if is_split_embeds:

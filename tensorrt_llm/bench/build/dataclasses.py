@@ -16,6 +16,22 @@ import struct
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     load_pretrained_config, get_qwen3_hybrid_layer_types)
 
+# Mapping from safetensors dtype strings to bytes per element.
+# Used to compute checkpoint size from per-dtype element counts.
+SAFETENSORS_DTYPE_BYTES = {
+    'F64': 8,
+    'F32': 4,
+    'F16': 2,
+    'BF16': 2,
+    'I64': 8,
+    'I32': 4,
+    'I16': 2,
+    'I8': 1,
+    'U8': 1,
+    'BOOL': 1,
+    'F8_E4M3': 1,
+}
+
 
 def parse_safetensors_file_metadata(model_path, filename):
 
@@ -121,6 +137,7 @@ class ModelConfig(BaseModel):
     name: str
     model_type: str
     param_count: int
+    checkpoint_size_in_gb: float = Field(default=0.0)
     num_hidden_layers: int = Field(validation_alias=AliasChoices(
         "num_hidden_layers",
         "n_layer",
@@ -181,17 +198,32 @@ class ModelConfig(BaseModel):
         return self
 
     @classmethod
-    def get_param_count(cls, model_hf_name, hf_model_path):
-        """ Read the parameter count from HF safetensor metadata. """
+    def get_param_count_and_checkpoint_size(cls, model_hf_name, hf_model_path):
+        """Read parameter count and checkpoint size from safetensors metadata.
+
+        Returns:
+            Tuple[int, float]: (param_count, checkpoint_size_in_gb).
+        """
         if model_hf_name == "EleutherAI/gpt-j-6b":  # GPT-J repo doesn't use safetensor format.
             param_count = 6053381344
+            checkpoint_size_in_gb = param_count * 2 / (1024**3)
         else:
             model_name_or_path = hf_model_path or model_hf_name
             metadata = get_safetensors_metadata(model_name_or_path)
             param_count = sum(metadata.parameter_count.values())
-        assert param_count, f"Can't get valid parameter count for model: {model_name_or_path}."
+            # Compute actual checkpoint size using per-dtype byte sizes.
+            # This is critical for quantized models (e.g. NVFP4) where
+            # different tensors have different dtypes (U8 for packed weights,
+            # BF16 for non-quantized layers, F8_E4M3 for scales, etc.).
+            checkpoint_size_in_bytes = sum(
+                count * SAFETENSORS_DTYPE_BYTES.get(dtype, 1)
+                for dtype, count in metadata.parameter_count.items())
+            checkpoint_size_in_gb = checkpoint_size_in_bytes / (1024**3)
+        if not param_count:
+            raise ValueError(f"Can't get valid parameter count for model: "
+                             f"{hf_model_path or model_hf_name}.")
 
-        return param_count
+        return param_count, checkpoint_size_in_gb
 
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
@@ -199,9 +231,14 @@ class ModelConfig(BaseModel):
                                                    or model_hf_name,
                                                    trust_remote_code=True)
         hf_config = pretrained_config.to_dict()
-        param_count = cls.get_param_count(model_hf_name, hf_model_path)
+        param_count, checkpoint_size_in_gb = (
+            cls.get_param_count_and_checkpoint_size(model_hf_name,
+                                                    hf_model_path))
 
-        return cls(name=model_hf_name, param_count=param_count, **hf_config)
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   checkpoint_size_in_gb=checkpoint_size_in_gb,
+                   **hf_config)
 
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
         return 0
@@ -273,7 +310,9 @@ class NemotronHybridConfig(ModelConfig):
                                                    or model_hf_name,
                                                    trust_remote_code=True)
         hf_config = pretrained_config.to_dict()
-        param_count = cls.get_param_count(model_hf_name, hf_model_path)
+        param_count, checkpoint_size_in_gb = (
+            cls.get_param_count_and_checkpoint_size(model_hf_name,
+                                                    hf_model_path))
 
         # HuggingFace PretrainedConfig.to_dict() only serializes attributes known to
         # the base class; custom configs (e.g. NemotronHConfig) have num_hidden_layers
@@ -298,7 +337,10 @@ class NemotronHybridConfig(ModelConfig):
                 if value is not None:
                     hf_config[key] = value
 
-        return cls(name=model_hf_name, param_count=param_count, **hf_config)
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   checkpoint_size_in_gb=checkpoint_size_in_gb,
+                   **hf_config)
 
 
 class Qwen3HybridConfig(ModelConfig):
@@ -315,25 +357,26 @@ class Qwen3HybridConfig(ModelConfig):
     num_linear_attention_layers: Optional[int] = Field(default=None)
     mamba_ssm_cache_dtype: Optional[str] = Field(default="auto")
 
-    @model_validator(mode="after")
-    def set_values_if_none(self):
-        """Derive num_attention_layers and num_linear_attention_layers.
+    @classmethod
+    def from_hf(cls, model_hf_name, hf_model_path):
+        pretrained_config = load_pretrained_config(hf_model_path
+                                                   or model_hf_name,
+                                                   trust_remote_code=True)
+        hf_config = pretrained_config.to_dict()
+        param_count, checkpoint_size_in_gb = (
+            cls.get_param_count_and_checkpoint_size(model_hf_name,
+                                                    hf_model_path))
 
-        Uses the HF config's layer_types / full_attention_interval.
-        """
-        if self.num_linear_attention_layers is None or self.num_attention_layers is None:
-            pretrained_config = load_pretrained_config(self.name,
-                                                       trust_remote_code=True)
-            layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
-            if self.num_attention_layers is None:
-                self.num_attention_layers = sum(1 for lt in layer_types
-                                                if lt == "full_attention")
-            if self.num_linear_attention_layers is None:
-                self.num_linear_attention_layers = sum(
-                    1 for lt in layer_types if lt == "linear_attention")
+        layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
+        hf_config.setdefault("num_attention_layers",
+                             layer_types.count("full_attention"))
+        hf_config.setdefault("num_linear_attention_layers",
+                             layer_types.count("linear_attention"))
 
-        super().set_values_if_none()
-        return self
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   checkpoint_size_in_gb=checkpoint_size_in_gb,
+                   **hf_config)
 
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
         d_inner = self.linear_value_head_dim * self.linear_num_value_heads

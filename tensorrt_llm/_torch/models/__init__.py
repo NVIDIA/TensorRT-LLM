@@ -13,6 +13,7 @@ from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
+from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
@@ -22,6 +23,7 @@ from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
+from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
@@ -46,6 +48,8 @@ from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_starcoder2 import Starcoder2ForCausalLM
+from .modeling_step3p7 import Step3p7ForCausalLM
+from .modeling_step3p7vl import Step3p7VLForConditionalGeneration
 from .modeling_t5 import T5ForConditionalGeneration
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
@@ -58,10 +62,12 @@ __all__ = [
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
+    "Exaone4_5_ForConditionalGeneration",
     "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
     "HCXVisionForCausalLM",
+    "LagunaForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
     "KimiK25ForConditionalGeneration",
@@ -100,6 +106,8 @@ __all__ = [
     "Qwen3VLModel",
     "MiniMaxM2ForCausalLM",
     "Cohere2ForCausalLM",
+    "Step3p7ForCausalLM",
+    "Step3p7VLForConditionalGeneration",
 ]
 
 if transformers.__version__ >= "4.45.1":

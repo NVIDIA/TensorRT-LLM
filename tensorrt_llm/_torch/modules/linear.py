@@ -1861,6 +1861,87 @@ class NVFP4LinearMethod(LinearMethodBase):
                     module.rebuild_tensor_metadata)
 
 
+class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
+    """W4A16 dequant fallback for NVFP4 on SM<100. Only used by
+    modeling_nemotron_h.  ``apply_linear_allreduce`` is inherited unchanged:
+    its fused path is SM>=100-gated upstream.
+    """
+
+    def post_load_weights(self, module: Linear):
+        # Skip parent's 32x16 weight padding (apply() accepts [N, K/2] as-is)
+        # and un-swizzle per-block scale once at load.
+        LinearMethodBase.post_load_weights(self, module)
+        pad_rows = fp4_utils.pad_up(module.out_features, 128)
+        pad_cols = fp4_utils.pad_up(
+            module.in_features // module.scaling_vector_size, 4)
+        scale_swizzled = module.weight_scale.data.view(
+            fp4_utils.float4_sf_dtype).reshape(pad_rows, pad_cols)
+        scale_linear = torch.ops.trtllm.block_scale_interleave_reverse(
+            scale_swizzled)
+        module.weight_scale.data.view(fp4_utils.float4_sf_dtype).copy_(
+            scale_linear.reshape(-1))
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        if isinstance(input, (Fp4QuantizedTensor, tuple)):
+            raise RuntimeError(
+                "W4A16NVFP4LinearMethod: hp input required; disable upstream "
+                "FP4 fusion (e.g. TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0)")
+
+        ## FP8 input from upstream FMHA pre-quant: invert by / module.inv_input_scale.
+        if input.dtype == torch.float8_e4m3fn:
+            assert module.inv_input_scale is not None, \
+                "W4A16NVFP4LinearMethod: FP8 input requires static inv_input_scale"
+            input = (input.to(module.dtype) / module.inv_input_scale).to(
+                module.dtype)
+
+        original_shape = None
+        if input.dim() > 2:
+            original_shape = input.shape
+            input = input.reshape(-1, input.shape[-1])
+
+        # NVFP4_AWQ pre_quant_scale (mirrors parent's _input_prepare branch).
+        if module.pre_quant_scale is not None:
+            assert input.dtype == module.pre_quant_scale.dtype, (
+                "Input dtype and pre_quant_scale dtype must match")
+            input = input * module.pre_quant_scale
+
+        from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
+            dequant_nvfp4_2d_triton
+        weight_deq = dequant_nvfp4_2d_triton(
+            module.weight.view(torch.uint8),
+            module.weight_scale,
+            module.weight_scale_2,
+            target_dtype=module.dtype,
+            sf_vec_size=module.scaling_vector_size,
+        )
+
+        if module.use_custom_cublas_mm:
+            output_buffer_kind = (
+                int(BufferKind.NCCL_WINDOW)
+                if self.supports_nccl_symmetric_memory_window_output
+                and module.all_reduce is not None
+                and module.all_reduce.uses_nccl_symmetric_memory_window() else
+                int(BufferKind.DEFAULT))
+            group = (module.mapping.tp_group
+                     if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
+                     and module.mapping is not None else None)
+            output = torch.ops.trtllm.cublas_mm(
+                input,
+                weight_deq.t(),
+                bias,
+                out_dtype=None,
+                output_buffer_kind=output_buffer_kind,
+                group=group,
+            )
+        else:
+            output = F.linear(input, weight_deq, bias)
+
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+        return output
+
+
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,

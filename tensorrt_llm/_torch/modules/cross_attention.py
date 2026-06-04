@@ -43,8 +43,9 @@ class CrossAttention(nn.Module):
 
     The cross-attention sub-layer honors ``ModelConfig.attn_backend``: when
     set to ``"TRTLLM"`` it dispatches through the production C++ attention op
-    on every supported architecture. Blackwell uses the ``trtllm_gen`` kernels,
-    while earlier architectures use the legacy ``thop.attention`` wrapper.
+    on every supported architecture. Cross-attention currently uses the THOP
+    attention path because the ``trtllm_gen`` backend API does not yet carry
+    encoder K/V tensors.
 
     Encoder and decoder self-attention are unaffected and continue to use
     whatever backend ``ModelConfig.attn_backend`` selects.

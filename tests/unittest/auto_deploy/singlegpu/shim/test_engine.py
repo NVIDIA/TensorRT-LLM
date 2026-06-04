@@ -175,7 +175,7 @@ class _DummyKVCacheManager:
         # Return many dummy page IDs; ADEngine will truncate as needed
         return list(range(1024))
 
-    def get_batch_cache_indices(self, request_ids):
+    def get_batch_cache_indices(self, request_ids, layer_idx=None):
         return [list(range(1024)) for _ in request_ids]
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
@@ -297,6 +297,7 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     req.multimodal_lengths = [4]
     # Flat prompt-length mask: text at [0,1,6,7], embeds at [2..5].
     req.py_multimodal_data = {
+        "mm_bidirectional_blocks": False,
         "multimodal_embed_mask_cumsum": torch.tensor(
             [False, False, True, True, True, True, False, False]
         )
@@ -313,6 +314,7 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     assert "mm_item_cu_seqlen" in named_args
     assert "mm_token_positions" in named_args
     assert "mm_token_lengths" in named_args
+    assert "mm_bidirectional_blocks" not in named_args
     assert "mm_special_offsets_cu_seqlen" in named_args
     assert "mm_special_offsets" in named_args
 
@@ -561,7 +563,7 @@ class _DummyHybridKVCacheManager:
             return list(range(num_blocks))
         return list(range(1024))
 
-    def get_batch_cache_indices(self, request_ids):
+    def get_batch_cache_indices(self, request_ids, layer_idx=None):
         return [list(range(1024)) for _ in request_ids]
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:

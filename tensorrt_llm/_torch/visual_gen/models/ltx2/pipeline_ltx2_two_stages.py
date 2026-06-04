@@ -39,11 +39,44 @@ from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_f
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+# Baseline BF16 peak memory ~75 GiB, saving BF16 weights snopshot total ~108 GiB.
+_BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
 
 
 # ---------------------------------------------------------------------------
 # LoRA helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_free_gpu_memory_gib() -> Optional[float]:
+    """Return free memory on the current CUDA device, or ``None`` if unavailable."""
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info()
+    except (RuntimeError, OSError) as exc:
+        logger.warning(f"Unable to query CUDA free memory for BF16 weight snapshots: {exc}")
+        return None
+
+    return free_bytes / (1024**3)
+
+
+def _should_save_bf16_weights(
+    threshold_gib: float = _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB,
+) -> bool:
+    free_gib = _get_free_gpu_memory_gib()
+    if free_gib is None:
+        logger.debug("BF16 weight snapshots disabled: CUDA free memory is unavailable")
+        return False
+
+    save_state = free_gib > threshold_gib
+    relation = ">" if save_state else "<="
+    logger.debug(
+        f"BF16 weight snapshots {'enabled' if save_state else 'disabled'}: "
+        f"free GPU memory {free_gib:.2f} GiB {relation} {threshold_gib:.2f} GiB threshold"
+    )
+    return save_state
 
 
 def _load_lora_deltas(
@@ -338,11 +371,12 @@ def _apply_lora_deltas(
     module: torch.nn.Module,
     deltas: Dict[str, torch.Tensor],
     sign: float = 1.0,
+    save_bf16_weights: bool = False,
 ) -> tuple:
     """Add (sign=+1) or remove (sign=-1) pre-computed LoRA deltas.
 
-    For standard (BF16/FP16) weights the delta is added directly and
-    later removed by subtracting the same delta.
+    For BF16 weights the delta is added directly and later removed either
+    by restoring an optional saved snapshot or by subtracting the same delta.
     For FP8-quantized weights (same shape, float8 dtype), we
     dequantize → apply → requantize.  FP4 weights are handled through
     the packed-FP4 branch because the current static and dynamic NVFP4
@@ -355,13 +389,15 @@ def _apply_lora_deltas(
     state afterwards.
 
     Returns ``(applied_count, saved_lora_state, snapshot_required_count)`` where
-    *saved_lora_state* maps each touched quantized parameter name to its
-    original tensor.  For packed FP4 it also stores the parent
+    *saved_lora_state* maps each touched snapshotted parameter name to its
+    original tensor.  BF16 weights are snapshotted only when
+    *save_bf16_weights* is true.  This does not change FP8 or FP4 LoRA
+    handling: those paths always snapshot quantized state.  For packed FP4 it
+    also stores the parent
     ``quant_method`` so that stage 2 can run with BF16 weights and then
     restore the exact original FP4 state without another quantization round
-    trip.  Dense BF16/FP16/FP32 weights are not stored in
-    *saved_lora_state*.  *snapshot_required_count* is the number of
-    quantized weights that must be restored from saved snapshots.
+    trip.  *snapshot_required_count* is the number of weights that must be
+    restored from saved snapshots.
     """
     applied = 0
     snapshot_required = 0
@@ -424,8 +460,11 @@ def _apply_lora_deltas(
                 ws_param.data.copy_(new_scale)
                 snapshot_required += 1
             else:
-                # BF16/FP16/FP32: direct in-place addition. These are
-                # restored by subtracting the same delta after stage 2.
+                if save_bf16_weights and param.dtype == torch.bfloat16:
+                    saved_state[param_name] = param.data.clone()
+                    snapshot_required += 1
+                # BF16: direct in-place addition, then restore by snapshot copy
+                # when memory allows. Other dense weights restore by subtraction.
                 param.data.add_(
                     delta.to(param.device, param.dtype),
                     alpha=sign,
@@ -580,13 +619,18 @@ def _restore_lora_state(
 # ---------------------------------------------------------------------------
 
 
+# Registered without ``hf_ids`` / ``defaults`` on purpose: this class is
+# only reached via ``LTX2Pipeline.resolve_variant()`` swap, never through
+# class-name dispatch from the registry, so its own discovery surface
+# entry would duplicate the canonical ``LTX2Pipeline`` entry above and
+# make ``supported_models()`` / ``pipeline_config()`` ambiguous.
 @register_pipeline("LTX2TwoStagesPipeline")
 class LTX2TwoStagesPipeline(LTX2Pipeline):
-    """Two-stage text-to-video with audio.
+    """Lightricks LTX-Video two-stage text-to-video with audio.
 
     Stage 1: denoise at half spatial resolution with full guidance.
-    Stage 2: learned 2x spatial upsample, refinement denoising
-             (distilled sigma schedule, no guidance, distilled LoRA),
+    Stage 2: learned 2x spatial upsample, refinement denoising with
+             the distilled sigma schedule (no guidance, distilled LoRA),
              then decode.
     """
 
@@ -608,7 +652,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         super().load_standard_components(
             checkpoint_dir,
             device,
-            skip_components,
+            skip_components=skip_components,
             **kwargs,
         )
 
@@ -803,11 +847,16 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # For FP4 models (static-packed or dynamic), stage 2 always runs in
         # BF16: the quant_method is swapped to UnquantizedLinearMethod inside
-        # _apply_lora_deltas and restored afterwards.  BF16 models are unaffected.
+        # _apply_lora_deltas and restored afterwards. FP8 handling is also
+        # unchanged and always restores from saved quantized state. BF16 weights
+        # save snapshots only when enough free GPU memory is available;
+        # otherwise they fall back to on-the-fly LoRA subtraction.
+        save_bf16_weights = _should_save_bf16_weights()
         n, saved_lora_state, snapshot_required = _apply_lora_deltas(
             self.transformer,
             self._distilled_lora_deltas,
             sign=1.0,
+            save_bf16_weights=save_bf16_weights,
         )
         logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
 
@@ -835,8 +884,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             self.transformer.set_ulysses_enabled(True)
             if snapshot_required and not saved_lora_state:
                 raise RuntimeError(
-                    "Quantized LoRA state was not saved; cannot safely restore "
-                    "FP8/FP4 stage 2 weights."
+                    "LoRA state was not saved; cannot safely restore stage 2 weights."
                 )
 
             snapshot_restored = 0
@@ -846,8 +894,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 _restore_lora_state(self.transformer, saved_lora_state)
                 snapshot_restored = _count_saved_lora_weight_tensors(saved_lora_state)
 
-            # Dense BF16/FP16/FP32 weights are not snapshotted; restore them by
-            # subtracting the LoRA deltas directly.
+            # BF16 weights that were not snapshotted, plus any other dense
+            # floating-point weights, are restored by subtracting LoRA deltas.
             dense_restored = _subtract_dense_lora_deltas(
                 self.transformer,
                 self._distilled_lora_deltas,

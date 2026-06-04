@@ -1,5 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/fused_sigmoid_gating_recurrent.py
 
+import os
 from typing import Optional
 
 import torch
@@ -7,6 +8,16 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.utils import custom_device_ctx
+from tensorrt_llm.logger import logger
+
+try:
+    # A missing build raises ImportError; a CuTe/CUTLASS mismatch raises
+    # RuntimeError (mirror FlashInfer's own guard) -> Triton fallback.
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
+        gated_delta_rule as _fi_gdn_decode_bf16_state_t1
+    _FLASHINFER_GDN_BF16_STATE_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _FLASHINFER_GDN_BF16_STATE_AVAILABLE = False
 
 
 @triton.heuristics({
@@ -98,8 +109,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             if idx >= 0:
                 tl.device_assert(idx < h0_dim0,
                                  "idx out of bounds in h0_source load")
-                p_h0 = (h0_source + idx * s_h0_0 + i_hv * K * V +
-                        o_k[:, None] * V + o_v[None, :])
+                # Pool layout [slots, HV, V, K] with K innermost (stride 1).
+                # b_h is logically [BK, BV]; element [k, v] lives at
+                # offset v*K + k within a (V, K) tile.
+                p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_k[:, None] +
+                        o_v[None, :] * K)
                 b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
         for _ in range(0, seq_T):
@@ -166,11 +180,102 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             if idx >= 0:
                 tl.device_assert(idx < h0_dim0,
                                  "idx out of bounds in h0_source store")
-                p_h0 = (h0_source + idx * s_h0_0 + i_hv * K * V +
-                        o_k[:, None] * V + o_v[None, :])
+                # Pool layout [slots, HV, V, K] with K innermost (stride 1).
+                p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_k[:, None] +
+                        o_v[None, :] * K)
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
         i_nh += grid_stride_nh
+
+
+def _can_use_flashinfer_gdn_decode(
+    initial_state_source: Optional[torch.Tensor],
+    K: int,
+    V: int,
+    T: int,
+    N: int,
+) -> bool:
+    """Check whether FlashInfer GDN bf16-state decode kernel can be used."""
+    # Env-var escape hatch for A/B comparison against the Triton fallback.
+    if os.environ.get("TRTLLM_FLA_DISABLE_FLASHINFER_GDN", "0") == "1":
+        return False
+    if not _FLASHINFER_GDN_BF16_STATE_AVAILABLE:
+        return False
+    if initial_state_source is None:
+        return False
+    if initial_state_source.dtype != torch.bfloat16:
+        return False
+    if K != 128 or V != 128:
+        return False
+    if N == 0:
+        return False
+    # Standard decode only: T is the flattened token total, so T == N forces
+    # exactly 1 token/sequence (making the [N, 1, ...] reshape valid). Varlen or
+    # multi-token batches (T != N) can't be reshaped from T alone -> Triton.
+    if T != N:
+        return False
+
+    return True
+
+
+def _flashinfer_gdn_decode(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float,
+    softplus_threshold: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float,
+    use_qk_l2norm_in_kernel: bool,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """GDN standard decode via the FlashInfer CuTe-DSL bf16-state kernel.
+
+    Guarded to ``T_per_seq == 1`` (uses ``gated_delta_rule``); the state pool +
+    indices are passed directly, no caller-side gather/scatter.
+    """
+    N = len(cu_seqlens) - 1
+    T_total = q.shape[1]
+    T_per_seq = T_total // N
+    HV = v.shape[2]
+    V = v.shape[3]
+
+    # Reshape from packed varlen [1, N*T, ...] to batched [N, T, ...].
+    q_bat = q.view(N, T_per_seq, q.shape[2], q.shape[3])
+    k_bat = k.view(N, T_per_seq, k.shape[2], k.shape[3])
+    v_bat = v.view(N, T_per_seq, v.shape[2], v.shape[3])
+    a_bat = a.view(N, T_per_seq, -1)
+    b_bat = b.view(N, T_per_seq, -1)
+
+    output = q.new_empty(N, T_per_seq, HV, V)
+
+    assert T_per_seq == 1, (
+        f"_flashinfer_gdn_decode expects standard decode (T_per_seq == 1), got "
+        f"{T_per_seq}; _can_use_flashinfer_gdn_decode should keep T == N")
+    _fi_gdn_decode_bf16_state_t1(
+        A_log=A_log,
+        a=a_bat,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        q=q_bat,
+        k=k_bat,
+        v=v_bat,
+        b=b_bat,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices.int(),
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        scale=scale,
+        output=output,
+    )
+
+    # Reshape output from [N, T, HV, V] back to [1, N*T, HV, V].
+    return output.reshape(1, T_total, HV, -1)
 
 
 def fused_sigmoid_gating_delta_rule_update(
@@ -193,11 +298,44 @@ def fused_sigmoid_gating_delta_rule_update(
     Fused triton implementation of sigmoid gating delta rule update.
     This function uses a single fused kernel that combines both sigmoid gating computation
     and the recurrent delta rule update for better performance.
+
+    When FlashInfer's CuTe-DSL GDN decode kernel is available and the state
+    dtype is bfloat16, dispatches to the faster FlashInfer path automatically.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
+    if scale is None:
+        scale = k.shape[-1]**-0.5
+    else:
+        assert scale > 0, "scale must be positive"
+
+    # Dispatch to FlashInfer CuTe-DSL kernel when available and conditions met.
+    if (cu_seqlens is not None and _can_use_flashinfer_gdn_decode(
+            initial_state_source, K, V, T, N)):
+        logger.info_once(
+            "Using FlashInfer CuTe-DSL kernel for GDN decode "
+            "(bf16 state, K=V=128)",
+            key="flashinfer_gdn_decode")
+        return _flashinfer_gdn_decode(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+        )
+
+    # Fallback: Triton kernel path.
     # Accept native view layouts from forward_decode rather than forcing packed
     # copies through input_guard.
     stride_q = q.stride(1)
@@ -211,11 +349,6 @@ def fused_sigmoid_gating_delta_rule_update(
     num_stages = 3
     num_warps = 1
 
-    if scale is None:
-        scale = k.shape[-1]**-0.5
-    else:
-        assert scale > 0, "scale must be positive"
-
     o = q.new_empty(NK, *v.shape)
     # (NK, NV, N * HV) is found faster than (N * HV, NV, NK)
     # As max of grid.z is 65535, we cap grid.z and let each Triton program
@@ -225,9 +358,10 @@ def fused_sigmoid_gating_delta_rule_update(
     if initial_state_source is not None:
         s_h0_0, s_h0_1, s_h0_2, s_h0_3 = initial_state_source.stride()
         slot_num = initial_state_source.shape[0]
+        # Pool layout is [slots, HV, V, K] with K innermost (stride 1).
         assert s_h0_3 == 1, f"s_h0_3: {s_h0_3} is not 1"
-        assert s_h0_2 == V, f"s_h0_2: {s_h0_2} is not {V}"
-        assert s_h0_1 == K * V, f"s_h0_1: {s_h0_1} is not {K * V}"
+        assert s_h0_2 == K, f"s_h0_2: {s_h0_2} is not {K}"
+        assert s_h0_1 == V * K, f"s_h0_1: {s_h0_1} is not {V * K}"
     else:
         s_h0_0 = 0
         slot_num = 0
