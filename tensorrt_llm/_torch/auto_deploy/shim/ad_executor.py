@@ -58,12 +58,13 @@ from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
-# Non-tensor multimodal metadata consumed by _store_prefill_multimodal_metadata.
+# Non-model multimodal metadata consumed before the exported graph or ignored by AD.
 # These keys must NOT leak into the generic extra_args dict — entries there
-# are expected to be tensors, and these are lists or nested dicts.
+# are expected to be tensors, and these may be scalars, lists, or nested dicts.
 _RESERVED_MM_DATA_KEYS = frozenset(
     {
         "layout_metadata",
+        "mm_bidirectional_blocks",
         "special_token_offsets",
         "multimodal_embed_mask_cumsum",
     }
