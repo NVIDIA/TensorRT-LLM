@@ -79,9 +79,10 @@ def test_gate_raises_on_mismatch():
         loader._check_gms_source_identity(_FakeGMSBackend(writer))
 
 
-def test_gate_inert_when_writer_identity_unavailable():
+def test_gate_raises_when_writer_identity_unavailable():
     # Publisher metadata not wired yet (get_source_identity returns None);
-    # the gate is inert and materialization proceeds without enforcement.
+    # GMS has no disk fallback, so unverified sharing must raise.
     local = _identity()
     loader = _new_loader(local)
-    loader._check_gms_source_identity(_FakeGMSBackend(None))
+    with pytest.raises(SourceIdentityMismatchError):
+        loader._check_gms_source_identity(_FakeGMSBackend(None))

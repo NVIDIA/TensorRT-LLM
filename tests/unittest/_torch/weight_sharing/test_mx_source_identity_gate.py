@@ -56,18 +56,18 @@ def test_gate_falls_back_on_mismatch():
     assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is False
 
 
-def test_gate_proceeds_when_no_local_identity():
-    # Legacy callers that don't supply an identity must not be gated.
+def test_gate_falls_back_when_no_local_identity():
+    # MX must not consume shared weights unless the receiver identity exists.
     loader = _new_loader(None, _identity())
-    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is True
+    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is False
 
 
-def test_gate_proceeds_when_source_identity_unavailable():
+def test_gate_falls_back_when_source_identity_unavailable():
     # Publisher identity not yet fetchable (upstream metadata channel pending);
-    # gate is inert and the transfer proceeds without SourceIdentity enforcement.
+    # reject P2P and fall back to disk rather than sharing unverified weights.
     local = _identity()
     loader = _new_loader(local, None, fetched=False)
-    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is True
+    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is False
 
 
 def test_fetch_source_identity_returns_none_until_upstream_wired():

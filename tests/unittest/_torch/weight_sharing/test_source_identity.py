@@ -184,11 +184,24 @@ def test_check_warn_fallback_on_match():
     assert decision.should_share is True
 
 
+def test_check_warn_fallback_on_missing_identity():
+    source = identity_from(FakeModelConfig())
+    decision = check_source_identity(None, source, IdentityCheckPolicy.WARN_FALLBACK)
+    assert decision.should_share is False
+    assert decision.match_result.mismatched_fields == ["local_identity"]
+
+
 def test_check_strict_raises_on_mismatch():
     local = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
     source = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
     with pytest.raises(SourceIdentityMismatchError):
         check_source_identity(local, source, IdentityCheckPolicy.STRICT)
+
+
+def test_check_strict_raises_on_missing_source_identity():
+    local = identity_from(FakeModelConfig())
+    with pytest.raises(SourceIdentityMismatchError):
+        check_source_identity(local, None, IdentityCheckPolicy.STRICT)
 
 
 def test_check_enforce_shares_despite_mismatch():

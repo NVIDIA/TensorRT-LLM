@@ -354,25 +354,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 (forwarded to the fetch seam).
 
         Returns:
-            ``True`` to proceed with P2P -- when no local identity was supplied
-            (legacy callers), the publisher's identity cannot be fetched yet
-            (publisher metadata is not wired yet), or the identities are
-            compatible. ``False`` only on a verified mismatch.
+            ``True`` to proceed with P2P only when both identities are present
+            and compatible. ``False`` when either identity is missing or the
+            identities mismatch, so the caller falls back to disk loading.
         """
         local_identity = self._local_source_identity
-        if local_identity is None:
-            return True
-
         source_identity = self._fetch_source_identity(checkpoint_dir, MxClient, build_identity)
-        if source_identity is None:
-            logger.warning_once(
-                "MX source SourceIdentity unavailable; proceeding with P2P "
-                "without SourceIdentity enforcement. Publisher metadata is "
-                "not wired yet; tracked by SOURCE-IDENTITY/MX-2.",
-                key="mx_source_identity_unavailable",
-            )
-            return True
-
         decision = check_source_identity(
             local_identity,
             source_identity,
@@ -392,7 +379,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
         Returns:
             The publisher's identity, or ``None`` when it cannot be fetched
-            yet (the gate is then inert).
+            yet (the compatibility gate then rejects P2P and falls back).
         """
         # TODO(SOURCE-IDENTITY/MX-2): read the publisher's identity from the MX
         # metadata channel (get_metadata / WorkerMetadata) once upstream

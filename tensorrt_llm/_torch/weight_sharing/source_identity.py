@@ -17,9 +17,9 @@
 A :class:`SourceIdentity` is a serializable fingerprint of configuration choices
 that affect how a model's weights are laid out in memory. It exists so that a
 *receiver* of pre-laid-out weights (e.g. MX peer-to-peer transfer, or a GMS
-read-only materialize) can verify, **once a producer identity is available**,
-that the producer ("source") and the consumer agree on every layout-affecting
-choice before the receiver consumes shared weights.
+read-only materialize) can verify that both the producer ("source") and the
+consumer built identities and agree on every layout-affecting choice before the
+receiver consumes shared weights.
 
 The identity is intentionally decoupled from any specific weight-sharing
 technology (neither MX nor GMS appears here). Both consume it identically::
@@ -33,7 +33,8 @@ technology (neither MX nor GMS appears here). Both consume it identically::
 
 The current MX and GMS call sites build the local receiver identity and expose a
 single fetch seam for publisher metadata. Until those publisher metadata seams
-are wired to real stored identities, the comparison is not enforced.
+are wired to real stored identities, missing source metadata rejects sharing
+(MX falls back to disk; GMS raises because it has no disk fallback path).
 
 Layered design
 --------------
@@ -159,8 +160,10 @@ class IdentityCheckPolicy(Enum):
     * ``WARN_FALLBACK`` (default): log a warning and fall back to non-shared
       loading. Never raises.
     * ``STRICT``: raise :class:`SourceIdentityMismatchError` on mismatch.
-    * ``ENFORCE``: always share regardless of mismatch (the caller explicitly
-      trusts the source, e.g. enforced cross-run sharing). Logs at debug.
+    * ``ENFORCE``: always share regardless of concrete-identity mismatch (the
+      caller explicitly trusts the source, e.g. enforced cross-run sharing).
+      Still requires both local and source identities to be present. Logs at
+      debug.
     """
 
     WARN_FALLBACK = "warn_fallback"
@@ -511,8 +514,8 @@ class SourceIdentity:
 
 
 def check_source_identity(
-    local: SourceIdentity,
-    source: SourceIdentity,
+    local: Optional[SourceIdentity],
+    source: Optional[SourceIdentity],
     policy: IdentityCheckPolicy = IdentityCheckPolicy.WARN_FALLBACK,
     *,
     compare_global: bool = True,
@@ -521,8 +524,10 @@ def check_source_identity(
     """Decide whether a receiver may consume ``source``'s shared weights.
 
     Args:
-        local: The receiver's own identity.
-        source: The producer's identity to validate against.
+        local: The receiver's own identity. ``None`` means the receiver did not
+            build an identity and cannot safely consume shared weights.
+        source: The producer's identity to validate against. ``None`` means the
+            producer identity is unavailable and cannot be verified.
         policy: How to react to a mismatch (see :class:`IdentityCheckPolicy`).
         compare_global: Compare the rank-independent config fingerprint.
         compare_shard: Compare the per-rank shard fingerprint.
@@ -535,6 +540,26 @@ def check_source_identity(
         SourceIdentityMismatchError: Under :attr:`IdentityCheckPolicy.STRICT`
             when the identities are incompatible.
     """
+    if local is None or source is None:
+        missing_fields: List[str] = []
+        if local is None:
+            missing_fields.append("local_identity")
+        if source is None:
+            missing_fields.append("source_identity")
+        result = IdentityMatchResult(matched=False, mismatched_fields=missing_fields)
+        message = (
+            "SourceIdentity unavailable for fields "
+            f"{missing_fields}; receiver cannot verify source weight layout."
+        )
+        if policy is IdentityCheckPolicy.STRICT:
+            raise SourceIdentityMismatchError(message)
+
+        if policy is IdentityCheckPolicy.ENFORCE:
+            logger.warning(f"{message} Cannot enforce shared weight loading.")
+        else:
+            logger.warning(f"{message} Falling back to non-shared weight loading.")
+        return IdentityCheckDecision(should_share=False, match_result=result, policy=policy)
+
     if policy is IdentityCheckPolicy.ENFORCE:
         result = local.matches(source, compare_global=False, compare_shard=False)
         if not result.matched:
