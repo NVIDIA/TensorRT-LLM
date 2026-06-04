@@ -14,11 +14,11 @@
 # limitations under the License.
 """Exercise the real MX checkpoint loader pre-transfer SourceIdentity gate.
 
-These tests drive ``MXCheckpointLoader._source_identity_compatible`` directly —
-the single decision point the MX ``load_weights`` path consults before starting
-a P2P transfer. Upstream ``modelexpress`` is never imported: the discovery
+These tests drive `MXCheckpointLoader._source_identity_compatible` directly —
+the single decision point the MX `load_weights` path consults before starting
+a P2P transfer. Upstream `modelexpress` is never imported: the discovery
 client / identity builder are passed as stubs, and the publisher-identity fetch
-seam is patched, so the gate logic runs against real ``SourceIdentity`` objects
+seam is patched, so the gate logic runs against real `SourceIdentity` objects
 without any model, GPU, or RDMA.
 """
 

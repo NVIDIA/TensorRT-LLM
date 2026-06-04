@@ -21,7 +21,7 @@ from tensorrt_llm._torch.weight_sharing.source_identity import (
     IdentityMatchResult,
     SourceIdentity,
     SourceIdentityMismatchError,
-    check_source_identity,
+    check_weight_sharing_compatibility,
 )
 
 __all__ = [
@@ -31,5 +31,5 @@ __all__ = [
     "IdentityCheckPolicy",
     "IdentityCheckDecision",
     "SourceIdentityMismatchError",
-    "check_source_identity",
+    "check_weight_sharing_compatibility",
 ]

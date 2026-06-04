@@ -14,12 +14,12 @@
 # limitations under the License.
 """Exercise the real GMS read-only pre-materialize SourceIdentity gate.
 
-These tests drive ``ModelLoader._check_gms_source_identity`` directly -- the
-single decision point the GMS RO path consults before ``materialize_module``.
+These tests drive `ModelLoader._check_gms_source_identity` directly -- the
+single decision point the GMS RO path consults before `materialize_module`.
 Unlike MX, GMS has no disk fallback, so a verified mismatch must *raise* under
-``STRICT`` rather than fall back. The ``ModelLoader`` is constructed via
-``__new__`` to bypass its heavy ``__init__``; the GMS backend is a stub
-exposing only ``get_source_identity`` so no GMS pool, GPU, or model is touched.
+`STRICT` rather than fall back. The `ModelLoader` is constructed via
+`__new__` to bypass its heavy `__init__`; the GMS backend is a stub
+exposing only `get_source_identity` so no GMS pool, GPU, or model is touched.
 """
 
 import pytest
@@ -31,7 +31,7 @@ from tensorrt_llm.llmapi.llm_args import LoadFormat
 
 
 class _FakeCheckpointLoader:
-    """Minimal checkpoint-loader stub exposing ``checkpoint_format``."""
+    """Minimal checkpoint-loader stub exposing `checkpoint_format`."""
 
     def __init__(self, checkpoint_format):
         self.checkpoint_format = checkpoint_format

@@ -35,7 +35,7 @@ from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
-    check_source_identity,
+    check_weight_sharing_compatibility,
 )
 
 
@@ -62,12 +62,13 @@ def test_backend_mismatch_flags_global():
     assert "backend_fingerprint" in result.mismatched_fields
 
 
-def test_model_layout_field_mismatch_flags_global():
+def test_model_layout_field_mismatch_flags_global_and_shard():
     a = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(hidden_size=4096)))
     b = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(hidden_size=8192)))
     result = a.matches(b)
     assert not result.matched
     assert "model_fingerprint" in result.mismatched_fields
+    assert "shard_fingerprint" in result.mismatched_fields
 
 
 def test_non_layout_model_metadata_does_not_affect_match():
@@ -76,7 +77,7 @@ def test_non_layout_model_metadata_does_not_affect_match():
     assert a.matches(b).matched
 
 
-def test_param_dtype_override_flags_global():
+def test_param_dtype_override_flags_shard():
     # Same config, but the constructed module realizes a different compute
     # dtype (a runtime override). A config-only projection would miss this;
     # the realized-layout fingerprint catches it.
@@ -89,7 +90,7 @@ def test_param_dtype_override_flags_global():
     )
     result = a.matches(b)
     assert not result.matched
-    assert "model_fingerprint" in result.mismatched_fields
+    assert "shard_fingerprint" in result.mismatched_fields
 
 
 def test_cross_architecture_same_shapes_flags_global():
@@ -164,7 +165,7 @@ def test_enforced_sharing_skips_global():
 
 def test_serialization_roundtrip():
     a = identity_from(FakeModelConfig())
-    restored = SourceIdentity.from_json(a.to_json())
+    restored = SourceIdentity.from_dict(a.to_dict())
     assert restored == a
     assert a.matches(restored).matched
 
@@ -172,7 +173,7 @@ def test_serialization_roundtrip():
 def test_check_warn_fallback_on_mismatch():
     local = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
     source = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
-    decision = check_source_identity(local, source, IdentityCheckPolicy.WARN_FALLBACK)
+    decision = check_weight_sharing_compatibility(local, source, IdentityCheckPolicy.WARN_FALLBACK)
     assert decision.should_share is False
     assert not decision.match_result.matched
 
@@ -180,13 +181,13 @@ def test_check_warn_fallback_on_mismatch():
 def test_check_warn_fallback_on_match():
     local = identity_from(FakeModelConfig())
     source = identity_from(FakeModelConfig())
-    decision = check_source_identity(local, source, IdentityCheckPolicy.WARN_FALLBACK)
+    decision = check_weight_sharing_compatibility(local, source, IdentityCheckPolicy.WARN_FALLBACK)
     assert decision.should_share is True
 
 
 def test_check_warn_fallback_on_missing_identity():
     source = identity_from(FakeModelConfig())
-    decision = check_source_identity(None, source, IdentityCheckPolicy.WARN_FALLBACK)
+    decision = check_weight_sharing_compatibility(None, source, IdentityCheckPolicy.WARN_FALLBACK)
     assert decision.should_share is False
     assert decision.match_result.mismatched_fields == ["local_identity"]
 
@@ -195,19 +196,19 @@ def test_check_strict_raises_on_mismatch():
     local = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
     source = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
     with pytest.raises(SourceIdentityMismatchError):
-        check_source_identity(local, source, IdentityCheckPolicy.STRICT)
+        check_weight_sharing_compatibility(local, source, IdentityCheckPolicy.STRICT)
 
 
 def test_check_strict_raises_on_missing_source_identity():
     local = identity_from(FakeModelConfig())
     with pytest.raises(SourceIdentityMismatchError):
-        check_source_identity(local, None, IdentityCheckPolicy.STRICT)
+        check_weight_sharing_compatibility(local, None, IdentityCheckPolicy.STRICT)
 
 
 def test_check_enforce_shares_despite_mismatch():
     local = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
     source = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
-    decision = check_source_identity(local, source, IdentityCheckPolicy.ENFORCE)
+    decision = check_weight_sharing_compatibility(local, source, IdentityCheckPolicy.ENFORCE)
     assert decision.should_share is True
 
 

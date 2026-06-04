@@ -22,10 +22,10 @@ consumer built identities and agree on every layout-affecting choice before the
 receiver consumes shared weights.
 
 The identity is intentionally decoupled from any specific weight-sharing
-technology (neither MX nor GMS appears here). Both consume it identically::
+technology (neither MX nor GMS appears here). Both consume it identically:
 
     local = SourceIdentity.from_model_config(model_config)
-    decision = check_source_identity(local, source_identity, policy)
+    decision = check_weight_sharing_compatibility(local, source_identity, policy)
     if decision.should_share:
         ...  # pull / materialize shared weights
     else:
@@ -40,15 +40,23 @@ Layered design
 --------------
 The fingerprint is split so comparison can be selective:
 
-* **global fingerprint** -- the realized parameter/buffer ``(shape, dtype)``
-  layout plus architecture identity, quantization, backend selection, fusion
-  flags, and the parallel *sizes* (TP/PP/EP/CP). This part must be identical
-  across every rank of a deployment.
-* **shard fingerprint** -- this rank's TP/PP/EP/CP *rank* slice. Receiver rank
-  ``N`` must align with the source rank that produced shard ``N``.
+* **global fingerprint** -- rank-invariant model identity, quantization,
+  backend selection, fusion flags, and parallel *sizes* (TP/PP/EP/CP).
+* **shard fingerprint** -- this rank's TP/PP/EP/CP *rank* slice plus the
+  realized local parameter/buffer `(shape, dtype)` layout. Receiver rank `N`
+  must align with the source rank that produced shard `N`.
 
 A caller that wants *enforced* sharing across otherwise-divergent runs can skip
-the global comparison (``compare_global=False``) and trust the source.
+the global comparison (`compare_global=False`) and trust the source.
+
+Adding fields
+-------------
+Add rank-invariant choices to one of the global builders below
+(`_build_model_fingerprint`, `_build_quant_fingerprint`,
+`_build_backend_fingerprint`, or `_build_parallel_fingerprint`). Add anything
+that can differ by rank or changes this rank's tensor names/shapes/dtypes to
+`_build_shard_fingerprint`. Add a focused unit test that mutates only the new
+field and verifies the expected fingerprint (`*_fingerprint`) mismatches.
 """
 
 from __future__ import annotations
@@ -72,22 +80,29 @@ if TYPE_CHECKING:
 # never match.
 SOURCE_IDENTITY_FORMAT_VERSION = 1
 
+_PRETRAINED_METADATA_FIELDS = frozenset(
+    {
+        "_name_or_path",
+        "auto_map",
+        "custom_pipelines",
+        "repository_url",
+        "transformers_version",
+    }
+)
+
 
 def _named_tensor_layout(model: Optional["nn.Module"]) -> Optional[dict]:
     """Project a module's realized parameter/buffer layout for hashing.
 
-    The realized ``(shape, dtype)`` of every parameter and buffer *is* the
-    ground truth for how a model's weights are laid out in memory -- far more
-    reliable than a hand-maintained allowlist of config fields, and naturally
-    backend-agnostic. It also captures runtime dtype overrides (which a
-    pretrained-config projection would miss) since it reads the constructed
-    module's actual tensors.
+    The realized `(shape, dtype)` of every parameter and buffer is the local
+    rank's weight layout. This catches shape-affecting config fields and
+    runtime dtype overrides without a hand-maintained model-field allowlist.
 
     Args:
-        model: The constructed (pre- or post-load) ``nn.Module``, or ``None``.
+        model: The constructed (pre- or post-load) `nn.Module`, or `None`.
 
     Returns:
-        A mapping of tensor name to ``[shape, dtype]``, or ``None`` when no
+        A mapping of tensor name to `[shape, dtype]`, or `None` when no
         module is available.
     """
     if model is None:
@@ -104,10 +119,29 @@ def _named_tensor_layout(model: Optional["nn.Module"]) -> Optional[dict]:
     return layout
 
 
+def _pretrained_config_payload(pretrained: Any) -> Any:
+    """Project rank-invariant pretrained config fields for hashing.
+
+    Args:
+        pretrained: A HuggingFace-style config object or `None`.
+
+    Returns:
+        A dict with metadata-only fields removed, or `None`.
+    """
+    if pretrained is None:
+        return None
+
+    to_dict = getattr(pretrained, "to_dict", None)
+    payload = to_dict() if callable(to_dict) else dict(getattr(pretrained, "__dict__", {}))
+    for name in _PRETRAINED_METADATA_FIELDS:
+        payload.pop(name, None)
+    return payload
+
+
 def _canonical_hash(obj: Any) -> str:
     """Compute a stable SHA-256 hash of an arbitrary JSON-able object.
 
-    Keys are sorted and non-JSON-serializable values fall back to ``str`` so
+    Keys are sorted and non-JSON-serializable values fall back to `str` so
     enums, dtypes, and similar config values hash deterministically.
 
     Args:
@@ -125,11 +159,11 @@ def _quant_to_dict(quant_config: Any) -> Any:
     """Project a quantization config to a JSON-able value for hashing.
 
     Args:
-        quant_config: A ``QuantConfig`` (pydantic model), an object exposing
-            ``to_dict``, or ``None``.
+        quant_config: A `QuantConfig` (pydantic model), an object exposing
+            `to_dict`, or `None`.
 
     Returns:
-        ``None`` when no config is given, the config's dict projection when one
+        `None` when no config is given, the config's dict projection when one
         is available, otherwise its string representation.
     """
     if quant_config is None:
@@ -157,10 +191,10 @@ class IdentityMatchResult:
 class IdentityCheckPolicy(Enum):
     """How a receiver reacts to an identity mismatch.
 
-    * ``WARN_FALLBACK`` (default): log a warning and fall back to non-shared
+    * `WARN_FALLBACK` (default): log a warning and fall back to non-shared
       loading. Never raises.
-    * ``STRICT``: raise :class:`SourceIdentityMismatchError` on mismatch.
-    * ``ENFORCE``: always share regardless of concrete-identity mismatch (the
+    * `STRICT`: raise :class:`SourceIdentityMismatchError` on mismatch.
+    * `ENFORCE`: always share regardless of concrete-identity mismatch (the
       caller explicitly trusts the source, e.g. enforced cross-run sharing).
       Still requires both local and source identities to be present. Logs at
       debug.
@@ -177,7 +211,7 @@ class SourceIdentityMismatchError(RuntimeError):
 
 @dataclass(frozen=True)
 class IdentityCheckDecision:
-    """Result of :func:`check_source_identity`."""
+    """Result of :func:`check_weight_sharing_compatibility`."""
 
     should_share: bool
     match_result: IdentityMatchResult
@@ -197,8 +231,7 @@ class SourceIdentity:
     # --- per-rank part (rank N must align with source rank N) ---
     rank: int
     shard_fingerprint: str
-    # Plaintext discovery descriptor for layers needing cleartext rather than
-    # hashes (e.g. MX ``list_sources``). Not compared by matches().
+    # Cleartext discovery descriptor (e.g. MX `list_sources`); not compared.
     model_name: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
@@ -218,22 +251,20 @@ class SourceIdentity:
         """Build an identity from a torch-backend :class:`ModelConfig`.
 
         Args:
-            model_config: The resolved torch-backend ``ModelConfig`` whose
+            model_config: The resolved torch-backend `ModelConfig` whose
                 quantization, backend, and parallel choices are fingerprinted.
-            model: The constructed ``nn.Module``. Its realized parameter and
-                buffer ``(shape, dtype)`` map is the layout ground truth for
-                the model fingerprint. Both producer and consumer must build
-                the identity at the same lifecycle point (model construction,
-                before weight load) so the projection is comparable. When
-                ``None``, the model fingerprint degrades to architecture
-                metadata only.
+            model: The constructed `nn.Module`. Its realized parameter/buffer
+                `(shape, dtype)` map is included in the shard fingerprint.
+                Producer and consumer must build the identity at the same
+                lifecycle point (model construction, before weight load). When
+                `None`, the shard fingerprint contains no tensor-layout data.
             model_name: Human-readable model identity used by discovery layers
                 (e.g. the MX server's source catalog). Does not affect the
                 compatibility fingerprints.
 
         Returns:
             A fully populated :class:`SourceIdentity` for
-            ``model_config.mapping.rank``.
+            `model_config.mapping.rank`.
         """
         mapping = model_config.mapping
         rank = getattr(mapping, "rank", 0)
@@ -244,12 +275,12 @@ class SourceIdentity:
 
         return cls(
             format_version=SOURCE_IDENTITY_FORMAT_VERSION,
-            model_fingerprint=cls._build_model_fingerprint(model_config, model),
+            model_fingerprint=cls._build_model_fingerprint(model_config),
             quant_fingerprint=cls._build_quant_fingerprint(model_config),
             backend_fingerprint=cls._build_backend_fingerprint(model_config),
             parallel_fingerprint=cls._build_parallel_fingerprint(mapping),
             rank=rank,
-            shard_fingerprint=cls._build_shard_fingerprint(mapping),
+            shard_fingerprint=cls._build_shard_fingerprint(mapping, model),
             model_name=model_name,
             tp_size=getattr(mapping, "tp_size", 1),
             pp_size=getattr(mapping, "pp_size", 1),
@@ -258,44 +289,29 @@ class SourceIdentity:
         )
 
     @staticmethod
-    def _build_model_fingerprint(model_config: "ModelConfig", model: Optional["nn.Module"]) -> str:
-        """Hash the realized weight layout plus a model-identity guard.
+    def _build_model_fingerprint(model_config: "ModelConfig") -> str:
+        """Hash rank-invariant model configuration fields.
 
-        The layout is taken from the constructed module's parameter and buffer
-        ``(shape, dtype)`` map -- the ground truth for how weights are laid out
-        in memory. ``architectures``/``model_type`` are folded in as a cheap
-        guard so two unrelated models that happen to share identical tensor
-        shapes (a layout collision) still fingerprint differently.
+        Rank-local tensor layout belongs to `_build_shard_fingerprint`.
 
         Args:
-            model_config: The resolved torch-backend ``ModelConfig``.
-            model: The constructed ``nn.Module`` (may be ``None``).
+            model_config: The resolved torch-backend `ModelConfig`.
 
         Returns:
-            A hex digest covering the realized parameter/buffer layout and the
-            model's architecture identity.
+            A hex digest covering model architecture and topology choices.
         """
         pretrained = getattr(model_config, "pretrained_config", None)
-        payload = {
-            "architectures": (
-                list(getattr(pretrained, "architectures", None) or [])
-                if pretrained is not None
-                else None
-            ),
-            "model_type": getattr(pretrained, "model_type", None) if pretrained else None,
-            "params": _named_tensor_layout(model),
-        }
-        return _canonical_hash(payload)
+        return _canonical_hash(_pretrained_config_payload(pretrained))
 
     @staticmethod
     def _build_quant_fingerprint(model_config: "ModelConfig") -> str:
         """Hash the quantization configuration.
 
         Args:
-            model_config: The resolved torch-backend ``ModelConfig``.
+            model_config: The resolved torch-backend `ModelConfig`.
 
         Returns:
-            A hex digest covering ``quant_config``, ``quant_config_dict``, and
+            A hex digest covering `quant_config`, `quant_config_dict`, and
             the dynamic-quantization flag.
         """
         payload = {
@@ -315,7 +331,7 @@ class SourceIdentity:
         """Hash the kernel-backend and fusion selections.
 
         Args:
-            model_config: The resolved torch-backend ``ModelConfig``.
+            model_config: The resolved torch-backend `ModelConfig`.
 
         Returns:
             A hex digest covering attention/MoE backends, allowed GEMM
@@ -351,7 +367,7 @@ class SourceIdentity:
         """Hash the parallel layout *sizes* (identical across all ranks).
 
         Args:
-            mapping: The deployment ``Mapping``.
+            mapping: The deployment `Mapping`.
 
         Returns:
             A hex digest covering TP/PP/CP/EP sizes and attention-DP settings.
@@ -375,16 +391,18 @@ class SourceIdentity:
         return _canonical_hash(payload)
 
     @staticmethod
-    def _build_shard_fingerprint(mapping: "Mapping") -> str:
-        """Hash the per-rank slice this rank owns of the parallel layout.
+    def _build_shard_fingerprint(mapping: "Mapping", model: Optional["nn.Module"]) -> str:
+        """Hash this rank's parallel slice and realized tensor layout.
 
         Args:
-            mapping: The deployment ``Mapping``.
+            mapping: The deployment `Mapping`.
+            model: The constructed `nn.Module` (may be `None`).
 
         Returns:
-            A hex digest covering the rank's TP/PP/CP/EP rank indices.
+            A hex digest covering this rank's TP/PP/CP/EP rank indices and
+            local parameter/buffer `(shape, dtype)` layout.
         """
-        payload = {"rank": getattr(mapping, "rank", 0)}
+        payload = {"rank": getattr(mapping, "rank", 0), "params": _named_tensor_layout(model)}
         for attr in ("tp_rank", "pp_rank", "cp_rank", "moe_tp_rank", "moe_ep_rank"):
             try:
                 payload[attr] = getattr(mapping, attr, None)
@@ -410,17 +428,17 @@ class SourceIdentity:
     def matches(
         self, other: "SourceIdentity", *, compare_global: bool = True, compare_shard: bool = True
     ) -> IdentityMatchResult:
-        """Compare this identity against ``other``.
+        """Compare this identity against `other`.
 
         Args:
             other: The identity to compare against (typically the source's).
             compare_global: Compare the rank-independent config fingerprint.
-                Set ``False`` for enforced sharing across divergent runs.
+                Set `False` for enforced sharing across divergent runs.
             compare_shard: Compare the per-rank shard fingerprint.
 
         Returns:
-            An :class:`IdentityMatchResult` whose ``matched`` flag is ``True``
-            only when every compared field agrees; ``mismatched_fields`` lists
+            An :class:`IdentityMatchResult` whose `matched` flag is `True`
+            only when every compared field agrees; `mismatched_fields` lists
             the field names that diverged.
         """
         mismatched: List[str] = []
@@ -449,8 +467,9 @@ class SourceIdentity:
         """Project the identity to a plain JSON-able dict.
 
         Returns:
-            A dict carrying every field, suitable for storage by a publisher
-            and reconstruction via :meth:`from_dict`.
+            A dict carrying every field, suitable for publisher metadata and
+            reconstruction via :meth:`from_dict`. Callers that need JSON can
+            serialize this dict at the boundary.
         """
         return {
             "format_version": self.format_version,
@@ -492,28 +511,8 @@ class SourceIdentity:
             dtype=data.get("dtype"),
         )
 
-    def to_json(self) -> str:
-        """Serialize the identity to a canonical JSON string.
 
-        Returns:
-            A deterministic (sorted-key) JSON encoding of :meth:`to_dict`.
-        """
-        return json.dumps(self.to_dict(), sort_keys=True)
-
-    @classmethod
-    def from_json(cls, payload: str) -> "SourceIdentity":
-        """Reconstruct an identity from its :meth:`to_json` encoding.
-
-        Args:
-            payload: A JSON string previously produced by :meth:`to_json`.
-
-        Returns:
-            The reconstructed :class:`SourceIdentity`.
-        """
-        return cls.from_dict(json.loads(payload))
-
-
-def check_source_identity(
+def check_weight_sharing_compatibility(
     local: Optional[SourceIdentity],
     source: Optional[SourceIdentity],
     policy: IdentityCheckPolicy = IdentityCheckPolicy.WARN_FALLBACK,
@@ -521,19 +520,19 @@ def check_source_identity(
     compare_global: bool = True,
     compare_shard: bool = True,
 ) -> IdentityCheckDecision:
-    """Decide whether a receiver may consume ``source``'s shared weights.
+    """Decide whether a receiver may consume `source`'s shared weights.
 
     Args:
-        local: The receiver's own identity. ``None`` means the receiver did not
+        local: The receiver's own identity. `None` means the receiver did not
             build an identity and cannot safely consume shared weights.
-        source: The producer's identity to validate against. ``None`` means the
+        source: The producer's identity to validate against. `None` means the
             producer identity is unavailable and cannot be verified.
         policy: How to react to a mismatch (see :class:`IdentityCheckPolicy`).
         compare_global: Compare the rank-independent config fingerprint.
         compare_shard: Compare the per-rank shard fingerprint.
 
     Returns:
-        An :class:`IdentityCheckDecision` whose ``should_share`` flag tells the
+        An :class:`IdentityCheckDecision` whose `should_share` flag tells the
         caller whether to consume the shared weights or fall back.
 
     Raises:

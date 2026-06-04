@@ -16,7 +16,7 @@
 
 These expose only the attributes the fingerprint projection reads, so the
 tests touch no real model, GPU, or weights. Used by both
-``test_source_identity.py`` and ``test_mx_source_identity_gate.py``.
+`test_source_identity.py` and `test_mx_source_identity_gate.py`.
 """
 
 from typing import Optional, Sequence
@@ -52,7 +52,7 @@ class FakePretrainedConfig:
 
 
 class FakeQuantConfig:
-    """Minimal stand-in for a pydantic ``QuantConfig``."""
+    """Minimal stand-in for a pydantic `QuantConfig`."""
 
     def __init__(self, quant_algo: str = "FP8", kv_cache_quant_algo: Optional[str] = None):
         self.quant_algo = quant_algo
@@ -86,9 +86,9 @@ class FakeQuantConfigWithPythonOnlyField(FakeQuantConfig):
 
 
 class FakeMapping:
-    """Minimal stand-in for ``Mapping`` exposing layout attributes only.
+    """Minimal stand-in for `Mapping` exposing layout attributes only.
 
-    ``world_size`` defaults to ``tp_size * pp_size`` when not given.
+    `world_size` defaults to `tp_size * pp_size` when not given.
     """
 
     def __init__(
@@ -132,9 +132,9 @@ class FakeMapping:
 
 
 class FakeModelConfig:
-    """Minimal stand-in for a torch-backend ``ModelConfig``.
+    """Minimal stand-in for a torch-backend `ModelConfig`.
 
-    ``quant_config`` defaults to a :class:`FakeQuantConfig`; pass ``None``
+    `quant_config` defaults to a :class:`FakeQuantConfig`; pass `None`
     explicitly to fingerprint an unquantized model.
     """
 
@@ -168,7 +168,7 @@ class FakeModelConfig:
 
 
 class _FakeTensor:
-    """Stand-in for a parameter/buffer exposing only ``shape`` and ``dtype``."""
+    """Stand-in for a parameter/buffer exposing only `shape` and `dtype`."""
 
     def __init__(self, shape: Sequence[int], dtype: str):
         self.shape = tuple(shape)
@@ -176,11 +176,11 @@ class _FakeTensor:
 
 
 class FakeModel:
-    """Minimal stand-in for an ``nn.Module`` exposing named tensors.
+    """Minimal stand-in for an `nn.Module` exposing named tensors.
 
     Parameter shapes are derived from the pretrained config so that
-    layout-affecting fields (``hidden_size`` etc.) change the realized layout
-    fingerprint, mirroring how real modules behave. ``dtype`` models a runtime
+    layout-affecting fields (`hidden_size` etc.) change the realized layout
+    fingerprint, mirroring how real modules behave. `dtype` models a runtime
     compute-dtype override that a config-only projection would miss.
     """
 
@@ -214,6 +214,6 @@ def identity_from(config: FakeModelConfig, *, model_name: Optional[str] = None) 
 def make_identity(
     *, attn_backend: str = "TRTLLM", rank: int = 0, model_name: str = "m"
 ) -> SourceIdentity:
-    """Build a :class:`SourceIdentity` from a fake config for ``rank``."""
+    """Build a :class:`SourceIdentity` from a fake config for `rank`."""
     cfg = FakeModelConfig(mapping=FakeMapping(rank=rank, tp_rank=rank), attn_backend=attn_backend)
     return identity_from(cfg, model_name=model_name)

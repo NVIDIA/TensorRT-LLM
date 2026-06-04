@@ -15,17 +15,17 @@
 
 """MX (ModelExpress) checkpoint loader.
 
-Thin adapter on top of the upstream ``modelexpress`` Python client
-(``ai-dynamo/modelexpress``). All NIXL/RDMA mechanics (agent setup,
+Thin adapter on top of the upstream `modelexpress` Python client
+(`ai-dynamo/modelexpress`). All NIXL/RDMA mechanics (agent setup,
 tensor registration, source-target name matching, dtype-cast handling,
-PVC fallback, etc.) live in the upstream ``MxLiveWeightLoader`` and
-``publish_model_params`` helpers — we only call them at the right
+PVC fallback, etc.) live in the upstream `MxLiveWeightLoader` and
+`publish_model_params` helpers — we only call them at the right
 points in TRT-LLM's loading lifecycle.
 
 When no MX server is reachable (or the upstream library is not
 installed), this loader transparently falls back to standard
 HuggingFace checkpoint loading (disk -> CPU -> GPU) by way of its
-``HfCheckpointLoader`` base class.
+`HfCheckpointLoader` base class.
 """
 
 import os
@@ -45,14 +45,14 @@ from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
 from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy,
     SourceIdentity,
-    check_source_identity,
+    check_weight_sharing_compatibility,
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-# Defensive default for the upstream ``MX_SOURCE_QUERY_TIMEOUT`` env var.
-# The upstream ``MxLiveWeightLoader`` polls the MX server every 5 s for up
-# to ``MX_SOURCE_QUERY_TIMEOUT`` seconds (default 3600 = 1 hour) waiting
+# Defensive default for the upstream `MX_SOURCE_QUERY_TIMEOUT` env var.
+# The upstream `MxLiveWeightLoader` polls the MX server every 5 s for up
+# to `MX_SOURCE_QUERY_TIMEOUT` seconds (default 3600 = 1 hour) waiting
 # for a source. On a cold cluster (no donor up yet), this means the very
 # first replica blocks for an hour before falling back to disk. We cap
 # the default at 30 s so first-replica startup degrades gracefully; users
@@ -83,19 +83,19 @@ def _temporary_env(key: str, value: Optional[str]):
 class MXCheckpointLoader(HfCheckpointLoader):
     """Checkpoint loader for MX (ModelExpress) P2P weight transfer.
 
-    When an MX server is reachable AND the upstream ``modelexpress``
+    When an MX server is reachable AND the upstream `modelexpress`
     library is installed, weights are transferred directly from a
     source instance via NIXL/RDMA, bypassing disk I/O. The source
-    publishes its weights *before* ``post_load_weights()`` runs so
+    publishes its weights *before* `post_load_weights()` runs so
     targets receive raw loaded state and can run their own
     post-load transforms.
 
     When the MX server or library is unavailable, this loader
     transparently falls back to standard HuggingFace checkpoint
-    loading via the parent ``HfCheckpointLoader``.
+    loading via the parent `HfCheckpointLoader`.
 
     All transport-level mechanics (NIXL, dtype casts, source matching,
-    fallback) are delegated to ``modelexpress.trtllm_live_transfer``
+    fallback) are delegated to `modelexpress.trtllm_live_transfer`
     so that this class stays a thin adapter — when the MX wire
     protocol or transport evolves, only the upstream library needs
     to track it.
@@ -121,10 +121,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # _checkpoint_format directly does not see a stale value.
         self._checkpoint_format = "MX"
         self._mx_server_url = mx_server_url
-        # ``model_name`` is the human-readable identity to publish/look up
+        # `model_name` is the human-readable identity to publish/look up
         # under on the MX server. Typically the user-supplied
-        # ``llm_args.model`` (a Hub ID like ``"Qwen/Qwen2.5-72B-Instruct"``
-        # or a local path). ``publish_as_source()`` resolves it via
+        # `llm_args.model` (a Hub ID like `"Qwen/Qwen2.5-72B-Instruct"`
+        # or a local path). `publish_as_source()` resolves it via
         # :func:`_resolve_mx_model_name` (with HF-snapshot path fallback).
         self._model_name = str(model_name) if model_name is not None else None
         self._query_timeout_s = query_timeout_s
@@ -146,9 +146,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
     def model_name(self) -> Optional[str]:
         """Explicit model identity passed to the constructor (if any).
 
-        Note this is the *as-configured* value (e.g. ``llm_args.model``),
+        Note this is the *as-configured* value (e.g. `llm_args.model`),
         not the final resolved identity that ends up in the published
-        ``MODEL_NAME``. The full resolution (with env var and basename
+        `MODEL_NAME`. The full resolution (with env var and basename
         fallbacks) happens inside :meth:`publish_as_source`.
         """
         return self._model_name
@@ -160,27 +160,27 @@ class MXCheckpointLoader(HfCheckpointLoader):
     def is_weights_preloaded(self) -> bool:
         """Whether the last :meth:`load_weights` call wired weights directly into the model.
 
-        Reports the result of the most recent ``load_weights()`` invocation
-        on this loader instance. ``ModelLoader`` consults this signal to
+        Reports the result of the most recent `load_weights()` invocation
+        on this loader instance. `ModelLoader` consults this signal to
         decide whether to run the standard weight-mapping pipeline:
 
-        - ``True``: MX P2P transfer succeeded; weights already live in
+        - `True`: MX P2P transfer succeeded; weights already live in
           model parameter buffers via direct writes from the upstream
-          ``MxLiveWeightLoader``. The mapping pipeline is skipped for
+          `MxLiveWeightLoader`. The mapping pipeline is skipped for
           all parameters covered by P2P.
-        - ``False``: either P2P was never attempted (no MX server URL,
+        - `False`: either P2P was never attempted (no MX server URL,
           no model reference, library missing) or it failed and we
           fell back to disk; weights still need to flow through
-          ``model.load_weights(...)`` via the standard mapper.
+          `model.load_weights(...)` via the standard mapper.
 
         Note this is a per-loader-instance flag, not a global one. The
-        flag is reset to ``False`` at the start of each ``load_weights``
+        flag is reset to `False` at the start of each `load_weights`
         call, so the value is only meaningful immediately after a
         successful call.
 
         Returns:
-            ``True`` iff the last ``load_weights`` populated the model
-            via P2P; ``False`` before any call and on any fallback path.
+            `True` iff the last `load_weights` populated the model
+            via P2P; `False` before any call and on any fallback path.
         """
         return self._p2p_succeeded
 
@@ -188,14 +188,14 @@ class MXCheckpointLoader(HfCheckpointLoader):
         """Load weights, preferring MX P2P transfer when available.
 
         Delegates the actual transfer to the upstream
-        ``modelexpress.trtllm_live_transfer.MxLiveWeightLoader``,
+        `modelexpress.trtllm_live_transfer.MxLiveWeightLoader`,
         which handles NIXL setup, source discovery, name matching,
         dtype casting, and PVC fallback for size-mismatched tensors.
 
         Args:
             checkpoint_dir: Path to the HF checkpoint directory.
             mapping: Distributed mapping configuration.
-            **kwargs: Additional keyword arguments. When ``model`` is
+            **kwargs: Additional keyword arguments. When `model` is
                 passed it is used as the target for direct P2P writes.
 
         Returns:
@@ -297,7 +297,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
     def _resolve_query_timeout_override(
         self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
     ) -> Optional[str]:
-        """Return temporary ``MX_SOURCE_QUERY_TIMEOUT`` override, if any."""
+        """Return temporary `MX_SOURCE_QUERY_TIMEOUT` override, if any."""
         if self._query_timeout_s is not None:
             return str(self._query_timeout_s)
 
@@ -343,7 +343,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         """Whether the MX source's identity is compatible with this receiver.
 
         Compares the receiver's local :class:`SourceIdentity` against the
-        publisher's via ``check_source_identity`` with the ``WARN_FALLBACK``
+        publisher's via `check_weight_sharing_compatibility` with the `WARN_FALLBACK`
         policy.
 
         Args:
@@ -354,13 +354,13 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 (forwarded to the fetch seam).
 
         Returns:
-            ``True`` to proceed with P2P only when both identities are present
-            and compatible. ``False`` when either identity is missing or the
+            `True` to proceed with P2P only when both identities are present
+            and compatible. `False` when either identity is missing or the
             identities mismatch, so the caller falls back to disk loading.
         """
         local_identity = self._local_source_identity
         source_identity = self._fetch_source_identity(checkpoint_dir, MxClient, build_identity)
-        decision = check_source_identity(
+        decision = check_weight_sharing_compatibility(
             local_identity,
             source_identity,
             IdentityCheckPolicy.WARN_FALLBACK,
@@ -378,7 +378,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
             build_identity: Builder used to derive the publisher identity.
 
         Returns:
-            The publisher's identity, or ``None`` when it cannot be fetched
+            The publisher's identity, or `None` when it cannot be fetched
             yet (the compatibility gate then rejects P2P and falls back).
         """
         # TODO(SOURCE-IDENTITY/MX-2): read the publisher's identity from the MX
@@ -406,21 +406,21 @@ class MXCheckpointLoader(HfCheckpointLoader):
     ) -> None:
         """Publish this instance's weights so other ranks can pull via P2P.
 
-        Called by the integration in ``model_loader.py`` *before*
-        ``post_load_weights()`` so targets receive raw loaded state and
+        Called by the integration in `model_loader.py` *before*
+        `post_load_weights()` so targets receive raw loaded state and
         can apply their own post-load transforms.
 
         Delegates to the upstream
-        ``modelexpress.trtllm_live_transfer.publish_model_params``
+        `modelexpress.trtllm_live_transfer.publish_model_params`
         helper, which handles the per-rank NIXL setup, tensor
         registration, and gRPC publish.
 
         Args:
             model: The model whose weights to publish.
             checkpoint_dir: Checkpoint directory. Used as a last-resort
-                fallback for resolving the ``MODEL_NAME`` identity when
-                neither ``model_name`` was passed to the constructor nor
-                ``MODEL_NAME`` is set in the environment.
+                fallback for resolving the `MODEL_NAME` identity when
+                neither `model_name` was passed to the constructor nor
+                `MODEL_NAME` is set in the environment.
         """
 
         if self._mx_server_url is None:
@@ -515,14 +515,14 @@ def _resolve_mx_model_name(model_name_arg: Optional[str], checkpoint_dir: Option
 
     Resolution order (first non-empty wins):
 
-    1. ``model_name_arg`` — the explicit value passed at construction
-       time (typically ``llm_args.model``: a Hub ID like
-       ``"Qwen/Qwen2.5-72B-Instruct"`` or a local path).
-    2. ``MODEL_NAME`` env var — upstream's existing convention.
-    3. ``checkpoint_dir`` basename, with HF-snapshot path fallback so
-       ``.../models--<org>--<name>/snapshots/<sha>/`` resolves to
-       ``"<org>/<name>"`` instead of the commit hash.
-    4. Literal ``"unknown"`` — matches upstream's own sentinel.
+    1. `model_name_arg` — the explicit value passed at construction
+       time (typically `llm_args.model`: a Hub ID like
+       `"Qwen/Qwen2.5-72B-Instruct"` or a local path).
+    2. `MODEL_NAME` env var — upstream's existing convention.
+    3. `checkpoint_dir` basename, with HF-snapshot path fallback so
+       `.../models--<org>--<name>/snapshots/<sha>/` resolves to
+       `"<org>/<name>"` instead of the commit hash.
+    4. Literal `"unknown"` — matches upstream's own sentinel.
     """
     candidate = model_name_arg or os.environ.get("MODEL_NAME") or checkpoint_dir
     if not candidate:
@@ -533,18 +533,18 @@ def _resolve_mx_model_name(model_name_arg: Optional[str], checkpoint_dir: Option
 def _normalize_model_identity(s: str) -> str:
     """Convert a model identifier to a stable, human-readable name.
 
-    Hub IDs (``"org/name"``) and arbitrary user-provided strings are
+    Hub IDs (`"org/name"`) and arbitrary user-provided strings are
     returned unchanged. Filesystem paths are reduced to a basename, with
-    HuggingFace cache snapshot layouts (``snapshots/<commit-sha>/``)
-    walked up to recover the original ``"org/name"`` identity.
+    HuggingFace cache snapshot layouts (`snapshots/<commit-sha>/`)
+    walked up to recover the original `"org/name"` identity.
     """
     if not s:
         return "unknown"
 
-    # Heuristic: a Hub ID is bare ``"name"`` or ``"org/name"``. Anything
+    # Heuristic: a Hub ID is bare `"name"` or `"org/name"`. Anything
     # that starts with a path separator/expansion or contains more than
     # one "/" is treated as a path. Single-"/" strings remain ambiguous;
-    # avoid an NFS ``exists`` probe for common Hub IDs and only touch the
+    # avoid an NFS `exists` probe for common Hub IDs and only touch the
     # filesystem when the string has explicit local-path syntax.
     looks_like_path = s.startswith(("/", "./", "../", "~")) or s.count("/") > 1
     if not looks_like_path:
@@ -553,9 +553,9 @@ def _normalize_model_identity(s: str) -> str:
     p = Path(s).expanduser()
     name = p.name
     if name and "snapshots" in p.parts:
-        # HF cache layout: ``.../models--<org>--<name>/snapshots/<sha>/``.
-        # Walk up to find the ``models--<org>--<name>`` directory and
-        # un-mangle it back to ``"<org>/<name>"``.
+        # HF cache layout: `.../models--<org>--<name>/snapshots/<sha>/`.
+        # Walk up to find the `models--<org>--<name>` directory and
+        # un-mangle it back to `"<org>/<name>"`.
         for ancestor in p.parents:
             if ancestor.name.startswith("models--"):
                 return ancestor.name[len("models--") :].replace("--", "/")
