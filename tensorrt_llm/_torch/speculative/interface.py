@@ -505,6 +505,11 @@ class SpecMetadata:
     # avoid a per-iter 64 MB zero-fill on the (max_num_requests, max_draft_len,
     # vocab_size) tensor. Shape: [max_num_requests, max_draft_len, vocab_size].
     full_draft_probs: Optional[torch.Tensor] = None
+    # Cached d2t-projected target vocab indices, computed once on first use
+    # (d2t is a model-static tensor). Replaces the per-iter
+    # arange + (source + d2t) % vocab_size kernel sequence inside the d2t
+    # padding step. Shape: [draft_vocab_size], dtype long.
+    d2t_target_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         pass
@@ -1077,8 +1082,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                          device=logits.device)
 
         # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
+        target_tokens = self._sample_tokens_for_batch(
+            logits, spec_metadata, num_contexts, batch_size)
 
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -1092,7 +1097,8 @@ class SpecWorkerBase(nn.Module, ABC):
         # Compare draft tokens with target tokens using cumulative product
         # Counts consecutive matches from the start
         num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
+            (draft_tokens
+             == gen_target_tokens[:, :runtime_draft_len]).int(),
             dim=-1).sum(1)
 
         # Apply force override if set
@@ -1201,9 +1207,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
-            target_probs = target_probs_flat.reshape(num_gens,
-                                                     runtime_draft_len + 1,
-                                                     vocab_size)
+            target_probs = target_probs_flat.reshape(
+                num_gens, runtime_draft_len + 1, vocab_size)
 
             draft_vocab_size = draft_probs.shape[-1]
             assert draft_probs.shape[0] == num_gens, (
@@ -1215,11 +1220,13 @@ class SpecWorkerBase(nn.Module, ABC):
             d2t = getattr(spec_metadata, "d2t", None)
             if draft_vocab_size != vocab_size:
                 # Use the pre-allocated buffer from spec_metadata.prepare()
-                # (zero-filled once at init; untouched positions stay 0). Falls
-                # back to per-iter allocation if the buffer is not configured,
-                # e.g. when use_rejection_sampling was off at prepare() time.
+                # (zero-filled once at init; untouched positions stay 0).
+                # Falls back to per-iter allocation if the buffer is not
+                # configured, e.g. when use_rejection_sampling was off at
+                # prepare() time.
                 if spec_metadata.full_draft_probs is not None:
-                    full_draft_probs = spec_metadata.full_draft_probs[:num_gens]
+                    full_draft_probs = spec_metadata.full_draft_probs[:
+                                                                      num_gens]
                 else:
                     full_draft_probs = torch.zeros(
                         (num_gens, runtime_draft_len, vocab_size),
@@ -1229,11 +1236,17 @@ class SpecWorkerBase(nn.Module, ABC):
                     assert d2t.numel() == draft_vocab_size, (
                         f"d2t size mismatch: {d2t.numel()} != {draft_vocab_size}"
                     )
-                    d2t = d2t.to(device=device)
-                    source_indices = torch.arange(draft_vocab_size,
-                                                  device=device,
-                                                  dtype=torch.long)
-                    target_indices = (source_indices + d2t) % vocab_size
+                    # d2t is model-static; compute target_indices once and
+                    # cache on spec_metadata to skip the arange + add + mod
+                    # kernel sequence on every iter.
+                    target_indices = spec_metadata.d2t_target_indices
+                    if target_indices is None:
+                        source_indices = torch.arange(draft_vocab_size,
+                                                      device=device,
+                                                      dtype=torch.long)
+                        target_indices = (source_indices +
+                                          d2t.to(device=device)) % vocab_size
+                        spec_metadata.d2t_target_indices = target_indices
                     full_draft_probs[:, :runtime_draft_len,
                                      target_indices] = draft_probs
                 else:
