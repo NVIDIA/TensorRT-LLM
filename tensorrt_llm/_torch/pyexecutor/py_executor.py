@@ -3188,7 +3188,16 @@ class PyExecutor:
             _new_request_count = len(new_requests)
         else:
             _new_request_count = 0
-        _new_request_count = self.dist.broadcast(_new_request_count, root=0)
+        # Pause the hang detector around the probe broadcast. When the server is
+        # idle, rank 0 blocks in get_from_request_queue (already pause-wrapped
+        # above) waiting for the next request, so the non-root ranks legitimately
+        # wait here on the broadcast for an unbounded time. Without pausing, their
+        # 300s watchdog falsely trips at the warmup->serving boundary and tears
+        # the server down. This mirrors RequestBroadcaster.broadcast, whose
+        # non-root wait on the heavy broadcast this probe gates is likewise
+        # wrapped in hang_detector.pause().
+        with self.hang_detector.pause():
+            _new_request_count = self.dist.broadcast(_new_request_count, root=0)
 
         if _new_request_count == 0:
             new_requests = []
