@@ -75,6 +75,14 @@ _HEURISTIC_TOPK_WARMUP_LOCK = threading.Lock()
 # byte-identical to the committed "sequential attend-all-compressed" fix.
 _DSV4_SM120_REAL_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_REAL_INDEXER",
                                           "0") == "1"
+# Perf step 2: route the SM120 real-indexer MXFP4 scorer through the fused Triton
+# kernel (triton_indexer_scorer.mqa_logits_mxfp4) instead of the torch einsum.
+# The fused kernel dequantizes inline + reduces over heads on the fly, so it
+# never materializes the [Nq, n_heads, Nk] accumulator (the ~64 GiB OOM at 32K)
+# or a dequantized k_f. DEFAULT OFF; fp4-only (torch fallback for fp8). Decode
+# uses it only for next_n==1 / num_gen==1 (the SM120 bs1 config).
+_DSV4_SM120_TRITON_SCORER = os.environ.get("TRTLLM_DSV4_SM120_TRITON_SCORER",
+                                           "0") == "1"
 
 
 def warmup_heuristic_topk_decode(top_k: int = 2048,
@@ -2157,6 +2165,18 @@ class Indexer(nn.Module):
         """
         if self.use_fp4:
             hd = self.head_dim
+            if _DSV4_SM120_TRITON_SCORER:
+                # Fused Triton kernel: dequant inline + reduce over heads, no
+                # [Nq,H,Nk] accumulator. Masking is done in-kernel -> return.
+                from .triton_indexer_scorer import mqa_logits_mxfp4
+                qc = q_fp8.reshape(-1, self.n_heads,
+                                   hd // 2).contiguous().view(torch.uint8)
+                qs = q_scale.reshape(-1, self.n_heads,
+                                     1).contiguous().view(torch.uint8)
+                kc = k_fp8.reshape(-1, hd // 2).contiguous().view(torch.uint8)
+                ksc = k_scale.reshape(-1, 1).contiguous().view(torch.uint8)
+                return mqa_logits_mxfp4(qc, qs, kc, ksc, weights,
+                                        cu_seqlen_ks, cu_seqlen_ke)
             q_f = self._dequant_mxfp4(
                 q_fp8.reshape(-1, self.n_heads, hd // 2).contiguous().view(
                     torch.uint8),
@@ -2248,6 +2268,20 @@ class Indexer(nn.Module):
         kscl = scale_region[block_ids, pos_in_blk_g]   # [G, S, sb] uint8
 
         if self.use_fp4:
+            if _DSV4_SM120_TRITON_SCORER and num_gen == 1:
+                # Fused Triton kernel (bs1 decode): gathered kdata/kscl + q codes
+                # -> dequant inline + reduce over heads, mask in-kernel. Returns
+                # [1, max_seq_len].
+                from .triton_indexer_scorer import mqa_logits_mxfp4
+                qc = q.contiguous().view(torch.uint8).reshape(
+                    1, self.n_heads, hd // 2)
+                qs = q_scale.reshape(1, self.n_heads,
+                                     1).contiguous().view(torch.uint8)
+                ks = torch.zeros(1, device=device, dtype=torch.int32)
+                ke = context_lens.reshape(-1)[:1].to(torch.int32)
+                return mqa_logits_mxfp4(
+                    qc, qs, kdata[0].contiguous(), kscl[0].contiguous(),
+                    weights_decode.reshape(1, self.n_heads), ks, ke)
             # MXFP4: dequant k from the cache + q from its per-head UE8M0 scale.
             k_f = self._dequant_mxfp4(kdata.contiguous(), kscl, hd)
             q_f = self._dequant_mxfp4(
