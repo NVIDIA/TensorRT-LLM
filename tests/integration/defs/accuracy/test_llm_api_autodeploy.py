@@ -1013,12 +1013,26 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
     MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
+    WORLD_SIZE = 8
+    # Config files driving this test. Resolved directly from the configs
+    # directory rather than the model registry so the test stays valid
+    # regardless of which models are enabled in models.yaml.
+    YAML_EXTRA = [
+        'dashboard_default.yaml',
+        'world_size_8.yaml',
+        'qwen3.5_moe_400b.yaml',
+        'enable_sharder_ir.yaml',
+    ]
     GSM8K_MAX_OUTPUT_LEN = 512
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
         fewshot_as_multiturn=True,
         chat_template_kwargs=dict(enable_thinking=False),
     )
+
+    @classmethod
+    def _yaml_extra_paths(cls):
+        return [str(_AD_CONFIGS_DIR / cfg) for cfg in cls.YAML_EXTRA]
 
     def get_default_kwargs(self):
         return {
@@ -1042,9 +1056,8 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
-        yaml_paths, registry_world_size = _get_registry_yaml_extra(
-            self.MODEL_NAME)
-        assert registry_world_size == world_size
+        assert self.WORLD_SIZE == world_size
+        yaml_paths = self._yaml_extra_paths()
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
                            dtype="bfloat16",
@@ -1067,9 +1080,8 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
-        yaml_paths, registry_world_size = _get_registry_yaml_extra(
-            self.MODEL_NAME)
-        assert registry_world_size == world_size
+        assert self.WORLD_SIZE == world_size
+        yaml_paths = self._yaml_extra_paths()
         model_path = hf_id_to_local_model_dir(self.MODEL_NAME_NVFP4)
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
