@@ -389,6 +389,97 @@ def _make_inputs(
     return logits, pre_idx, seq_lens
 
 
+def _make_inputs_varlen(
+    num_rows: int,
+    N: int,
+    top_k: int,
+    dtype: torch.dtype,
+    seed: int,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    pattern: str = "uniform_random",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Like ``_make_inputs`` but with **per-row varying seq_lens**.
+
+    The kernel API supports per-row seq_lens (it reads ``seq_lens[row_idx]``
+    to determine each row's actual scan length), but the default
+    ``_make_inputs`` builds a uniform batch. This variant exercises the
+    realistic decode-time scenario where rows in a batch belong to
+    requests with different KV-cache lengths.
+
+    ``pattern`` controls how varying seq_lens are constructed (all values
+    are in UNCOMPRESSED-token space — kernel divides by ``compress_ratio``
+    internally):
+
+      * ``"uniform_random"``: seq_lens drawn uniformly from
+        ``[top_k + 1, N]`` per row.
+      * ``"mixed"``: cycled pattern ``[N, N//2, N//4, max(N//8, top_k+1)]``
+        — exercises the {long, medium, short, very-short} mix that
+        prefill-decode interleaving creates.
+      * ``"first_long"``: row 0 = N, rest = ``max(N // 16, top_k + 1)``
+        — exercises the worst case where one long row drives auto-dispatch
+        to a large cluster_size but other rows are way too short to benefit.
+
+    ``logits`` is allocated at ``[num_rows, N]`` (padded), but each row's
+    valid range is ``logits[r, :seq_lens[r] // compress_ratio]``. The kernel
+    only scans within that range; the rest can be undefined.
+    """
+    if num_rows % next_n != 0:
+        raise ValueError(f"num_rows ({num_rows}) must be divisible by next_n ({next_n})")
+    torch.manual_seed(seed)
+    device = "cuda"
+
+    logits_f32 = torch.randn(num_rows, N, dtype=torch.float32, device=device) * 2.0
+    logits = logits_f32.to(dtype)
+    num_groups = num_rows // next_n
+    min_n = top_k + 1  # below this triggers degenerate-path; not a varlen interest
+
+    if pattern == "uniform_random":
+        N_uncompressed_per_row = torch.randint(
+            min_n, N + 1, (num_groups,), dtype=torch.int32, device=device
+        )
+    elif pattern == "mixed":
+        base = [N, N // 2, N // 4, max(N // 8, min_n)]
+        N_uncompressed_per_row = torch.tensor(
+            [base[i % len(base)] for i in range(num_groups)],
+            dtype=torch.int32,
+            device=device,
+        )
+    elif pattern == "first_long":
+        rest = max(N // 16, min_n)
+        N_uncompressed_per_row = torch.full(
+            (num_groups,),
+            rest,
+            dtype=torch.int32,
+            device=device,
+        )
+        N_uncompressed_per_row[0] = N
+    else:
+        raise ValueError(f"unknown pattern: {pattern}")
+
+    # seq_lens is in uncompressed-token space; multiply by cr so the
+    # kernel's `N_kernel = seq_lens // cr` ends up matching the
+    # per-row uncompressed value above. For cr=1 this is a no-op.
+    seq_lens = N_uncompressed_per_row * compress_ratio
+
+    # pre_idx: argmax must come from the EACH ROW's effective scan range,
+    # not the full padded N. The reference _tie_aware_correct masks logits
+    # to the same range, so this mirrors what the kernel actually sees.
+    pre_idx = torch.zeros(num_groups, top_k, dtype=torch.int32, device=device)
+    for r in range(num_groups):
+        # Use group's row 0 (= num_rows row index r * next_n) for argmax.
+        # For next_n > 1 the kernel's effective scan range varies per
+        # sub-row within the group; the group's row 0 has N_eff =
+        # N_uncompressed_per_row - next_n + 0 + 1.
+        row_eff = (N_uncompressed_per_row[r] - next_n + 1).item()
+        if row_eff > 0:
+            pre_idx[r, 0] = logits[r * next_n, :row_eff].argmax().int()
+    for j in range(1, top_k):
+        pre_idx[:, j] = j
+
+    return logits, pre_idx, seq_lens
+
+
 def _tie_aware_correct(
     kernel_idxs: torch.Tensor,
     logits: torch.Tensor,
@@ -514,6 +605,79 @@ def test_gvr_topk_decode(
         f"num_threads_per_block={num_threads_per_block} "
         f"enable_warp_parallel_reduce={enable_warp_parallel_reduce} "
         f"cluster_size={cluster_size}: {msg}"
+    )
+
+
+# ============================================================================
+# Varlen test: each row in a batch has a DIFFERENT seq_len. This mirrors
+# real decode-time scenarios where requests in a batch belong to different
+# conversations with different KV-cache lengths. The kernel API has always
+# supported this (it reads ``seq_lens[row_idx]`` per row), but the default
+# fixed-N pytest doesn't exercise it. The cluster path is particularly
+# interesting under varlen because auto-dispatch picks cluster_size based
+# on max_seq_len, so short rows in a batch get over-clustered — this test
+# verifies that's at least CORRECT (perf cost is a separate concern).
+# ============================================================================
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("max_N", [8192, 32768, 131072])
+@pytest.mark.parametrize("batch_size", [4, 16, 64])
+@pytest.mark.parametrize("cluster_size", [1, 2, 4])
+@pytest.mark.parametrize("seed", [42, 1337])
+@pytest.mark.parametrize("pattern", ["uniform_random", "mixed", "first_long"])
+def test_gvr_topk_decode_varlen(
+    dtype: torch.dtype,
+    top_k: int,
+    max_N: int,
+    batch_size: int,
+    cluster_size: int,
+    seed: int,
+    pattern: str,
+) -> None:
+    """Per-row varying seq_lens for the cluster kernel.
+
+    Verifies the cluster kernel produces correct top-K for each row
+    given its OWN seq_len (not max_N).
+    """
+    if max_N < top_k:
+        pytest.skip("max_N < top_k forces every row degenerate; not varlen-interesting")
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if batch_size * cluster_size > num_sms:
+        pytest.skip(
+            f"batch_size*cluster_size ({batch_size * cluster_size}) > num_sms "
+            f"({num_sms}); multi-wave cluster scheduling is a separate concern"
+        )
+
+    logits, pre_idx, seq_lens = _make_inputs_varlen(
+        num_rows=batch_size,
+        N=max_N,
+        top_k=top_k,
+        dtype=dtype,
+        seed=seed,
+        next_n=1,
+        compress_ratio=1,
+        pattern=pattern,
+    )
+    _, out_idxs = gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        top_k,
+        next_n=1,
+        num_sms=num_sms,
+        num_threads_per_block=512,
+        enable_warp_parallel_reduce=False,
+        return_output_values=False,
+        cluster_size=cluster_size,
+        max_seq_len=max_N,
+    )
+    torch.cuda.synchronize()
+    ok, msg = _tie_aware_correct(out_idxs, logits, seq_lens, top_k, next_n=1)
+    assert ok, (
+        f"VARLEN dtype={dtype} K={top_k} max_N={max_N} BS={batch_size} "
+        f"cs={cluster_size} seed={seed} pattern={pattern} "
+        f"seq_lens={seq_lens.tolist()}: {msg}"
     )
 
 

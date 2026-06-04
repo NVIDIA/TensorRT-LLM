@@ -1861,8 +1861,29 @@ class GvrTopKClusterKernel:
         # double-counting at the boundary, and tracking per-CTA
         # uneven start/end adds branching, so the floor-pin-tail
         # approach keeps the per-CTA inner loop predictable.
+        #
+        # ★ slice_base MUST be a multiple of vec_w (= 16 bytes /
+        # sizeof(dtype) = 4 for fp32, 8 for bf16/fp16). The peer CTAs'
+        # LDG.E.128 inner loop uses
+        #     addr = row_addr + (slice_start + tidx*vec_w) * elem_bytes
+        # with ``assumed_align=vec_align`` (=16 bytes). For this to hold
+        # on peer CTAs, ``slice_start = cta_in_cluster * slice_base``
+        # must itself be vec_w-aligned, which requires slice_base to be
+        # a multiple of vec_w. Fixed-N production benchmarks happen to
+        # use N values divisible by 16 elements, so the original
+        # ``slice_base = N // cs`` worked. Varlen workloads (real decode
+        # where each row has its own seq_len) expose this: arbitrary
+        # actual_kv_len makes ``slice_base`` arbitrary, producing
+        # misaligned LDG.E.128 → ``CUDA_ERROR_MISALIGNED_ADDRESS``.
+        # Fix: round slice_base DOWN to a multiple of vec_w. The last
+        # CTA still picks up everything in [(cs-1)*slice_base, N), which
+        # absorbs both the floor leftover AND any non-vec_w-aligned tail
+        # of N; the block_count_ge inner loop's tail-vec + scalar-tail
+        # paths handle the non-aligned end gracefully.
         if cutlass.const_expr(cluster_size > 1):
-            slice_base = N // cutlass.Int32(cluster_size)
+            vec_w_const = cutlass.const_expr(self.vec_bits // self.dtype.width)
+            raw_base = N // cutlass.Int32(cluster_size)
+            slice_base = (raw_base // cutlass.Int32(vec_w_const)) * cutlass.Int32(vec_w_const)
             slice_start = cta_in_cluster * slice_base
             slice_end_normal = slice_start + slice_base
             slice_is_last = cta_in_cluster == cutlass.Int32(cluster_size - 1)
