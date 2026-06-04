@@ -331,7 +331,12 @@ class TestModelDefaults:
 
 
 def test_KvCacheConfig_declaration():
+    default_config = KvCacheConfig()
+    assert default_config.mamba_state_cache_interval is None
+    assert default_config.mamba_save_last_snapshot is True
+
     config = KvCacheConfig(enable_block_reuse=True,
+                           mamba_state_cache_interval=256,
                            max_tokens=1024,
                            max_attention_window=[1024, 1024, 1024],
                            free_gpu_memory_fraction=0.5,
@@ -341,7 +346,8 @@ def test_KvCacheConfig_declaration():
                            event_buffer_max_size=0,
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
-                           attention_dp_events_gather_period_ms=10)
+                           attention_dp_events_gather_period_ms=10,
+                           mamba_save_last_snapshot=False)
 
     pybind_config = config._to_pybind()
     assert pybind_config.enable_block_reuse == True
@@ -355,6 +361,8 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+    assert config.mamba_state_cache_interval == 256
+    assert config.mamba_save_last_snapshot == False
 
 
 def test_CapacitySchedulerPolicy():

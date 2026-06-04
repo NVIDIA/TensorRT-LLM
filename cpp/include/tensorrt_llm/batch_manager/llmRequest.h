@@ -1207,6 +1207,16 @@ public:
         mEstimatedReusableTokens = estimatedReusableTokens;
     }
 
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getExpectChunkingPoints() const noexcept
+    {
+        return mExpectChunkingPoints;
+    }
+
+    void setExpectChunkingPoints(std::optional<std::vector<SizeType32>> expectChunkingPoints)
+    {
+        mExpectChunkingPoints = std::move(expectChunkingPoints);
+    }
+
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
     {
         mDraftTokens = draftTokens;
@@ -2060,6 +2070,8 @@ protected:
     // capacity-scheduler queries. Reset to 0 after addSequenceBatch sets
     // the authoritative mPrepopulatedPromptLen and advances context position.
     mutable SizeType32 mEstimatedReusableTokens{0};
+
+    std::optional<std::vector<SizeType32>> mExpectChunkingPoints{std::nullopt};
 
     SizeType32 mMaxSentTokenLen;
 

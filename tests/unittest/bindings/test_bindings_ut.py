@@ -407,6 +407,12 @@ def test_llm_request():
 
     assert llm_request.orig_prompt_len == 3
 
+    assert llm_request.expect_chunking_points is None
+    llm_request.expect_chunking_points = [2, 4]
+    assert llm_request.expect_chunking_points == [2, 4]
+    llm_request.expect_chunking_points = None
+    assert llm_request.expect_chunking_points is None
+
     assert not llm_request.draft_tokens
     llm_request.draft_tokens = [1, 2, 3]
     assert llm_request.draft_tokens == [1, 2, 3]

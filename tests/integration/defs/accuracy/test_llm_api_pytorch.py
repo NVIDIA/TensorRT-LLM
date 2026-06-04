@@ -7060,6 +7060,67 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_blackwell
+    def test_nvfp4_block_reuse_sequential_contained_prompt(self):
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=True,
+                    mamba_ssm_cache_dtype="float16",
+                    mamba_state_cache_interval=0,
+                    mamba_save_last_snapshot=True,
+                    free_gpu_memory_fraction=0.6,
+                ),
+                max_batch_size=8,
+                tensor_parallel_size=1,
+                moe_expert_parallel_size=1,
+                pipeline_parallel_size=1,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+        ) as llm:
+            print("LLM init finished")
+            first_turn = (
+                "User: I'm preparing a production rollout for a TensorRT-LLM "
+                "service that will handle repeated troubleshooting questions. "
+                "What checks should I run before enabling KV cache reuse?")
+            first_prompt = f"{first_turn}\nAI Agent:"
+            first_prompt_ids = llm.tokenizer.encode(first_prompt)
+            # Exercise reuse from a saved last snapshot, not only from a full
+            # KV block.
+            while (len(first_prompt_ids) <= 32
+                   or len(first_prompt_ids) % 32 == 0):
+                first_turn += (
+                    " Include model loading, GPU memory headroom, and a short "
+                    "deterministic generation check.")
+                first_prompt = f"{first_turn}\nAI Agent:"
+                first_prompt_ids = llm.tokenizer.encode(first_prompt)
+            print(f"first turn: {first_prompt}")
+
+            suffix_ids = llm.tokenizer.encode(
+                "\n\nUser: Thanks. Now turn that into a two-step validation "
+                "plan for a second request whose prompt contains the first "
+                "conversation.\nAI Agent:",
+                add_special_tokens=False)
+            second_prompt_ids = first_prompt_ids + suffix_ids
+            assert second_prompt_ids[:len(first_prompt_ids)] == first_prompt_ids
+
+            sampling_params = SamplingParams(max_tokens=8,
+                                             temperature=0,
+                                             add_special_tokens=False,
+                                             ignore_eos=True)
+            first_outputs = llm.generate([first_prompt_ids],
+                                         sampling_params=sampling_params)
+            second_outputs = llm.generate([second_prompt_ids],
+                                          sampling_params=sampling_params)
+
+            print(first_outputs[0].outputs[0].text)
+            print(second_outputs[0].outputs[0].text)
+            assert len(first_outputs) == 1
+            assert len(second_outputs) == 1
+            assert len(first_outputs[0].outputs[0].token_ids) > 0
+            assert len(second_outputs[0].outputs[0].token_ids) > 0
+
+    @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.parametrize(
         "tp_size, ep_size, pp_size, attention_dp",

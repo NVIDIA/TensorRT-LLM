@@ -721,7 +721,8 @@ def create_py_executor(
     else:
         ctx_chunk_config = None
 
-    if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
+    if kv_cache_config.enable_block_reuse and is_hybrid_linear(
+            config) and kv_cache_config.mamba_state_cache_interval > 0:
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
                             kv_cache_config.mamba_state_cache_interval)
 

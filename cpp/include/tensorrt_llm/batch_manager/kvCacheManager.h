@@ -202,10 +202,16 @@ struct LinearAttentionMetadata
         if (statesSnapshotInterval > 0)
         {
             count += promptLen / statesSnapshotInterval; // round down
+            // both enabled
+            if (saveLastSnapshot
+                && (promptLen / tokensPerBlock * tokensPerBlock
+                    != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+            {
+                count += 1;
+            }
         }
-        if (saveLastSnapshot
-            && (promptLen / tokensPerBlock * tokensPerBlock
-                != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+        // only last snapshot enabled
+        else if (saveLastSnapshot)
         {
             count += 1;
         }

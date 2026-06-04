@@ -173,6 +173,7 @@ void initBindings(nb::module_& m)
             nb::arg("kv_tokens_per_block"))
         .def_prop_rw(
             "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
+        .def_prop_rw("expect_chunking_points", &GenLlmReq::getExpectChunkingPoints, &GenLlmReq::setExpectChunkingPoints)
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
