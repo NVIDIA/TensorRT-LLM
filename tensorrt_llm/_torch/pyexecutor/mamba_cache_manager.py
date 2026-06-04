@@ -24,20 +24,21 @@ import torch
 import tensorrt_llm.bindings
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import \
-        AttentionMetadata
+    from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
+from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
-    PoolConfiguration, get_pp_layers)
+    BaseResourceManager,
+    CacheTypeCpp,
+    DataType,
+    KVCacheManager,
+    PoolConfiguration,
+    get_pp_layers,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
-                                 torch_dtype_to_binding)
-from tensorrt_llm.bindings.internal.batch_manager import (
-    LinearAttentionMetadata, LinearCacheType)
+from tensorrt_llm._utils import nvtx_range, prefer_pinned, torch_dtype_to_binding
+from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata, LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -46,6 +47,20 @@ RnnStateManagerCpp = tensorrt_llm.bindings.internal.batch_manager.RnnStateManage
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 GB = 1 << 30
+
+# Replay kernels pad the token/window dimension to at least 16 for tensor-core
+# tiles, so history sizes below 16 are no faster when not writing and do
+# expensive checkpoint writes more often. This minimum tensor-core tile size is
+# present in all tensor-core generations, with newer GPUs adding larger tile
+# operations, not smaller ones. In the other direction, history sizes above 16
+# currently pad to 32, which is substantially slower with the current kernel
+# design. Keep the default floor at 16 while still allowing larger T, which
+# degenerates to checkpointing every step instead of rejecting the request. If
+# larger T becomes common, we could consider padding larger histories to powers
+# of 2 or multiples of 16, but this is untested. For smaller T, we could explore
+# combining larger histories with new kernel designs that stay efficient when
+# the window is only partly full.
+MIN_REPLAY_HISTORY_SIZE = 16
 
 
 def get_tensor_size_bytes(tensor):
@@ -518,7 +533,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 assert n_groups % tp_size == 0, \
                     "replay state update requires n_groups divisible by tp_size"
                 n_groups_per_rank = n_groups // tp_size
-                self.replay_history_size = max(16, T)
+                self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, T)
 
                 # Compact replay cache.
                 spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
@@ -585,7 +600,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                 f"conv_state size: {get_tensor_size_bytes(conv_states) / GB:.2f}GB, "
                 f"ssm_state size: {get_tensor_size_bytes(ssm_states) / GB:.2f}GB, "
                 f"ssm_spec_cache size: {get_tensor_size_bytes(ssm_spec_cache) / GB:.2f}GB, "
-                f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB"
+                "intermediate_conv_window_cache size: "
+                f"{get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB"
             )
         else:
             self.mamba_cache = self.State(
@@ -687,8 +703,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         # cuda_graph_runner caches one dummy per runtime_draft_len value
         # (see _get_padded_batch), so any id in the range of dummy request IDs
         # may be live concurrently.
-        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-            CUDA_GRAPH_DUMMY_REQUEST_ID
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
         max_dl = self.speculative_num_draft_tokens or 0
         return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
                 CUDA_GRAPH_DUMMY_REQUEST_ID)
@@ -1171,7 +1186,8 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
-        assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
+        assert not kv_cache_config.enable_block_reuse, (
+            "mamba hybrid cache requires block reuse to be disabled in KV cache config")
 
         pool_size = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
 
@@ -1345,9 +1361,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.replay_step_width: Optional[int] = (
             spec_config.max_draft_len +
             1 if spec_config is not None and use_replay_state_update else None)
-        self.replay_history_size: Optional[int] = (max(
-            16, self.replay_step_width) if self.replay_step_width is not None
-                                                   else None)
+        self.replay_history_size: Optional[int] = (
+            max(MIN_REPLAY_HISTORY_SIZE, self.replay_step_width)
+            if self.replay_step_width is not None else None)
         # Same allocation gate as PythonMambaCacheManager: the rand_seed
         # buffer must exist whenever SR can fire, not only on the replay path.
         self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
@@ -1435,7 +1451,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.linear_attention_metadata = LinearAttentionMetadata()
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
-        self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_state_cache_interval if kv_cache_config.enable_block_reuse else 0
+        self.linear_attention_metadata.states_snapshot_interval = (
+            kv_cache_config.mamba_state_cache_interval
+            if kv_cache_config.enable_block_reuse else 0)
         # RNN model params for disagg TP-mismatch split/concat.
         conv_section_map = {"nemotron_hybrid": 1, "qwen3_next": 2}
         self.linear_attention_metadata.rnn_num_heads = self._rnn_num_heads
@@ -1553,8 +1571,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         ``T = budget // bytes_per_token``.
         """
         # Lazy import to avoid pulling config_utils into module import order.
-        from tensorrt_llm._torch.pyexecutor.config_utils import \
-            extract_mamba_kv_cache_params
+        from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
 
         # Attention slope from the parent's existing formula.
         attention_slope = KVCacheManager.get_cache_size_per_token(
@@ -1678,7 +1695,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self._pending_state_transfers = self.impl.copy_linear_attention_block_batch(
             self.requests)
         if self._pending_state_transfers:
-            logger.info(f"Need to transfer mamba state blocks")
+            logger.info("Need to transfer mamba state blocks")
         self._setup_state_indices()
         # Reset replay double-buffer state for fresh context blocks. A reused
         # block (prefix-cache hit or block recycled across requests) may carry
@@ -1934,7 +1951,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                     f"prepopulated_token_num={req.prepopulated_prompt_len}, "
                     f"context_chunk_size={req.context_chunk_size if not req.is_context_finished else 'N/A'}, "
                     f"block_index for next step is {block_indices[bad_i]}, "
-                    f"\nblock_ids={self.impl.get_cache_block_ids(req.py_request_id, LinearCacheType.RECURRENT_STATES.value)}"
+                    "\nblock_ids="
+                    f"{self.impl.get_cache_block_ids(req.py_request_id, LinearCacheType.RECURRENT_STATES.value)}"
                 )
             self._host_state_indices[:n] = values
 
@@ -1977,7 +1995,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if current >= prompt_len:
             return 0
         if not self.kv_cache_config.enable_block_reuse:
-            assert current == 0, f"Expected context_current_position to be 0 when block reuse is disabled, but got {current}"
+            assert current == 0, (
+                "Expected context_current_position to be 0 when block reuse is "
+                f"disabled, but got {current}")
             return prompt_len - current
         step = self.linear_attention_metadata.states_snapshot_interval
         stop_positions = calc_context_stop_positions(prompt_len,

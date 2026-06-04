@@ -13,6 +13,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MIN_REPLAY_HISTORY_SIZE,
     CppMambaCacheManager,
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
@@ -125,13 +126,13 @@ def test_replay_update_mamba_states_uses_history_window():
     """Replay path accumulates PNAT until layer kernels write a checkpoint."""
     mgr = _make_mgr(max_batch_size=4, max_draft_len=5, use_replay_state_update=True)
     assert mgr.replay_step_width == 6
-    assert mgr.replay_history_size == 16
+    assert mgr.replay_history_size == MIN_REPLAY_HISTORY_SIZE
     assert mgr.mamba_cache.prev_num_accepted_tokens.dtype == torch.int32
     assert mgr.mamba_cache.cache_buf_idx.dtype == torch.int32
-    assert mgr.mamba_cache.old_x.shape[3] == 16
-    assert mgr.mamba_cache.old_B.shape[3] == 16
-    assert mgr.mamba_cache.old_dt.shape[4] == 16
-    assert mgr.mamba_cache.old_dA_cumsum.shape[4] == 16
+    assert mgr.mamba_cache.old_x.shape[3] == MIN_REPLAY_HISTORY_SIZE
+    assert mgr.mamba_cache.old_B.shape[3] == MIN_REPLAY_HISTORY_SIZE
+    assert mgr.mamba_cache.old_dt.shape[4] == MIN_REPLAY_HISTORY_SIZE
+    assert mgr.mamba_cache.old_dA_cumsum.shape[4] == MIN_REPLAY_HISTORY_SIZE
 
     mgr._prepare_mamba_cache_blocks([100, 101])
     slot_appended = mgr.mamba_cache_index[100]
