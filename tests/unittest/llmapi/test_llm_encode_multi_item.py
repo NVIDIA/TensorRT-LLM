@@ -196,7 +196,7 @@ _QWEN3_PATH = get_model_path("Qwen3/Qwen3-0.6B")
 
 
 @pytest.fixture(scope="module")
-def llm() -> Generator[LLM, None, None]:
+def llm(force_fa2: None) -> Generator[LLM, None, None]:
     llm = LLM(model=_QWEN3_PATH, encode_only=True, attn_backend="FLASHINFER")
     with llm:
         yield llm
@@ -285,7 +285,6 @@ def test_multi_item_and_single_item_agreement(
     llm: LLM,
     batch_size: int,
     attention_only_qwen3: None,
-    force_fa2: None,
     multi_item_prompts: list[tuple[list[int], list[int]]],
     copy_logits_to_host: bool,
 ):
