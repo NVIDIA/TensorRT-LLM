@@ -38,9 +38,11 @@ _FORCE_RAGGED_FA2 = False
 
 
 @dataclass(kw_only=True, frozen=True)
-class MultiItemParams:
-    # cf. https://github.com/flashinfer-ai/flashinfer/pull/1015 and FlashInfer wrapper.plan()
+class FlashInferMultiItemParams:
+    """Multi-item scoring related parameters for FlashInfer APIs.
 
+    cf. https://github.com/flashinfer-ai/flashinfer/pull/1015 and FlashInfer wrapper.plan()
+    """
     prefix_len_ptr: torch.Tensor
     max_item_len_ptr: torch.Tensor
     token_pos_in_items_ptr: torch.Tensor
@@ -61,7 +63,7 @@ class PlanParams:
 
     attention_mask_type: AttentionMaskType
     attention_mask_data: Optional[torch.Tensor] = None
-    multi_item_params: Optional[MultiItemParams] = None
+    multi_item_params: Optional[FlashInferMultiItemParams] = None
     sm_scale: Optional[float] = None
     window_left: Optional[int] = None
 
@@ -1007,7 +1009,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
              q_scaling: Optional[float] = None,
              attention_window_size: Optional[int] = None,
              attention_mask_data: Optional[torch.Tensor] = None,
-             multi_item_params: Optional[MultiItemParams] = None,
+             multi_item_params: Optional[FlashInferMultiItemParams] = None,
              flashinfer_backend: str = "fa2") -> PlanParams:
 
         sm_scale = None
@@ -1251,7 +1253,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         *,
         metadata: FlashInferAttentionMetadata,
         device: torch.device,
-    ) -> MultiItemParams:
+    ) -> FlashInferMultiItemParams:
         if metadata.num_generations > 0:
             raise ValueError(
                 "\"multi_item_part_lens\" not supported for generation requests."
@@ -1322,7 +1324,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         token_pos_in_items_ptr = token_pos_in_items_ptr.to(dtype=torch.uint16,
                                                            non_blocking=True)
 
-        return MultiItemParams(
+        return FlashInferMultiItemParams(
             prefix_len_ptr=prefix_len_ptr,
             max_item_len_ptr=max_item_len_ptr,
             token_pos_in_items_ptr=token_pos_in_items_ptr,
@@ -1646,7 +1648,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # Query
         q = q.view(-1, self.num_heads, self.head_dim)
 
-        multi_item_params: MultiItemParams | None = None
+        multi_item_params: FlashInferMultiItemParams | None = None
         if multi_item_part_lens is not None:
             multi_item_params = self._process_multi_item_part_lens(
                 multi_item_part_lens,
