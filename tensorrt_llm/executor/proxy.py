@@ -167,6 +167,32 @@ class GenerationExecutorProxy(GenerationExecutor):
             name="proxy_error_monitor")
         self._error_monitor_thread.start()
 
+        # Single-thread executor that owns *all* profile-control IPC traffic
+        # (``request_queue.put`` for StartProfile/StopProfile and
+        # ``profile_ack_queue.get`` for the matching ack). Pinning these
+        # ZMQ socket operations to one owning thread is required because:
+        #
+        #   * pyzmq sockets are not thread-safe; concurrent access from
+        #     multiple threads — even one writer + one reader — is undefined
+        #     behavior in libzmq.
+        #   * The HTTP handler reaches us through ``asyncio.to_thread``,
+        #     which does not pin to the same worker thread between calls,
+        #     so back-to-back ``/start_profile`` and ``/stop_profile``
+        #     could otherwise touch ``profile_ack_queue`` from two
+        #     different threads.
+        #
+        # The HTTP handler still blocks on a Future returned by this
+        # executor, so the synchronous "chrome trace is on disk by the
+        # time /stop_profile returns 200" contract is preserved without
+        # any ZMQ socket op leaking into the FastAPI thread pool.
+        #
+        # NOTE: ``request_queue`` is also written from ``submit()`` /
+        # ``abort_request()`` on user-caller threads — that pre-existing
+        # cross-thread access is out of scope for this change. The fix
+        # here narrowly targets the new profile-control path.
+        self._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="proxy_profile_control")
+
         # MPI registers its joiner using threading._register_atexit if possible.
         # These functions run before atexit.register, so to avoid deadlock,
         # we have to notify workers to exit before MPI starts to wait them.
@@ -385,6 +411,16 @@ class GenerationExecutorProxy(GenerationExecutor):
                 raise RuntimeError(error_msg)
             return
 
+    def _profile_control_call(self, kind: str, request, timeout: float) -> None:
+        """Worker-side body of ``start_profile`` / ``stop_profile``.
+
+        Runs on ``_profile_control_executor`` so all profile-related
+        ZMQ socket ops (``request_queue.put`` and ``profile_ack_queue.get``
+        via ``_wait_profile_ack``) happen on a single owning thread.
+        """
+        self.request_queue.put(request)
+        self._wait_profile_ack(kind, timeout)
+
     def start_profile(self,
                       output_dir=None,
                       num_steps=None,
@@ -396,13 +432,23 @@ class GenerationExecutorProxy(GenerationExecutor):
         raises ``RuntimeError`` if ``PyExecutor`` rejected the start
         (e.g. a profile window is already active or pending) so the
         HTTP /start_profile endpoint can return 409.
+
+        The actual ZMQ traffic (``request_queue.put`` +
+        ``profile_ack_queue.get``) is dispatched onto
+        ``_profile_control_executor`` — a single-thread executor — so the
+        FastAPI thread-pool worker that called us never touches the
+        ZMQ sockets directly. ``Future.result()`` re-raises any
+        ``RuntimeError`` from ``_wait_profile_ack`` so the HTTP layer
+        still sees worker rejections.
         """
-        self.request_queue.put(
-            StartProfileRequest(output_dir=output_dir,
-                                num_steps=num_steps,
-                                start_step=start_step,
-                                activities=activities))
-        self._wait_profile_ack("start", self._START_PROFILE_ACK_TIMEOUT_S)
+        request = StartProfileRequest(output_dir=output_dir,
+                                      num_steps=num_steps,
+                                      start_step=start_step,
+                                      activities=activities)
+        future = self._profile_control_executor.submit(
+            self._profile_control_call, "start", request,
+            self._START_PROFILE_ACK_TIMEOUT_S)
+        future.result()
 
     def stop_profile(self) -> None:
         """Forward runtime profiling stop to the IPC worker process.
@@ -412,9 +458,15 @@ class GenerationExecutorProxy(GenerationExecutor):
         RPC-proxy paths: by the time this method returns the trace
         file is on disk, so HTTP callers can reliably read it
         immediately after /stop_profile returns 200.
+
+        Like ``start_profile``, the actual ZMQ traffic is dispatched
+        onto ``_profile_control_executor`` so the calling thread never
+        touches the ZMQ sockets.
         """
-        self.request_queue.put(StopProfileRequest())
-        self._wait_profile_ack("stop", self._STOP_PROFILE_ACK_TIMEOUT_S)
+        future = self._profile_control_executor.submit(
+            self._profile_control_call, "stop", StopProfileRequest(),
+            self._STOP_PROFILE_ACK_TIMEOUT_S)
+        future.result()
 
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
@@ -608,6 +660,16 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.dispatch_result_thread.stop()
             self.dispatch_result_thread.join()
 
+        # Drain the profile-control executor before closing its sockets.
+        # ``shutdown(wait=True)`` blocks until any in-flight
+        # start_profile/stop_profile call has finished its
+        # ``_wait_profile_ack`` round-trip on the owner thread, so we
+        # don't tear ``profile_ack_queue`` out from under it.
+        if hasattr(self, '_profile_control_executor'
+                   ) and self._profile_control_executor is not None:
+            self._profile_control_executor.shutdown(wait=True)
+            self._profile_control_executor = None
+
         # step3: finish all remaining work
 
         # close the RPC client
@@ -621,6 +683,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.result_queue.close()
         if self._resource_governor_queue is not None:
             self._resource_governor_queue.close()
+        # ``profile_ack_queue`` is only torn down here because the
+        # owning ``_profile_control_executor`` was just drained above.
+        self.profile_ack_queue.close()
 
         self.workers_started = False
         self.mpi_session.shutdown()
