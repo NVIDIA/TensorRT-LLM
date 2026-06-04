@@ -30,11 +30,13 @@ from ..attention_interface import (
     BatchInfo,
     MHACallable,
     ReplayCacheBufIdxHandler,
+    ReplayNWritesHandler,
     ReplayOldBHandler,
     ReplayOldDAcumsumHandler,
     ReplayOldDtHandler,
     ReplayOldXHandler,
     ReplayPrevNumAcceptedHandler,
+    ReplayWorkItemsHandler,
     ResourceHandlerDict,
     SpecSSMResourceHandler,
 )
@@ -64,7 +66,7 @@ def _fi_align(t: torch.Tensor) -> torch.Tensor:
         "ssm_state_cache",
         "intermediate_ssm_state_cache",
         # replay buffers: written in-place by the precompute and main kernels
-        # (double-buffered B/dt/dA_cumsum, single-buffered x); None in non-replay mode
+        # (double-buffered x/B/dt/dA_cumsum); None in non-replay mode
         "replay_old_x",
         "replay_old_b",
         "replay_old_dt",
@@ -103,6 +105,8 @@ def _flashinfer_cached_ssm(
     ],  # [max_batch, 2, nheads, T] fp32; None in non-replay
     replay_cache_buf_idx: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
     replay_prev_num_accepted: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
+    replay_work_items: Optional[torch.Tensor],  # [max_batch, 4] int32; None in non-replay
+    replay_n_writes: Optional[torch.Tensor],  # [1] int32; None in non-replay
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -218,6 +222,8 @@ def _flashinfer_cached_ssm(
                 B_extend,
                 C_extend,
                 out=preallocated_ssm_out_e,
+                n_writes=replay_n_writes,
+                replay_work_items=replay_work_items[:num_extend],
                 D=D_full,
                 dt_bias=dt_bias_hp,
                 dt_softplus=True,
@@ -350,6 +356,8 @@ def _flashinfer_cached_ssm_fake(
     ],  # [max_batch, 2, nheads, T] fp32; None in non-replay
     replay_cache_buf_idx: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
     replay_prev_num_accepted: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
+    replay_work_items: Optional[torch.Tensor],  # [max_batch, 4] int32; None in non-replay
+    replay_n_writes: Optional[torch.Tensor],  # [1] int32; None in non-replay
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -400,7 +408,7 @@ class FlashinferBackendSSM(BaseBackendSSM):
 
         ssm_h = ret["ssm_state_cache"]
 
-        # All 7 optional caches are always registered positionally (None = unused in this mode).
+        # Optional replay/spec caches are registered positionally (None = unused in this mode).
         # intermediate_ssm_state_cache: real in non-replay, None in replay.
         # replay_old_*: real in replay mode (SM80+), None otherwise.
         if use_replay:
@@ -418,6 +426,8 @@ class FlashinferBackendSSM(BaseBackendSSM):
             ret["replay_old_da_cumsum"] = ReplayOldDAcumsumHandler(num_heads=ssm_h.num_heads)
             ret["replay_cache_buf_idx"] = ReplayCacheBufIdxHandler()
             ret["replay_prev_num_accepted"] = ReplayPrevNumAcceptedHandler()
+            ret["replay_work_items"] = ReplayWorkItemsHandler()
+            ret["replay_n_writes"] = ReplayNWritesHandler()
         else:
             ret["intermediate_ssm_state_cache"] = SpecSSMResourceHandler.from_base(ssm_h)
             ret["replay_old_x"] = None
@@ -426,4 +436,6 @@ class FlashinferBackendSSM(BaseBackendSSM):
             ret["replay_old_da_cumsum"] = None
             ret["replay_cache_buf_idx"] = None
             ret["replay_prev_num_accepted"] = None
+            ret["replay_work_items"] = None
+            ret["replay_n_writes"] = None
         return ret

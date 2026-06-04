@@ -538,6 +538,8 @@ class FlashinferOpBackend(MoEOpBackend):
             _trtllm.DeepSeekV3: _flashinfer.DeepSeekV3,
             _trtllm.Llama4: _flashinfer.Llama4,
             _trtllm.RenormalizeNaive: _flashinfer.RenormalizeNaive,
+            _trtllm.MiniMax2: _flashinfer.MiniMax2,
+            _trtllm.SigmoidRenorm: _flashinfer.SigmoidRenorm,
             _trtllm.Unspecified: _flashinfer.Unspecified,
         }
         if routing_method_type not in _mapping:

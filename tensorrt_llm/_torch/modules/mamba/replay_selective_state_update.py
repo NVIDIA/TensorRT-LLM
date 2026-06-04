@@ -40,6 +40,22 @@ _REPLAY_WORK_CACHE_SLOT = tl.constexpr(REPLAY_WORK_CACHE_SLOT)
 _REPLAY_WORK_PNAT = tl.constexpr(REPLAY_WORK_PNAT)
 _REPLAY_WORK_CACHE_BUF_IDX = tl.constexpr(REPLAY_WORK_CACHE_BUF_IDX)
 _REPLAY_WORK_ITEM_WIDTH = tl.constexpr(REPLAY_WORK_ITEM_WIDTH)
+MIN_REPLAY_TILE_SIZE = 16
+
+
+# Naming convention:
+# - step: one decode invocation of replay_selective_state_update, with token
+#   positions [0, T).
+# - window: the replay cache capacity [0, max_window). History from previous
+#   steps occupies [0, PNAT). In non-rectangle replay, this history is the only
+#   valid window-indexed range; current-step values stay in T-space.
+# - rectangle nowrite: combines both ranges in window space, with history at
+#   [0, PNAT), current-step tokens at [PNAT, PNAT + T), and padding after
+#   PNAT + T masked invalid.
+# - history_*: cached prior-token values, always indexed in window space.
+# - step_*: current-step values in T-space.
+# - step_*_in_window: current-step values remapped to rectangle window positions.
+# - *_window: combined history + step values over the full window dimension.
 
 
 # Lazy global allocator for Triton TMA tensor descriptors. Required by any
@@ -371,19 +387,19 @@ def _replay_precompute_impl(
     C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
     B_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
 
-    C_all = tl.load(
+    C_tile = tl.load(
         C_base + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
-    B_all = tl.load(
+    B_tile = tl.load(
         B_base + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
 
     # Compute raw CB once — shared across all heads in this block
-    raw_CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
+    raw_CB = tl.dot(C_tile.to(tl.bfloat16), tl.trans(B_tile).to(tl.bfloat16))
 
     # Store B to cache at [write_offset : write_offset+T) of write_buf.
     if first_head % nheads_ngroups_ratio == 0:
@@ -397,7 +413,7 @@ def _replay_precompute_impl(
             old_B_base
             + (write_offset + offs_t)[:, None] * stride_old_B_T
             + offs_n[None, :] * stride_old_B_dstate,
-            B_all,
+            B_tile,
             mask=t_mask[:, None] & n_mask[None, :],
         )
 
@@ -432,7 +448,7 @@ def _rectangle_precompute_impl(
     B_ptr,
     C_ptr,
     # Output pointers
-    cb_scaled_ptr,  # (batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_K) — rectangle
+    cb_scaled_ptr,  # (batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_K) — rectangle window
     decay_vec_ptr,  # (batch, nheads, BLOCK_SIZE_T) — total_decay * exp(cumAdt_new[t])
     # Cache pointers (both buffers reachable via stride_*_dbuf).  Nowrite
     # path: read from buf_active at [0, PNAT), write new tokens at
@@ -445,7 +461,7 @@ def _rectangle_precompute_impl(
     state_batch_indices_ptr,
     # Dimensions
     T: tl.constexpr,
-    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,  # rectangle K-axis bound
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,  # rectangle window bound
     dstate: tl.constexpr,
     nheads_ngroups_ratio: tl.constexpr,
     # dt strides
@@ -464,7 +480,7 @@ def _rectangle_precompute_impl(
     stride_C_T,
     stride_C_group,
     stride_C_dstate,
-    # cb_scaled strides (rectangle: (batch, nheads, T, K))
+    # cb_scaled strides (rectangle: batch, nheads, T, window)
     stride_cb_batch,
     stride_cb_head,
     stride_cb_t,
@@ -515,21 +531,21 @@ def _rectangle_precompute_impl(
     write_buf = buf_active
     write_offset = prev_num_accepted_tokens
 
-    # Rectangle K-axis layout: old at [0, PNAT), new at [PNAT, PNAT+T).
+    # Rectangle window layout: history at [0, PNAT), step tokens at [PNAT, PNAT+T).
     # PNAT + T <= MAX is guaranteed on the nowrite path → no overlap.
 
-    offs_t = tl.arange(0, BLOCK_SIZE_T)  # T-axis (output rows)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)  # K-axis (rectangle input cols)
+    offs_t = tl.arange(0, BLOCK_SIZE_T)  # current-step output rows
+    offs_window = tl.arange(0, BLOCK_SIZE_K)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
     t_mask = offs_t < T
     n_mask = offs_n < dstate
 
-    # K-axis masks. Cache and matmul share rows.
-    is_old_k = offs_k < prev_num_accepted_tokens
-    safe_old_k = tl.where(is_old_k, offs_k, 0)
-    k_new_idx = offs_k - prev_num_accepted_tokens
-    is_new_k = (k_new_idx >= 0) & (k_new_idx < T)
-    safe_k_new = tl.where(is_new_k, k_new_idx, 0)
+    # Window masks. Cache and matmul share this logical dimension.
+    is_history_position = offs_window < prev_num_accepted_tokens
+    safe_history_idx = tl.where(is_history_position, offs_window, 0)
+    step_idx_from_window = offs_window - prev_num_accepted_tokens
+    is_step_position = (step_idx_from_window >= 0) & (step_idx_from_window < T)
+    safe_step_idx = tl.where(is_step_position, step_idx_from_window, 0)
 
     offs_h = tl.arange(0, HEADS_PER_BLOCK)
     heads_block = first_head + offs_h
@@ -593,25 +609,25 @@ def _rectangle_precompute_impl(
     # work can overlap the upstream conv1d latency.
     group_idx = first_head // nheads_ngroups_ratio
 
-    # Group-level: old B from active buffer at [0, PNAT) of the K-axis.
+    # Group-level: history B from active buffer at [0, PNAT) of the window.
     old_B_read_base = (
         old_B_ptr
         + cache_batch_idx * stride_old_B_cache
         + buf_active * stride_old_B_dbuf
         + group_idx * stride_old_B_group
     )
-    old_B_load = tl.load(
+    history_B = tl.load(
         old_B_read_base
-        + safe_old_k[:, None] * stride_old_B_T
+        + safe_history_idx[:, None] * stride_old_B_T
         + offs_n[None, :] * stride_old_B_dstate,
-        mask=is_old_k[:, None] & n_mask[None, :],
+        mask=is_history_position[:, None] & n_mask[None, :],
         other=0.0,
     )
 
     # combo_block stays in registers across gdc_wait and is used directly
     # after the wait to compute rect_CB_scaled.
 
-    # Per-head read bases (H,) - broadcast with offs_k for 2D loads.
+    # Per-head read bases (H,) - broadcast with offs_window for 2D loads.
     old_dt_read_h = (
         old_dt_ptr
         + cache_batch_idx * stride_old_dt_cache
@@ -625,16 +641,16 @@ def _rectangle_precompute_impl(
         + heads_block * stride_old_dA_cumsum_head
     )
 
-    # (H, K) loads at [0, PNAT) — old data from previous step.
-    hk_mask = is_old_k[None, :]  # (1, K)
-    old_dt_all = tl.load(
-        old_dt_read_h[:, None] + safe_old_k[None, :] * stride_old_dt_T,
-        mask=hk_mask,
+    # (H, window) loads at [0, PNAT) from previous steps.
+    history_mask_h = is_history_position[None, :]
+    history_dt = tl.load(
+        old_dt_read_h[:, None] + safe_history_idx[None, :] * stride_old_dt_T,
+        mask=history_mask_h,
         other=0.0,
     ).to(tl.float32)
-    old_dA_cumsum_all = tl.load(
-        old_dA_cumsum_read_h[:, None] + safe_old_k[None, :] * stride_old_dA_cumsum_T,
-        mask=hk_mask,
+    history_dA_cumsum = tl.load(
+        old_dA_cumsum_read_h[:, None] + safe_history_idx[None, :] * stride_old_dA_cumsum_T,
+        mask=history_mask_h,
         other=0.0,
     ).to(tl.float32)
     # Use loop-1 registers for this step's newly appended tokens.  These are
@@ -644,35 +660,35 @@ def _rectangle_precompute_impl(
     ht_mask = t_mask[None, :]  # (1, T)
     dA_cumsum_new = dA_cumsum_step + dA_cumsum_prefix[:, None]  # (H, T)
 
-    # Production uses matching padded T/K sizes, where tl.gather is the cheap
+    # Production uses matching padded T and window sizes, where tl.gather is the cheap
     # path.  Some tests use a larger padded K than T; Triton rejects that gather
     # axis mismatch, so use a slower one-hot sum fallback for those cases.  The
     # wrapper passes this as an explicit constexpr so fast-path compilations do
     # not carry the fallback branch.
     if USE_GATHER_FOR_NEW_TOKENS:
-        new_token_gather_idx = tl.broadcast_to(safe_k_new[None, :], (HEADS_PER_BLOCK, BLOCK_SIZE_K))
-        dt_at_kn = tl.where(
-            is_new_k[None, :],
-            tl.gather(dt_new, new_token_gather_idx, axis=1),
+        step_gather_idx = tl.broadcast_to(safe_step_idx[None, :], (HEADS_PER_BLOCK, BLOCK_SIZE_K))
+        step_dt_in_window = tl.where(
+            is_step_position[None, :],
+            tl.gather(dt_new, step_gather_idx, axis=1),
             0.0,
-        )  # (H, K)
-        dA_cumsum_at_kn = tl.where(
-            is_new_k[None, :],
-            tl.gather(dA_cumsum_new, new_token_gather_idx, axis=1),
+        )  # (H, window)
+        step_dA_cumsum_in_window = tl.where(
+            is_step_position[None, :],
+            tl.gather(dA_cumsum_new, step_gather_idx, axis=1),
             0.0,
-        )  # (H, K)
+        )  # (H, window)
     else:
-        new_token_selector = (
-            offs_t[:, None] == (offs_k[None, :] - prev_num_accepted_tokens)
-        ) & is_new_k[None, :]
-        dt_at_kn = tl.sum(
-            tl.where(new_token_selector[None, :, :], dt_new[:, :, None], 0.0),
+        step_in_window_selector = (
+            offs_t[:, None] == (offs_window[None, :] - prev_num_accepted_tokens)
+        ) & is_step_position[None, :]
+        step_dt_in_window = tl.sum(
+            tl.where(step_in_window_selector[None, :, :], dt_new[:, :, None], 0.0),
             axis=1,
-        )  # (H, K)
-        dA_cumsum_at_kn = tl.sum(
-            tl.where(new_token_selector[None, :, :], dA_cumsum_new[:, :, None], 0.0),
+        )  # (H, window)
+        step_dA_cumsum_in_window = tl.sum(
+            tl.where(step_in_window_selector[None, :, :], dA_cumsum_new[:, :, None], 0.0),
             axis=1,
-        )  # (H, K)
+        )  # (H, window)
 
     # The write buffer stores continuous cumsum, so decay_vec_full[t] is
     # exp(continuous_cumsum[PNAT+t]) directly.
@@ -685,18 +701,20 @@ def _rectangle_precompute_impl(
     )  # (H, T)
     tl.store(decay_vec_addrs, decay_vec_full_block, mask=ht_mask)
 
-    # combo_block[t, k] = dt[k] * exp(cumsum[t] - cumsum[k]).
-    # Old and new K positions share the same formula because both halves use
+    # combo_block[t, j] = dt[j] * exp(cumsum[t] - cumsum[j]).
+    # History and step positions share the same formula because both halves use
     # continuous cumsum values.
-    factor_dt = tl.where(is_old_k[None, :], old_dt_all, dt_at_kn)  # (H, K)
-    s_k = tl.where(
-        is_old_k[None, :],
-        -old_dA_cumsum_all,
-        -dA_cumsum_at_kn,
-    )  # (H, K)
-    # exp_diff (H, T, K) = exp(s_k (H, 1, K) + dA_cumsum_new (H, T, 1)).
-    exp_diff = tl.exp(s_k[:, None, :] + dA_cumsum_new[:, :, None])
-    combo_block = factor_dt[:, None, :] * exp_diff  # (H, T, K)
+    dt_factor_window = tl.where(
+        is_history_position[None, :], history_dt, step_dt_in_window
+    )  # (H, window)
+    neg_dA_cumsum_window = tl.where(
+        is_history_position[None, :],
+        -history_dA_cumsum,
+        -step_dA_cumsum_in_window,
+    )  # (H, window)
+    # exp_diff (H, T, window) = exp(-cumsum[j] (H, 1, window) + cumsum[t] (H, T, 1)).
+    exp_diff = tl.exp(neg_dA_cumsum_window[:, None, :] + dA_cumsum_new[:, :, None])
+    combo_block = dt_factor_window[:, None, :] * exp_diff  # (H, T, window)
 
     # ---- gdc_wait: from here on we depend on conv1d's outputs ----
     if LAUNCH_WITH_PDL:
@@ -704,26 +722,26 @@ def _rectangle_precompute_impl(
 
     # Conv1d outputs: B and C
     C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
-    B_new_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
+    step_B_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
 
-    C_all = tl.load(
+    C_tile = tl.load(
         C_base + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
-    B_new_orig = tl.load(
-        B_new_base + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
+    step_B = tl.load(
+        step_B_base + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
-    B_new_shifted = tl.load(
-        B_new_base + safe_k_new[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
-        mask=is_new_k[:, None] & n_mask[None, :],
+    step_B_in_window = tl.load(
+        step_B_base + safe_step_idx[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
+        mask=is_step_position[:, None] & n_mask[None, :],
         other=0.0,
     )
-    # Disjoint masks: old at [0, PNAT), new at [PNAT, PNAT+T).
-    B_combined = old_B_load + B_new_shifted
-    raw_rect_CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_combined).to(tl.bfloat16))
+    # Disjoint masks: history at [0, PNAT), step tokens at [PNAT, PNAT+T).
+    B_window = history_B + step_B_in_window
+    raw_rect_CB = tl.dot(C_tile.to(tl.bfloat16), tl.trans(B_window).to(tl.bfloat16))
 
     # Append new B to cache at [PNAT, PNAT+T) of write_buf (once per group).
     if first_head % nheads_ngroups_ratio == 0:
@@ -737,37 +755,41 @@ def _rectangle_precompute_impl(
             old_B_write_base
             + (write_offset + offs_t)[:, None] * stride_old_B_T
             + offs_n[None, :] * stride_old_B_dstate,
-            B_new_orig,
+            step_B,
             mask=t_mask[:, None] & n_mask[None, :],
         )
 
-    # Causal mask (BLOCK_SIZE_T × BLOCK_SIZE_K, shared across heads).
-    # New tokens occupy runtime positions [PNAT, PNAT+T).
+    # Causal mask (BLOCK_SIZE_T × window, shared across heads).
+    # Step tokens occupy runtime positions [PNAT, PNAT+T).
     t_idx_2d = offs_t[:, None]
-    k_idx_2d = offs_k[None, :]
-    is_old_k_2d = k_idx_2d < prev_num_accepted_tokens
-    k_new_idx_2d = k_idx_2d - prev_num_accepted_tokens
-    is_new_causal_2d = (k_new_idx_2d >= 0) & (k_new_idx_2d < T) & (k_new_idx_2d <= t_idx_2d)
-    causal_combined = (is_old_k_2d | is_new_causal_2d) & t_mask[:, None]
+    window_idx_2d = offs_window[None, :]
+    is_history_position_2d = window_idx_2d < prev_num_accepted_tokens
+    step_idx_from_window_2d = window_idx_2d - prev_num_accepted_tokens
+    is_step_causal_2d = (
+        (step_idx_from_window_2d >= 0)
+        & (step_idx_from_window_2d < T)
+        & (step_idx_from_window_2d <= t_idx_2d)
+    )
+    causal_combined = (is_history_position_2d | is_step_causal_2d) & t_mask[:, None]
 
-    # Post-wait vectorized: combo_block (H, T, K) is still live in registers.
+    # Post-wait vectorized: combo_block (H, T, window) is still live in registers.
     # rect_CB_scaled = where(causal, raw_rect_CB * combo_block, 0); store as
-    # one (H, T, K) tile.
+    # one (H, T, window) tile.
     rect_CB_scaled_block = tl.where(
         causal_combined[None, :, :],
         raw_rect_CB[None, :, :] * combo_block,
         0.0,
-    )  # (H, T, K)
+    )  # (H, T, window)
     cb_scaled_addrs = (
         cb_scaled_ptr
         + pid_b * stride_cb_batch
         + heads_block[:, None, None] * stride_cb_head
         + offs_t[None, :, None] * stride_cb_t
-        + offs_k[None, None, :] * stride_cb_j
-    )  # (H, T, K)
+        + offs_window[None, None, :] * stride_cb_j
+    )  # (H, T, window)
     cb_store_mask_3d = (offs_t[None, :, None] < BLOCK_SIZE_T) & (
-        offs_k[None, None, :] < BLOCK_SIZE_K
-    )  # (1, T, K) → broadcasts to (H, T, K)
+        offs_window[None, None, :] < BLOCK_SIZE_K
+    )  # (1, T, window) → broadcasts to (H, T, window)
     tl.store(cb_scaled_addrs, rect_CB_scaled_block, mask=cb_store_mask_3d)
 
 
@@ -776,9 +798,15 @@ def _rectangle_precompute_impl(
 # the Python wrapper on the rectangle nowrite path.
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
-@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.heuristics(
-    {"BLOCK_SIZE_K": lambda args: max(triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+    {"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), MIN_REPLAY_TILE_SIZE)}
+)
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_K": lambda args: max(
+            triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), MIN_REPLAY_TILE_SIZE
+        )
+    }
 )
 @triton.jit()
 def _dynamic_precompute_kernel(
@@ -819,7 +847,7 @@ def _dynamic_precompute_kernel(
     stride_C_T,
     stride_C_group,
     stride_C_dstate,
-    # cb_scaled strides — wrapper allocates (T, K), so stride_cb_t = K
+    # cb_scaled strides — wrapper allocates (T, window), so stride_cb_t is the padded window size.
     stride_cb_batch,
     stride_cb_head,
     stride_cb_t,
@@ -1227,7 +1255,7 @@ def _persistent_main_impl(
     # Phase 1: Replay via tl.dot fast-forward (reads from active_buf)
     group_idx = pid_h // nheads_ngroups_ratio
 
-    old_window_mask = offs_window < prev_num_accepted_tokens
+    history_mask = offs_window < prev_num_accepted_tokens
 
     old_dt_base = (
         old_dt_ptr
@@ -1235,8 +1263,10 @@ def _persistent_main_impl(
         + active_buf * stride_old_dt_dbuf
         + pid_h * stride_old_dt_head
     )
-    old_dt_all = tl.load(
-        old_dt_base + offs_window * stride_old_dt_T, mask=old_window_mask, other=0.0
+    history_dt = tl.load(
+        old_dt_base + offs_window * stride_old_dt_T,
+        mask=history_mask,
+        other=0.0,
     ).to(tl.float32)
 
     old_dA_cumsum_base = (
@@ -1245,9 +1275,9 @@ def _persistent_main_impl(
         + active_buf * stride_old_dA_cumsum_dbuf
         + pid_h * stride_old_dA_cumsum_head
     )
-    old_dA_cumsum_all = tl.load(
+    history_dA_cumsum = tl.load(
         old_dA_cumsum_base + offs_window * stride_old_dA_cumsum_T,
-        mask=old_window_mask,
+        mask=history_mask,
         other=0.0,
     ).to(tl.float32)
 
@@ -1258,7 +1288,7 @@ def _persistent_main_impl(
         tl.float32
     )
 
-    coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
+    coeff = tl.exp(total_dA_cumsum - history_dA_cumsum) * history_dt
 
     # Double buffering keeps old_x replay reads and checkpoint writes in
     # disjoint buffers on write steps.
@@ -1274,11 +1304,11 @@ def _persistent_main_impl(
         + write_buf * stride_old_x_dbuf
         + pid_h * stride_old_x_head
     )
-    old_x_all = tl.load(
+    history_x = tl.load(
         old_x_read_base
         + offs_window[:, None] * stride_old_x_T
         + offs_m[None, :] * stride_old_x_dim,
-        mask=old_window_mask[:, None] & m_mask[None, :],
+        mask=history_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
 
@@ -1288,18 +1318,18 @@ def _persistent_main_impl(
         + active_buf * stride_old_B_dbuf
         + group_idx * stride_old_B_group
     )
-    old_B_all = tl.load(
+    history_B = tl.load(
         old_B_base + offs_window[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
-        mask=old_window_mask[:, None] & n_mask[None, :],
+        mask=history_mask[:, None] & n_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
-    dB_scaled = coeff[:, None] * old_B_all
+    dB_scaled = coeff[:, None] * history_B
 
     total_decay = tl.where(prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum), 1.0)
     state *= total_decay
 
-    state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
+    state += tl.dot(tl.trans(history_x).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
 
     if is_write:
         if USE_RS_ROUNDING:
@@ -1431,13 +1461,13 @@ def _persistent_main_impl(
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
 
-    C_all = tl.load(
+    C_tile = tl.load(
         C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
 
-    x_all = tl.load(
+    step_x = tl.load(
         x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
         mask=t_mask[:, None] & m_mask[None, :],
         other=0.0,
@@ -1446,10 +1476,10 @@ def _persistent_main_impl(
         old_x_write_base
         + (write_offset + offs_t)[:, None] * stride_old_x_T
         + offs_m[None, :] * stride_old_x_dim,
-        x_all,
+        step_x,
         mask=t_mask[:, None] & m_mask[None, :],
     )
-    x_all = x_all.to(tl.float32)
+    step_x = step_x.to(tl.float32)
 
     cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
     CB_scaled = tl.load(
@@ -1463,25 +1493,25 @@ def _persistent_main_impl(
         tl.float32
     )
 
-    init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
-    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), x_all.to(tl.bfloat16))
-    out_all = init_out + cb_out
+    init_out = tl.dot(C_tile.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
+    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), step_x.to(tl.bfloat16))
+    output_tile = init_out + cb_out
 
     if HAS_D:
-        out_all = out_all + x_all * D[None, :]
+        output_tile = output_tile + step_x * D[None, :]
 
     if HAS_Z:
-        z_all = tl.load(
+        z_tile = tl.load(
             z_ptr + offs_t[:, None] * stride_z_T + offs_m[None, :] * stride_z_dim,
             mask=t_mask[:, None] & m_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        out_all_z = out_all * z_all * tl.sigmoid(z_all)
-        out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
-        tl.store(out_all_ptrs, out_all_z, mask=t_mask[:, None] & m_mask[None, :])
+        gated_output_tile = output_tile * z_tile * tl.sigmoid(z_tile)
+        output_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+        tl.store(output_ptrs, gated_output_tile, mask=t_mask[:, None] & m_mask[None, :])
     else:
-        out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
-        tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
+        output_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+        tl.store(output_ptrs, output_tile, mask=t_mask[:, None] & m_mask[None, :])
 
 
 # `_persistent_rectangle_impl`: rectangle nowrite path for the persistent
@@ -1557,7 +1587,7 @@ def _persistent_rectangle_impl(
     stride_out_T,
     stride_out_head,
     stride_out_dim,
-    # cb_scaled strides (rectangle (batch, nheads, T, K))
+    # cb_scaled strides (rectangle: batch, nheads, T, window)
     stride_cb_batch,
     stride_cb_head,
     stride_cb_t,
@@ -1578,24 +1608,24 @@ def _persistent_rectangle_impl(
     QUANT_MAX: tl.constexpr,
     USE_TMA_LOAD: tl.constexpr = False,
 ):
-    # Nowrite-only: new tokens append at [PNAT, PNAT+T).
+    # Nowrite-only: step tokens append at [PNAT, PNAT+T).
 
-    # Rectangle K-axis layout: old at [0, PNAT), new at [PNAT, PNAT+T).
+    # Rectangle window layout: history at [0, PNAT), step tokens at [PNAT, PNAT+T).
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
     offs_t = tl.arange(0, BLOCK_SIZE_T)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_window = tl.arange(0, BLOCK_SIZE_K)
     m_mask = offs_m < dim
     n_mask = offs_n < dstate
     t_mask = offs_t < T
 
-    # K-axis masks (approach C: PNAT-runtime offset, matches precompute).
-    is_old_k = offs_k < prev_num_accepted_tokens
-    safe_old_k = tl.where(is_old_k, offs_k, 0)
-    k_new_idx = offs_k - prev_num_accepted_tokens
-    is_new_k = (k_new_idx >= 0) & (k_new_idx < T)
-    safe_k_new = tl.where(is_new_k, k_new_idx, 0)
+    # Window masks use the same PNAT-runtime offset as rectangle precompute.
+    is_history_position = offs_window < prev_num_accepted_tokens
+    safe_history_idx = tl.where(is_history_position, offs_window, 0)
+    step_idx_from_window = offs_window - prev_num_accepted_tokens
+    is_step_position = (step_idx_from_window >= 0) & (step_idx_from_window < T)
+    safe_step_idx = tl.where(is_step_position, step_idx_from_window, 0)
 
     # Load state.  Quant scale hoist: defer `* decode_scale` post-matmul.
     if USE_TMA_LOAD:
@@ -1654,45 +1684,51 @@ def _persistent_rectangle_impl(
             D_ptr + pid_h * stride_D_head + offs_m * stride_D_dim, mask=m_mask, other=0.0
         ).to(tl.float32)
 
-    # Hoist: old_x doesn't depend on conv1d/precompute; load before gdc_wait.
-    old_x_load = tl.load(
-        old_x_read_base + safe_old_k[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
-        mask=is_old_k[:, None] & m_mask[None, :],
+    # Hoist: history x doesn't depend on conv1d/precompute; load before gdc_wait.
+    history_x = tl.load(
+        old_x_read_base
+        + safe_history_idx[:, None] * stride_old_x_T
+        + offs_m[None, :] * stride_old_x_dim,
+        mask=is_history_position[:, None] & m_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
 
-    C_all = tl.load(
+    C_tile = tl.load(
         C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
-    x_K = tl.load(
-        x_ptr + safe_k_new[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
-        mask=is_new_k[:, None] & m_mask[None, :],
+    step_x_in_window = tl.load(
+        x_ptr + safe_step_idx[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
+        mask=is_step_position[:, None] & m_mask[None, :],
         other=0.0,
     )
     tl.store(
-        old_x_write_base + offs_k[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
-        x_K,
-        mask=is_new_k[:, None] & m_mask[None, :],
+        old_x_write_base
+        + offs_window[:, None] * stride_old_x_T
+        + offs_m[None, :] * stride_old_x_dim,
+        step_x_in_window,
+        mask=is_step_position[:, None] & m_mask[None, :],
     )
 
-    x_K_f32 = x_K.to(tl.float32)
-    x_combined = old_x_load + x_K_f32
+    step_x_in_window_f32 = step_x_in_window.to(tl.float32)
+    x_window = history_x + step_x_in_window_f32
 
     if HAS_D or HAS_Z:
-        sel_tk = offs_t[:, None] == (offs_k[None, :] - prev_num_accepted_tokens)
-        x_all = tl.dot(sel_tk.to(tl.bfloat16), x_K.to(tl.bfloat16))
+        step_in_window_selector = offs_t[:, None] == (
+            offs_window[None, :] - prev_num_accepted_tokens
+        )
+        step_x = tl.dot(step_in_window_selector.to(tl.bfloat16), step_x_in_window.to(tl.bfloat16))
     else:
-        x_all = x_K_f32  # placeholder; unused
+        step_x = step_x_in_window_f32  # placeholder; unused
 
     cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
     CB_scaled = tl.load(
-        cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_k[None, :] * stride_cb_j,
-        mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_k[None, :] < BLOCK_SIZE_K),
+        cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_window[None, :] * stride_cb_j,
+        mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_window[None, :] < BLOCK_SIZE_K),
         other=0.0,
     ).to(tl.float32)
 
@@ -1702,30 +1738,30 @@ def _persistent_rectangle_impl(
     )
 
     state_out = (
-        tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec_full[:, None]
+        tl.dot(C_tile.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec_full[:, None]
     )
     if QUANT_MAX > 0.0:
         state_out = state_out * decode_scale[None, :]
 
-    token_out = tl.dot(CB_scaled.to(tl.bfloat16), x_combined.to(tl.bfloat16))
+    token_out = tl.dot(CB_scaled.to(tl.bfloat16), x_window.to(tl.bfloat16))
 
-    out_all = state_out + token_out
+    output_tile = state_out + token_out
 
     if HAS_D:
-        out_all = out_all + x_all * D[None, :]
+        output_tile = output_tile + step_x * D[None, :]
 
     if HAS_Z:
-        z_all = tl.load(
+        z_tile = tl.load(
             z_ptr + offs_t[:, None] * stride_z_T + offs_m[None, :] * stride_z_dim,
             mask=t_mask[:, None] & m_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        out_all_z = out_all * z_all * tl.sigmoid(z_all)
-        out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
-        tl.store(out_all_ptrs, out_all_z, mask=t_mask[:, None] & m_mask[None, :])
+        gated_output_tile = output_tile * z_tile * tl.sigmoid(z_tile)
+        output_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+        tl.store(output_ptrs, gated_output_tile, mask=t_mask[:, None] & m_mask[None, :])
     else:
-        out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
-        tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
+        output_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+        tl.store(output_ptrs, output_tile, mask=t_mask[:, None] & m_mask[None, :])
 
 
 # Persistent main kernel: 1D grid, persistent CTA loop.
@@ -1737,16 +1773,22 @@ def _persistent_rectangle_impl(
 )
 @triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
-@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.heuristics(
+    {"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), MIN_REPLAY_TILE_SIZE)}
+)
 @triton.heuristics(
     {
         "BLOCK_SIZE_WINDOW": lambda args: max(
-            triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16
+            triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), MIN_REPLAY_TILE_SIZE
         )
     }
 )
 @triton.heuristics(
-    {"BLOCK_SIZE_K": lambda args: max(triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+    {
+        "BLOCK_SIZE_K": lambda args: max(
+            triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), MIN_REPLAY_TILE_SIZE
+        )
+    }
 )
 @triton.heuristics(
     {"NUM_PID_M_BLOCKS": lambda args: triton.cdiv(args["dim"], args["BLOCK_SIZE_M"])}
@@ -1885,7 +1927,7 @@ def _persistent_main_kernel(
     FLATTEN: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
     IS_DYNAMIC: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr = 16,  # rectangle K-axis (heuristic-derived)
+    BLOCK_SIZE_K: tl.constexpr = MIN_REPLAY_TILE_SIZE,  # rectangle window dimension
     RECTANGLE: tl.constexpr = False,  # when True, dispatch nowrite slots to _persistent_rectangle_impl
     # 3 TMA toggles per the 3 live paths per-compilation:
     #   USE_TMA_LOAD_WRITE   — SSM state load when is_write
@@ -3827,9 +3869,9 @@ def replay_selective_state_update(
         assert state_scales.device == state.device
 
     # Cache window capacity comes from old_x.shape[2]; it may equal T or be
-    # larger when retaining replay history. Window-axis kernel tiles
-    # (BLOCK_SIZE_WINDOW, BLOCK_SIZE_K) are derived independently from
-    # MAX_REPLAY_BUFFER_LENGTH so max_window can exceed BLOCK_SIZE_T freely.
+    # larger when retaining replay history. Replay and rectangle window tile
+    # sizes are derived independently from MAX_REPLAY_BUFFER_LENGTH so
+    # max_window can exceed BLOCK_SIZE_T freely.
     max_window = old_x.shape[2]
     assert T <= max_window, f"T={T} exceeds cache max_window={max_window}"
 
@@ -3873,18 +3915,18 @@ def replay_selective_state_update(
     assert tie_hdim
 
     device = x.device
-    BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
-    # Rectangle K-axis bound = window (max_window).  Computed unconditionally
+    BLOCK_SIZE_T = max(triton.next_power_of_2(T), MIN_REPLAY_TILE_SIZE)
+    # Rectangle window bound = max_window.  Computed unconditionally
     # so the launch sites can refer to it; only used on the rectangle path.
     # If this differs from BLOCK_SIZE_T, rectangle precompute uses a slower
-    # one-hot fallback because tl.gather requires matching padded axis sizes.
-    # Production uses matching padded T/K; mismatches are for tests/debugging.
-    BLOCK_SIZE_K = max(triton.next_power_of_2(max_window), 16)
+    # one-hot fallback because tl.gather requires matching padded dimension sizes.
+    # Production uses matching padded T and window sizes; mismatches are for tests/debugging.
+    BLOCK_SIZE_K = max(triton.next_power_of_2(max_window), MIN_REPLAY_TILE_SIZE)
     rectangle_use_gather = BLOCK_SIZE_T == BLOCK_SIZE_K
 
     # Allocate precomputed intermediates (per-call, not cached).  Always
-    # allocate (T, K) — the largest layout that any path uses.  Replay-style
-    # paths only touch the first T columns; rectangle/dynamic use the full K.
+    # allocate (T, window) — the largest layout that any path uses. Replay-style
+    # paths only touch the first T columns; rectangle/dynamic use the full window.
     # The few extra unused columns per row are negligible (~6KB per layer at
     # production sizes) and let the dispatch helpers share one buffer.
     cb_scaled = torch.empty(
