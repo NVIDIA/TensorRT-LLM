@@ -917,7 +917,8 @@ class BaseLLM:
             for i in range(len(token_ids_list)):
                 results.append(
                     EncoderOutput(
-                        logits=logits[i] if logits.dim() > 1 else logits,
+                        logits=(logits[i] if len(token_ids_list) > 1
+                                or logits.dim() > 1 else logits),
                         prompt_token_ids=token_ids_list[i],
                         prompt=prompts[i],
                     ))
