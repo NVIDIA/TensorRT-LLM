@@ -77,6 +77,15 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
+    # The MX load paths build a receiver-side SourceIdentity from the resolved
+    # ModelConfig. These tests stub the config, so short-circuit the fingerprint
+    # construction to a sentinel; identity-comparison logic is covered
+    # separately in test_source_identity.py.
+    monkeypatch.setattr(
+        model_loader_mod.SourceIdentity,
+        "from_model_config",
+        classmethod(lambda cls, *_args, **_kwargs: SimpleNamespace(name="local-identity")),
+    )
     monkeypatch.setattr(
         model_loader_mod.AutoModelForCausalLM,
         "from_config",
@@ -114,8 +123,12 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(mon
 
     # reload() uses self.weight_mapper unconditionally; MX success must
     # initialize it even though the initial load skipped _call_load_weights.
+    model._weights_transformed = True
+    model.linear._weights_transformed = True
     loader.reload(model, {"reloaded": MagicMock()})
     assert loader._call_load_weights.call_count == 1
+    assert model._weights_transformed is False
+    assert model.linear._weights_transformed is False
     assert events == ["post_load_weights", "load_weights"]
 
 
@@ -198,13 +211,17 @@ class _HookModel(_HookRecorder):
         self.removed_child = _HookRecorder("removed_child", events, removed=True)
 
 
-def test_staged_hook_setup_aliases_is_top_level_only():
+def test_staged_hook_setup_aliases_walks_skip_removed_modules():
     events = []
     model = _HookModel(events)
 
     ModelLoader._setup_aliases(model)
 
-    assert events == [("model", "setup_aliases")]
+    assert events == [
+        ("model", "setup_aliases"),
+        ("child", "setup_aliases"),
+        ("transformed_child", "setup_aliases"),
+    ]
 
 
 def test_staged_hook_walks_skip_removed_and_transformed_modules():

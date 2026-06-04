@@ -417,7 +417,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
 
-    def post_load_weights(self):
+    def setup_aliases(self):
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
