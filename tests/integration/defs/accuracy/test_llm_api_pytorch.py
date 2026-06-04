@@ -2548,9 +2548,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                               attention_dp, enable_lm_head_tp_in_adp,
                               cuda_graph, overlap_scheduler, max_batch_size,
                               moe_backend):
-        # TODO: Remove this forced failure — injected to test isolation rerun logic in CI
-        if enable_lm_head_tp_in_adp and ep_size == 4 and attention_dp and moe_backend == "CUTLASS":
-            assert False, "Intentional failure to test isolation rerun logic"
 
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
@@ -3696,9 +3693,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
         ids=["tp8", "tp8_attn_dp", "ep8", "dep8"],
     )
     def test_nvfp4(self, ep_size, attention_dp):
-        # TODO: Remove this forced failure — injected to test rerun logic in CI
-        assert False, "Intentional failure to test rerun logic"
-
         model_name = "moonshotai/Kimi-K2.5"
         model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
