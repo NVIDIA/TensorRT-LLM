@@ -42,6 +42,7 @@ from _torch.modules.moe.moe_test_utils import (
     get_backend_class,
     iter_base_test_configs,
     replay_tactics_and_check,
+    should_skip_megamoe_cutedsl,
     should_skip_to_accelerate_ci,
     skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
@@ -54,8 +55,11 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
-from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
-from tensorrt_llm._torch.modules.fused_moe.quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod
+from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    NVFP4MegaMoECuteDslMethod,
+    W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+)
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -64,9 +68,20 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 logger = logging.getLogger(__name__)
 
 
+_MEGAMOE_BACKEND_TYPES = {
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
+}
+
+
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
-    """MegaMoE resolves an EP ProcessGroup at construction time."""
-    if backend_type != MoeBackendType.MEGAMOE:
+    """Every MegaMoE backend (DG + CuteDSL) resolves an EP ProcessGroup
+    at construction time via ``_resolve_ep_pg``. Single-process tests
+    must therefore initialise ``torch.distributed`` even when the test
+    only exercises ``ep_size == 1`` -- otherwise the constructor raises
+    ``MegaMoe*Unavailable``. Both MegaMoE backends need the same fixture
+    so the dist helper must accept the full set."""
+    if backend_type not in _MEGAMOE_BACKEND_TYPES:
         return
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for MegaMoE tests")
@@ -175,7 +190,7 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
             moe_tp_size=1,
             moe_ep_size=4,
         ),
-        moe_backend=MoeBackendType.MEGAMOE.value,
+        moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )
 
     with pytest.raises(
@@ -211,6 +226,261 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         method.post_load_weights(DummyModule())
 
 
+def test_megamoe_cutedsl_resolve_gate_up_clamp_uniform_and_reject():
+    """``MegaMoECuteDsl._resolve_gate_up_clamp`` maps a uniform per-layer
+    ``swiglu_limit`` to one codegen-time scalar and rejects non-uniform /
+    per-expert clamp (the kernel bakes a single ``gate_up_clamp`` constant).
+
+    Pure-CPU: exercises the static helper directly, no GPU / kernel build.
+    """
+    # None -> no clamp.
+    assert MegaMoECuteDsl._resolve_gate_up_clamp(None) is None
+
+    # Uniform tensor (any shape) -> the shared scalar.
+    uniform = torch.full((8,), 7.0)
+    assert MegaMoECuteDsl._resolve_gate_up_clamp(uniform) == pytest.approx(7.0)
+
+    # 0-d scalar tensor -> its value.
+    scalar = torch.tensor(3.5)
+    assert MegaMoECuteDsl._resolve_gate_up_clamp(scalar) == pytest.approx(3.5)
+
+    # Plain python scalar accepted for robustness.
+    assert MegaMoECuteDsl._resolve_gate_up_clamp(10.0) == pytest.approx(10.0)
+
+    # Non-uniform / per-expert clamp -> ValueError.
+    non_uniform = torch.tensor([3.0, 3.0, 5.0, 3.0])
+    with pytest.raises(ValueError, match="uniform"):
+        MegaMoECuteDsl._resolve_gate_up_clamp(non_uniform)
+
+
+def test_megamoe_cutedsl_can_implement_requires_registered_custom_op(monkeypatch):
+    import tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op as custom_op_module
+    import tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl as backend_module
+
+    monkeypatch.setattr(backend_module, "get_sm_version", lambda: 100)
+    monkeypatch.setattr(
+        backend_module,
+        "is_megamoe_cute_dsl_runtime_available",
+        lambda: (True, None),
+    )
+    monkeypatch.setattr(custom_op_module, "IS_MEGAMOE_OP_AVAILABLE", False)
+    monkeypatch.setattr(custom_op_module, "MEGAMOE_OP_UNAVAILABLE_REASON", "custom op unavailable")
+
+    ok, reason = MegaMoECuteDsl.can_implement(
+        QuantAlgo.NVFP4,
+        dtype_activation=torch.bfloat16,
+        hidden_size=512,
+        intermediate_size=512,
+    )
+
+    assert not ok
+    assert reason is not None
+    assert "custom op unavailable" in reason
+
+
+def test_megamoe_cutedsl_builds_per_expert_fc1_norm_const_from_raw_w2_input_scale():
+    """``fc1_norm_const`` preserves the checkpoint's per-expert w2 input scale.
+
+    Pure-CPU: exercises the quant-method helper directly, no GPU / kernel build.
+    """
+    raw_input_scales = {
+        3: {"w2": torch.tensor(0.25)},
+        5: {"w2": torch.tensor(0.5)},
+        7: {"w2": torch.tensor(0.125)},
+    }
+
+    norm_const = NVFP4MegaMoECuteDslMethod._build_fc1_norm_const_tensor(
+        raw_input_scales,
+        [5, 3, 7],
+        device=torch.device("cpu"),
+    )
+
+    torch.testing.assert_close(
+        norm_const,
+        torch.tensor([2.0, 4.0, 8.0], dtype=torch.float32),
+    )
+
+    with pytest.raises(ValueError, match="Missing raw w2.input_scale"):
+        NVFP4MegaMoECuteDslMethod._build_fc1_norm_const_tensor(
+            raw_input_scales,
+            [3, 11],
+            device=torch.device("cpu"),
+        )
+
+
+def test_megamoe_cutedsl_fc2_alpha_uses_per_expert_w2_input_scale():
+    """FC2 alpha must match the per-expert fc1_norm_const quantization scale."""
+
+    class DummyModule:
+        fc31_input_scale = torch.nn.Parameter(torch.tensor(16.0), requires_grad=False)
+        fc2_input_scale = torch.nn.Parameter(torch.tensor(100.0), requires_grad=False)
+        tmp_raw_input_scales = {
+            3: {"w2": torch.tensor(0.25)},
+            5: {"w2": torch.tensor(0.5)},
+        }
+
+    method = NVFP4MegaMoECuteDslMethod()
+    tmp_weight_scale_2 = {
+        0: {
+            "w1": torch.tensor(0.125),
+            "w3": torch.tensor(0.125),
+            "w2": torch.tensor(0.25),
+        },
+        1: {
+            "w1": torch.tensor(0.125),
+            "w3": torch.tensor(0.125),
+            "w2": torch.tensor(0.5),
+        },
+    }
+    fc31_alpha = torch.empty(2, dtype=torch.float32)
+    fc2_alpha = torch.empty(2, dtype=torch.float32)
+
+    method._reconcile_and_compute_alphas(
+        DummyModule,
+        tmp_weight_scale_2,
+        fc31_alpha,
+        fc2_alpha,
+        load_expert_ids=[3, 5],
+    )
+
+    torch.testing.assert_close(
+        fc2_alpha,
+        torch.tensor([0.25 * 0.25, 0.5 * 0.5], dtype=torch.float32),
+    )
+
+
+def test_megamoe_cutedsl_backend_small_balanced_case():
+    """MegaMoE CuteDSL backend-level smoke test mirroring the upstream small case.
+
+    The upstream `mega_runner.py` passes this envelope when it owns both input
+    generation and the kernel launch. This test uses the TRT-LLM backend path
+    instead, so failures point at TRT-LLM's weight/scale/input construction
+    before the custom op call.
+    """
+    backend_type = MoeBackendType.MEGAMOE_CUTEDSL
+    quant_algo = QuantAlgo.NVFP4
+    dtype_activation = torch.bfloat16
+    seq_len = 8
+    model_config = MoeModelConfig(num_experts=8, top_k=1, hidden_size=512, intermediate_size=512)
+
+    skip_reason = should_skip_megamoe_cutedsl(
+        backend_type=backend_type,
+        quant_algo=quant_algo,
+        dtype=dtype_activation,
+        model_config=model_config,
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    _ensure_single_proc_dist_for_megamoe(backend_type, mapping.rank)
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed(1234)
+        AutoTuner.get().setup_distributed_state(mapping)
+        AutoTuner.get().clear_cache()
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+
+        # Match the upstream correctness-mode data distribution: mostly zero,
+        # with a small fraction of +/-1 values.
+        rand_u8 = torch.randint(
+            0,
+            100,
+            (seq_len, model_config.hidden_size),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        x = torch.zeros(
+            (seq_len, model_config.hidden_size),
+            dtype=dtype_activation,
+            device="cuda",
+        )
+        x.masked_fill_((rand_u8 >= 80) & (rand_u8 < 90), 1.0)
+        x.masked_fill_(rand_u8 >= 90, -1.0)
+
+        router_logits = torch.full(
+            (seq_len, model_config.num_experts),
+            -1000.0,
+            dtype=dtype_activation,
+            device="cuda",
+        )
+        router_logits[
+            torch.arange(seq_len, device="cuda"),
+            torch.arange(seq_len, device="cuda"),
+        ] = 1000.0
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo,
+            x,
+            backend_type,
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=model_config.num_experts,
+            dtype=dtype_activation,
+            intermediate_size=model_config.intermediate_size,
+            hidden_size=model_config.hidden_size,
+            quant_config=quant_config,
+            activation_type=ActivationType.Swiglu,
+        )
+
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=model_config.num_experts,
+            hidden_size=model_config.hidden_size,
+            intermediate_size=model_config.intermediate_size,
+            dtype=dtype_activation,
+            quant_config=quant_config,
+            mapping=mapping,
+            activation_type=ActivationType.Swiglu,
+        )
+
+        ref_cls = quant_kwargs.pop("ref_cls", None)
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        if ref_cls is not None:
+            ref_fused_moe = quantize_util.create_ref_module(routing_method, ref_cls=ref_cls)
+        else:
+            ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode(), autotune():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            output = run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype_activation,
+                router_logits,
+            )
+
+        try:
+            ref_fused_moe.check_accuracy(output, ref_output)
+        except Exception as e:
+            output_f = output.float()
+            ref_f = ref_output.float()
+            cosine = torch.nn.functional.cosine_similarity(output_f, ref_f, dim=-1)
+            raise AssertionError(
+                "MegaMoE CuteDSL small backend case failed; "
+                f"output_absmax={output_f.abs().max().item():.6g}, "
+                f"ref_absmax={ref_f.abs().max().item():.6g}, "
+                f"cosine_mean={cosine.mean().item():.6g}, "
+                f"cosine_min={cosine.min().item():.6g}"
+            ) from e
+
+
 def run_backend_moe(
     backend: MoE,
     backend_type: MoeBackendType,
@@ -230,7 +500,7 @@ def run_backend_moe(
     - TRTLLM: token_final_scales=bfloat16, optionally router_logits
     - CUTEDSL: token_final_scales=float32
     - DEEPGEMM: workspace, token_final_scales=float32
-    - MEGAMOE_DEEPGEMM: token_selected_experts=int64, output_dtype
+    - MegaMoE backends: token_selected_experts=int64, output_dtype
 
     Args:
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
@@ -261,7 +531,7 @@ def run_backend_moe(
 
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
         args["workspace"] = backend.get_workspace(m_max, 128)
-    elif backend_type == MoeBackendType.MEGAMOE:
+    elif backend_type in _MEGAMOE_BACKEND_TYPES:
         args["token_selected_experts"] = token_selected_experts.to(torch.int64)
         args["output_dtype"] = dtype
 
@@ -292,7 +562,8 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
-    MoeBackendType.MEGAMOE,
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
 ]
 
 # Data types to test
@@ -544,6 +815,10 @@ def test_moe_backend(
     # DENSEGEMM: disable fused fc2_alpha path for backend-level testing.
     if backend_type == MoeBackendType.DENSEGEMM:
         monkeypatch.setenv("TRTLLM_MOE_FUSED_FC2_ALPHA", "0")
+
+    # MEGAMOE_CUTEDSL threads per-expert fc31_alpha / fc2_alpha /
+    # fc1_norm_const through the kernel ABI, so NVFP4QuantizeUtil's non-1
+    # weight_scale_2 values compute correctly without a test bypass.
 
     is_gated = is_gated_activation(activation_type)
     swiglu_gptoss_style = False
