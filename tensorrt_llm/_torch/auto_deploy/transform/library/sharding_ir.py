@@ -19,9 +19,13 @@ This module implements the ``apply_sharding_hints`` and ``strip_sharding_hints``
 transforms, which apply deterministic, node-local sharding based on explicit
 hint kwargs on custom ops and a runtime ``DistConfig``.
 
-This is the replacement for the legacy heuristic-based sharding pipeline in
-``sharding.py``.  See the design documents in ``sharding_architecture_documents/``
-for background.
+This is the default AutoDeploy sharding pipeline. ``has_sharding_ir_markers``
+auto-detects whether the exported FX graph carries the IR's ``all_reduce``
+markers; ``apply_sharding_hints`` consumes them and short-circuits the
+heuristic-detection fallback in ``sharding.py``. Both stay registered in
+``default.yaml`` so the long-tail of modeling files not yet ported to IR
+keeps working transparently. See the design documents in
+``sharding_architecture_documents/`` for background.
 """
 
 import operator
@@ -60,8 +64,9 @@ from ..interface import (
     TransformRegistry,
 )
 
-# NOTE: sharding.py module will be deprecated in the future. The following
-# imports will move into sharding_ir.py when legacy sharding is removed.
+# Shared helpers used by both sharding pipelines. Lives in ``sharding.py`` for
+# now; will fold into ``sharding_ir.py`` if/when the heuristic-detection
+# fallback is retired (i.e. once every modeling file is IR-ported).
 from .sharding import (
     SplitDimension,
     _get_dist_ops,
@@ -879,10 +884,9 @@ except AttributeError:
 class IRShardingConfig(TransformConfig):
     """Minimal configuration for the hint-driven IR sharding transform.
 
-    This replaces the legacy ``ShardingTransformConfig`` for
-    ``ApplyShardingHints``, carrying only the fields that the IR path actually
-    reads.  When the legacy sharding path is removed, this is the only sharding
-    config class.
+    Carries only the fields the IR pipeline reads. ``ShardingTransformConfig``
+    in ``sharding.py`` is the parallel config used by the heuristic-detection
+    fallback for modeling files not yet ported to IR.
     """
 
     allreduce_strategy: AllReduceStrategy = Field(
