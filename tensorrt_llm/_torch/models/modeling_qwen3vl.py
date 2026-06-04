@@ -1150,13 +1150,13 @@ class Qwen3VisionModelBase(nn.Module):
         embeds, deepstack_embeds = self.visual(pixel_values.to(self.model_dtype), grid_thw=grid_thw)
         return torch.cat([embeds] + deepstack_embeds, dim=1)
 
-    def _adapter_image_bucket(self, items, multimodal_params):
+    def _image_encoder_adapter(self, items, multimodal_params):
         """Stack per-item image pixel_values + grids, encode in one call."""
         pixel_values = torch.cat([it.payload["pixel_values"] for it in items], dim=0)
         grid = torch.cat([it.payload["image_grid_thw"] for it in items], dim=0)
         return self._encode_visual_inputs(pixel_values, grid)
 
-    def _adapter_video_bucket(self, items, multimodal_params):
+    def _video_encoder_adapter(self, items, multimodal_params):
         """Stack per-item video pixel_values + grids, encode in one call."""
         pixel_values = torch.cat([it.payload["pixel_values_videos"] for it in items], dim=0)
         grid = torch.cat([it.payload["video_grid_thw"] for it in items], dim=0)
@@ -1184,8 +1184,8 @@ class Qwen3VisionModelBase(nn.Module):
         final = encode_by_modality_and_scatter(
             multimodal_params=multimodal_params,
             encoders={
-                "image": self._adapter_image_bucket,
-                "video": self._adapter_video_bucket,
+                "image": self._image_encoder_adapter,
+                "video": self._video_encoder_adapter,
             },
             extract=lambda param_idx, param: _qwen3vl_extract_items(
                 param_idx, param, spatial_merge_size=spatial_merge_size

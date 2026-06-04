@@ -271,8 +271,8 @@ class TestQwen3VLBucketAdapters:
     def _make_encoder_stub(self, encode_visual_inputs_return):
         enc = MagicMock(spec=Qwen3VisionModelBase)
         enc._encode_visual_inputs = MagicMock(return_value=encode_visual_inputs_return)
-        enc._adapter_image_bucket = Qwen3VisionModelBase._adapter_image_bucket.__get__(enc)
-        enc._adapter_video_bucket = Qwen3VisionModelBase._adapter_video_bucket.__get__(enc)
+        enc._image_encoder_adapter = Qwen3VisionModelBase._image_encoder_adapter.__get__(enc)
+        enc._video_encoder_adapter = Qwen3VisionModelBase._video_encoder_adapter.__get__(enc)
         return enc
 
     @pytest.mark.parametrize(
@@ -281,7 +281,7 @@ class TestQwen3VLBucketAdapters:
             (
                 # Image bucket: two items stack into one (32, 1176) call with a
                 # (2, 3) grid (20 + 12 patches across two grid rows).
-                "_adapter_image_bucket",
+                "_image_encoder_adapter",
                 [
                     ModalityItem(
                         0,
@@ -312,7 +312,7 @@ class TestQwen3VLBucketAdapters:
             ),
             (
                 # Video bucket: one item -> (32, 1176) call with a (1, 3) grid.
-                "_adapter_video_bucket",
+                "_video_encoder_adapter",
                 [
                     ModalityItem(
                         0,
