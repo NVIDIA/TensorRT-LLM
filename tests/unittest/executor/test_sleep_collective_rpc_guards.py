@@ -432,7 +432,6 @@ class TestListenerUncaughtExceptionSendsErrorAck:
             # not in the narrow except.  We patch recv to raise StopIteration
             # on the second call so the loop terminates cleanly in the test.
             call_count = [0]
-            original_recv = FakeComm.recv
 
             def _recv_once(self_inner, source, tag):
                 call_count[0] += 1
