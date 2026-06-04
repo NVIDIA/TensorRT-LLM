@@ -17,9 +17,9 @@
 These tests do NOT execute the fused graph (which would require a process group);
 they only verify that the pattern matcher rewrites the expected subgraphs into a
 single ``trtllm_fused_allreduce_residual_rmsnorm`` op. They specifically cover the
-``reshape`` between the all-reduce and the residual add (e.g. a TP linear output
-``[B, S, H]`` reshaped to a flattened residual ``[B*S, H]``), which previously broke
-the match and left the op unfused.
+``reshape`` between the all-reduce and the residual add (e.g. a TP MLP/MoE output
+all-reduced as a flattened ``[B*S, H]`` tensor and reshaped back to the 3D residual
+``[B, S, H]``), which previously broke the match and left the op unfused.
 """
 
 from types import SimpleNamespace
@@ -51,8 +51,8 @@ class RMSNorm(torch.nn.Module):
 class ARResidualNorm(torch.nn.Module):
     """all_reduce -> [reshape] -> add(residual) -> rmsnorm.
 
-    ``x`` is provided 3D when ``with_reshape`` so that the all-reduce output is
-    reshaped to the (2D) residual shape before the add.
+    ``x`` is provided 2D when ``with_reshape`` so that the all-reduce output is
+    reshaped (expanded) to the 3D residual shape before the add.
     """
 
     def __init__(self, hidden_size, strategy, add_order, with_reshape):
@@ -84,19 +84,21 @@ def test_allreduce_residual_rmsnorm_match(add_order, with_reshape, strategy):
     hidden = 512
     bsz, seq = 2, 4
     if with_reshape:
-        x = torch.randn(bsz, seq, hidden, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(bsz * seq, hidden, device="cuda", dtype=torch.bfloat16)
+        residual = torch.randn(bsz, seq, hidden, device="cuda", dtype=torch.bfloat16)
     else:
         x = torch.randn(bsz * seq, hidden, device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn(bsz * seq, hidden, device="cuda", dtype=torch.bfloat16)
+        residual = torch.randn(bsz * seq, hidden, device="cuda", dtype=torch.bfloat16)
 
     model = ARResidualNorm(hidden, strategy, add_order, with_reshape)
 
     # Dynamic leading dim to exercise the symbolic re-trace path of the matcher.
-    # For the reshape variant x is 3D [bs, seq, h] and is reshaped to the 2D residual
-    # [bs*seq, h], so the residual token dim is the derived dim seq * bs.
+    # For the reshape variant x is the 2D [bs*seq, h] all-reduce output reshaped
+    # (expanded) to the 3D residual [bs, seq, h], so the 2D token dim is the derived
+    # dim seq * bs and the residual batch dim is bs.
     if with_reshape:
         bs = Dim("bs")
-        dynamic_shapes = ({0: bs}, {0: seq * bs})
+        dynamic_shapes = ({0: seq * bs}, {0: bs})
     else:
         tokens = Dim("tokens")
         dynamic_shapes = ({0: tokens}, {0: tokens})
