@@ -114,6 +114,7 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
