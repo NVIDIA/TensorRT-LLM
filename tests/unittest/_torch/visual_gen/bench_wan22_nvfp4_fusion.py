@@ -46,6 +46,7 @@ import gc
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 # Prepend the source tree to sys.path so this bench script picks up
 # in-flight Python edits (e.g. the Fp4QuantizedTensor reshape fix in
@@ -62,18 +63,9 @@ os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 # per-region via the module attributes below.
 os.environ.setdefault("TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", "0")
 
-import torch
-
-from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGenArgs
-from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
-    WanTransformer3DModel,
-)
-from tensorrt_llm._utils import get_sm_version, nvtx_range
-
 
 def _checkpoint_path() -> str:
+    """Resolve the calibrated NVFP4 checkpoint path."""
     candidates = [
         os.environ.get("WAN22_T2V_NVFP4_PATH"),
         "/models/Wan2.2-T2V-A14B-Diffusers-NVFP4",
@@ -88,7 +80,7 @@ def _checkpoint_path() -> str:
     )
 
 
-def _snapshot_and_force_fusion(model: WanTransformer3DModel, *, active: bool):
+def _snapshot_and_force_fusion(model: Any, *, active: bool) -> None:
     """Snapshot the post-load fused-state, then toggle every per-module switch.
 
     On first call records the original ``is_nvfp4`` / ``nvfp4_scale`` /
@@ -97,6 +89,9 @@ def _snapshot_and_force_fusion(model: WanTransformer3DModel, *, active: bool):
     ``test_wan22_nvfp4_fusion_integration._set_fusion_active`` so the
     benchmark and correctness test share the same A/B semantics.
     """
+    from tensorrt_llm._torch.modules.layer_norm import LayerNorm
+    from tensorrt_llm._torch.modules.mlp import MLP
+
     for _, norm in model.named_modules():
         if not isinstance(norm, LayerNorm):
             continue
@@ -141,12 +136,14 @@ _RESOLUTION_PRESETS = {
 }
 
 
-def _build_inputs(resolution: str, device: str = "cuda"):
+def _build_inputs(resolution: str, device: str = "cuda") -> tuple[Any, Any, Any]:
     """Construct (latent, timestep, text_emb) for the chosen resolution preset.
 
     Text condition is fixed at 77 tokens of hidden_size 4096 (UMT5 output
     surface for Wan 2.2). Single batch.
     """
+    import torch
+
     if resolution not in _RESOLUTION_PRESETS:
         raise ValueError(
             f"unknown resolution {resolution!r}; choose from "
@@ -167,7 +164,7 @@ def _build_inputs(resolution: str, device: str = "cuda"):
     return hidden_states, timestep, encoder_hidden_states
 
 
-def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+def _cosine_similarity(a: Any, b: Any) -> float:
     """Tensor-wide cosine similarity between two equally-shaped tensors.
 
     Operates in fp32 to avoid bf16 dot-product saturation; returns a Python
@@ -181,14 +178,28 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a32.dot(b32) / denom).item()
 
 
-@torch.inference_mode()
-def _capture_output(model: WanTransformer3DModel, inputs) -> torch.Tensor:
+def _capture_output(model: Any, inputs: tuple[Any, Any, Any]) -> Any:
     """One forward pass, full output captured for numerical A/B comparison."""
+    import torch
+
     hs, ts, enc = inputs
-    return model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+    with torch.inference_mode():
+        return model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
 
 
-def _load_model(ckpt_path: str) -> WanTransformer3DModel:
+def _load_model(ckpt_path: str) -> Any:
+    """Load the calibrated Wan 2.2 NVFP4 transformer checkpoint."""
+    import safetensors.torch as st
+    import torch
+
+    from tensorrt_llm._torch.visual_gen.config import (
+        DiffusionModelConfig,
+        VisualGenArgs,
+    )
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
+        WanTransformer3DModel,
+    )
+
     args = VisualGenArgs(model=ckpt_path)
     model_config = DiffusionModelConfig.from_pretrained(ckpt_path, args=args)
     assert model_config.force_dynamic_quantization is False, (
@@ -196,8 +207,6 @@ def _load_model(ckpt_path: str) -> WanTransformer3DModel:
         "makes sense when fused paths actually fire."
     )
     model = WanTransformer3DModel(model_config=model_config).to("cuda").eval()
-
-    import safetensors.torch as st
 
     weights: dict = {}
     transformer_dir = Path(ckpt_path, "transformer")
@@ -212,10 +221,9 @@ def _load_model(ckpt_path: str) -> WanTransformer3DModel:
     return model
 
 
-@torch.inference_mode()
 def _time_region(
-    model: WanTransformer3DModel,
-    inputs,
+    model: Any,
+    inputs: tuple[Any, Any, Any],
     *,
     warmup: int,
     iters: int,
@@ -228,36 +236,46 @@ def _time_region(
     measures ``iters`` iterations wrapped in one NVTX range. Returns the
     average per-iteration latency in milliseconds.
     """
-    hs, ts, enc = inputs
+    import torch
 
-    # Warmup: bake the autotuner caches, kernel-selection state machine,
-    # and graph capture (if any future capture lands) so the timed window
-    # measures steady-state. Tagged so nsys can ignore it.
-    with nvtx_range(f"{label} warmup", color="grey"):
-        for _ in range(warmup):
-            _ = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
-        torch.cuda.synchronize()
+    from tensorrt_llm._utils import nvtx_range
 
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    with nvtx_range(label, color=color):
-        for i in range(iters):
-            starts[i].record()
-            _ = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
-            ends[i].record()
-        torch.cuda.synchronize()
+    with torch.inference_mode():
+        hs, ts, enc = inputs
 
-    per_iter_ms = [s.elapsed_time(e) for s, e in zip(starts, ends)]
-    avg = sum(per_iter_ms) / len(per_iter_ms)
-    p50 = sorted(per_iter_ms)[len(per_iter_ms) // 2]
-    print(
-        f"  [{label}] avg={avg:.3f} ms  p50={p50:.3f} ms  "
-        f"min={min(per_iter_ms):.3f}  max={max(per_iter_ms):.3f}  n={iters}"
-    )
-    return avg
+        # Warmup: bake the autotuner caches, kernel-selection state machine,
+        # and graph capture (if any future capture lands) so the timed window
+        # measures steady-state. Tagged so nsys can ignore it.
+        with nvtx_range(f"{label} warmup", color="grey"):
+            for _ in range(warmup):
+                _ = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+            torch.cuda.synchronize()
+
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        with nvtx_range(label, color=color):
+            for i in range(iters):
+                starts[i].record()
+                _ = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+                ends[i].record()
+            torch.cuda.synchronize()
+
+        per_iter_ms = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+        avg = sum(per_iter_ms) / len(per_iter_ms)
+        p50 = sorted(per_iter_ms)[len(per_iter_ms) // 2]
+        print(
+            f"  [{label}] avg={avg:.3f} ms  p50={p50:.3f} ms  "
+            f"min={min(per_iter_ms):.3f}  max={max(per_iter_ms):.3f}  n={iters}"
+        )
+        return avg
 
 
-def main():
+def main() -> None:
+    """Run the benchmark CLI."""
+    import torch
+
+    from tensorrt_llm._utils import get_sm_version
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
@@ -268,10 +286,13 @@ def main():
         help="Latent shape preset. 720p_81frames matches the Wan 2.2 NVFP4 "
         "production default (M=75600 tokens vs 1560 for 480p_1frame).",
     )
-    parser.add_argument("--order", choices=["baseline_first", "fused_first"],
-                        default="baseline_first",
-                        help="Run order. baseline_first is safer if the autotuner "
-                             "ever picks a different tactic in cold vs warm cache.")
+    parser.add_argument(
+        "--order",
+        choices=["baseline_first", "fused_first"],
+        default="baseline_first",
+        help="Run order. baseline_first is safer if the autotuner ever picks "
+        "a different tactic in cold vs warm cache.",
+    )
     parser.add_argument(
         "--numerical-ab",
         action="store_true",
@@ -306,8 +327,11 @@ def main():
         print("Smoke run (fused path on, single forward, no timing):")
         _snapshot_and_force_fusion(model, active=True)
         with torch.inference_mode():
-            out = model(hidden_states=inputs[0], timestep=inputs[1],
-                        encoder_hidden_states=inputs[2])
+            out = model(
+                hidden_states=inputs[0],
+                timestep=inputs[1],
+                encoder_hidden_states=inputs[2],
+            )
         torch.cuda.synchronize()
         finite = torch.isfinite(out).all().item()
         print(f"  output shape: {tuple(out.shape)}")
@@ -334,9 +358,12 @@ def main():
             outputs[label] = _capture_output(model, inputs).detach().to(torch.float32).cpu()
             torch.cuda.synchronize()
         latencies[label] = _time_region(
-            model, inputs,
-            warmup=args.warmup, iters=args.iters,
-            label=label, color=color,
+            model,
+            inputs,
+            warmup=args.warmup,
+            iters=args.iters,
+            label=label,
+            color=color,
         )
 
     print()
