@@ -15,7 +15,6 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaCacheManager,
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
-    validate_hybrid_cache_config,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -278,7 +277,7 @@ def _build_hybrid_with_mamba_layer(
     spec_config=None,
     max_batch_size=4,
     enable_block_reuse=False,
-    mamba_state_cache_interval=None,
+    mamba_state_cache_interval=256,
     is_estimating_kv_cache=False,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
@@ -289,11 +288,6 @@ def _build_hybrid_with_mamba_layer(
     attn_mask = [False, True]
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     # Cap max_tokens to keep the real C++ pool allocation tiny.
-    # When block reuse is enabled, mamba_state_cache_interval must be a positive
-    # multiple of tokens_per_block (validated by validate_hybrid_cache_config);
-    # default to one tokens_per_block (32) so the helper stays usable.
-    if enable_block_reuse and mamba_state_cache_interval is None:
-        mamba_state_cache_interval = 32
     kv_cache_config = KvCacheConfig(
         max_tokens=512,
         enable_block_reuse=enable_block_reuse,
@@ -486,53 +480,6 @@ def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
         f"need >= live_state + reuse_snapshots = {expected_min}; the old "
         f"max(reuse, live) formula dropped reuse headroom"
     )
-
-
-# ---------------------------------------------------------------------------
-# validate_hybrid_cache_config: pure-Python guard on KvCacheConfig
-#
-# When block reuse is enabled for a mamba/attention hybrid model, the user must
-# pick a mamba_state_cache_interval that is (a) set, (b) positive, and (c) a
-# multiple of tokens_per_block. The validator runs at CppMambaHybridCacheManager
-# construction time and surfaces a clear error before the C++ pool is sized.
-# ---------------------------------------------------------------------------
-
-
-def test_validate_hybrid_cache_config_noop_when_reuse_disabled():
-    """With block reuse disabled, the interval is unused so any value
-    (including the new None default) must be accepted."""
-    cfg = KvCacheConfig(enable_block_reuse=False, mamba_state_cache_interval=None)
-    validate_hybrid_cache_config(cfg, tokens_per_block=32)
-
-
-def test_validate_hybrid_cache_config_accepts_valid_interval():
-    """interval must be positive and a multiple of tokens_per_block."""
-    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=256)
-    validate_hybrid_cache_config(cfg, tokens_per_block=32)
-
-
-def test_validate_hybrid_cache_config_rejects_unset_interval():
-    """Default is now None; under block reuse, an unset interval must
-    fail-fast at the validator rather than silently propagating None
-    into the downstream snapshot-position math."""
-    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=None)
-    with pytest.raises((AssertionError, TypeError)):
-        validate_hybrid_cache_config(cfg, tokens_per_block=32)
-
-
-@pytest.mark.parametrize("interval", [0, -1, -256])
-def test_validate_hybrid_cache_config_rejects_non_positive_interval(interval):
-    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=interval)
-    with pytest.raises(AssertionError, match="must be positive"):
-        validate_hybrid_cache_config(cfg, tokens_per_block=32)
-
-
-def test_validate_hybrid_cache_config_rejects_non_multiple_interval():
-    """Snapshot positions must align with block boundaries; otherwise the
-    block-reuse path mis-attributes tokens across blocks."""
-    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=100)
-    with pytest.raises(AssertionError, match="multiple of tokens_per_block"):
-        validate_hybrid_cache_config(cfg, tokens_per_block=32)
 
 
 # ---------------------------------------------------------------------------
