@@ -444,6 +444,101 @@ def test_call_with_token_ids_flattens_mixed_modalities_in_prompt_order():
     ]
 
 
+# Embedding lengths the dummy-placeholder pass bakes in MODALITY-MAJOR order
+# (image[0], image[1], audio[0]) — mirroring Nano's `_process_mixed_modalities`,
+# which runs `compute_mm_embedding_lengths` on the synthetic modality-major
+# placeholder text. Deliberately distinct per item so an order mismatch is
+# observable, and deliberately != num_mm_tokens so a stale value is not silently
+# the same list as the count flatten.
+_STALE_MODALITY_MAJOR_EMBED_LENGTHS = [_IMG0_TOKENS, _IMG1_TOKENS, _AUDIO0_TOKENS]
+# The same per-item embedding lengths re-ordered to the REAL interleaved prompt
+# order (image[0], audio[0], image[1]) the consumer indexes by.
+_EXPECTED_PROMPT_ORDER_EMBED_LENGTHS = [_IMG0_TOKENS, _AUDIO0_TOKENS, _IMG1_TOKENS]
+
+
+class _FakeStaleLengthsProcessor(_FakeTokenIdMMProcessor):
+    """`_FakeTokenIdMMProcessor` whose dummy pass bakes stale lengths.
+
+    Mirrors Nano: the dummy-placeholder pass (driven by the modality-major
+    `get_text_with_mm_placeholders` text) bakes per-item embedding lengths in
+    modality-major order. For an interleaved real prompt the consumer indexes
+    those lengths by the interleaved item order, so a stale modality-major list
+    yields the wrong item's row count.
+    """
+
+    def call_with_text_prompt(self, inputs, sampling_params):
+        prompt_token_ids, extra = super().call_with_text_prompt(inputs, sampling_params)
+        # The dummy pass bakes lengths in modality-major order (image, image,
+        # audio) — stale w.r.t. the interleaved real prompt resolved later.
+        extra["multimodal_data"]["multimodal_embedding_lengths"] = list(
+            _STALE_MODALITY_MAJOR_EMBED_LENGTHS
+        )
+        return prompt_token_ids, extra
+
+    def expand_prompt_token_ids_for_mm(
+        self,
+        prompt_token_ids,
+        num_mm_tokens_per_placeholder,
+        hf_processor_mm_kwargs=None,
+        mm_data=None,
+    ):
+        # Build a realistic expanded prompt: each item's placeholder becomes the
+        # matching number of that modality's feature tokens, in the resolved
+        # (interleaved) prompt order. This lets the registry's mask-based
+        # re-bake of `multimodal_embedding_lengths` count real embed slots.
+        self.lengths_seen_by_expander = list(num_mm_tokens_per_placeholder)
+        assert mm_data is not None
+        feature_id = {"image": _IMAGE_FEATURE_ID, "audio": _AUDIO_FEATURE_ID}
+        # `item_order` for this prompt is image, audio, image (see
+        # `get_mm_item_order`); zip it with the resolved per-item counts.
+        order = self.get_mm_item_order(prompt_token_ids, mm_data)
+        expanded = [10]
+        for (modality, _), count in zip(order, num_mm_tokens_per_placeholder):
+            expanded.extend([feature_id[modality]] * count)
+            expanded.append(13)
+        return expanded, None
+
+    def get_vocab_size(self):
+        return None
+
+    def get_mm_token_ids(self):
+        return torch.tensor([_IMAGE_FEATURE_ID, _AUDIO_FEATURE_ID])
+
+    def get_mm_special_token_ids(self):
+        return None
+
+
+def test_call_with_token_ids_emits_embedding_lengths_in_prompt_order():
+    """call_with_token_ids re-bakes multimodal_embedding_lengths in prompt order.
+
+    Lengths-shaped twin of the item_order fix: the dummy-placeholder pass bakes a
+    stale MODALITY-MAJOR `multimodal_embedding_lengths` (image, image, audio).
+    `call_with_token_ids` re-bakes `multimodal_item_order` in the real interleaved
+    order (image, audio, image) but must ALSO emit `multimodal_embedding_lengths`
+    in that same real order, so a consumer indexing lengths by the interleaved
+    item order reads each item's true row count — not the stale modality-major
+    list.
+    """
+    processor = _FakeStaleLengthsProcessor()
+    inputs = _mixed_interleaved_inputs()
+
+    _, extra = processor.call_with_token_ids(inputs, SamplingParams())
+
+    embed_lengths = extra["multimodal_data"]["multimodal_embedding_lengths"]
+    # Lengths track the REAL interleaved prompt order (image, audio, image).
+    assert embed_lengths == _EXPECTED_PROMPT_ORDER_EMBED_LENGTHS
+    # Sanity: the stale modality-major value would have been observably wrong.
+    assert _STALE_MODALITY_MAJOR_EMBED_LENGTHS != _EXPECTED_PROMPT_ORDER_EMBED_LENGTHS
+    # And lengths align position-for-position with the re-baked item order.
+    item_order = extra["multimodal_data"]["multimodal_item_order"]
+    assert item_order == [
+        {"modality": "image", "index": 0},
+        {"modality": "audio", "index": 0},
+        {"modality": "image", "index": 1},
+    ]
+    assert len(embed_lengths) == len(item_order)
+
+
 # --- Nano-style video-embedded-audio hoist through the hashing path ---------
 #
 # A video carrying an embedded audio track is modeled (Nano) as a separate

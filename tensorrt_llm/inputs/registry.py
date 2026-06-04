@@ -25,8 +25,9 @@ from .multimodal import (_SUPPORTED_HASHING_MODALITIES, MixedModalItemOrder,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         default_hasher, find_mm_token_lengths,
-                         hexdigest_to_int32, validate_mm_inputs)
+                         compute_mm_embedding_lengths, default_hasher,
+                         find_mm_token_lengths, hexdigest_to_int32,
+                         validate_mm_inputs)
 
 # yapf: enable
 
@@ -448,6 +449,37 @@ class BaseMultimodalInputProcessor(ABC):
             "modality": modality,
             "index": idx,
         } for modality, idx in item_order]
+
+        # Re-bake per-item embedding lengths in the real interleaved prompt
+        # order too. The dummy-placeholder pass ran the text path on synthetic
+        # modality-major placeholder text, so any `multimodal_embedding_lengths`
+        # the processor pre-baked there is in that stale modality-major order
+        # (the lengths-shaped twin of the stale `multimodal_item_order` dropped
+        # above). Consumers index lengths by the interleaved item order, so a
+        # surviving modality-major list reports the wrong item's row count.
+        # Recompute from the real expanded prompt IDs and the real-order
+        # `num_mm_tokens`, mirroring the hashing path's mask -> per-item length
+        # derivation. We re-bake (rather than pop-and-defer to that hashing
+        # recompute) because a non-hashing path can reach the consumer: when
+        # `multimodal_hashing_supported` is False (or a first hashing attempt
+        # raises), `process_prompt_maybe_hash` calls the processor directly and
+        # the hashing recompute never runs — popping there would leave lengths
+        # absent, re-introducing the None-lengths class the Qwen fix just closed.
+        # Skip when the processor exposes neither `vocab_size` nor
+        # `mm_token_ids` (no embed-mask predicate): such a processor cannot have
+        # baked mask-derived lengths to begin with, and `compute_mm_embedding_lengths`
+        # would have nothing to scan against (mirrors `maybe_compute_mm_embed_cumsum`).
+        vocab_size = self.get_vocab_size()
+        mm_token_ids = self.get_mm_token_ids()
+        if vocab_size is not None or mm_token_ids is not None:
+            mm_container["multimodal_embedding_lengths"] = (
+                compute_mm_embedding_lengths(
+                    expanded_ids,
+                    num_mm_tokens,
+                    vocab_size=vocab_size,
+                    mm_token_ids=mm_token_ids,
+                    mm_special_token_ids=self.get_mm_special_token_ids(),
+                ))
 
         return expanded_ids, extra_processed_inputs
 
