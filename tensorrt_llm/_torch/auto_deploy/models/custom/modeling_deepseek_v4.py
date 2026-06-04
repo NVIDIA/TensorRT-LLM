@@ -58,6 +58,37 @@ class DeepseekV4CausalLMOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
 
 
+def _normalize_deepseek_v4_rope_scaling(
+    rope_scaling: Optional[Mapping[str, Any]],
+    max_position_embeddings: int,
+) -> dict[str, Any]:
+    """Return a YaRN config accepted by current transformers validators."""
+
+    normalized = (
+        dict(rope_scaling)
+        if rope_scaling is not None
+        else {
+            "type": "yarn",
+            "rope_type": "yarn",
+            "factor": 1.0,
+            "original_max_position_embeddings": max_position_embeddings,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+        }
+    )
+    rope_type = normalized.get("rope_type", normalized.get("type", "yarn"))
+    normalized["rope_type"] = rope_type
+    normalized["type"] = normalized.get("type", rope_type)
+    normalized["factor"] = float(normalized.get("factor", 1.0))
+    normalized["beta_fast"] = float(normalized.get("beta_fast", 32.0))
+    normalized["beta_slow"] = float(normalized.get("beta_slow", 1.0))
+    original_seq_len = int(normalized.get("original_max_position_embeddings", 0) or 0)
+    if original_seq_len <= 0:
+        original_seq_len = max_position_embeddings
+    normalized["original_max_position_embeddings"] = original_seq_len
+    return normalized
+
+
 class DeepseekV4Config(PretrainedConfig):
     """Minimal local config for DeepSeek V4 when transformers lacks one."""
 
@@ -145,13 +176,9 @@ class DeepseekV4Config(PretrainedConfig):
         self.hidden_act = hidden_act
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling or {
-            "type": "yarn",
-            "factor": 1.0,
-            "original_max_position_embeddings": 0,
-            "beta_fast": 32,
-            "beta_slow": 1,
-        }
+        self.rope_scaling = _normalize_deepseek_v4_rope_scaling(
+            rope_scaling, max_position_embeddings
+        )
         self.rms_norm_eps = rms_norm_eps
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters

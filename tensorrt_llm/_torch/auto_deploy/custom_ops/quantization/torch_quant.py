@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
 from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     unpack_uint8_to_int4_weight_2d,
@@ -55,6 +56,18 @@ def _dequant_weight_fp8(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     return weight_fp8.to(dtype) * weight_scale
+
+
+def _dequant_block_fp8_weight(
+    weight_fp8: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return dequant_fp8_weight_two_dim_block_grid(
+        weight_fp8, weight_scale, block_n, block_k, dtype=dtype
+    )
 
 
 # The NVFP4 helpers below are adapted from modelopt.torch.quantization.qtensor.nvfp4_tensor.NVFP4QTensor
