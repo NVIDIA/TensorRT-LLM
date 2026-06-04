@@ -1082,8 +1082,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                          device=logits.device)
 
         # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(
-            logits, spec_metadata, num_contexts, batch_size)
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
 
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -1097,8 +1097,7 @@ class SpecWorkerBase(nn.Module, ABC):
         # Compare draft tokens with target tokens using cumulative product
         # Counts consecutive matches from the start
         num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens
-             == gen_target_tokens[:, :runtime_draft_len]).int(),
+            (draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
             dim=-1).sum(1)
 
         # Apply force override if set
@@ -1207,8 +1206,9 @@ class SpecWorkerBase(nn.Module, ABC):
 
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
-            target_probs = target_probs_flat.reshape(
-                num_gens, runtime_draft_len + 1, vocab_size)
+            target_probs = target_probs_flat.reshape(num_gens,
+                                                     runtime_draft_len + 1,
+                                                     vocab_size)
 
             draft_vocab_size = draft_probs.shape[-1]
             assert draft_probs.shape[0] == num_gens, (
@@ -1225,8 +1225,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 # configured, e.g. when use_rejection_sampling was off at
                 # prepare() time.
                 if spec_metadata.full_draft_probs is not None:
-                    full_draft_probs = spec_metadata.full_draft_probs[:
-                                                                      num_gens]
+                    full_draft_probs = spec_metadata.full_draft_probs[:num_gens]
                 else:
                     full_draft_probs = torch.zeros(
                         (num_gens, runtime_draft_len, vocab_size),
