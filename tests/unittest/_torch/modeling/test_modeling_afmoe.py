@@ -86,6 +86,25 @@ AFMOE_CONFIG = {
 }
 
 
+def _synthetic_tp_mapping(tp_size: int, enable_attention_dp: bool = False) -> Mapping:
+    # These tests inspect module TP attributes in one pytest process.  Force
+    # the lightweight MPI-topology Mapping even when TLLM_DISABLE_MPI=1 would
+    # otherwise require an initialized torch.distributed DeviceMesh.
+    with patch("tensorrt_llm.mapping.mpi_disabled", return_value=False):
+        return Mapping(
+            world_size=tp_size,
+            tp_size=tp_size,
+            rank=0,
+            enable_attention_dp=enable_attention_dp,
+        )
+
+
+def _shutdown_kv_cache_manager(kv_cache_manager: KVCacheManager) -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    kv_cache_manager.shutdown()
+
+
 class TestAfmoeRegistry(unittest.TestCase):
     """Verify AfmoeForCausalLM resolves through _torch auto-model registration."""
 
@@ -338,14 +357,16 @@ class TestAfmoeSanity(unittest.TestCase):
             position_ids.append(position_id)
         position_ids = torch.cat(position_ids).unsqueeze(0)
 
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = model.forward(
-                input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
-            )
+        try:
+            with torch.inference_mode():
+                attn_metadata.prepare()
+                logits = model.forward(
+                    input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
+                )
 
-        self.assertEqual(len(past_seen_tokens), logits.shape[0])
-        kv_cache_manager.shutdown()
+            self.assertEqual(len(past_seen_tokens), logits.shape[0])
+        finally:
+            _shutdown_kv_cache_manager(kv_cache_manager)
 
     def test_moe_layer_config(self):
         config_dict = deepcopy(AFMOE_CONFIG)
@@ -421,20 +442,19 @@ class TestAfmoeTPAttributes(unittest.TestCase):
     def _build_model(self, tp_size):
         config_dict = deepcopy(AFMOE_CONFIG)
         afmoe_config = AfmoeConfig.from_dict(config_dict)
-        mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=0)
-        model_config = ModelConfig(pretrained_config=afmoe_config, mapping=mapping)
+        mapping = _synthetic_tp_mapping(tp_size)
+        model_config = ModelConfig(
+            pretrained_config=afmoe_config, mapping=mapping, allreduce_strategy="NCCL"
+        )
         return AfmoeForCausalLM(model_config)
 
     def _build_attention_dp_model(self, tp_size):
         config_dict = deepcopy(AFMOE_CONFIG)
         afmoe_config = AfmoeConfig.from_dict(config_dict)
-        mapping = Mapping(
-            world_size=tp_size,
-            tp_size=tp_size,
-            rank=0,
-            enable_attention_dp=True,
+        mapping = _synthetic_tp_mapping(tp_size, enable_attention_dp=True)
+        model_config = ModelConfig(
+            pretrained_config=afmoe_config, mapping=mapping, allreduce_strategy="NCCL"
         )
-        model_config = ModelConfig(pretrained_config=afmoe_config, mapping=mapping)
         return AfmoeForCausalLM(model_config)
 
     def test_qkv_is_column_parallel_with_output_gate(self):
@@ -644,22 +664,24 @@ class TestAfmoeAllCloseToHF(unittest.TestCase):
             max_num_tokens=8192,
         )
 
-        hf_position_ids = position_ids.to(torch.long)
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = model.forward(
-                input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
-            )
-            ref = hf_model.forward(
-                input_ids=input_ids.unsqueeze(0).long(),
-                position_ids=hf_position_ids,
-                use_cache=False,
-            )
+        try:
+            hf_position_ids = position_ids.to(torch.long)
+            with torch.inference_mode():
+                attn_metadata.prepare()
+                logits = model.forward(
+                    input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
+                )
+                ref = hf_model.forward(
+                    input_ids=input_ids.unsqueeze(0).long(),
+                    position_ids=hf_position_ids,
+                    use_cache=False,
+                )
 
-        # Loose tolerance: bf16 + token-choice MoE routing amplify per-logit
-        # noise (same rationale as the EXAONE-MoE parity test).
-        torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=1.0, rtol=0.5)
-        kv_cache_manager.shutdown()
+            # Loose tolerance: bf16 + token-choice MoE routing amplify per-logit
+            # noise (same rationale as the EXAONE-MoE parity test).
+            torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=1.0, rtol=0.5)
+        finally:
+            _shutdown_kv_cache_manager(kv_cache_manager)
 
 
 if __name__ == "__main__":
