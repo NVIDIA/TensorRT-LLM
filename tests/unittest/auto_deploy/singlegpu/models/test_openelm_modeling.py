@@ -470,3 +470,133 @@ def test_openelm_model_can_be_exported():
     assert logits2.shape == (B2, S2, config.vocab_size)
     assert torch.isfinite(logits2).all()
     assert_rmse_close(logits2, ref_out2.logits, rmse_ratio_tol=0.05, msg="Export dynamic: ")
+
+
+# =============================================================================
+# Vendored OpenELMConfig (CPU/offline): derivation + AutoConfig registration
+# =============================================================================
+#
+# The config is bundled locally (not loaded from Apple's hub remote code, which
+# is incompatible with transformers 5.x). These tests verify the per-layer
+# derivation matches Apple's published values and that registering the local
+# class makes AutoConfig.from_pretrained bypass the checkpoint's auto_map.
+
+# apple/OpenELM-270M-Instruct published config inputs (layer-wise scaling).
+_OPENELM_270M = dict(
+    num_transformer_layers=16,
+    model_dim=1280,
+    head_dim=64,
+    num_gqa_groups=4,
+    qkv_multipliers=[0.5, 1.0],
+    ffn_multipliers=[0.5, 4.0],
+    share_input_output_layers=True,
+    normalize_qk_projections=True,
+)
+# Known-good per-layer head counts derived by Apple's algorithm for the 270M preset.
+_EXPECTED_NUM_QUERY_HEADS = [12, 12, 12, 12, 12, 16, 16, 16, 16, 16, 16, 16, 20, 20, 20, 20]
+_EXPECTED_NUM_KV_HEADS = [3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5]
+
+# apple/OpenELM-3B-Instruct preset. A different size point with head_dim=128 (vs 64),
+# exercising a separate divisibility path. Expected lists are Apple's published
+# num_query_heads / num_kv_heads from the 3B checkpoint's config.json.
+_OPENELM_3B = dict(
+    num_transformer_layers=36,
+    model_dim=3072,
+    head_dim=128,
+    num_gqa_groups=4,
+    qkv_multipliers=[0.5, 1.0],
+    ffn_multipliers=[0.5, 4.0],
+    share_input_output_layers=True,
+    normalize_qk_projections=True,
+)
+# fmt: off
+_EXPECTED_3B_NUM_QUERY_HEADS = [
+    12, 12, 12, 12, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 24, 24, 24, 24, 24, 24,
+]
+_EXPECTED_3B_NUM_KV_HEADS = [
+    3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6,
+]
+# fmt: on
+
+
+def test_openelm_config_derivation_matches_apple():
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
+
+    # `use_cache=True` would crash Apple's remote config under transformers 5.x;
+    # the vendored class must accept it without raising.
+    config = OpenELMConfig(use_cache=True, **_OPENELM_270M)
+
+    assert config.model_type == "openelm"
+    assert config.num_query_heads == _EXPECTED_NUM_QUERY_HEADS
+    assert config.num_kv_heads == _EXPECTED_NUM_KV_HEADS
+    assert len(config.ffn_multipliers) == 16
+    # per-layer FFN multipliers are a linspace(0.5, 4.0, 16)
+    assert config.ffn_multipliers[0] == 0.5 and config.ffn_multipliers[-1] == 4.0
+    # GQA divisibility holds for every layer
+    assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads))
+
+
+def test_openelm_config_derivation_matches_apple_3b():
+    """Derivation must also be correct for a different size point (3B, head_dim=128)."""
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
+
+    config = OpenELMConfig(use_cache=True, **_OPENELM_3B)
+
+    assert config.num_transformer_layers == 36
+    assert config.num_query_heads == _EXPECTED_3B_NUM_QUERY_HEADS
+    assert config.num_kv_heads == _EXPECTED_3B_NUM_KV_HEADS
+    # ffn multipliers expand to a length-36 linspace(0.5, 4.0)
+    assert len(config.ffn_multipliers) == 36
+    assert config.ffn_multipliers[0] == 0.5 and config.ffn_multipliers[-1] == 4.0
+    assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads))
+
+
+def test_openelm_config_tolerates_unknown_kwargs():
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
+
+    # extra/unknown kwargs (as forwarded by transformers) must not raise
+    config = OpenELMConfig(use_cache=True, some_future_field=123, **_OPENELM_270M)
+    assert len(config.num_query_heads) == 16
+
+
+def test_openelm_config_registered_as_local_class():
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
+
+    assert "openelm" in CONFIG_MAPPING
+    registered = CONFIG_MAPPING["openelm"]
+    assert registered is OpenELMConfig
+    # transformers treats a registered class whose module is not under
+    # `transformers.` as `explicit_local_code`, which beats a remote auto_map.
+    assert not registered.__module__.startswith("transformers.")
+
+
+def test_openelm_autoconfig_prefers_local_over_remote(tmp_path):
+    """AutoConfig must prefer the local class over remote code.
+
+    Even with trust_remote_code=True and an auto_map present — and with no
+    configuration_openelm.py on disk, so a remote-code path would fail — the
+    local class is used. This proves Apple's remote code never runs.
+    """
+    import json
+
+    from transformers import AutoConfig
+
+    # Importing the modeling module triggers AutoConfig.register("openelm", ...).
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
+
+    config_json = {
+        "model_type": "openelm",
+        "auto_map": {"AutoConfig": "configuration_openelm.OpenELMConfig"},
+        "use_cache": True,
+        **_OPENELM_270M,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config_json))
+    # Deliberately NO configuration_openelm.py in tmp_path.
+
+    config = AutoConfig.from_pretrained(str(tmp_path), trust_remote_code=True)
+    assert type(config) is OpenELMConfig
+    assert config.num_query_heads == _EXPECTED_NUM_QUERY_HEADS

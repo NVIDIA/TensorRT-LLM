@@ -28,16 +28,26 @@ OpenELM is a heterogeneous transformer with per-layer varying:
 - Q/K normalization before RoPE
 - Shared input/output embeddings (no separate lm_head)
 
-Config is loaded from the HF checkpoint via trust_remote_code=True.
+The config is bundled locally as ``OpenELMConfig`` (registered with ``AutoConfig``)
+rather than loaded from Apple's hub remote code. Apple's ``configuration_openelm.py``
+was written for transformers 4.x and its private ``__post_init__(self)`` collides
+with the transformers 5.x strict-dataclass ``PreTrainedConfig`` (which forwards
+unrecognized kwargs such as ``use_cache`` to ``self.__post_init__(**kwargs)``),
+raising ``TypeError`` before any model code runs. Vendoring the config locally
+mirrors the pattern used by the other AutoDeploy custom models (e.g. EXAONE) and
+removes Apple's frozen remote code from the execution path entirely.
 Uses AutoDeploy canonical IR ops for export compatibility.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from numbers import Number
+from typing import List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import AutoConfig, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
@@ -58,6 +68,148 @@ def _make_divisible(v, divisor=8, min_value=None):
     if new_v < 0.9 * v:
         new_v += divisor
     return new_v
+
+
+def _compute_heads(model_dim: int, head_dim: int) -> int:
+    """Number of heads given model/head dim (from HF OpenELM config)."""
+    if model_dim % head_dim != 0:
+        raise ValueError(
+            f"Model dimension should be divisible by head dimension. "
+            f"Got: {model_dim} and {head_dim}."
+        )
+    return model_dim // head_dim
+
+
+# =============================================================================
+# Config (vendored locally; see module docstring)
+# =============================================================================
+
+
+class OpenELMConfig(PretrainedConfig):
+    """OpenELM configuration, vendored from Apple's ``configuration_openelm.py``.
+
+    Bundled with the custom model implementation so AutoDeploy never executes
+    Apple's hub remote code (which is incompatible with transformers 5.x). The
+    per-layer derivation that Apple performed in ``__post_init__`` is inlined
+    into ``__init__`` here to avoid the transformers 5.x dataclass collision on
+    the reserved ``__post_init__`` name.
+
+    Derivation logic is adapted from Apple's OpenELM config
+    (Copyright (C) 2024 Apple Inc.; https://huggingface.co/apple/OpenELM-270M-Instruct).
+    """
+
+    model_type = "openelm"
+
+    def __init__(
+        self,
+        vocab_size: int = 32000,
+        max_context_length: int = 2048,
+        num_transformer_layers: int = 12,
+        model_dim: int = 2048,
+        head_dim: int = 128,
+        qkv_multipliers: Union[Number, List[Number]] = 1.0,
+        num_query_heads: Union[int, None] = None,
+        num_gqa_groups: int = 1,
+        ffn_multipliers: Union[Number, List[Number]] = 4.0,
+        ffn_with_glu: bool = True,
+        ffn_dim_divisor: int = 256,
+        activation_fn_name: str = "swish",
+        normalization_layer_name: str = "rms_norm",
+        normalize_qk_projections: bool = False,
+        share_input_output_layers: bool = False,
+        rope_freq_constant: int = 10000,
+        rope_max_length: int = 4096,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        **kwargs,
+    ) -> None:
+        self.vocab_size = vocab_size
+        self.max_context_length = max_context_length
+        self.num_transformer_layers = num_transformer_layers
+        self.model_dim = model_dim
+        self.head_dim = head_dim
+        self.qkv_multipliers = qkv_multipliers
+        self.num_gqa_groups = num_gqa_groups
+        self.ffn_multipliers = ffn_multipliers
+        self.ffn_with_glu = ffn_with_glu
+        self.ffn_dim_divisor = ffn_dim_divisor
+        self.activation_fn_name = activation_fn_name
+        self.normalization_layer_name = normalization_layer_name
+        self.normalize_qk_projections = normalize_qk_projections
+        self.share_input_output_layers = share_input_output_layers
+        self.rope_freq_constant = rope_freq_constant
+        self.rope_max_length = rope_max_length
+        self.num_query_heads = (
+            _compute_heads(model_dim, head_dim) if num_query_heads is None else num_query_heads
+        )
+        self.initializer_range = initializer_range
+
+        # --- per-layer derivation (inlined from Apple's __post_init__) ---
+        head_multiple_of = self.num_gqa_groups if self.num_gqa_groups is not None else 2
+
+        if isinstance(self.qkv_multipliers, Number):
+            qkv_dim = _make_divisible(
+                self.model_dim * self.qkv_multipliers,
+                divisor=self.head_dim * head_multiple_of,
+            )
+            query_dims = [int(qkv_dim)] * self.num_transformer_layers
+        elif isinstance(self.qkv_multipliers, (tuple, list)) and len(self.qkv_multipliers) == 2:
+            qkv_multipliers = [
+                round(v, 2)
+                for v in np.linspace(
+                    self.qkv_multipliers[0],
+                    self.qkv_multipliers[1],
+                    num=self.num_transformer_layers,
+                    dtype=float,
+                )
+            ]
+            query_dims = [
+                int(_make_divisible(self.model_dim * m, divisor=self.head_dim * head_multiple_of))
+                for m in qkv_multipliers
+            ]
+        else:
+            raise NotImplementedError(
+                f"QKV multipliers should be a single number or a list of exactly two numbers. "
+                f"Got: {self.qkv_multipliers}."
+            )
+
+        self.num_query_heads = [int(_compute_heads(q_dim, self.head_dim)) for q_dim in query_dims]
+        self.num_kv_heads = [q // self.num_gqa_groups for q in self.num_query_heads]
+
+        if isinstance(self.ffn_multipliers, Number):
+            self.ffn_multipliers = [self.ffn_multipliers] * self.num_transformer_layers
+        elif isinstance(self.ffn_multipliers, (tuple, list)):
+            if len(self.ffn_multipliers) == 2:
+                self.ffn_multipliers = [
+                    round(v, 2)
+                    for v in np.linspace(
+                        self.ffn_multipliers[0],
+                        self.ffn_multipliers[1],
+                        num=self.num_transformer_layers,
+                        dtype=float,
+                    )
+                ]
+            else:
+                assert len(self.ffn_multipliers) == self.num_transformer_layers, (
+                    f"{len(self.ffn_multipliers)=}!={self.num_transformer_layers=}"
+                )
+        else:
+            raise NotImplementedError(
+                f"FFN multipliers should be a single number or a list of exactly two numbers. "
+                f"Got: {self.ffn_multipliers}."
+            )
+
+        for layer_idx in range(len(query_dims)):
+            assert self.num_query_heads[layer_idx] % self.num_kv_heads[layer_idx] == 0
+
+        super().__init__(
+            use_cache=use_cache,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs,
+        )
 
 
 # =============================================================================
@@ -395,5 +547,18 @@ class OpenELMForCausalLM(OpenELMPreTrainedModel, GenerationMixin):
         return OpenELMCausalLMOutput(logits=logits)
 
 
-# Register with AutoModelForCausalLMFactory
+# Register the vendored config with AutoConfig so AutoConfig.from_pretrained resolves
+# `model_type: openelm` to this local class instead of executing Apple's hub remote
+# code. Because this class's module is not under `transformers.`, transformers treats
+# it as `explicit_local_code` and uses it even when trust_remote_code=True and the
+# checkpoint's config.json declares an auto_map.
+try:
+    AutoConfig.register("openelm", OpenELMConfig, exist_ok=True)
+except TypeError:
+    try:
+        AutoConfig.register("openelm", OpenELMConfig)
+    except ValueError:
+        pass
+
+# Register with AutoModelForCausalLMFactory (keyed by config class name "OpenELMConfig")
 AutoModelForCausalLMFactory.register_custom_model_cls("OpenELMConfig", OpenELMForCausalLM)
