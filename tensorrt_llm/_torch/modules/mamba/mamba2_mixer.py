@@ -349,7 +349,11 @@ class Mamba2Mixer(nn.Module):
                                                                    num_prefills]
 
             has_initial_states_p = has_initial_states[:num_prefills]
-            conv_states[state_indices_p[~has_initial_states_p]].zero_()
+            # Explicitly zero fresh context slots. Recycled slots may still
+            # carry a prior request's SSM/conv state, which kernels read.
+            fresh_p = state_indices_p[~has_initial_states_p]
+            conv_states[fresh_p] = 0
+            ssm_states[fresh_p] = 0
             # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
             xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
                                                     self.tp_d_inner,
