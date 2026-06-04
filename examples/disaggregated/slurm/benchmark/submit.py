@@ -397,7 +397,7 @@ def save_env_file(env_file, server_env_var, worker_env_var, ctx_worker_env_var,
     print(f"Environment variables saved to {env_file}")
 
 
-def submit_job(config, log_dir, dry_run):
+def submit_job(config, log_dir, dry_run, config_file=None):
     # Extract configurations
     slurm_config = config['slurm']
     slurm_config.setdefault('extra_args', '')
@@ -516,8 +516,15 @@ def submit_job(config, log_dir, dry_run):
     if log_dir is None:
         log_base = os.path.join(script_dir, "logs")
 
-        date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
+        # Derive experiment name from config filename (strip common prefix and extension)
+        config_basename = os.path.basename(config_file) if config_file else ''
+        experiment_name = os.path.splitext(config_basename)[0]
+        for prefix in ('config_', 'config-'):
+            if experiment_name.startswith(prefix):
+                experiment_name = experiment_name[len(prefix):]
+                break
+
+        log_base = os.path.join(log_base, f"{experiment_name}/{isl}-{osl}")
 
         mtp_suffix = "" if mtp_size is None else f"_mtp{mtp_size}"
 
@@ -619,6 +626,13 @@ def submit_job(config, log_dir, dry_run):
             etcd_endpoint = f"http://{disagg_server_hostname}:{etcd_port}"
             upsert_env_config(env_config, 'worker_env_var', 'ETCD_ENDPOINTS',
                               f'ETCD_ENDPOINTS={etcd_endpoint}')
+
+    # Always export ETCD_ENDPOINTS when using etcd discovery so the NIXL
+    # library can use etcd-based metadata exchange (fetchRemoteMD).
+    if sd_backend == 'etcd':
+        etcd_endpoint = f"http://{disagg_server_hostname}:{etcd_port}"
+        upsert_env_config(env_config, 'worker_env_var', 'ETCD_ENDPOINTS',
+                          f'ETCD_ENDPOINTS={etcd_endpoint}')
 
     # Replace static server lists with disagg_cluster auto-discovery
     server_config.pop('context_servers', None)
@@ -973,7 +987,7 @@ def main():
         print(f"Processing: {config_file}")
         try:
             config = load_config(config_file)
-            submit_job(config, args.log_dir, args.dry_run)
+            submit_job(config, args.log_dir, args.dry_run, config_file)
             print(f"Successfully submitted job for: {config_file}\n")
         except Exception as e:
             traceback.print_exc()

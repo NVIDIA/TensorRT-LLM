@@ -4120,9 +4120,12 @@ class PyExecutor:
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                # If cancel is successful, mark as complete so it can be cleaned up
-                # Otherwise, try at next iteration
-                if is_cancelled:
+                # Synchronize cancel across TP ranks: only proceed if ALL
+                # ranks cancelled successfully, otherwise active_requests
+                # diverges and the next forward collective deadlocks.
+                all_cancelled = self.dist.allreduce(int(is_cancelled),
+                                                    op=ReduceOp.MIN)
+                if all_cancelled > 0:
                     request.py_kv_transfer_start_time = None
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 

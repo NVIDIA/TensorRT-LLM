@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import os
 from enum import Enum, auto
 from typing import Dict, List, Set
 
 from tensorrt_llm._torch.disaggregation.base.region import DataRole as RegionDataRole
 
 from .page import AttentionLayerGroup, KVCachePageTable, MambaLayerGroup, PhysicalPool, PoolView
+
+# gdr_copy on GB200 cannot pin buffers larger than ~4GB.
+# Split NIXL registrations into chunks at most this size.
+_NIXL_MAX_REG_BYTES = int(os.environ.get("TRTLLM_NIXL_MAX_REG_BYTES", str(4 * 1024**3)))
 
 
 class PoolRole(Enum):
@@ -169,10 +174,31 @@ def get_device_pointer(
 # -------------------------------------------------------------------------
 
 
+def _split_region(
+    ptr: int, size: int, device_id: int, name: str, max_bytes: int
+) -> list[tuple[int, int, int, str]]:
+    """Split a memory region into chunks no larger than *max_bytes*."""
+    if size <= max_bytes:
+        return [(ptr, size, device_id, name)]
+    descs: list[tuple[int, int, int, str]] = []
+    offset = 0
+    chunk_idx = 0
+    while offset < size:
+        chunk_size = min(max_bytes, size - offset)
+        descs.append((ptr + offset, chunk_size, device_id, f"{name}_chunk{chunk_idx}"))
+        offset += chunk_size
+        chunk_idx += 1
+    return descs
+
+
 def get_unique_pool_memory_descs(
     page_table: KVCachePageTable, device_id: int
 ) -> list[tuple[int, int, int, str]]:
-    """Return deduplicated (ptr, size, device_id, name) tuples for all physical pools."""
+    """Return deduplicated (ptr, size, device_id, name) tuples for all physical pools.
+
+    Pools larger than _NIXL_MAX_REG_BYTES are split into multiple regions so
+    that gdr_copy can pin each one individually.
+    """
     unique_pools: dict[tuple[int, int], int] = {}  # (ptr, size) -> index
     pool_counter = 0
     for lg_idx, lg in enumerate(page_table.layer_groups):
@@ -191,10 +217,13 @@ def get_unique_pool_memory_descs(
                 if pool_key not in unique_pools:
                     unique_pools[pool_key] = pool_counter
                     pool_counter += 1
-    return [
-        (pool_ptr, pool_size, device_id, f"kv_cache_memory_pool{idx}")
-        for (pool_ptr, pool_size), idx in unique_pools.items()
-    ]
+
+    descs: list[tuple[int, int, int, str]] = []
+    for (pool_ptr, pool_size), idx in unique_pools.items():
+        descs.extend(
+            _split_region(pool_ptr, pool_size, device_id, f"kv_cache_memory_pool{idx}", _NIXL_MAX_REG_BYTES)
+        )
+    return descs
 
 
 # -------------------------------------------------------------------------

@@ -17,8 +17,12 @@ disagg_cluster_uri=${10}
 # Do not set CUDA_VISIBLE_DEVICES here. Let Slurm/enroot expose the devices
 # assigned to this step; TRT-LLM relies on that visibility for peer checks.
 
-# Clear UCX_TLS for specific clusters
-unset UCX_TLS
+# Only clear UCX_TLS if the benchmark config didn't explicitly set one.
+if [ -z "${UCX_TLS:-}" ]; then
+    unset UCX_TLS
+else
+    echo "Using UCX_TLS: ${UCX_TLS}"
+fi
 
 # Resolve KVBM leader ZMQ hostname to IPv4 so ZMQ can bind (leader) and
 # connect (workers) using the same address across nodes.
