@@ -18,6 +18,7 @@ synthesizes the modality-major default order).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,10 +28,13 @@ from _mm_encode_helpers import _make_param
 from tensorrt_llm._torch.models.mixed_modal_encode import ModalityItem
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModelBase,
+    Qwen3VLInputProcessorBase,
     _qwen3vl_extract_items,
     _qwen3vl_grid_rows,
     _qwen3vl_slice_payload,
 )
+from tensorrt_llm.inputs.multimodal import MixedModalEncodeContext
+from tensorrt_llm.sampling_params import SamplingParams
 
 
 class TestQwen3VLPayloadSlicer:
@@ -343,3 +347,119 @@ class TestQwen3VLBucketAdapters:
         assert pixel_values_arg.shape == (32, 1176)
         assert grid_arg.shape == expected_grid_shape
         torch.testing.assert_close(result, out_tensor)
+
+
+# --- Mixed image+video preprocess writes embedding lengths (non-hashing path) --
+
+_QWEN_VOCAB_SIZE = 1000
+_QWEN_IMAGE_TOKEN_ID = 10
+_QWEN_VIDEO_TOKEN_ID = 11
+# spatial_merge_size = 2. Image grid [1, 4, 4] -> 1*(4//2)*(4//2) = 4 tokens.
+# Video grid [1, 2, 2] -> 1*(2//2)*(2//2) = 1 token.
+_QWEN_IMAGE_GRID = [[1, 4, 4]]
+_QWEN_VIDEO_GRID = [[1, 2, 2]]
+_QWEN_IMAGE_TOKENS = 4
+_QWEN_VIDEO_TOKENS = 1
+
+
+def _make_mixed_qwen_processor():
+    """Construct a Qwen3VL input processor that runs `call_with_text_prompt`
+    without model weights.
+
+    `__init__` loads an HF processor/tokenizer, so build via `__new__` and set
+    only the attributes the mixed preprocess path reads, stubbing `_preprocess`
+    (the HF call) and `get_mrope_config` (rope math, irrelevant to the lengths
+    metadata under test). The image token-count hook is stubbed to the grid
+    formula too, since the base default delegates to the HF processor.
+    """
+    proc = Qwen3VLInputProcessorBase.__new__(Qwen3VLInputProcessorBase)
+    proc._config = SimpleNamespace(
+        text_config=SimpleNamespace(vocab_size=_QWEN_VOCAB_SIZE, dtype=torch.float32),
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=_QWEN_IMAGE_TOKEN_ID,
+        video_token_id=_QWEN_VIDEO_TOKEN_ID,
+    )
+    proc._dtype = torch.float32
+    proc._processor = None
+    proc.tllm_multimodal_token_id = proc.get_vocab_size() + 1
+
+    # Prompt with image first then video, so the scanned item order is
+    # [(image, 0), (video, 0)].
+    text_prompt = (
+        "<|vision_start|><|image_pad|><|vision_end|> <|vision_start|><|video_pad|><|vision_end|>"
+    )
+    # Stubbed HF output: input_ids carry one image token then one video token
+    # (placeholders, pre-expansion is irrelevant — the embed mask keys off the
+    # post-_postprocess tllm_multimodal_token_id). The image block is 4 tokens
+    # and the video block is 1 token, matching the grid token counts.
+    input_ids = torch.tensor(
+        [
+            [
+                5,
+                *([_QWEN_IMAGE_TOKEN_ID] * _QWEN_IMAGE_TOKENS),
+                6,
+                *([_QWEN_VIDEO_TOKEN_ID] * _QWEN_VIDEO_TOKENS),
+                7,
+            ]
+        ]
+    )
+    processed = {
+        "input_ids": input_ids,
+        "pixel_values": torch.zeros(_QWEN_IMAGE_TOKENS, 1),
+        "image_grid_thw": torch.tensor(_QWEN_IMAGE_GRID),
+        "pixel_values_videos": torch.zeros(_QWEN_VIDEO_TOKENS, 1),
+        "video_grid_thw": torch.tensor(_QWEN_VIDEO_GRID),
+        "attention_mask": torch.ones_like(input_ids),
+    }
+    proc._preprocess = lambda text, mm_data, mm_processor_kwargs: processed
+    proc.get_mrope_config = lambda *args, **kwargs: {}
+    # The base get_num_tokens_per_image delegates to the HF processor; stub it to
+    # the grid formula so it works weightless. get_num_tokens_per_video already
+    # computes from the grid (no HF call needed).
+    proc.get_num_tokens_per_image = lambda *, image, **kwargs: _QWEN_IMAGE_TOKENS
+    return proc, text_prompt
+
+
+def test_qwen3vl_mixed_preprocess_writes_matching_embedding_lengths():
+    """Qwen3-VL mixed preprocess must bake multimodal_embedding_lengths.
+
+    Regression for the mixed-modality crash: the `len(modalities) > 1` branch
+    wrote `multimodal_item_order` but never `multimodal_embedding_lengths`, so on
+    the non-hashing (direct preprocess) path nobody filled it. The per-item
+    extractor then built a `MixedModalEncodeContext` via
+    `from_metadata(..., multimodal_data.get("multimodal_embedding_lengths"))`,
+    hitting `tuple(int(x) for x in None)` -> TypeError. The fix makes the
+    preprocess path emit the SAME metadata the registry hashing path does.
+    """
+    proc, text_prompt = _make_mixed_qwen_processor()
+    inputs = {
+        "prompt": text_prompt,
+        "multi_modal_data": {
+            "image": [torch.zeros(3, 8, 8)],
+            "video": [[torch.zeros(3, 4, 4)]],
+        },
+    }
+
+    _, extra = proc.call_with_text_prompt(inputs, SamplingParams())
+    multimodal_data = extra["multimodal_data"]
+
+    # The mixed branch baked the prompt order: image first, then video.
+    assert multimodal_data["multimodal_item_order"] == [
+        {"modality": "image", "index": 0},
+        {"modality": "video", "index": 0},
+    ]
+    # The crash fix: per-item embedding lengths are present and in prompt order
+    # (image=4, then video=1). Embedding lengths are the embed-slot counts, which
+    # equal the per-item token budgets here (no framing specials on Qwen3-VL).
+    assert multimodal_data["multimodal_embedding_lengths"] == [
+        _QWEN_IMAGE_TOKENS,
+        _QWEN_VIDEO_TOKENS,
+    ]
+    # The lengths agree with what a transient MixedModalEncodeContext expects
+    # (per-slot row counts aligned with the order) — i.e. the context the
+    # extractor builds via from_metadata constructs without error.
+    ctx = MixedModalEncodeContext.from_metadata(
+        multimodal_data, multimodal_data["multimodal_embedding_lengths"]
+    )
+    assert ctx is not None
+    assert ctx.embedding_lengths == (_QWEN_IMAGE_TOKENS, _QWEN_VIDEO_TOKENS)

@@ -34,7 +34,13 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import MixedModalEncodeContext, MultimodalParams, scan_prompt_order
+from ...inputs.multimodal import (
+    MixedModalEncodeContext,
+    MultimodalParams,
+    compute_mm_embedding_lengths,
+    find_mm_token_lengths,
+    scan_prompt_order,
+)
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -587,10 +593,11 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         multimodal_data = {}
         normalized_mm_data = MixedModalEncodeContext._normalize(mm_data)
         modalities = [modality for modality in _QWEN_MODALITIES if normalized_mm_data.get(modality)]
+        item_order = None
         if len(modalities) > 1:
+            item_order = self._get_mm_item_order_from_text(text_prompt, mm_data)
             multimodal_data["multimodal_item_order"] = [
-                {"modality": modality, "index": idx}
-                for modality, idx in self._get_mm_item_order_from_text(text_prompt, mm_data)
+                {"modality": modality, "index": idx} for modality, idx in item_order
             ]
         pixel_values = processed_inputs.get("pixel_values", None)
         if pixel_values is not None:
@@ -618,6 +625,31 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         fused_input_ids = processed_inputs["input_ids"][0]
         if mm_data:
             fused_input_ids = self._postprocess(fused_input_ids)
+
+        # Mixed-modality (>1 distinct modality): bake the per-item embedding
+        # lengths alongside the item order so the non-hashing (direct preprocess)
+        # path produces the same metadata the registry hashing path does. Without
+        # this, the per-item extractor's
+        # MixedModalEncodeContext.from_metadata(..., None) hits
+        # tuple(int(x) for x in None) -> TypeError. Computed AFTER fused_input_ids
+        # is finalized (post-_postprocess) and the image/video multimodal_data
+        # keys are populated, since find_mm_token_lengths reads video_grid_thw
+        # from multimodal_data["video"] and the embed mask is derived from the
+        # returned fused_input_ids.
+        if item_order is not None:
+            num_mm_tokens_by_key = find_mm_token_lengths(
+                mm_data, self, multimodal_data=multimodal_data
+            )
+            num_mm_tokens = MixedModalEncodeContext.project_by_order(
+                item_order, num_mm_tokens_by_key
+            )
+            multimodal_data["multimodal_embedding_lengths"] = compute_mm_embedding_lengths(
+                fused_input_ids,
+                num_mm_tokens,
+                vocab_size=self.get_vocab_size(),
+                mm_token_ids=self.get_mm_token_ids(),
+                mm_special_token_ids=self.get_mm_special_token_ids(),
+            )
 
         return fused_input_ids.to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
