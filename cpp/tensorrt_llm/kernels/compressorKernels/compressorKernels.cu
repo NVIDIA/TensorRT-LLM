@@ -668,9 +668,6 @@ FOREACH_DECODE_CONFIG(INST_DECODE)
 // For HD=512 bf16: head_blocks=2; for HD=128 bf16: head_blocks=1.
 // ============================================================================
 
-// Forward declaration (defined in prefill section below).
-static inline int prefillNthreads(int head_dim, int elem_bytes_for_vec);
-
 void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
     int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
     int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size, int max_blocks, int head_dim,
@@ -745,19 +742,20 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 // ============================================================================
 // Prefill Kernel: prefillReductionKernel
 //
-// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES>
+// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES, COMPRESS_RATIO, NUM_RED_WARPS>
 //
-// Grid:  (batch_size, max_outputs_per_batch) — one block per compressed output
-// Block: (NTHRD) where NTHRD = HEAD_DIM / VEC (>= 32 threads)
+// Grid:  (batch_size, max_outputs_per_batch, head_blocks)
+// Block: (NTHRD_INNER * NUM_RED_WARPS), where NTHRD_INNER covers one head chunk.
 //
 // Unlike the decode kernel (which operates token-by-token from paged state),
 // the prefill kernel processes the full input sequence at once. Each block
-// reads compress_ratio consecutive input rows from kv_score and reduces them
-// via online softmax to produce one compressed output.
+// handles one compressed output for one head_dim chunk. For compress_ratio=128,
+// four reduction groups split the token dimension for state writes and online
+// softmax, then merge per-element partials in shared memory.
 //
 // The last block (local_output_idx == num_outputs - 1) also handles saving
 // compressor state for any remainder tokens that don't form a full chunk.
-// This state is written to paged kv/score caches for use in future decode steps.
+// All full chunks are also written to paged kv/score caches for block reuse.
 //
 // Memory layout:
 //   kv_score:    [total_tokens, 2*state_dim] — interleaved KV and score from linear projection
@@ -807,7 +805,7 @@ __device__ __forceinline__ void prefillSoftmaxVec(void const* __restrict__ kv_sc
     }
 }
 
-template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int COMPRESS_RATIO>
+template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int COMPRESS_RATIO, int NUM_RED_WARPS = 1>
 __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
     int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
@@ -826,10 +824,19 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     using KvScoreVecT = typename VecType<VEC * KV_SCORE_ELEM_BYTES>::type;
     using StateVecT = typename VecType<VEC * STATE_ELEM_BYTES>::type;
     static_assert(VEC >= 4, "VEC must be >= 4 for float4 ape loads");
+    static_assert(NUM_RED_WARPS == 1 || NUM_RED_WARPS == 4, "Unsupported NUM_RED_WARPS");
 
-    int const tid = threadIdx.x;
+    constexpr int NTHRD_BASE = HEAD_DIM / VEC;
+    constexpr int HEAD_BLOCKS = (COMPRESS_RATIO == 128 && NTHRD_BASE > 32) ? (NTHRD_BASE / 32) : 1;
+    constexpr int NTHRD_INNER = NTHRD_BASE / HEAD_BLOCKS;
+    constexpr int ELEM_PER_BLOCK = NTHRD_INNER * VEC;
+
+    int const tid = (HEAD_BLOCKS == 1 && NUM_RED_WARPS == 1) ? threadIdx.x : (threadIdx.x % NTHRD_INNER);
+    int const red_warp = (NUM_RED_WARPS == 1) ? 0 : (threadIdx.x / NTHRD_INNER);
     int const batch_idx = blockIdx.x;
     int const local_output_idx = blockIdx.y;
+    int const head_blk = (HEAD_BLOCKS == 1) ? 0 : blockIdx.z;
+    int const eff_tid = (HEAD_BLOCKS == 1) ? tid : (head_blk * NTHRD_INNER + tid);
 
     int const sp = start_pos_arr[batch_idx];
     int const kv_len = kv_lens[batch_idx];
@@ -862,6 +869,18 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     int64_t const two_sd = 2 * state_dim;
     int64_t const page_sd = static_cast<int64_t>(page_size) * state_dim;
 
+    float rmax[VEC], rsum[VEC], rwsum[VEC];
+    if constexpr (!IS_OVERLAP)
+    {
+#pragma unroll
+        for (int i = 0; i < VEC; i++)
+        {
+            rmax[i] = -INFINITY;
+            rsum[i] = 0.0f;
+            rwsum[i] = 0.0f;
+        }
+    }
+
     // ================================================================
     // Phase 1: State Update (all output blocks, for block reuse support)
     //
@@ -876,9 +895,17 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     // APE index is r (position within the compression window), matching the
     // index used during the original decode/prefill that first established
     // the window alignment.
-    auto write_to_paged = [&](int range_start, int range_end, int write_r_start)
+    auto write_to_paged = [&](int range_start, int range_end, int write_r_start, bool accumulateNewTokens)
     {
-        for (int r = write_r_start; r < range_end - range_start; r++)
+        int const write_count = range_end - range_start - write_r_start;
+        if (write_count <= 0)
+        {
+            return;
+        }
+
+        int const r_begin = write_r_start + write_count * red_warp / NUM_RED_WARPS;
+        int const r_end = write_r_start + write_count * (red_warp + 1) / NUM_RED_WARPS;
+        for (int r = r_begin; r < r_end; r++)
         {
             int const pos = range_start + r;
             int const input_row = pos - sp; // >= 0 since pos >= sp (loop starts at write_r_start)
@@ -894,18 +921,20 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
                 int64_t const dkv = static_cast<int64_t>(phys_kv) * page_sd + blk_off * state_dim + col;
                 int64_t const dsc = static_cast<int64_t>(phys_sc) * page_sd + blk_off * state_dim + col;
 
-                KvScoreVecT kv_raw = reinterpret_cast<KvScoreVecT const*>(&kv_score[src])[tid];
-                KvScoreVecT sc_raw = reinterpret_cast<KvScoreVecT const*>(&kv_score[src + state_dim])[tid];
+                KvScoreVecT kv_raw = reinterpret_cast<KvScoreVecT const*>(&kv_score[src])[eff_tid];
+                KvScoreVecT sc_raw = reinterpret_cast<KvScoreVecT const*>(&kv_score[src + state_dim])[eff_tid];
 
                 KvScoreElemT const* kv_e = reinterpret_cast<KvScoreElemT const*>(&kv_raw);
                 StateVecT kv_out;
                 StateElemT* kv_o = reinterpret_cast<StateElemT*>(&kv_out);
+                float kv_f[VEC];
 #pragma unroll
                 for (int i = 0; i < VEC; i++)
                 {
-                    kv_o[i] = static_cast<StateElemT>(static_cast<float>(kv_e[i]));
+                    kv_f[i] = static_cast<float>(kv_e[i]);
+                    kv_o[i] = static_cast<StateElemT>(kv_f[i]);
                 }
-                reinterpret_cast<StateVecT*>(&paged_kv[dkv])[tid] = kv_out;
+                reinterpret_cast<StateVecT*>(&paged_kv[dkv])[eff_tid] = kv_out;
 
                 KvScoreElemT const* sc_e = reinterpret_cast<KvScoreElemT const*>(&sc_raw);
                 StateVecT sc_out;
@@ -913,13 +942,35 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
 #pragma unroll
                 for (int i = 0; i < VEC; i += 4)
                 {
-                    float4 av = *reinterpret_cast<float4 const*>(&ape[r * state_dim + col + tid * VEC + i]);
-                    sc_o[i] = static_cast<StateElemT>(static_cast<float>(sc_e[i]) + av.x);
-                    sc_o[i + 1] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 1]) + av.y);
-                    sc_o[i + 2] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 2]) + av.z);
-                    sc_o[i + 3] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 3]) + av.w);
+                    float4 av = *reinterpret_cast<float4 const*>(&ape[r * state_dim + col + eff_tid * VEC + i]);
+                    float const sf0 = static_cast<float>(sc_e[i]) + av.x;
+                    float const sf1 = static_cast<float>(sc_e[i + 1]) + av.y;
+                    float const sf2 = static_cast<float>(sc_e[i + 2]) + av.z;
+                    float const sf3 = static_cast<float>(sc_e[i + 3]) + av.w;
+                    sc_o[i] = static_cast<StateElemT>(sf0);
+                    sc_o[i + 1] = static_cast<StateElemT>(sf1);
+                    sc_o[i + 2] = static_cast<StateElemT>(sf2);
+                    sc_o[i + 3] = static_cast<StateElemT>(sf3);
+
+                    if constexpr (!IS_OVERLAP)
+                    {
+                        if (accumulateNewTokens)
+                        {
+                            float const sf[4] = {sf0, sf1, sf2, sf3};
+#pragma unroll
+                            for (int j = 0; j < 4; j++)
+                            {
+                                float const nm = fmaxf(rmax[i + j], sf[j]);
+                                float const sc = expf(rmax[i + j] - nm);
+                                float const tm = expf(sf[j] - nm);
+                                rsum[i + j] = rsum[i + j] * sc + tm;
+                                rwsum[i + j] = rwsum[i + j] * sc + kv_f[i + j] * tm;
+                                rmax[i + j] = nm;
+                            }
+                        }
+                    }
                 }
-                reinterpret_cast<StateVecT*>(&paged_score[dsc])[tid] = sc_out;
+                reinterpret_cast<StateVecT*>(&paged_score[dsc])[eff_tid] = sc_out;
             }
         }
     };
@@ -930,7 +981,7 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     if (should_compress)
     {
         int const write_r_start = (win_start < sp) ? (sp - win_start) : 0;
-        write_to_paged(win_start, win_start + COMPRESS_RATIO, write_r_start);
+        write_to_paged(win_start, win_start + COMPRESS_RATIO, write_r_start, !IS_OVERLAP);
     }
 
     // 1b. Remainder tokens (last block only).
@@ -943,7 +994,7 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
         int const rem_start_pos = last_abs_idx * COMPRESS_RATIO;
         int const rem_count = kv_len - rem_start_pos;
         int const rem_write_start = (rem_start_pos < sp) ? (sp - rem_start_pos) : 0;
-        write_to_paged(rem_start_pos, rem_start_pos + rem_count, rem_write_start);
+        write_to_paged(rem_start_pos, rem_start_pos + rem_count, rem_write_start, false);
     }
 
     // ================================================================
@@ -957,14 +1008,20 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     if (!should_compress)
         return;
 
-    float rmax[VEC], rsum[VEC], rwsum[VEC];
-#pragma unroll
-    for (int i = 0; i < VEC; i++)
+    if constexpr (IS_OVERLAP)
     {
-        rmax[i] = -INFINITY;
-        rsum[i] = 0.0f;
-        rwsum[i] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < VEC; i++)
+        {
+            rmax[i] = -INFINITY;
+            rsum[i] = 0.0f;
+            rwsum[i] = 0.0f;
+        }
     }
+
+    constexpr int positions_per_warp = COMPRESS_RATIO / NUM_RED_WARPS;
+    int const my_r_start = red_warp * positions_per_warp;
+    int const my_r_end = (red_warp == NUM_RED_WARPS - 1) ? COMPRESS_RATIO : (my_r_start + positions_per_warp);
 
     // Helper: online-softmax reduction over a contiguous window of COMPRESS_RATIO positions.
     // Positions [range_start, range_start + new_start) come from paged cache (APE already
@@ -973,13 +1030,14 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     // Two branch-free loops avoid a per-iteration if/else on pos < sp.
     //   kv_col_off  — column offset into kv_score / paged state (0 or HEAD_DIM for overlap)
     //   ape_col_off — column offset into APE table for the score column (same as kv_col_off)
-    auto reduce_window = [&](int range_start, int kv_col_off, int ape_col_off)
+    auto reduce_window = [&](int range_start, int kv_col_off, int ape_col_off, bool skipNewTokens)
     {
         // Precompute split once for the whole window.
         int const new_start = (range_start < sp) ? min(sp - range_start, COMPRESS_RATIO) : 0;
 
         // Paged portion — APE already fused when tokens were stored.
-        for (int r = 0; r < new_start; r++)
+        int const paged_r_end = min(new_start, my_r_end);
+        for (int r = my_r_start; r < paged_r_end; r++)
         {
             int const pos = range_start + r;
             int log_blk = pos / page_size;
@@ -987,17 +1045,21 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
             int phys_kv = block_table_kv[batch_idx * max_blocks + log_blk];
             int phys_sc = block_table_score[batch_idx * max_blocks + log_blk];
             decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, page_sd, state_dim,
-                phys_kv, phys_sc, blk_off, kv_col_off, tid, rmax, rsum, rwsum);
+                phys_kv, phys_sc, blk_off, kv_col_off, eff_tid, rmax, rsum, rwsum);
         }
 
         // New-token portion — read from kv_score and add APE live.
-        for (int r = new_start; r < COMPRESS_RATIO; r++)
+        if (!skipNewTokens)
         {
-            int const pos = range_start + r;
-            int const input_row = pos - sp;
-            int64_t const row = static_cast<int64_t>(input_offset + input_row) * two_sd;
-            prefillSoftmaxVec<HEAD_DIM, KV_SCORE_ELEM_BYTES, VEC>(
-                kv_score_raw, ape, row, kv_col_off, r * state_dim + ape_col_off, state_dim, tid, rmax, rsum, rwsum);
+            int const new_r_start = max(my_r_start, new_start);
+            for (int r = new_r_start; r < my_r_end; r++)
+            {
+                int const pos = range_start + r;
+                int const input_row = pos - sp;
+                int64_t const row = static_cast<int64_t>(input_offset + input_row) * two_sd;
+                prefillSoftmaxVec<HEAD_DIM, KV_SCORE_ELEM_BYTES, VEC>(kv_score_raw, ape, row, kv_col_off,
+                    r * state_dim + ape_col_off, state_dim, eff_tid, rmax, rsum, rwsum);
+            }
         }
     };
 
@@ -1007,19 +1069,66 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
         //   prev-segment (first head_dim,  kv_col=0)    from window (abs_idx-1)
         //   curr-segment (second head_dim, kv_col=HD)   from window abs_idx
         if (abs_idx > 0)
-            reduce_window((abs_idx - 1) * COMPRESS_RATIO, 0, 0); // prev window, first half
-        reduce_window(win_start, HEAD_DIM, HEAD_DIM);            // curr window, second half
+            reduce_window((abs_idx - 1) * COMPRESS_RATIO, 0, 0, false); // prev window, first half
+        reduce_window(win_start, HEAD_DIM, HEAD_DIM, false);            // curr window, second half
     }
     else
     {
-        // Non-overlap mode: reduce one ratio-sized window.
-        reduce_window(win_start, 0, 0);
+        // Non-overlap mode: new tokens were reduced while writing paged state;
+        // only a reused prefix, if any, still needs to be read from paged state.
+        reduce_window(win_start, 0, 0, true);
+    }
+
+    if constexpr (NUM_RED_WARPS > 1)
+    {
+        extern __shared__ float smem[];
+        float* s_rmax = smem;
+        float* s_rsum = s_rmax + NUM_RED_WARPS * ELEM_PER_BLOCK;
+        float* s_rwsum = s_rsum + NUM_RED_WARPS * ELEM_PER_BLOCK;
+
+#pragma unroll
+        for (int i = 0; i < VEC; i++)
+        {
+            int const local_elem = tid * VEC + i;
+            s_rmax[red_warp * ELEM_PER_BLOCK + local_elem] = rmax[i];
+            s_rsum[red_warp * ELEM_PER_BLOCK + local_elem] = rsum[i];
+            s_rwsum[red_warp * ELEM_PER_BLOCK + local_elem] = rwsum[i];
+        }
+        __syncthreads();
+
+        if (red_warp == 0)
+        {
+            for (int w = 1; w < NUM_RED_WARPS; w++)
+            {
+#pragma unroll
+                for (int i = 0; i < VEC; i++)
+                {
+                    int const local_elem = tid * VEC + i;
+                    float const m2 = s_rmax[w * ELEM_PER_BLOCK + local_elem];
+                    float const s2 = s_rsum[w * ELEM_PER_BLOCK + local_elem];
+                    float const ws2 = s_rwsum[w * ELEM_PER_BLOCK + local_elem];
+
+                    float const nm = fmaxf(rmax[i], m2);
+                    float const sc1 = expf(rmax[i] - nm);
+                    float const sc2 = expf(m2 - nm);
+                    rsum[i] = rsum[i] * sc1 + s2 * sc2;
+                    rwsum[i] = rwsum[i] * sc1 + ws2 * sc2;
+                    rmax[i] = nm;
+                }
+            }
+        }
     }
 
     // ================================================================
     // Store output (vectorized)
     // ================================================================
-    int64_t const out_base = static_cast<int64_t>(output_offset + local_output_idx) * HEAD_DIM + tid * VEC;
+    bool const should_write = (NUM_RED_WARPS == 1) || (red_warp == 0);
+    if (!should_write)
+    {
+        return;
+    }
+
+    int64_t const out_base = static_cast<int64_t>(output_offset + local_output_idx) * HEAD_DIM + eff_tid * VEC;
 
     if (out_elem_bytes == 2)
     {
@@ -1046,36 +1155,37 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     }
 }
 
-// Explicit instantiations
-#define INST_PREFILL(HD, KV_EB, STATE_EB, CR)                                                                          \
-    template __global__ void prefillReductionKernel<HD, KV_EB, STATE_EB, CR>(void const*, float const*, void*, void*,  \
-        int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int32_t const*, int,    \
-        int, int, int);
+// Explicit instantiations.  CR=128 uses four reduction groups to split the long
+// token loop; CR=4 stays single-warp because the reduction is too small to amortize
+// the merge overhead.
+#define INST_PREFILL(HD, KV_EB, STATE_EB, CR, NRW)                                                                     \
+    template __global__ void prefillReductionKernel<HD, KV_EB, STATE_EB, CR, NRW>(void const*, float const*, void*,    \
+        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int32_t const*,  \
+        int, int, int, int);
 
-#define INST_PREFILL_DTYPES(HD, CR)                                                                                    \
-    INST_PREFILL(HD, 2, 2, CR)                                                                                         \
-    INST_PREFILL(HD, 2, 4, CR) INST_PREFILL(HD, 4, 2, CR) INST_PREFILL(HD, 4, 4, CR)
+#define INST_PREFILL_DTYPES(HD, CR, NRW)                                                                               \
+    INST_PREFILL(HD, 2, 2, CR, NRW)                                                                                    \
+    INST_PREFILL(HD, 2, 4, CR, NRW) INST_PREFILL(HD, 4, 2, CR, NRW) INST_PREFILL(HD, 4, 4, CR, NRW)
 
-INST_PREFILL_DTYPES(128, 4)
-INST_PREFILL_DTYPES(128, 128)
-INST_PREFILL_DTYPES(512, 4)
-INST_PREFILL_DTYPES(512, 128)
+INST_PREFILL_DTYPES(128, 4, 1)
+INST_PREFILL_DTYPES(128, 128, 4)
+INST_PREFILL_DTYPES(512, 4, 1)
+INST_PREFILL_DTYPES(512, 128, 4)
 #undef INST_PREFILL_DTYPES
 #undef INST_PREFILL
 
 // ============================================================================
 // Prefill Launch Wrapper
 //
-// Grid is (batch_size, max(max_outputs, 1)). Blocks for local_output_idx >= num_outputs
-// early-exit inside the kernel.
+// Grid is (batch_size, max(max_outputs, 1), head_blocks). Blocks for
+// local_output_idx >= num_outputs early-exit inside the kernel.
 // ============================================================================
 
-// Compute threads per block: mirrors compile-time NTHRD = HEAD_DIM / VEC.
-static inline int prefillNthreads(int head_dim, int elem_bytes_for_vec)
+// Compute vector width: mirrors compile-time VEC.
+static inline int prefillVec(int head_dim, int elem_bytes_for_vec)
 {
     int max_vec = 16 / elem_bytes_for_vec;
-    int vec = (head_dim / max_vec >= 32) ? max_vec : (head_dim / 32);
-    return head_dim / vec;
+    return (head_dim / max_vec >= 32) ? max_vec : (head_dim / 32);
 }
 
 void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
@@ -1091,50 +1201,59 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
         (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
         "prefillReductionLaunch only supports bf16/fp32 kv_score and paged state");
     int const elem_bytes_for_vec = max(kv_score_elem_bytes, state_elem_bytes);
-    int const nthreads = prefillNthreads(head_dim, elem_bytes_for_vec);
+    int const vec = prefillVec(head_dim, elem_bytes_for_vec);
+    int const nthrd_base = head_dim / vec;
+    constexpr int MULTI_WARP = 4;
+    bool const use_multi_warp = (compress_ratio == 128);
+    int const head_blocks = (use_multi_warp && nthrd_base > 32) ? (nthrd_base / 32) : 1;
+    int const nthreads_inner = nthrd_base / head_blocks;
+    int const num_red_warps = use_multi_warp ? MULTI_WARP : 1;
+    int const nthreads = nthreads_inner * num_red_warps;
+    int const elem_per_block = nthreads_inner * vec;
+    int const smem_bytes = use_multi_warp ? (3 * MULTI_WARP * elem_per_block * static_cast<int>(sizeof(float))) : 0;
     int const coff = overlap ? 2 : 1;
     int const state_dim = coff * head_dim;
-    dim3 grid(batch_size, max(max_outputs, 1));
+    dim3 grid(batch_size, max(max_outputs, 1), head_blocks);
 
-#define LAUNCH_PREFILL(HD, KV_EB, STATE_EB, CR)                                                                        \
-    prefillReductionKernel<HD, KV_EB, STATE_EB, CR><<<grid, nthreads, 0, stream>>>(kv_score, ape, paged_kv,            \
-        paged_score, block_table_kv, block_table_score, output, kv_lens, start_pos, cu_seq_lens, cu_kv_comp,           \
+#define LAUNCH_PREFILL(HD, KV_EB, STATE_EB, CR, NRW)                                                                   \
+    prefillReductionKernel<HD, KV_EB, STATE_EB, CR, NRW><<<grid, nthreads, smem_bytes, stream>>>(kv_score, ape,        \
+        paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, start_pos, cu_seq_lens, cu_kv_comp, \
         page_size, state_dim, max_blocks, out_elem_bytes)
 
-#define DISPATCH_PREFILL_DTYPE(HD, CR)                                                                                 \
+#define DISPATCH_PREFILL_DTYPE(HD, CR, NRW)                                                                            \
     do                                                                                                                 \
     {                                                                                                                  \
         if (kv_score_elem_bytes == 4 && state_elem_bytes == 4)                                                         \
         {                                                                                                              \
-            LAUNCH_PREFILL(HD, 4, 4, CR);                                                                              \
+            LAUNCH_PREFILL(HD, 4, 4, CR, NRW);                                                                         \
         }                                                                                                              \
         else if (kv_score_elem_bytes == 2 && state_elem_bytes == 4)                                                    \
         {                                                                                                              \
-            LAUNCH_PREFILL(HD, 2, 4, CR);                                                                              \
+            LAUNCH_PREFILL(HD, 2, 4, CR, NRW);                                                                         \
         }                                                                                                              \
         else if (kv_score_elem_bytes == 4 && state_elem_bytes == 2)                                                    \
         {                                                                                                              \
-            LAUNCH_PREFILL(HD, 4, 2, CR);                                                                              \
+            LAUNCH_PREFILL(HD, 4, 2, CR, NRW);                                                                         \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
-            LAUNCH_PREFILL(HD, 2, 2, CR);                                                                              \
+            LAUNCH_PREFILL(HD, 2, 2, CR, NRW);                                                                         \
         }                                                                                                              \
     } while (false)
 
     if (head_dim == 512)
     {
         if (compress_ratio == 4)
-            DISPATCH_PREFILL_DTYPE(512, 4);
+            DISPATCH_PREFILL_DTYPE(512, 4, 1);
         else
-            DISPATCH_PREFILL_DTYPE(512, 128);
+            DISPATCH_PREFILL_DTYPE(512, 128, 4);
     }
     else
     {
         if (compress_ratio == 4)
-            DISPATCH_PREFILL_DTYPE(128, 4);
+            DISPATCH_PREFILL_DTYPE(128, 4, 1);
         else
-            DISPATCH_PREFILL_DTYPE(128, 128);
+            DISPATCH_PREFILL_DTYPE(128, 128, 4);
     }
 
 #undef DISPATCH_PREFILL_DTYPE

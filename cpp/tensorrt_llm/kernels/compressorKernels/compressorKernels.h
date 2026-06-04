@@ -50,7 +50,8 @@ void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or f
     cudaStream_t stream);
 
 // Prefill kernel: bulk compression with per-token gather/scatter + state update.
-// Writes remainder tokens to paged cache, then performs online softmax reduction.
+// Writes all newly seen token states to paged cache for block reuse, then performs
+// online softmax reduction.
 //
 // Grid: (batch_size, max_outputs_per_batch, num_head_chunks)
 // Each block computes one compressed output for one head_dim chunk.
