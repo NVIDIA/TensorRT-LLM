@@ -224,6 +224,14 @@ class Step3VisionMLP(MLP):
 # head dims are zero-padded up to the next supported size (128). The kernel
 # sees zero-padded channels while 2D RoPE math runs on the real channels; the
 # softmax scale is preserved through a compensating ``q_scaling`` (see below).
+#
+# TODO(perf): padding 96->128 wastes ~33% of the QK^T / P*V flops and adds a
+# per-forward ``torch.cat`` on q/k/v every layer. The head_dim restriction is
+# specific to the trtllm-gen cubins, not to attention in general: FlashInfer ragged
+# prefill supports head_dim=96 natively. Dispatching the vision tower's
+# attention through a head_dim-96-native backend would drop the padding, the
+# ``q_scaling`` compensation, and the per-forward pads. The same hack exists in
+# ``modeling_gemma4_vision.py`` (72->80), so a shared helper could fix both.
 _FMHA_SUPPORTED_HEAD_DIMS = (64, 80, 128, 256, 512)
 
 
