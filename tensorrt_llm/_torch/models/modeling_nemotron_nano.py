@@ -17,9 +17,7 @@ from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import (
     MixedModalEncodeContext,
     MultimodalParams,
-    _as_cpu_tensor,
-    _compute_mm_masks,
-    _find_mm_embedding_lengths_from_masks,
+    compute_mm_embedding_lengths,
     scan_prompt_order,
 )
 
@@ -2849,37 +2847,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             mm_data,
         )
         # Same modality can appear twice. Keep per-item embed lengths so chunks follow prompt order.
-        multimodal_data["multimodal_embedding_lengths"] = self._find_multimodal_embedding_lengths(
-            input_ids, num_mm_tokens
-        )
-        self._merge_mm_data_updates(multimodal_data, mm_data_updates)
-        return input_ids, {"multimodal_data": multimodal_data}
-
-    def _find_multimodal_embedding_lengths(
-        self,
-        input_ids: Union[torch.Tensor, List[int], np.ndarray],
-        num_mm_tokens: List[int],
-    ) -> List[int]:
-        """Compute per-item multimodal embedding-token counts for a prompt.
-
-        Derives the embed mask from this processor's vocab size / multimodal
-        token id predicates, then counts embed-slot tokens per logical item
-        described by `num_mm_tokens`.
-
-        Args:
-            input_ids: Prompt token ids (CPU-resident); coerced to a tensor.
-            num_mm_tokens: Per-item multimodal token counts in prompt order.
-
-        Returns:
-            Per-item embedding-token counts aligned with `num_mm_tokens`.
-        """
-        mm_mask, embed_mask, _ = _compute_mm_masks(
-            _as_cpu_tensor(input_ids),
+        multimodal_data["multimodal_embedding_lengths"] = compute_mm_embedding_lengths(
+            input_ids,
+            num_mm_tokens,
             vocab_size=self.get_vocab_size(),
             mm_token_ids=self.get_mm_token_ids(),
             mm_special_token_ids=self.get_mm_special_token_ids(),
         )
-        return _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask, num_mm_tokens)
+        self._merge_mm_data_updates(multimodal_data, mm_data_updates)
+        return input_ids, {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()
     def call_with_text_prompt(

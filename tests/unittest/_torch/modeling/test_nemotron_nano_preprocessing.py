@@ -431,9 +431,15 @@ class TestNanoV2VLInputProcessor:
                 "_expand_mixed_prompt_text_for_mm",
                 return_value=(torch.zeros(1, 4, dtype=torch.long), None),
             ),
-            mock.patch.object(
-                proc,
-                "_find_multimodal_embedding_lengths",
+            # `compute_mm_embedding_lengths` is now a module-level call; its
+            # arguments (the token-id hooks below) are evaluated eagerly before
+            # the patched function runs, so stub the hooks to harmless values to
+            # keep this test scoped to the image-budget reservation.
+            mock.patch.object(proc, "get_mm_token_ids", return_value=None),
+            mock.patch.object(proc, "get_mm_special_token_ids", return_value=None),
+            mock.patch.object(proc, "get_vocab_size", return_value=1000),
+            mock.patch(
+                "tensorrt_llm._torch.models.modeling_nemotron_nano.compute_mm_embedding_lengths",
                 return_value=[],
             ),
         ):
@@ -1950,7 +1956,7 @@ class TestMixedModalityAudioHoist:
          single-modality video path injects via `_extract_audio_from_video`), and
       2. register the extracted audio as a top-level `mm_data["audio"]` item,
     so the scanner emits `(video, k), (audio, k)` at the right ranks and
-    `_find_multimodal_embedding_lengths` splits the budget into separate
+    `compute_mm_embedding_lengths` splits the budget into separate
     vision-only video + audio slots.
     """
 
@@ -2613,7 +2619,7 @@ class TestVideoWithEmbeddedAudioHoist:
         )
         # Per-slot budgets must equal the multimodal-token count the REAL
         # `_expand_mixed_prompt_text_for_mm` emits (the only un-mocked count path
-        # here), so `_find_multimodal_embedding_lengths` reconciles. For this proc
+        # here), so `compute_mm_embedding_lengths` reconciles. For this proc
         # (`video_target_num_patches=256`, 2 frames) the video slot is 136 and the
         # audio slot is 6. The video count is 132 vision tokens (2 tubelets x [64
         # context + 2 `<img>`/`</img>` specials]) plus 4 from this suite's Mock

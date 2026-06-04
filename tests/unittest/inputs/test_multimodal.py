@@ -15,6 +15,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
     _compute_mm_masks,
     _find_mm_embedding_lengths_from_masks,
+    compute_mm_embedding_lengths,
 )
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
@@ -92,6 +93,55 @@ def test_mixed_image_video_audio_masks_runs_embedding_lengths():
     )
 
     assert embedding_lengths == [2, 2, 1]
+
+    # The public `compute_mm_embedding_lengths` wraps the same
+    # `_compute_mm_masks` -> `_find_mm_embedding_lengths_from_masks` derivation
+    # behind one entry point (shared by Nano, Qwen3-VL, and the registry). Given
+    # the same predicates it must reproduce the mask-level result, accepting raw
+    # `input_ids` (here a plain Python list) directly.
+    assert compute_mm_embedding_lengths(
+        input_ids.tolist(),
+        num_mm_tokens,
+        vocab_size=None,
+        mm_token_ids=torch.tensor([image_token, video_token, audio_token]),
+        mm_special_token_ids=torch.tensor([video_start, video_end, audio_start, audio_end]),
+    ) == [2, 2, 1]
+
+
+def test_compute_mm_embedding_lengths_vocab_size_path_counts_high_ids():
+    """The vocab_size route (no explicit mm_token_ids) counts ids >= vocab_size.
+
+    This mirrors the Qwen3-VL preprocess path, where placeholder tokens are
+    rewritten to `tllm_multimodal_token_id = vocab_size + 1` and there are no
+    framing specials. Two items (image then video) with embed counts 3 and 2.
+    """
+    vocab_size = 1000
+    mm_id = vocab_size + 1
+    # 10 mm mm mm 11 | 12 mm mm 13
+    input_ids = [10, mm_id, mm_id, mm_id, 11, 12, mm_id, mm_id, 13]
+    num_mm_tokens = [3, 2]
+
+    assert compute_mm_embedding_lengths(
+        input_ids,
+        num_mm_tokens,
+        vocab_size=vocab_size,
+        mm_token_ids=None,
+        mm_special_token_ids=None,
+    ) == [3, 2]
+
+
+def test_compute_mm_embedding_lengths_no_mm_tokens_returns_empty():
+    """No multimodal tokens -> empty per-item lengths (text-only prompt)."""
+    assert (
+        compute_mm_embedding_lengths(
+            [10, 11, 12],
+            [],
+            vocab_size=1000,
+            mm_token_ids=None,
+            mm_special_token_ids=None,
+        )
+        == []
+    )
 
 
 def test_runtime_data_cumsum_math_simplest():

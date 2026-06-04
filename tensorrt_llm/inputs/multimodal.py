@@ -1432,6 +1432,45 @@ def _find_mm_embedding_lengths_from_masks(
     return embedding_lengths
 
 
+def compute_mm_embedding_lengths(
+    input_ids: Union[torch.Tensor, List[int], np.ndarray],
+    num_mm_tokens: List[int],
+    *,
+    vocab_size: Optional[int],
+    mm_token_ids: Optional[torch.Tensor],
+    mm_special_token_ids: Optional[torch.Tensor],
+) -> List[int]:
+    """Compute per-item multimodal embedding-token counts for one prompt.
+
+    Derives the embed mask from the provided vocab size / multimodal token id
+    predicates, then counts embed-slot tokens per logical item described by
+    `num_mm_tokens`. This is the single source of truth for the mask -> per-item
+    embedding-length derivation shared by the Nano and Qwen3-VL preprocess paths
+    and the registry hashing path.
+
+    Args:
+        input_ids: Prompt token ids (CPU-resident); coerced to a tensor.
+        num_mm_tokens: Per-item multimodal token counts in prompt order.
+        vocab_size: Tokenizer/model vocab size; positions >= this are embed
+            slots when `mm_token_ids` is not provided.
+        mm_token_ids: Optional explicit embed-slot token ids (takes precedence
+            over `vocab_size`).
+        mm_special_token_ids: Optional in-prompt framing token ids excluded from
+            the embed mask.
+
+    Returns:
+        Per-item embedding-token counts aligned with `num_mm_tokens`.
+    """
+    mm_mask, embed_mask, _ = _compute_mm_masks(
+        _as_cpu_tensor(input_ids),
+        vocab_size=vocab_size,
+        mm_token_ids=mm_token_ids,
+        mm_special_token_ids=mm_special_token_ids,
+    )
+    return _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask,
+                                                 num_mm_tokens)
+
+
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
                                                np.ndarray],
                        mm_hashes: List[List[int]], start_positions: List[int],

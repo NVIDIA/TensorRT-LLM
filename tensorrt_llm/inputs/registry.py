@@ -1229,7 +1229,11 @@ def create_input_processor_with_hash(
         if input_ids_tensor.numel() == 0:
             start_positions, start_special_token_positions = [], []
             item_run_cu_offsets, run_positions, run_lengths = [0], [], []
-            multimodal_embedding_lengths = []
+            # Empty prompt has no embed slots; only fill the fallback if the
+            # processor didn't already pre-bake lengths (it won't here, but the
+            # guard keeps the two branches symmetric).
+            if "multimodal_embedding_lengths" not in multimodal_data:
+                multimodal_data["multimodal_embedding_lengths"] = []
         else:
             mm_mask, embed_mask, special_mask = _compute_mm_masks(
                 input_ids_tensor,
@@ -1244,11 +1248,15 @@ def create_input_processor_with_hash(
                                                     num_mm_tokens))
             item_run_cu_offsets, run_positions, run_lengths = (
                 _find_mm_token_runs_from_mask(mm_mask, num_mm_tokens))
-            multimodal_embedding_lengths = (
-                _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask,
-                                                      num_mm_tokens))
-        multimodal_data.setdefault("multimodal_embedding_lengths",
-                                   multimodal_embedding_lengths)
+            # The mask -> per-item embedding-length derivation is the only piece
+            # a processor may have pre-baked (e.g. Nano). Skip recomputing it
+            # when present; the masks above are still needed for start_positions,
+            # runs, and the embed cumsum, so _compute_mm_masks stays. Reuse those
+            # masks here rather than re-scanning via compute_mm_embedding_lengths.
+            if "multimodal_embedding_lengths" not in multimodal_data:
+                multimodal_data["multimodal_embedding_lengths"] = (
+                    _find_mm_embedding_lengths_from_masks(
+                        mm_mask, embed_mask, num_mm_tokens))
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:

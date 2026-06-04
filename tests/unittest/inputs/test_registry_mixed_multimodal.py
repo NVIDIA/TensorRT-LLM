@@ -216,6 +216,53 @@ def test_tokenized_wrapper_mixed_modalities_builds_metadata_for_all_items():
     assert extra["multimodal_data"]["multimodal_embedding_lengths"] == _MIXED_PROMPT_ORDER_TOKENS
 
 
+def test_hashing_path_preserves_processor_baked_embedding_lengths():
+    """A processor that pre-bakes multimodal_embedding_lengths keeps its value.
+
+    Mirrors Nano, which computes per-item embedding lengths in its preprocess
+    (`compute_mm_embedding_lengths`) and writes them into multimodal_data. The
+    registry's missing-key guard must NOT recompute/overwrite them. We pre-bake a
+    deliberately distinct sentinel so an overwrite would be observable: the real
+    mask-derived value here is `_MIXED_PROMPT_ORDER_TOKENS` ([2, 4, 3]).
+    """
+    _SENTINEL_LENGTHS = [99, 98, 97]
+
+    class _PrebakedLengthsProcessor(_FakeMixedProcessor):
+        def __call__(self, inputs, sampling_params):
+            prompt_token_ids, extra = super().__call__(inputs, sampling_params)
+            extra["multimodal_data"]["multimodal_embedding_lengths"] = list(_SENTINEL_LENGTHS)
+            return prompt_token_ids, extra
+
+    processor = _PrebakedLengthsProcessor()
+    wrapper = create_input_processor_with_hash(processor)
+    mm_data = {
+        "image": [torch.tensor([1])],
+        "video": [[torch.tensor([2])]],
+        "audio": [torch.tensor([3])],
+    }
+
+    _, extra = wrapper(
+        {
+            "prompt_token_ids": [
+                10,
+                _IMAGE_PLACEHOLDER_ID,
+                11,
+                _VIDEO_PLACEHOLDER_ID,
+                12,
+                _AUDIO_PLACEHOLDER_ID,
+                13,
+            ],
+            "multi_modal_data": mm_data,
+        },
+        SamplingParams(),
+    )
+
+    # The processor-baked value survives unchanged (guard skips the recompute).
+    assert extra["multimodal_data"]["multimodal_embedding_lengths"] == _SENTINEL_LENGTHS
+    # Sanity: the registry would otherwise have derived the real mask value.
+    assert _SENTINEL_LENGTHS != _MIXED_PROMPT_ORDER_TOKENS
+
+
 def test_text_wrapper_single_video_uses_default_item_order():
     """A single-modality (video-only) request bypasses get_mm_item_order and uses the default order."""
 
