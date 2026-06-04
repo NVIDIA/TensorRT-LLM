@@ -729,8 +729,9 @@ class BaseLLM:
         self,
         inputs: Union[PromptInputs, Sequence[PromptInputs]],
         add_special_tokens: bool = True,
+        return_raw_logits: bool = False,
         **model_kwargs: Any,
-    ) -> Union[EncoderOutput, List[EncoderOutput]]:
+    ) -> Union[EncoderOutput, List[EncoderOutput], torch.Tensor]:
         """Encode inputs using an encoder-only model (PyTorch backend only).
 
         Only available when encode_only=True is set in the LLM constructor.
@@ -739,11 +740,15 @@ class BaseLLM:
             inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
                 It can be a single prompt or batched prompts.
             add_special_tokens (bool): Whether to add special tokens (e.g., [CLS]/[SEP]) during tokenization. Defaults to True.
+            return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.
             model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),
                 inputs_embeds (reward models).
 
         Returns:
-            Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]: The encoder output(s) containing logits or embeddings.
+            Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:
+            If return_raw_logits=True, returns the raw CPU logits tensor for the
+            whole input batch. Otherwise, returns one EncoderOutput for a single
+            input, or a list of EncoderOutput objects for batched inputs.
 
         Raises:
             RuntimeError: If encode_only mode is not enabled.
@@ -775,47 +780,38 @@ class BaseLLM:
 
         # Tokenize each input (reuses existing input_processor)
         token_ids_list = []
+        sequence_lengths = []
         prompts = []
         sampling_params = SamplingParams(add_special_tokens=add_special_tokens)
 
-        total_tokens = 0
-        max_seq_len_batch = 0
         for inp in inputs:
             inp = prompt_inputs(inp)
             if "prompt_token_ids" in inp:
                 token_ids_list.append(inp["prompt_token_ids"])
-                seq_len = len(inp["prompt_token_ids"])
-                total_tokens += seq_len
-                max_seq_len_batch = max(max_seq_len_batch, seq_len)
+                sequence_lengths.append(len(inp["prompt_token_ids"]))
                 prompts.append(None)
             elif "prompt" in inp:
                 token_ids, _ = self.input_processor(inp, sampling_params)
                 token_ids_list.append(token_ids)
-                seq_len = len(token_ids)
-                total_tokens += seq_len
-                max_seq_len_batch = max(max_seq_len_batch, seq_len)
+                sequence_lengths.append(len(token_ids))
                 prompts.append(inp["prompt"])
             else:
                 raise TypeError(f"Unsupported input type: {type(inp)}")
 
         # Validate inputs against model capacity
-        if total_tokens > max_num_tokens:
+        if sum(sequence_lengths) > max_num_tokens:
             raise ValueError(
-                f"Total tokens ({total_tokens}) across the batch exceeds "
+                f"Total tokens ({sum(sequence_lengths)}) across the batch exceeds "
                 f"max_num_tokens ({max_num_tokens}). Reduce batch size or "
                 f"sequence lengths.")
 
-        if max_seq_len_batch > max_seq_len:
+        if max(sequence_lengths) > max_seq_len:
             raise ValueError(
-                f"Max sequence length ({max_seq_len_batch}) exceeds "
+                f"Max sequence length ({max(sequence_lengths)}) exceeds "
                 f"max_seq_len ({max_seq_len}). Truncate the input or increase "
                 f"max_seq_len.")
 
-        # Pack into flat tensors
-        seq_lens = torch.tensor([len(t) for t in token_ids_list],
-                                dtype=torch.int32)
-        flat_token_ids = torch.tensor(
-            [tid for tids in token_ids_list for tid in tids], dtype=torch.int32)
+        flat_token_ids = [tid for tids in token_ids_list for tid in tids]
 
         # Build inputs dict — common + model-specific kwargs.
         # Filter keys that are set internally by _prepare_encoder_inputs or
@@ -830,20 +826,30 @@ class BaseLLM:
             k: v
             for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
         }
+
+        if filtered_kwargs and engine.encoder_cuda_graph_runner.enabled:
+            raise NotImplementedError(
+                "LLM.encode(..., **model_kwargs) is not supported when encoder CUDA "
+                "graphs are enabled. Disable encoder CUDA graphs or omit model_kwargs. "
+                f"Unsupported keys: {sorted(filtered_kwargs)}")
+
         forward_inputs = {
             'input_ids': flat_token_ids,
-            'seq_lens': seq_lens,
+            'seq_lens': sequence_lengths,
             **filtered_kwargs,
         }
 
         # Single forward pass
         outputs = self._encoder_executor.batch_forward(forward_inputs)
+        logits = outputs['logits'].cpu()
+
+        if return_raw_logits:
+            return logits
 
         # Package as EncoderOutput.
         # NOTE: logits[i] assumes batch-indexed output (e.g., BERT classification
         # returns [batch_size, num_classes]). Per-token models that return packed
         # [total_tokens, hidden_size] would need cumulative-sum slicing instead.
-        logits = outputs['logits'].cpu()
         results = []
         for i in range(len(token_ids_list)):
             results.append(
