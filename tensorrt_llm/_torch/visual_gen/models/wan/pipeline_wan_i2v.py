@@ -121,7 +121,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
         t_emb = ce.time_embedder(t_freq)
 
-        teacache = self.model_config.teacache
+        teacache = self.pipeline_config.teacache
         if teacache is not None and teacache.use_ret_steps:
             # ret_steps mode: use timestep_proj — what the ret_steps coefficients were calibrated for
             return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
@@ -130,7 +130,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -168,13 +168,15 @@ class WanImageToVideoPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN I2V transformer with quantization support...")
-        self.transformer = WanTransformer3DModel(model_config=self.model_configs["transformer"])
+        self.transformer = WanTransformer3DModel(
+            model_config=self.pipeline_config.model_configs["transformer"]
+        )
 
         # Wan2.2: Optionally create second transformer for two-stage denoising
         if self.boundary_ratio is not None:
             logger.info("Creating second transformer for Wan2.2 I2V two-stage denoising...")
             self.transformer_2 = WanTransformer3DModel(
-                model_config=self.model_configs["transformer_2"]
+                model_config=self.pipeline_config.model_configs["transformer_2"]
             )
 
     def load_standard_components(
@@ -221,7 +223,7 @@ class WanImageToVideoPipeline(BasePipeline):
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         if PipelineComponent.VAE not in skip_components:
@@ -310,7 +312,7 @@ class WanImageToVideoPipeline(BasePipeline):
             logger.info("Transformer_2 weights loaded successfully.")
 
         # Cache the target dtype from model config (default: bfloat16)
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
         # Set model to eval mode
         if self.transformer is not None:
@@ -323,7 +325,7 @@ class WanImageToVideoPipeline(BasePipeline):
     def post_load_weights(self) -> None:
         super().post_load_weights()  # Calls transformer.post_load_weights() for FP8 scale transformations
         if self.transformer is not None:
-            if self.model_config.cache_backend == "teacache":
+            if self.pipeline_config.cache_backend == "teacache":
                 register_extractor_from_config(
                     ExtractorConfig(
                         model_class_name="WanTransformer3DModel",
@@ -338,7 +340,7 @@ class WanImageToVideoPipeline(BasePipeline):
                 )
                 self.transformer_cache_backend = self.cache_accelerator
             else:
-                if self.model_config.cache_backend == "cache_dit":
+                if self.pipeline_config.cache_backend == "cache_dit":
                     self._setup_cache_acceleration(self.transformer, coefficients=None)
                 self.transformer_cache_backend = self.cache_accelerator
 

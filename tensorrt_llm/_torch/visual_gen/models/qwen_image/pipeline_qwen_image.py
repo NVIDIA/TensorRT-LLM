@@ -87,7 +87,7 @@ class QwenImagePipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -122,7 +122,7 @@ class QwenImagePipeline(BasePipeline):
     # ------------------------------------------------------------------
     def _init_transformer(self) -> None:
         logger.info("Creating Qwen-Image transformer")
-        model_config = self.model_configs["transformer"]
+        model_config = self.pipeline_config.model_configs["transformer"]
         # ``pretrained_config`` is populated from
         # ``<ckpt>/transformer/config.json``. Read the fields we care
         # about with defaults matching the Qwen-Image 20B reference model.
@@ -199,7 +199,7 @@ class QwenImagePipeline(BasePipeline):
             self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         if PipelineComponent.VAE not in skip_components:
@@ -232,7 +232,7 @@ class QwenImagePipeline(BasePipeline):
             # default. Cast only non-quantized tensors so FP8/NVFP4 weights
             # and FP32 scales keep the dtypes created by Linear.load_weights().
             self.transformer.to_inference_dtype().eval()
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
     # ------------------------------------------------------------------
     # Prompt encoding (Qwen2.5-VL chat template).

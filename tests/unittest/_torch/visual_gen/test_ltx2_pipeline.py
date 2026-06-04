@@ -200,7 +200,7 @@ class TestLTX2Quantization:
 
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
-        assert pipeline.model_config.quant_config.quant_algo is not None
+        assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
         quant_count = 0
         found_fp8 = False
@@ -1205,7 +1205,7 @@ class TestLTX2TwoStagePipelineLoading:
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         try:
             assert isinstance(pipeline, LTX2TwoStagesPipeline)
-            assert pipeline.model_config.quant_config.quant_algo is not None
+            assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
             quant_count = sum(
                 1

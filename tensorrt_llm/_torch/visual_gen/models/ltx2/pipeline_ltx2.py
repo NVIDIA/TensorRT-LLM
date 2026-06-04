@@ -644,7 +644,7 @@ class LTX2Pipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def default_warmup_resolutions(self):
@@ -733,13 +733,13 @@ class LTX2Pipeline(BasePipeline):
         the reference ``LTXModelConfigurator.from_config()``.  Missing keys
         fall back to the same defaults the reference uses.
         """
-        attn_cfg = getattr(self.model_config, "attention", None)
+        attn_cfg = getattr(self.pipeline_config, "attention", None)
         if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
             raise NotImplementedError(
                 "Quantized attention is not yet supported for the LTX-2 pipeline."
             )
 
-        model_config = self.model_configs["transformer"]
+        model_config = self.pipeline_config.model_configs["transformer"]
         cfg = model_config.pretrained_config
 
         rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
@@ -807,11 +807,11 @@ class LTX2Pipeline(BasePipeline):
         iterations (WARMUP_STEPS=2), so the captured graph contains the
         optimized compiled kernels.
         """
-        if not self.model_config.cuda_graph.enable:
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
         runner = _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
-        compile_note = " (with torch.compile)" if self.model_config.torch_compile.enable else ""
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
             f"CUDA graph runner: wrapping transformer.forward (Modality-aware){compile_note}"
         )
@@ -850,7 +850,7 @@ class LTX2Pipeline(BasePipeline):
                 tokenizer files, and ``preprocessor_config.json``.
         """
         skip_components = skip_components or []
-        dtype = self.model_config.torch_dtype
+        dtype = self.pipeline_config.torch_dtype
 
         needs_text = (
             PipelineComponent.TOKENIZER not in skip_components
@@ -879,7 +879,7 @@ class LTX2Pipeline(BasePipeline):
             ).to(device)
 
         # --- Resolve native config ----------------------------------------
-        native_config = self.model_config.extra_attrs.get("monolithic_safetensors_config")
+        native_config = self.pipeline_config.extra_attrs.get("monolithic_safetensors_config")
         sft_paths = _find_safetensors_files(checkpoint_dir)
         _prefetch_ltx2_safetensors_files(sft_paths)
 
@@ -1021,7 +1021,7 @@ class LTX2Pipeline(BasePipeline):
         # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
 
         # Cache-DiT
-        if self.transformer is not None and self.model_config.cache_backend == "cache_dit":
+        if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
             self._setup_cache_acceleration(self.transformer, coefficients=None)
 
         # Compression ratios from native scale factors
@@ -1467,7 +1467,7 @@ class LTX2Pipeline(BasePipeline):
         # CFG parallel for multi-modal guidance: each GPU handles one
         # CFG pass (cond or uncond), results are all-gathered, then
         # STG/modality passes run on every GPU before the guidance formula.
-        vgm = self.model_config.visual_gen_mapping
+        vgm = self.pipeline_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         seq_parallel_size = vgm.seq_size if vgm is not None else 1
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg

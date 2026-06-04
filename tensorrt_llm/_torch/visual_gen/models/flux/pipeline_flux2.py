@@ -167,7 +167,7 @@ class Flux2Pipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -189,7 +189,9 @@ class Flux2Pipeline(BasePipeline):
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
         logger.info("Creating FLUX.2 transformer with quantization support...")
-        self.transformer = Flux2Transformer2DModel(model_config=self.model_configs["transformer"])
+        self.transformer = Flux2Transformer2DModel(
+            model_config=self.pipeline_config.model_configs["transformer"]
+        )
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
@@ -255,13 +257,13 @@ class Flux2Pipeline(BasePipeline):
                 # Mistral3 is a multimodal model (not pure CausalLM)
                 self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
                     text_encoder_path,
-                    torch_dtype=self.model_config.torch_dtype,
+                    torch_dtype=self.pipeline_config.torch_dtype,
                 ).to(device)
             else:
                 # Qwen3 and other CausalLM text encoders
                 self.text_encoder = AutoModelForCausalLM.from_pretrained(
                     text_encoder_path,
-                    torch_dtype=self.model_config.torch_dtype,
+                    torch_dtype=self.pipeline_config.torch_dtype,
                 ).to(device)
 
         # VAE (FLUX.2-specific VAE with BatchNorm)
@@ -294,7 +296,7 @@ class Flux2Pipeline(BasePipeline):
             self.transformer.load_weights(transformer_weights)
             logger.info("Transformer weights loaded successfully.")
 
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
         if self.transformer is not None:
             self.transformer.eval()

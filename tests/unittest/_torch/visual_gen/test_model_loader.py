@@ -124,7 +124,7 @@ def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_exists):
     pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
 
     # Verify model config has dynamic_weight_quant enabled
-    assert pipeline.model_config.dynamic_weight_quant is True, (
+    assert pipeline.pipeline_config.dynamic_weight_quant is True, (
         "dynamic_weight_quant should be True when linear.type specifies FP8"
     )
 
@@ -252,7 +252,7 @@ def test_load_without_quant_config_no_fp8(checkpoint_exists):
     pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
 
     # Verify dynamic_weight_quant is False
-    assert pipeline.model_config.dynamic_weight_quant is False, (
+    assert pipeline.pipeline_config.dynamic_weight_quant is False, (
         "dynamic_weight_quant should be False when no quant_config"
     )
 

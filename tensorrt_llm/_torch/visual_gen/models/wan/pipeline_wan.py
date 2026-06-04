@@ -125,7 +125,7 @@ class WanPipeline(BasePipeline):
 
         t_emb = ce.time_embedder(t_freq)
 
-        teacache = self.model_config.teacache
+        teacache = self.pipeline_config.teacache
         if teacache is not None and teacache.use_ret_steps:
             return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
         else:
@@ -133,7 +133,7 @@ class WanPipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -177,13 +177,15 @@ class WanPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
-        self.transformer = WanTransformer3DModel(model_config=self.model_configs["transformer"])
+        self.transformer = WanTransformer3DModel(
+            model_config=self.pipeline_config.model_configs["transformer"]
+        )
 
         # Wan2.2 A14B: create second transformer for two-stage denoising
         if self.is_wan22_14b:
             logger.info("Creating second transformer for Wan2.2 A14B two-stage denoising...")
             self.transformer_2 = WanTransformer3DModel(
-                model_config=self.model_configs["transformer_2"]
+                model_config=self.pipeline_config.model_configs["transformer_2"]
             )
 
     def load_standard_components(
@@ -225,7 +227,7 @@ class WanPipeline(BasePipeline):
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         if PipelineComponent.VAE not in skip_components:
@@ -289,7 +291,7 @@ class WanPipeline(BasePipeline):
             logger.info("Transformer_2 weights loaded successfully.")
 
         # Cache the target dtype from model config (default: bfloat16)
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
         # Set model to eval mode
         if self.transformer is not None:
@@ -301,7 +303,7 @@ class WanPipeline(BasePipeline):
         super().post_load_weights()  # Calls transformer.post_load_weights() for FP8 scale transformations
         if self.transformer is not None:
             # TeaCache extractor only when using TeaCache (not Cache-DiT).
-            if self.model_config.cache_backend == "teacache":
+            if self.pipeline_config.cache_backend == "teacache":
                 register_extractor_from_config(
                     ExtractorConfig(
                         model_class_name="WanTransformer3DModel",
@@ -316,7 +318,7 @@ class WanPipeline(BasePipeline):
                 )
                 self.transformer_cache_backend = self.cache_accelerator
             else:
-                if self.model_config.cache_backend == "cache_dit":
+                if self.pipeline_config.cache_backend == "cache_dit":
                     self._setup_cache_acceleration(self.transformer, coefficients=None)
                 # TeaCache is not supported for Wan 2.2 unless using Cache-DiT.
                 self.transformer_cache_backend = self.cache_accelerator

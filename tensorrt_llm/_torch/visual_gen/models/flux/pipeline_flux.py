@@ -99,7 +99,7 @@ class FluxPipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -121,7 +121,9 @@ class FluxPipeline(BasePipeline):
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""
         logger.info("Creating FLUX transformer with quantization support...")
-        self.transformer = FluxTransformer2DModel(model_config=self.model_configs["transformer"])
+        self.transformer = FluxTransformer2DModel(
+            model_config=self.pipeline_config.model_configs["transformer"]
+        )
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
@@ -156,7 +158,7 @@ class FluxPipeline(BasePipeline):
             self.text_encoder = CLIPTextModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         # T5 tokenizer and text encoder (for sequence embeddings)
@@ -171,7 +173,7 @@ class FluxPipeline(BasePipeline):
             self.text_encoder_2 = T5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER_2,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         # VAE
@@ -203,7 +205,7 @@ class FluxPipeline(BasePipeline):
             self.transformer.load_weights(transformer_weights)
             logger.info("Transformer weights loaded successfully.")
 
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
         if self.transformer is not None:
             self.transformer.eval()
