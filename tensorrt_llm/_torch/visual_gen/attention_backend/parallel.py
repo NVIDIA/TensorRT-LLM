@@ -93,7 +93,7 @@ class UlyssesAttention(AttentionBackend):
         self,
         inner_backend: AttentionBackend,
         process_group: torch.distributed.ProcessGroup,
-        async_pipeline: bool = False,
+        async_ulysses: bool = False,
     ):
         self.inner_backend = inner_backend
         self.process_group = process_group
@@ -108,7 +108,7 @@ class UlyssesAttention(AttentionBackend):
         self.num_heads = self.sharded_num_heads * self.world_size
         self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
 
-        # Async pipeline state. Eagerly populated when async_pipeline=True;
+        # Async pipeline state. Eagerly populated when async_ulysses=True;
         # forward_async assumes these are set. Non-async path doesn't touch
         # them.
         self._pg_boxed = None
@@ -118,7 +118,7 @@ class UlyssesAttention(AttentionBackend):
         # side stream so V/Q/K pushes FIFO together without intermediate
         # barrier kernels.
         self._pending_barriers: int = 0
-        if async_pipeline:
+        if async_ulysses:
             device = torch.cuda.current_device()
             if device not in UlyssesAttention._side_stream_by_device:
                 UlyssesAttention._side_stream_by_device[device] = torch.cuda.Stream(device=device)
@@ -779,7 +779,7 @@ def wrap_parallel_attention(
     *,
     visual_gen_mapping: Optional["VisualGenMapping"] = None,
     enable_sequence_parallel: bool = True,
-    async_pipeline: bool = False,
+    async_ulysses: bool = False,
 ) -> AttentionBackend:
     """Wrap a compute backend with the configured parallelism strategy.
 
@@ -811,6 +811,6 @@ def wrap_parallel_attention(
         attn = UlyssesAttention(
             attn,
             process_group=vgm.ulysses_group,
-            async_pipeline=async_pipeline,
+            async_ulysses=async_ulysses,
         )
     return attn

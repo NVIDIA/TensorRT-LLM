@@ -242,7 +242,7 @@ class Attention(nn.Module):
             self.attn,
             visual_gen_mapping=vgm,
             enable_sequence_parallel=enable_sequence_parallel,
-            async_pipeline=use_ulysses and async_ulysses,
+            async_ulysses=use_ulysses and async_ulysses,
         )
 
     def _init_qkv_proj(self) -> None:
@@ -569,7 +569,7 @@ class Attention(nn.Module):
         ``forward``'s unfused branch.
 
         Precondition: caller gates on ``_use_async_ulysses`` so ``self.attn``
-        is a ``UlyssesAttention`` with ``async_pipeline=True``.
+        is a ``UlyssesAttention`` with ``async_ulysses=True``.
 
         Returns 3D ``[B, S, H*D]`` matching ``forward``'s output contract.
 
@@ -587,7 +587,7 @@ class Attention(nn.Module):
         if not hasattr(self.attn, "forward_async"):
             raise ValueError(
                 "Attention.forward_async() requires the inner attention to be a "
-                "UlyssesAttention with async_pipeline=True. Build the Attention with "
+                "UlyssesAttention with async_ulysses=True. Build the Attention with "
                 "ParallelConfig(ulysses_size > 1, async_ulysses=True), or use "
                 "forward() for sync execution."
             )
