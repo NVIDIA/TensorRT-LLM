@@ -338,20 +338,16 @@ class DeepseekV3WeightLoader:
         # by ModelLoader._load_and_validate_config to match user max_draft_len.
         # The original checkpoint MTP layer count (used for mod-indexing) is
         # preserved as `_ckpt_num_nextn_predict_layers`.
-        ckpt_num_nextn_predict_layers = (
-            getattr(self.config, '_ckpt_num_nextn_predict_layers', None)
-            or self.config.num_nextn_predict_layers)
+        model_nextn = getattr(self.config, 'num_nextn_predict_layers', 0) or 0
+        ckpt_num_nextn_predict_layers = (getattr(
+            self.config, '_ckpt_num_nextn_predict_layers', None) or model_nextn)
 
-        def detect_shared_mtp_weights() -> bool:
-            # Detect if MTP layers share checkpoint weights (model has more MTP
-            # layer instances than the checkpoint provides). In this case,
-            # multiple model MTP layers map to the same checkpoint layer via
-            # modulo, and mark_consumed must be skipped to avoid deleting
-            # weights that later MTP layers still need.
-            model_nextn = self.config.num_nextn_predict_layers or 0
-            return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
-
-        has_shared_mtp_weights = detect_shared_mtp_weights()
+        # Detect if MTP layers share checkpoint weights (model has more MTP
+        # layer instances than the checkpoint provides). In this case, multiple
+        # model MTP layers map to the same checkpoint layer via modulo, and
+        # mark_consumed must be skipped to avoid deleting weights that later
+        # MTP layers still need.
+        has_shared_mtp_weights = model_nextn > ckpt_num_nextn_predict_layers > 0
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
