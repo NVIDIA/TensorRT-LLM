@@ -1,0 +1,36 @@
+version: 0.0.1
+llm_perf_disagg:
+
+# 1: GB200 test cases
+- condition:
+    wildcards:
+      gpu:
+      - 'gb200'
+  tests:
+  # GB200 DeepSeek-R1
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-UCX] TIMEOUT (120)
+  # GB200 GPT-OSS-120B
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
+  # GB200 Kimi-K2.5-Thinking
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_kimi-k25-thinking-fp4_1k1k_con2048_ctx1_dep4_gen1_dep32_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_kimi-k25-thinking-fp4_1k1k_con4096_ctx1_dep4_gen1_dep8_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
+  # GB200 accuracy cases
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_wideep_accuracy-deepseek-r1-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_wideep_accuracy-deepseek-r1-fp4_gpqa_diamond_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb200_qwen3-235b-fp4_1k1k_ctx1_gen4_tep8_bs32_eplb0_mtp0_con1_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb200_qwen3-235b-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb0_mtp3_con2048_ccb-NIXL] TIMEOUT (120)
+  # GB200 aggregated gen_only
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_qwen3-235b-fp4_1k1k_ctx1_gen4_tep8_bs32_eplb0_mtp0_con1_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_qwen3-235b-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb0_mtp3_con2048_ccb-NIXL] TIMEOUT (120)
+
+# 2: GB300 test cases
+- condition:
+    wildcards:
+      gpu:
+      - 'gb300'
+  tests:
+  # GB300 DeepSeek-R1
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-r1-fp4_128k8k_con1_ctx1_pp4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
