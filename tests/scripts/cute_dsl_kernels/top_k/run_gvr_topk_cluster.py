@@ -65,6 +65,8 @@ def _compile(
     compress_ratio: int,
     return_output_values: bool,
     cluster_size: int = 1,
+    enable_smem_cache: bool = False,
+    smem_cache_elems: int = 32768,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -126,6 +128,8 @@ def _compile(
         compress_ratio=compress_ratio,
         return_output_values=return_output_values,
         cluster_size=cluster_size,
+        enable_smem_cache=enable_smem_cache,
+        smem_cache_elems=smem_cache_elems,
     )
     return cute.compile(
         kernel,
@@ -257,6 +261,20 @@ def gvr_topk_decode(
             cluster_size = 2
         else:
             cluster_size = 1
+
+    # Shift E (kernel-side SMEM slice cache): currently OFF by default.
+    # The hypothesis was that caching the per-CTA slice once in SMEM and
+    # then letting Phase 2's 6-10 secant iterations read from SMEM (LDS)
+    # instead of restreaming GMEM would shave 4-5us at N=131K cluster=4.
+    # Empirically B200's 126MB L2 cache already serves the cluster
+    # re-reads transparently (total cluster row data << L2 capacity);
+    # adding the extra GMEM→SMEM load pass + LDS bank-conflict risk made
+    # the net change -5.5% to +3.7% across dtypes — within noise and
+    # not worth the code complexity. The kernel code is kept (gated by
+    # self.enable_smem_cache const_expr) for future workloads where L2
+    # pressure is higher (e.g. multi-row contention, larger N).
+    smem_cache_elems = 32768
+    enable_smem_cache = False
     if num_threads_per_block is None:
         if max_seq_len is not None and logits.dtype != torch.float32:
             n_thresh_t = 131072
@@ -305,6 +323,8 @@ def gvr_topk_decode(
         compress_ratio,
         return_output_values,
         cluster_size,
+        enable_smem_cache,
+        smem_cache_elems,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
@@ -440,11 +460,11 @@ def _tie_aware_correct(
 @pytest.mark.parametrize("use_256bit_load", [False])
 @pytest.mark.parametrize("num_threads_per_block", [512])
 @pytest.mark.parametrize("enable_warp_parallel_reduce", [False])
-# cluster_size sweep: 1 (≡ V5 baseline), 2 (default cluster), 4 (aggressive
-# parallelism). cs=4 exercises a different DSMEM gather loop trip count
-# in the kernel handoff and is essential to flush out cluster_size-
-# generic bugs that a cs=2-only sweep would miss.
-@pytest.mark.parametrize("cluster_size", [1, 2, 4])
+# cluster_size sweep: 1 (≡ V5 baseline), 2 (default cluster), 4, 8, 16
+# (aggressive parallelism, exercising deeper cluster sync + gather paths).
+# B200's per-GPC SM count caps cluster_size at ~16; the kernel rejects
+# cluster_size > 16 in __init__.
+@pytest.mark.parametrize("cluster_size", [1, 2, 4, 8, 16])
 def test_gvr_topk_decode(
     dtype: torch.dtype,
     top_k: int,

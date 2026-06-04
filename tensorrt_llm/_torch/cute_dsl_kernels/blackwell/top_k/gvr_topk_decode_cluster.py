@@ -236,6 +236,8 @@ class GvrTopKClusterKernel:
         compress_ratio: int = 1,
         return_output_values: bool = True,
         cluster_size: int = 2,
+        enable_smem_cache: bool = False,
+        smem_cache_elems: int = 32768,
     ):
         # cluster_size: number of CTAs cooperating per row.
         #   1 → degenerate (== V5 single-CTA); kept for A/B testing.
@@ -249,6 +251,19 @@ class GvrTopKClusterKernel:
                 f"cluster_size must be in [1, 16] (B200 GPC limit); got {cluster_size}"
             )
         self.cluster_size = cluster_size
+        # SMEM slice cache (Shift E): when enabled, the per-CTA slice is
+        # loaded GMEM → SMEM ONCE between Phase 1 and Phase 2, then the
+        # 6-10 secant iterations and the Phase 3 retry-shrink + collect
+        # scans all read from SMEM (LDS.128) instead of GMEM (LDG.E.128).
+        # Replaces ~N_iters * slice_bytes / L2_BW of L2 read traffic with
+        # ~slice_bytes / L2_BW (one-time) + ~N_iters * slice_bytes / SMEM_BW.
+        # Requires slice_len <= smem_cache_elems at runtime (the wrapper
+        # auto-disables when slice would overflow); ``smem_cache_elems``
+        # also controls the SMEM allocation size at JIT compile.
+        if enable_smem_cache and smem_cache_elems <= 0:
+            raise ValueError("smem_cache_elems must be > 0 when enable_smem_cache")
+        self.enable_smem_cache = enable_smem_cache
+        self.smem_cache_elems = smem_cache_elems
         # e.g., dtype = cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
         self.dtype = dtype
         self.top_k = top_k
@@ -345,6 +360,104 @@ class GvrTopKClusterKernel:
         self.MAX_REFINE_ITERS = 15
         self.FLT_MAX = 3.4028235e38
         self.NEG_FLT_MAX = -self.FLT_MAX
+
+    # ------------------------------------------------------------------
+    # Shift E: cache this CTA's slice into SMEM once, then let Phase 2 +
+    # Phase 3 read from SMEM instead of re-streaming GMEM each iteration.
+    # The scan iteration pattern mirrors block_count_ge exactly so the
+    # SMEM layout is naturally aligned for the subsequent LDS.128 reads
+    # (each thread's positions {tid*vec_w + k*step_elem : k} stay
+    # contiguous through both the GMEM→SMEM transfer and the SMEM→register
+    # reads in block_count_ge).
+    #
+    # Layout: smem_input[i] aliases input_row[slice_start + i] for
+    # i in [0, slice_len); thread tid writes 1 vec_w fragment per
+    # unrolled iter via LDG.E.128 → STS.E.128 (LDG.E.256 with the
+    # use_256bit_load knob). Tail loops mirror block_count_ge's
+    # tail handling so partial-vec_w slices stay correct.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def load_slice_to_smem(
+        self,
+        input_row,
+        slice_start,
+        slice_end,
+        smem_input,
+        tidx,
+    ):
+        num_threads = cutlass.const_expr(self.num_threads)
+        vec_w = cutlass.const_expr(self.vec_bits // self.dtype.width)
+        elem_bytes = cutlass.const_expr(self.dtype.width // 8)
+        vec_align = cutlass.const_expr(self.vec_align_bytes)
+        step_elem = cutlass.const_expr(num_threads * vec_w)
+
+        copy_atom = self._make_load_copy_atom()
+        row_addr = input_row.iterator.toint()
+        smem_addr = smem_input.iterator.toint()
+
+        slice_len = slice_end - slice_start
+        i_local = tidx * cutlass.Int32(vec_w)
+        step = cutlass.Int32(step_elem)
+        n_aligned_local = (slice_len // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
+
+        # Vectorized GMEM→SMEM load via 4-way LDG.E.* unroll, mirroring
+        # block_count_ge's fast path. ic_local indexes both GMEM
+        # (input_row[slice_start + ic_local]) and SMEM (smem_input[ic_local]).
+        if self.enable_unroll_4:
+            rng_frag = cute.make_fragment((vec_w,), self.dtype)
+            big_iters = cutlass.Int32(0)
+            if slice_len > i_local + cutlass.Int32(vec_w - 1):
+                big_iters = (slice_len - i_local - cutlass.Int32(vec_w)) // cutlass.Int32(
+                    step_elem
+                ) + cutlass.Int32(1)
+            for k in cutlass.range(big_iters, unroll=4):
+                ic_local = i_local + k * cutlass.Int32(step_elem)
+                src_ptr = cute.make_ptr(
+                    self.dtype,
+                    row_addr + cutlass.Int64(slice_start + ic_local) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.gmem,
+                    assumed_align=vec_align,
+                )
+                src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
+                cute.copy(copy_atom, src, rng_frag)
+                dst_ptr = cute.make_ptr(
+                    self.dtype,
+                    smem_addr + cutlass.Int64(ic_local) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.smem,
+                    assumed_align=vec_align,
+                )
+                dst = cute.make_tensor(dst_ptr, cute.make_layout((vec_w,)))
+                cute.copy(copy_atom, rng_frag, dst)
+            i_local = i_local + big_iters * cutlass.Int32(step_elem)
+
+        # 1-way tail vec loop (slice_len mod step_elem residual).
+        tail_frag = cute.make_fragment((vec_w,), self.dtype)
+        while i_local + cutlass.Int32(vec_w - 1) < slice_len:
+            src_ptr = cute.make_ptr(
+                self.dtype,
+                row_addr + cutlass.Int64(slice_start + i_local) * cutlass.Int64(elem_bytes),
+                cute.AddressSpace.gmem,
+                assumed_align=vec_align,
+            )
+            src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
+            cute.copy(copy_atom, src, tail_frag)
+            dst_ptr = cute.make_ptr(
+                self.dtype,
+                smem_addr + cutlass.Int64(i_local) * cutlass.Int64(elem_bytes),
+                cute.AddressSpace.smem,
+                assumed_align=vec_align,
+            )
+            dst = cute.make_tensor(dst_ptr, cute.make_layout((vec_w,)))
+            cute.copy(copy_atom, tail_frag, dst)
+            i_local = i_local + step
+
+        # Scalar tail (slice_len % vec_w). Each thread strides by num_threads.
+        it_local = n_aligned_local + tidx
+        while it_local < slice_len:
+            smem_input[it_local] = input_row[slice_start + it_local]
+            it_local = it_local + cutlass.Int32(num_threads)
+
+        cute.arch.barrier()
 
     # ------------------------------------------------------------------
     # Build a vectorized copy atom for the input scan loops. With
@@ -604,6 +717,7 @@ class GvrTopKClusterKernel:
         warp_id,
         lane,
         do_cluster_aggregation: cutlass.Constexpr[bool] = True,
+        smem_input=None,  # Shift E: optional SMEM-cached slice (smem_input[i] == input_row[slice_start+i])
     ):
         """Count input[i] >= threshold across this CTA's row slice, then
         DSMEM-aggregate across the cluster.
@@ -636,14 +750,19 @@ class GvrTopKClusterKernel:
 
         row_addr = input_row.iterator.toint()
         slice_len = slice_end - slice_start
-        # Vec-aligned upper bound inside the slice. For non-last CTAs whose
-        # slice_base is a multiple of vec_w (guaranteed when N is a multiple
-        # of cluster_size * vec_w — true for all GVR shapes we care about),
-        # this aligns identically to the V5 path. For the last CTA the
-        # leftover tail is consumed by the scalar tail loop below.
-        n_aligned = slice_start + (slice_len // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
-        N = slice_end  # alias for upper-bound check in unchanged loop body
-        i = slice_start + tidx * cutlass.Int32(vec_w)
+        # Shift E: when reading from the SMEM-cached slice, all indices
+        # are slice-LOCAL (smem_input[0] == input_row[slice_start]). When
+        # streaming GMEM we keep the V5 global indices. We compute both
+        # so the const_expr branch below picks the right one.
+        if cutlass.const_expr(smem_input is not None):
+            smem_addr = smem_input.iterator.toint()
+            n_aligned = (slice_len // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
+            N = slice_len  # upper bound is slice-local
+            i = tidx * cutlass.Int32(vec_w)
+        else:
+            n_aligned = slice_start + (slice_len // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
+            N = slice_end  # global upper bound
+            i = slice_start + tidx * cutlass.Int32(vec_w)
         step = cutlass.Int32(step_elem)
 
         # Fast path: 4-way unroll for LSU-pipelining ILP.
@@ -667,12 +786,20 @@ class GvrTopKClusterKernel:
 
             for k in cutlass.range(big_iters, unroll=4):
                 i_local = i + k * cutlass.Int32(step_elem)
-                src_ptr_k = cute.make_ptr(
-                    self.dtype,
-                    row_addr + cutlass.Int64(i_local) * cutlass.Int64(elem_bytes),
-                    cute.AddressSpace.gmem,
-                    assumed_align=vec_align,
-                )
+                if cutlass.const_expr(smem_input is not None):
+                    src_ptr_k = cute.make_ptr(
+                        self.dtype,
+                        smem_addr + cutlass.Int64(i_local) * cutlass.Int64(elem_bytes),
+                        cute.AddressSpace.smem,
+                        assumed_align=vec_align,
+                    )
+                else:
+                    src_ptr_k = cute.make_ptr(
+                        self.dtype,
+                        row_addr + cutlass.Int64(i_local) * cutlass.Int64(elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=vec_align,
+                    )
                 src_k = cute.make_tensor(src_ptr_k, cute.make_layout((vec_w,)))
                 cute.copy(copy_atom, src_k, rng_frag)
                 for j in cutlass.range_constexpr(vec_w):
@@ -692,12 +819,20 @@ class GvrTopKClusterKernel:
         # same vec_align bytes hold.
         tail_frag = cute.make_fragment((vec_w,), self.dtype)
         while i + cutlass.Int32(vec_w - 1) < N:
-            src_ptr = cute.make_ptr(
-                self.dtype,
-                row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
-                cute.AddressSpace.gmem,
-                assumed_align=vec_align,
-            )
+            if cutlass.const_expr(smem_input is not None):
+                src_ptr = cute.make_ptr(
+                    self.dtype,
+                    smem_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.smem,
+                    assumed_align=vec_align,
+                )
+            else:
+                src_ptr = cute.make_ptr(
+                    self.dtype,
+                    row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.gmem,
+                    assumed_align=vec_align,
+                )
             src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
             cute.copy(copy_atom, src, tail_frag)
             for j in cutlass.range_constexpr(vec_w):
@@ -709,10 +844,16 @@ class GvrTopKClusterKernel:
                     c = c + cutlass.Int32(1)
             i = i + step
 
-        # Tail scalar loop
+        # Tail scalar loop. SMEM path uses slice-local indexing
+        # (smem_input[it]); GMEM path uses global indices (input_row[it]).
         it = n_aligned + tidx
         while it < N:
-            v = self._load_fp32(input_row, it)
+            if cutlass.const_expr(smem_input is not None):
+                v = smem_input[it]
+                if cutlass.const_expr(self.dtype != cutlass.Float32):
+                    v = cutlass.Float32(v)
+            else:
+                v = self._load_fp32(input_row, it)
             if v >= threshold:
                 c = c + cutlass.Int32(1)
             it = it + cutlass.Int32(num_threads)
@@ -802,6 +943,7 @@ class GvrTopKClusterKernel:
         tidx,
         warp_id,
         lane,
+        smem_input=None,  # Shift E: optional SMEM-cached slice
     ):
         """Refine smem threshold to land cand_count in [kK, kCC] window.
 
@@ -829,6 +971,7 @@ class GvrTopKClusterKernel:
             tidx,
             warp_id,
             lane,
+            smem_input=smem_input,
         )
 
         # tid==0 classifies the initial count.
@@ -903,6 +1046,7 @@ class GvrTopKClusterKernel:
                     tidx,
                     warp_id,
                     lane,
+                    smem_input=smem_input,
                 )
                 # tid==0 classifies the new count.
                 if tidx == 0:
@@ -953,6 +1097,7 @@ class GvrTopKClusterKernel:
         tidx,
         warp_id,
         lane,
+        smem_input=None,  # Shift E: optional SMEM-cached slice
     ):
         """Retry-shrink (if done!=1) + warp/block prefix sum + stream-write.
 
@@ -990,6 +1135,7 @@ class GvrTopKClusterKernel:
                 tidx,
                 warp_id,
                 lane,
+                smem_input=smem_input,
             )
             if tidx == 0:
                 if s_iscalars[0] > cutlass.Int32(kCC):
@@ -1021,6 +1167,7 @@ class GvrTopKClusterKernel:
                     tidx,
                     warp_id,
                     lane,
+                    smem_input=smem_input,
                 )
                 if tidx == 0:
                     c_rs = s_iscalars[0]
@@ -1099,10 +1246,20 @@ class GvrTopKClusterKernel:
         step_elem = cutlass.const_expr(num_threads * vec_w)
 
         slice_len = slice_end - slice_start
-        n_aligned = slice_start + (slice_len // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
-        N_local = slice_end  # alias the slice upper bound to N_local for loop predicates
+        # Shift E: use slice-LOCAL indices when reading the cached slice;
+        # GLOBAL indices when streaming GMEM (matching V5). The candidate
+        # index written to smem_vals is ALWAYS the global position so
+        # downstream Phase 4 / output writeback stays correct.
+        if cutlass.const_expr(smem_input is not None):
+            smem_addr = smem_input.iterator.toint()
+            n_aligned = (slice_len // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
+            N_local = slice_len
+            ic = tidx * cutlass.Int32(vec_w)
+        else:
+            n_aligned = slice_start + (slice_len // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
+            N_local = slice_end
+            ic = slice_start + tidx * cutlass.Int32(vec_w)
         wc = my_write_pos
-        ic = slice_start + tidx * cutlass.Int32(vec_w)
         step = cutlass.Int32(step_elem)
 
         # Phase3 unrolling: master gated by self.enable_phase3_unroll.
@@ -1121,12 +1278,22 @@ class GvrTopKClusterKernel:
 
                 for k in cutlass.range(big_iters, unroll=4):
                     ic_local = ic + k * cutlass.Int32(step_elem)
-                    src_ptr_k = cute.make_ptr(
-                        self.dtype,
-                        row_addr + cutlass.Int64(ic_local) * cutlass.Int64(elem_bytes),
-                        cute.AddressSpace.gmem,
-                        assumed_align=vec_align,
-                    )
+                    if cutlass.const_expr(smem_input is not None):
+                        src_ptr_k = cute.make_ptr(
+                            self.dtype,
+                            smem_addr + cutlass.Int64(ic_local) * cutlass.Int64(elem_bytes),
+                            cute.AddressSpace.smem,
+                            assumed_align=vec_align,
+                        )
+                        global_base = slice_start + ic_local
+                    else:
+                        src_ptr_k = cute.make_ptr(
+                            self.dtype,
+                            row_addr + cutlass.Int64(ic_local) * cutlass.Int64(elem_bytes),
+                            cute.AddressSpace.gmem,
+                            assumed_align=vec_align,
+                        )
+                        global_base = ic_local
                     src_k = cute.make_tensor(src_ptr_k, cute.make_layout((vec_w,)))
                     cute.copy(copy_atom, src_k, rng_frag)
                     for j in cutlass.range_constexpr(vec_w):
@@ -1136,7 +1303,7 @@ class GvrTopKClusterKernel:
                             vj = cutlass.Float32(rng_frag[j])
                         if vj >= thr_final and wc < cutlass.Int32(kCC):
                             smem_keys[wc] = vj
-                            smem_vals[wc] = ic_local + cutlass.Int32(j)
+                            smem_vals[wc] = global_base + cutlass.Int32(j)
                             wc = wc + cutlass.Int32(1)
                 # Advance ic past all consumed vec_w-aligned positions.
                 ic = ic + big_iters * cutlass.Int32(step_elem)
@@ -1144,12 +1311,22 @@ class GvrTopKClusterKernel:
         # Tail vec loop: 1-way, handles remainder < 2*step.
         tail_frag = cute.make_fragment((vec_w,), self.dtype)
         while ic + cutlass.Int32(vec_w - 1) < N_local:
-            src_ptr = cute.make_ptr(
-                self.dtype,
-                row_addr + cutlass.Int64(ic) * cutlass.Int64(elem_bytes),
-                cute.AddressSpace.gmem,
-                assumed_align=vec_align,
-            )
+            if cutlass.const_expr(smem_input is not None):
+                src_ptr = cute.make_ptr(
+                    self.dtype,
+                    smem_addr + cutlass.Int64(ic) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.smem,
+                    assumed_align=vec_align,
+                )
+                global_base_t = slice_start + ic
+            else:
+                src_ptr = cute.make_ptr(
+                    self.dtype,
+                    row_addr + cutlass.Int64(ic) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.gmem,
+                    assumed_align=vec_align,
+                )
+                global_base_t = ic
             src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
             cute.copy(copy_atom, src, tail_frag)
             for j in cutlass.range_constexpr(vec_w):
@@ -1159,17 +1336,24 @@ class GvrTopKClusterKernel:
                     vj = cutlass.Float32(tail_frag[j])
                 if vj >= thr_final and wc < cutlass.Int32(kCC):
                     smem_keys[wc] = vj
-                    smem_vals[wc] = ic + cutlass.Int32(j)
+                    smem_vals[wc] = global_base_t + cutlass.Int32(j)
                     wc = wc + cutlass.Int32(1)
             ic = ic + step
 
         # Tail scalar loop (slice_len % vec_w)
         it = n_aligned + tidx
         while it < N_local:
-            v = self._load_fp32(input_row, it)
+            if cutlass.const_expr(smem_input is not None):
+                v = smem_input[it]
+                if cutlass.const_expr(self.dtype != cutlass.Float32):
+                    v = cutlass.Float32(v)
+                pos_global = slice_start + it
+            else:
+                v = self._load_fp32(input_row, it)
+                pos_global = it
             if v >= thr_final and wc < cutlass.Int32(kCC):
                 smem_keys[wc] = v
-                smem_vals[wc] = it
+                smem_vals[wc] = pos_global
                 wc = wc + cutlass.Int32(1)
             it = it + cutlass.Int32(num_threads)
         cute.arch.barrier()
@@ -1792,6 +1976,21 @@ class GvrTopKClusterKernel:
             byte_alignment=16,
         )
 
+        # Shift E: per-CTA SMEM slice cache. Allocated as ``self.dtype``
+        # so the same vec_w-wide LDG → STS → LDS pipeline works for all
+        # supported dtypes (fp32/bf16/fp16). At cluster_size=4 and
+        # N <= 131072 this holds the full slice (<= 32K elements);
+        # at cluster_size=2 it holds it for N <= 64K (above that the
+        # wrapper auto-falls back to enable_smem_cache=False).
+        if cutlass.const_expr(self.enable_smem_cache):
+            smem_input = smem.allocate_tensor(
+                element_type=self.dtype,
+                layout=cute.make_ordered_layout((self.smem_cache_elems,), order=(0,)),
+                byte_alignment=128,
+            )
+        else:
+            smem_input = None
+
         # ---- Degenerate path: N <= top_k → copy input as-is ----
         if N <= cutlass.Int32(top_k):
             jd = tidx
@@ -1842,6 +2041,23 @@ class GvrTopKClusterKernel:
                         je = je + cutlass.Int32(1)
             else:
                 # =============================================================
+                # Shift E: cache this CTA's slice to SMEM ONCE here, before
+                # Phase 2 starts its 6-10 secant iterations. Phase 1 (preIdx)
+                # already happened and used scattered LDG on positions outside
+                # this CTA's slice, so it stays GMEM. Phase 2 and Phase 3
+                # only touch positions in [slice_start, slice_end) — exactly
+                # what we cache.
+                # =============================================================
+                if cutlass.const_expr(self.enable_smem_cache):
+                    self.load_slice_to_smem(
+                        input_row,
+                        slice_start,
+                        slice_end,
+                        smem_input,
+                        tidx,
+                    )
+
+                # =============================================================
                 # Phase 2 — Secant threshold search
                 # =============================================================
                 self.phase2_secant_search(
@@ -1857,6 +2073,7 @@ class GvrTopKClusterKernel:
                     tidx,
                     warp_id,
                     lane,
+                    smem_input=smem_input,
                 )
 
                 # =============================================================
@@ -1918,6 +2135,7 @@ class GvrTopKClusterKernel:
                     tidx,
                     warp_id,
                     lane,
+                    smem_input=smem_input,
                 )
 
                 # Cluster handoff #2: leader's gather of peer smem_keys /
