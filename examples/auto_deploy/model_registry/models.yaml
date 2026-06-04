@@ -795,14 +795,3 @@ models:
 # - name: CohereLabs/aya-vision-32b
 #   config_id: multimodal
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
-# =============================================================================
-# Sharding-IR-marked variants of models also listed above. Kept separate to
-# preserve their distinct config_ids; the IR path is now auto-detected from
-# torch.ops.auto_deploy.all_reduce nodes in the exported FX graph.
-# =============================================================================
-- name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8-IR
-  config_id: nano_v3__enable_sharder_ir
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
-- name: deepseek-ai/DeepSeek-R1-IR
-  config_id: num_hidden_layers_5__enable_sharder_ir
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']

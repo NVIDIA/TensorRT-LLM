@@ -100,32 +100,22 @@ Pass `layer_type="moe"` into `torch_moe`; `apply_sharding_hints` handles EP/TP.
 
 The model's existing registration (`AutoModelForCausalLMFactory.register_custom_model_cls` at the bottom of the file and its import in `__init__.py`) stays unchanged. No new registration is needed — sharding hints do not change the model identity.
 
-### Step 9: YAML — enable hint-driven sharding
+### Step 9: YAML — no per-model opt-in needed
 
-Add `enable_sharder_ir.yaml` to the model's `yaml_extra` list in `examples/auto_deploy/model_registry/models.yaml` (if not already present). This composable fragment disables legacy sharding passes and enables `apply_sharding_hints`. Registry fragments are deep-merged in `yaml_extra` order (see `DynamicYamlMixInForSettings` in `tensorrt_llm/_torch/auto_deploy/utils/_config.py`).
+No YAML change is required to enable the IR path. The default sharding pipeline (`apply_sharding_hints`) auto-detects the presence of `torch.ops.auto_deploy.all_reduce` markers in the exported FX graph and routes IR-marked models to the IR pipeline; non-marked models fall through to the legacy `detect_sharding` + `sharding_transform_executor` pair. The markers you added in Steps 1–7 are sufficient.
 
-Example transform block:
+If the model needs a non-default `apply_sharding_hints` config (for example a non-NCCL `allreduce_strategy`, or selective `shard_layers`), add a per-model yaml override under `examples/auto_deploy/model_registry/configs/` that overrides only the keys you need:
 
 ```yaml
-# Typical contents for enable_sharder_ir.yaml (registry composable fragment)
 transforms:
+  apply_sharding_hints:
+    allreduce_strategy: SYMM_MEM
+    # shard_layers: ['mha', 'mlp']   # optional selective sharding
   export_to_gm:
     num_moe_experts_for_export: 2   # often required when expert count is large (>64)
-  detect_sharding:
-    stage: sharding
-    enabled: false
-  sharding_transform_executor:
-    stage: sharding
-    enabled: false
-  apply_sharding_hints:
-    stage: sharding
-    enabled: true
-    run_shape_prop: true
-    allreduce_strategy: NCCL
-    # shard_layers: ['mha', 'mlp']   # optional selective sharding
-  gather_logits_before_lm_head:
-    enabled: true
 ```
+
+To force the legacy pipeline (e.g. while an IR port has a known bug awaiting fix), add `enable_legacy_sharding.yaml` to the model's `yaml_extra` — that override disables `apply_sharding_hints` and re-enables the legacy stages explicitly.
 
 Set `world_size` once, to the **maximum number of GPUs available on the machine**, auto-detected with `python -c 'import torch; print(torch.cuda.device_count())'` (or `nvidia-smi --list-gpus | wc -l`). Do **not** hardcode `world_size: 8` (or any other literal) — porting agents run on heterogeneous hardware and an 8-GPU literal will simply fail to launch on a 2- or 4-GPU machine. If the model's `num_attention_heads` (and, for GQA, `num_key_value_heads`) does not divide the detected GPU count, fall back to the largest power-of-two divisor that does (e.g. 4 on an 8-GPU machine if `num_attention_heads = 12`). Run the end-to-end command exactly once at that size — there is no value in repeating it at multiple smaller sizes, because the offline sharding equivalence test (Step 10b) already exercises 2- and 4-GPU dist configs cheaply.
 
