@@ -188,7 +188,7 @@ def encoder_dispatch(
 
 def scatter_to_prompt_order(
     index: ScatterIndices,
-    bucket_outputs: Dict[str, torch.Tensor],
+    outputs_by_modality: Dict[str, torch.Tensor],
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -200,7 +200,7 @@ def scatter_to_prompt_order(
     final = torch.empty((index.total_tokens, hidden_dim), dtype=dtype, device=device)
     for modality in index.active_modalities:
         dst = index.dst_indices[modality].to(device)
-        final.index_copy_(0, dst, bucket_outputs[modality])
+        final.index_copy_(0, dst, outputs_by_modality[modality])
     return final
 
 
@@ -252,7 +252,7 @@ def encode_by_modality_and_scatter(
 
     if index.total_tokens == 0:
         return torch.empty((0, hidden_dim), dtype=dtype, device=device)
-    bucket_outputs = encoder_dispatch(index, items, encoders, multimodal_params)
+    outputs_by_modality = encoder_dispatch(index, items, encoders, multimodal_params)
     return scatter_to_prompt_order(
-        index, bucket_outputs, device=device, dtype=dtype, hidden_dim=hidden_dim
+        index, outputs_by_modality, device=device, dtype=dtype, hidden_dim=hidden_dim
     )

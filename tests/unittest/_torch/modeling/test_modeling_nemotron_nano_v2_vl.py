@@ -381,7 +381,7 @@ def _wire_plan_based_encode(model, hidden_dim: int = 128) -> None:
 
     `_encode_multimodal` walks the flat-item assembly (`MixedModalityAssembly`
     + `_nano_extract_items`, both module-level) and dispatches each modality
-    bucket through `_adapter_vision_bucket` / `_adapter_audio_bucket`. There is
+    bucket through `_vision_encoder_adapter` / `_audio_encoder_adapter`. There is
     no post-encode interleave: video-embedded audio is hoisted to a first-class
     `(audio, k)` item, so the scatter produces the canonical layout directly.
     The single-item payload slicer (`_nano_slice_payload`) stays auto-mocked —
@@ -390,8 +390,8 @@ def _wire_plan_based_encode(model, hidden_dim: int = 128) -> None:
     """
     for name in (
         "_encode_multimodal",
-        "_adapter_vision_bucket",
-        "_adapter_audio_bucket",
+        "_vision_encoder_adapter",
+        "_audio_encoder_adapter",
     ):
         setattr(model, name, MethodType(getattr(NemotronH_Nano_VL_V2, name), model))
     model._build_single_modality_param = NemotronH_Nano_VL_V2._build_single_modality_param
@@ -606,7 +606,7 @@ class TestEncodeMultimodalAudioOrder:
         # returning one embedding per item in bucket (= input) order.
         # Per-video EVS token counts are TENSORS (what the real vision_encoder /
         # apply_evs_per_video returns), so the multi-video concat in
-        # `_adapter_vision_bucket` can `torch.cat` them.
+        # `_vision_encoder_adapter` can `torch.cat` them.
         vision_return = ([v0_emb, v1_emb], [torch.arange(v0_len), torch.arange(v1_len)])
         # `_encode_audio` is called once for the whole audio bucket, returning one
         # (emb, per_clip_counts) per item in order.

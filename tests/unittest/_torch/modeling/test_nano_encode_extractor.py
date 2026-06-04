@@ -517,7 +517,7 @@ class TestNanoVisionBucketAdapter:
     def _make_model_stub(self, vision_encoder_return):
         model = MagicMock(spec=NemotronH_Nano_VL_V2)
         model.vision_encoder = MagicMock(return_value=vision_encoder_return)
-        model._adapter_vision_bucket = NemotronH_Nano_VL_V2._adapter_vision_bucket.__get__(model)
+        model._vision_encoder_adapter = NemotronH_Nano_VL_V2._vision_encoder_adapter.__get__(model)
         model._build_single_modality_param = NemotronH_Nano_VL_V2._build_single_modality_param
         return model
 
@@ -526,7 +526,7 @@ class TestNanoVisionBucketAdapter:
         params = [_make_param({"video": item.payload, "modality_type": "video"})]
         emb = torch.randn(9, 4)
         model = self._make_model_stub(([emb], [[3, 3, 3]]))
-        out = model._adapter_vision_bucket([item], params)
+        out = model._vision_encoder_adapter([item], params)
         assert out.shape == (9, 4)
         assert params[0].multimodal_data["num_tokens_in_video"] == [3, 3, 3]
 
@@ -545,7 +545,7 @@ class TestNanoVisionBucketAdapter:
         ]
         emb = torch.randn(5, 4)
         model = self._make_model_stub(([emb], None))
-        out = model._adapter_vision_bucket([item], params)
+        out = model._vision_encoder_adapter([item], params)
         assert out.shape == (5, 4)
         passed_params = model.vision_encoder.call_args[0][0]
         assert len(passed_params) == 1
@@ -564,7 +564,7 @@ class TestNanoVisionBucketAdapter:
         emb0 = torch.ones(5, 4)
         emb1 = torch.ones(3, 4) * 2.0
         model = self._make_model_stub(([emb0, emb1], None))
-        out = model._adapter_vision_bucket(items, params)
+        out = model._vision_encoder_adapter(items, params)
         model.vision_encoder.assert_called_once()
         assert out.shape == (8, 4)
         torch.testing.assert_close(out[:5], emb0)
@@ -593,7 +593,7 @@ class TestNanoVisionBucketAdapter:
             torch.tensor([3, 1, 1]),  # param 1, video 0: 3 tubelets
         ]
         model = self._make_model_stub((embs, num_tokens))
-        out = model._adapter_vision_bucket(items, params)
+        out = model._vision_encoder_adapter(items, params)
         assert out.shape == (13, 4)
         # param 0: video 0 ++ video 1, in prompt order (NOT [2] from an overwrite).
         torch.testing.assert_close(
@@ -615,7 +615,7 @@ class TestNanoAudioBucketAdapter:
     def _make_model_stub(self, encode_audio_return):
         model = MagicMock(spec=NemotronH_Nano_VL_V2)
         model._encode_audio = MagicMock(return_value=encode_audio_return)
-        model._adapter_audio_bucket = NemotronH_Nano_VL_V2._adapter_audio_bucket.__get__(model)
+        model._audio_encoder_adapter = NemotronH_Nano_VL_V2._audio_encoder_adapter.__get__(model)
         return model
 
     def test_list_return_concatenated_in_order(self):
@@ -626,7 +626,7 @@ class TestNanoAudioBucketAdapter:
             ModalityItem(0, "audio", 0, 0, 4, {"id": "a0"}),
             ModalityItem(1, "audio", 0, 0, 3, {"id": "a1"}),
         ]
-        out = model._adapter_audio_bucket(items, [object(), object()])
+        out = model._audio_encoder_adapter(items, [object(), object()])
         assert out.shape == (7, 4)
         torch.testing.assert_close(out[:4], emb0)
         torch.testing.assert_close(out[4:], emb1)
@@ -636,5 +636,5 @@ class TestNanoAudioBucketAdapter:
         emb = torch.randn(4, 4)
         model = self._make_model_stub([(emb, [4])])
         items = [ModalityItem(0, "audio", 0, 0, 4, {"id": "a0"})]
-        out = model._adapter_audio_bucket(items, [object()])
+        out = model._audio_encoder_adapter(items, [object()])
         torch.testing.assert_close(out, emb)

@@ -3691,7 +3691,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 offset += int(lengths[prompt_pos]) // num_image_token
         return offset
 
-    def _adapter_vision_bucket(
+    def _vision_encoder_adapter(
         self,
         items: List[ModalityItem],
         multimodal_params: List[MultimodalParams],
@@ -3728,7 +3728,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 )
         return torch.cat(embs, dim=0)
 
-    def _adapter_audio_bucket(
+    def _audio_encoder_adapter(
         self,
         items: List[ModalityItem],
         multimodal_params: List[MultimodalParams],
@@ -3782,7 +3782,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         Per-request `num_tokens_in_video` (needed by EVS) is stashed on
         each video param's `multimodal_data` dict as a side-channel by
-        `_adapter_vision_bucket`, identical to the pre-refactor behavior.
+        `_vision_encoder_adapter`, identical to the pre-refactor behavior.
 
         Audio (standalone or hoisted from a video by the input processor) is a
         first-class `(audio, k)` item: there is no embedded-audio special case,
@@ -3798,9 +3798,9 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         final = encode_by_modality_and_scatter(
             multimodal_params=multimodal_params,
             encoders={
-                "image": self._adapter_vision_bucket,
-                "video": self._adapter_vision_bucket,
-                "audio": self._adapter_audio_bucket,
+                "image": self._vision_encoder_adapter,
+                "video": self._vision_encoder_adapter,
+                "audio": self._audio_encoder_adapter,
             },
             extract=extract,
             device=self._encode_multimodal_device(),
