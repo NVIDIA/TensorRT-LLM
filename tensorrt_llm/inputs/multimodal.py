@@ -345,8 +345,7 @@ class MixedModalEncodeContext:
     `from_raw_entries`), resolve (`resolve_order`), validate
     (`validate_order` + the order-only `__post_init__` checks), normalize
     payload shape (`_normalize`), and project per-modality collections into
-    prompt order (`project_by_order` / `project_uuids_by_order`, with the
-    instance `flatten` / `flatten_uuids` delegating to them).
+    prompt order (`project_by_order` / `project_uuids_by_order`).
 
     `MultimodalInput` owns the token-space layout that crosses to C++; this
     owns the encode-space layout that stays in Python. Not a general bag:
@@ -524,14 +523,6 @@ class MixedModalEncodeContext:
                     f"Multimodal item order covers {len(seen[modality])} "
                     f"{modality} item(s), expected {len(items)}")
 
-    def validate_coverage(self, mm_items: Dict[str, List[Any]]) -> None:
-        """Verify this context's order references every multimodal item once.
-
-        Coverage needs the actual item lists, so it is a method (not
-        `__post_init__`).
-        """
-        self.validate_order(self.order, mm_items)
-
     # ---- Projections ----
 
     @staticmethod
@@ -558,16 +549,6 @@ class MixedModalEncodeContext:
                 modality_uuids = [modality_uuids]
             ordered.append(modality_uuids[idx])
         return ordered
-
-    def flatten(self, values_by_key: Dict[str, List[Any]]) -> List[Any]:
-        """Project per-modality values into this context's prompt order."""
-        return self.project_by_order(self.order, values_by_key)
-
-    def flatten_uuids(
-        self, mm_uuids: Optional[Dict[str, List[Optional[str]]]]
-    ) -> Optional[List[Optional[str]]]:
-        """Project optional per-modality UUIDs into this context's prompt order."""
-        return self.project_uuids_by_order(self.order, mm_uuids)
 
 
 @dataclass

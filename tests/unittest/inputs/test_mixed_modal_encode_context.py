@@ -26,21 +26,6 @@ def test_duplicate_reference_raises():
         MixedModalEncodeContext(order=(("image", 0), ("image", 0)), embedding_lengths=(32, 32))
 
 
-def test_flatten_projects_per_modality_values_into_prompt_order():
-    ctx = MixedModalEncodeContext(
-        order=(("image", 0), ("video", 0), ("image", 1)),
-        embedding_lengths=(1, 1, 1),
-    )
-    out = ctx.flatten({"image": ["i0", "i1"], "video": ["v0"]})
-    assert out == ["i0", "v0", "i1"]
-
-
-def test_flatten_uuids_handles_none():
-    ctx = MixedModalEncodeContext(order=(("image", 0),), embedding_lengths=(1,))
-    assert ctx.flatten_uuids(None) is None
-    assert ctx.flatten_uuids({"image": ["u0"]}) == ["u0"]
-
-
 def test_default_order_is_modality_major():
     order = MixedModalEncodeContext.default_order({"image": ["a", "b"], "video": ["c"]})
     assert order == (("image", 0), ("image", 1), ("video", 0))
