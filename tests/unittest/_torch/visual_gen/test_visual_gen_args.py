@@ -211,7 +211,7 @@ class TestVisualGenArgsFromDict:
         assert args.quant_config["quant_algo"] == "FP8"
         # The same dict is the source of truth for the derived flags; verify
         # the pipeline-config parser will run on it.
-        qc, _, dwq, daq = DiffusionPipelineConfig.load_diffusion_quant_config(args.quant_config)
+        qc, _, dwq, _ = DiffusionPipelineConfig.load_diffusion_quant_config(args.quant_config)
         assert qc.quant_algo is not None
         assert dwq is True
 
