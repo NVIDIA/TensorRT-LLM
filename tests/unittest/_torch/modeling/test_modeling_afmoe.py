@@ -43,8 +43,17 @@ from tensorrt_llm.llmapi import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.llmapi import MoeConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from transformers import AfmoeConfig as HFAfmoeConfig
-from transformers.models.afmoe.modeling_afmoe import AfmoeForCausalLM as HFAfmoeForCausalLM
+
+# AFMoE is a recent addition to HF transformers; older installed versions may
+# not ship it.  Guard the reference-model imports (matching the exaone4 test
+# pattern) so the whole module still collects when HF afmoe is unavailable and
+# only the HF parity test is skipped.
+SKIP_AFMOE_HF_ACCURACY_TEST = False
+try:
+    from transformers import AfmoeConfig as HFAfmoeConfig
+    from transformers.models.afmoe.modeling_afmoe import AfmoeForCausalLM as HFAfmoeForCausalLM
+except ImportError:
+    SKIP_AFMOE_HF_ACCURACY_TEST = True
 
 WINDOW_SIZE = 4
 NUM_HIDDEN_LAYERS = 4
@@ -544,6 +553,10 @@ class TestAfmoeTPAttributes(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+@unittest.skipIf(
+    SKIP_AFMOE_HF_ACCURACY_TEST,
+    "installed transformers does not provide the HF afmoe reference model",
+)
 class TestAfmoeAllCloseToHF(unittest.TestCase):
     """Compare TRT-LLM AFMoE context-phase logits against the HF reference.
 
