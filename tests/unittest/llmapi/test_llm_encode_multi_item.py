@@ -309,7 +309,7 @@ def test_multi_item_and_single_item_agreement(
 
     for req_idx, (_, prompt_components_lens) in enumerate(multi_item_prompts):
         for item_idx in range(len(prompt_components_lens) - 1):
-            # NB: Even with .plan(fixed_split_size=4096), rtol needs to be rather relaxed.
+            # NB: Even with flashinfer.*Wrapper.plan(fixed_split_size=4096), rtol needs to be rather relaxed.
             torch.testing.assert_close(
                 multi_item_logits_list[req_idx][item_idx],
                 single_item_logits_list[req_idx][item_idx],
