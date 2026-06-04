@@ -1,7 +1,6 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
-import java.nio.charset.StandardCharsets
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
@@ -2478,7 +2477,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
             try {
-                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64(), StandardCharsets.UTF_8)
+                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64())
                 def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
                 pipeline.writeFile(file: cbtsInputLocal, text: cbtsInputJson)
                 sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
