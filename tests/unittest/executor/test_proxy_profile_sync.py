@@ -19,6 +19,7 @@ The contract documented in
 These tests pin that contract for the IPC-proxy path.
 """
 
+import concurrent.futures
 import queue
 import threading
 import time
@@ -36,6 +37,11 @@ def _bare_proxy():
     Provides only the queues the profile handlers touch. Avoids the
     heavy real ``__init__`` (no MPI session, no zmq sockets, no worker
     subprocess).
+
+    Also wires a real single-thread ``_profile_control_executor`` —
+    this matches the production setup, which pins all profile-related
+    ZMQ socket operations to one owning thread (see
+    ``GenerationExecutorProxy.__init__``).
     """
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
     proxy.request_queue = MagicMock()
@@ -43,6 +49,9 @@ def _bare_proxy():
     # attribute does not exist; we stub it as MagicMock so old code paths
     # accessing it via getattr() see a sentinel.
     proxy.profile_ack_queue = MagicMock()
+    proxy._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="proxy_profile_control"
+    )
     return proxy
 
 
@@ -194,3 +203,83 @@ def test_stop_profile_timeout_warns_does_not_hang():
     elapsed = time.monotonic() - t0
     # The TimeoutError path returns promptly.
     assert elapsed < 1.0
+
+
+def test_profile_control_pinned_to_single_owner_thread(tmp_path):
+    """Regression test for QiJune's review §2.
+
+    All ZMQ socket operations triggered by ``start_profile`` /
+    ``stop_profile`` must run on the same single owner thread, even
+    though the public API is invoked from many different caller
+    threads (``asyncio.to_thread`` does not pin to one worker).
+
+    We capture the ``threading.current_thread()`` identity inside both
+    the ``request_queue.put`` and ``profile_ack_queue.get`` mocks, and
+    invoke the proxy from several caller threads in sequence. After
+    the round-trip we assert:
+
+      * Every queue operation observed exactly one owner thread.
+      * That owner thread is *not* any of the caller threads — it is
+        the dedicated ``proxy_profile_control`` worker created by
+        ``_profile_control_executor``.
+    """
+    proxy = _bare_proxy()
+
+    seen_threads = []
+
+    def record_put(req):
+        seen_threads.append(("put", threading.current_thread()))
+
+    def record_get(timeout=None):
+        seen_threads.append(("get", threading.current_thread()))
+        # Return a matching ack so the call can complete promptly.
+        # Match whatever kind the most recent put requested.
+        last_req = seen_threads[-2][1] if len(seen_threads) >= 2 else None  # noqa: F841
+        # We return ("start", None) and ("stop", None) alternately; the
+        # caller pattern below issues start then stop, so this side_effect
+        # list approach is simpler than parsing the mock call history.
+        return record_get._next_ack.pop(0)
+
+    record_get._next_ack = [("start", None), ("stop", None)]
+
+    proxy.request_queue.put.side_effect = record_put
+    proxy.profile_ack_queue.get.side_effect = record_get
+
+    caller_threads = []
+
+    def run_start():
+        caller_threads.append(threading.current_thread())
+        proxy.start_profile(output_dir=str(tmp_path), num_steps=5)
+
+    def run_stop():
+        caller_threads.append(threading.current_thread())
+        proxy.stop_profile()
+
+    # Invoke from two distinct caller threads to mirror what
+    # ``asyncio.to_thread`` may do under load.
+    t1 = threading.Thread(target=run_start, name="caller_1")
+    t1.start()
+    t1.join()
+    t2 = threading.Thread(target=run_stop, name="caller_2")
+    t2.start()
+    t2.join()
+
+    # 2 puts (start request, stop request) + 2 gets (each ack) = 4 ops.
+    assert len(seen_threads) == 4, seen_threads
+
+    owner_threads = {th for _, th in seen_threads}
+    assert len(owner_threads) == 1, (
+        f"Profile-control queue ops touched multiple threads: "
+        f"{[(op, th.name) for op, th in seen_threads]}"
+    )
+
+    owner = next(iter(owner_threads))
+    # The owner is the executor's worker, not either caller thread.
+    assert owner not in caller_threads, (
+        f"Owner thread {owner.name!r} matched a caller thread; the "
+        "executor pinning is not effective."
+    )
+    assert owner.name.startswith("proxy_profile_control"), (
+        f"Owner thread name {owner.name!r} does not match the expected "
+        "'proxy_profile_control' prefix."
+    )
