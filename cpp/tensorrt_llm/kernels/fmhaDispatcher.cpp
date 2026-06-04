@@ -238,10 +238,10 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mChunkedAttentionSize = runnerParams.chunkedAttentionSize;
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
-        tllmRunnerParams.mJITWarmup = runnerParams.trtllmGenFmhaJITWarmup;
-        tllmRunnerParams.mJITWarmupMaxNumRequests = runnerParams.trtllmGenFmhaJITWarmupMaxNumRequests;
-        tllmRunnerParams.mJITWarmupMaxSeqLenQ = runnerParams.trtllmGenFmhaJITWarmupMaxSeqLenQ;
-        tllmRunnerParams.mJITWarmupMaxSeqLenKv = runnerParams.trtllmGenFmhaJITWarmupMaxSeqLenKv;
+        tllmRunnerParams.mJITWarmup = runnerParams.trtllmGenJITWarmup;
+        tllmRunnerParams.mJITWarmupMaxNumRequests = runnerParams.trtllmGenJITWarmupMaxNumRequests;
+        tllmRunnerParams.mJITWarmupMaxSeqLenQ = runnerParams.trtllmGenJITWarmupMaxSeqLenQ;
+        tllmRunnerParams.mJITWarmupMaxSeqLenKv = runnerParams.trtllmGenJITWarmupMaxSeqLenKv;
         tllmRunnerParams.mMaxNumPagesPerSeqKv = maxBlocksPerSeq;
         tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? numTokensPerBlock : 0;
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;

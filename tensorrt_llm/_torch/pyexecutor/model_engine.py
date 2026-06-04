@@ -625,7 +625,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER if is_draft_model else ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self._trtllm_gen_fmha_jit_warmup = False
+        self._trtllm_gen_jit_warmup = False
 
         # Create config and runner
         cuda_graph_runner_config = CUDAGraphRunnerConfig(
@@ -1045,12 +1045,12 @@ class PyTorchModelEngine(ModelEngine):
 
         @contextlib.contextmanager
         def trtllm_gen_fmha_jit_warmup():
-            previous = self._trtllm_gen_fmha_jit_warmup
-            self._trtllm_gen_fmha_jit_warmup = True
+            previous = self._trtllm_gen_jit_warmup
+            self._trtllm_gen_jit_warmup = True
             try:
                 yield
             finally:
-                self._trtllm_gen_fmha_jit_warmup = previous
+                self._trtllm_gen_jit_warmup = previous
 
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
@@ -4458,8 +4458,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
                                                    draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
-            attn_metadata.trtllm_gen_fmha_jit_warmup = (
-                self._trtllm_gen_fmha_jit_warmup)
+            attn_metadata.trtllm_gen_jit_warmup = (self._trtllm_gen_jit_warmup)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)

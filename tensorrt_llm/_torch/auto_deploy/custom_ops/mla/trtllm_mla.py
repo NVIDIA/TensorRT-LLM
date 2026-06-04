@@ -853,6 +853,7 @@ def _handle_prefill_thop(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     quant_mode: int,
     sequence_length: torch.Tensor,
     context_lengths: torch.Tensor,
@@ -910,6 +911,7 @@ def _handle_prefill_thop(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             quant_mode,
             sequence_length,
             context_lengths,
@@ -1039,6 +1041,7 @@ def _handle_prefill_thop(
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
@@ -1122,6 +1125,7 @@ def _handle_prefill_thop_cached_kv(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     quant_mode: int,
     sequence_length: torch.Tensor,
     context_lengths: torch.Tensor,
@@ -1330,6 +1334,7 @@ def _handle_prefill_thop_cached_kv(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,  # max_seq_len
             max_context_length,
             1,  # beam_width
             int(AttentionMaskType.padding),  # FULL mask: every Q attends to every K in this chunk
@@ -1459,6 +1464,7 @@ def _handle_prefill_thop_cached_kv(
         tokens_per_block,
         max_num_requests,
         max_context_length,
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # CAUSAL: new Q tokens with causal mask over new K/V
@@ -1552,6 +1558,7 @@ def _handle_decode_impl(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     q_scaling: float,
     quant_mode: int,
     sequence_length: torch.Tensor,
@@ -1718,6 +1725,7 @@ def _handle_decode_impl(
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
@@ -1833,6 +1841,7 @@ def _mla_with_cache_impl(
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
+    max_seq_len = batch_info.get_max_seq_len()
     max_context_length = batch_info.get_max_context_length()
     max_num_requests = batch_info.get_max_batch_size()
 
@@ -1966,6 +1975,7 @@ def _mla_with_cache_impl(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             quant_mode,
             sequence_length,
             context_lengths,
@@ -2001,6 +2011,7 @@ def _mla_with_cache_impl(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             q_scaling,
             quant_mode,
             sequence_length,
