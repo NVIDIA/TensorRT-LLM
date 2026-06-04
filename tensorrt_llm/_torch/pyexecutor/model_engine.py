@@ -4433,21 +4433,29 @@ class PyTorchModelEngine(ModelEngine):
                 if key is None:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         # Eager path — no graph for this bucket.
-                        return self._forward_step(model_inputs, **forward_kwargs)
+                        return self._forward_step(model_inputs,
+                                                  **forward_kwargs)
 
                 if self.encoder_cuda_graph_runner.needs_capture(key):
 
                     def forward_fn(
-                            capture_inputs: Dict[str, Any], **forward_kwargs) -> Dict[str, Any]:
+                            capture_inputs: Dict[str, Any]) -> Dict[str, Any]:
+                        capture_inputs = capture_inputs.copy()
+                        forward_kwargs = capture_inputs.pop("_forward_kwargs")
                         with MoeLoadBalancerIterContext(moe_load_balancer):
-                            return self._forward_step(capture_inputs, **forward_kwargs)
+                            return self._forward_step(capture_inputs,
+                                                      **forward_kwargs)
 
                     self.encoder_cuda_graph_runner.capture(
-                        key, forward_fn, model_inputs, **forward_kwargs)
+                        key, forward_fn, {
+                            **model_inputs, "_forward_kwargs": forward_kwargs
+                        })
 
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     graph_outputs = self.encoder_cuda_graph_runner.replay(
-                        key, model_inputs, **forward_kwargs)
+                        key, {
+                            **model_inputs, "_forward_kwargs": forward_kwargs
+                        })
 
             # Return a clone to avoid sharing data_ptr with the static buffers.
             outputs = {}
