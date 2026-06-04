@@ -549,6 +549,35 @@ def test_needs_resize_returns_true_when_fraction_is_positive(resizable_kv_cache_
     assert interface.needs_resize() is True
 
 
+def test_prepare_kv_cache_config_preserves_fraction_for_vswa_estimate():
+    """VSWA must keep the memory-fraction cap even when AD passes a token estimate."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32,
+            free_gpu_memory_fraction=0.2,
+        ),
+    )
+    interface.add_resource(
+        "kv_swa",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64),
+    )
+    interface.add_resource("kv_full", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    kv_managed, _ = interface._identify_managed_kv_resources()
+    kv_cache_config = interface._prepare_kv_cache_config(
+        max_tokens=interface.info.max_seq_len,
+        kv_managed=kv_managed,
+    )
+
+    assert kv_cache_config.free_gpu_memory_fraction == 0.2
+    assert kv_cache_config.max_tokens == interface.info.max_seq_len
+    assert kv_cache_config.max_attention_window == [64, 128]
+
+
 def test_resize_kv_cache_manager_skipped_when_not_needed(paged_kv_cache_config):
     """Test resize_kv_cache_manager() does nothing when resize not needed."""
     interface = CachedSequenceInterface(
