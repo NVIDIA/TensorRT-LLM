@@ -259,7 +259,9 @@ struct KvCacheIterationStats
     // Cached-but-unpinned blocks in the primary pool. Distinct from primaryUsedNumBlocks,
     // which also counts blocks pinned during onboard memcpy windows.
     SizeType32 primaryEvictableNumBlocks{0};
+    SizeType32 primaryPeakFreeNumBlocks{0};
     SizeType32 primaryPeakUsedNumBlocks{0};
+    SizeType32 primaryPeakEvictableNumBlocks{0};
     // Secondary (host) pool
     SizeType32 secondaryMaxNumBlocks{0};
     SizeType32 secondaryFreeNumBlocks{0};
@@ -268,7 +270,9 @@ struct KvCacheIterationStats
     // host cache"; secondaryUsedNumBlocks only counts pinned blocks during the sub-ms
     // onboard memcpy window so it cannot answer that question on its own.
     SizeType32 secondaryEvictableNumBlocks{0};
+    SizeType32 secondaryPeakFreeNumBlocks{0};
     SizeType32 secondaryPeakUsedNumBlocks{0};
+    SizeType32 secondaryPeakEvictableNumBlocks{0};
 
     // --- Per-iteration deltas (reset on each read) ---
     // Context phase: block allocation and reuse
