@@ -1876,9 +1876,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         # on, fold post_attention_layernorm into hc_ffn.fused_hc and skip the
         # redundant allreduce in forward_MoE (the data is already full after
         # attention's internal o_b_proj allreduce).
-        self.skip_premoe_allreduce = (
-            _resolve_skip_premoe_allreduce() and self.enable_fused_hc
-        )
+        self.skip_premoe_allreduce = _resolve_skip_premoe_allreduce() and self.enable_fused_hc
         self.next_layer_layernorm: RMSNorm = None
         # Finalized in DeepseekV4ForCausalLM.post_load_weights once the full layer
         # list is visible: a layer may defer its hc_ffn.post_mapping only if
@@ -2028,9 +2026,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 else None
             )
             _norm_eps = (
-                self.post_attention_layernorm.variance_epsilon
-                if _norm_w is not None
-                else 0.0
+                self.post_attention_layernorm.variance_epsilon if _norm_w is not None else 0.0
             )
             residual, post_mix, comb_mix, layer_input = self.hc_ffn.fused_hc(
                 x_prev=x_attn,
