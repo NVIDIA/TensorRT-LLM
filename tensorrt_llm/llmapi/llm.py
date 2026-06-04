@@ -1468,8 +1468,9 @@ class _TorchLLM(BaseLLM):
         """Reset local KV prefix-cache reuse state.
 
         This invalidates local prefix-cache metadata in the PyTorch backend. It
-        does not abort or preempt running requests, and it does not reset
-        connector-managed external or offloaded cache state.
+        requires no active or queued requests, and it does not reset
+        connector-managed external or offloaded cache state. Callers should
+        quiesce traffic before invoking this method.
         """
         if self._encode_only:
             raise RuntimeError("reset_prefix_cache() is not available when "

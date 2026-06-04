@@ -996,7 +996,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             reset_prefix_cache()
-        except (NotImplementedError, ValueError) as e:
+        except (NotImplementedError, RuntimeError, ValueError) as e:
             return self._create_not_supported_error(str(e))
 
         return Response(status_code=200)

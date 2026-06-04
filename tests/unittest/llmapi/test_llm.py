@@ -2725,10 +2725,10 @@ class _FakeCollectiveResetExecutor:
     def __init__(self):
         self.calls = []
 
-    def collective_rpc(self, method, args, kwargs, non_block,
-                       unique_reply_rank, target_ranks):
-        self.calls.append((method, args, kwargs, non_block, unique_reply_rank,
-                           target_ranks))
+    def collective_rpc(self, method, args, kwargs, non_block, unique_reply_rank,
+                       target_ranks):
+        self.calls.append(
+            (method, args, kwargs, non_block, unique_reply_rank, target_ranks))
         return [None]
 
     def shutdown(self):
@@ -2739,6 +2739,12 @@ class _FakeUnsupportedResetExecutor:
 
     def shutdown(self):
         pass
+
+
+class _FakeNotImplementedResetGenerator:
+
+    def reset_prefix_cache(self):
+        raise NotImplementedError("not supported")
 
 
 def test_llm_reset_prefix_cache_dispatches_to_executor() -> None:
@@ -2758,8 +2764,17 @@ def test_llm_reset_prefix_cache_uses_collective_rpc() -> None:
 
     llm.reset_prefix_cache()
 
-    assert llm._executor.calls == [("reset_prefix_cache", (), None, False,
-                                    None, None)]
+    assert llm._executor.calls == [("reset_prefix_cache", (), None, False, None,
+                                    None)]
+
+
+def test_llm_reset_prefix_cache_rejects_encode_only() -> None:
+    llm = object.__new__(LLM_torch)
+    llm._encode_only = True
+    llm._executor = _FakeResetExecutor()
+
+    with pytest.raises(RuntimeError, match="encode_only=True"):
+        llm.reset_prefix_cache()
 
 
 def test_llm_reset_prefix_cache_rejects_unsupported_executor() -> None:
@@ -2786,6 +2801,15 @@ def test_openai_reset_prefix_cache_endpoint_rejects_unsupported_generator(
 ) -> None:
     server = object.__new__(OpenAIServer)
     server.generator = object()
+
+    response = asyncio.run(server.reset_prefix_cache())
+
+    assert response.status_code == 501
+
+
+def test_openai_reset_prefix_cache_endpoint_maps_not_implemented() -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = _FakeNotImplementedResetGenerator()
 
     response = asyncio.run(server.reset_prefix_cache())
 
