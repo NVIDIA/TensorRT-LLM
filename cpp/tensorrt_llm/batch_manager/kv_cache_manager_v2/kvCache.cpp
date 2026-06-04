@@ -193,33 +193,6 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
     return blockPageGetPage(blockPage);
 }
 
-KvCache::ActivePageStats KvCache::debugActivePageStats() const
-{
-    auto& storageMgr = mManager->storage();
-    int const numTiers = storageMgr.numCacheLevels();
-    std::vector<int> counts(static_cast<size_t>(numTiers), 0);
-    std::vector<int> unscheduledEvictable(static_cast<size_t>(numTiers), 0);
-
-    for (auto const& activePage : _activePages())
-    {
-        auto page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
-        if (!page)
-        {
-            continue;
-        }
-
-        CacheLevel const level = page->cacheLevel;
-        auto const levelIdx = static_cast<size_t>(level);
-        counts.at(levelIdx) += 1;
-        if (storageMgr.isEvictable(*page) && !page->scheduledForEviction())
-        {
-            unscheduledEvictable.at(levelIdx) += 1;
-        }
-    }
-
-    return {std::move(counts), std::move(unscheduledEvictable)};
-}
-
 void KvCache::activate()
 {
     assert(mStatus == Status::SUSPENDED);

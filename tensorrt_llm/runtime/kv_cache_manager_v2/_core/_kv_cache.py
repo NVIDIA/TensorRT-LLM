@@ -733,6 +733,14 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
+    @property
+    def committed_tokens(self) -> list[TokenIdExt]:
+        return list(self._committed_tokens)
+
+    @property
+    def reuse_scope(self) -> ReuseScope:
+        return self._reuse_scope
+
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
     # If there is a uncommitted block containing committed tokens, we will commit the block immediately.
@@ -981,21 +989,6 @@ class _KVCache:
         except OutOfPagesError:
             return False
         return True
-
-    def _debug_active_page_stats(self) -> tuple[list[int], list[int]]:
-        storage = self.manager._storage
-        counts = [0] * storage.num_cache_levels
-        unscheduled_evictable = [0] * storage.num_cache_levels
-        for ordinal, beam_idx, lc_idx in self._active_pages():
-            block_page = self._page(ordinal, beam_idx, lc_idx)
-            if block_page is None:
-                continue
-            page = block_page.page
-            level = page.cache_level
-            counts[level] += 1
-            if storage.is_evictable(page) and not page.scheduled_for_eviction:
-                unscheduled_evictable[level] += 1
-        return counts, unscheduled_evictable
 
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:
         """Yields (ordinal, beam_idx, lc_idx) for all active pages.

@@ -35,18 +35,21 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // ---------------------------------------------------------------------------
-// MemoryPoolDesc / MemoryPoolGroupDesc — describe GPU memory pool layout.
+// PoolDesc / PoolGroupDesc — describe GPU memory pool layout.
 // ---------------------------------------------------------------------------
-struct MemoryPoolDesc
+struct PoolDesc
 {
-    MemAddress base;
-    int pageSize;
+    PoolIndex poolIndex = 0;
+    MemAddress baseAddress = 0;
+    int slotBytes = 0;
 };
 
-struct MemoryPoolGroupDesc
+struct PoolGroupDesc
 {
-    int numPages;
-    std::vector<MemoryPoolDesc> pools; // indexed by PoolIndex
+    PoolGroupIndex poolGroupIndex = 0;
+    int numSlots = 0;
+    SlotDesc slotDesc;
+    std::vector<PoolDesc> pools; // indexed by PoolIndex
 };
 
 // ---------------------------------------------------------------------------
@@ -156,6 +159,8 @@ public:
     // Mirrors Python's KVCacheManager.get_aggregated_pages().
     std::vector<AggregatedPageDesc> getAggregatedPages(std::vector<BufferId> const& buffers) const;
 
+    std::vector<PoolGroupDesc> poolGroupDescs() const;
+
     // ---- Query / info ------------------------------------------------------
 
     int tokensPerBlock() const noexcept;
@@ -188,11 +193,11 @@ public:
     // Layer grouping: layers with the same lifecycle share pool allocation.
     std::vector<std::vector<LayerId>> layerGrouping() const;
 
-    // Sorted by CacheLevel from warm to cold. Mirrors Python's cache_tier_list property.
-    std::vector<CacheTier> cacheTierList() const;
-
     // Iterator over all buffer identifiers. Mirrors Python's all_buffer_ids property.
     std::vector<BufferId> allBufferIds() const;
+
+    // Sorted by CacheLevel from warm to cold. Mirrors Python's cache_tier_list property.
+    std::vector<CacheTier> cacheTierList() const;
 
     // Get the max possible sequence length limited by GPU memory pools.
     // Mirrors Python's clamp_max_seq_len_for_mem().

@@ -20,6 +20,8 @@ from ._kv_cache_manager import (
     ExpandedBuffer,
     KVCacheManager,
     PageIndexConverter,
+    PoolDesc,
+    PoolGroupDesc,
     ScratchDesc,
 )
 
@@ -31,5 +33,7 @@ __all__ = [
     "AggregatedPageDesc",
     "ExpandedBuffer",
     "PageIndexConverter",
+    "PoolDesc",
+    "PoolGroupDesc",
     "ScratchDesc",
 ]

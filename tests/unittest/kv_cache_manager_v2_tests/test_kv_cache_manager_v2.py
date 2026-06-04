@@ -51,22 +51,21 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         SwaScratchReuseConfig,
         TokenId,
         TokenIdExt,
+        _introspection,
         _KVCache,
     )
-    from kv_cache_manager_v2._block_radix_tree import Hasher, traverse_post_order
+    from kv_cache_manager_v2._block_radix_tree import Hasher
     from kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,
         CacheTier,
         MemAddress,
         PageIndexMode,
-        PageStatus,
         SlidingWindowSize,
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
-    from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
-    from kv_cache_manager_v2._storage._core import CacheLevelStorage, SlotAllocator
+    from kv_cache_manager_v2._storage._core import SlotAllocator
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -79,7 +78,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         round_up,
         temporary_sys_path,
         typed_range,
-        unwrap_rawref,
     )
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -104,28 +102,21 @@ else:
         SwaScratchReuseConfig,
         TokenId,
         TokenIdExt,
+        _introspection,
         _KVCache,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
-        Hasher,
-        traverse_post_order,
-    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Hasher
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,
         CacheTier,
         MemAddress,
         PageIndexMode,
-        PageStatus,
         SlidingWindowSize,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
-    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
-        CacheLevelStorage,
-        SlotAllocator,
-    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import SlotAllocator
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -138,7 +129,6 @@ else:
         round_up,
         temporary_sys_path,
         typed_range,
-        unwrap_rawref,
     )
 
 from copy import deepcopy
@@ -154,9 +144,9 @@ def get_cached_cuda_event_type():
     backend = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
     if backend == "cpp":
         try:
-            import bindings
+            from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
 
-            return bindings.internal.batch_manager.kv_cache_manager_v2.CachedCudaEvent
+            return CachedCudaEvent
         except ImportError:
             from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
                 CachedCudaEvent,
@@ -228,8 +218,8 @@ class TestCacheLevelStorage(unittest.TestCase):
         slot_size_list = [16_252_928, 4_063_232]
         min_slots = 157
 
-        grains = CacheLevelStorage._grains_for_slots(min_slots, slot_size_list, granularity)
-        slots, used = CacheLevelStorage._grains_to_slots(grains, slot_size_list, granularity)
+        grains = _introspection.grains_for_slots(min_slots, slot_size_list, granularity)
+        slots, used = _introspection.grains_to_slots(grains, slot_size_list, granularity)
 
         self.assertGreaterEqual(slots, min_slots)
         self.assertLessEqual(used, grains)
@@ -243,11 +233,11 @@ class TestCacheLevelStorage(unittest.TestCase):
         ]
         min_slots = [157, 3907, 157]
         total_min_grains = sum(
-            CacheLevelStorage._grains_for_slots(slots, sizes, granularity)
+            _introspection.grains_for_slots(slots, sizes, granularity)
             for slots, sizes in zip(min_slots, slot_size_lists)
         )
 
-        slot_counts = CacheLevelStorage.ratio_to_slot_count_list(
+        slot_counts = _introspection.ratio_to_slot_count_list(
             total_min_grains * granularity,
             slot_size_lists,
             [0.2, 0.5, 0.3],
@@ -553,7 +543,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         def overall_utilization() -> float:
             numerator = 0
             denominator = 0
-            for stat in self.manager._storage.get_statistics():
+            for stat in _introspection.storage_statistics(self.manager):
                 slot_size = sum(stat_slot_sizes(stat))
                 numerator += slot_size * stat.unavailable
                 denominator += slot_size * stat.total
@@ -567,7 +557,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             self.assertTrue(first_cache.resume(stream))
             self.assertTrue(first_cache.resize(cfg.tokens_per_block))
 
-            utilizations = self.manager._storage.get_utilization(GPU_LEVEL)
+            utilizations = _introspection.storage_utilization(self.manager, GPU_LEVEL)
             self.assertGreater(max(utilizations), cfg.max_util_for_resume)
             self.assertLess(overall_utilization(), cfg.max_util_for_resume)
 
@@ -601,15 +591,10 @@ class TestNoBatching(TestKVCacheManagerV2):
                 req.kv_cache.close()
         s.take_finish_event()
 
-        for root_block in self.manager._radix_tree.next.values():
-            for block0 in root_block.next.values():
-                for block in traverse_post_order(block0):
-                    for page in block.storage:
-                        if page is not None:
-                            assert unwrap_rawref(page).status == PageStatus.DROPPABLE
+        self.assertTrue(_introspection.all_tree_pages_droppable(self.manager))
 
         req0 = reusable_requests[0]
-        prompt1 = req0.kv_cache._committed_tokens[: (seq_len // 2 - 7)]
+        prompt1 = req0.kv_cache.committed_tokens[: (seq_len // 2 - 7)]
         # request id must be same as req0 because we wrote it into the kv cache.
         req1 = self.Request(
             next(req_id_gen),
@@ -637,7 +622,7 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         def commit_for(reuse_scope: ReuseScope | None) -> None:
             kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
-            self.assertEqual(kv_cache._reuse_scope, reuse_scope or default_scope)
+            self.assertEqual(kv_cache.reuse_scope, reuse_scope or default_scope)
             with TemporaryCudaStream([]) as stream_holder:
                 stream = cast(CudaStream, stream_holder.handle)
                 self.assertTrue(kv_cache.resume(stream))
@@ -652,7 +637,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         def num_reused(reuse_scope: ReuseScope | None) -> int:
             probed = self.manager.probe_reuse(reuse_scope, tokens[:-1])
             kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
-            self.assertEqual(kv_cache._reuse_scope, reuse_scope or default_scope)
+            self.assertEqual(kv_cache.reuse_scope, reuse_scope or default_scope)
             ret = kv_cache.num_committed_tokens
             kv_cache.close()
             self.assertEqual(probed, ret)
@@ -944,7 +929,7 @@ class TestBatching(TestKVCacheManagerV2):
         for kv_cache, _, _ in removed:
             seq_len = self.seq_len_dict[kv_cache]
             if seq_len < self.avg_length * 3:
-                self.past_sequences.append(kv_cache._committed_tokens[:seq_len])
+                self.past_sequences.append(kv_cache.committed_tokens[:seq_len])
             kv_cache.close()
             self.seq_len_dict.pop(kv_cache)
             self.num_finished += 1
@@ -976,11 +961,7 @@ class TestBatching(TestKVCacheManagerV2):
                 step = suspended[-1]
                 kv_cache = step.kv_cache
                 ok = kv_cache.resume(stream)
-                if (
-                    ok
-                    and not self.enable_reuse
-                    and kv_cache._commit_state == _KVCache.CommitState.ALLOWED
-                ):
+                if ok and not self.enable_reuse and _introspection.is_commit_allowed(kv_cache):
                     kv_cache.stop_committing()
                 ok = ok and kv_cache.resize(len(step.history) + len(step.input), None)
                 if ok:
@@ -1563,13 +1544,13 @@ class TestResizeQuota(TestKVCacheManagerV2):
         success = self.manager.resize(HOST_LEVEL, 128 << 20)
         assert success
         prefetch_target = kv_cache_lst[1]
-        # _debug_active_page_stats returns (active counts, unscheduled evictable counts) by cache level.
-        prefetch_counts_before, _ = prefetch_target._debug_active_page_stats()
+        # _introspection.active_page_stats returns (active counts, unscheduled evictable counts) by cache level.
+        prefetch_counts_before, _ = _introspection.active_page_stats(prefetch_target)
         self.assertGreater(prefetch_counts_before[DISK_LEVEL], 0)
         success = prefetch_target.prefetch(HOST_LEVEL)
         self.assertEqual(success, True)
-        prefetch_counts_after, unscheduled_evictable_after = (
-            prefetch_target._debug_active_page_stats()
+        prefetch_counts_after, unscheduled_evictable_after = _introspection.active_page_stats(
+            prefetch_target
         )
         self.assertEqual(prefetch_counts_after[GPU_LEVEL], prefetch_counts_before[GPU_LEVEL])
         self.assertEqual(prefetch_counts_after[DISK_LEVEL], 0)
@@ -2078,7 +2059,7 @@ class TestInitRatioConfig(unittest.TestCase):
         """Without typical_step or constraints, uses hardcoded fallback."""
         cfg = self._make_config()
         manager = KVCacheManager(cfg)
-        ratio = manager._current_gpu_ratio
+        ratio = _introspection.current_gpu_ratio(manager)
         self.assertEqual(len(ratio), 2)
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
         # Windowed layers need fewer blocks than non-windowed at history=2048.
@@ -2090,7 +2071,7 @@ class TestInitRatioConfig(unittest.TestCase):
         step = BatchDesc(kv_caches=[KVCacheDesc(capacity=64, history_length=32)] * 64)
         cfg = self._make_config(typical_step=step)
         manager = KVCacheManager(cfg)
-        ratio = manager._current_gpu_ratio
+        ratio = _introspection.current_gpu_ratio(manager)
         self.assertEqual(len(ratio), 2)
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
         # Short sequences (32 tokens < window 128): no stale blocks.
@@ -2103,7 +2084,7 @@ class TestInitRatioConfig(unittest.TestCase):
         step = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)
         cfg = self._make_config(typical_step=step)
         manager = KVCacheManager(cfg)
-        ratio = manager._current_gpu_ratio
+        ratio = _introspection.current_gpu_ratio(manager)
         self.assertEqual(len(ratio), 2)
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
         # Windowed layers (window=128) have many stale blocks, non-windowed keep all.
@@ -2117,11 +2098,11 @@ class TestInitRatioConfig(unittest.TestCase):
         constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=256, history_length=128)] * 256)
         cfg_unconstrained = self._make_config(typical_step=typical)
         mgr_unconstrained = KVCacheManager(cfg_unconstrained)
-        ratio_unconstrained = mgr_unconstrained._current_gpu_ratio
+        ratio_unconstrained = _introspection.current_gpu_ratio(mgr_unconstrained)
 
         cfg_constrained = self._make_config(typical_step=typical, constraints=[constraint])
         mgr_constrained = KVCacheManager(cfg_constrained)
-        ratio_constrained = mgr_constrained._current_gpu_ratio
+        ratio_constrained = _introspection.current_gpu_ratio(mgr_constrained)
 
         self.assertGreater(ratio_constrained[0], ratio_unconstrained[0])
         self.assertAlmostEqual(sum(ratio_constrained), 1.0, places=6)
@@ -2158,7 +2139,8 @@ class TestInitRatioConfig(unittest.TestCase):
             return stat.slot_size
 
         slots_by_size = {
-            tuple(stat_slot_sizes(stat)): stat.total for stat in manager._storage.get_statistics()
+            tuple(stat_slot_sizes(stat)): stat.total
+            for stat in _introspection.storage_statistics(manager)
         }
         self.assertEqual(slots_by_size[(grain - 1,)], 2)
         self.assertEqual(slots_by_size[(grain,)], 3)
@@ -2221,7 +2203,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
 
         # Verify constraint clamping: each pool group has enough slots.
-        stats = manager._storage.get_statistics()
+        stats = _introspection.storage_statistics(manager)
         self.assertGreaterEqual(
             stats[0].total,
             slots_pg0,
@@ -2348,7 +2330,7 @@ class TestInitRatioConfig(unittest.TestCase):
             typical_step=typical,
         )
         mgr_no_constraint = KVCacheManager(cfg_no_constraint)
-        ratio_no_constraint = mgr_no_constraint._current_gpu_ratio
+        ratio_no_constraint = _introspection.current_gpu_ratio(mgr_no_constraint)
 
         # Ratio with constraint that typical already covers.
         cfg_with_constraint = self._make_config(
@@ -2357,7 +2339,7 @@ class TestInitRatioConfig(unittest.TestCase):
             constraints=[constraint],
         )
         mgr_with_constraint = KVCacheManager(cfg_with_constraint)
-        ratio_with_constraint = mgr_with_constraint._current_gpu_ratio
+        ratio_with_constraint = _introspection.current_gpu_ratio(mgr_with_constraint)
 
         # Ratios should be identical since typical covers the constraint.
         for i in range(len(ratio_no_constraint)):
@@ -2389,8 +2371,8 @@ class TestInitRatioConfig(unittest.TestCase):
         cfg_yes = self._make_config(typical_step=step, enable_swa_scratch_reuse=True, **multi)
         mgr_no = KVCacheManager(cfg_no)
         mgr_yes = KVCacheManager(cfg_yes)
-        ratio_no = mgr_no._current_gpu_ratio
-        ratio_yes = mgr_yes._current_gpu_ratio
+        ratio_no = _introspection.current_gpu_ratio(mgr_no)
+        ratio_yes = _introspection.current_gpu_ratio(mgr_yes)
 
         # With scratch: PG0 (windowed) needs far fewer slots.
         self.assertLess(ratio_yes[0], ratio_no[0])
@@ -2457,7 +2439,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
 
         # Verify constraint clamping: each pool group has enough slots.
-        stats = manager._storage.get_statistics()
+        stats = _introspection.storage_statistics(manager)
         self.assertGreaterEqual(
             stats[0].total,
             slots_pg0,

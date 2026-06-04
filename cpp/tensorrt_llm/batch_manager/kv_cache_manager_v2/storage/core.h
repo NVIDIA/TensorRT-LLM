@@ -33,6 +33,8 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+class KvCacheIntrospection;
+
 // ---------------------------------------------------------------------------
 // Slot — represents ownership of one allocated slot in a pool group.
 // Mirrors _storage/_core.py::Slot.
@@ -470,6 +472,8 @@ protected:
     std::vector<std::unique_ptr<PoolGroupBase>> mPoolGroups;
 
 private:
+    friend class KvCacheIntrospection;
+
     // Distribute grains among pools within a pool group.
     // Returns {num_slots, grains_consumed}.
     static std::pair<int, int64_t> grainsToSlots(

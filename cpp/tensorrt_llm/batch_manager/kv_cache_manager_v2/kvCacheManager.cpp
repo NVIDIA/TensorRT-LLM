@@ -245,7 +245,6 @@ std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode) const
 
 std::vector<AggregatedPageDesc> KvCacheManager::getAggregatedPages(std::vector<BufferId> const& buffers) const
 {
-    // Group buffers by (lifeCycleId, poolIndex), sorted by byte offset within slot.
     using Key = std::pair<LifeCycleId, PoolIndex>;
 
     struct Entry
@@ -257,58 +256,82 @@ std::vector<AggregatedPageDesc> KvCacheManager::getAggregatedPages(std::vector<B
 
     std::map<Key, std::vector<Entry>> groups;
 
-    for (auto const& bid : buffers)
+    for (auto const& bufferId : buffers)
     {
-        auto it = mStorage->mBufferAttr.find(bid);
+        auto it = mStorage->mBufferAttr.find(bufferId);
         if (it == mStorage->mBufferAttr.end())
             throw std::out_of_range("getAggregatedPages: unknown buffer id");
+
         auto const& attr = it->second;
         size_t start = attr.offset;
         size_t end = attr.offset + attr.size;
         Key key{attr.lifeCycleId, attr.poolIndex};
-        groups[key].push_back({start, end, ExpandedBuffer{bid, attr.expansion}});
+        groups[key].push_back({start, end, ExpandedBuffer{bufferId, attr.expansion}});
     }
 
     std::vector<AggregatedPageDesc> result;
-    auto& gpuStorage = *mStorage->mLevels[0].storage; // GPU level
-
     for (auto& [key, entries] : groups)
     {
-        auto [lc, poolIdx] = key;
-        PoolGroupIndex pgIdx = static_cast<PoolGroupIndex>(mStorage->getPoolGroupIndex(lc));
+        auto [lifeCycleId, poolIdx] = key;
+        auto pgIdx = static_cast<PoolGroupIndex>(mStorage->getPoolGroupIndex(lifeCycleId));
 
-        // Sort by start offset.
         std::sort(entries.begin(), entries.end(), [](Entry const& a, Entry const& b) { return a.start < b.start; });
 
-        // Pool base = address of (pgIdx, poolIdx, slot 0).
-        MemAddress poolBase = gpuStorage.getBaseAddress(pgIdx, poolIdx, SlotId(0));
+        auto const poolBase = mStorage->getMemPoolBaseAddress(pgIdx, poolIdx);
         int stride = mStorage->slotSize(pgIdx).at(static_cast<size_t>(poolIdx));
 
-        // Merge contiguous ranges.
-        auto flush = [&](size_t cStart, size_t cEnd, std::vector<ExpandedBuffer>& bufs)
+        auto flush = [&](size_t start, size_t end, std::vector<ExpandedBuffer>& buffersInRange)
         {
-            result.push_back(AggregatedPageDesc{
-                MemAddress(poolBase + cStart), static_cast<int>(cEnd - cStart), stride, lc, std::move(bufs)});
+            result.push_back(AggregatedPageDesc{MemAddress(poolBase + start), static_cast<int>(end - start), stride,
+                lifeCycleId, std::move(buffersInRange)});
         };
 
-        size_t curStart = entries[0].start, curEnd = entries[0].end;
-        std::vector<ExpandedBuffer> curBufs{entries[0].eb};
+        size_t currentStart = entries.front().start;
+        size_t currentEnd = entries.front().end;
+        std::vector<ExpandedBuffer> currentBuffers{entries.front().eb};
         for (size_t i = 1; i < entries.size(); ++i)
         {
-            if (entries[i].start == curEnd)
+            if (entries[i].start == currentEnd)
             {
-                curEnd = entries[i].end;
-                curBufs.push_back(entries[i].eb);
+                currentEnd = entries[i].end;
+                currentBuffers.push_back(entries[i].eb);
+                continue;
             }
-            else
-            {
-                flush(curStart, curEnd, curBufs);
-                curStart = entries[i].start;
-                curEnd = entries[i].end;
-                curBufs = {entries[i].eb};
-            }
+
+            flush(currentStart, currentEnd, currentBuffers);
+            currentStart = entries[i].start;
+            currentEnd = entries[i].end;
+            currentBuffers = {entries[i].eb};
         }
-        flush(curStart, curEnd, curBufs);
+        flush(currentStart, currentEnd, currentBuffers);
+    }
+
+    return result;
+}
+
+// ---- Pool group layout -----------------------------------------------------
+
+std::vector<PoolGroupDesc> KvCacheManager::poolGroupDescs() const
+{
+    auto const& slotDescList = mStorage->slotDescList();
+    std::vector<PoolGroupDesc> result;
+    result.reserve(slotDescList.size());
+
+    for (size_t pg = 0; pg < slotDescList.size(); ++pg)
+    {
+        auto pgIdx = static_cast<PoolGroupIndex>(pg);
+        auto const& slotDesc = slotDescList.at(pg);
+        auto slotSizeList = mStorage->slotSize(pgIdx);
+
+        std::vector<PoolDesc> pools;
+        pools.reserve(slotSizeList.size());
+        for (size_t pool = 0; pool < slotSizeList.size(); ++pool)
+        {
+            auto poolIdx = static_cast<PoolIndex>(pool);
+            pools.push_back(PoolDesc{poolIdx, mStorage->getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(pool)});
+        }
+
+        result.push_back(PoolGroupDesc{pgIdx, mStorage->numSlots(pgIdx, kGpuLevel), slotDesc, std::move(pools)});
     }
 
     return result;
@@ -388,8 +411,8 @@ std::vector<BufferId> KvCacheManager::allBufferIds() const
 {
     std::vector<BufferId> result;
     result.reserve(mStorage->mBufferAttr.size());
-    for (auto const& [id, attr] : mStorage->mBufferAttr)
-        result.push_back(id);
+    for (auto const& item : mStorage->mBufferAttr)
+        result.push_back(item.first);
     return result;
 }
 

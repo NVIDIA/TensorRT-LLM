@@ -21,10 +21,10 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/introspection.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
-#include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storage/config.h"
 
 #include <cassert>
@@ -118,6 +118,24 @@ static nb::tuple reuseScopeTuple(kv::ReuseScope const& self)
     return nb::make_tuple(optionalIntToObject(self.loraId), optionalIntToObject(self.salt));
 }
 
+static nb::list committedTokensList(kv::KvCache const& self)
+{
+    nb::list result;
+    for (auto const& tok : self.committedTokens())
+    {
+        if (auto* id = std::get_if<kv::TokenId>(&tok))
+        {
+            result.append(*id);
+        }
+        else
+        {
+            auto const& d = std::get<kv::DigestToken>(tok);
+            result.append(nb::bytes(reinterpret_cast<char const*>(d.data()), d.size()));
+        }
+    }
+    return result;
+}
+
 static std::optional<int64_t> castOptionalIntAttr(nb::handle obj, char const* attrName)
 {
     nb::object attr = nb::steal(PyObject_GetAttrString(obj.ptr(), attrName));
@@ -181,12 +199,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("HOST_MEM", kv::CacheTier::HOST_MEM)
         .value("DISK", kv::CacheTier::DISK)
         .export_values();
-
-    // ---- KvCache::CommitState enum (also accessible as _KVCache.CommitState)
-    auto kvCacheCommitState = nb::enum_<kv::KvCache::CommitState>(m, "KvCacheCommitState")
-                                  .value("ALLOWED", kv::KvCache::CommitState::ALLOWED)
-                                  .value("VIRTUAL_STOP", kv::KvCache::CommitState::VIRTUAL_STOP)
-                                  .value("USER_STOP", kv::KvCache::CommitState::USER_STOP);
 
     // ---- KvCache::Status enum (also accessible as _KVCache.Status) ---------
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")
@@ -347,6 +359,57 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return nb::not_implemented();
             },
             nb::arg("other"));
+
+    // ---- Storage layout structs -------------------------------------------
+    nb::class_<kv::CoalescedBuffer>(m, "CoalescedBuffer")
+        .def_ro("single_buffer_size", &kv::CoalescedBuffer::singleBufferSize)
+        .def_ro("buffer_ids", &kv::CoalescedBuffer::bufferIds)
+        .def_prop_ro("size", &kv::CoalescedBuffer::size)
+        .def_prop_ro("num_buffers", &kv::CoalescedBuffer::numBuffers);
+
+    nb::class_<kv::SlotDescVariant>(m, "SlotDescVariant")
+        .def_prop_ro("layer_group_id", [](kv::SlotDescVariant const& self) { return self.lifeCycleId; })
+        .def_ro("coalesced_buffers", &kv::SlotDescVariant::coalescedBuffers)
+        .def_prop_ro("slot_size_list",
+            [](kv::SlotDescVariant const& self)
+            {
+                auto sizes = self.slotSizeList();
+                return std::vector<int>(sizes.begin(), sizes.end());
+            });
+
+    nb::class_<kv::SlotDesc>(m, "SlotDesc")
+        .def_ro("variants", &kv::SlotDesc::variants)
+        .def_prop_ro("slot_size_list",
+            [](kv::SlotDesc const& self)
+            {
+                auto sizes = self.slotSizeList();
+                return std::vector<int>(sizes.begin(), sizes.end());
+            });
+
+    nb::class_<kv::PoolDesc>(m, "PoolDesc")
+        .def_ro("pool_index", &kv::PoolDesc::poolIndex)
+        .def_ro("base_address", &kv::PoolDesc::baseAddress)
+        .def_ro("slot_bytes", &kv::PoolDesc::slotBytes);
+
+    nb::class_<kv::PoolGroupDesc>(m, "PoolGroupDesc")
+        .def_ro("pool_group_index", &kv::PoolGroupDesc::poolGroupIndex)
+        .def_ro("num_slots", &kv::PoolGroupDesc::numSlots)
+        .def_ro("slot_desc", &kv::PoolGroupDesc::slotDesc)
+        .def_ro("pools", &kv::PoolGroupDesc::pools);
+
+    nb::class_<kv::ExpandedBuffer>(m, "ExpandedBuffer")
+        .def_ro("id", &kv::ExpandedBuffer::id)
+        .def_ro("expansion", &kv::ExpandedBuffer::expansion)
+        .def("__eq__",
+            [](kv::ExpandedBuffer const& a, kv::ExpandedBuffer const& b)
+            { return a.id == b.id && a.expansion == b.expansion; });
+
+    nb::class_<kv::AggregatedPageDesc>(m, "AggregatedPageDesc")
+        .def_ro("base", &kv::AggregatedPageDesc::base)
+        .def_ro("size", &kv::AggregatedPageDesc::size)
+        .def_ro("stride", &kv::AggregatedPageDesc::stride)
+        .def_ro("layer_group_id", &kv::AggregatedPageDesc::layerGroupId)
+        .def_ro("buffers", &kv::AggregatedPageDesc::buffers);
 
     // ---- Config structs ----------------------------------------------------
     // Helper: add __copy__ and __deepcopy__ for aggregate config types.
@@ -523,7 +586,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("cuda_stream") = nb::none())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
         .def("prefetch", &kv::KvCache::prefetch, nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
-        .def("_debug_active_page_stats", &kv::KvCache::debugActivePageStats, nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",
@@ -606,28 +668,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "cuda_stream",
             [](kv::KvCache const& self) -> intptr_t { return reinterpret_cast<intptr_t>(self.cudaStream()); },
             [](kv::KvCache& self, intptr_t stream) { self.setCudaStream(reinterpret_cast<CUstream>(stream)); })
-        .def_prop_ro("_commit_state", &kv::KvCache::commitState)
         .def_rw("id", &kv::KvCache::id)
         .def_prop_ro(
             "manager", [](kv::KvCache& self) -> kv::KvCacheManager& { return self.manager(); },
             nb::rv_policy::reference_internal)
-        .def_prop_ro("_committed_tokens",
-            [](kv::KvCache const& self)
-            {
-                nb::list result;
-                for (auto const& tok : self.committedTokens())
-                {
-                    if (auto* id = std::get_if<kv::TokenId>(&tok))
-                        result.append(*id);
-                    else
-                    {
-                        auto const& d = std::get<kv::DigestToken>(tok);
-                        result.append(nb::bytes(reinterpret_cast<char const*>(d.data()), d.size()));
-                    }
-                }
-                return result;
-            })
-        .def_prop_ro("_reuse_scope", &kv::KvCache::reuseScope)
+        .def_prop_ro("committed_tokens", &committedTokensList)
+        .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
         .def(
             "get_aggregated_page_indices",
             [](kv::KvCache const& self, kv::LayerGroupId lgId, kv::BeamIndex beamIdx, bool validOnly)
@@ -663,42 +709,37 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("beam_idx"), nb::arg("layer_group_id"), nb::arg("buf"));
 
-    // Make Status and CommitState accessible as _KVCache.Status / _KVCache.CommitState
+    // Make Status accessible as _KVCache.Status.
     m.attr("_KVCache").attr("Status") = kvCacheStatus;
-    m.attr("_KVCache").attr("CommitState") = kvCacheCommitState;
 
-    // ---- StorageStatistics ---------------------------------------------------
-    nb::class_<kv::StorageStatistics>(m, "StorageStatistics")
+    // ---- Introspection -------------------------------------------------------
+    auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
+    nb::class_<kv::StorageStatistics>(mIntrospection, "StorageStatistics")
         .def_ro("slot_sizes", &kv::StorageStatistics::slotSizes)
         .def_ro("total", &kv::StorageStatistics::total)
         .def_ro("free", &kv::StorageStatistics::free)
         .def_ro("evictable", &kv::StorageStatistics::evictable)
         .def_prop_ro("available", &kv::StorageStatistics::available)
         .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
-
-    // ---- StorageManager (partial — for test introspection) -----------------
-    nb::class_<kv::StorageManager>(m, "StorageManager")
-        .def(
-            "get_statistics",
-            [](kv::StorageManager const& self, kv::CacheLevel level)
-            {
-                std::vector<kv::StorageStatistics> result;
-                int numPg = self.numPoolGroups();
-                for (int pg = 0; pg < numPg; ++pg)
-                    result.push_back(self.getStatistics(level, static_cast<kv::PoolGroupIndex>(pg)));
-                return result;
-            },
-            nb::arg("level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>())
-        .def(
-            "get_ratio_list",
-            [](kv::StorageManager const& self, kv::CacheLevel level) { return self.getRatioList(level); },
-            nb::arg("level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>())
-        .def(
-            "get_utilization",
-            [](kv::StorageManager const& self, kv::CacheLevel level) { return self.getUtilization(level); },
-            nb::arg("level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("num_pool_groups", [](kv::StorageManager const& self) { return self.numPoolGroups(); })
-        .def_prop_ro("num_cache_levels", [](kv::StorageManager const& self) { return self.numCacheLevels(); });
+    mIntrospection.def("active_page_stats", &kv::KvCacheIntrospection::activePageStats, nb::arg("kv_cache"),
+        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
+        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("is_commit_allowed", &kv::KvCacheIntrospection::isCommitAllowed, nb::arg("kv_cache"),
+        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("current_gpu_ratio", &kv::KvCacheIntrospection::currentGpuRatio, nb::arg("manager"),
+        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("storage_statistics", &kv::KvCacheIntrospection::storageStatistics, nb::arg("manager"),
+        nb::arg("cache_level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("storage_utilization", &kv::KvCacheIntrospection::storageUtilization, nb::arg("manager"),
+        nb::arg("cache_level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("grains_for_slots", &kv::KvCacheIntrospection::grainsForSlots, nb::arg("num_slots"),
+        nb::arg("slot_size_list"), nb::arg("granularity"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("grains_to_slots", &kv::KvCacheIntrospection::grainsToSlots, nb::arg("pg_grains"),
+        nb::arg("slot_size_list"), nb::arg("granularity"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("ratio_to_slot_count_list", &kv::KvCacheIntrospection::ratioToSlotCountList, nb::arg("quota"),
+        nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"), nb::arg("min_slots"),
+        nb::call_guard<nb::gil_scoped_release>());
 
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
@@ -747,8 +788,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("best_efforts") = false, nb::call_guard<nb::gil_scoped_release>())
         .def("get_quota", &kv::KvCacheManager::getQuota, nb::arg("cache_level"))
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
+        .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", &kv::KvCacheManager::cacheTierList)
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
+        .def_prop_ro("pool_group_descs", &kv::KvCacheManager::poolGroupDescs)
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
@@ -775,40 +818,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_aggregated_pages",
             [](kv::KvCacheManager const& self, nb::object buffers)
             {
-                // Convert Python iterable → C++ vector (GIL held).
                 std::vector<kv::BufferId> ids;
                 for (auto item : nb::cast<nb::iterable>(buffers))
                     ids.push_back(nb::cast<kv::BufferId>(item));
-                // Release GIL for the pure C++ computation.
-                nb::gil_scoped_release rel;
+                nb::gil_scoped_release release;
                 return self.getAggregatedPages(ids);
             },
             nb::arg("buffers"))
         .def("adjust", &kv::KvCacheManager::adjust, nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("need_adjustment", &kv::KvCacheManager::needAdjustment)
-        .def_prop_ro(
-            "_radix_tree", [](kv::KvCacheManager& self) -> kv::BlockRadixTree& { return self.radixTree(); },
-            nb::rv_policy::reference_internal)
-        .def_prop_ro(
-            "_current_gpu_ratio", [](kv::KvCacheManager& self) { return self.storage().getRatioList(kv::kGpuLevel); })
-        .def_prop_ro(
-            "_storage", [](kv::KvCacheManager& self) -> kv::StorageManager& { return self.storage(); },
-            nb::rv_policy::reference_internal);
-
-    // ---- ExpandedBuffer / AggregatedPageDesc --------------------------------
-    nb::class_<kv::ExpandedBuffer>(m, "ExpandedBuffer")
-        .def_ro("id", &kv::ExpandedBuffer::id)
-        .def_ro("expansion", &kv::ExpandedBuffer::expansion)
-        .def("__eq__",
-            [](kv::ExpandedBuffer const& a, kv::ExpandedBuffer const& b)
-            { return a.id == b.id && a.expansion == b.expansion; });
-
-    nb::class_<kv::AggregatedPageDesc>(m, "AggregatedPageDesc")
-        .def_ro("base", &kv::AggregatedPageDesc::base)
-        .def_ro("size", &kv::AggregatedPageDesc::size)
-        .def_ro("stride", &kv::AggregatedPageDesc::stride)
-        .def_ro("layer_group_id", &kv::AggregatedPageDesc::layerGroupId)
-        .def_ro("buffers", &kv::AggregatedPageDesc::buffers);
+        .def_prop_ro("need_adjustment", &kv::KvCacheManager::needAdjustment);
 
     // ---- PageIndexConverter ------------------------------------------------
     nb::class_<kv::PageIndexConverter>(m, "PageIndexConverter")
@@ -831,89 +849,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return self(baseIndices, indexMode, scratch);
             },
             nb::arg("base_indices"), nb::arg("index_mode") = nb::none(), nb::arg("scratch") = nb::none());
-
-    // ---- Page (read-only introspection, used via block.storage) ---------------
-    // status is returned as int so it compares equal with the Python IntEnum PageStatus.
-    nb::class_<kv::Page>(m, "Page")
-        .def_prop_ro("status", [](kv::Page const& self) { return static_cast<int>(self.status()); })
-        .def_prop_ro("scheduled_for_eviction", &kv::Page::scheduledForEviction);
-
-    // ---- Block (radix-tree node) --------------------------------------------
-    nb::class_<kv::Block>(m, "Block")
-        .def_prop_ro("next",
-            [](kv::Block const& self)
-            {
-                nb::dict d;
-                for (auto const& [key, sp] : self.next)
-                    d[nb::bytes(reinterpret_cast<char const*>(key.data()), key.size())] = sp;
-                return d;
-            })
-        .def_prop_ro("prev",
-            [](kv::Block& self) -> nb::object
-            {
-                if (!self.prev)
-                    return nb::none();
-                if (self.prev->type() == kv::NodeBase::Type::kROOT_BLOCK)
-                    return nb::cast(static_cast<kv::RootBlock*>(self.prev), nb::rv_policy::reference);
-                return nb::cast(toStd(static_cast<kv::Block*>(self.prev)->sharedFromThis()));
-            })
-        .def_prop_ro("storage",
-            [](kv::Block const& self)
-            {
-                nb::list lst;
-                for (auto* page : self.storage)
-                {
-                    if (page == nullptr)
-                    {
-                        lst.append(nb::none());
-                    }
-                    else
-                    {
-                        kv::WeakPtr<kv::Page> weakPage = page->sharedFromThis();
-                        // Return a callable: page() returns the Page object.
-                        // This matches the rawref.ref[Page] protocol used in Python.
-                        lst.append(nb::cpp_function(
-                            [weakPage]() -> nb::object
-                            {
-                                auto strongPage = weakPage.lock();
-                                if (strongPage)
-                                {
-                                    return nb::cast(toStd(strongPage));
-                                }
-                                return nb::none();
-                            }));
-                    }
-                }
-                return lst;
-            });
-
-    // ---- RootBlock (radix-tree root node) -----------------------------------
-    nb::class_<kv::RootBlock>(m, "RootBlock")
-        .def_ro("reuse_scope", &kv::RootBlock::reuseScope)
-        .def_prop_ro("next",
-            [](kv::RootBlock const& self)
-            {
-                nb::dict d;
-                for (auto const& [key, sp] : self.next)
-                    d[nb::bytes(reinterpret_cast<char const*>(key.data()), key.size())] = sp;
-                return d;
-            });
-
-    // ---- BlockRadixTree (read-only introspection) ---------------------------
-    nb::class_<kv::BlockRadixTree>(m, "BlockRadixTree")
-        .def_prop_ro("tokens_per_block", &kv::BlockRadixTree::tokensPerBlock)
-        .def_prop_ro("num_life_cycles", &kv::BlockRadixTree::numLifeCycles)
-        .def_prop_ro("next",
-            [](kv::BlockRadixTree const& self)
-            {
-                nb::dict d;
-                for (auto const& [key, rb] : self.roots())
-                {
-                    d[nb::bytes(reinterpret_cast<char const*>(key.data()), key.size())]
-                        = nb::cast(rb.get(), nb::rv_policy::reference);
-                }
-                return d;
-            });
 }
 
 } // namespace tensorrt_llm::nanobind::batch_manager

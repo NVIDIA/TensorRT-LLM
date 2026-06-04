@@ -15,10 +15,10 @@
 
 import time
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Iterable, Iterator, cast
+from typing import Iterator, cast
 
 from .. import rawref
 from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
@@ -39,7 +39,7 @@ from .._common import (
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
-from .._storage._config import BufferId, create_storage_config
+from .._storage._config import BufferId, SlotDesc, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
 from .._utils import (
@@ -60,15 +60,18 @@ from ._moving_average import MovingAverage
 
 
 @dataclass(slots=True, frozen=True)
-class MemoryPoolDesc:
-    base: MemAddress
-    page_size: int
+class PoolDesc:
+    pool_index: PoolIndex
+    base_address: MemAddress
+    slot_bytes: int
 
 
 @dataclass(slots=True, frozen=True)
-class MemoryPoolGroupDesc:
-    num_pages: int
-    pools: TypedIndexList[PoolIndex, MemoryPoolDesc]
+class PoolGroupDesc:
+    pool_group_index: PoolGroupIndex
+    num_slots: int
+    slot_desc: SlotDesc
+    pools: TypedIndexList[PoolIndex, PoolDesc]
 
 
 @dataclass(slots=True, frozen=True)
@@ -494,53 +497,72 @@ class KVCacheManager:
         Returns:
             A iterator of aggregated buffers.
         """
-        # Group by (life_cycle, pool_index)
         groups = defaultdict[tuple[LifeCycleId, PoolIndex], list[tuple[Range, ExpandedBuffer]]](
             list[tuple[Range, ExpandedBuffer]]
         )
         buffer_attr_map = self._storage._buffer_attr
-        for b in buffers:
-            attr = buffer_attr_map[b]
-            size = attr.size
+        for buffer in buffers:
+            attr = buffer_attr_map[buffer]
             start = attr.offset
             key = (attr.life_cycle_id, attr.pool_index)
-            groups[key].append((Range(start, start + size), ExpandedBuffer(b, attr.expansion)))
+            groups[key].append(
+                (Range(start, start + attr.size), ExpandedBuffer(buffer, attr.expansion))
+            )
 
         storage = self._storage._levels[GPU_LEVEL].storage
         lc2pg = self._storage._life_cycle_grouping
         for (lc, pool_idx), group in groups.items():
             pg_idx = lc2pg[lc]
-            # Sort by start offset
-            group.sort(key=lambda x: x[0].start)
-            # Merge contiguous
+            group.sort(key=lambda item: item[0].start)
             current_start, current_end, current_buffers = (
                 group[0][0].start,
                 group[0][0].end,
                 [group[0][1]],
             )
-            # cache stride and pool_base for this group
             stride = storage.slot_size(pg_idx)[pool_idx]
             pool_base = int(cast(int, storage.slot_address(pg_idx, pool_idx, SlotId(0))))
-            for i in range(1, len(group)):
-                next_range, next_buf = group[i]
+            for next_range, next_buffer in group[1:]:
                 if next_range.start == current_end:
                     current_end = next_range.end
-                    current_buffers.append(next_buf)
-                else:
-                    base = MemAddress(pool_base + current_start)
-                    yield AggregatedPageDesc(
-                        base, current_end - current_start, stride, lc, tuple(current_buffers)
-                    )
-                    current_start, current_end, current_buffers = (
-                        next_range.start,
-                        next_range.end,
-                        [next_buf],
-                    )
-            # Flush last
+                    current_buffers.append(next_buffer)
+                    continue
+
+                base = MemAddress(pool_base + current_start)
+                yield AggregatedPageDesc(
+                    base, current_end - current_start, stride, lc, tuple(current_buffers)
+                )
+                current_start, current_end, current_buffers = (
+                    next_range.start,
+                    next_range.end,
+                    [next_buffer],
+                )
             base = MemAddress(pool_base + current_start)
             yield AggregatedPageDesc(
                 base, current_end - current_start, stride, lc, tuple(current_buffers)
             )
+
+    @property
+    def pool_group_descs(self) -> TypedIndexList[PoolGroupIndex, PoolGroupDesc]:
+        storage = self._storage
+
+        def get_pool_group_desc(pg_idx: PoolGroupIndex) -> PoolGroupDesc:
+            slot_size_list = storage.slot_size(pg_idx)
+            pools = make_typed(
+                lambda pool_idx: PoolDesc(
+                    pool_index=pool_idx,
+                    base_address=storage.get_mem_pool_base_address(pg_idx, pool_idx),
+                    slot_bytes=slot_size_list[pool_idx],
+                ),
+                storage.num_pools(pg_idx),
+            )
+            return PoolGroupDesc(
+                pool_group_index=pg_idx,
+                num_slots=storage.num_slots(pg_idx),
+                slot_desc=storage._slot_desc_list[pg_idx],
+                pools=pools,
+            )
+
+        return make_typed(get_pool_group_desc, storage.num_pool_groups)
 
     @property
     def _current_gpu_ratio(self) -> TypedIndexList[PoolGroupIndex, float]:

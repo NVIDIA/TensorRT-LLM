@@ -28,7 +28,6 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -36,6 +35,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // Forward declarations.
+class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
 struct ScratchDesc;
@@ -266,11 +266,6 @@ public:
         return mBlocks;
     }
 
-    using ActivePageStats = std::tuple<std::vector<int>, std::vector<int>>;
-
-    // Test/debug introspection: active pages and unscheduled evictable pages by cache level.
-    ActivePageStats debugActivePageStats() const;
-
     int numCommittedBlocks() const noexcept
     {
         return mNumCommittedBlocks;
@@ -391,6 +386,8 @@ public:
     std::optional<int64_t> id; // opaque identifier (mirrors Python's id field)
 
 private:
+    friend class KvCacheIntrospection;
+
     // Activate: lock all pages to GPU. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();

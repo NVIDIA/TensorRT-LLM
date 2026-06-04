@@ -24,11 +24,7 @@ _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
 if _BACKEND == "python":
     from . import rawref  # noqa: F401
-    from ._block_radix_tree import (  # noqa: F401
-        BlockRadixTree,
-        ReuseScope,
-        gen_multimodal_cache_key_tokens,
-    )
+    from ._block_radix_tree import ReuseScope, gen_multimodal_cache_key_tokens  # noqa: F401
     from ._common import (  # noqa: F401
         BAD_PAGE_INDEX,
         GPU_LEVEL,
@@ -67,6 +63,8 @@ if _BACKEND == "python":
         ExpandedBuffer,
         KVCacheManager,
         PageIndexConverter,
+        PoolDesc,
+        PoolGroupDesc,
         ScratchDesc,
         _KVCache,
     )
@@ -74,7 +72,11 @@ if _BACKEND == "python":
     from ._exceptions import OutOfPagesError  # noqa: F401
     from ._life_cycle_registry import LayerGroupId, LifeCycleId  # noqa: F401
     from ._storage import BufferId  # noqa: F401
+    from ._storage._config import CoalescedBuffer, SlotDesc, SlotDescVariant  # noqa: F401
+    from ._storage._core import PoolGroupIndex, PoolIndex  # noqa: F401
     from ._utils import HalfOpenRange, exact_div, typed_range  # noqa: F401
+
+    _cpp_introspection = None
 else:
 
     class ReuseScope(NamedTuple):
@@ -112,12 +114,13 @@ else:
     AggregatedPageDesc = _cpp.AggregatedPageDesc
     AttentionLayerConfig = _cpp.AttentionLayerConfig
     BatchDesc = _cpp.BatchDesc
-    BlockRadixTree = _cpp.BlockRadixTree
     BufferConfig = _cpp.BufferConfig
     BufferId = _cpp.BufferId
+    CoalescedBuffer = _cpp.CoalescedBuffer
     CacheTier = _cpp.CacheTier
     DiskCacheTierConfig = _cpp.DiskCacheTierConfig
     GpuCacheTierConfig = _cpp.GpuCacheTierConfig
+    ExpandedBuffer = _cpp.ExpandedBuffer
     HostCacheTierConfig = _cpp.HostCacheTierConfig
     KVCacheDesc = _cpp.KVCacheDesc
     KVCacheManager = _cpp.KVCacheManager
@@ -125,10 +128,14 @@ else:
     KvCacheStatus = _cpp.KvCacheStatus
     OutOfPagesError = _cpp.OutOfPagesError
     PageStatus = _cpp.PageStatus
+    PoolDesc = _cpp.PoolDesc
+    PoolGroupDesc = _cpp.PoolGroupDesc
+    SlotDesc = _cpp.SlotDesc
+    SlotDescVariant = _cpp.SlotDescVariant
     SsmLayerConfig = _cpp.SsmLayerConfig
     _KVCache = _cpp._KVCache
+    _cpp_introspection = getattr(_cpp, "_introspection", None)
 
-    ExpandedBuffer = getattr(_cpp, "ExpandedBuffer", None)
     HelixConfig = getattr(_cpp, "HelixConfig", None)
     PageIndexConverter = getattr(_cpp, "PageIndexConverter", None)
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
@@ -145,6 +152,8 @@ else:
     LayerId = int
     LifeCycleId = int
     MemAddress = int
+    PoolGroupIndex = int
+    PoolIndex = int
     Priority = int
     SlidingWindowSize = Optional[int]
     TokenId = int
@@ -205,9 +214,9 @@ __all__ = [
     "BAD_PAGE_INDEX",
     "BatchDesc",
     "BeamIndex",
-    "BlockRadixTree",
     "BufferConfig",
     "BufferId",
+    "CoalescedBuffer",
     "CacheLevel",
     "CacheTier",
     "CacheTierConfig",
@@ -234,10 +243,16 @@ __all__ = [
     "PageIndexConverter",
     "PageIndexMode",
     "PageStatus",
+    "PoolDesc",
+    "PoolGroupDesc",
+    "PoolGroupIndex",
+    "PoolIndex",
     "Priority",
     "ReuseScope",
     "ScratchDesc",
     "SlidingWindowSize",
+    "SlotDesc",
+    "SlotDescVariant",
     "SsmLayerConfig",
     "SwaScratchReuseConfig",
     "TokenId",

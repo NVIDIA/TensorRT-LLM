@@ -167,6 +167,11 @@ public:
         return static_cast<int>(mSlotDescList.size());
     }
 
+    std::vector<SlotDesc> const& slotDescList() const noexcept
+    {
+        return mSlotDescList;
+    }
+
     int numCacheLevels() const noexcept
     {
         return static_cast<int>(mLevels.size());
