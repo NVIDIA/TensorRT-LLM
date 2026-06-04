@@ -669,8 +669,16 @@ def llms_and_encoder(
     pd_disagg: bool,
 ) -> Generator[tuple[tuple[LLM, LLM | None], MultimodalEncoder], None, None]:
     """Get LLM instances and a multimodal encoder, initialized in parallel."""
-    if model_dir == _NANO_V2_VL_FP8_DIR and get_sm_version() < 90:
-        pytest.skip("Nemotron-Nano-12B-v2-VL FP8 requires Hopper+ (SM90)")
+    if model_dir == _NANO_V2_VL_FP8_DIR:
+        if get_sm_version() < 90:
+            pytest.skip("Nemotron-Nano-12B-v2-VL FP8 requires Hopper+ (SM90)")
+        if pd_disagg:
+            # pd_disagg instantiates ref_llm + llm_decode + encoder together here,
+            # and the test body then adds a prefill_llm worker. Three simultaneous
+            # 12B FP8 instances OOM a single 80GB H100 during KV-cache estimation,
+            # so single-GPU CI covers only the no_pd_disagg encode path.
+            pytest.skip("Nemotron-Nano-12B-v2-VL FP8 pd_disagg needs >1 H100 "
+                        "(3 simultaneous 12B instances OOM a single 80GB GPU)")
     # Several tests need these instances live together; building them as one fixture lets setup overlap.
     encoder_max_batch_size = _get_encoder_max_batch_size(model_dir)
     initializers = _create_llm_initializers(model_dir, pd_disagg)
