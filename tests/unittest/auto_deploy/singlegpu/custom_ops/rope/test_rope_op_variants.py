@@ -30,7 +30,8 @@ torch.manual_seed(1234)
 @pytest.mark.parametrize(
     "dtype,atol,rtol",
     [
-        (torch.bfloat16, 1e-4, 1e-4),
+        # FlashInfer and the HF reference can differ by one bfloat16 bin (ULP).
+        (torch.bfloat16, 1e-4, 1e-2),
         (torch.float16, 5e-4, 5e-4),
     ],
     ids=["bfloat16", "float16"],  # q/k must be in half precision
