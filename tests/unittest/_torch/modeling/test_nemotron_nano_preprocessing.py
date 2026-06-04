@@ -431,9 +431,9 @@ class TestNanoV2VLInputProcessor:
                 "_expand_mixed_prompt_text_for_mm",
                 return_value=(torch.zeros(1, 4, dtype=torch.long), None),
             ),
-            mock.patch(
-                "tensorrt_llm._torch.models.modeling_nemotron_nano."
-                "find_multimodal_embedding_lengths",
+            mock.patch.object(
+                proc,
+                "_find_multimodal_embedding_lengths",
                 return_value=[],
             ),
         ):
@@ -1950,7 +1950,7 @@ class TestMixedModalityAudioHoist:
          single-modality video path injects via `_extract_audio_from_video`), and
       2. register the extracted audio as a top-level `mm_data["audio"]` item,
     so the scanner emits `(video, k), (audio, k)` at the right ranks and
-    `find_multimodal_embedding_lengths` splits the budget into separate
+    `_find_multimodal_embedding_lengths` splits the budget into separate
     vision-only video + audio slots.
     """
 
@@ -2576,7 +2576,7 @@ class TestVideoWithEmbeddedAudioHoist:
         )
         # Per-slot budgets must equal the multimodal-token count the REAL
         # `_expand_mixed_prompt_text_for_mm` emits (the only un-mocked count path
-        # here), so `find_multimodal_embedding_lengths` reconciles. For this proc
+        # here), so `_find_multimodal_embedding_lengths` reconciles. For this proc
         # (`video_target_num_patches=256`, 2 frames) the video slot is 136 and the
         # audio slot is 6. The video count is 132 vision tokens (2 tubelets x [64
         # context + 2 `<img>`/`</img>` specials]) plus 4 from this suite's Mock
