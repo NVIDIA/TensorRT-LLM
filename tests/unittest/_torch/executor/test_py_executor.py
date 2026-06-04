@@ -7,8 +7,11 @@ to PyExecutor, including:
 - waiting_queue management
 - is_shutdown state management
 - expected_num_active_requests tracking
+- Event-loop crash propagation to await_responses callers (nvbug 6038228)
 """
 
+import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -383,3 +386,168 @@ class TestComputeScheduledTokens:
             context_chunk_size=50, context_remaining_length=50, estimated_reusable_tokens=10
         )
         assert PyExecutor._compute_scheduled_tokens([req0, req1], []) == 20 + 40
+
+
+# ---------------------------------------------------------------------------
+# Tests for event-loop crash propagation to _await_single_response callers.
+#
+# nvbug 6038228: when PyExecutor._event_loop_wrapper crashed (e.g. KV cache
+# OOM), the main thread parked in _await_single_response would block forever
+# because is_shutdown was never set / observed by the wait predicate. The fix
+# stashes the original error in self._event_loop_error, sets is_shutdown +
+# notifies in _executor_loop_cleanup, and re-raises the error from
+# _await_single_response so callers exit promptly with a meaningful message.
+#
+# We exercise the actual PyExecutor methods by binding them to a lightweight
+# stub that carries only the attributes those methods touch.
+# ---------------------------------------------------------------------------
+
+
+class _ResponseStub:
+    """Minimal stub carrying only the state used by _await_single_response."""
+
+    def __init__(self):
+        self.response_lock = threading.Lock()
+        self.response_cv = threading.Condition(self.response_lock)
+        self.responses = {}
+        self.is_shutdown = False
+        self._event_loop_error = None
+
+    # Bind the real production method so the test exercises real code.
+    _await_single_response = PyExecutor._await_single_response
+
+
+class TestAwaitSingleResponseShutdown:
+    """_await_single_response must not block forever when the event loop dies."""
+
+    def test_returns_response_when_available(self):
+        """Normal path: response exists, returned and consumed."""
+        stub = _ResponseStub()
+        stub.responses = {7: ["resp_a", "resp_b"]}
+
+        result = stub._await_single_response(id=7, timeout=1.0)
+        assert result == ["resp_a", "resp_b"]
+        assert 7 not in stub.responses
+
+    def test_returns_response_even_during_shutdown(self):
+        """If a response was enqueued before shutdown it is still returned;
+        the shutdown branch only fires when nothing is queued for this id."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+        stub._event_loop_error = RuntimeError("crash")
+        stub.responses = {7: ["resp"]}
+
+        result = stub._await_single_response(id=7, timeout=1.0)
+        assert result == ["resp"]
+
+    def test_raises_on_shutdown_with_event_loop_error(self):
+        """When the event loop crashed, _await_single_response surfaces the
+        original error as RuntimeError instead of hanging."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+        stub._event_loop_error = RuntimeError("KV cache OOM")
+
+        with pytest.raises(RuntimeError, match="Event loop terminated"):
+            stub._await_single_response(id=42, timeout=1.0)
+
+    def test_raises_on_shutdown_without_event_loop_error(self):
+        """Shutdown without a stored error still raises rather than blocking
+        — distinguishes "shutdown" from "timed out without shutdown"."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+
+        with pytest.raises(RuntimeError, match="Event loop shut down"):
+            stub._await_single_response(id=42, timeout=1.0)
+
+    def test_returns_empty_on_timeout(self):
+        """Pre-fix behaviour: a bare timeout (no shutdown, no response) used
+        to KeyError. The fix returns an empty list to match the documented
+        timeout contract used elsewhere in the executor API."""
+        stub = _ResponseStub()
+        result = stub._await_single_response(id=99, timeout=0.01)
+        assert result == []
+
+    def test_wakes_up_when_shutdown_set_from_another_thread(self):
+        """Real-world scenario: main thread is parked in
+        _await_single_response while the event-loop thread crashes and
+        triggers _executor_loop_cleanup, which sets is_shutdown + notifies.
+        The waiter must wake and re-raise."""
+        stub = _ResponseStub()
+        original_error = RuntimeError("simulated event-loop crash")
+
+        def crash_after_delay():
+            time.sleep(0.05)
+            stub._event_loop_error = original_error
+            with stub.response_cv:
+                stub.is_shutdown = True
+                stub.response_cv.notify_all()
+
+        crash_thread = threading.Thread(target=crash_after_delay, daemon=True)
+        crash_thread.start()
+
+        with pytest.raises(RuntimeError, match="Event loop terminated"):
+            stub._await_single_response(id=1, timeout=5.0)
+
+        crash_thread.join(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _executor_loop_cleanup ordering (notify before PP wait).
+# ---------------------------------------------------------------------------
+
+
+class _CleanupStub:
+    """Stub for _executor_loop_cleanup: records the order in which the
+    shutdown notification and PP-handle wait happen."""
+
+    def __init__(self, pp_handles_raise=False):
+        self.response_lock = threading.Lock()
+        self.response_cv = threading.Condition(self.response_lock)
+        self.is_shutdown = False
+        self.shutdown_event = threading.Event()
+        self.num_micro_batches = 1
+        self.send_handles = {}
+        self.send_schedule_handles = {}
+        self.send_expected_batch_num_handles = {}
+        self._pp_handles_raise = pp_handles_raise
+        self._events: list = []
+
+        original_notify = self.response_cv.notify_all
+
+        def record_notify():
+            self._events.append("notify_all")
+            original_notify()
+
+        self.response_cv.notify_all = record_notify
+
+    def wait_on_pp_send_handles(self, handles, idx):
+        self._events.append(f"wait_pp_{idx}")
+        if self._pp_handles_raise:
+            raise RuntimeError("PP send handle in bad state")
+
+    _executor_loop_cleanup = PyExecutor._executor_loop_cleanup
+
+
+class TestExecutorLoopCleanup:
+    """Cleanup must wake waiters BEFORE doing potentially-blocking PP work,
+    and a PP-handle exception must not skip the shutdown notification."""
+
+    def test_notify_happens_before_pp_wait(self):
+        stub = _CleanupStub()
+        stub._executor_loop_cleanup()
+
+        assert stub._events[0] == "notify_all"
+        assert "wait_pp_0" in stub._events
+        assert stub._events.index("notify_all") < stub._events.index("wait_pp_0")
+        assert stub.is_shutdown is True
+        assert stub.shutdown_event.is_set()
+
+    def test_pp_wait_exception_does_not_skip_notify(self):
+        """If wait_on_pp_send_handles raises, the shutdown notification
+        must still have happened (it ran first), and cleanup must not
+        propagate the error so the executor thread terminates cleanly."""
+        stub = _CleanupStub(pp_handles_raise=True)
+        stub._executor_loop_cleanup()
+
+        assert stub.is_shutdown is True
+        assert "notify_all" in stub._events

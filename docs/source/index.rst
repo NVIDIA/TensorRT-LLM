@@ -23,6 +23,7 @@ Welcome to TensorRT LLM's Documentation!
    :name: Deployment Guide
 
    examples/llm_api_examples.rst
+   examples/visual_gen_examples.rst
    examples/trtllm_serve_examples
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst

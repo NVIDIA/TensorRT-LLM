@@ -103,7 +103,7 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config, disabl
 
 ### MTP
 
-MTP is currently only supported by Deepseek. MTP can be tuned with the following configuration options:
+MTP is supported by DeepSeek models and other architectures that ship native MTP modules (including Step-3.x). MTP can be tuned with the following configuration options:
 
 * `max_draft_len`: Maximum draft candidate length.
 * `num_nextn_predict_layers`: Number of MTP modules to use. Currently must match `max_draft_len`.

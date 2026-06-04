@@ -316,7 +316,6 @@ def get_model_yaml_config(model_label: str,
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:2000,500-gpus:4',
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:4',
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:512,32-gpus:4',
-                'llama_v3.1_405b_instruct_fp4',
                 'llama_v4_scout_17b_16e_instruct_fp4',
                 'llama_v4_maverick_17b_128e_instruct_fp8'
             ],
@@ -475,9 +474,12 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Nemotron-3-Super-120B-NVFP4: (no MTP)
+        # Nemotron-3-Super-120B-NVFP4 (streaming/low-latency variant for spark perf)
+        # Streaming serve cases use small cuda_graph batch and no attention DP for latency.
         {
-            'patterns': ['nemotron_3_super_120b_nvfp4-'],
+            'patterns': [
+                'nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-',
+            ],
             'config': {
                 'max_seq_len': 1048576,
                 'enable_chunked_prefill': True,
@@ -498,9 +500,11 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Nemotron-3-Super-120B-NVFP4: MTP speculative decoding
+        # Nemotron-3-Super-120B-NVFP4_MTP (streaming/low-latency variant for spark perf)
         {
-            'patterns': ['nemotron_3_super_120b_nvfp4_mtp'],
+            'patterns': [
+                'nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-',
+            ],
             'config': {
                 'max_seq_len': 1048576,
                 'enable_chunked_prefill': True,
@@ -512,6 +516,62 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_config': {
                     'enable_padding': True,
                     'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3,
+                    'allow_advanced_sampling': True,
+                },
+            }
+        },
+        # Nemotron-3-Super-120B-NVFP4 (throughput variant, aligned with curated yaml)
+        # Non-streaming cases use attention DP and larger cuda_graph batch for throughput.
+        # Pattern is intentionally narrowed so it does NOT match the
+        # 'serve-pytorch-streaming-' streaming variant above.
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4-serve-pytorch-float'],
+            'config': {
+                'max_seq_len': 1048576,
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': True,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 256,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+            }
+        },
+        # Nemotron-3-Super-120B-NVFP4_MTP (throughput variant with MTP spec decoding)
+        # Pattern is intentionally narrowed so it does NOT match the
+        # '_mtp-serve-pytorch-streaming-' streaming variant above.
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-float'],
+            'config': {
+                'max_seq_len': 1048576,
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': True,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 256,
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
