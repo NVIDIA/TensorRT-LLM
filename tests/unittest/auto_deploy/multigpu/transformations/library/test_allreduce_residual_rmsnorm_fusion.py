@@ -80,6 +80,87 @@ class AllreduceResidualNorm2(torch.nn.Module):
         return normed, y
 
 
+class ARResidualNormReshape(torch.nn.Module):
+    """AR+residual+RMSNorm with a reshape between the all-reduce and the residual add.
+
+    ``x`` is provided 3D ``[B, S, H]`` and the all-reduce output is reshaped to the 2D
+    residual ``[B*S, H]`` before the add (e.g. a TP linear output flattened onto a 2D
+    residual stream).
+    """
+
+    def __init__(self, hidden_size, dtype, strategy, add_order):
+        super().__init__()
+        self.norm = RMSNorm(hidden_size, 1e-5, dtype)
+        self.strategy = strategy
+        self.add_order = add_order
+
+    def forward(self, x, residual):
+        x = torch.ops.auto_deploy.trtllm_dist_all_reduce.default(x, self.strategy)
+        x = torch.reshape(x, residual.shape)
+        y = residual + x if self.add_order == "residual_first" else x + residual
+        return self.norm(y), y
+
+
+def _test_allreduce_fusion_variant(
+    port: int | None,
+    strategy: str,
+    rmsnorm_op: str,
+    add_order: str,
+):
+    if not is_trtllm_op_available():
+        pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
+
+    if port is None:
+        port = mpi_broadcast(get_free_port() if mpi_rank() == 0 else None)
+
+    _, _ = initialize_or_skip(port=port)
+
+    try:
+        dtype = torch.float16
+        hidden = 16
+        x = torch.randn(2, 8, hidden).to(dtype).cuda()
+        residual = torch.randn(16, hidden).to(dtype).cuda()
+
+        model = ARResidualNormReshape(hidden, dtype, strategy, add_order)
+        args = (x, residual)
+        gm = torch_export_to_gm(model, args=args, clone=True)
+        original_outputs, residual_original = gm(x, residual)
+
+        optimizer_config = {
+            "match_rmsnorm_pattern": {"stage": "pattern_matcher"},
+            "detect_sharding": {"stage": "post_export", "allreduce_strategy": strategy},
+        }
+        if rmsnorm_op == "triton_rms_norm":
+            optimizer_config["fuse_rmsnorm"] = {
+                "stage": "post_load_fusion",
+                "rmsnorm_backend": "triton",
+            }
+        optimizer_config["fuse_allreduce_residual_rmsnorm"] = {"stage": "post_load_fusion"}
+
+        gm_transformed = InferenceOptimizer(None, optimizer_config)(None, gm)
+        fused_outputs, residual_fused = gm_transformed(x, residual)
+
+        has_fused_node = any(
+            is_op(node, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm)
+            for node in gm_transformed.graph.nodes
+        )
+        assert has_fused_node, "Fused node not found."
+
+        assert torch.allclose(residual_original, residual_fused, atol=1e-3, rtol=1e-3), (
+            "Residual output differs between original and fused models."
+        )
+        assert torch.allclose(original_outputs, fused_outputs, atol=1e-3, rtol=1e-3), (
+            "Norm output differs between original and fused models."
+        )
+
+        export(gm_transformed, args=args)
+        torch_export_to_gm(gm_transformed, args=args)
+    finally:
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            torch.distributed.barrier()
+        cleanup()
+
+
 def _test_allreduce_fusion(port: int | None, ModuleCls, strategy: str, rmsnorm_op: str):
     if not is_trtllm_op_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
@@ -211,6 +292,43 @@ def test_allreduce_fusion(device_count, ModuleCls, strategy, rmsnorm_op):
                 ModuleCls=ModuleCls,
                 strategy=strategy,
                 rmsnorm_op=rmsnorm_op,
+            )
+            return
+        except DistNetworkError as e:
+            last_exc = e
+            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
+                raise
+        finally:
+            mpi_pool.shutdown()
+    raise RuntimeError(
+        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
+    ) from last_exc
+
+
+@pytest.mark.parametrize("device_count", get_device_counts())
+@pytest.mark.parametrize("add_order", ["residual_first", "x_first"])
+@pytest.mark.parametrize("strategy", ["AUTO", "ONESHOT"], ids=["strategy_auto", "strategy_oneshot"])
+@pytest.mark.parametrize(
+    "rmsnorm_op", ["torch_rmsnorm", "triton_rms_norm"], ids=["rmsnorm_torch", "rmsnorm_triton"]
+)
+def test_allreduce_fusion_reshape(device_count, add_order, strategy, rmsnorm_op):
+    # Covers the reshape variant (reshape between all-reduce and residual add),
+    # end-to-end on real GPUs.
+    if device_count <= 1:
+        pytest.skip("Require multi GPUs to run test_allreduce_fusion_reshape.")
+
+    n_workers = device_count
+    max_retries = 5
+    last_exc: Exception | None = None
+    for _ in range(max_retries):
+        mpi_pool = MpiPoolSession(n_workers=n_workers)
+        try:
+            mpi_pool.submit_sync(
+                _test_allreduce_fusion_variant,
+                port=None,
+                strategy=strategy,
+                rmsnorm_op=rmsnorm_op,
+                add_order=add_order,
             )
             return
         except DistNetworkError as e:
