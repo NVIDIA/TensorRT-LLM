@@ -2680,6 +2680,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         for modality, field_updates in mm_data_updates.items():
             multimodal_data.setdefault(modality, {}).update(field_updates)
 
+    def _video_embedded_audios(self, mm_data: Dict[str, Any]) -> List[Any]:
+        """Per-video embedded audio track (or None per item); [] when hoisting is off."""
+        if self._audio_extractor is None:
+            return []
+        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
+        return [getattr(v, "audio", None) for v in videos]
+
     def promote_nested_mm_data(self, mm_data: Dict[str, Any]) -> Dict[str, Any]:
         """Hoist video-embedded audio to a first-class top-level `audio` item.
 
@@ -2706,12 +2713,16 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         or no audio extractor is configured. Mixing standalone audio with
         video-embedded audio in one request is not supported (the prompt-order
         index of the hoisted audio would be ambiguous); it raises.
+
+        Idempotent (per the base-hook contract): re-promoting already-promoted
+        data is a no-op — the hoisted video copies have `.audio` cleared, so the
+        early-out sees no embedded audio left to hoist.
         """
-        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
-        video_audios = [getattr(v, "audio", None) for v in videos]
-        if not any(a is not None for a in video_audios) or self._audio_extractor is None:
+        video_audios = self._video_embedded_audios(mm_data)
+        if not any(a is not None for a in video_audios):
             return mm_data
 
+        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
         if mm_data.get("audio"):
             raise NotImplementedError(
                 "Nano does not support mixing standalone audio with "
@@ -2752,11 +2763,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         No-op (returns the inputs unchanged) when there is no video-embedded
         audio or no audio extractor is configured.
         """
-        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
-        video_audios = [getattr(v, "audio", None) for v in videos]
-        if not any(a is not None for a in video_audios) or self._audio_extractor is None:
+        video_audios = self._video_embedded_audios(mm_data)
+        if not any(a is not None for a in video_audios):
             return text_prompt, mm_data
 
+        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
         # Promote the embedded audio to a top-level `(audio, k)` item + vision-only
         # video (shared with the token path); raises on standalone+embedded audio.
         hoisted_mm_data = self.promote_nested_mm_data(mm_data)

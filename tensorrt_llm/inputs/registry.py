@@ -301,9 +301,20 @@ class BaseMultimodalInputProcessor(ABC):
         carries one modality embedded inside another (e.g. Nano's video-embedded
         audio, modeled as a separate `(audio, k)` prompt item) override this to
         hoist the nested payload so that both `find_mm_token_lengths` and the
-        prompt-item order resolution see the promoted items. Called once at the
-        top of `call_with_token_ids`; the promoted `mm_data` is reused for length
-        computation, order resolution, and placeholder expansion alike.
+        prompt-item order resolution see the promoted items.
+
+        Contract for overrides:
+
+        - Idempotent: re-promoting already-promoted data MUST be a no-op. A
+          single request flows through more than one independent entry boundary
+          (the hashing wrapper in `create_input_processor_with_hash` promotes
+          for hashing, then the processor's own `call_with_token_ids` promotes
+          again), and the dummy-placeholder pass may also re-enter. Each
+          boundary normalizes its own `mm_data`; there is no single global
+          promote, so promotion must converge to a fixed point.
+        - Non-mutating: return a shallow-rebuilt copy rather than mutating the
+          caller's `mm_data` (the raw payload is still needed elsewhere — e.g.
+          the text path reads the original nested payload to place placeholders).
         """
         return mm_data
 
@@ -350,6 +361,10 @@ class BaseMultimodalInputProcessor(ABC):
         # (e.g. Nano's video-embedded audio) to a first-class top-level item
         # before counts, lengths, and order resolution are derived, so the
         # promoted `mm_data` flows consistently into every downstream step.
+        # `self` is a `BaseMultimodalInputProcessor`, which always defines the
+        # hook (base is a no-op), so this calls it directly rather than via the
+        # optional-hook `_promote_nested_mm_data` dispatch used by the hashing
+        # wrapper, whose `input_processor` may be a hookless bare processor.
         mm_data = self.promote_nested_mm_data(inputs["multi_modal_data"])
         mm_counts = _mm_data_to_counts(mm_data)
 
@@ -997,6 +1012,26 @@ def _mm_data_to_counts(mm_data: Dict[str, Any]) -> Dict[str, int]:
     return {k: len(v) for k, v in mm_items.items()}
 
 
+def _promote_nested_mm_data(processor, mm_data: Dict[str,
+                                                     Any]) -> Dict[str, Any]:
+    """Dispatch `mm_data` through `processor.promote_nested_mm_data` if present.
+
+    The single home for the optional-hook `getattr`: `processor` may be a bare
+    processor with no promotion hook (e.g. a plain `DefaultInputProcessor`), so
+    the hook is resolved defensively and skipped when absent. Promotion hoists a
+    modality payload nested inside another modality's items (e.g. Nano's
+    video-embedded audio) to a first-class top-level item so that hashes,
+    lengths, and prompt-item order resolution all see the promoted items. The
+    base hook is a no-op, so single-modality and non-promoting processors are
+    unaffected. Idempotent (see `BaseMultimodalInputProcessor.promote_nested_mm_data`),
+    so calling this at independent entry boundaries is safe.
+    """
+    promote = getattr(processor, "promote_nested_mm_data", None)
+    if callable(promote):
+        return promote(mm_data)
+    return mm_data
+
+
 def _process_multimodal_with_dummy_placeholders(
     input_processor: BaseMultimodalInputProcessor,
     mm_data: Dict[str, Any],
@@ -1121,15 +1156,12 @@ def create_input_processor_with_hash(
         # processed `multimodal_item_order`, which references the promoted items
         # (e.g. a hoisted `audio`). Resolving the order against the raw,
         # un-promoted data would raise "order references modality ..." and
-        # silently disable multimodal hashing / block reuse. The base
-        # implementation is a no-op, so single-modality and non-promoting
-        # processors are unaffected.
-        promote_nested_mm_data = getattr(input_processor,
-                                         "promote_nested_mm_data", None)
-        if callable(promote_nested_mm_data):
-            mm_data = promote_nested_mm_data(inputs['multi_modal_data'])
-        else:
-            mm_data = inputs['multi_modal_data']
+        # silently disable multimodal hashing / block reuse. `input_processor`
+        # may be a bare processor with no hook, so the optional-hook dispatch is
+        # centralized in `_promote_nested_mm_data` (the base hook is a no-op, so
+        # single-modality and non-promoting processors are unaffected).
+        mm_data = _promote_nested_mm_data(input_processor,
+                                          inputs['multi_modal_data'])
 
         # Extract optional UUIDs (can be None, or dict with same structure as mm_data)
         mm_uuids = inputs.get('multi_modal_uuids', None)

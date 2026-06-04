@@ -2562,6 +2562,43 @@ class TestVideoWithEmbeddedAudioHoist:
         assert hoisted_text == "<video>"
         assert "audio" not in hoisted_mm_data
 
+    def test_video_embedded_audios_empty_without_extractor(self):
+        # The shared helper short-circuits to [] when no audio extractor is
+        # configured, so the promote/hoist early-outs both see "no audio".
+        proc = self._make_proc()
+        proc._audio_extractor = None
+        mm_data = {"video": [self._video_with_audio()]}
+
+        assert proc._video_embedded_audios(mm_data) == []
+
+    def test_video_embedded_audios_returns_per_video_audio_or_none(self):
+        # With an extractor, the helper yields one entry per video: the embedded
+        # AudioData or None, preserving order.
+        proc = self._make_proc()
+        with_audio = self._video_with_audio()
+        without_audio = self._video_with_audio()
+        without_audio.audio = None
+        mm_data = {"video": [with_audio, without_audio]}
+
+        audios = proc._video_embedded_audios(mm_data)
+
+        assert len(audios) == 2
+        assert audios[0] is with_audio.audio
+        assert audios[1] is None
+
+    def test_promote_is_idempotent(self):
+        # Re-promoting already-promoted data is a no-op: the hoisted video copies
+        # have `.audio` cleared, so the helper yields all-None and promote
+        # early-outs (returns the same object).
+        proc = self._make_proc()
+        mm_data = {"video": [self._video_with_audio()]}
+
+        promoted = proc.promote_nested_mm_data(mm_data)
+        assert proc._video_embedded_audios(promoted) == [None]
+
+        repromoted = proc.promote_nested_mm_data(promoted)
+        assert repromoted is promoted
+
     def test_full_pipeline_emits_video_audio_plan(self):
         # End-to-end through the REAL processor __call__ with the REAL hoist: a
         # single video-with-audio yields a (video, 0), (audio, 0) prompt order
