@@ -269,11 +269,12 @@ transforms:
   fuse_rope_into_trtllm_mla:
     stage: post_load_fusion
     enabled: false
-  # DeepSeek-V3 / -R1: replicate PT's pre-fused q_a + kv_a_with_mqa GEMM,
-  # dispatching trtllm::dsv3_fused_a_gemm_op (custom kernel for bf16,
-  # num_tokens in [1,16], HD_IN=7168, HD_OUT=2112; falls back to cuBLAS
-  # otherwise).  Disabled by default; opt in per-model YAML.
-  fuse_dsv3_a_gemm:
+  # DeepSeek-V3 / -R1: route the generic fuse_gemms-merged q_a + kv_a_with_mqa
+  # GEMM (2112x7168 bf16) to trtllm::dsv3_fused_a_gemm_op (custom kernel for
+  # num_tokens in [1,16]; falls back to cuBLAS otherwise).  Backend selector
+  # only — the fusion is done by fuse_gemms.  Disabled by default; opt in
+  # per-model YAML.  Runs after rope fusion.
+  lower_dsv3_a_gemm:
     stage: post_load_fusion
     enabled: false
   fuse_dsv3_router_gemm:

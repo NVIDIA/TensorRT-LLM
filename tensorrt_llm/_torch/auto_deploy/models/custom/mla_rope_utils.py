@@ -140,3 +140,27 @@ def _kv_b_proj_dequant_load_hook(
 
         # Remove scale from state_dict so it is not loaded into a non-existent buffer.
         del state_dict[scale_key]
+
+
+def is_gptj_layout(gm) -> bool:
+    """Return True if MLA RoPE weights are in GPTJ (interleaved) layout.
+
+    Detected by the presence of ``torch_rope_with_qk_interleaving`` in the
+    graph: models that skip ``_rope_deinterleave_load_hook`` keep weights in
+    GPTJ layout and use this op in their forward.  Models that apply the hook
+    (GPTJ→NeoX at load time) use ``torch_rope_with_explicit_cos_sin`` instead,
+    and ``fuse_rope_into_trtllm_mla`` must undo the permutation before the
+    fused kernel runs.
+    """
+    import torch
+
+    qk_interleaving = getattr(torch.ops.auto_deploy, "torch_rope_with_qk_interleaving", None)
+    if qk_interleaving is None:
+        return False
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target in (
+            qk_interleaving,
+            qk_interleaving.default,
+        ):
+            return True
+    return False
