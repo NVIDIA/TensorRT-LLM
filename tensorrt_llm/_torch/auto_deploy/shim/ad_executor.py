@@ -393,28 +393,6 @@ class ADEngine(ModelEngine):
         self.llm_args.print_iter_log = reporting_info.print_log
         self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
-        # Honor the user's PyExecutor scheduling/streaming knobs from ad_config
-        # instead of hardcoding stubs. Hardcoding these silently dropped the
-        # corresponding yaml settings:
-        #   - stream_interval=1 emitted a response every decode step -> per-token
-        #     detok/postprocess/HTTP overhead that inflates ITL at high concurrency.
-        #   - attention_dp_config=None disabled attention-DP load balancing even
-        #     when enable_attention_dp was set.
-        #   - batch_wait_* = 0 disabled request-batching accumulation.
-        # Fall back to the previous stub defaults only when ad_config is absent.
-        self.llm_args.stream_interval = ad_config.stream_interval if ad_config is not None else 1
-        self.llm_args.attention_dp_config = (
-            ad_config.attention_dp_config if ad_config is not None else None
-        )
-        self.llm_args.batch_wait_timeout_ms = (
-            ad_config.batch_wait_timeout_ms if ad_config is not None else 0
-        )
-        self.llm_args.batch_wait_timeout_iters = (
-            ad_config.batch_wait_timeout_iters if ad_config is not None else 0
-        )
-        self.llm_args.batch_wait_max_tokens_ratio = (
-            ad_config.batch_wait_max_tokens_ratio if ad_config is not None else 0.0
-        )
         self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
@@ -424,12 +402,22 @@ class ADEngine(ModelEngine):
         self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
 
         if ad_config is not None:
+            self.llm_args.stream_interval = ad_config.stream_interval
+            self.llm_args.attention_dp_config = ad_config.attention_dp_config
+            self.llm_args.batch_wait_timeout_ms = ad_config.batch_wait_timeout_ms
+            self.llm_args.batch_wait_timeout_iters = ad_config.batch_wait_timeout_iters
+            self.llm_args.batch_wait_max_tokens_ratio = ad_config.batch_wait_max_tokens_ratio
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
             self.llm_args.max_stats_len = ad_config.max_stats_len
             self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
+            self.llm_args.stream_interval = 1
+            self.llm_args.attention_dp_config = None
+            self.llm_args.batch_wait_timeout_ms = 0
+            self.llm_args.batch_wait_timeout_iters = 0
+            self.llm_args.batch_wait_max_tokens_ratio = 0.0
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
