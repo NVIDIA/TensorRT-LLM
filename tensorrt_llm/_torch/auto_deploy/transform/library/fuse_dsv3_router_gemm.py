@@ -16,7 +16,7 @@ dsv3RouterGemm min-latency kernel). This transform mirrors that:
   to(fp32) -> torch_linear_simple(w_fp32[256,7168]) -> noaux_tc_op
     =>  dsv3_router_gemm(hidden_bf16, w_bf16[256,7168]) -> noaux_tc_op   (logits stay fp32)
 
-Runs at ``post_load_fusion`` (after weight materialization), like fuse_dsv3_a_gemm.
+Runs at ``post_load_fusion`` (after weight materialization).
 Only the GEMM precision changes (bf16 inputs, fp32 output logits) — the routing
 (noaux_tc_op) is untouched; matches the PT backend.
 """

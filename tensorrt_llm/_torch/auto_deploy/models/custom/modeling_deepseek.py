@@ -588,8 +588,10 @@ class DeepSeekV3Attention(nn.Module):
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 
-        # Apply RoPE using custom op (weights pre-permuted to NeoX format at load time)
-        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
+        # Weights are in GPTJ (interleaved) layout; use the interleaving-aware op
+        # so the eager path is numerically correct and fuse_rope_into_trtllm_mla
+        # can detect GPTJ layout from the graph pattern.
+        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
             q_pe,
             k_pe,
             cos,
@@ -785,18 +787,11 @@ class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Pre-permute RoPE weight rows from interleaved to NeoX format at load time
-        # so the forward can use torch_rope_with_explicit_cos_sin (→ flashinfer_rope).
-        self._register_load_state_dict_pre_hook(
-            partial(
-                mla_rope_utils._rope_deinterleave_load_hook,
-                qk_rope_head_dim=config.qk_rope_head_dim,
-                qk_nope_head_dim=config.qk_nope_head_dim,
-                num_heads=config.num_attention_heads,
-                kv_lora_rank=config.kv_lora_rank,
-                num_layers=config.num_hidden_layers,
-            )
-        )
+        # The fused trtllm_mla path applies GPTJ-style rope internally, so
+        # de-interleaving weights to NeoX at load time and undoing at fusion
+        # time is a redundant round-trip.  We keep weights in GPTJ layout and
+        # use torch_rope_with_qk_interleaving in the forward (above), which the
+        # fusion transform detects to skip the undo.
 
         # Dequantize kv_b_proj FP8 weights at load time.
         # kv_b_proj.weight is passed directly to torch_mla (not via a quantized linear op)

@@ -556,7 +556,7 @@ def _execute_kv_proj_in_aux_stream(gm: GraphModule) -> Tuple[GraphModule, int]:
 
 
 # ===========================================================================
-# Pattern 2: Fused-graph KV-cone overlap (post fuse_dsv3_a_gemm)
+# Pattern 2: Fused-graph KV-cone overlap (post a-projection fusion)
 # ===========================================================================
 
 
@@ -717,7 +717,7 @@ class MultiStreamMLAAttn(BaseTransform):
 
     Pattern 0: Full KV path overlap for unfused Q/KV GEMMs (begin/end aux).
     Pattern 1: Overlaps KV projection linear with Q projection chain (fallback).
-    Pattern 2: Fused-graph (post fuse_dsv3_a_gemm) KV-cone overlap.
+    Pattern 2: Fused-graph (post a-projection fusion) KV-cone overlap.
 
     Pattern 0 is tried first.  If it finds nothing, pattern 2 is tried (handles
     the post-V4 fused graph).  Pattern 1 is the legacy fallback.

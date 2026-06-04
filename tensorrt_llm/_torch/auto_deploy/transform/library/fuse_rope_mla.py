@@ -36,6 +36,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ...custom_ops.mla.rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
+from ...models.custom.mla_rope_utils import is_gptj_layout
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -45,7 +46,7 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 # At post_load_fusion, only the backend-agnostic torch_rope_* IR ops are
 # present (optimize_rope has not yet replaced them with flashinfer_rope).
 _ROPE_OP_TARGETS = []
-for _name in ("torch_rope_with_explicit_cos_sin",):
+for _name in ("torch_rope_with_explicit_cos_sin", "torch_rope_with_qk_interleaving"):
     try:
         _packet = getattr(torch.ops.auto_deploy, _name)
         _ROPE_OP_TARGETS.append(_packet)
@@ -121,15 +122,18 @@ def _build_rotary_cos_sin_from_buffers(
     Returns a ``[1, max_pos * rope_dim * 2]`` float32 CUDA tensor, or None
     if construction fails.
     """
-    if is_op(rope_node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
-        # torch_rope(q, k, cos, sin, unsqueeze_dim)
+    _explicit_cos_sin_ops = (
+        torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
+        torch.ops.auto_deploy.torch_rope_with_qk_interleaving,
+    )
+    if any(is_op(rope_node, op) for op in _explicit_cos_sin_ops):
+        # Both ops share signature (q, k, cos, sin, unsqueeze_dim) and use
+        # NeoX-doubled cos/sin [max_pos, qk_rope_head_dim].
         cos_node = rope_node.args[2]
         sin_node = rope_node.args[3]
         cos_buf = _trace_to_buffer(gm, cos_node)
         sin_buf = _trace_to_buffer(gm, sin_node)
         if cos_buf is not None and sin_buf is not None:
-            # cos_buf/sin_buf are already in NeoX-doubled format
-            # [max_pos, head_dim] where head_dim = qk_rope_head_dim.
             # Stack interleaved [cos_0, sin_0, cos_1, sin_1, ...] as expected
             # by mla_rope_generation.
             result = torch.stack([cos_buf.float(), sin_buf.float()], dim=-1)
@@ -442,6 +446,11 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
             ad_logger.info("No torch_mla nodes found; skipping.")
             return gm, TransformInfo(skipped=True, detail="no MLA nodes")
 
+        # Detect GPTJ layout BEFORE the fusion consumes the rope nodes:
+        # torch_rope_with_qk_interleaving in the graph means weights stayed in
+        # GPTJ layout (no load-time de-interleave) so no undo is needed below.
+        already_gptj = is_gptj_layout(gm)
+
         # Try to trace the RoPE pattern from the first MLA node.
         trace_result = _trace_rope_node(mla_nodes[0])
         if trace_result is None:
@@ -489,9 +498,12 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
 
         # Reverse the NeoX weight de-interleave so projected data arrives in
         # GPTJ layout — matching what mla_rope_generation expects.
-        # The is_neox flag is always True when matching torch_rope_with_explicit_cos_sin
-        # (which uses the NeoX/split-half rotation style).
-        n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
+        # Skip when the graph was already in GPTJ layout (detected above before
+        # the rope nodes were consumed): those models never de-interleaved.
+        if not already_gptj:
+            n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
+        else:
+            n_fixed = 0
         ad_logger.info(
             f"Reversed RoPE weight de-interleave on {n_fixed} tensors "
             "(NeoX→GPTJ) for fused decode kernel."
