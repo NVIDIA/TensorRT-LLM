@@ -30,7 +30,10 @@ transforms:
   apply_sharding_hints:
     enabled: true
     requires_shape_prop: true
-    shard_layers: ["mha", "moe"]
+    shard_layers: ["mha", "moe", "lm_head"]  # V3: vocab-parallel lm_head (colwise + all_gather)
+    # TP2 trial: AUTO -> tunable_allreduce picks oneshot-lamport fused AR.
+    # NCCL has no fused residual+rmsnorm kernel -> RING_LL + separate rmsnorm.
+    allreduce_strategy: AUTO
   quantize_mxfp4_moe:
     backend: trtllm
     trtllm_quant_act: mxfp8
