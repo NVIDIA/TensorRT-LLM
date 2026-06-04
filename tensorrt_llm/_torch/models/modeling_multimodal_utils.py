@@ -16,6 +16,7 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
+import functools
 import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
@@ -62,6 +63,7 @@ _PROCESSOR_OUTPUT_KEYS = frozenset({
 })
 
 
+@functools.lru_cache(maxsize=None)
 def _install_processor_output_validation_filter():
     """Install a process-wide filter over transformers' ``validate_typed_dict``.
 
@@ -75,16 +77,11 @@ def _install_processor_output_validation_filter():
     every subsequent processor call. We filter those keys out before calling
     the genuine huggingface_hub implementation.
 
-    Installed once at module import (not per-call) because the trtllm-serve
-    preprocess path dispatches each request via ``asyncio.to_thread`` into a
-    ``ThreadPoolExecutor``: a previous CM-scoped patch raced when multiple
-    worker threads entered concurrently — each snapshotted whatever was
-    *currently* bound (often another thread's filter, not the genuine HF
-    function), and the filters chained recursively, eventually tripping
-    Python's recursion limit and surfacing as HTTP 400 to clients. Python's
-    import lock guarantees this function runs exactly once per process, so
-    ``base_orig`` is captured exactly once from the genuine HF function and
-    no runtime code path ever rebinds ``validate_typed_dict`` again.
+    Called from each Qwen VL input processor's ``__init__``. ``@lru_cache``
+    guarantees the patch runs at most once per process: ``base_orig`` is
+    captured exactly once from the genuine HF function, so concurrent
+    ``trtllm-serve`` workers dispatched via ``asyncio.to_thread`` cannot
+    observe a partially-patched state or chain filters recursively.
 
     Patches every transformers module that binds ``validate_typed_dict`` —
     each does its own ``from huggingface_hub.dataclasses import …``, so
@@ -121,9 +118,6 @@ def _install_processor_output_validation_filter():
 
     for b in binders:
         b.validate_typed_dict = _filtered_validate
-
-
-_install_processor_output_validation_filter()
 
 
 def _get_uncached_multimodal_params(

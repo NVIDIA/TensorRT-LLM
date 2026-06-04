@@ -43,6 +43,7 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
+    _install_processor_output_validation_filter,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_attached_multimodal_embeddings,
@@ -161,6 +162,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         trust_remote_code: bool = True,
         **kwargs,
     ):
+        _install_processor_output_validation_filter()
         super().__init__(
             model_path=model_path,
             config=config,
@@ -388,9 +390,9 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         # round-trip into the validator via tokenizer ``init_kwargs`` /
         # ``model_input_names`` and would trip ``TypeError:
         # merged_typed_dict.__init__() got an unexpected keyword argument
-        # 'video_grid_thw'``. ``modeling_multimodal_utils`` installs a
-        # process-wide filter at import that drops those keys before the
-        # validator sees them.
+        # 'video_grid_thw'``. ``_install_processor_output_validation_filter``
+        # (called from ``__init__``) installs a process-wide filter that drops
+        # those keys before the validator sees them.
         return self.processor(
             text=[text],
             images=images,

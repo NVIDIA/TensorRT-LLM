@@ -55,9 +55,10 @@ if IS_FLASHINFER_AVAILABLE:
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
-                                        get_attached_multimodal_embeddings,
-                                        get_multimodal_embeddings)
+from .modeling_multimodal_utils import (
+    _install_processor_output_validation_filter, find_input_mm_embeds,
+    fuse_input_embeds, get_attached_multimodal_embeddings,
+    get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
@@ -74,6 +75,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True,
                  **kwargs):
+        _install_processor_output_validation_filter()
         super().__init__(model_path=model_path,
                          config=config,
                          tokenizer=tokenizer,
@@ -310,9 +312,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # round-trip into the validator via tokenizer ``init_kwargs`` /
         # ``model_input_names`` and would trip ``TypeError:
         # merged_typed_dict.__init__() got an unexpected keyword argument
-        # 'video_grid_thw'``. ``modeling_multimodal_utils`` installs a
-        # process-wide filter at import that drops those keys before the
-        # validator sees them.
+        # 'video_grid_thw'``. ``_install_processor_output_validation_filter``
+        # (called from ``__init__``) installs a process-wide filter that drops
+        # those keys before the validator sees them.
         return self.processor(text=[text],
                               images=images,
                               videos=videos,

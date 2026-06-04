@@ -465,8 +465,8 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         # Qwen2/3-VL checkpoints leak processor *output* keys (e.g.
         # ``video_grid_thw``) into ``output_kwargs[<modality>]`` via the
         # tokenizer's ``init_kwargs`` / ``model_input_names``, tripping
-        # validation. ``modeling_multimodal_utils`` installs a process-wide
-        # filter at import that drops those keys before the validator sees
+        # validation. The Qwen VL input processor's ``__init__`` installs a
+        # process-wide filter that drops those keys before the validator sees
         # them.
         processor_inputs = hf_processor(
             text=[input["prompt"] for input in inputs],
