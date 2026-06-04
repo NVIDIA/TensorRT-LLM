@@ -95,6 +95,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                 init=True,
                                                 repr=False)
 
+    # Encoder CUDA graph compatibility: overrides host-side max_context_q_len
+    # so FMHA kernel launch params are stable across graph capture/replay even
+    # when actual per-batch sequence lengths vary. Only set by
+    # EncoderCUDAGraphRunner; None elsewhere.
+    max_context_q_len_override: Optional[int] = None
+
     # Flags to enable spec-dec mode (multi-query mode) in TRTLLM XQA Kernels
     # spec decoding mode can be enabled for non-TRTLLM-gen kernels (pre-Blackwell XQA kernels)
     # is_spec_decoding_enabled specifies if spec-dec mode is supported for the entire runtime.
@@ -560,6 +566,50 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
+
+    def prepare_encoder_only(self) -> None:
+        """Fast path for encoder-only forward (eager + CUDA graph capture)."""
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+
+        # For encoder batches every request is a context request, so total
+        # kv-tokens equals total q-tokens.
+        self.host_total_kv_lens[0] = self._num_tokens
+
+        # Graph metadata binds these views once per key; eager refreshes them
+        # because batch shape can vary between calls.
+        if not self.is_cuda_graph:
+            n = self.num_seqs
+            self.kv_lens_cuda_runtime = self._seq_lens_cuda[:n]
+            self.kv_lens_runtime = self._seq_lens[:n]
+            self.prompt_lens_cuda_runtime = self._seq_lens_cuda[:n]
+            self.prompt_lens_cpu_runtime = self._seq_lens[:n]
+            self.host_request_types_runtime = self.host_request_types[:n]
+
+    def bind_encoder_cuda_graph_seq_lens(self, seq_lens_host: torch.Tensor,
+                                         padded_batch_size: int) -> None:
+        """Bind stable seq_lens storage for one encoder CUDA graph key."""
+        self._seq_lens = seq_lens_host[:padded_batch_size]
+        self._num_contexts = padded_batch_size
+        self._num_generations = 0
+
+        self.kv_lens_cuda_runtime = self._seq_lens_cuda[:padded_batch_size]
+        self.kv_lens_runtime = self._seq_lens
+        self.prompt_lens_cuda_runtime = self._seq_lens_cuda[:padded_batch_size]
+        self.prompt_lens_cpu_runtime = self._seq_lens
+        self.host_request_types[:padded_batch_size].fill_(0)
+        self.host_request_types_runtime = self.host_request_types[:
+                                                                  padded_batch_size]
+        self.host_total_kv_lens[1] = 0
+
+    def prepare_encoder_cuda_graph_replay(self, seq_lens: List[int],
+                                          padded_num_tokens: int) -> None:
+        """Update per-replay encoder CUDA graph metadata in-place."""
+        self._seq_lens.copy_(torch.tensor(seq_lens, dtype=torch.int))
+        self._num_tokens = padded_num_tokens
+        self._num_ctx_tokens = padded_num_tokens
+        self.host_total_kv_lens[0] = padded_num_tokens
 
     def prepare_flash_mla(self) -> None:
         # Invalidate the pre-computed metadata so that forward() recomputes it
@@ -1455,6 +1505,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if forward_args.kv_scale_quant_orig is None:
             forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
 
+        # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
+        if metadata.max_context_q_len_override is not None:
+            assert metadata.is_cuda_graph
+            assert metadata.num_generations == 0
+            assert metadata.kv_cache_manager is None
+            assert metadata.num_contexts == metadata.num_seqs
+
         helix_active = metadata.helix_position_offsets is not None
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
@@ -1500,6 +1557,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 context_lengths=metadata.prompt_lens_cuda_runtime,
                 host_context_lengths=metadata.prompt_lens_cpu_runtime,
                 host_request_types=metadata.host_request_types_runtime,
+                max_context_q_len_override=metadata.max_context_q_len_override,
                 kv_cache_block_offsets=metadata.kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=metadata.
                 host_kv_cache_pool_pointers,
