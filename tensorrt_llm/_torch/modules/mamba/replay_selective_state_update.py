@@ -497,7 +497,7 @@ def _replay_state_update_kernel(
         # Each Philox call produces 4 random ints.  We call randint4x on
         # quarter-sized dstate offsets and join+reshape to get the full
         # (M, dstate) random tensor — 4x fewer PRNG rounds.
-        rand_seed = tl.load(rand_seed_ptr)
+        rand_seed = tl.load(rand_seed_ptr + cache_batch_idx)
         base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
         offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // 4)
         rand_offsets_q = (
@@ -671,8 +671,11 @@ def replay_selective_state_update(
         z: (batch, T, nheads, dim) optional silu gate.
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
         state_batch_indices: (batch,) optional cache slot mapping.
-        rand_seed: optional single-element int64 CUDA tensor for Philox PRNG seed.
-            When provided, state is stochastically rounded to fp16 on store.
+        rand_seed: optional (cache_size,) int64 CUDA tensor of per-cache-slot
+            Philox PRNG seeds.  The caller bumps this tensor in-place for each
+            replay invocation so CUDA graph replay still gets fresh draws; the
+            kernel indexes it by cache_batch_idx.  When provided, state is
+            stochastically rounded to fp16 on store.
             When None, standard deterministic rounding is used.
         philox_rounds: number of Philox PRNG rounds (default 10).
         launch_with_pdl: enable external PDL (conv1d → precompute chain).
@@ -743,6 +746,19 @@ def replay_selective_state_update(
     assert old_dA_cumsum.shape == (cache_size, 2, nheads, T)
     assert cache_buf_idx.shape == (cache_size,)
     assert prev_num_accepted_tokens.shape == (cache_size,)
+    if rand_seed is not None:
+        assert rand_seed.dtype == torch.int64, (
+            f"rand_seed dtype must be int64, got {rand_seed.dtype}"
+        )
+        assert rand_seed.dim() == 1, (
+            f"rand_seed must be a 1D tensor; got shape {tuple(rand_seed.shape)}"
+        )
+        if rand_seed.shape[0] == 1 and cache_size > 1:
+            rand_seed = rand_seed.expand(cache_size).contiguous()
+        assert rand_seed.shape[0] >= cache_size, (
+            f"rand_seed must have length 1 or >= cache_size ({cache_size}); "
+            f"got shape {tuple(rand_seed.shape)}"
+        )
 
     tie_hdim = (
         A.stride(-1) == 0

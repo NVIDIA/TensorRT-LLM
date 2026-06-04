@@ -2,8 +2,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    filter_mm_token_from_input_ids, fuse_input_embeds)
+    filter_mm_token_from_input_ids, find_input_mm_embeds, fuse_input_embeds)
 from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            MultimodalRuntimeData)
 
 
 def make_embedding(num_embeddings: int = 100,
@@ -103,6 +105,60 @@ def test_fuse_input_embeds_mismatch_raises(device):
                           mm_token_ids=None,
                           text_token_indices=text_idx,
                           mm_token_indices=mm_idx)
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_mismatch_error_includes_counts(device):
+    emb = make_embedding(num_embeddings=50, hidden_size=8, device=device)
+    input_ids = torch.tensor([1, 51, 2, 52, 3], dtype=torch.long, device=device)
+    text_idx, mm_idx = filter_mm_token_from_input_ids(
+        input_ids, vocab_size=emb.num_embeddings)
+    wrong_mm = torch.randn(mm_idx.shape[0] + 1, 8, device=device)
+
+    with pytest.raises(ValueError,
+                       match="Multimodal token count mismatch") as exc_info:
+        fuse_input_embeds(
+            emb,
+            input_ids,
+            [wrong_mm],
+            text_token_indices=text_idx,
+            mm_token_indices=mm_idx,
+        )
+
+    error_message = str(exc_info.value)
+    assert "found 2 image tokens in input_ids" in error_message
+    assert "received 3 image embeddings" in error_message
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_with_chunked_multimodal_slice(device):
+    hidden = 8
+    emb = make_embedding(num_embeddings=50, hidden_size=hidden, device=device)
+    input_ids = torch.tensor([1, 51, 2, 52, 3], dtype=torch.long, device=device)
+    full_mm_embed = torch.randn(5, hidden, device=device)
+    runtime = MultimodalRuntimeData(
+        past_seen_token_num=3,
+        chunk_end_pos=5,
+        embed_mask_cumsum=torch.arange(1, 6, dtype=torch.int64),
+    )
+    multimodal_params = [MultimodalParams(multimodal_runtime=runtime)]
+
+    mm_embeds = find_input_mm_embeds([full_mm_embed], multimodal_params)
+    out_ids, out_embeds = fuse_input_embeds(emb,
+                                            input_ids,
+                                            mm_embeds,
+                                            mm_token_ids=None)
+
+    assert out_ids is None
+    assert out_embeds is not None
+    _, mm_idx = filter_mm_token_from_input_ids(input_ids,
+                                               vocab_size=emb.num_embeddings)
+    torch.testing.assert_close(
+        out_embeds[mm_idx],
+        full_mm_embed[3:5].to(dtype=out_embeds.dtype, device=out_embeds.device),
+    )
 
 
 @pytest.mark.parametrize("device", ["cpu"] +

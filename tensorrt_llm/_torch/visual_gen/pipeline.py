@@ -708,8 +708,7 @@ class BasePipeline(nn.Module):
         ulysses_size = vgm.ulysses_size if vgm else 1
         attn2d_row_size = vgm.attn2d_row_size if vgm else 1
         attn2d_col_size = vgm.attn2d_col_size if vgm else 1
-        attn2d_size = attn2d_row_size * attn2d_col_size
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
 
         is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
@@ -722,10 +721,9 @@ class BasePipeline(nn.Module):
                 if attn2d_row_size * attn2d_col_size > 1:
                     logger.info(
                         f"CFG Parallel: cfg_size={cfg_size}, "
-                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}"
+                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}, "
+                        f"ulysses_size={ulysses_size}"
                     )
-                else:
-                    logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
 
             # Split main embeddings
             if is_split_embeds:

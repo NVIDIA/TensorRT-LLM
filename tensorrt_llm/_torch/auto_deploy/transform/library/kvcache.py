@@ -316,7 +316,7 @@ class _InsertCachedOperator(BaseTransform):
     ):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
-            all_args = (
+            args = (
                 *qkv_nodes,
                 *meta_nodes_std,
                 *meta_nodes_extra,
@@ -324,11 +324,8 @@ class _InsertCachedOperator(BaseTransform):
                 *constants,
             )
             if prepared_attn_mask is not None:
-                all_args = (*all_args, prepared_attn_mask)
-            cached_attn_node = gm.graph.call_function(
-                cached_attn_op,
-                args=all_args,
-            )
+                args = (*args, prepared_attn_mask)
+            cached_attn_node = gm.graph.call_function(cached_attn_op, args=args)
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
 
@@ -431,17 +428,22 @@ class _InsertCachedOperator(BaseTransform):
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
-                    resource_name = cm.add_resource(k, resource_handler)
-                    cache_in_nodes.append(self._process_cache_node(gm, resource_name))
-                    # Determine group from handler equality
-                    if isinstance(resource_handler, KVPagedResourceHandler):
-                        for gi, ref in enumerate(handler_groups):
-                            if resource_handler == ref:
-                                group_idx = gi
-                                break
-                        else:
-                            group_idx = len(handler_groups)
-                            handler_groups.append(resource_handler)
+                    if resource_handler is None:
+                        # None sentinel: pass literal None positionally, no resource allocated.
+                        cache_in_nodes.append(None)
+                    else:
+                        resource_name = cm.add_resource(k, resource_handler)
+                        node = self._process_cache_node(gm, resource_name)
+                        cache_in_nodes.append(node)
+                        # Determine group from handler equality
+                        if isinstance(resource_handler, KVPagedResourceHandler):
+                            for gi, ref in enumerate(handler_groups):
+                                if resource_handler == ref:
+                                    group_idx = gi
+                                    break
+                            else:
+                                group_idx = len(handler_groups)
+                                handler_groups.append(resource_handler)
                 if layer_idx is not None:
                     cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
                     group_idx_by_layer_idx[layer_idx] = group_idx
@@ -619,14 +621,6 @@ class _InsertCachedOperator(BaseTransform):
 @TransformRegistry.register("insert_cached_attention")
 class InsertCachedAttention(_InsertCachedOperator):
     """A transform to insert cached attention into the graph module."""
-
-    def _apply(self, *args, **kwargs):
-        if self.config.backend == "triton":
-            self._log_warning(
-                "'triton' backend only supports GREEDY sampling (top_k=1). "
-                "Please set top_k=1 in the sampling parameters to ensure cohesive output."
-            )
-        return super()._apply(*args, **kwargs)
 
 
 @TransformRegistry.register("insert_cached_mla_attention")

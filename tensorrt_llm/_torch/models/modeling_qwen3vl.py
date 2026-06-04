@@ -351,7 +351,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
     @nvtx_range("Qwen3VLInputProcessorBase forward()")
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self,
         inputs: TextPrompt,
         sampling_params: SamplingParams,
@@ -1060,7 +1060,7 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         if not _is_disagg():
             self.mm_encoder = Qwen3VisionModelBase(
-                model_config, kwargs.get("vision_model_class", None)
+                copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
             ).eval()
 
         self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")

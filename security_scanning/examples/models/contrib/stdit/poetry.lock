@@ -581,31 +581,31 @@ ssh = ["bcrypt (>=3.1.5)"]
 
 [[package]]
 name = "cuda-bindings"
-version = "13.3.0"
+version = "13.3.1"
 description = "Python bindings for CUDA"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "platform_system == \"Linux\""
 files = [
-    {file = "cuda_bindings-13.3.0-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:326b31d88314068f0ead48141222d7ada094f4013723dd924af9db10150fa472"},
-    {file = "cuda_bindings-13.3.0-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:76edf9a22ad52c306d33204d16071f15203217640ffc4083f854425062a30a02"},
-    {file = "cuda_bindings-13.3.0-cp310-cp310-win_amd64.whl", hash = "sha256:a26690cae5ff9a9cf46ab4619d097dd5c1000c7de9680652705a9a5d46b2409e"},
-    {file = "cuda_bindings-13.3.0-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:244a167d81a9d07d3209d02c8e02e848c2b7c38f4d01e8e4d1f9620b173ae006"},
-    {file = "cuda_bindings-13.3.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:820ab45be3f39a088f39c4a04eb8b852d0b339bff8c518da5c258882b8a4e21b"},
-    {file = "cuda_bindings-13.3.0-cp311-cp311-win_amd64.whl", hash = "sha256:2ef7180ea85405bf6d70e4b3924d293333faf6d5aa57b36e7ddf8aaae29a8a78"},
-    {file = "cuda_bindings-13.3.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f72f67f5790e7fa51e3f893e007e49567573ccdf4ed1ca988fbbbd36cd77847c"},
-    {file = "cuda_bindings-13.3.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a99c3b8d584f266c616bd0f30c7cd83e33553e3ef2abad41ff5a74fbc033a69a"},
-    {file = "cuda_bindings-13.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:851e138181b3a6edf6f29ba30ce7481df9a0dbfffc655b603dd1bb31032707ca"},
-    {file = "cuda_bindings-13.3.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a7698fcc4577aa96372866f4d0c9a6cf686cd5c90eab94581c29d37fe6600542"},
-    {file = "cuda_bindings-13.3.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:abd908f651160d12c45c5714a38ee102a1173a55433c0d1509ec0e8293beb4a6"},
-    {file = "cuda_bindings-13.3.0-cp313-cp313-win_amd64.whl", hash = "sha256:97afb1ebe2f60b538d88a902a952749e97f999505cd8aca78d491ea7e8b038c8"},
-    {file = "cuda_bindings-13.3.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4a801fa30e75d25b74252123aefc746b6c4275624d2b8640632dd1dfeeaa1f88"},
-    {file = "cuda_bindings-13.3.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:94d40ef7b4bdd9dce0244a1baa132e0e538f1eb2c0d162fb3648a15e48515365"},
-    {file = "cuda_bindings-13.3.0-cp314-cp314-win_amd64.whl", hash = "sha256:e17a46d711233a8a8e4c33aaa773e13810abe5fe686e08ca3e3df52449e6d7eb"},
-    {file = "cuda_bindings-13.3.0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e5911bea15810b749a8077f8c45423ed785d51618b8e8664dea1fc8f5a2a76c8"},
-    {file = "cuda_bindings-13.3.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e2870fed7707a37f8af0c02364b05f355ebe8921604e8c68eb56cf66867e0798"},
-    {file = "cuda_bindings-13.3.0-cp314-cp314t-win_amd64.whl", hash = "sha256:2ddb3b5c9b013f42b1304ba39c0fe4277f4c228987e62d850aff66353aeb0ee2"},
+    {file = "cuda_bindings-13.3.1-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:120fcc53d57903df529c3486962c56528cba5b7d6c57c99537320ed9922c8b86"},
+    {file = "cuda_bindings-13.3.1-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9851b0caa8bfd3bc6fa054eaf57bea7c8e9c3a62db2d2621224677f49f3c53d0"},
+    {file = "cuda_bindings-13.3.1-cp310-cp310-win_amd64.whl", hash = "sha256:c0c4b1a995098c46695c24257a342dc97d6e6d3f3050b944c9f43bd26d734051"},
+    {file = "cuda_bindings-13.3.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c5879712accf6e14bb01aa5e67440eb84998b8d104b509cc7a6dc0b8f656a474"},
+    {file = "cuda_bindings-13.3.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:04436a9364059c84b8f9636f359eccda1cf814341f5b670c71d80d2f79dbc708"},
+    {file = "cuda_bindings-13.3.1-cp311-cp311-win_amd64.whl", hash = "sha256:507b0e19e7f934c5e30f30f0244ad70a75812619a7d3a0d742543caae1bd50f1"},
+    {file = "cuda_bindings-13.3.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c7855c4868aabc0cfae28abbe83d56734bdfbd08f08fc234ac1912a12858bf49"},
+    {file = "cuda_bindings-13.3.1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e32d08f71ebcdf00f0f41eab2eb37e8da94c8ed411cc9f7f7a019ce6b34abe3a"},
+    {file = "cuda_bindings-13.3.1-cp312-cp312-win_amd64.whl", hash = "sha256:b134dd8c5c66ae4c4ad814f7aee88fd215353c077010cbc47e3b55ed35ec9eff"},
+    {file = "cuda_bindings-13.3.1-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9efb21c1ee64981e184b9e0ba5eb3179e5ba3d4b51665a6cb52b8ef3d01a7cbf"},
+    {file = "cuda_bindings-13.3.1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2732904099e0a4d4db774a5fc6d91ee95fae065b4d2ecabb4968c5fe2406c9d7"},
+    {file = "cuda_bindings-13.3.1-cp313-cp313-win_amd64.whl", hash = "sha256:18c8c167c8907b8f02531ca810534315c458dabef31f7965095619bf647b9202"},
+    {file = "cuda_bindings-13.3.1-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1ab2f74ed65bfef4163ba07a8db16f1085e0729291db12a2423aff84ee8278b8"},
+    {file = "cuda_bindings-13.3.1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:efd4c814d311ec08c981f6dded1dbe7d4b371067ee4f6c14cccec4bde9590f80"},
+    {file = "cuda_bindings-13.3.1-cp314-cp314-win_amd64.whl", hash = "sha256:8de12ef60bf40756852cb62bbb40460609269f6ece522903d1cc93d73a3ececb"},
+    {file = "cuda_bindings-13.3.1-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c3c772dfff49681541d59630c90f858e173ac926b9c593a2b7123f2a1043cc76"},
+    {file = "cuda_bindings-13.3.1-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:36febb7c1079d68a981dbbd8d5a67235b399802b82075c9388624719607e52b9"},
+    {file = "cuda_bindings-13.3.1-cp314-cp314t-win_amd64.whl", hash = "sha256:61120b5e4f4a63f67efd7e7396914cb9ef871bb1f0021e990fb70277be240a4d"},
 ]
 
 [package.dependencies]
@@ -762,14 +762,14 @@ pytest = ["pytest (>=7)"]
 
 [[package]]
 name = "filelock"
-version = "3.29.0"
+version = "3.29.1"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.29.0-py3-none-any.whl", hash = "sha256:96f5f6344709aa1572bbf631c640e4ebeeb519e08da902c39a001882f30ac258"},
-    {file = "filelock-3.29.0.tar.gz", hash = "sha256:69974355e960702e789734cb4871f884ea6fe50bd8404051a3530bc07809cf90"},
+    {file = "filelock-3.29.1-py3-none-any.whl", hash = "sha256:85199dfd706869641b72b2e8955d5416a4b2b7dc4b0e8e6d97b4cc1299a6983b"},
+    {file = "filelock-3.29.1.tar.gz", hash = "sha256:d97e6b1b9757569626c58caa07dc4beb1613f4a2938b1e8cc81afca398906c9e"},
 ]
 
 [[package]]
@@ -944,14 +944,14 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.16.4"
+version = "1.17.0"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "huggingface_hub-1.16.4-py3-none-any.whl", hash = "sha256:994ec184c3330952d7b5f131ea0b1a6ba1047bd05461f5dec191f8fc1099fbd7"},
-    {file = "huggingface_hub-1.16.4.tar.gz", hash = "sha256:023bacd155f837d3fa56379ac8e23dababe6d6d87b04f8dacc258a44a38abe01"},
+    {file = "huggingface_hub-1.17.0-py3-none-any.whl", hash = "sha256:3b8156d23118e87f6a587648bfbc04f04a12a757ccb4ed298b35c4ae638bf24c"},
+    {file = "huggingface_hub-1.17.0.tar.gz", hash = "sha256:fad842b6763ef70ebc3919665b1b9273645203185400a7d6c5eddc2323cc3435"},
 ]
 
 [package.dependencies]
@@ -981,14 +981,14 @@ typing = ["types-PyYAML", "types-simplejson", "types-toml", "types-tqdm", "types
 
 [[package]]
 name = "idna"
-version = "3.16"
+version = "3.18"
 description = "Internationalized Domain Names in Applications (IDNA)"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "idna-3.16-py3-none-any.whl", hash = "sha256:cc246e3a3f89580c3a951b5ad298ca4638078b2cdd4f115654332b5c26daded5"},
-    {file = "idna-3.16.tar.gz", hash = "sha256:d7a6da03db833450fca25d2358ac9ff06cd624577a4aea3a596d5c0f77b8e03d"},
+    {file = "idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2"},
+    {file = "idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848"},
 ]
 
 [package.extras]
@@ -1627,18 +1627,18 @@ pynacl = ">=1.5"
 
 [[package]]
 name = "plumbum"
-version = "1.10.0"
+version = "2.0.0"
 description = "Plumbum: shell combinators library"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "plumbum-1.10.0-py3-none-any.whl", hash = "sha256:9583d737ac901c474d99d030e4d5eec4c4e6d2d7417b1cf49728cf3be34f6dc8"},
-    {file = "plumbum-1.10.0.tar.gz", hash = "sha256:f8cbf0ecec0b73ff4e349398b65112a9e3f9300e7dc019001217dcc148d5c97c"},
+    {file = "plumbum-2.0.0-py3-none-any.whl", hash = "sha256:4bc91d72625a85a90ed0fd358575eb7afe3bc265b53edf47e642e644bc821d32"},
+    {file = "plumbum-2.0.0.tar.gz", hash = "sha256:73aceeb20bd08a55a9e919828f995685aa9dd4cfd454158c2878d25ee0fa9024"},
 ]
 
 [package.dependencies]
-pywin32 = {version = "*", markers = "platform_system == \"Windows\" and platform_python_implementation != \"PyPy\""}
+typing-extensions = {version = "*", markers = "python_version < \"3.13\""}
 
 [package.extras]
 ssh = ["paramiko"]
@@ -1730,37 +1730,6 @@ cffi = {version = ">=2.0.0", markers = "platform_python_implementation != \"PyPy
 [package.extras]
 docs = ["sphinx (<7)", "sphinx_rtd_theme"]
 tests = ["hypothesis (>=3.27.0)", "pytest (>=7.4.0)", "pytest-cov (>=2.10.1)", "pytest-xdist (>=3.5.0)"]
-
-[[package]]
-name = "pywin32"
-version = "311"
-description = "Python for Window Extensions"
-optional = false
-python-versions = "*"
-groups = ["main"]
-markers = "platform_system == \"Windows\" and platform_python_implementation != \"PyPy\""
-files = [
-    {file = "pywin32-311-cp310-cp310-win32.whl", hash = "sha256:d03ff496d2a0cd4a5893504789d4a15399133fe82517455e78bad62efbb7f0a3"},
-    {file = "pywin32-311-cp310-cp310-win_amd64.whl", hash = "sha256:797c2772017851984b97180b0bebe4b620bb86328e8a884bb626156295a63b3b"},
-    {file = "pywin32-311-cp310-cp310-win_arm64.whl", hash = "sha256:0502d1facf1fed4839a9a51ccbcc63d952cf318f78ffc00a7e78528ac27d7a2b"},
-    {file = "pywin32-311-cp311-cp311-win32.whl", hash = "sha256:184eb5e436dea364dcd3d2316d577d625c0351bf237c4e9a5fabbcfa5a58b151"},
-    {file = "pywin32-311-cp311-cp311-win_amd64.whl", hash = "sha256:3ce80b34b22b17ccbd937a6e78e7225d80c52f5ab9940fe0506a1a16f3dab503"},
-    {file = "pywin32-311-cp311-cp311-win_arm64.whl", hash = "sha256:a733f1388e1a842abb67ffa8e7aad0e70ac519e09b0f6a784e65a136ec7cefd2"},
-    {file = "pywin32-311-cp312-cp312-win32.whl", hash = "sha256:750ec6e621af2b948540032557b10a2d43b0cee2ae9758c54154d711cc852d31"},
-    {file = "pywin32-311-cp312-cp312-win_amd64.whl", hash = "sha256:b8c095edad5c211ff31c05223658e71bf7116daa0ecf3ad85f3201ea3190d067"},
-    {file = "pywin32-311-cp312-cp312-win_arm64.whl", hash = "sha256:e286f46a9a39c4a18b319c28f59b61de793654af2f395c102b4f819e584b5852"},
-    {file = "pywin32-311-cp313-cp313-win32.whl", hash = "sha256:f95ba5a847cba10dd8c4d8fefa9f2a6cf283b8b88ed6178fa8a6c1ab16054d0d"},
-    {file = "pywin32-311-cp313-cp313-win_amd64.whl", hash = "sha256:718a38f7e5b058e76aee1c56ddd06908116d35147e133427e59a3983f703a20d"},
-    {file = "pywin32-311-cp313-cp313-win_arm64.whl", hash = "sha256:7b4075d959648406202d92a2310cb990fea19b535c7f4a78d3f5e10b926eeb8a"},
-    {file = "pywin32-311-cp314-cp314-win32.whl", hash = "sha256:b7a2c10b93f8986666d0c803ee19b5990885872a7de910fc460f9b0c2fbf92ee"},
-    {file = "pywin32-311-cp314-cp314-win_amd64.whl", hash = "sha256:3aca44c046bd2ed8c90de9cb8427f581c479e594e99b5c0bb19b29c10fd6cb87"},
-    {file = "pywin32-311-cp314-cp314-win_arm64.whl", hash = "sha256:a508e2d9025764a8270f93111a970e1d0fbfc33f4153b388bb649b7eec4f9b42"},
-    {file = "pywin32-311-cp38-cp38-win32.whl", hash = "sha256:6c6f2969607b5023b0d9ce2541f8d2cbb01c4f46bc87456017cf63b73f1e2d8c"},
-    {file = "pywin32-311-cp38-cp38-win_amd64.whl", hash = "sha256:c8015b09fb9a5e188f83b7b04de91ddca4658cee2ae6f3bc483f0b21a77ef6cd"},
-    {file = "pywin32-311-cp39-cp39-win32.whl", hash = "sha256:aba8f82d551a942cb20d4a83413ccbac30790b50efb89a75e4f586ac0bb8056b"},
-    {file = "pywin32-311-cp39-cp39-win_amd64.whl", hash = "sha256:e0c4cfb0621281fe40387df582097fd796e80430597cb9944f0ae70447bacd91"},
-    {file = "pywin32-311-cp39-cp39-win_arm64.whl", hash = "sha256:62ea666235135fee79bb154e695f3ff67370afefd71bd7fea7512fc70ef31e3d"},
-]
 
 [[package]]
 name = "pyyaml"
@@ -2465,14 +2434,14 @@ telegram = ["requests"]
 
 [[package]]
 name = "transformers"
-version = "5.9.0"
+version = "5.10.1"
 description = "Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and multimodal models, for both inference and training."
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "transformers-5.9.0-py3-none-any.whl", hash = "sha256:1d19509bcff7028ebc6b277d71caa712e8353778463d38764237d14b42b52788"},
-    {file = "transformers-5.9.0.tar.gz", hash = "sha256:25997cb8fa6053533171634b6162d7df54346530ec2aa9b42bb834e63668c842"},
+    {file = "transformers-5.10.1-py3-none-any.whl", hash = "sha256:ccb919ea1b77338b44d0d45d23f7472081906b1bb6ed8e5f5cf4d692d1da03d4"},
+    {file = "transformers-5.10.1.tar.gz", hash = "sha256:31112d1dcdfcf9934242acbba891f44e2279ff74b9b8ba4595640e0e04195a3a"},
 ]
 
 [package.dependencies]

@@ -9,11 +9,11 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -129,6 +129,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
         self.ff_out = Linear(
             in_features,
@@ -143,6 +144,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
 
         self.norm2 = LayerNorm(
@@ -201,6 +203,7 @@ class WanTimeTextImageEmbedding(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         self.text_embedder = PixArtAlphaTextProjection(text_embed_dim, dim, act_fn="gelu_tanh")
 
@@ -281,9 +284,13 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
-        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h, 14B 40h)
-        # fit the default fused_dit_qk_norm_rope op's full-dim template now that
-        # the num_heads cap is 64 (post-survey 2026-05).
+        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h,
+        # 14B 40h) fit the default fused_dit_qk_norm_rope op's full-dim
+        # template now that the num_heads cap is 64 (post-survey 2026-05).
+        # However, this kernel does not support TP due to the cross-head
+        # normalization being a collective op. Thus, we must disable it if
+        # using TP.
+        tp_size = model_config.mapping.tp_size if model_config.mapping else 1
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -291,7 +298,7 @@ class WanBlock(nn.Module):
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
             eps=eps,
-            fuse_qk_norm_rope=True,
+            fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
         )
@@ -306,7 +313,7 @@ class WanBlock(nn.Module):
             eps=eps,
             config=model_config,
             layer_idx=_layer_idx,
-            enable_ulysses=False,
+            enable_sequence_parallel=False,
         )
 
         if cross_attn_norm:
@@ -331,13 +338,14 @@ class WanBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
-            reduce_output=False,
+            reduce_output=(tp_size != 1),
         )
 
-        # I2V: Additional K/V projections for image embeddings
+        # I2V: Additional K/V projections for image embeddings.
         self.add_k_proj = self.add_v_proj = None
         self.norm_added_k = None
         if added_kv_proj_dim is not None:
+            tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
             self.add_k_proj = Linear(
                 added_kv_proj_dim,
                 hidden_size,
@@ -346,6 +354,8 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
             )
             self.add_v_proj = Linear(
                 added_kv_proj_dim,
@@ -355,9 +365,16 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
             )
-            self.norm_added_k = RMSNorm(
-                hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True
+            self.norm_added_k = RMSNormTPAware(
+                hidden_size=hidden_size,
+                eps=eps,
+                dtype=dtype,
+                has_weights=True,
+                enable_tp=(tp_size > 1),
+                mapping=model_config.mapping,
             )
 
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
@@ -469,8 +486,6 @@ class WanTransformer3DModel(nn.Module):
         self.model_config = model_config
 
         vgm = model_config.visual_gen_mapping
-        if vgm is not None and vgm.tp_size > 1:
-            raise ValueError(f"WAN does not support tensor parallelism. Got tp_size={vgm.tp_size}")
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
         self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
@@ -571,6 +586,7 @@ class WanTransformer3DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
         self.scale_shift_table = nn.Parameter(
@@ -772,6 +788,9 @@ class WanTransformer3DModel(nn.Module):
                     loader.load_linear_weights(module, name, weight_dicts)
                 elif "add_k_proj" in name or "add_v_proj" in name:
                     logger.info(f"[Weight Loading] No weights found for I2V module: {name}")
+            elif isinstance(module, RMSNormTPAware):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():
