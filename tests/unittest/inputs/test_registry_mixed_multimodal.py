@@ -568,7 +568,7 @@ class _FakeNanoVideoAudioProcessor(BaseMultimodalInputProcessor):
     """Reproduce Nano's video-embedded audio hoist as seen by the hashing path.
 
     The raw request carries a single `video` whose `VideoData` nests an audio
-    track. `promote_nested_mm_data` hoists that audio to a top-level `audio`
+    track. `hoist_video_embedded_audio` hoists that audio to a top-level `audio`
     item (vision-only-stripping the video), and `call_with_text_prompt` returns
     a `multimodal_item_order` of `[(video, 0), (audio, 0)]` — i.e. the processed
     metadata references a modality (`audio`) that is absent from the raw,
@@ -603,7 +603,7 @@ class _FakeNanoVideoAudioProcessor(BaseMultimodalInputProcessor):
         return torch.float32
 
     # --- the Nano hoist contract under test ---
-    def promote_nested_mm_data(self, mm_data):
+    def hoist_video_embedded_audio(self, mm_data):
         videos = MixedModalItemOrder._normalize(mm_data).get("video", [])
         video_audios = [getattr(v, "audio", None) for v in videos]
         if not any(a is not None for a in video_audios):
@@ -622,7 +622,7 @@ class _FakeNanoVideoAudioProcessor(BaseMultimodalInputProcessor):
     def call_with_text_prompt(self, inputs, sampling_params):
         # Mirror Nano's mixed path: promote the embedded audio, then emit an
         # item order that references the promoted `audio` item.
-        mm_data = self.promote_nested_mm_data(inputs["multi_modal_data"])
+        mm_data = self.hoist_video_embedded_audio(inputs["multi_modal_data"])
         assert "audio" in mm_data  # the hoist happened
         item_order = [("video", 0), ("audio", 0)]
         multimodal_data = {

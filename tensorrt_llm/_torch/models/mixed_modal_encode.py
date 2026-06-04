@@ -94,8 +94,20 @@ class ScatterIndices(NamedTuple):
 
 def build_scatter_index(items: List[ModalityItem], num_params: int) -> ScatterIndices:
     """Partition items into per-modality buckets and compute batch-relative
-    destination rows. Per-request uniqueness is already guaranteed by
-    `MixedModalItemOrder.__post_init__`; this is pure index math.
+    Computes destination rows for each item. Each prompt slot is unique per request,
+    enforced by `MixedModalItemOrder.__post_init__`; only index calculations here.
+
+    Worked example (used in the inline comments below). Two requests with
+    interleaved modalities, num_params=2:
+
+        item  src_param  modality  prompt_pos  rows (encoder-output row count)
+          0       0        image       0         2
+          1       0        video       1         3
+          2       1        video       0         3
+          3       1        image       1         2
+
+    Canonical buffer (ordered by src_param, then prompt_pos), size 10:
+        req0: [img rows 0,1][vid rows 2,3,4]   req1: [vid rows 5,6,7][img rows 8,9]
     """
     n = len(items)
     if n == 0:
@@ -103,28 +115,34 @@ def build_scatter_index(items: List[ModalityItem], num_params: int) -> ScatterIn
 
     # One pass lifts Python ModalityItem fields into parallel int64 tensors (the
     # Python-object -> tensor boundary); everything after is vectorized.
-    src = torch.tensor([it.src_param_idx for it in items], dtype=torch.int64)
-    rows = torch.tensor([it.rows for it in items], dtype=torch.int64)
-    pos = torch.tensor([it.prompt_pos for it in items], dtype=torch.int64)
-    active_modalities = list(dict.fromkeys(it.modality for it in items))  # first-seen order
-    code = {m: i for i, m in enumerate(active_modalities)}
-    mcode = torch.tensor([code[it.modality] for it in items], dtype=torch.int64)
+    src = torch.tensor([it.src_param_idx for it in items], dtype=torch.int64)  # ex: [0,0,1,1]
+    rows = torch.tensor([it.rows for it in items], dtype=torch.int64)  # ex: [2,3,3,2]
+    pos = torch.tensor([it.prompt_pos for it in items], dtype=torch.int64)  # ex: [0,1,0,1]
+    active_modalities = list(
+        dict.fromkeys(it.modality for it in items)
+    )  # first-seen: [image, video]
+    code = {m: i for i, m in enumerate(active_modalities)}  # ex: {image:0, video:1}
+    mcode = torch.tensor([code[it.modality] for it in items], dtype=torch.int64)  # ex: [0,1,1,0]
 
-    # Per-param row totals via scatter_add (no Python accumulation loop).
+    # Per-param row totals. ex: [5,5] (req0: 2+3, req1: 3+2)
     param_lengths = torch.zeros(num_params, dtype=torch.int64).scatter_add_(0, src, rows)
 
     # Each item's destination start == exclusive prefix sum of `rows` in canonical
     # (src_param, prompt_pos) order. The canonical buffer is items concatenated by
     # param then by prompt order, so an item's start is the rows ordered before it.
     # One argsort + one cumsum replaces the per-param sort-and-accumulate loop.
-    sort_key = src * (int(pos.max()) + 1) + pos
-    order = torch.argsort(sort_key)
-    excl_sorted = torch.cumsum(rows[order], dim=0) - rows[order]
+    sort_key = src * (int(pos.max()) + 1) + pos  # ex: src*2+pos = [0,1,2,3]
+    order = torch.argsort(sort_key)  # ex: [0,1,2,3] (canonical item order)
+    excl_sorted = (
+        torch.cumsum(rows[order], dim=0) - rows[order]
+    )  # ex: [2,5,8,10]-[2,3,3,2]=[0,2,5,8]
     dst_start = torch.empty(n, dtype=torch.int64)
-    dst_start[order] = excl_sorted  # unsort back to original item order
+    dst_start[order] = excl_sorted  # unsort back to original item order. ex: [0,2,5,8]
 
-    # Buckets + destination rows. Only remaining loop is over distinct modalities
-    # (<= 3); each body is a vectorized nonzero + _expand_ranges (no per-item loop).
+    # Buckets + destination rows. loop over distinct modalities ( <= 3)
+    # each body is a vectorized nonzero + _expand_ranges
+    # ex: image -> slots [0,3], starts [0,8], rows [2,2] -> dst [0,1,8,9]
+    #     video -> slots [1,2], starts [2,5], rows [3,3] -> dst [2,3,4,5,6,7]
     modality_slots: Dict[str, torch.Tensor] = {}
     dst_indices: Dict[str, torch.Tensor] = {}
     for modality, c in code.items():
@@ -146,8 +164,8 @@ def _expand_ranges(starts: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
 
     Vectorized equivalent of
     ``torch.cat([torch.arange(s, s + l) for s, l in zip(starts, lengths)])``,
-    built with a single `repeat_interleave` + `arange` (no per-token Python
-    loop). Both inputs are int64 1-D tensors of equal length; returns an empty
+    built with a single `repeat_interleave` + `arange`.
+    Both inputs are int64 1-D tensors of equal length; returns an empty
     int64 tensor when there are no rows.
     """
     total = int(lengths.sum()) if lengths.numel() > 0 else 0

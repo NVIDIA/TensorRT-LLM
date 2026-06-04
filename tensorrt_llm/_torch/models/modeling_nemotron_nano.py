@@ -1328,6 +1328,41 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         num_image_tokens += len(self._img_start_token_ids) + len(self._img_end_token_ids)
         return num_image_tokens
 
+    def reconcile_dynamic_image_token_counts(
+        self,
+        num_mm_tokens_by_key: Dict[str, List[int]],
+        multimodal_data: Optional[Dict[str, Any]],
+    ) -> Dict[str, List[int]]:
+        """Reconcile planned image counts to the dummy-pass post-tile actuals.
+
+        On the dynamic-tiler path `get_num_tokens_per_image` (used by
+        `find_mm_token_lengths` in the token-id fast path) plans each image at the
+        full `_max_num_patches` cap with no text / reservation context, but the
+        dummy-placeholder pass tiled the same images at the reservation-reduced
+        budget and stored the actual per-image context counts under
+        `multimodal_data["image"]["num_tokens_per_image"]`. Replace the planned
+        counts with those actuals (plus the `<img>`/`</img>` start / end specials,
+        which `get_num_tokens_per_image` folds into its total) so the token-id
+        path bakes the same `multimodal_embedding_lengths` the encoder will emit.
+        Mirrors the text path's deferral / splice in `_process_mixed_modalities`.
+        No-op when there is no dynamic tiler or no per-image actuals to reconcile.
+        """
+        if self.dynamic_tiler is None:
+            return num_mm_tokens_by_key
+        planned_image_counts = num_mm_tokens_by_key.get("image")
+        if not planned_image_counts:
+            return num_mm_tokens_by_key
+        actual_num_tokens = ((multimodal_data or {}).get("image") or {}).get("num_tokens_per_image")
+        # Reconcile only when the dummy pass produced exactly one actual per
+        # planned image; any other shape means these are not the per-image
+        # tiling counts, so leave the planned counts untouched.
+        if actual_num_tokens is None or len(actual_num_tokens) != len(planned_image_counts):
+            return num_mm_tokens_by_key
+        start_end = len(self._img_start_token_ids) + len(self._img_end_token_ids)
+        reconciled = dict(num_mm_tokens_by_key)
+        reconciled["image"] = [actual + start_end for actual in actual_num_tokens]
+        return reconciled
+
     def _get_video_tokens_per_frame(
         self, orig_w: Optional[int] = None, orig_h: Optional[int] = None
     ) -> int:
@@ -2707,7 +2742,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         videos = MixedModalItemOrder._normalize(mm_data).get("video", [])
         return [getattr(v, "audio", None) for v in videos]
 
-    def promote_nested_mm_data(self, mm_data: Dict[str, Any]) -> Dict[str, Any]:
+    def hoist_video_embedded_audio(self, mm_data: Dict[str, Any]) -> Dict[str, Any]:
         """Hoist video-embedded audio to a first-class top-level `audio` item.
 
         A video that carries an embedded audio track (`VideoData.audio`) is
@@ -2734,9 +2769,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         video-embedded audio in one request is not supported (the prompt-order
         index of the hoisted audio would be ambiguous); it raises.
 
-        Idempotent (per the base-hook contract): re-promoting already-promoted
-        data is a no-op — the hoisted video copies have `.audio` cleared, so the
-        early-out sees no embedded audio left to hoist.
+        Idempotent (the dispatch in `call_with_token_ids` / the hashing wrapper
+        may re-enter): re-promoting already-promoted data is a no-op — the hoisted
+        video copies have `.audio` cleared, so the early-out sees no embedded
+        audio left to hoist.
         """
         video_audios = self._video_embedded_audios(mm_data)
         if not any(a is not None for a in video_audios):
@@ -2770,11 +2806,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         text_prompt: str,
         mm_data: Dict[str, Any],
     ) -> Tuple[str, Dict[str, Any]]:
-        """Text-path wrapper around `promote_nested_mm_data`.
+        """Text-path wrapper around `hoist_video_embedded_audio`.
 
         The raw mixed prompt does NOT carry a `<sound_context>` run for
         video-embedded audio (only the single-modality video path injects one),
-        so in addition to the data promotion done by `promote_nested_mm_data`
+        so in addition to the data promotion done by `hoist_video_embedded_audio`
         this injects a `<sound_context>` placeholder after each
         video-with-audio placeholder in the text (mirroring
         `_extract_audio_from_video`), so the downstream order scanner emits
@@ -2790,7 +2826,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         videos = MixedModalItemOrder._normalize(mm_data).get("video", [])
         # Promote the embedded audio to a top-level `(audio, k)` item + vision-only
         # video (shared with the token path); raises on standalone+embedded audio.
-        hoisted_mm_data = self.promote_nested_mm_data(mm_data)
+        hoisted_mm_data = self.hoist_video_embedded_audio(mm_data)
 
         # Inject <sound_context> after each <video> that carries audio (same
         # rebuild as `_extract_audio_from_video`, but feature prep is deferred to

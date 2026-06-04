@@ -2775,10 +2775,10 @@ class TestVideoWithEmbeddedAudioHoist:
         proc = self._make_proc()
         mm_data = {"video": [self._video_with_audio()]}
 
-        promoted = proc.promote_nested_mm_data(mm_data)
+        promoted = proc.hoist_video_embedded_audio(mm_data)
         assert proc._video_embedded_audios(promoted) == [None]
 
-        repromoted = proc.promote_nested_mm_data(promoted)
+        repromoted = proc.hoist_video_embedded_audio(promoted)
         assert repromoted is promoted
 
     def test_full_pipeline_emits_video_audio_plan(self):
@@ -2834,7 +2834,7 @@ class TestTokenPathVideoEmbeddedAudioHoist:
     carries a `<sound_context>` placeholder after each video-with-audio (the
     natural analogue of the text path injecting one). `mm_data` still nests the
     audio on the `VideoData` (not yet hoisted). The processor's
-    `promote_nested_mm_data` hook must, before `find_mm_token_lengths` and the
+    `hoist_video_embedded_audio` hook must, before `find_mm_token_lengths` and the
     token-path order resolution (the model's `get_mm_item_order`) run:
       1. register the embedded audio as a top-level `mm_data["audio"]` item, and
       2. vision-only-strip `.audio` off the video items,
@@ -2975,7 +2975,7 @@ class TestTokenPathVideoEmbeddedAudioHoist:
         video.audio = None
 
         mm_data = {"video": [video]}
-        promoted = proc.promote_nested_mm_data(mm_data)
+        promoted = proc.hoist_video_embedded_audio(mm_data)
 
         assert "audio" not in promoted
         # The original mm_data is returned unchanged (no copy needed).
@@ -2990,7 +2990,7 @@ class TestTokenPathVideoEmbeddedAudioHoist:
         mm_data = {"video": [video], "audio": [(standalone.samples, standalone.sample_rate)]}
 
         with pytest.raises(NotImplementedError, match="standalone audio"):
-            proc.promote_nested_mm_data(mm_data)
+            proc.hoist_video_embedded_audio(mm_data)
 
 
 class TestTokenPathBakesPromptItemOrder:
@@ -3072,3 +3072,68 @@ class TestTokenPathBakesPromptItemOrder:
             {"modality": "video", "index": 0},
             {"modality": "image", "index": 1},
         ]
+
+
+class TestTokenPathReconcilesDynamicTilerImageCounts:
+    """The pre-tokenized (`call_with_token_ids`) path must size the image slot
+    from the post-tile actual, mirroring the text path's reconciliation.
+
+    Sibling of `test_mixed_image_audio_dynamic_tiler_reconciles_post_tile_counts`
+    (which covers the text path). On the dynamic-tiler path a large image
+    co-located with a real audio is PLANNED at the full `_max_num_patches` cap by
+    `get_num_tokens_per_image` (called inside `find_mm_token_lengths`), but the
+    dummy-placeholder pass TILES it at the reservation-reduced budget. The
+    token-id path then bakes `multimodal_embedding_lengths` from the full-cap
+    `num_mm_tokens` and never reconciles to the post-tile actuals the dummy pass
+    already produced, so the encoder emits fewer rows than `sum(item.rows)` and
+    the row-count check in `mixed_modal_encode.py` trips (a user-reachable
+    `ValueError` that rejects the request). The fix reconciles the image slot to
+    the actual post-tile count before baking lengths.
+    """
+
+    def test_call_with_token_ids_reconciles_mixed_image_audio_dynamic_tiler(self):
+        proc = _make_fast_path_audio_processor(
+            max_model_len=120, max_num_patches=512, min_num_patches=4
+        )
+        # Pin the vocab size so the real `compute_mm_embedding_lengths` embed-mask
+        # path runs end-to-end (the Mock config would otherwise leave it a Mock).
+        proc.config.llm_config.vocab_size = 1000
+
+        img_ctx = proc.img_context_token_id
+        snd_ctx = proc._sound_context_token_id
+
+        img = Image.new("RGB", (512, 512))
+        audio = np.random.randn(16000).astype(np.float32)
+        mm_data = {"image": [img], "audio": [audio]}
+        # Pre-tokenized prompt with one placeholder per mm item, in prompt order.
+        prompt_token_ids = [1, img_ctx, 2, snd_ctx, 3]
+
+        _, extra = proc.call_with_token_ids(
+            {"prompt_token_ids": prompt_token_ids, "multi_modal_data": mm_data},
+            None,
+        )
+
+        multimodal_data = extra["multimodal_data"]
+        item_order = multimodal_data["multimodal_item_order"]
+        image_slot = next(i for i, entry in enumerate(item_order) if entry["modality"] == "image")
+
+        # The dummy-placeholder pass tiled the image at the reservation-reduced
+        # budget; this is the per-image context count the encoder will emit.
+        actual_image_context = multimodal_data["image"]["num_tokens_per_image"][0]
+
+        # The OLD planned count: full `_max_num_patches`-cap tiling, minus the
+        # `<img>`/`</img>` start/end specials `get_num_tokens_per_image` folds in.
+        planned_total = proc.get_num_tokens_per_image(image=img)
+        start_end = len(proc._img_start_token_ids) + len(proc._img_end_token_ids)
+        planned_image_context = planned_total - start_end
+
+        # Precondition: the budget squeeze must actually force a divergence,
+        # otherwise the test would pass vacuously.
+        assert actual_image_context < planned_image_context
+
+        # The baked embedding length for the image slot must equal the ACTUAL
+        # post-tile context count (what the encoder emits), NOT the planned
+        # full-cap count. Pre-fix, the token-id path bakes the full cap here, so
+        # the encoder row-count cross-check would reject the request.
+        embedding_lengths = multimodal_data["multimodal_embedding_lengths"]
+        assert embedding_lengths[image_slot] == actual_image_context

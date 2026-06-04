@@ -294,31 +294,6 @@ class BaseMultimodalInputProcessor(ABC):
         """
         ...
 
-    def promote_nested_mm_data(self, mm_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Promote nested modality payloads to first-class top-level items.
-
-        Returns the (possibly rebuilt) `mm_data`. The base implementation is a
-        no-op (returns `mm_data` unchanged). Models whose raw `multi_modal_data`
-        carries one modality embedded inside another (e.g. Nano's video-embedded
-        audio, modeled as a separate `(audio, k)` prompt item) override this to
-        hoist the nested payload so that both `find_mm_token_lengths` and the
-        prompt-item order resolution see the promoted items.
-
-        Contract for overrides:
-
-        - Idempotent: re-promoting already-promoted data MUST be a no-op. A
-          single request flows through more than one independent entry boundary
-          (the hashing wrapper in `create_input_processor_with_hash` promotes
-          for hashing, then the processor's own `call_with_token_ids` promotes
-          again), and the dummy-placeholder pass may also re-enter. Each
-          boundary normalizes its own `mm_data`; there is no single global
-          promote, so promotion must converge to a fixed point.
-        - Non-mutating: return a shallow-rebuilt copy rather than mutating the
-          caller's `mm_data` (the raw payload is still needed elsewhere — e.g.
-          the text path reads the original nested payload to place placeholders).
-        """
-        return mm_data
-
     def call_with_token_ids(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
@@ -358,15 +333,13 @@ class BaseMultimodalInputProcessor(ABC):
             )
 
         prompt_token_ids = inputs["prompt_token_ids"]
-        # Promote any modality payload nested inside another modality's items
-        # (e.g. Nano's video-embedded audio) to a first-class top-level item
-        # before counts, lengths, and order resolution are derived, so the
-        # promoted `mm_data` flows consistently into every downstream step.
-        # `self` is a `BaseMultimodalInputProcessor`, which always defines the
-        # hook (base is a no-op), so this calls it directly rather than via the
-        # optional-hook `_promote_nested_mm_data` dispatch used by the hashing
-        # wrapper, whose `input_processor` may be a hookless bare processor.
-        mm_data = self.promote_nested_mm_data(inputs["multi_modal_data"])
+        # Hoist a video's embedded audio track into a standalone top-level audio
+        # item before counts, lengths, and order resolution are derived, so the
+        # hoisted audio flows consistently into every downstream step. This is the
+        # only nested-payload case (Nano's video-embedded audio); the dispatch
+        # resolves Nano's hook and is a no-op for processors that do not define it.
+        mm_data = _maybe_hoist_video_embedded_audio(self,
+                                                    inputs["multi_modal_data"])
         mm_counts = _mm_data_to_counts(mm_data)
 
         # Run the HF processor / vision encoder on a synthetic placeholder
@@ -395,6 +368,21 @@ class BaseMultimodalInputProcessor(ABC):
             raise ValueError(
                 "call_with_token_ids: find_mm_token_lengths returned no token "
                 "lengths for the provided multi_modal_data.")
+        # `find_mm_token_lengths` plans counts from the raw payload, which can
+        # diverge from what the dummy-placeholder pass actually produced (e.g.
+        # Nano's dynamic image tiler plans at the full `_max_num_patches` cap but
+        # the dummy pass tiles at a reservation-reduced budget). Reconcile against
+        # the dummy-pass actuals before the counts drive placeholder expansion and
+        # `multimodal_embedding_lengths`, so the baked lengths match the rows the
+        # encoder will emit. Reconciliation is a model-specific opt-in hook (only
+        # models like Nano with budget-adaptive token counts define it); resolve
+        # it defensively and skip when absent.
+        reconcile = getattr(self, "reconcile_dynamic_image_token_counts", None)
+        if callable(reconcile):
+            num_mm_tokens_by_key = reconcile(
+                num_mm_tokens_by_key,
+                (extra_processed_inputs or {}).get("multimodal_data"),
+            )
         # The dummy-placeholder pass ran the text path on synthetic placeholder
         # text built modality-major by `get_text_with_mm_placeholders`, which for
         # a mixed request bakes a stale modality-major `multimodal_item_order`
@@ -586,9 +574,7 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def get_num_multimodal_tokens(self):
-        """
-        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        """
+        """Get the Hugging Face processor's '_get_num_multimodal_tokens' method."""
         if hasattr(self.processor, '_get_num_multimodal_tokens'):
             return self.processor._get_num_multimodal_tokens
         else:
@@ -670,9 +656,7 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """
-    Base class for generating dummy inputs. Specially for profiling
-    """
+    """Base class for generating dummy inputs. Specially for profiling."""
 
     DEFAULT_IMAGE_MAX_DIM = 16384
     DEFAULT_IMAGE_MIN_DIM = 128
@@ -793,9 +777,7 @@ class MultimodalPlaceholderMetadata:
 
 
 class MultimodalPlaceholderRegistry:
-    """
-    Registry for the multimodal models to keep track of the placeholder information.
-    """
+    """Registry for the multimodal models to keep track of the placeholder information."""
 
     def __init__(self) -> None:
         self._multimodal_placeholder_by_model_type: Dict[
@@ -1044,23 +1026,21 @@ def _mm_data_to_counts(mm_data: Dict[str, Any]) -> Dict[str, int]:
     return {k: len(v) for k, v in mm_items.items()}
 
 
-def _promote_nested_mm_data(processor, mm_data: Dict[str,
-                                                     Any]) -> Dict[str, Any]:
-    """Dispatch `mm_data` through `processor.promote_nested_mm_data` if present.
+def _maybe_hoist_video_embedded_audio(
+        processor, mm_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Dispatch `mm_data` through `processor.hoist_video_embedded_audio` if present.
 
-    The single home for the optional-hook `getattr`: `processor` may be a bare
-    processor with no promotion hook (e.g. a plain `DefaultInputProcessor`), so
-    the hook is resolved defensively and skipped when absent. Promotion hoists a
-    modality payload nested inside another modality's items (e.g. Nano's
-    video-embedded audio) to a first-class top-level item so that hashes,
-    lengths, and prompt-item order resolution all see the promoted items. The
-    base hook is a no-op, so single-modality and non-promoting processors are
-    unaffected. Idempotent (see `BaseMultimodalInputProcessor.promote_nested_mm_data`),
-    so calling this at independent entry boundaries is safe.
+    The single home for the optional-hook `getattr`: `processor` may not define
+    the hook (e.g. a plain `DefaultInputProcessor`), so it is resolved defensively
+    and skipped when absent. Today the only definer is Nano, whose hook hoists a
+    video's embedded audio track into a standalone top-level audio item (and strips
+    it off the video), so hashes, lengths, and prompt-item order all see it as its
+    own `(audio, k)` item. The hook must be idempotent, so calling this at
+    independent entry boundaries is safe.
     """
-    promote = getattr(processor, "promote_nested_mm_data", None)
-    if callable(promote):
-        return promote(mm_data)
+    hoist = getattr(processor, "hoist_video_embedded_audio", None)
+    if callable(hoist):
+        return hoist(mm_data)
     return mm_data
 
 
@@ -1181,19 +1161,10 @@ def create_input_processor_with_hash(
         cache identifier and returned in KV cache events instead of the content hash.
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
-        # Promote any modality payload nested inside another modality's items
-        # (e.g. Nano's video-embedded audio) to a first-class top-level item
-        # BEFORE hashes, lengths, and order resolution are derived. This mirrors
-        # call_with_token_ids and keeps the hashing path aligned with the
-        # processed `multimodal_item_order`, which references the promoted items
-        # (e.g. a hoisted `audio`). Resolving the order against the raw,
-        # un-promoted data would raise "order references modality ..." and
-        # silently disable multimodal hashing / block reuse. `input_processor`
-        # may be a bare processor with no hook, so the optional-hook dispatch is
-        # centralized in `_promote_nested_mm_data` (the base hook is a no-op, so
-        # single-modality and non-promoting processors are unaffected).
-        mm_data = _promote_nested_mm_data(input_processor,
-                                          inputs['multi_modal_data'])
+        # Promote Nano's video-embedded audio to a first-class top-level item
+        # BEFORE hashes, lengths, and order resolution are derived.
+        mm_data = _maybe_hoist_video_embedded_audio(input_processor,
+                                                    inputs['multi_modal_data'])
 
         # Extract optional UUIDs (can be None, or dict with same structure as mm_data)
         mm_uuids = inputs.get('multi_modal_uuids', None)
