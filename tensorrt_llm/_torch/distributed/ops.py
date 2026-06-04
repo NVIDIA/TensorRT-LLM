@@ -532,6 +532,14 @@ class MNNVLAllReduce(nn.Module):
     """
     allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
 
+    SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
+        AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+    })
+
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
         self.mapping = mapping
@@ -589,17 +597,18 @@ class MNNVLAllReduce(nn.Module):
         """Forward pass for MNNVL AllReduce.
 
         Args:
-            input (torch.Tensor): Input tensor to be reduced
-            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations
+            input (torch.Tensor): Input tensor to be reduced; last dim is the hidden dimension.
+            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations.
 
         Returns:
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s). Output tensors
+            preserve the input's N-D shape (NVFP4 quant output has its last dim halved; the
+            NVFP4 scale-factor output is 1-D).
         """
 
         fusion_op = all_reduce_params.fusion_op
-        shape = input.shape
-        input = input.view(-1, shape[-1])
-        (num_tokens, hidden_dim) = input.shape
+        hidden_dim = input.shape[-1]
+        num_tokens = input.numel() // hidden_dim
 
         workspace_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
@@ -623,26 +632,8 @@ class MNNVLAllReduce(nn.Module):
         # The buffer flags is tied to the buffer and used to save the state of the buffer
         buffer_flags = workspace["buffer_flags"]
 
-        if fusion_op == AllReduceFusionOp.NONE:
-            output, = torch.ops.trtllm.mnnvl_fusion_allreduce(
-                input,
-                None,  # gamma
-                None,  # residual
-                1e-6,  # epsilon
-                buffer_base,  # comm_buffer
-                buffer_flags,  # buffer_flags
-                False,  # rmsnorm_fusion
-            )
-            return output.view(shape)
-
-        supported_fusion_ops = (
-            AllReduceFusionOp.RESIDUAL_RMS_NORM,
-            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
-            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
-            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
-        )
-        if fusion_op not in supported_fusion_ops:
+        is_fusion = fusion_op != AllReduceFusionOp.NONE
+        if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
             return None
 
         outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
@@ -652,33 +643,11 @@ class MNNVLAllReduce(nn.Module):
             all_reduce_params.eps,  # epsilon
             buffer_base,  # comm_buffer
             buffer_flags,  # buffer_flags
-            True,  # rmsnorm_fusion
+            is_fusion,  # rmsnorm_fusion
             all_reduce_params.scale,  # scale
             int(fusion_op),
         )
-
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            output, residual_out = outputs
-            return output.view(shape), residual_out.view(shape)
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
-            quant_out, residual_out = outputs
-            return quant_out.view(shape), residual_out.view(shape)
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
-            output, quant_out, residual_out = outputs
-            return output.view(shape), quant_out.view(shape), residual_out.view(
-                shape)
-
-        fp4_shape = (*shape[:-1], shape[-1] // 2)
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
-            quant_out, scale_out, residual_out = outputs
-            return quant_out.view(fp4_shape), scale_out, residual_out.view(
-                shape)
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
-            output, quant_out, scale_out, residual_out = outputs
-            return (output.view(shape), quant_out.view(fp4_shape), scale_out,
-                    residual_out.view(shape))
-
-        return None
+        return tuple(outputs) if is_fusion else outputs[0]
 
 
 class AllReduce(nn.Module):

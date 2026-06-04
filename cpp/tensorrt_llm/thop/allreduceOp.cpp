@@ -1810,11 +1810,13 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     TORCH_CHECK(
         mcast_mem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a mcastBuffer instance.");
     TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
-    TORCH_CHECK(input.dim() == 2, "[mnnvlFusionAllReduce] input must be a 2D tensor");
+    TORCH_CHECK(input.dim() >= 2, "[mnnvlFusionAllReduce] input must have at least 2 dimensions");
 
+    // Treat input as a flat (numTokens, hiddenDim) buffer for the kernel while preserving the
+    // original N-D shape for the returned tensors (via empty_like / input.sizes() below).
     auto const eltsPerThread = sizeof(float4) / input.itemsize();
-    auto const hiddenDim = input.size(1);
-    auto const numTokens = input.size(0);
+    auto const hiddenDim = input.size(-1);
+    auto const numTokens = input.numel() / hiddenDim;
     TORCH_CHECK(hiddenDim % eltsPerThread == 0,
         "[mnnvlFusionAllReduce] Hidden dimension must be divisible by " + std::to_string(eltsPerThread) + ", got "
             + std::to_string(hiddenDim));
