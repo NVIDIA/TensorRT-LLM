@@ -1170,6 +1170,31 @@ def extractNvbugId(prTitle)
     return matcher ? matcher[0][1] : null
 }
 
+// Normalize a customized QA test list into a single comma-separated line.
+// The list may be supplied one entry per line and/or comma-separated, with
+// "#" line comments allowed. Raw newlines must not survive here: the value is
+// embedded into the newline-delimited key=value parameter stream passed to
+// triggerRemoteJob, so an embedded newline would corrupt the parameters that
+// follow it. Returns "" when no entries remain.
+@NonCPS
+def normalizeQaTestList(rawTestList)
+{
+    if (!rawTestList) {
+        return ""
+    }
+    def entries = []
+    rawTestList.readLines().each { line ->
+        def withoutComment = line.replaceFirst(/#.*$/, "")
+        withoutComment.split(",").each { entry ->
+            def trimmed = entry.trim()
+            if (trimmed) {
+                entries.add(trimmed)
+            }
+        }
+    }
+    return entries.join(",")
+}
+
 // Trigger the QA function verification pipeline (LLM_FUNCTION_AUTO_V2C) on the
 // QA Jenkins server for --qa-verify-only. Pre-conditions:
 //   1. nvbug id parsed from the PR title.
@@ -1196,8 +1221,9 @@ def launchQaVerify(pipeline, globalVars, qaVerifyTestList)
         // Optional customized test list entries (one per line and/or
         // comma-separated, "#" comments allowed); appended to the bug's
         // waives/test_records result. Only applied in manual mode (nvbug_ids
-        // non-empty); blank means none.
-        def customizedTestList = qaVerifyTestList?.trim() ?: ""
+        // non-empty); blank means none. Normalized to a single comma-separated
+        // line so embedded newlines do not corrupt the parameter stream below.
+        def customizedTestList = normalizeQaTestList(qaVerifyTestList)
 
         pipeline.echo(
             "Triggering QA verify job: " +
