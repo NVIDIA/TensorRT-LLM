@@ -1358,7 +1358,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention treats decoder beams as already-expanded rows and
         # reads request-scoped encoder K/V, so kernel beam indirection stays off.
         kernel_beam_width = 1 if metadata.is_cross else metadata.beam_width
-        prefer_trtllm_gen = _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION or metadata.is_cross
+        # Use TRTLLM-Gen when the user opts in globally; is_supported() below
+        # then gates on hardware/config support. This applies uniformly to
+        # self- and cross-attention. When TRTLLM-Gen is off or unsupported,
+        # cross-attention falls back to the legacy thop.attention cross path.
+        prefer_trtllm_gen = _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
@@ -1394,6 +1398,23 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 skip_softmax_threshold_scale_factor_decode=
                 skip_softmax_threshold_scale_factor_decode,
             )[0])
+
+        # Cross-attention: both the trtllm-gen and legacy thop QKV-preprocessing
+        # kernels read Q from a fused QKV buffer (row stride
+        # q_hidden + 2 * kv_hidden), but the cross-attention module supplies a
+        # Q-only tensor [num_tokens, q_hidden]. Widen Q once here so both paths
+        # feed the kernel the layout it expects; the trailing K/V columns are
+        # never read (encoder K/V come from cross_kv_input). Done after the
+        # dispatch decision so is_supported() still sees the original Q tensor.
+        if metadata.is_cross:
+            q_hidden_size = self.num_heads * self.head_dim
+            kv_hidden_size = self.num_kv_heads * self.head_dim
+            fused_q = q.new_zeros(
+                (q.shape[0], q_hidden_size + 2 * kv_hidden_size))
+            fused_q[:, :q_hidden_size].copy_(q)
+            q = fused_q
+            is_fused_qkv = True
+
         if can_use_trtllm_gen:
             trtllm_gen_attention(
                 q,
@@ -1496,12 +1517,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_fused_qkv_arg = is_fused_qkv
             legacy_attention_kwargs = {}
             if metadata.is_cross:
-                q_hidden_size = self.num_heads * self.head_dim
-                kv_hidden_size = self.num_kv_heads * self.head_dim
-                q_arg = q.new_zeros(
-                    (q.shape[0], q_hidden_size + 2 * kv_hidden_size))
-                q_arg[:, :q_hidden_size].copy_(q)
-                is_fused_qkv_arg = True
                 legacy_attention_kwargs = {
                     "cross_attention": True,
                     "cross_kv": cross_kv_input,

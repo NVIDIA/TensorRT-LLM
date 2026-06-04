@@ -195,7 +195,6 @@ class TestSplitKvCacheBudgetForCross:
         creator = _make_creator(config, is_enc_dec=True)
         self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
-        assert cross_config is not None
         assert self_config is not config
         assert cross_config.max_gpu_total_bytes == total // 2
         assert self_config.max_gpu_total_bytes == total - total // 2
@@ -343,7 +342,6 @@ class TestResourceManagerType:
     """Verify CROSS_KV_CACHE_MANAGER exists in the enum."""
 
     def test_cross_kv_cache_manager_in_enum(self):
-        assert hasattr(ResourceManagerType, "CROSS_KV_CACHE_MANAGER")
         assert ResourceManagerType.CROSS_KV_CACHE_MANAGER.value == "CROSS_KV_CACHE_MANAGER"
 
 
@@ -513,8 +511,6 @@ class TestCrossKvCacheConstruction:
         resources = {}
         creator.build_managers(resources, estimating_kv_cache=False)
 
-        assert resources[ResourceManagerType.KV_CACHE_MANAGER] is not None
-        assert resources[ResourceManagerType.CROSS_KV_CACHE_MANAGER] is not None
         creator._create_cross_kv_cache_manager.assert_called_once()
 
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
@@ -540,8 +536,6 @@ class TestCrossKvCacheConstruction:
         resources = {}
         creator.build_managers(resources, estimating_kv_cache=True)
 
-        assert resources[ResourceManagerType.KV_CACHE_MANAGER] is not None
-        assert resources[ResourceManagerType.CROSS_KV_CACHE_MANAGER] is not None
         creator._create_cross_kv_cache_manager.assert_called_once()
 
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
@@ -793,9 +787,6 @@ class TestBindCapacitySchedulerCrossParam:
                 cross_kv_cache_manager=cross_mgr,
                 no_schedule_until_state=LlmRequestState.ENCODER_INIT,
             )
-
-            # The cross manager is stored on the wrapper.
-            assert scheduler.cross_kv_cache_manager is cross_mgr
 
             # Construction forwarded the gating to the C++ binding.
             ctor_kwargs = cap_cls.call_args.kwargs

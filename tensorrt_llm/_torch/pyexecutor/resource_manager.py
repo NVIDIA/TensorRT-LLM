@@ -678,42 +678,48 @@ class KVCacheManager(BaseResourceManager):
             remaining_tokens / self.tokens_per_block)
         return need_blocks
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def _prepare_cross_kv_resources(self,
+                                    scheduled_batch: ScheduledRequests) -> None:
+        """Allocate the cross-attention KV cache for a scheduled batch.
+        """
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
-            if self.kv_cache_type == CacheTypeCpp.CROSS:
-                batch_request_infos = []
-                batch_llm_requests = []
-                for req in scheduled_batch.context_requests:
-                    if (getattr(req, "py_skip_cross_kv_projection", False)
-                            or not req.is_first_context_chunk
-                            or not self._kv_connector_should_add_sequence(req)):
-                        continue
+            batch_request_infos = []
+            batch_llm_requests = []
+            for req in scheduled_batch.context_requests:
+                if (getattr(req, "py_skip_cross_kv_projection", False)
+                        or not req.is_first_context_chunk
+                        or not self._kv_connector_should_add_sequence(req)):
+                    continue
 
-                    encoder_output_len = getattr(req, "encoder_output_len",
-                                                 None)
-                    if encoder_output_len is None:
-                        raise RuntimeError(
-                            "Cross KV cache allocation requires "
-                            f"encoder_output_len for request {req.py_request_id}."
-                        )
+                encoder_output_len = getattr(req, "encoder_output_len", None)
+                if encoder_output_len is None:
+                    raise RuntimeError(
+                        "Cross KV cache allocation requires "
+                        f"encoder_output_len for request {req.py_request_id}.")
 
-                    batch_request_infos.append(
-                        (req.py_request_id, int(encoder_output_len), 1))
-                    batch_llm_requests.append(req)
+                batch_request_infos.append(
+                    (req.py_request_id, int(encoder_output_len), 1))
+                batch_llm_requests.append(req)
 
-                if batch_request_infos:
-                    self.impl.add_sequence_batch(batch_request_infos,
-                                                 batch_llm_requests)
+            if batch_request_infos:
+                self.impl.add_sequence_batch(batch_request_infos,
+                                             batch_llm_requests)
 
-                # Cross KV is written once from encoder K/V projection and
-                # then remains fixed for decoder generation.
-                self.impl.refresh_blocks()
-                return
+            self.impl.refresh_blocks()
 
-            # Collect first-chunk requests eligible for batch add_sequence.
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            self._prepare_cross_kv_resources(scheduled_batch)
+            return
+
+        with request_context(self.is_draft, scheduled_batch):
+            # wait for all pending work to finish before launching offload/onboarding/partial copy
+            self.impl.sync_transfer_manager_with_buffer_manager()
+
+            # Collect first-chunk requests eligible for batch add_sequence_batch.
             # When block reuse is enabled, addSequenceBatch uses a two-phase
             # claim-then-onboard strategy that prevents host offloading from
             # evicting reusable blocks in the radix tree.
@@ -925,13 +931,19 @@ class KVCacheManager(BaseResourceManager):
 
         return requests
 
+    def _update_cross_kv_resources(self,
+                                   scheduled_batch: ScheduledRequests) -> None:
+        """Persist cross-attention KV blocks after a scheduled batch.
+        """
+        for request in scheduled_batch.context_requests:
+            self.impl.store_context_blocks(request)
+
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
         if self.kv_cache_type == CacheTypeCpp.CROSS:
-            for request in scheduled_batch.context_requests:
-                self.impl.store_context_blocks(request)
+            self._update_cross_kv_resources(scheduled_batch)
             return
 
         if not self.is_draft:
@@ -1826,6 +1838,15 @@ class KVCacheManager(BaseResourceManager):
                                  request_ids: List[int], beam_width: int,
                                  num_context: int, num_seqs: int):
         if self.kv_cache_type == CacheTypeCpp.CROSS and beam_width > 1:
+            # This branch is reached only via attribute aliasing, never a
+            # direct cross_kv_cache_manager.copy_batch_block_offsets(...) call:
+            # AttentionMetadata.create_cross_metadata() sets
+            # cross_md.kv_cache_manager = cross_kv_cache_manager
+            # (attention_backend/interface.py), and then
+            # TrtllmAttentionMetadata.prepare() calls
+            # self.kv_cache_manager.copy_batch_block_offsets(...)
+            # (attention_backend/trtllm.py), which dispatches here on the
+            # cross manager.
             num_gen_requests = len(request_ids) - num_context
             expected_num_seqs = num_context + num_gen_requests * beam_width
             assert num_seqs == expected_num_seqs, (

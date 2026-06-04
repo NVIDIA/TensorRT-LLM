@@ -1755,9 +1755,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.qkv_bias = params.qkv_bias;
         preprocessingParams.tokens_info = decoder_params.tokensInfo;
         preprocessingParams.seq_lens = params.context_lengths;
-        // For cross-attention this is the decoder-side length used by the preprocessing
-        // kernel to decide whether to store encoder K/V into the cross-KV cache.
+        // For self-attention, cache_seq_lens indicates whether chunked context is used
+        // (i.e. cache_seq_len > seq_len).
+        // For cross-attention, callers do not consistently use sequence_lengths as decoder length; use decoder
+        // context lengths so the encoder KV-cache write gate opens.
         preprocessingParams.cache_seq_lens = isCrossAttention() ? params.context_lengths : params.sequence_lengths;
+
         preprocessingParams.encoder_seq_lens = params.encoder_input_lengths;
         preprocessingParams.cu_seq_lens = cu_q_seqlens;
         // Cross-attention only.

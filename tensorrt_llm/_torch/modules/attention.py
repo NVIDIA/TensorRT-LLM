@@ -119,7 +119,6 @@ def attn_custom_op_inplace(
     output_sf: Optional[torch.Tensor],
 ) -> None:
     metadata, attn_layer = extract_extra_attrs(layer_idx, "attn")
-    rel_attn_max_distance = relative_attention_max_distance
     mask = PredefinedAttentionMask(
         attention_mask
     ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
@@ -139,7 +138,7 @@ def attn_custom_op_inplace(
         output_sf=output_sf,
         attention_sinks=attention_sinks,
         relative_attention_bias=relative_attention_bias,
-        relative_attention_max_distance=rel_attn_max_distance,
+        relative_attention_max_distance=relative_attention_max_distance,
     )
 
 
@@ -720,7 +719,6 @@ class Attention(nn.Module):
         has_lora: bool = False,
     ):
         num_tokens = attn_metadata.num_tokens
-        rel_attn_max_distance = relative_attention_max_distance
 
         q = q[:num_tokens, :]
         if k is not None:
@@ -763,7 +761,8 @@ class Attention(nn.Module):
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
                     relative_attention_bias=relative_attention_bias,
-                    relative_attention_max_distance=rel_attn_max_distance,
+                    relative_attention_max_distance=
+                    relative_attention_max_distance,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -804,7 +803,7 @@ class Attention(nn.Module):
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
-                relative_attention_max_distance=rel_attn_max_distance,
+                relative_attention_max_distance=relative_attention_max_distance,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -830,7 +829,6 @@ class Attention(nn.Module):
     ):
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
-        rel_attn_max_distance = relative_attention_max_distance
         if mrope_config is not None:
             if "mrope_rotary_cos_sin" in mrope_config:
                 mrope_rotary_cos_sin = mrope_config["mrope_rotary_cos_sin"]
@@ -878,7 +876,7 @@ class Attention(nn.Module):
                 attention_mask_data,
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
-                relative_attention_max_distance=rel_attn_max_distance,
+                relative_attention_max_distance=relative_attention_max_distance,
                 has_lora=has_lora,
             )
         if output_sf is not None:
@@ -969,7 +967,6 @@ class Attention(nn.Module):
         if relative_attention_bias is not None:
             assert self.attn_backend == "TRTLLM", "Relative attention bias is only supported for TRTLLM backend."
 
-        rel_attn_max_distance = relative_attention_max_distance
         attn_output = self.forward_impl(
             q,
             k,
@@ -981,7 +978,7 @@ class Attention(nn.Module):
             mrope_config=mrope_config,
             attention_sinks=attention_sinks,
             relative_attention_bias=relative_attention_bias,
-            relative_attention_max_distance=rel_attn_max_distance,
+            relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
         )
 

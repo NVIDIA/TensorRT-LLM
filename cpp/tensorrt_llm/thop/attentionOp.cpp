@@ -514,11 +514,10 @@ public:
             if (cross_attention && cross_kv.has_value() && encoder_input_lengths.has_value())
             {
                 auto const& cross_kv_tensor = cross_kv.value();
-                auto const& enc_lens = encoder_input_lengths.value();
                 enqueue_params.cross_kv = static_cast<T const*>(cross_kv_tensor.data_ptr());
                 enqueue_params.num_encoder_tokens = static_cast<int32_t>(cross_kv_tensor.size(0));
                 enqueue_params.cross_kv_length
-                    = enc_lens.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+                    = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
             }
 
             if (op.isMLAEnabled())
@@ -716,8 +715,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool const use_sage_attn
         = sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
     TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn || cross_attention,
-        "Only fused QKV is supported for non-MLA non-cross attention now");
-    TLLM_CHECK_WITH_INFO(update_kv_cache || cross_attention, "KV cache update cannot be disabled now");
+        "For non-MLA, non-cross, non-SageAttention attention, only fused QKV is supported now.");
+    TLLM_CHECK_WITH_INFO(
+        update_kv_cache || cross_attention, "KV cache update cannot be disabled now (except for cross attention).");
     auto qkv_or_q = q;
     if (is_fused_qkv)
     {

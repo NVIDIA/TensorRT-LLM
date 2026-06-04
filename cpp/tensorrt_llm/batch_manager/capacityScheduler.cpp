@@ -444,7 +444,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
 
     // Keep track of blocks contributed by requests in context phase
     auto [newlyContributedContextBlocks, newlyContributedCrossContextBlocks]
-        = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager, crossKvCacheManager);
+        = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager);
 
     // Find last active in case we need to evict.  Encoder-init requests are
     // intentionally excluded here: they hold no started self- or cross-pool

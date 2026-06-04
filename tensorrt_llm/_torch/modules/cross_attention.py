@@ -162,38 +162,12 @@ class CrossAttention(nn.Module):
         self.v_proj.create_weights()
         self.o_proj.create_weights()
 
-    @staticmethod
-    def _infer_encoder_seq_lens(
-        encoder_hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        """Infer per-request encoder lengths from ``encoder_hidden_states``.
-
-        Used as a fallback when ``cross_attn_metadata`` is not provided.
-        Only single-request batches are unambiguous; multi-request batches
-        require the caller to supply ``cross_attn_metadata`` with explicit
-        ``seq_lens_kv``.
-        """
-        num_encoder_tokens = encoder_hidden_states.shape[0]
-        num_requests = int(attn_metadata.seq_lens.numel())
-        if num_requests == 1:
-            return torch.tensor([num_encoder_tokens], dtype=torch.int32)
-        if num_encoder_tokens % num_requests != 0:
-            raise ValueError(
-                "Cannot infer encoder_seq_lens from encoder_hidden_states for "
-                f"a multi-request batch (num_requests={num_requests}, "
-                f"num_encoder_tokens={num_encoder_tokens}). "
-                "Pass an explicit cross_attn_metadata with seq_lens_kv set."
-            )
-        per_request = num_encoder_tokens // num_requests
-        return torch.full((num_requests,), per_request, dtype=torch.int32)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
-        cross_attn_metadata: Optional[AttentionMetadata] = None,
+        cross_attn_metadata: AttentionMetadata,
         skip_cross_kv_projection: bool = False,
         all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
@@ -209,11 +183,10 @@ class CrossAttention(nn.Module):
             cross_attn_metadata: Cross-attention metadata carrying encoder
                 K/V-side lengths, cross-pool block tables, etc. Must satisfy
                 ``cross_attn_metadata.is_cross is True`` (i.e. the K/V-side
-                ``seq_lens_kv`` differs from the Q-side ``seq_lens``). When
-                ``None``, the module auto-builds a stateless cross metadata
-                from ``attn_metadata`` and the inferred encoder lengths
-                (single-request batches only — see
-                :meth:`_infer_encoder_seq_lens`).
+                ``seq_lens_kv`` differs from the Q-side ``seq_lens``). Always
+                required — build it via
+                ``attn_metadata.create_cross_metadata(encoder_seq_lens,
+                cross_kv_cache_manager)``.
             skip_cross_kv_projection: When ``True``, K/V are read from the
                 cross-KV cache without re-projection (decoder generation
                 steps). When ``False``, K/V are projected from
@@ -224,35 +197,19 @@ class CrossAttention(nn.Module):
         Returns:
             Output tensor ``[num_tokens, hidden_size]``.
         """
-        # Resolve / build the cross-attention metadata. We require that the
-        # backend sees ``metadata.is_cross is True`` so that the no-KV-cache
-        # path uses the encoder-side cu_seqlens, and so that the with-KV-cache
-        # path uses the cross pool.
-        metadata = cross_attn_metadata
-        if metadata is None:
-            if skip_cross_kv_projection:
-                raise ValueError(
-                    "cross_attn_metadata is required when "
-                    "skip_cross_kv_projection=True: the module needs the "
-                    "cross-pool block tables and cached encoder lengths to "
-                    "read K/V from the cache."
-                )
-            assert encoder_hidden_states is not None, (
-                "encoder_hidden_states is required when cross-KV projection "
-                "is not skipped (first decoder context step)."
-            )
-            encoder_seq_lens = self._infer_encoder_seq_lens(encoder_hidden_states, attn_metadata)
-            metadata = attn_metadata.create_cross_metadata(
-                encoder_seq_lens=encoder_seq_lens,
-                cross_kv_cache_manager=None,
-            )
-        else:
-            assert metadata.is_cross, (
-                "cross_attn_metadata.is_cross must be True. Build it via "
+        if cross_attn_metadata is None:
+            raise ValueError(
+                "cross_attn_metadata is required. Build it via "
                 "attn_metadata.create_cross_metadata(encoder_seq_lens, "
-                "cross_kv_cache_manager) so seq_lens_kv differs from "
-                "seq_lens."
+                "cross_kv_cache_manager)."
             )
+        assert cross_attn_metadata.is_cross, (
+            "cross_attn_metadata.is_cross must be True. Build it via "
+            "attn_metadata.create_cross_metadata(encoder_seq_lens, "
+            "cross_kv_cache_manager) so seq_lens_kv differs from "
+            "seq_lens."
+        )
+        metadata = cross_attn_metadata
 
         q = self.q_proj(hidden_states)
 
