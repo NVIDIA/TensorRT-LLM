@@ -1435,91 +1435,71 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         self._validate_servers_available()
 
-        # Pre-compute outside the lock (tokenization + hashing)
         conv_id = self._get_conversation_id(request)
+
+        # Explicit conversation_id: route by the session table alone and never
+        # touch request content. Block hashes are consumed only by the implicit
+        # prefix-match path below (requests with no conversation_id), so for a
+        # pinned session -- new or already-seen -- the GIL-bound
+        # _request_to_block_hashes is pure overhead that would serialize the
+        # single orchestrator event loop and cap dispatch throughput.
+        if conv_id:
+            weight = self._estimate_content_weight(request)
+            async with self._lock:
+                entry = self._session_table.get(conv_id)
+                if (entry is not None and entry[0] in self._server_state
+                        and entry[0] != exclude_server):
+                    # Sticky hit: keep the pinned server, refresh LRU only.
+                    server = entry[0]
+                    self._session_table.move_to_end(conv_id)
+                    await self._register_request(server, request)
+                    self._add_content_load(server, request, weight)
+                else:
+                    # New conversation_id (or its server is gone/excluded):
+                    # pin to the least-loaded server. Store no block hashes --
+                    # the trie is only read for conversation_id-less requests.
+                    server = self._select_least_loaded(exclude_server)
+                    if server is None:
+                        raise ValueError("No available servers after excluding "
+                                         f"{exclude_server}")
+                    await self._register_request(server, request)
+                    self._add_content_load(server, request, weight)
+                    self._update_session(conv_id, server, [])
+                return server, {
+                    "server_info": self._server_info.get(server, {})
+                }
+
+        # No conversation_id: content-based routing. Compute block hashes
+        # (outside the lock) for implicit prefix matching, else least-loaded.
         block_hashes = self._request_to_block_hashes(request)
         weight = self._estimate_content_weight(request, block_hashes)
 
         async with self._lock:
+            matched_id = self._find_matching_session(block_hashes,
+                                                     exclude_server)
+            if matched_id is not None:
+                server, _ = self._session_table[matched_id]
+                self._update_session(matched_id, server, block_hashes)
+                await self._register_request(server, request)
+                self._add_content_load(server, request, weight)
+                logger.debug(
+                    f"ConversationRouter: IMPLICIT match conv_id={matched_id} "
+                    f"-> server={server}, weight={weight}")
+                return server, {
+                    "server_info": self._server_info.get(server, {})
+                }
 
-            # 1. Explicit conversation_id — sticky routing.
-            #    Always honour session affinity when the server is alive
-            #    and not explicitly excluded.  No overload gate — the
-            #    server itself provides backpressure.
-            if conv_id and conv_id in self._session_table:
-                sticky_server, _ = self._session_table[conv_id]
-                if sticky_server not in self._server_state:
-                    logger.debug(
-                        f"ConversationRouter: STICKY MISS conv_id={conv_id} "
-                        f"-> server={sticky_server} NOT in server_state, "
-                        f"falling through to FALLBACK")
-                elif sticky_server == exclude_server:
-                    logger.debug(
-                        f"ConversationRouter: STICKY MISS conv_id={conv_id} "
-                        f"-> server={sticky_server} is exclude_server")
-                else:
-                    self._update_session(conv_id, sticky_server, block_hashes)
-                    await self._register_request(sticky_server, request)
-                    self._add_content_load(sticky_server, request, weight)
-                    loads = {
-                        s: self._get_content_load(s)
-                        for s in self._servers
-                    }
-                    logger.debug(
-                        f"ConversationRouter: STICKY conv_id={conv_id} "
-                        f"-> server={sticky_server}, "
-                        f"content_loads={loads}, weight={weight}")
-                    return sticky_server, {
-                        "server_info": self._server_info.get(sticky_server, {})
-                    }
-            elif conv_id:
-                logger.debug(f"ConversationRouter: NEW conv_id={conv_id} "
-                             f"not in session_table "
-                             f"(size={len(self._session_table)})")
-
-            # 2. Implicit block-hash prefix matching.
-            #    Always honour match when the server is alive.
-            matched_id = None
-            if not conv_id:
-                matched_id = self._find_matching_session(
-                    block_hashes, exclude_server)
-                if matched_id is not None:
-                    sticky_server, _ = self._session_table[matched_id]
-                    self._update_session(matched_id, sticky_server,
-                                         block_hashes)
-                    await self._register_request(sticky_server, request)
-                    self._add_content_load(sticky_server, request, weight)
-                    loads = {
-                        s: self._get_content_load(s)
-                        for s in self._servers
-                    }
-                    logger.debug(
-                        f"ConversationRouter: IMPLICIT match "
-                        f"conv_id={matched_id} -> server={sticky_server}, "
-                        f"content_loads={loads}, weight={weight}")
-                    return sticky_server, {
-                        "server_info": self._server_info.get(sticky_server, {})
-                    }
-
-            # 3. Fallback — least-loaded server for new sessions or
-            #    sessions whose sticky server is unavailable.
             server = self._select_least_loaded(exclude_server)
             if server is None:
                 raise ValueError(
                     f"No available servers after excluding {exclude_server}")
             await self._register_request(server, request)
             self._add_content_load(server, request, weight)
-
-            # Store session mapping.
-            if not conv_id:
-                conv_id = self._generate_implicit_id()
-            self._update_session(conv_id, server, block_hashes)
-            loads = {s: self._get_content_load(s) for s in self._servers}
-            logger.debug(
-                f"ConversationRouter: FALLBACK conv_id={conv_id} "
-                f"-> server={server}, content_loads={loads}, weight={weight}")
-
-        return server, {"server_info": self._server_info.get(server, {})}
+            implicit_id = self._generate_implicit_id()
+            self._update_session(implicit_id, server, block_hashes)
+            logger.debug(f"ConversationRouter: FALLBACK conv_id={implicit_id} "
+                         f"-> server={server}, weight={weight}")
+            return server, {"server_info": self._server_info.get(server, {})}
 
     async def finish_request(self,
                              request: OpenAIRequest,
