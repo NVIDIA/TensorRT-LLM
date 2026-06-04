@@ -4,7 +4,7 @@
 
 Covers `MultimodalRuntimeData` cumsum math and the flat-mask producers
 (`maybe_compute_mm_embed_cumsum` and the `_compute_mm_masks` helpers). The
-prompt-order type now lives on `MixedModalEncodeContext`; its tests are in
+prompt-order type now lives on `MixedModalItemOrder`; its tests are in
 `test_mixed_modal_encode_context.py`.
 """
 

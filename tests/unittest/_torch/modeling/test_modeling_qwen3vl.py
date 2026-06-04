@@ -147,7 +147,7 @@ def _qwen_image_video_param(include_order=True, include_lengths=True):
         # Per-item encoder rows in PROMPT order (video=3, then image=4), aligned
         # with `multimodal_item_order`. The producer emits this key alongside the
         # order, and the refactored extractor sources per-item rows from it (via
-        # `MixedModalEncodeContext.from_metadata`).
+        # `MixedModalItemOrder.from_metadata`).
         multimodal_data["multimodal_embedding_lengths"] = [3, 4]
     else:
         # Drop the explicit per-item counts so the token-count fallback chain has
@@ -184,7 +184,7 @@ def test_qwen3vl_mixed_image_video_encoder_returns_single_tensor_in_prompt_order
 # NOTE: the per-request uniqueness (`duplicate prompt_pos`) and the
 # length-agreement invariants previously exercised here against
 # `MixedModalityAssembly.from_params` now live in
-# `MixedModalEncodeContext.__post_init__` and are covered by the context
+# `MixedModalItemOrder.__post_init__` and are covered by the context
 # construction tests (test_mixed_modal_encode_context.py) and the per-item
 # length-mismatch test in test_qwen3vl_encode_extractor.py.
 

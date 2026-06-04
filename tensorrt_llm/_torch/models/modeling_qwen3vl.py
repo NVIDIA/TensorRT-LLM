@@ -35,7 +35,7 @@ from ...inputs import (
     support_multimodal_disaggregated,
 )
 from ...inputs.multimodal import (
-    MixedModalEncodeContext,
+    MixedModalItemOrder,
     MultimodalParams,
     compute_mm_embedding_lengths,
     find_mm_token_lengths,
@@ -164,7 +164,7 @@ def _qwen3vl_grid_rows(
 
     `t*(h//m)*(w//m)` (the encoder-output row count == scatter footprint), the
     Qwen3VL source of truth. Used as the fallback row source when the extractor
-    has no `MixedModalEncodeContext` (pure single-modality); when a context is
+    has no `MixedModalItemOrder` (pure single-modality); when a context is
     present, per-item rows come from `ctx.embedding_lengths` instead. Falls back
     to a test-convention `num_tokens` or `multimodal_runtime.total_embeds_in_request`
     when the grid + merge size are unavailable.
@@ -213,7 +213,7 @@ def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[i
     Qwen3VL has only image and video modalities; no audio, no ghost items. The
     extractor parses the two wire keys (`multimodal_item_order` +
     `multimodal_embedding_lengths`) into one validated typed view at the point of
-    use via `MixedModalEncodeContext.from_metadata`, then walks `ctx.order` and
+    use via `MixedModalItemOrder.from_metadata`, then walks `ctx.order` and
     emits one item per entry: each owns its prompt rank (`prompt_pos`), slices its
     single-item payload out of the aggregate `pixel_values`/`*_grid_thw` blob, and
     sizes its `rows` from the per-grid post-merge count (the encoder-output row
@@ -239,7 +239,7 @@ def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[i
     # index)` pairs, and validates length agreement with
     # `multimodal_embedding_lengths`. A raw `tuple(pair)` over dict entries would
     # yield the dict keys and silently collapse every item to default slot 0.
-    ctx = MixedModalEncodeContext.from_metadata(
+    ctx = MixedModalItemOrder.from_metadata(
         multimodal_data, multimodal_data.get("multimodal_embedding_lengths")
     )
     if ctx is not None:
@@ -333,7 +333,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         mm_data: Dict[str, Any],
     ) -> List[Tuple[str, int]]:
         """Infer Qwen image/video item order from placeholder order in text."""
-        normalized = MixedModalEncodeContext._normalize(mm_data)
+        normalized = MixedModalItemOrder._normalize(mm_data)
         expected_counts = {
             modality: len(normalized.get(modality, [])) for modality in _QWEN_MODALITIES
         }
@@ -591,7 +591,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             processed_inputs = self._preprocess(text_prompt, mm_data, mm_processor_kwargs)
 
         multimodal_data = {}
-        normalized_mm_data = MixedModalEncodeContext._normalize(mm_data)
+        normalized_mm_data = MixedModalItemOrder._normalize(mm_data)
         modalities = [modality for modality in _QWEN_MODALITIES if normalized_mm_data.get(modality)]
         item_order = None
         if len(modalities) > 1:
@@ -630,7 +630,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         # lengths alongside the item order so the non-hashing (direct preprocess)
         # path produces the same metadata the registry hashing path does. Without
         # this, the per-item extractor's
-        # MixedModalEncodeContext.from_metadata(..., None) hits
+        # MixedModalItemOrder.from_metadata(..., None) hits
         # tuple(int(x) for x in None) -> TypeError. Computed AFTER fused_input_ids
         # is finalized (post-_postprocess) and the image/video multimodal_data
         # keys are populated, since find_mm_token_lengths reads video_grid_thw
@@ -640,9 +640,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             num_mm_tokens_by_key = find_mm_token_lengths(
                 mm_data, self, multimodal_data=multimodal_data
             )
-            num_mm_tokens = MixedModalEncodeContext.project_by_order(
-                item_order, num_mm_tokens_by_key
-            )
+            num_mm_tokens = MixedModalItemOrder.project_by_order(item_order, num_mm_tokens_by_key)
             multimodal_data["multimodal_embedding_lengths"] = compute_mm_embedding_lengths(
                 fused_input_ids,
                 num_mm_tokens,

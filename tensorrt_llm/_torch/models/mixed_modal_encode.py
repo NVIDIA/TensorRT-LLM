@@ -95,7 +95,7 @@ class ScatterIndices(NamedTuple):
 def build_scatter_index(items: List[ModalityItem], num_params: int) -> ScatterIndices:
     """Partition items into per-modality buckets and compute batch-relative
     destination rows. Per-request uniqueness is already guaranteed by
-    `MixedModalEncodeContext.__post_init__`; this is pure index math.
+    `MixedModalItemOrder.__post_init__`; this is pure index math.
     """
     n = len(items)
     if n == 0:

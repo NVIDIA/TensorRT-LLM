@@ -15,7 +15,7 @@ from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import (
-    MixedModalEncodeContext,
+    MixedModalItemOrder,
     MultimodalParams,
     compute_mm_embedding_lengths,
     scan_prompt_order,
@@ -435,7 +435,7 @@ def _nano_extract_items(
     * **Multi-modality (PER-ITEM).** More than one distinct modality present —
       the interleaving case (including a repeated modality and video-with-audio
       hoisted to a first-class ``(audio, k)`` item by the input processor).
-      Yields ONE item per ``MixedModalEncodeContext`` order entry: ``prompt_pos``
+      Yields ONE item per ``MixedModalItemOrder`` order entry: ``prompt_pos``
       is the rank, ``mm_idx_per_modality`` is the per-modality index, ``rows`` is the
       per-slot ``multimodal_embedding_lengths`` entry, and ``payload`` is sliced
       to that single sub-item by the ``slice_payload`` callable (the model's
@@ -472,7 +472,7 @@ def _nano_extract_items(
     # Parse the two wire keys (`multimodal_item_order` +
     # `multimodal_embedding_lengths`) into one validated typed view at the point
     # of use. `from_metadata` returns None when the order key is absent, and its
-    # `MixedModalEncodeContext.__post_init__` owns the order/embedding_lengths
+    # `MixedModalItemOrder.__post_init__` owns the order/embedding_lengths
     # length invariant, so no pre-guard is needed for the mismatch case. The
     # None guard below stays: a present order key with absent lengths would
     # otherwise reach `from_metadata` and raise an opaque TypeError when it
@@ -484,11 +484,11 @@ def _nano_extract_items(
             "'multimodal_embedding_lengths'; the per-item extractor needs the "
             "per-slot row counts."
         )
-    ctx = MixedModalEncodeContext.from_metadata(multimodal_data, embedding_lengths)
+    ctx = MixedModalItemOrder.from_metadata(multimodal_data, embedding_lengths)
     if ctx is None:
         raise KeyError(
             f"Nano multi-modality param {param_idx} cannot build a "
-            "MixedModalEncodeContext: 'multimodal_item_order' metadata is "
+            "MixedModalItemOrder: 'multimodal_item_order' metadata is "
             "missing; the per-item extractor needs the prompt order to assign "
             "each item its slot."
         )
@@ -1632,7 +1632,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         lengths_by_item = {
             item: length for item, length in zip(item_order, num_mm_tokens_per_placeholder)
         }
-        normalized = MixedModalEncodeContext._normalize(mm_data)
+        normalized = MixedModalItemOrder._normalize(mm_data)
         image_items = normalized.get("image", [])
         video_items = normalized.get("video", [])
         audio_items = normalized.get("audio", [])
@@ -1740,7 +1740,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         lengths_by_item = {
             item: length for item, length in zip(item_order, num_mm_tokens_per_placeholder)
         }
-        video_items = MixedModalEncodeContext._normalize(mm_data).get("video", [])
+        video_items = MixedModalItemOrder._normalize(mm_data).get("video", [])
         placeholder_by_modality = {
             "image": self.img_context_token,
             "video": self.video_context_token,
@@ -2642,7 +2642,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     ) -> List[int]:
         """Compute per-item multimodal token lengths in prompt order."""
         num_mm_tokens: List[int] = []
-        normalized = MixedModalEncodeContext._normalize(mm_data)
+        normalized = MixedModalItemOrder._normalize(mm_data)
         for modality, item_idx in item_order:
             item = normalized[modality][item_idx]
             if modality == "image":
@@ -2682,7 +2682,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         """Per-video embedded audio track (or None per item); [] when hoisting is off."""
         if self._audio_extractor is None:
             return []
-        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
+        videos = MixedModalItemOrder._normalize(mm_data).get("video", [])
         return [getattr(v, "audio", None) for v in videos]
 
     def promote_nested_mm_data(self, mm_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -2720,7 +2720,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if not any(a is not None for a in video_audios):
             return mm_data
 
-        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
+        videos = MixedModalItemOrder._normalize(mm_data).get("video", [])
         if mm_data.get("audio"):
             raise NotImplementedError(
                 "Nano does not support mixing standalone audio with "
@@ -2765,7 +2765,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if not any(a is not None for a in video_audios):
             return text_prompt, mm_data
 
-        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
+        videos = MixedModalItemOrder._normalize(mm_data).get("video", [])
         # Promote the embedded audio to a top-level `(audio, k)` item + vision-only
         # video (shared with the token path); raises on standalone+embedded audio.
         hoisted_mm_data = self.promote_nested_mm_data(mm_data)
@@ -2820,7 +2820,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             if modality != "image"
         )
 
-        normalized = MixedModalEncodeContext._normalize(mm_data)
+        normalized = MixedModalItemOrder._normalize(mm_data)
         images = mm_data.get("image")
         if images is not None:
             multimodal_data["image"] = self._prepare_image_modality_data(
@@ -3677,7 +3677,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         is the legacy one-tile default and the offset is the index itself.
         """
         multimodal_data = param.multimodal_data or {}
-        item_order = MixedModalEncodeContext.order_from_metadata(multimodal_data)
+        item_order = MixedModalItemOrder.order_from_metadata(multimodal_data)
         lengths = multimodal_data.get("multimodal_embedding_lengths")
         if item_order is None or lengths is None:
             return mm_idx_per_modality
@@ -3772,7 +3772,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         Returns a single-element `List[torch.Tensor]` whose tensor holds
         all per-request embeddings concatenated in input-param order, with
-        each param's slice in MixedModalEncodeContext order. Conforms to the contract
+        each param's slice in MixedModalItemOrder order. Conforms to the contract
         expected by `get_multimodal_embeddings`, which enables
         chunked-prefill caching.
 

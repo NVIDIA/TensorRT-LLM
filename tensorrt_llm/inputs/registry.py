@@ -20,7 +20,7 @@ from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
 # yapf: disable
-from .multimodal import (_SUPPORTED_HASHING_MODALITIES, MixedModalEncodeContext,
+from .multimodal import (_SUPPORTED_HASHING_MODALITIES, MixedModalItemOrder,
                          MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
@@ -409,16 +409,16 @@ class BaseMultimodalInputProcessor(ABC):
         # (the same scan the expand step uses), which walks the placeholder
         # layout of the real prompt. The framework `resolve_order` is metadata-
         # only, so it cannot derive this interleaved order — the model must.
-        mm_items = MixedModalEncodeContext._normalize(mm_data)
+        mm_items = MixedModalItemOrder._normalize(mm_data)
         if len(mm_items) <= 1:
-            item_order = MixedModalEncodeContext.default_order(mm_items)
+            item_order = MixedModalItemOrder.default_order(mm_items)
         else:
-            item_order = MixedModalEncodeContext.from_raw_entries(
+            item_order = MixedModalItemOrder.from_raw_entries(
                 self.get_mm_item_order(prompt_token_ids, mm_data),
                 source=f"{type(self).__name__}.get_mm_item_order",
             )
-        MixedModalEncodeContext.validate_order(item_order, mm_items)
-        num_mm_tokens = MixedModalEncodeContext.project_by_order(
+        MixedModalItemOrder.validate_order(item_order, mm_items)
+        num_mm_tokens = MixedModalItemOrder.project_by_order(
             item_order, num_mm_tokens_by_key)
 
         expanded_ids, mm_data_updates = self.expand_prompt_token_ids_for_mm(
@@ -1191,12 +1191,12 @@ def create_input_processor_with_hash(
         # (supersedes the single-modality next(iter(...)) assumption). The order
         # is read from the processed metadata, which every preprocess path now
         # bakes (text paths and the token-id fast path alike).
-        item_order = MixedModalEncodeContext.resolve_order(
+        item_order = MixedModalItemOrder.resolve_order(
             mm_data,
             multimodal_data=(extra_processed_inputs
                              or {}).get("multimodal_data"),
         )
-        num_mm_tokens = MixedModalEncodeContext.project_by_order(
+        num_mm_tokens = MixedModalItemOrder.project_by_order(
             item_order, num_mm_tokens_by_key)
         if len(num_mm_tokens) <= 0:
             raise ValueError("multimodal hashing produced an empty multimodal "
@@ -1262,9 +1262,9 @@ def create_input_processor_with_hash(
                ) > 0 and mm_special_token_ids is not None:
             multimodal_data[
                 "special_token_offsets"] = start_special_token_positions
-        mm_hashes_flat = MixedModalEncodeContext.project_by_order(
+        mm_hashes_flat = MixedModalItemOrder.project_by_order(
             item_order, mm_hashes)
-        mm_uuid_list = MixedModalEncodeContext.project_uuids_by_order(
+        mm_uuid_list = MixedModalItemOrder.project_uuids_by_order(
             item_order, mm_uuids)
         validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
                            num_mm_tokens)

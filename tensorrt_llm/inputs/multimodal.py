@@ -333,7 +333,7 @@ _SUPPORTED_HASHING_MODALITIES = ("image", "video", "audio")
 
 
 @dataclass(frozen=True)
-class MixedModalEncodeContext:
+class MixedModalItemOrder:
     """Per-request mixed-modality encode bookkeeping (Python-only).
 
     Holds the prompt-order spine and each item's encoder-output footprint, and
@@ -473,9 +473,9 @@ class MixedModalEncodeContext:
 
     @classmethod
     def from_metadata(
-        cls, multimodal_data: Optional[Dict[str, Any]],
-        embedding_lengths: Iterable[int]
-    ) -> Optional["MixedModalEncodeContext"]:
+            cls, multimodal_data: Optional[Dict[str, Any]],
+            embedding_lengths: Iterable[int]
+    ) -> Optional["MixedModalItemOrder"]:
         """Pair the explicit prompt order (if any) with per-item lengths.
 
         Returns `None` when no `multimodal_item_order` key is present, so the

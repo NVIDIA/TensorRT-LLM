@@ -3,14 +3,14 @@
 """Tests for the Qwen3VL multimodal item extractor and bucket adapters.
 
 The extractor parses the two wire keys (`multimodal_item_order` +
-`multimodal_embedding_lengths`) into one transient `MixedModalEncodeContext` via
+`multimodal_embedding_lengths`) into one transient `MixedModalItemOrder` via
 `from_metadata`, walks `ctx.order`, and yields one canonical six-field
 `ModalityItem` per prompt slot. A `ModalityItem` owns exactly one slot
 (`prompt_pos`); its `rows` is both the encoder-output row count and its scatter
 footprint. Per-item payload slicing (one image / one video out of an aggregate
 `pixel_values` + `*_grid_thw` blob) goes through `_qwen3vl_slice_payload`; the
 per-grid post-merge token count is `_qwen3vl_grid_rows`. When the extractor has a
-`MixedModalEncodeContext`, rows come from `ctx.embedding_lengths`; the grid-row
+`MixedModalItemOrder`, rows come from `ctx.embedding_lengths`; the grid-row
 helper is the fallback for pure single-modality requests that carry no
 `multimodal_item_order` key (so `from_metadata` returns None and the extractor
 synthesizes the modality-major default order).
@@ -33,7 +33,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     _qwen3vl_grid_rows,
     _qwen3vl_slice_payload,
 )
-from tensorrt_llm.inputs.multimodal import MixedModalEncodeContext
+from tensorrt_llm.inputs.multimodal import MixedModalItemOrder
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -217,7 +217,7 @@ class TestQwen3VLExtractItems:
                     {"modality": "video", "index": 0},
                     {"modality": "image", "index": 1},
                 ],
-                # The transient MixedModalEncodeContext requires the per-slot row
+                # The transient MixedModalItemOrder requires the per-slot row
                 # counts alongside the order (length-agreement is validated in
                 # `__post_init__`). Rows still come from the grid via `rows_for`
                 # until Task 5b sources them from the context; these match.
@@ -242,7 +242,7 @@ class TestQwen3VLExtractItems:
         assert items[0].payload["pixel_values"].shape[0] == 256
 
     def test_mixed_order_length_mismatch_raises(self):
-        # The extractor now builds a transient MixedModalEncodeContext from the
+        # The extractor now builds a transient MixedModalItemOrder from the
         # two wire keys, so a `multimodal_item_order` whose length disagrees with
         # `multimodal_embedding_lengths` is rejected at construction time (the
         # context's `__post_init__` length-agreement check). The old
@@ -426,7 +426,7 @@ def test_qwen3vl_mixed_preprocess_writes_matching_embedding_lengths():
     Regression for the mixed-modality crash: the `len(modalities) > 1` branch
     wrote `multimodal_item_order` but never `multimodal_embedding_lengths`, so on
     the non-hashing (direct preprocess) path nobody filled it. The per-item
-    extractor then built a `MixedModalEncodeContext` via
+    extractor then built a `MixedModalItemOrder` via
     `from_metadata(..., multimodal_data.get("multimodal_embedding_lengths"))`,
     hitting `tuple(int(x) for x in None)` -> TypeError. The fix makes the
     preprocess path emit the SAME metadata the registry hashing path does.
@@ -455,10 +455,10 @@ def test_qwen3vl_mixed_preprocess_writes_matching_embedding_lengths():
         _QWEN_IMAGE_TOKENS,
         _QWEN_VIDEO_TOKENS,
     ]
-    # The lengths agree with what a transient MixedModalEncodeContext expects
+    # The lengths agree with what a transient MixedModalItemOrder expects
     # (per-slot row counts aligned with the order) — i.e. the context the
     # extractor builds via from_metadata constructs without error.
-    ctx = MixedModalEncodeContext.from_metadata(
+    ctx = MixedModalItemOrder.from_metadata(
         multimodal_data, multimodal_data["multimodal_embedding_lengths"]
     )
     assert ctx is not None

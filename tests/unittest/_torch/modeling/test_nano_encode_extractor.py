@@ -281,7 +281,7 @@ class TestNanoExtractMultiModalityPerItem:
 
     def test_multi_modality_embedding_lengths_mismatch_raises(self):
         # item_order length must match multimodal_embedding_lengths length. The
-        # invariant is owned by MixedModalEncodeContext.__post_init__, which
+        # invariant is owned by MixedModalItemOrder.__post_init__, which
         # raises with an "embedding_lengths length" message; the extractor no
         # longer pre-guards it.
         order = [("image", 0), ("video", 0), ("image", 1)]
@@ -295,7 +295,7 @@ class TestNanoExtractMultiModalityPerItem:
 
     def test_multi_modality_requires_encode_context(self):
         # A multi-modality param with NO multimodal_item_order key cannot build a
-        # transient MixedModalEncodeContext (from_metadata returns None), so the
+        # transient MixedModalItemOrder (from_metadata returns None), so the
         # per-item extractor raises a clear error naming both the typed view it
         # could not build and the missing wire key it needs.
         param = _make_param(
@@ -305,7 +305,7 @@ class TestNanoExtractMultiModalityPerItem:
                 "audio": {"input_audio_features": "auds"},
             }
         )
-        with pytest.raises(KeyError, match="MixedModalEncodeContext.*multimodal_item_order"):
+        with pytest.raises(KeyError, match="MixedModalItemOrder.*multimodal_item_order"):
             list(_nano_extract_items(0, param, slice_payload=_StubSlicer()))
 
 

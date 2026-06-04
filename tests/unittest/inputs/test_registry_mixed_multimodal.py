@@ -5,7 +5,7 @@ from typing import ClassVar
 
 import torch
 
-from tensorrt_llm.inputs.multimodal import MixedModalEncodeContext, find_mm_token_lengths
+from tensorrt_llm.inputs.multimodal import MixedModalItemOrder, find_mm_token_lengths
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalInputProcessor,
@@ -54,7 +54,7 @@ class _FakeMixedProcessor:
             # (via its model-internal `get_mm_item_order` hook), mirroring how the
             # real token-id fast path resolves order before expansion.
             item_order = self.get_mm_item_order(prompt_token_ids, mm_data)
-            num_mm_tokens = MixedModalEncodeContext.project_by_order(item_order, lengths_by_key)
+            num_mm_tokens = MixedModalItemOrder.project_by_order(item_order, lengths_by_key)
             prompt_token_ids, _ = self.expand_prompt_token_ids_for_mm(
                 prompt_token_ids,
                 num_mm_tokens,
@@ -509,7 +509,7 @@ class _FakeNanoVideoAudioProcessor(BaseMultimodalInputProcessor):
 
     # --- the Nano hoist contract under test ---
     def promote_nested_mm_data(self, mm_data):
-        videos = MixedModalEncodeContext._normalize(mm_data).get("video", [])
+        videos = MixedModalItemOrder._normalize(mm_data).get("video", [])
         video_audios = [getattr(v, "audio", None) for v in videos]
         if not any(a is not None for a in video_audios):
             return mm_data
