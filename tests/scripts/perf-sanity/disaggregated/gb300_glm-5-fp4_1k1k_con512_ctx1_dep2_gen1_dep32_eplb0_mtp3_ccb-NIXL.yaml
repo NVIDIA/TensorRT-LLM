@@ -3,9 +3,9 @@ metadata:
   precision: fp4
   model_dir_name: GLM-5-NVFP4
   supported_gpus:
-  - GB200
+  - GB300
   script_file: disaggr_torch.slurm
-  benchmark_type: 8k1k
+  benchmark_type: 1k1k
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -21,7 +21,7 @@ benchmark:
   benchmark_ratio: 0.0
   streaming: true
   concurrency_list: '512'
-  input_length: 8192
+  input_length: 1024
   output_length: 1024
   dataset_file: <dataset_file>
 hardware:
@@ -71,10 +71,10 @@ worker_config:
     stream_interval: 20
   ctx:
     print_iter_log: true
-    max_batch_size: 2
+    max_batch_size: 16
     max_num_tokens: 16384
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 4
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 2
     pipeline_parallel_size: 1
     context_parallel_size: 1
     enable_attention_dp: true
