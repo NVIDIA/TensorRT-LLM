@@ -673,6 +673,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.seqlen_this_rank_cp = self.prompt_len
         self.total_input_len_cp = self.prompt_len
         self.py_helix_is_inactive_rank = False
+        # Helix speculative-decode state. py_helix_global_decode_len is the number
+        # of decode tokens committed globally (across CP ranks). It advances by one
+        # per iteration for plain decode and by the accepted count (golden plus
+        # accepted drafts) for speculative decode, and gives the global query-token
+        # positions and round-robin KV ownership in a verify forward.
+        self.py_helix_global_decode_len = 0
+        # This-rank KV length before the current forward's writes, used by the model
+        # engine as num_cached_tokens for the multi-token verify forward.
+        self.py_helix_local_past_seen = self.prompt_len
+        # Context (prompt) tokens this CP rank owns. The per-rank KV length is this
+        # base plus the owned decode-token count.
+        self.py_helix_context_seqlen_cp = self.prompt_len
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0

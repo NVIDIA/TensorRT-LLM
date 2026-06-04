@@ -545,8 +545,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         else:
             self._saved_generation_lengths = None
 
+        # Save Helix per-token buffers that the draft loop overwrites so the
+        # target verify metadata can be restored (needed for CUDA graph capture).
+        self._saved_helix_position_offsets = None
+        self._saved_helix_is_inactive_rank = None
+        if getattr(attn_metadata, 'helix_position_offsets', None) is not None:
+            self._saved_helix_position_offsets = attn_metadata.helix_position_offsets.clone(
+            )
+        if getattr(attn_metadata, 'helix_is_inactive_rank', None) is not None:
+            self._saved_helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank.clone(
+            )
+
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if self._saved_helix_position_offsets is not None:
+            attn_metadata.helix_position_offsets.copy_(
+                self._saved_helix_position_offsets)
+            self._saved_helix_position_offsets = None
+        if self._saved_helix_is_inactive_rank is not None:
+            attn_metadata.helix_is_inactive_rank.copy_(
+                self._saved_helix_is_inactive_rank)
+            self._saved_helix_is_inactive_rank = None
         if self._saved_kv_lens_cuda is not None:
             batch_size = self._saved_kv_lens_cuda.shape[0]
             attn_metadata.kv_lens_cuda[:batch_size].copy_(
@@ -570,6 +589,34 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
                 self._saved_generation_lengths)
             self._saved_generation_lengths = None
+
+    def _helix_draft_owner_mask(self, attn_metadata, position_ids, batch_size):
+        """Owner CP rank mask for a draft-loop step under Helix.
+
+        Each draft step processes one token per sequence at the global positions in
+        position_ids. A token's owner rank is derived from its global decode-index
+        (global_position minus total_input_len_cp). Only the owner writes the draft
+        token's KV; the others treat it as query-only. This also writes the
+        per-token Helix buffers (positions for RoPE, inactive flags, active counts)
+        read by the generation kernel.
+
+        Returns the boolean owner mask of shape [batch_size], or None when Helix is
+        not active.
+        """
+        if not self.mapping.has_cp_helix():
+            return None
+        tpb = attn_metadata.tokens_per_block
+        cp_size = self.mapping.cp_size
+        cp_rank = self.mapping.cp_rank
+        pos = position_ids[:batch_size].to(torch.int64).reshape(-1)
+        total_input_len = attn_metadata.helix_total_input_len[:batch_size].to(
+            torch.int64)
+        decode_index = pos - total_input_len
+        owner = ((decode_index // tpb) % cp_size) == cp_rank
+        attn_metadata.helix_position_offsets[:batch_size].copy_(
+            pos.to(torch.int32))
+        attn_metadata.helix_is_inactive_rank[:batch_size].copy_(~owner)
+        return owner
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -716,6 +763,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     elif spec_metadata.all_rank_num_seqs is not None:
                         attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
+                # Under Helix, set the per-token global positions and KV ownership
+                # for this draft step's tokens before the draft forward.
+                helix_owner_mask = self._helix_draft_owner_mask(
+                    attn_metadata, inputs["position_ids"], batch_size)
+
                 hidden_states, hidden_states_to_save = draft_model.model(
                     **inputs)
 
@@ -755,12 +807,29 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         attn_metadata.num_contexts = 0
                     # update kv_lens_cuda
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            runtime_draft_len -
-                            num_accepted_tokens[num_contexts:])
-                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
+                        if helix_owner_mask is not None:
+                            # Under Helix, the verify kv_lens already reflects this
+                            # rank's owned (speculatively written) draft tokens. The
+                            # first draft step then appends the new draft token only
+                            # on its owner rank.
+                            attn_metadata.kv_lens_cuda[:batch_size] += (
+                                helix_owner_mask.to(
+                                    attn_metadata.kv_lens_cuda.dtype))
+                        else:
+                            attn_metadata.kv_lens_cuda[
+                                num_contexts:batch_size] -= (
+                                    runtime_draft_len -
+                                    num_accepted_tokens[num_contexts:])
+                            attn_metadata.kv_lens_cuda[:num_contexts] += 1
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
-                    attn_metadata.kv_lens_cuda[:batch_size] += 1
+                    if helix_owner_mask is not None:
+                        # Only the rank that owns this draft token stored its KV,
+                        # so only its kv_lens grows.
+                        attn_metadata.kv_lens_cuda[:batch_size] += (
+                            helix_owner_mask.to(
+                                attn_metadata.kv_lens_cuda.dtype))
+                    else:
+                        attn_metadata.kv_lens_cuda[:batch_size] += 1
                 # support attention dp
                 inputs = {
                     "input_ids": new_draft_token,

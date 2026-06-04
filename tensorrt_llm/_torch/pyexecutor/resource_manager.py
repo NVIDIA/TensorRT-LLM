@@ -983,6 +983,99 @@ class KVCacheManager(BaseResourceManager):
             remaining_tokens / self.tokens_per_block)
         return need_blocks
 
+    def _helix_owns_decode_index(self, decode_index: int) -> bool:
+        """Return whether this CP rank owns the KV of a global decode-index.
+
+        Decode tokens are assigned round-robin by block: decode-index d is owned
+        by rank (d // tokens_per_block) % cp_size. Every decode token is stored on
+        exactly one rank, and the attention all-to-all reconstructs the full
+        result. The rule holds for both plain decode and speculative decode.
+        """
+        block_id = decode_index // self.tokens_per_block
+        return block_id % self.mapping.cp_size == self.mapping.cp_rank
+
+    def _helix_count_owned(self, start_index: int, count: int) -> int:
+        """Count decode-indices in [start_index, start_index + count) owned by this rank."""
+        return sum(1 for j in range(count)
+                   if self._helix_owns_decode_index(start_index + j))
+
+    def _helix_owned_decode_count(self, num_decode_tokens: int) -> int:
+        """Closed-form count of decode-indices in [0, num_decode_tokens) owned by this rank."""
+        if num_decode_tokens <= 0:
+            return 0
+        tpb = self.tokens_per_block
+        cp_size = self.mapping.cp_size
+        cp_rank = self.mapping.cp_rank
+        full_blocks = num_decode_tokens // tpb
+        rem = num_decode_tokens % tpb
+        # Full blocks b in [0, full_blocks) with b % cp_size == cp_rank.
+        owned_full_blocks = full_blocks // cp_size + (
+            1 if cp_rank < full_blocks % cp_size else 0)
+        owned = owned_full_blocks * tpb
+        # Partial trailing block.
+        if rem > 0 and (full_blocks % cp_size == cp_rank):
+            owned += rem
+        return owned
+
+    def _helix_rank_kv_len(self, req: LlmRequest,
+                           global_decode_len: int) -> int:
+        """Per-rank KV length: owned context tokens plus owned decode tokens in [0, global_decode_len)."""
+        return req.py_helix_context_seqlen_cp + self._helix_owned_decode_count(
+            global_decode_len)
+
+    def _helix_prepare_generation_kv(self, req: LlmRequest,
+                                     draft_len: int) -> None:
+        """Reserve KV cache slots for a Helix generation or verify forward.
+
+        Decode tokens are distributed across CP ranks by global decode-index, so
+        this rank only reserves slots for the tokens it owns. New decode tokens
+        start at global decode-index g. A speculative verify re-feeds the last
+        accepted token at g - 1, but that token is already cached and is not
+        re-written (the model engine marks it inactive).
+
+        py_helix_local_past_seen is the per-rank cached length passed as
+        num_cached_tokens. It is recomputed from ownership so it never drifts.
+        """
+        g = req.py_helix_global_decode_len
+        req.py_helix_local_past_seen = self._helix_rank_kv_len(req, g)
+
+        # Reserve owned KV slots for the tokens written this forward plus reserve
+        # slack. New decode-indices start at g; over-reservation is rewound later.
+        reserve = max(draft_len, self._kv_reserve_draft_tokens)
+        n_reserve = 1 + reserve
+        for j in range(n_reserve):
+            if self._helix_owns_decode_index(g + j):
+                self.impl.add_token(req.py_request_id)
+
+        # Used only by the plain-decode generation path (single new token at g).
+        # The speculative verify path recomputes per-token ownership separately.
+        req.py_helix_is_inactive_rank = not self._helix_owns_decode_index(g)
+
+    def _helix_rewind_generation_kv(self, req: LlmRequest) -> None:
+        """Rewind this rank's rejected and slack draft KV, then advance lengths.
+
+        Removes only the tokens this rank owns among the rejected drafts and
+        reserve slack. Kept new decode-indices are [g, g + accepted] (golden plus
+        accepted drafts); the rewound range is [g + 1 + accepted, g + reserve].
+        """
+        g = req.py_helix_global_decode_len
+        accepted = req.py_num_accepted_draft_tokens
+        runtime_draft_len = req.py_rewind_len + accepted
+        reserve = max(runtime_draft_len, self._kv_reserve_draft_tokens)
+
+        # Total rewound tokens (rejected drafts plus reserve slack).
+        rewind_count = reserve - accepted
+        if rewind_count > 0:
+            owned_rewind = self._helix_count_owned(g + 1 + accepted,
+                                                   rewind_count)
+            if owned_rewind > 0:
+                self.rewind_kv_cache(req, owned_rewind)
+
+        # Advance the committed decode length and recompute the per-rank KV length.
+        req.py_helix_global_decode_len = g + 1 + accepted
+        req.seqlen_this_rank_cp = self._helix_rank_kv_len(
+            req, req.py_helix_global_decode_len)
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
@@ -1037,18 +1130,10 @@ class KVCacheManager(BaseResourceManager):
                             req, block_ids)
 
             for req in scheduled_batch.generation_requests:
-                if self.mapping.has_cp_helix():
-                    # Distribute the decode blocks across CP ranks in a round-robin manner.
-                    decode_block_id = (req.py_decoding_iter -
-                                       1) // self.tokens_per_block
-                    if decode_block_id % self.mapping.cp_size == self.mapping.cp_rank:
-                        req.py_helix_is_inactive_rank = False
-                        req.seqlen_this_rank_cp += 1
-                    else:
-                        req.py_helix_is_inactive_rank = True
-                        # Skip allocating KV cache at decode for inactive helix ranks.
-                        continue
                 draft_len = get_draft_token_length(req)
+                if self.mapping.has_cp_helix():
+                    self._helix_prepare_generation_kv(req, draft_len)
+                    continue
                 self.impl.add_token(req.py_request_id)
                 for _ in range(max(draft_len, self._kv_reserve_draft_tokens)):
                     self.impl.add_token(req.py_request_id)
@@ -1193,6 +1278,11 @@ class KVCacheManager(BaseResourceManager):
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                         req.py_decoding_iter = 1
+                    # Initialize the Helix speculative-decode bookkeeping so the
+                    # verify-path input prep reads consistent values.
+                    req.py_helix_global_decode_len = req.py_decoding_iter
+                    req.py_helix_context_seqlen_cp = req.seqlen_this_rank_cp
+                    req.py_helix_local_past_seen = req.seqlen_this_rank_cp
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     for _ in range(_kv_draft):
@@ -1217,6 +1307,11 @@ class KVCacheManager(BaseResourceManager):
         for request in scheduled_batch.generation_requests:
             if request.state in (LlmRequestState.GENERATION_COMPLETE,
                                  LlmRequestState.CONTEXT_INIT):
+                continue
+            if self.mapping.has_cp_helix():
+                # Helix rewinds only this rank's owned rejected and slack tokens
+                # and advances the committed decode length.
+                self._helix_rewind_generation_kv(request)
                 continue
             if request.py_rewind_len > 0:
                 self.rewind_kv_cache(request, request.py_rewind_len)

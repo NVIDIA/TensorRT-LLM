@@ -2541,6 +2541,47 @@ class PyTorchModelEngine(ModelEngine):
 
         return inputs, self.gather_ids_cuda[:num_generation_tokens]
 
+    def _helix_verify_token_params(self, request: LlmRequest, num_draft: int,
+                                   tokens_per_block: int):
+        """Compute per-query-token Helix parameters for a speculative verify forward.
+
+        Returns (global_positions, inactive_flags, num_active):
+        global_positions are the absolute positions of the 1 + num_draft query
+        tokens, computed globally because each rank holds only a shard for RoPE.
+        inactive_flags mark, per query token, whether this rank does not write its
+        KV; a draft at global decode-index d is owned by rank
+        (d // tokens_per_block) % cp_size, and the re-fed last-accepted token is
+        inactive on every rank (already cached, never re-written). num_active is
+        the count of query tokens this rank writes KV for, used to grow kv_lens.
+
+        The verify forward re-feeds the last committed token at decode-index g - 1
+        followed by the draft tokens. On the first generation forward (g == 0)
+        there is no re-fed token and the single new token is at decode-index 0.
+        """
+        cp_size = self.mapping.cp_size
+        cp_rank = self.mapping.cp_rank
+        g = request.py_helix_global_decode_len
+        total_input_len = request.total_input_len_cp
+        is_refed = g > 0
+        first_decode_index = (g - 1) if is_refed else g
+        first_pos = total_input_len + first_decode_index
+        global_positions = list(range(first_pos, first_pos + 1 + num_draft))
+        inactive_flags = []
+        num_active = 0
+        for j in range(1 + num_draft):
+            if is_refed and j == 0:
+                # Re-fed last-accepted token: already cached on its owner rank,
+                # never re-written.
+                inactive_flags.append(True)
+                continue
+            # Newly written token: draft j (or the single new token when not refed).
+            decode_index = first_decode_index + j
+            owned = (decode_index // tokens_per_block) % cp_size == cp_rank
+            inactive_flags.append(not owned)
+            if owned:
+                num_active += 1
+        return global_positions, inactive_flags, num_active
+
     def _prepare_tp_inputs(
             self,
             scheduled_requests: ScheduledRequests,
@@ -2756,6 +2797,19 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+
+        # Helix CP parameters. helix_position_offsets and helix_is_inactive_rank
+        # are per query token; helix_num_active_tokens is per request (the number
+        # of query tokens this CP rank writes KV for). Populated in the extend
+        # (speculative verify) and generation loops below.
+        helix_is_inactive_rank, helix_position_offsets = [], []
+        helix_total_input_len = []
+        # Cache invariant method result to avoid repeated calls per-request.
+        _has_cp_helix = self.mapping.has_cp_helix()
+        _helix_tokens_per_block = (kv_cache_manager.tokens_per_block
+                                   if _has_cp_helix
+                                   and kv_cache_manager is not None else None)
+
         for request in extend_requests:
             request_ids.append(request.py_request_id)
             request_accepted_path[
@@ -2791,10 +2845,22 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + num_draft_tokens)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num,
-                              past_seen_token_num + 1 + num_draft_tokens)))
+                if _has_cp_helix:
+                    # Under Helix each rank holds only a shard of the sequence, so
+                    # query token positions are computed globally and the per-rank
+                    # cached length is provided by the resource manager.
+                    positions_h, inactive_h, _ = self._helix_verify_token_params(
+                        request, num_draft_tokens, _helix_tokens_per_block)
+                    past_seen_token_num = request.py_helix_local_past_seen
+                    position_ids.extend(positions_h)
+                    helix_position_offsets.extend(positions_h)
+                    helix_is_inactive_rank.extend(inactive_h)
+                    helix_total_input_len.append(request.total_input_len_cp)
+                else:
+                    position_ids.extend(
+                        list(
+                            range(past_seen_token_num,
+                                  past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
@@ -2814,17 +2880,33 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + self.runtime_draft_len)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num, past_seen_token_num + 1 +
-                              self.runtime_draft_len)))
+                if _has_cp_helix:
+                    # Overlap-scheduler verify path under Helix: global positions
+                    # and per-rank cached length (see _helix_verify_token_params).
+                    positions_h, inactive_h, _ = self._helix_verify_token_params(
+                        request, self.runtime_draft_len,
+                        _helix_tokens_per_block)
+                    position_ids.extend(positions_h)
+                    helix_position_offsets.extend(positions_h)
+                    helix_is_inactive_rank.extend(inactive_h)
+                    helix_total_input_len.append(request.total_input_len_cp)
+                else:
+                    position_ids.extend(
+                        list(
+                            range(
+                                past_seen_token_num, past_seen_token_num + 1 +
+                                self.runtime_draft_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
                                             (1 + self.runtime_draft_len))
 
-                num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 self.runtime_draft_len + 1)
+                if _has_cp_helix:
+                    num_cached_tokens_per_seq.append(
+                        request.py_helix_local_past_seen)
+                else:
+                    num_cached_tokens_per_seq.append(past_seen_token_num +
+                                                     self.runtime_draft_len + 1)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
@@ -2885,9 +2967,6 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
-        helix_is_inactive_rank, helix_position_offsets = [], []
-        # Cache invariant method result to avoid repeated calls per-request
-        _has_cp_helix = self.mapping.has_cp_helix()
         _n_gen = len(generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width
@@ -2931,20 +3010,19 @@ class PyTorchModelEngine(ModelEngine):
                 position_id = past_seen_token_num
                 if _has_cp_helix:
                     # We compute a global position_id because each helix rank has only a subset of
-                    # tokens for a sequence.
+                    # tokens for a sequence. The per-rank cached length is recomputed from ownership
+                    # by the resource manager (py_helix_local_past_seen).
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
-                    if request.py_helix_is_inactive_rank:
-                        past_seen_token_num = request.seqlen_this_rank_cp
-                    else:
-                        # Discount the token added to active rank in resource manager as it hasn't
-                        # been previously seen.
-                        past_seen_token_num = request.seqlen_this_rank_cp - 1
+                    past_seen_token_num = request.py_helix_local_past_seen
 
                     for beam in range(beam_width):
-                        # Update helix-specific parameters.
+                        # Update helix-specific parameters. Plain decode writes a
+                        # single token, so this rank owns exactly one query token
+                        # when active and none when inactive.
                         helix_is_inactive_rank.append(
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
+                        helix_total_input_len.append(request.total_input_len_cp)
 
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
@@ -3299,6 +3377,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
+                helix_total_input_len=helix_total_input_len,
             )
 
         if not attn_metadata.is_cuda_graph:
