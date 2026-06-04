@@ -29,6 +29,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
+    compute_mm_embedding_lengths,
 )
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 
@@ -446,6 +447,100 @@ class TestNanoV2VLInputProcessor:
             proc._process_mixed_modalities(prompt, mm_data)
 
         assert captured["reserved"] == expected_reserved
+
+    def test_mixed_image_audio_dynamic_tiler_reconciles_post_tile_counts(self):
+        """The mixed path must size the image slot from the post-tile actual.
+
+        Headline user-reachable crash: on the dynamic-tiler path a large image
+        co-located with a real audio is PLANNED at the full `_max_num_patches`
+        cap by `get_num_tokens_per_image`, but `_prepare_image_modality_data`
+        TILES it at the reservation-reduced budget. When
+        `(max_model_len - text_len - reserved - min_num_patches) * 4 <
+        max_num_patches` the actual tiled count is smaller than the planned one,
+        so the encoder emits fewer rows than `sum(item.rows)` and the row-count
+        check in `mixed_modal_encode.py` trips (or, under `python -O`, the
+        mismatch silently corrupts the scatter). The fix reconciles the image
+        slot to the actual post-tile count.
+
+        Unlike `test_mixed_modalities_reserves_non_image_budget`, this test does
+        NOT mock `_expand_mixed_prompt_text_for_mm` or the embedding-length
+        computation: those mocks hide this bug because they discard the
+        per-image `num_mm_tokens` that the reconciliation must fix. Instead it
+        captures the reconciled `num_mm_tokens` that the real build consumes
+        (the single source of truth for both `input_ids` and
+        `multimodal_embedding_lengths`) and asserts the image slot equals the
+        actual tiled count, not the planned full-cap count.
+        """
+        proc = _make_audio_processor(max_model_len=120, max_num_patches=512, min_num_patches=4)
+        # The lightweight Mock config / mock tokenizer leave these token-id and
+        # vocab hooks as Mock objects or as the colliding id 0 (the mock
+        # tokenizer encodes every string as `range(len(s))`, so `<so_start>` /
+        # `<so_end>` both resolve to 0, which then aliases the first text token).
+        # That would break the REAL `compute_mm_embedding_lengths` mask logic for
+        # reasons unrelated to the reconciliation under test. Pin them to
+        # concrete, distinct ids (clear of the image context id 20 and the
+        # `<img>`/`</img>` specials 500/501) so the real embed-mask path runs
+        # end-to-end and the only divergence left is the image-count bug itself.
+        proc._sound_context_token_id = 30
+        proc._sound_start_token_id = 31
+        proc._sound_end_token_id = 32
+        proc.config.llm_config.vocab_size = 1000
+
+        img = Image.new("RGB", (512, 512))
+        audio = np.random.randn(16000).astype(np.float32)
+        mm_data = {"image": [img], "audio": [audio]}
+        prompt = f"{proc.img_context_token} then {AUDIO_PLACEHOLDER}"
+
+        # The non-image reservation is the real expanded audio cost; with it the
+        # image budget is squeezed below the `_max_num_patches` cap so the tiled
+        # (actual) count is strictly smaller than the planned full-cap count.
+        reserved = proc.get_num_tokens_per_audio(audio=audio)
+        actual_data, _ = proc._process_images_dynamic([img], prompt, reserved)
+        actual_image_context = actual_data["num_tokens_per_image"][0]
+
+        # The OLD planned count: full `_max_num_patches`-cap tiling, plus the
+        # `<img>`/`</img>` start/end specials that `get_num_tokens_per_image`
+        # folds into its total.
+        planned_total = proc.get_num_tokens_per_image(image=img)
+        start_end = len(proc._img_start_token_ids) + len(proc._img_end_token_ids)
+        planned_image_context = planned_total - start_end
+
+        # The actual tiled context count must be strictly smaller than the old
+        # planned full-cap count, otherwise this budget would not exercise the
+        # divergence the fix targets.
+        assert actual_image_context < planned_image_context
+
+        # Capture the reconciled `num_mm_tokens` that the real build consumes.
+        # It drives BOTH `input_ids` (via `_expand_mixed_prompt_text_for_mm`)
+        # and `multimodal_embedding_lengths` (via `compute_mm_embedding_lengths`),
+        # so the per-image embed length equals this slot minus start/end.
+        captured = {}
+        real_lengths = compute_mm_embedding_lengths
+
+        def _spy_lengths(input_ids, num_mm_tokens, **kw):
+            captured["num_mm_tokens"] = list(num_mm_tokens)
+            return real_lengths(input_ids, num_mm_tokens, **kw)
+
+        with mock.patch(
+            "tensorrt_llm._torch.models.modeling_nemotron_nano.compute_mm_embedding_lengths",
+            side_effect=_spy_lengths,
+        ):
+            _, extra = proc._process_mixed_modalities(prompt, mm_data)
+
+        # Locate the image slot in prompt order and read its reconciled count.
+        item_order = extra["multimodal_data"]["multimodal_item_order"]
+        image_slot = next(i for i, entry in enumerate(item_order) if entry["modality"] == "image")
+        reconciled_image_context = captured["num_mm_tokens"][image_slot] - start_end
+
+        # The image slot must be sized from the ACTUAL post-tile count, not the
+        # PLANNED full-cap count.
+        assert reconciled_image_context == actual_image_context
+        assert reconciled_image_context < planned_image_context
+
+        # And the resulting embedding length for the image entry must match the
+        # actual encoder rows (the real `compute_mm_embedding_lengths` output).
+        embedding_lengths = extra["multimodal_data"]["multimodal_embedding_lengths"]
+        assert embedding_lengths[image_slot] == actual_image_context
 
     def test_process_images_dynamic_mismatched_placeholders_raises(self):
         """Mismatch between <image> placeholders and image count should raise."""
@@ -2869,9 +2964,14 @@ class TestTokenPathBakesPromptItemOrder:
         prompt_token_ids = [1, img_ctx, 2, vid_ctx, 3, img_ctx, 4]
 
         # Keep the dummy-placeholder pass CPU-only and orthogonal to the
-        # order-resolution under test.
+        # order-resolution under test. `num_tokens_per_image` is required on the
+        # dynamic-tiler path: `_process_mixed_modalities` reconciles the deferred
+        # image slots from it (one entry per image; values are irrelevant here).
         proc._prepare_image_modality_data = mock.Mock(
-            return_value={"pixel_values": torch.ones(1, 3, 2, 2)}
+            return_value={
+                "pixel_values": torch.ones(1, 3, 2, 2),
+                "num_tokens_per_image": [4, 4],
+            }
         )
         proc._prepare_video_modality_data = mock.Mock(
             return_value={

@@ -472,14 +472,22 @@ class TestEncodeByModalityAndScatter:
         )
         assert final.shape == (0, 4)
 
-    def test_bucket_shape_assert_fires_on_encoder_regression(self):
+    def test_bucket_shape_mismatch_raises_value_error(self):
+        """A wrong encoder row count must raise `ValueError` (not `assert`).
+
+        The dispatch row-count check is a `ValueError`, not an `assert`: an
+        `assert` is compiled out under `python -O`, which would let a row-count
+        mismatch flow into the scatter's `index_copy_` and silently corrupt the
+        output buffer. The error must still name the offending modality and the
+        observed vs expected row counts.
+        """
         H = 4
 
         def broken_encoder(items, multimodal_params):
             return torch.zeros((1, H), dtype=torch.float32)  # wrong row count
 
         items_by_param = {0: [ModalityItem(0, "image", 0, 0, 5, {})]}
-        with pytest.raises(AssertionError, match="image"):
+        with pytest.raises(ValueError, match="image"):
             encode_by_modality_and_scatter(
                 multimodal_params=[object()],
                 encoders={"image": broken_encoder},

@@ -2639,14 +2639,29 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self,
         item_order: List[Tuple[str, int]],
         mm_data: Dict[str, Any],
-    ) -> List[int]:
-        """Compute per-item multimodal token lengths in prompt order."""
-        num_mm_tokens: List[int] = []
+    ) -> List[Optional[int]]:
+        """Compute per-item multimodal token lengths in prompt order.
+
+        On the dynamic-tiler image path the per-image count cannot be known
+        here: `get_num_tokens_per_image` would tile at the full `_max_num_patches`
+        cap, but `_prepare_image_modality_data` tiles at the reservation-reduced
+        budget, so the planned and actual counts diverge for a large image under
+        a tight budget. To avoid that divergence (which makes the encoder emit
+        fewer rows than `sum(item.rows)`), image entries are DEFERRED here as a
+        `None` sentinel and reconciled to the actual post-tile count by
+        `_process_mixed_modalities`. The fixed-tile path has no such divergence,
+        so it keeps the direct `get_num_tokens_per_image` call.
+        """
+        num_mm_tokens: List[Optional[int]] = []
         normalized = MixedModalItemOrder._normalize(mm_data)
         for modality, item_idx in item_order:
             item = normalized[modality][item_idx]
             if modality == "image":
-                num_mm_tokens.append(self.get_num_tokens_per_image(image=item))
+                if self.dynamic_tiler is not None:
+                    # Deferred: reconciled from post-tile actuals downstream.
+                    num_mm_tokens.append(None)
+                else:
+                    num_mm_tokens.append(self.get_num_tokens_per_image(image=item))
             elif modality == "audio":
                 num_mm_tokens.append(self.get_num_tokens_per_audio(audio=item))
             elif modality == "video":
@@ -2827,6 +2842,37 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 normalized.get("image", []),
                 text_prompt,
                 reserved_non_image_tokens,
+            )
+            # Reconcile the deferred image slots (see `_get_num_tokens_for_item_order`):
+            # on the dynamic-tiler path the per-image count is only known after
+            # `_prepare_image_modality_data` tiles at the reservation-reduced
+            # budget, so those slots arrive here as `None` sentinels. Splice the
+            # actual post-tile `num_tokens_per_image` into them so `input_ids` and
+            # `multimodal_embedding_lengths` match the rows the encoder will
+            # actually emit. Add the start / end specials so placeholder expansion
+            # yields exactly the actual context token count (mirroring
+            # `get_num_tokens_per_image`, which folds them into its returned total).
+            if any(
+                modality == "image" and num_mm_tokens[slot] is None
+                for slot, (modality, _) in enumerate(item_order)
+            ):
+                actual_num_tokens = multimodal_data["image"]["num_tokens_per_image"]
+                start_end = len(self._img_start_token_ids) + len(self._img_end_token_ids)
+                mm_idx = 0
+                for slot, (modality, _) in enumerate(item_order):
+                    if modality != "image":
+                        continue
+                    if num_mm_tokens[slot] is None:
+                        num_mm_tokens[slot] = actual_num_tokens[mm_idx] + start_end
+                    mm_idx += 1
+
+        # Loud-fail: no image slot may remain a deferred sentinel once images
+        # have been prepared (e.g. a stray image item the tiler did not size).
+        if any(tokens is None for tokens in num_mm_tokens):
+            raise ValueError(
+                "Unreconciled image token count in mixed-modality request: "
+                f"num_mm_tokens={num_mm_tokens} still contains a deferred "
+                "sentinel after image preprocessing."
             )
 
         videos = mm_data.get("video")

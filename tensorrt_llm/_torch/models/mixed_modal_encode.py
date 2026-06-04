@@ -178,10 +178,14 @@ def encoder_dispatch(
         bucket_items = [items[i] for i in index.modality_slots[modality].tolist()]
         out = encoders[modality](bucket_items, multimodal_params)
         expected = index.dst_indices[modality].numel()  # == sum of this bucket's rows
-        assert out.shape[0] == expected, (
-            f"encoder for {modality!r} returned {out.shape[0]} rows; expected "
-            f"{expected} (sum of item rows)"
-        )
+        if out.shape[0] != expected:
+            # ValueError (not assert): an assert is compiled out under
+            # `python -O`, which would let a row-count mismatch flow into a
+            # wrong-shaped `index_copy_` below and silently corrupt the scatter.
+            raise ValueError(
+                f"encoder for {modality!r} returned {out.shape[0]} rows; expected "
+                f"{expected} (sum of item rows)"
+            )
         outputs[modality] = out
     return outputs
 
