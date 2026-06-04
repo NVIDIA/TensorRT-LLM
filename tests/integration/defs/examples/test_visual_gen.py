@@ -83,7 +83,6 @@ WAN22_LPIPS_NUM_INFERENCE_STEPS = 4
 WAN22_LPIPS_GUIDANCE_SCALE = 4.0
 WAN22_LPIPS_SEED = 42
 WAN22_LPIPS_FRAME_RATE = 16.0
-
 # LTX-2 configuration
 LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
@@ -528,9 +527,8 @@ def _generate_ltx2_lpips_video(output_path):
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
 
 
-def _generate_wan_lpips_video(
+def _run_wan_lpips_pipeline(
     model_path,
-    output_path,
     prompt,
     negative_prompt,
     height,
@@ -539,16 +537,27 @@ def _generate_wan_lpips_video(
     num_inference_steps,
     guidance_scale,
     seed,
-    frame_rate,
+    attention_backend="VANILLA",
+    parallel=None,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import (
+        AttentionConfig,
+        CompilationConfig,
+        TorchCompileConfig,
+        VisualGenArgs,
+    )
 
     _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
-    args = VisualGenArgs(
+    args_kwargs = dict(
         model=model_path,
+        compilation_config=CompilationConfig(skip_warmup=True),
         torch_compile_config=TorchCompileConfig(enable=False),
+        attention_config=AttentionConfig(backend=attention_backend),
     )
+    if parallel is not None:
+        args_kwargs["parallel_config"] = parallel
+    args = VisualGenArgs(**args_kwargs)
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
         with torch.no_grad():
@@ -562,11 +571,41 @@ def _generate_wan_lpips_video(
                 guidance_scale=guidance_scale,
                 seed=seed,
             )
-        generated_video = result.video.detach().cpu()
+        if result is None or result.video is None:
+            return None
+        return result.video.detach().cpu()
     finally:
         del pipeline
         _cleanup_cuda()
 
+
+def _generate_wan_lpips_video(
+    model_path,
+    output_path,
+    prompt,
+    negative_prompt,
+    height,
+    width,
+    num_frames,
+    num_inference_steps,
+    guidance_scale,
+    seed,
+    frame_rate,
+    parallel=None,
+):
+    generated_video = _run_wan_lpips_pipeline(
+        model_path,
+        prompt,
+        negative_prompt,
+        height,
+        width,
+        num_frames,
+        num_inference_steps,
+        guidance_scale,
+        seed,
+        parallel=parallel,
+    )
+    assert generated_video is not None, "Single-GPU Wan LPIPS run produced no video"
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=frame_rate)
 
 
