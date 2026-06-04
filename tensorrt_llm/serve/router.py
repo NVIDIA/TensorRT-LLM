@@ -983,6 +983,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  backfill_block_hashes_on_finish: bool = False,
                  load_weight: float = 1.0,
                  load_cap: float = float("inf"),
+                 use_remote_kv_events: bool = True,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -994,7 +995,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._load_cap = load_cap
         # Opt-in workaround for the disagg-gen path that doesn't emit
         # kv_cache_events. Stash hashes at routing, inject on finish.
-        self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish
+        self._use_remote_kv_events = use_remote_kv_events
+        self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish or not use_remote_kv_events
         self._inflight_backfill_hashes: dict[int, tuple[list[BlockHash],
                                                         str]] = {}
 
@@ -1162,8 +1164,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 await self._server_state[server].decrement_load(request)
         self._apply_backfill_on_finish(request, server, success)
         if server is not None and server in self._server_state:
-            # Fire-and-forget; poll runs in background and coalesces per server.
-            self._server_state[server].schedule_poll_and_update(session)
+            if self._use_remote_kv_events:
+                self._server_state[server].schedule_poll_and_update(session)
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
