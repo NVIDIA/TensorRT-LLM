@@ -661,7 +661,13 @@ class _KVCache:
     # two APIs) where we use more pages than necessary for SWA layers. So we use a single API to avoid
     # this. Usually this is a concern only for prefill phase where we create many tokens in one step. For
     # other cases, we can just set the capacity and history_length properties instead.
-    def resize(self, capacity: int | None, history_length: int | None = None) -> bool:
+    def resize(
+        self,
+        capacity: int | None,
+        history_length: int | None = None,
+        *,
+        allow_swa_scratch_reuse: bool = True,
+    ) -> bool:
         assert self.status == self.Status.ACTIVE
         tokens_per_block = self.tokens_per_block
         assert div_up(self._capacity, tokens_per_block) == len(self._blocks)
@@ -678,8 +684,12 @@ class _KVCache:
         if capacity < history_length:
             raise ValueError("History length cannot be greater than capacity")
         manager = self.manager
-        # Scratch reuse: compute scratch ranges and slot delta
-        enable_scratch = self.enable_swa_scratch_reuse
+        # Scratch reuse: compute scratch ranges and slot delta.
+        # Callers undoing a pure capacity grow (see revert_allocate_context)
+        # pass allow_swa_scratch_reuse=False: the SWA scratch path asserts a
+        # generation-time window-slide invariant that a capacity revert does
+        # not satisfy, and there is no scratch state to preserve in that case.
+        enable_scratch = self.enable_swa_scratch_reuse and allow_swa_scratch_reuse
         if enable_scratch and capacity != self._capacity:
             max_rewind_len = self._swa_scratch_max_rewind_len()
             min_history_length = max(0, self._capacity - max_rewind_len)

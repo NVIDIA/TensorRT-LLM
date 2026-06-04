@@ -2734,7 +2734,23 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         if pre_cap >= kv_cache.capacity:
             return
-        if not kv_cache.resize(pre_cap):
+        if kv_cache.has_scratch_slots:
+            # Prefill grew past the SWA window and allocated scratch slots, so a
+            # plain capacity shrink is impossible: resize() refuses to shrink
+            # while scratch slots are live, and its SWA-scratch path assumes a
+            # generation-time window slide (history_length >= old_capacity -
+            # max_rewind_len) that a not-yet-forwarded context request does not
+            # satisfy. suspend() frees the scratch slots and releases all pages
+            # back to the pool for the defer window; the request is resumed via
+            # prepare_context() -> _resume_and_restore() on its next schedule,
+            # the same machinery used by generation and the pre_cap > 0 path.
+            kv_cache.suspend()
+            return
+        # No scratch slots: undo the pure capacity grow (history_length and SWA
+        # scratch are untouched by the grow) as a scratch-free shrink. Engaging
+        # SWA scratch reuse would assert the generation-time window-slide
+        # invariant above, which this deferred-context revert does not satisfy.
+        if not kv_cache.resize(pre_cap, allow_swa_scratch_reuse=False):
             raise RuntimeError(
                 f"Failed to revert KV cache capacity for context "
                 f"request {req.py_request_id} from "
