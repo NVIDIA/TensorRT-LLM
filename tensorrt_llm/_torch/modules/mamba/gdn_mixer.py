@@ -12,9 +12,15 @@ import triton.language as tl
 from torch import nn
 from transformers import Qwen3NextConfig
 
+from tensorrt_llm._utils import get_sm_version
+
 # Default: FlashInfer GDN prefill ON. Set TLLM_USE_FLASHINFER_GDN_PREFILL=0 to
 # fall back to the vendored Triton chunk_gated_delta_rule.
-if os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1":
+# The FlashInfer GDN prefill kernel (gdn_prefill_launcher.cu) only supports
+# device major version 9 (SM90/Hopper); on other archs it aborts at load. Gate
+# the selection on SM90 so non-Hopper GPUs (e.g. Blackwell SM120) use the
+# device-agnostic Triton path.
+if os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1" and get_sm_version() == 90:
     from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
 else:
     from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
