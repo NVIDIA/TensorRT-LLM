@@ -57,8 +57,9 @@ inline int32_t getPaddedHeadDimForSmem(int32_t headDim) {
 // Whether the kernel uses the opt-in K-only BF16Q+FP8KV transform pipeline.
 template <typename FmhaOptions_>
 inline bool usesKOnlyTransformPipeline(FmhaOptions_ const& options) {
-  bool const isSupportedHeadDim = options.mHeadDimQk == options.mHeadDimV &&
-                                  (options.mHeadDimQk == 64 || options.mHeadDimQk == 128);
+  bool const isSupportedHeadDim =
+    options.mHeadDimQk == options.mHeadDimV &&
+    (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
   return options.mEnablesBf16QFp8KvKOnlyTransform && !isContextKernel(options.mFmhaKernelType) &&
          !options.mIsMlaGen && options.mDtypeQ != options.mDtypeK && isSupportedHeadDim &&
          options.mDtypeQ == tg::Dtype::Bfloat16 && options.mDtypeK == tg::Dtype::E4m3 &&
@@ -88,8 +89,9 @@ inline bool usesE4m3ToBfloat16SassPatch(FmhaOptions_ const& options) {
 // Whether separate transformed K/V resources are supported for this kernel.
 template <typename FmhaOptions_>
 inline bool supportsSeparateTransformedKv(FmhaOptions_ const& options) {
-  bool const isSupportedHeadDim = options.mHeadDimQk == options.mHeadDimV &&
-                                  (options.mHeadDimQk == 64 || options.mHeadDimQk == 128);
+  bool const isSupportedHeadDim =
+    options.mHeadDimQk == options.mHeadDimV &&
+    (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
   return isBf16QFp8KvFullTransformGeneration(options) && !options.mIsMlaGen &&
          options.mNumInstsQ == 1 && options.mNumInstsKv == 1 && isSupportedHeadDim;
 }

@@ -194,6 +194,8 @@ struct FmhaOptionsFromArgs {
   bool mIsNumPrefetchedFmasSet{false};
   // Relative error tolerance.
   bool mIsRtolSet{false};
+  // Whether to use separate transformed K/V resources.
+  bool mIsSeparateTransformedKvSet{false};
   // Tile scheduler type.
   bool mIsTileSchedulerSet{false};
   // Whether to use an ordered sequence between softmax0 and softmax1.
@@ -523,7 +525,7 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mEnablesBf16QFp8KvKOnlyTransform) {
     TLLM_CHECK_ERROR(usesKOnlyTransformPipeline(options),
                      "BF16Q+FP8KV K-only transform is only supported for non-MLA Blackwell "
-                     "generation kernels with BF16 Q, E4M3 K/V, and H64/H128.");
+                     "generation kernels with BF16 Q, E4M3 K/V, and H64/H128/H256.");
     TLLM_CHECK_ERROR(!options.mSeparateTransformedKv,
                      "BF16Q+FP8KV K-only transform cannot be combined with separateTransformedKv.");
   }
@@ -533,7 +535,7 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     TLLM_CHECK_ERROR(supportsSeparateTransformedKv(options),
                      "separateTransformedKv is only supported by BF16Q+E4M3KV full-transform "
                      "generation kernels on Blackwell with numInstsQ=1, numInstsKv=1, and equal "
-                     "H64/H128 K/V heads.");
+                     "H64/H128/H256 K/V heads.");
   }
 
   if (options.mMmaOrder == MmaOrder::Qk0_Qk1_Pv0_Pv1) {
