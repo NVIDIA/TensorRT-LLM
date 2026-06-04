@@ -902,6 +902,17 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                 runtime_draft_len + 1 -
                 num_accepted_tokens[num_contexts:batch_size])
+            # A generation request's KV length can never be smaller than the
+            # number of query tokens (mtp_num_modules) the draft layer processes
+            # this step. This only underflows for the tiny dummy sequences used
+            # during generation-step warmup; real sequences are long enough that
+            # subtracting the rejected draft tokens stays well above the draft
+            # length. Clamping in-place (CUDA-graph safe) keeps an invalid
+            # kv_len < q_len from reaching the attention kernel, which otherwise
+            # computes a negative effective KV range and triggers an illegal
+            # memory access (e.g. Step3p7 MTP with dense sliding-window attention).
+            attn_metadata.kv_lens_cuda[num_contexts:batch_size].clamp_(
+                min=mtp_num_modules)
             attn_metadata.on_update_kv_lens()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
