@@ -897,14 +897,23 @@ class CachedSequenceInterface:
 
     def _allocate_unmanaged_state_resource(self, handler: StateResourceHandler) -> torch.Tensor:
         """Allocate state resources in the slot domain used by runtime metadata."""
-        max_num_state_slots = self.info.max_num_state_slots
-        if TRTLLM_AVAILABLE and isinstance(
-            self._kv_cache_manager, (MambaHybridCacheManager, MixedMambaHybridCacheManager)
+        # Spec-decoding intermediate buffers (registered unconditionally by SSM/conv
+        # backends) are never read when spec decoding is disabled. Allocating them at
+        # full max_num_state_slots wastes hundreds of MiB per layer and can OOM. Bind a
+        # 1-slot placeholder so the cache slot exists without the full allocation.
+        if self._spec_config is None and isinstance(
+            handler, (SpecSSMResourceHandler, SpecCausalConvResourceHandler)
         ):
-            # ADEngine passes Mamba cache indices through slot_idx for every stateful
-            # op when a Mamba-hybrid cache manager is present. Mirror the padding
-            # slots reserved by that manager for CUDA-graph/spec-decoding dummies.
-            max_num_state_slots += self.info.batch_info.get_max_draft_len() + 1
+            max_num_state_slots = 1
+        else:
+            max_num_state_slots = self.info.max_num_state_slots
+            if TRTLLM_AVAILABLE and isinstance(
+                self._kv_cache_manager, (MambaHybridCacheManager, MixedMambaHybridCacheManager)
+            ):
+                # ADEngine passes Mamba cache indices through slot_idx for every stateful
+                # op when a Mamba-hybrid cache manager is present. Mirror the padding
+                # slots reserved by that manager for CUDA-graph/spec-decoding dummies.
+                max_num_state_slots += self.info.batch_info.get_max_draft_len() + 1
 
         return torch.empty(
             max_num_state_slots,
