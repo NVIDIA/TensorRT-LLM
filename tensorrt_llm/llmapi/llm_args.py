@@ -1130,6 +1130,14 @@ class DecodingBaseConfig(StrictBaseModel):
         "false to fall back to exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
+    allow_advanced_sampling: bool = Field(
+        default=False,
+        status="deprecated",
+        description=
+        "DEPRECATED: no-op kept for backward compatibility. Will be removed "
+        "in a future release. Non-greedy sampling is now auto-detected per "
+        "request; this flag no longer has any effect.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -1193,6 +1201,23 @@ class DecodingBaseConfig(StrictBaseModel):
                                                    None) is not None:
             self.use_rejection_sampling = False
         return self
+
+    @model_validator(mode='before')
+    @classmethod
+    def _warn_deprecated_allow_advanced_sampling(cls, data):
+        """Warn when users set the deprecated allow_advanced_sampling flag.
+
+        Non-greedy sampling is now auto-detected per request and always
+        available, so the flag is a no-op; warn loudly so callers update
+        their configs before the flag is removed.
+        """
+        if isinstance(data, dict) and 'allow_advanced_sampling' in data:
+            logger.warning(
+                "DecodingBaseConfig: 'allow_advanced_sampling' is deprecated "
+                "and will be removed in a future release. The flag has no "
+                "effect — non-greedy sampling is now auto-detected per "
+                "request.")
+        return data
 
     @model_validator(mode='after')
     # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
@@ -4535,6 +4560,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 # Rejection sampling is only wired up for Eagle3 one-model paths.
                 # Silently fall back for other spec types so the new default
                 # (True) does not break them.
+                # TODO: extend rejection sampling to the remaining speculative
+                # decoding paths (MTP / DraftTarget / PARD / DFlash /
+                # SaveHiddenStates / SA) and unify the dispatch in SpecMetadata
+                # so new spec algorithms get rejection sampling for free; once
+                # all paths are covered this whitelist guard can be removed.
                 self.speculative_config.use_rejection_sampling = False
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
