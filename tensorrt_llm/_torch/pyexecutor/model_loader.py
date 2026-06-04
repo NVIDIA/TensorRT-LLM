@@ -317,6 +317,17 @@ class ModelLoader:
 
         return llm_args
 
+    @staticmethod
+    def _needs_source_identity(checkpoint_loader: BaseCheckpointLoader,
+                               load_format: LoadFormat) -> bool:
+        """Whether this load path can consume a SourceIdentity gate.
+
+        Keep ordinary loading a strict no-op: SourceIdentity is currently used
+        only by MX (pre-transfer fallback gate) and GMS (pre-materialize
+        strict gate), so default HF/AUTO paths should not even build one.
+        """
+        return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == "MX"
+
     def load(
         self,
         checkpoint_dir: str,
@@ -352,17 +363,21 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
-            # Receiver's local SourceIdentity, built once from the final
-            # ModelConfig and the freshly constructed module. The module's
-            # realized parameter/buffer (shape, dtype) map is the layout ground
-            # truth; building it here (post-construction, pre-weight-load)
-            # gives producer and consumer a common, comparable lifecycle point.
-            self._source_identity = SourceIdentity.from_model_config(
-                config,
-                model,
-                model_name=str(
-                    getattr(self.llm_args, "model", None) or checkpoint_dir),
-            )
+            self._source_identity: Optional[SourceIdentity] = None
+            if self._needs_source_identity(checkpoint_loader, load_format):
+                # Receiver's local SourceIdentity, built once from the final
+                # ModelConfig and the freshly constructed module. The module's
+                # realized parameter/buffer (shape, dtype) map is the layout
+                # ground truth; building it here (post-construction,
+                # pre-weight-load) gives producer and consumer a common,
+                # comparable lifecycle point.
+                self._source_identity = SourceIdentity.from_model_config(
+                    config,
+                    model,
+                    model_name=str(
+                        getattr(self.llm_args, "model", None)
+                        or checkpoint_dir),
+                )
 
             memo = dict()
 

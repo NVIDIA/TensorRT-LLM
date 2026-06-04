@@ -27,6 +27,14 @@ from _source_identity_fakes import make_identity as _identity
 
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import SourceIdentityMismatchError
+from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+
+class _FakeCheckpointLoader:
+    """Minimal checkpoint-loader stub exposing ``checkpoint_format``."""
+
+    def __init__(self, checkpoint_format):
+        self.checkpoint_format = checkpoint_format
 
 
 class _FakeGMSBackend:
@@ -44,6 +52,14 @@ def _new_loader(local_identity):
     loader = ModelLoader.__new__(ModelLoader)
     loader._source_identity = local_identity
     return loader
+
+
+def test_source_identity_is_only_needed_for_mx_or_gms():
+    # Default HF/AUTO loading should be a strict no-op: no SourceIdentity
+    # construction, no tensor-layout traversal, no behavior change.
+    assert not ModelLoader._needs_source_identity(_FakeCheckpointLoader("HF"), LoadFormat.AUTO)
+    assert ModelLoader._needs_source_identity(_FakeCheckpointLoader("MX"), LoadFormat.AUTO)
+    assert ModelLoader._needs_source_identity(_FakeCheckpointLoader("HF"), LoadFormat.GMS)
 
 
 def test_gate_passes_on_matching_identity():
