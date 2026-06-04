@@ -507,10 +507,18 @@ void XqaDispatcher::runImpl(
         // seqLensKvPtr. ContiguousKv keeps its true past-kv length because its strides
         // depend on it.
         // Include the generation span in spec-dec tree kernel selection.
-        tllmRunnerParams.mMaxSeqLenKv = (params.is_spec_dec_tree && params.multi_query_tokens)
-            ? std::max(params.max_past_kv_length, params.max_past_kv_length + params.generation_input_length)
-            : ((tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv) ? params.max_attention_window_size
-                                                                   : params.max_past_kv_length);
+        if (params.is_spec_dec_tree && params.multi_query_tokens)
+        {
+            tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length + params.generation_input_length;
+        }
+        else if (tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv)
+        {
+            tllmRunnerParams.mMaxSeqLenKv = params.max_attention_window_size;
+        }
+        else
+        {
+            tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
+        }
         tllmRunnerParams.mJITWarmup = params.trtllm_gen_jit_warmup;
         tllmRunnerParams.mJITWarmupMaxNumRequests = params.trtllm_gen_jit_warmup_max_num_requests;
         tllmRunnerParams.mJITWarmupMaxSeqLenQ = params.trtllm_gen_jit_warmup_max_seq_len_q;

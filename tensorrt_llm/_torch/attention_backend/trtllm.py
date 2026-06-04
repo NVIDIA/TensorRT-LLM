@@ -118,6 +118,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # C++ attention op requires a 2-D position_offsets tensor and reads
     # sizes()[1] as the generation length / packed-mask row stride.
     spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
+    # Compact Hopper C++ row stride for 1D dynamic-tree offsets.
+    position_offsets_stride: int = 0
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
@@ -170,10 +172,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     @property
     def spec_decoding_position_offsets_for_cpp(self) -> Optional[torch.Tensor]:
         """``spec_decoding_position_offsets`` reshaped to the 2D layout the C++
-        kernel expects. 1D inputs (dynamic-tree shorthand) are viewed as
-        ``(max_num_requests, -1)``."""
+        kernel expects."""
         offsets = self.spec_decoding_position_offsets
         if offsets is not None and offsets.dim() == 1:
+            if (self.spec_decoding_position_offsets_cpp is not None
+                    and not self.is_sm_version_trtllm_gen_kernel(
+                        sm=get_sm_version())):
+                return self.spec_decoding_position_offsets_cpp
             return offsets.view(self.max_num_requests, -1)
         return offsets
 
@@ -240,14 +245,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         offsets = self.spec_decoding_position_offsets
         if offsets is None or offsets.dim() != 1:
             self.spec_decoding_position_offsets_cpp = offsets
+            self.position_offsets_stride = 0
             return
 
         if self.max_num_requests > 0 and query_len > 0:
+            self.position_offsets_stride = query_len
             total = self.max_num_requests * query_len
             self.spec_decoding_position_offsets_cpp = offsets[:total].view(
                 self.max_num_requests, query_len)
         else:
             self.spec_decoding_position_offsets_cpp = offsets
+            self.position_offsets_stride = 0
 
     def _post_init_with_buffers(self, buffers) -> None:
 

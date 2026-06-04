@@ -61,8 +61,7 @@ struct XqaFixedParams
     bool isPagedKv;
     // Is speculative decoding enabled.
     bool isSpecDecoding;
-    // Spec-dec tree bounds for FMHA kernel selection.
-    int specDecodingMaxGenLen;
+    // Spec-dec tree bound for FMHA kernel selection.
     int specDecodingTargetMaxGenLen = 0;
     // Do we apply alibi ?
     bool hasAlibi;
