@@ -24,7 +24,11 @@ import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID,
+    LlmRequest,
+    LlmRequestType,
+)
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
@@ -179,7 +183,7 @@ def _create_transceivers(tp, managers, config):
     return results
 
 
-def _create_managers(tp):
+def _create_managers(tp, max_batch_size=MAX_BATCH_SIZE, enable_attention_dp=False):
     """Create MixedMambaHybridCacheManagers for all TP ranks (PP=1).
 
     Layer 0 is a dummy attention layer required by page table infrastructure.
@@ -187,7 +191,9 @@ def _create_managers(tp):
     """
     managers = []
     for rank in range(tp):
-        mapping = Mapping(world_size=tp, rank=rank, tp_size=tp, pp_size=1)
+        mapping = Mapping(
+            world_size=tp, rank=rank, tp_size=tp, pp_size=1, enable_attention_dp=enable_attention_dp
+        )
         mgr = MixedMambaHybridCacheManager(
             mamba_d_state=MAMBA_D_STATE,
             mamba_d_conv=MAMBA_D_CONV,
@@ -200,7 +206,7 @@ def _create_managers(tp):
             mamba_ssm_cache_dtype=torch.float32,
             # dummy attention layer (page table scaffolding)
             kv_cache_config=KvCacheConfig(
-                max_tokens=256 * MAX_BATCH_SIZE,
+                max_tokens=256 * max_batch_size,
                 enable_block_reuse=False,
                 event_buffer_max_size=0,
             ),
@@ -211,7 +217,7 @@ def _create_managers(tp):
             head_dim=64,
             tokens_per_block=8,
             max_seq_len=256,
-            max_batch_size=MAX_BATCH_SIZE,
+            max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=DataType.FLOAT,
         )
@@ -323,6 +329,36 @@ def _read_actual(gen_managers, gen_request_ids) -> Dict:
 # ---------------------------------------------------------------------------
 # Main test logic
 # ---------------------------------------------------------------------------
+def test_mamba_disagg_attention_dp_dummy_with_batch_size_one(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "0")
+    mgr = _create_managers(1, max_batch_size=1, enable_attention_dp=True)[0]
+    try:
+        req = LlmRequest(
+            request_id=100,
+            max_new_tokens=1,
+            input_tokens=list(range(16)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                SamplingParams()._get_sampling_config()
+            ),
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+        )
+        batch = ScheduledRequests()
+        batch.reset_context_requests([req])
+        mgr.prepare_resources(batch)
+
+        mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID], is_gen=True, prepare_resource=True)
+
+        assert mgr._impl.mamba_cache_free_blocks == []
+        assert (
+            mgr._impl.mamba_cache_index[ATTENTION_DP_DUMMY_REQUEST_ID]
+            == mgr._impl._attention_dp_dummy_slot
+        )
+        assert mgr._impl.mamba_cache_index[100] != mgr._impl._attention_dp_dummy_slot
+    finally:
+        mgr.shutdown()
+
+
 def run_mamba_transfer_test(ctx_tp: int, gen_tp: int):
     """Test mamba transfer: ctx_tp -> gen_tp (PP=1, no DP)."""
     # -- 1. Create managers, zero mamba caches --

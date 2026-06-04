@@ -334,21 +334,22 @@ class DeepseekV3WeightLoader:
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, 'mark_consumed')
 
+        # The pretrained_config's num_nextn_predict_layers may have been expanded
+        # by ModelLoader._load_and_validate_config to match user max_draft_len.
+        # The original checkpoint MTP layer count (used for mod-indexing) is
+        # preserved as `_ckpt_num_nextn_predict_layers`.
+        ckpt_num_nextn_predict_layers = (
+            getattr(self.config, '_ckpt_num_nextn_predict_layers', None)
+            or self.config.num_nextn_predict_layers)
+
         def detect_shared_mtp_weights() -> bool:
-            # Detect if MTP layers share checkpoint weights (model requests more
-            # MTP layers than the checkpoint provides). In this case, multiple
-            # model MTP layers map to the same checkpoint layer via modulo, and
-            # mark_consumed must be skipped to avoid deleting weights that later
-            # MTP layers still need.
-            ckpt_nextn = self.config.num_nextn_predict_layers or 0
-            spec_config = self.model_config.spec_config
-            if spec_config is not None and hasattr(
-                    spec_config, 'spec_dec_mode'
-            ) and spec_config.spec_dec_mode.is_mtp_one_model():
-                model_nextn = spec_config.num_nextn_predict_layers or 0
-            else:
-                model_nextn = 0
-            return model_nextn > ckpt_nextn > 0
+            # Detect if MTP layers share checkpoint weights (model has more MTP
+            # layer instances than the checkpoint provides). In this case,
+            # multiple model MTP layers map to the same checkpoint layer via
+            # modulo, and mark_consumed must be skipped to avoid deleting
+            # weights that later MTP layers still need.
+            model_nextn = self.config.num_nextn_predict_layers or 0
+            return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
 
         has_shared_mtp_weights = detect_shared_mtp_weights()
 
@@ -368,7 +369,7 @@ class DeepseekV3WeightLoader:
                     mtp_layer_idx = int(
                         names[2]) - self.config.num_hidden_layers
                     names[2] = str(mtp_layer_idx %
-                                   self.config.num_nextn_predict_layers +
+                                   ckpt_num_nextn_predict_layers +
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
                 mark_consumed = can_mark_consumed and not is_shared_mtp_layer
@@ -1857,7 +1858,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
         ):
             model_nextn = self.config.num_nextn_predict_layers
-            ckpt_nextn = self.config.num_nextn_predict_layers
+            # When MTP layers share checkpoint weights (vanilla MTP with
+            # max_draft_len > ckpt MTP count), the original checkpoint count is
+            # preserved on pretrained_config; otherwise it equals num_nextn.
+            ckpt_nextn = (getattr(self.config, '_ckpt_num_nextn_predict_layers',
+                                  None) or self.config.num_nextn_predict_layers)
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:

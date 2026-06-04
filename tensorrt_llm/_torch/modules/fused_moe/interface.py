@@ -967,6 +967,19 @@ class MoE(nn.Module):
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         router_logits = self._maybe_get_perfect_router_logits(router_logits)
         if self.register_to_config and is_torch_compiling():
+            # Routed-expert MoE LoRA is fused into torch.ops.trtllm.fused_moe
+            # via lora_params, but the trtllm::moe_custom_op graph path used here
+            # cannot carry lora_params. Dropping it silently would apply no LoRA,
+            # so reject instead. _moe_lora_enabled is only set by backends that
+            # fuse MoE LoRA, so other backends are unaffected.
+            if getattr(self, "_moe_lora_enabled", False):
+                raise RuntimeError(
+                    "Routed-expert MoE LoRA is not supported together with "
+                    "`register_to_config` + `torch.compile` (the "
+                    "`trtllm::moe_custom_op` graph path cannot carry LoRA "
+                    "adapter pointers). Disable `register_to_config`/"
+                    "torch.compile for this model, or remove the MoE modules "
+                    "from `lora_config.lora_target_modules`.")
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x
             x_sf = x.scaling_factor if isinstance(x,
