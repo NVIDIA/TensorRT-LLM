@@ -281,7 +281,6 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_2_nodes_grace_bl
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_dep8_32k8k] SKIP (https://nvbugs/6236094)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_dep8_8k1k] SKIP (https://nvbugs/6227472)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_tep8_32k8k] SKIP (https://nvbugs/6227472)
-perf/test_perf_sanity.py::test_e2e[aggr_upload-llama3_1_8b_fp8_ad_hopper-llama3_1_8b_ad_ws1_1k1k] SKIP (https://nvbugs/6244474)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] SKIP (https://nvbugs/6153575)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6215844)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_kimi-k25-thinking-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6179661)
