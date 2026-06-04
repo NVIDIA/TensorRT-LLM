@@ -21,6 +21,7 @@ import os
 import random
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.request
 import zipfile
@@ -82,7 +83,6 @@ WAN22_LPIPS_NUM_INFERENCE_STEPS = 4
 WAN22_LPIPS_GUIDANCE_SCALE = 4.0
 WAN22_LPIPS_SEED = 42
 WAN22_LPIPS_FRAME_RATE = 16.0
-
 # LTX-2 configuration
 LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
@@ -401,18 +401,6 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
 
 
-def _disable_wan_fused_qk_norm_rope_if_unavailable(pipeline):
-    try:
-        getattr(torch.ops.trtllm, "fused_dit_cross_head_qk_norm_rope")
-        return
-    except AttributeError:
-        pass
-
-    for module in pipeline.modules():
-        if hasattr(module, "fuse_qk_norm_rope"):
-            module.fuse_qk_norm_rope = False
-
-
 def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, generated_path):
     reference_key = "reference_video_path" if media_type == "video" else "reference_image_path"
     generated_key = "generated_video_path" if media_type == "video" else "generated_image_path"
@@ -539,9 +527,8 @@ def _generate_ltx2_lpips_video(output_path):
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
 
 
-def _generate_wan_lpips_video(
+def _run_wan_lpips_pipeline(
     model_path,
-    output_path,
     prompt,
     negative_prompt,
     height,
@@ -550,18 +537,28 @@ def _generate_wan_lpips_video(
     num_inference_steps,
     guidance_scale,
     seed,
-    frame_rate,
+    attention_backend="VANILLA",
+    parallel=None,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import (
+        AttentionConfig,
+        CompilationConfig,
+        TorchCompileConfig,
+        VisualGenArgs,
+    )
 
     _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
-    args = VisualGenArgs(
+    args_kwargs = dict(
         model=model_path,
+        compilation_config=CompilationConfig(skip_warmup=True),
         torch_compile_config=TorchCompileConfig(enable=False),
+        attention_config=AttentionConfig(backend=attention_backend),
     )
+    if parallel is not None:
+        args_kwargs["parallel_config"] = parallel
+    args = VisualGenArgs(**args_kwargs)
     pipeline = PipelineLoader(args).load(skip_warmup=True)
-    _disable_wan_fused_qk_norm_rope_if_unavailable(pipeline)
     try:
         with torch.no_grad():
             result = pipeline.forward(
@@ -574,11 +571,41 @@ def _generate_wan_lpips_video(
                 guidance_scale=guidance_scale,
                 seed=seed,
             )
-        generated_video = result.video.detach().cpu()
+        if result is None or result.video is None:
+            return None
+        return result.video.detach().cpu()
     finally:
         del pipeline
         _cleanup_cuda()
 
+
+def _generate_wan_lpips_video(
+    model_path,
+    output_path,
+    prompt,
+    negative_prompt,
+    height,
+    width,
+    num_frames,
+    num_inference_steps,
+    guidance_scale,
+    seed,
+    frame_rate,
+    parallel=None,
+):
+    generated_video = _run_wan_lpips_pipeline(
+        model_path,
+        prompt,
+        negative_prompt,
+        height,
+        width,
+        num_frames,
+        num_inference_steps,
+        guidance_scale,
+        seed,
+        parallel=parallel,
+    )
+    assert generated_video is not None, "Single-GPU Wan LPIPS run produced no video"
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=frame_rate)
 
 
@@ -698,12 +725,17 @@ def test_wan22_t2v_lpips_against_golden(tmp_path):
 
 @pytest.fixture(scope="session")
 def wan_trtllm_video_path(_visual_gen_deps, llm_venv, llm_root):
-    """Generate input video via visual_gen_wan_t2v.py and return path to trtllm_output.mp4."""
+    """Generate input video via models/wan_t2v.py and return path to trtllm_output.mp4."""
     return _generate_wan_video(llm_venv, llm_root, WAN_T2V_MODEL_SUBPATH, "wan")
 
 
 def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
-    """Generate a video with visual_gen_wan_t2v.py for a given model checkpoint.
+    """Generate a video with examples/visual_gen/models/wan_t2v.py for a given checkpoint.
+
+    The slim example hardcodes prompt/H/W/frames (matching WAN_T2V_* constants
+    above), so this helper only synthesizes a VisualGenArgs YAML for engine
+    config (parallelism / attention / cuda graph) and passes it via
+    ``--visual_gen_args``.
 
     Returns the path to the generated .mp4, or calls pytest.skip if the model
     is not found under LLM_MODELS_ROOT.
@@ -720,25 +752,36 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
     output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
     if os.path.isfile(output_path):
         return output_path
-    script_path = os.path.join(llm_root, "examples", "visual_gen", "visual_gen_wan_t2v.py")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_t2v.py")
     assert os.path.isfile(script_path), f"Visual gen script not found: {script_path}"
+
+    cfg_size = 2 if torch.cuda.device_count() >= 2 else 1
+    visual_gen_args_yaml = os.path.join(out_dir, "visual_gen_args.yaml")
+    with open(visual_gen_args_yaml, "w") as f:
+        f.write(
+            textwrap.dedent(
+                f"""\
+                attention_config:
+                  backend: VANILLA
+                parallel_config:
+                  cfg_size: {cfg_size}
+                  ulysses_size: 1
+                cuda_graph_config:
+                  enable: false
+                """
+            )
+        )
+
     cmd = [
         script_path,
-        "--height",
-        str(WAN_T2V_HEIGHT),
-        "--width",
-        str(WAN_T2V_WIDTH),
-        "--num_frames",
-        str(WAN_T2V_NUM_FRAMES),
-        "--model_path",
+        "--model",
         model_path,
-        "--prompt",
-        WAN_T2V_PROMPT,
+        "--visual_gen_args",
+        visual_gen_args_yaml,
         "--output_path",
         output_path,
     ]
-    if torch.cuda.device_count() >= 2:
-        cmd.extend(["--cfg_size", "2"])
     venv_check_call(llm_venv, cmd)
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
     return output_path
@@ -768,9 +811,6 @@ def _linear_type_to_quant_config(linear_type):
 
 def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
     """Generate a video using the LTX-2 Python API directly.
-
-    Calls VisualGen / VisualGenArgs / VisualGenParams instead of shelling out
-    to examples/visual_gen/visual_gen_ltx2.py (which may be removed).
 
     Returns the path to the generated .mp4, or calls pytest.skip if the model
     or text encoder is not found under LLM_MODELS_ROOT.
@@ -1187,6 +1227,28 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Quickstart did not produce output.avi at {output_path}"
 
 
+def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/api_walkthrough.py end-to-end."""
+    scratch_space = conftest.llm_models_root()
+    model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
+    if not os.path.isdir(model_src):
+        pytest.skip(
+            f"Model not found: {model_src} "
+            f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
+        )
+
+    model_dst = os.path.join(llm_venv.get_working_directory(), "Wan-AI", WAN_T2V_MODEL_SUBPATH)
+    if not os.path.islink(model_dst):
+        os.makedirs(os.path.dirname(model_dst), exist_ok=True)
+        os.symlink(model_src, model_dst, target_is_directory=True)
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "api_walkthrough.py")
+    venv_check_call(llm_venv, [script_path])
+
+    output_path = os.path.join(llm_venv.get_working_directory(), "api_walkthrough_output.avi")
+    assert os.path.isfile(output_path), f"API walkthrough did not produce {output_path}"
+
+
 # =============================================================================
 # Core example tests — run per-model scripts from examples/visual_gen/models/
 # with shared YAML configs from examples/visual_gen/configs/.
@@ -1198,15 +1260,11 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
 
     This is a core example test: it validates that the per-model example script
     and the shared YAML config work together as documented in the README.
-    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint.
-
-    NOTE: If a strict-duplicate test exists elsewhere (same model, same quant,
-    same resolution, same prompt, same script invocation), consider removing
-    it in favour of this one.  As of this writing, the closest test is
-    test_vbench_dimension_score_wan22_a14b_nvfp4 which uses the same checkpoint
-    but invokes the *old* visual_gen_wan_t2v.py script (not models/wan_t2v.py)
-    with different resolution/prompt and additionally runs VBench scoring.
-    Not a strict duplicate.
+    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint and the shared
+    ``configs/wan2.2-t2v-fp4-1gpu.yaml`` (NVFP4 dynamic quant). The closest
+    overlapping test is ``test_vbench_dimension_score_wan22_a14b_nvfp4``,
+    which runs the same script but with a no-quant YAML synthesized at
+    runtime and additionally evaluates VBench scores.
     """
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)

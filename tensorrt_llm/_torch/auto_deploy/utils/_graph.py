@@ -357,7 +357,27 @@ def lint(gm: GraphModule) -> None:
     gm.graph.lint()
 
 
+def _restore_topological_order(gm: GraphModule) -> None:
+    """Move nodes after their direct inputs if graph rewrites left them out of order."""
+    while True:
+        node_order = {node: idx for idx, node in enumerate(gm.graph.nodes)}
+        for node in list(gm.graph.nodes):
+            input_nodes = [
+                input_node for input_node in node.all_input_nodes if input_node in node_order
+            ]
+            if not input_nodes:
+                continue
+            latest_input = max(input_nodes, key=node_order.__getitem__)
+            if node_order[node] < node_order[latest_input]:
+                latest_input.append(node)
+                break
+        else:
+            return
+
+
 def _canonicalize_single_gm(gm: GraphModule) -> None:
+    _restore_topological_order(gm)
+
     # clean up graph (needs to be done repeatedly until no more dead code)
     eliminate_dead_code(gm, is_impure_node=_is_impure_node)
 

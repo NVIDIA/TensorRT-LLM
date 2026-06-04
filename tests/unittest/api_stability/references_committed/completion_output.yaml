@@ -20,10 +20,10 @@ methods:
         annotation: Optional[torch.Tensor]
         default: null
       logprobs:
-        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]] | List[float]]
+        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]] | list[float]]
         default: null
       prompt_logprobs:
-        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]]]
+        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]] | list[float]]
         default: null
     return_annotation: None
 properties: {}

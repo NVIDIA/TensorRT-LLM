@@ -158,10 +158,17 @@ EXCLUDE_TEST_FILES = {
     "test_flashinfer_mamba_cached_op.py",
     # Require TRT-LLM custom ops (dsv3_router_gemm_op, noaux_tc_op, etc.)
     "test_deepseek_custom.py",
+    "test_glm4_moe_modeling.py",
     "test_glm4_moe_lite_modeling.py",
+    "test_glm_moe_dsa_modeling.py",
+    # Full-model tests hit standalone-incompatible HF cache behavior.
+    "test_granite_moe_hybrid_modeling.py",
+    # Imports triton_kernels, which is not a standalone dependency.
+    "test_mxfp4_moe_layout.py",
     # Require TRT-LLM distributed ops (trtllm_dist_all_gather)
     "test_gather_logits_before_lm_head.py",
-    # Multimodal types are None in standalone (MultimodalInput guard)
+    # Multimodal processors depend on TensorRT-LLM multimodal request types.
+    "test_gemma4_modeling.py",
     "test_qwen3_5_moe.py",
     # Hardware-specific (requires H100+ shared memory)
     "test_triton_mla_op.py",
@@ -377,8 +384,16 @@ def _create_test_conftest(tests_dir: str) -> None:
         # limitations under the License.
 
         \"\"\"Conftest for standalone auto_deploy tests.\"\"\"
-        import sys
+        import importlib.util
         import os
+        import sys
+
+        _trtllm_spec = importlib.util.find_spec("tensorrt_llm")
+        if _trtllm_spec is not None:
+            raise RuntimeError(
+                "Standalone llmc tests must not be able to import tensorrt_llm; "
+                f"found {getattr(_trtllm_spec, 'origin', None)!r}"
+            )
 
         # Add _utils_test to the Python path so test files can import from it
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_utils_test"))
