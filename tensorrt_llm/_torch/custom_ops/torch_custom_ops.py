@@ -811,9 +811,9 @@ class MarlinNVFP4Runner(TunableRunner):
     MAX_SM_VERSION = 99  # SM90-series only (Hopper)
     NVFP4_SCALE_VECTOR_SIZE = 16
 
-    def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype):
+    def __init__(self, output_buffer_kind: int, output_dtype: torch.dtype):
         super().__init__()
-        self.to_userbuffers = to_userbuffers
+        self.output_buffer_kind = int(output_buffer_kind)
         self.output_dtype = output_dtype
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -905,7 +905,7 @@ class MarlinNVFP4Runner(TunableRunner):
             out_dtype=self.output_dtype,
             size_n=size_n,
             size_k=size_k,
-            to_userbuffers=self.to_userbuffers,
+            output_buffer_kind=self.output_buffer_kind,
         )
         return result
 
@@ -1048,8 +1048,6 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         self.output_dtype = output_dtype
         self.allowed_backends = allowed_backends
         self.group = group
-        self.to_userbuffers = (self.output_buffer_kind == int(
-            BufferKind.USERBUFFERS))
 
     def unique_id(self):
         """Include allowed_backends in cache key to avoid sharing cache across different backend configs."""
@@ -1075,7 +1073,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # Add Marlin tactics (SM90 Hopper only) — users must opt-in explicitly
         # by listing "marlin" in ``allowed_backends``.
         if self._is_backend_allowed("marlin"):
-            marlin_runner = MarlinNVFP4Runner(self.to_userbuffers,
+            marlin_runner = MarlinNVFP4Runner(self.output_buffer_kind,
                                               self.output_dtype)
             marlin_tactics = marlin_runner.get_valid_tactics(inputs, profile)
             if marlin_tactics:
@@ -1236,7 +1234,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                            tactic=sub_tactic,
                                                            bias=bias)
         elif backend == "marlin":
-            return MarlinNVFP4Runner(self.to_userbuffers,
+            return MarlinNVFP4Runner(self.output_buffer_kind,
                                      self.output_dtype)(inputs,
                                                         tactic=sub_tactic)
         else:

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +16,8 @@
  */
 
 #include "tensorrt_llm/kernels/marlin/marlin_nvfp4.h"
+#include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
-#include "userbuffersTensor.h"
 #include <torch/extension.h>
 
 using torch::Tensor;
@@ -43,11 +43,12 @@ namespace torch_ext
 // out_dtype:          output dtype (fp16 or bf16)
 // size_n:             output dimension N
 // size_k:             reduction dimension K
-// to_userbuffers:     allocate output in userbuffers
+// output_buffer_kind: output allocation kind (0=default, 1=userbuffers, 2=nccl_window)
+// group:              communicator ranks, used when output_buffer_kind selects an NCCL window
 Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional<Tensor> const& scale_a,
     Tensor const& scale_b, std::optional<Tensor> const& alpha, Tensor const& weight_global_scale,
     std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t size_n, int64_t size_k,
-    bool to_userbuffers = false)
+    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     CHECK_TH_CUDA(mat_a);
     TORCH_CHECK(mat_a.scalar_type() == FLOAT4_E2M1X2 || mat_a.scalar_type() == at::ScalarType::BFloat16,
@@ -74,15 +75,8 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
     int32_t k = static_cast<int32_t>(size_k);
 
     // Allocate output
-    Tensor out;
-    if (to_userbuffers)
-    {
-        out = torch_ext::create_userbuffers_tensor({m, n}, out_dtype_).first;
-    }
-    else
-    {
-        out = at::empty({m, n}, mat_a.options().dtype(out_dtype_));
-    }
+    auto [out, _] = torch_ext::allocate_output(
+        {m, n}, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
     if (m == 0)
         return out;
@@ -131,7 +125,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "marlin_nvfp4_gemm(Tensor mat_a, Tensor mat_b, Tensor? scale_a, Tensor scale_b, Tensor? alpha,"
         " Tensor weight_global_scale, Tensor? bias, ScalarType? out_dtype,"
-        " int size_n, int size_k, bool to_userbuffers=False) -> (Tensor out)");
+        " int size_n, int size_k, int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -1121,7 +1121,8 @@ def _register_fake():
           out_dtype: Optional[torch.dtype],
           size_n: int,
           size_k: int,
-          to_userbuffers: bool = False):
+          output_buffer_kind: int = 0,
+          group: Optional[List[int]] = None):
         # mat_a: [M, K/2] FP4 packed (or BF16 when W4A16)
         # mat_b: Marlin-packed weights
         # Output: [M, size_n] with dtype=out_dtype

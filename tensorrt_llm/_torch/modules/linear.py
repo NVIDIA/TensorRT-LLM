@@ -2857,7 +2857,7 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
             out_dtype=module.dtype,
             size_n=module.out_features,
             size_k=module.in_features,
-            to_userbuffers=False,
+            output_buffer_kind=int(BufferKind.DEFAULT),
         )
         if bias is not None:
             output = output + bias
