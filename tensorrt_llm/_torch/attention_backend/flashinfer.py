@@ -1,8 +1,9 @@
+import functools
 import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Optional, TypeAlias, cast
+from typing import Any, Dict, Literal, NewType, Optional, TypeAlias, cast
 
 import flashinfer
 import torch
@@ -65,8 +66,12 @@ class PlanParams:
     window_left: Optional[int] = None
 
 
-# NB: Some features (multi-item scoring) are only supported with paged KV-cache wrapper (page_size=1)
-_RaggedPrefillWrapper: TypeAlias = flashinfer.BatchPrefillWithRaggedKVCacheWrapper | flashinfer.BatchPrefillWithPagedKVCacheWrapper
+# NB: Some features (multi-item scoring) are only supported with the paged KV-cache wrapper.
+#     With page_size=1, the latter can also be used for ragged KV data.
+_PageSizeOnePrefillWrapper = NewType(
+    "_PageSizeOnePrefillWrapper",
+    flashinfer.BatchPrefillWithPagedKVCacheWrapper)
+_RaggedPrefillWrapper: TypeAlias = flashinfer.BatchPrefillWithRaggedKVCacheWrapper | _PageSizeOnePrefillWrapper
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -672,7 +677,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     "The selected FlashInfer attention backend does not support multi-item attention masking."
                 )
             assert isinstance(ragged_prefill_wrapper,
-                              flashinfer.BatchPrefillWithPagedKVCacheWrapper)
+                              flashinfer.BatchPrefillWithPagedKVCacheWrapper
+                              )  # _PageSizeOnePrefillWrapper
             plan_kwargs = dict(
                 prefix_len_ptr=multi_item_params.prefix_len_ptr,
                 token_pos_in_items_ptr=multi_item_params.token_pos_in_items_ptr,
@@ -1028,6 +1034,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             torch.float8_e4m3fn, torch.float8_e5m2
         ] or (plan_params.num_heads // plan_params.num_kv_heads >= 4)
 
+    @staticmethod
+    @functools.wraps(flashinfer.BatchPrefillWithPagedKVCacheWrapper)
+    def _page_size_one_prefill_wrapper_builder(*args, **kwargs):
+        return _PageSizeOnePrefillWrapper(
+            flashinfer.BatchPrefillWithPagedKVCacheWrapper(*args, **kwargs))
+
     def _plan_with_params(self,
                           plan_params: PlanParams,
                           flashinfer_backend: str = "fa2") -> PlanParams:
@@ -1046,7 +1058,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     "FlashInfer without a KV cache manager does not support "
                     "CUDA graph capture; use the TRTLLM attention backend.")
             if plan_params.multi_item_params is None:
-                ragged_cls = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
+                ragged_builder = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
                 # NB: cuDNN chosen in https://github.com/NVIDIA/TensorRT-LLM/pull/12911
                 ragged_flashinfer_backend = "cudnn" if not _FORCE_RAGGED_FA2 else "fa2"
             else:
@@ -1054,14 +1066,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 # BatchPrefillWithRaggedKVCacheWrapper silently ignores multi-item scoring arguments,
                 # using flashinfer.BatchPrefillWithPagedKVCacheWrapper with page_size=1 instead.
                 # NB: https://github.com/sgl-project/sglang/pull/10979 also uses the paged-KV kernels.
-                ragged_cls = flashinfer.BatchPrefillWithPagedKVCacheWrapper
+                ragged_builder = self._page_size_one_prefill_wrapper_builder
             if plan_params in self._plan_params_to_wrappers:
                 ragged_prefill_wrapper = self._plan_params_to_wrappers[
                     plan_params].ragged_prefill_wrapper
                 assert ragged_prefill_wrapper is not None
                 assert ragged_prefill_wrapper._backend == ragged_flashinfer_backend
             else:
-                ragged_prefill_wrapper = ragged_cls(
+                ragged_prefill_wrapper = ragged_builder(
                     self.workspace_buffer,
                     "NHD",  # ragged KVs use always NHD
                     backend=ragged_flashinfer_backend,
