@@ -1807,7 +1807,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             effective_mask_data = attention_mask_data
             if (self.flashinfer_backend == "trtllm-gen"
                     and attention_mask_data is not None):
-                logger.warning("Falling back to causal attention")
+                logger.warning_once("Falling back to causal attention",
+                                    key="trtllm_gen_unsupported_custom_mask")
                 effective_mask_type = int(AttentionMaskType.causal)
                 effective_mask_data = None
 
