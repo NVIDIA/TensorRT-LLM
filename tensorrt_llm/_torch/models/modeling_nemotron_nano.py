@@ -441,7 +441,7 @@ def _nano_extract_items(
       is the rank, ``mm_idx_per_modality`` is the per-modality index, ``rows`` is the
       per-slot ``multimodal_embedding_lengths`` entry, and ``payload`` is sliced
       to that single sub-item by the ``slice_payload`` callable (the model's
-      bound ``_slice_payload`` in production). There is no ghost audio and no
+      bound ``_nano_slice_payload`` in production). There is no ghost audio and no
       post-encode interleave — audio (standalone or hoisted) is just another item.
     """
     multimodal_data = param.multimodal_data or {}
@@ -3585,23 +3585,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             cursor += n_clips
         return results
 
-    def _slice_payload(
-        self,
-        param: MultimodalParams,
-        modality: str,
-        mm_idx_per_modality: int,
-        *,
-        rows: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Per-item slice-payload entry point for the Nano extractor.
-
-        The per-item (multi-modality) extractor invokes this bound method
-        directly (the previous `NanoPayloadSlicer` wrapper was dissolved). The
-        actual per-modality tensor slicing lives in `_nano_slice_payload` so it
-        can consult `self.vision_encoder.num_image_token`.
-        """
-        return self._nano_slice_payload(param, modality, mm_idx_per_modality, rows=rows)
-
     def _nano_slice_payload(
         self,
         param: MultimodalParams,
@@ -3819,7 +3802,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             return []
 
         def extract(param_idx: int, param: MultimodalParams):
-            yield from _nano_extract_items(param_idx, param, slice_payload=self._slice_payload)
+            yield from _nano_extract_items(param_idx, param, slice_payload=self._nano_slice_payload)
 
         final = encode_by_modality_and_scatter(
             multimodal_params=multimodal_params,

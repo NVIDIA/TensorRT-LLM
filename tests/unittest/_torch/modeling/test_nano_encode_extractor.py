@@ -17,7 +17,7 @@ Two extraction regimes:
   * multi-modality (more than one distinct modality): one item per
     `MultimodalPromptOrder` entry; `prompt_pos` is the rank, `rows` is the
     per-slot `multimodal_embedding_lengths` entry, and the payload is sliced to
-    that single sub-item by the model's `_slice_payload` method.
+    that single sub-item by the model's `_nano_slice_payload` method.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class _StubSlicer:
     """Test slice-payload callable that returns a sentinel-tagged per-item payload.
 
     The extractor's payload-slicing is delegated to a `slice_payload` callable
-    (the bound `NemotronH_Nano_VL_V2._slice_payload` in production); in
+    (the bound `NemotronH_Nano_VL_V2._nano_slice_payload` in production); in
     extractor-only tests we substitute this stub so we can assert WHICH
     `(modality, mm_idx_per_modality)` the extractor asked to slice, independent
     of the real per-modality tensor math (covered separately in
@@ -310,12 +310,12 @@ class TestNanoExtractMultiModalityPerItem:
 
 
 # ---------------------------------------------------------------------------
-# _slice_payload: per-modality single-item payload slicing (sec 3.4).
+# _nano_slice_payload: per-modality single-item payload slicing (sec 3.4).
 # ---------------------------------------------------------------------------
 
 
 class TestNanoPayloadSlicer:
-    """`NemotronH_Nano_VL_V2._slice_payload` carves one sub-item out of an
+    """`NemotronH_Nano_VL_V2._nano_slice_payload` carves one sub-item out of an
     aggregate per-modality payload. Zero-copy where the source already stores
     per-item lists (dynamic-image, temporal-video); tile-range slice for
     fixed-tile; clip-range slice for audio.
@@ -332,11 +332,10 @@ class TestNanoPayloadSlicer:
         model._nano_fixed_tile_offset = MethodType(
             NemotronH_Nano_VL_V2._nano_fixed_tile_offset, model
         )
-        # `_slice_payload` is the per-model method the extractor now calls
+        # `_nano_slice_payload` is the per-model method the extractor now calls
         # directly (the `NanoPayloadSlicer` wrapper was dissolved); return the
         # bound method so it is itself the `slice_payload=` callable.
-        model._slice_payload = MethodType(NemotronH_Nano_VL_V2._slice_payload, model)
-        return model._slice_payload
+        return model._nano_slice_payload
 
     def test_dynamic_image_indexes_per_item_lists(self):
         # Dynamic-resolution image payload stores per-image lists; slicing item k
@@ -458,7 +457,7 @@ class TestNanoPayloadSlicer:
 
 
 class TestNanoExtractorWithRealSlicer:
-    """The extractor wired to the real bound `_slice_payload` method yields
+    """The extractor wired to the real bound `_nano_slice_payload` method yields
     per-item payloads that are correctly sliced sub-items (not the aggregate
     blob)."""
 
@@ -473,10 +472,9 @@ class TestNanoExtractorWithRealSlicer:
         model._nano_fixed_tile_offset = MethodType(
             NemotronH_Nano_VL_V2._nano_fixed_tile_offset, model
         )
-        # Return the bound per-model `_slice_payload`; it is the `slice_payload=`
+        # Return the bound per-model `_nano_slice_payload`; it is the `slice_payload=`
         # callable the extractor now invokes directly.
-        model._slice_payload = MethodType(NemotronH_Nano_VL_V2._slice_payload, model)
-        return model._slice_payload
+        return model._nano_slice_payload
 
     def test_fixed_tile_repeated_image_slices_each_image(self):
         # image(0) -> video(0) -> image(1), fixed-tile images. Each image item
