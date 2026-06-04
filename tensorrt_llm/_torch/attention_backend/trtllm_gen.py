@@ -442,8 +442,6 @@ class FlashInferTrtllmGenAttention:
         self._support_results: dict[tuple[object, ...], Tuple[bool, str]] = {}
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
-        self._multi_ctas_kv_counter_workspace_ptr: Optional[int] = None
-        self._multi_ctas_kv_counter_size: int = 0
 
     @property
     def layout(self) -> str:
@@ -776,33 +774,6 @@ class FlashInferTrtllmGenAttention:
         if device_index is None:
             device_index = torch.cuda.current_device()
         return self._get_multi_processor_count_for_device(device_index)
-
-    def _clear_multi_ctas_kv_counter_workspace_if_needed(
-        self,
-        fmha_workspace: torch.Tensor,
-        num_heads: int,
-        max_num_requests: int,
-    ) -> None:
-        counter_size = _get_multi_ctas_kv_counter_size(
-            num_heads,
-            max_num_requests,
-            self._multi_processor_count,
-        )
-        workspace_ptr = fmha_workspace.data_ptr()
-        if (
-            workspace_ptr == self._multi_ctas_kv_counter_workspace_ptr
-            and counter_size <= self._multi_ctas_kv_counter_size
-        ):
-            return
-
-        _clear_multi_ctas_kv_counter_workspace(
-            fmha_workspace,
-            num_heads,
-            max_num_requests,
-            self._multi_processor_count,
-        )
-        self._multi_ctas_kv_counter_workspace_ptr = workspace_ptr
-        self._multi_ctas_kv_counter_size = counter_size
 
     def forward(
         self,
@@ -1229,10 +1200,20 @@ class FlashInferTrtllmGenAttention:
             True,  # need_build_kv_cache_metadata
         )
 
-        self._clear_multi_ctas_kv_counter_workspace_if_needed(
-            fmha_workspace,
-            attn.num_heads,
-            meta.max_num_requests,
+        # FIXME: Flashinfer trtllm-gen API doesn't support a separate
+        # multi CTAs counter buffer. We have to clear a small buffer
+        # before trtllm_gen_batch_decode_with_kv_cache.
+        #
+        # We must also avoid clearing the workspace only when it is
+        # resized. The warmup phase may have already cached the workspace
+        # pointer; if the capture phase skips the zeroing step, the
+        # CUDA graph will not include the counter initialization. We
+        # have already verified—specifically in the context of the GPTOSS-20B
+        # test graph replay scenario—that this skipping logic is unsafe.
+        #
+        # https://github.com/flashinfer-ai/flashinfer/issues/3433
+        _clear_multi_ctas_kv_counter_workspace(
+            fmha_workspace, attn.num_heads, meta.max_num_requests, self._multi_processor_count
         )
 
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length
