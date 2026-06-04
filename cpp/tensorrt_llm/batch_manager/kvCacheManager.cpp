@@ -3822,7 +3822,64 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     }
     else
     {
-        // TLLM_LOG_WARNING("[kv cache manager] storeContextBlocks: Can not find sequence for request %lu", requestId);
+        // The sequence was removed (warmup teardown, TRT overlap with MTP, or early
+        // termination) before storeContextBlocks could register its blocks in the reuse
+        // trie. The blocks are still allocated on GPU with stale KV data.
+        //
+        // If we leave them untracked, the eviction policy will eventually recycle them
+        // to new requests via the radix trie. Those requests will read garbage context,
+        // output immediate EOS, and cascade the corruption through the entire trie until
+        // the engine is restarted.
+        //
+        // Fix: release orphaned blocks to the free pool WITHOUT storing them for reuse.
+        TLLM_LOG_WARNING(
+            "[kv cache manager] storeContextBlocks: Can not find sequence for request %lu. "
+            "Releasing orphaned blocks to prevent KV-cache corruption under block reuse.",
+            requestId);
+
+        mBlockManager.releaseOrphanedBlocks(requestId);
+    }
+}
+
+void BlockManager::releaseOrphanedBlocks(RequestIdType requestId)
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.releaseOrphanedBlocks(requestId);
+    }
+}
+
+void WindowBlockManager::releaseOrphanedBlocks(RequestIdType requestId)
+{
+    // Extract the block tracking for this request. If removeSequence already
+    // cleaned it up, this returns an empty node and we're done (no double-free).
+    auto node = mAllocatedBlocksPerSeq.extract(requestId);
+    if (node.empty())
+    {
+        return;
+    }
+
+    auto& allocatedBlocks = node.mapped();
+    TLLM_LOG_DEBUG(
+        "%s::releaseOrphanedBlocks - Releasing %zu orphaned blocks for request %lu "
+        "(blocks contain stale KV data, NOT stored for reuse)",
+        mLogPrefix.c_str(), allocatedBlocks.size(), requestId);
+
+    // Release blocks WITHOUT storing them in the reuse trie. This is the same
+    // cleanup as the no-reuse path in releaseBlocks() above: decrement refcounts
+    // and return zero-ref blocks to the eviction policy free pool. We deliberately
+    // skip storeBlocks() — the data is stale and must not poison the trie.
+    for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
+    {
+        auto& block = *it;
+        if (block->hasRefs())
+        {
+            block->decRefCount();
+        }
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(block);
+        }
     }
 }
 

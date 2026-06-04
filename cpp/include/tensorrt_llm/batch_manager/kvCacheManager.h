@@ -1195,6 +1195,14 @@ public:
     //!          are already in the trie when they are replaced with placeholders.
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
+    //! \brief Release orphaned blocks for a request whose sequence was removed before
+    //!        storeContextBlocks could register them in the reuse trie.
+    //! \details Returns blocks to the eviction policy free pool WITHOUT inserting them
+    //!          into the radix trie, preventing stale KV-cache data from being recycled
+    //!          to new requests (which would cause cascading empty-completion corruption).
+    //!          No-op if removeSequence already cleaned up this request.
+    void releaseOrphanedBlocks(LlmRequest::RequestIdType requestId);
+
     //! \brief Store blocks in the reuse trie.
     //! \param blockKeys Key of each block.
     //! \param blocks Block pointers (beam 0 only). OOW slots contain placeholder blocks
@@ -1819,6 +1827,12 @@ public:
 
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
+
+    //! \brief Release orphaned blocks across all window managers for a request whose
+    //!        sequence was removed before its context blocks were stored for reuse.
+    //! \details Delegates to each WindowBlockManager::releaseOrphanedBlocks. Prevents
+    //!          stale KV blocks from poisoning the reuse trie under enable_block_reuse.
+    void releaseOrphanedBlocks(LlmRequest::RequestIdType requestId);
 
     //! \brief Store newest block for reuse
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
