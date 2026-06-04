@@ -50,16 +50,16 @@ class FluxPipeline(BasePipeline):
     Supports FLUX.1-dev (50 steps, guidance) and FLUX.1-schnell (4 steps, no guidance).
     """
 
-    def __init__(self, model_config):
+    def __init__(self, pipeline_config):
         if (
-            model_config.visual_gen_mapping is not None
-            and model_config.visual_gen_mapping.cfg_size != 1
+            pipeline_config.visual_gen_mapping is not None
+            and pipeline_config.visual_gen_mapping.cfg_size != 1
         ):
             raise ValueError(
                 "FluxPipeline does not support CFG parallelism. Please set cfg_size to 1."
             )
 
-        super().__init__(model_config)
+        super().__init__(pipeline_config)
 
     @staticmethod
     def _compute_flux_timestep_embedding(
@@ -121,7 +121,7 @@ class FluxPipeline(BasePipeline):
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""
         logger.info("Creating FLUX transformer with quantization support...")
-        self.transformer = FluxTransformer2DModel(model_config=self.model_config)
+        self.transformer = FluxTransformer2DModel(model_config=self.model_configs["transformer"])
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():

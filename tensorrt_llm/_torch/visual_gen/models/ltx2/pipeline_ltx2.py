@@ -629,7 +629,7 @@ class LTX2Pipeline(BasePipeline):
             logger.info(f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled; forcing one-stage LTX2 pipeline.")
             return cls
 
-        checkpoint_path = getattr(config.pretrained_config, "_name_or_path", "")
+        checkpoint_path = getattr(config.primary_pretrained_config, "_name_or_path", "")
         if checkpoint_path:
             config.extra_attrs.update(
                 resolve_ltx2_pipeline_extra_attrs(Path(checkpoint_path), config.extra_attrs)
@@ -739,7 +739,8 @@ class LTX2Pipeline(BasePipeline):
                 "Quantized attention is not yet supported for the LTX-2 pipeline."
             )
 
-        cfg = self.model_config.pretrained_config
+        model_config = self.model_configs["transformer"]
+        cfg = model_config.pretrained_config
 
         rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
         freq_prec = getattr(cfg, "frequencies_precision", False)
@@ -780,7 +781,7 @@ class LTX2Pipeline(BasePipeline):
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
-            model_config=self.model_config,
+            model_config=model_config,
         )
         self.transformer._transformer_config = vars(cfg)
 

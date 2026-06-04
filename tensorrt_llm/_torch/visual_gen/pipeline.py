@@ -98,7 +98,7 @@ def _parse_profile_range():
 
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
-    from .config import DiffusionModelConfig
+    from .config import DiffusionPipelineConfig
 
 
 class BasePipeline(nn.Module):
@@ -107,7 +107,7 @@ class BasePipeline(nn.Module):
     """
 
     @classmethod
-    def resolve_variant(cls, config: "DiffusionModelConfig") -> Type["BasePipeline"]:
+    def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
 
         Override in subclasses to select a variant pipeline at creation
@@ -117,11 +117,13 @@ class BasePipeline(nn.Module):
         """
         return cls
 
-    def __init__(self, model_config: "DiffusionModelConfig"):
+    def __init__(self, pipeline_config: "DiffusionPipelineConfig"):
         super().__init__()
-        self.model_config = model_config
-        self.config = model_config.pretrained_config
-        self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
+        self.pipeline_config = pipeline_config
+        self.model_config = pipeline_config
+        self.model_configs = pipeline_config.model_configs
+        self.config = pipeline_config.primary_pretrained_config
+        self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
@@ -401,10 +403,7 @@ class BasePipeline(nn.Module):
         if not coefficients:
             return
         teacache_cfg = self.model_config.teacache
-        checkpoint_path = (
-            getattr(getattr(self.model_config, "pretrained_config", None), "_name_or_path", "")
-            or ""
-        )
+        checkpoint_path = getattr(self.model_config.primary_pretrained_config, "_name_or_path", "")
         matched = False
         for model_size, coeff_data in coefficients.items():
             if model_size.lower() in checkpoint_path.lower():

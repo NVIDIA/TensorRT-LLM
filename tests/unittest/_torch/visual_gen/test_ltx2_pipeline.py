@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig, CacheDiTConfig, VisualGenArgs
@@ -811,7 +811,7 @@ class TestTwoStagePipelineVariantResolution:
         )
 
         config = MagicMock()
-        config.pretrained_config._name_or_path = ""
+        config.primary_pretrained_config._name_or_path = ""
         config.extra_attrs = {
             "spatial_upsampler_path": "/fake/upsampler.safetensors",
             "distilled_lora_path": "/fake/lora.safetensors",
@@ -828,7 +828,7 @@ class TestTwoStagePipelineVariantResolution:
 
         monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
         config = MagicMock()
-        config.pretrained_config._name_or_path = ""
+        config.primary_pretrained_config._name_or_path = ""
         config.extra_attrs = {
             "spatial_upsampler_path": "/fake/upsampler.safetensors",
             "distilled_lora_path": "/fake/lora.safetensors",
@@ -844,7 +844,7 @@ class TestTwoStagePipelineVariantResolution:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
-        config.pretrained_config._name_or_path = ""
+        config.primary_pretrained_config._name_or_path = ""
         config.extra_attrs = {}
 
         result = LTX2Pipeline.resolve_variant(config)
@@ -857,7 +857,7 @@ class TestTwoStagePipelineVariantResolution:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
-        config.pretrained_config._name_or_path = ""
+        config.primary_pretrained_config._name_or_path = ""
         config.extra_attrs = {"spatial_upsampler_path": "/fake/upsampler.safetensors"}
 
         result = LTX2Pipeline.resolve_variant(config)
@@ -881,7 +881,7 @@ class TestLTX2ForceOneStageEnv:
         lora_path.touch()
 
         args = VisualGenArgs(model=str(checkpoint_path))
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+        config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
 
         assert LTX2Pipeline.resolve_variant(config) is LTX2TwoStagesPipeline
         assert config.extra_attrs["spatial_upsampler_path"] == str(upsampler_path)
@@ -898,7 +898,7 @@ class TestLTX2ForceOneStageEnv:
         lora_path.touch()
 
         args = VisualGenArgs(model=str(checkpoint_path))
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+        config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
 
         assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
         assert "spatial_upsampler_path" not in config.extra_attrs
@@ -919,7 +919,7 @@ class TestLTX2ForceOneStageEnv:
                 "distilled_lora_path": "/fake/lora.safetensors",
             },
         )
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+        config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
 
         assert config.extra_attrs["spatial_upsampler_path"] == "/fake/upsampler.safetensors"
         assert config.extra_attrs["distilled_lora_path"] == "/fake/lora.safetensors"
@@ -941,7 +941,7 @@ class TestLTX2ForceOneStageEnv:
                 "distilled_lora_path": "/fake/lora.safetensors",
             },
         )
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+        config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
 
         assert config.cache_backend == "cache_dit"
         assert config.extra_attrs["spatial_upsampler_path"] == "/fake/upsampler.safetensors"

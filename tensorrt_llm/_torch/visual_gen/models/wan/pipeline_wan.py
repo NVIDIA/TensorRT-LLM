@@ -89,23 +89,24 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     doc="Wan 2.1 & 2.2 text-to-video family.",
 )
 class WanPipeline(BasePipeline):
-    def __init__(self, model_config):
+    def __init__(self, pipeline_config):
         # Wan2.2 A14B two-stage denoising parameters
         self.transformer_2 = None
-        self.boundary_ratio = getattr(model_config.pretrained_config, "boundary_ratio", None)
-        self.expand_timesteps = getattr(model_config.pretrained_config, "expand_timesteps", False)
+        primary_pretrained_config = pipeline_config.primary_pretrained_config
+        self.boundary_ratio = getattr(primary_pretrained_config, "boundary_ratio", None)
+        self.expand_timesteps = getattr(primary_pretrained_config, "expand_timesteps", False)
         # Derived model type flags
         self.is_wan22_14b = self.boundary_ratio is not None
         self.is_wan22_5b = self.expand_timesteps
 
         # Validate TeaCache compatibility before allocating GPU memory
-        if (self.is_wan22_14b or self.is_wan22_5b) and model_config.cache_backend == "teacache":
+        if (self.is_wan22_14b or self.is_wan22_5b) and pipeline_config.cache_backend == "teacache":
             raise ValueError(
                 "TeaCache is not supported for Wan 2.2 models. "
                 "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
 
-        super().__init__(model_config)
+        super().__init__(pipeline_config)
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
@@ -176,12 +177,14 @@ class WanPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
-        self.transformer = WanTransformer3DModel(model_config=self.model_config)
+        self.transformer = WanTransformer3DModel(model_config=self.model_configs["transformer"])
 
         # Wan2.2 A14B: create second transformer for two-stage denoising
         if self.is_wan22_14b:
             logger.info("Creating second transformer for Wan2.2 A14B two-stage denoising...")
-            self.transformer_2 = WanTransformer3DModel(model_config=self.model_config)
+            self.transformer_2 = WanTransformer3DModel(
+                model_config=self.model_configs["transformer_2"]
+            )
 
     def load_standard_components(
         self,

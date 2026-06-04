@@ -12,6 +12,7 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -474,16 +475,14 @@ class WanBlock(nn.Module):
         return x
 
 
-class WanTransformer3DModel(nn.Module):
+class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
 
     def __init__(
         self,
         model_config: DiffusionModelConfig,
     ):
-        super().__init__()
-
-        self.model_config = model_config
+        super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
 

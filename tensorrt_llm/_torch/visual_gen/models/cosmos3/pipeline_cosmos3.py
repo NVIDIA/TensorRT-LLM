@@ -63,12 +63,12 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
     doc="Cosmos3 Omnimodal world models.",
 )
 class Cosmos3OmniMoTPipeline(BasePipeline):
-    def __init__(self, model_config):
-        super().__init__(model_config)
+    def __init__(self, pipeline_config):
+        super().__init__(pipeline_config)
 
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
-        self.transformer = Cosmos3VFMTransformer(self.model_config)
+        self.transformer = Cosmos3VFMTransformer(self.model_configs["transformer"])
 
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
