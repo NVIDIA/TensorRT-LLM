@@ -484,7 +484,6 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attn_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
-            self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
             max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
@@ -538,6 +537,7 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.encoder_attn_metadata = None
+        self.spec_metadata = None
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
@@ -1214,7 +1214,7 @@ class PyTorchModelEngine(ModelEngine):
             max_seq_len_list = [effective_max_seq_len]
 
         def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
-            spec_metadata = getattr(self, 'spec_metadata', None)
+            spec_metadata = self.spec_metadata
             if force_non_greedy and spec_metadata is not None:
                 spec_metadata._force_non_greedy_for_capture = True
                 # maybe_get_cuda_graph reads spec_metadata.is_all_greedy_sample
