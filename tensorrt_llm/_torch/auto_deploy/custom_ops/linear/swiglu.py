@@ -51,6 +51,7 @@ def torch_swiglu_mlp(
     gate_bias: Optional[torch.Tensor],
     up_bias: Optional[torch.Tensor],
     down_bias: Optional[torch.Tensor],
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Standardized SwiGLU MLP operation.
 
@@ -86,6 +87,7 @@ def _(
     gate_bias: Optional[torch.Tensor],
     up_bias: Optional[torch.Tensor],
     down_bias: Optional[torch.Tensor],
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for tracing."""
     # Output shape is [..., hidden_size] where hidden_size = down_weight.shape[0]
@@ -159,6 +161,7 @@ def torch_nvfp4_swiglu_mlp(
     down_input_scale: torch.Tensor,
     down_weight_scale: torch.Tensor,
     down_alpha: torch.Tensor,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """NVFP4 quantized SwiGLU MLP operation (intermediate representation).
 
@@ -230,6 +233,7 @@ def _(
     down_input_scale: torch.Tensor,
     down_weight_scale: torch.Tensor,
     down_alpha: torch.Tensor,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for tracing."""
     # Output shape: [..., hidden_size] where hidden_size = down_weight.shape[0]
@@ -323,6 +327,7 @@ def torch_finegrained_fp8_swiglu_mlp(
     gate_weight_scale: torch.Tensor,
     up_weight_scale: torch.Tensor,
     down_weight_scale: torch.Tensor,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FineGrained FP8 quantized SwiGLU MLP operation (intermediate representation).
 
@@ -382,6 +387,7 @@ def _(
     gate_weight_scale: torch.Tensor,
     up_weight_scale: torch.Tensor,
     down_weight_scale: torch.Tensor,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for tracing."""
     # Output shape: [..., hidden_size] where hidden_size = down_weight.shape[0]

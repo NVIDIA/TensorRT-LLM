@@ -164,6 +164,7 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
         self.disagg_config = self._get_extra_config()
         if disagg_config:
             self.disagg_config.update(disagg_config)
+            self.host = self.disagg_config.get("hostname", self.host)
         self.log_path = log_path
         self.log_file = None
         self.extra_config_file = os.path.join(

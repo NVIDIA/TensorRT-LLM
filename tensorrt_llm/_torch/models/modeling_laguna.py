@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -247,6 +248,12 @@ class LagunaAttention(QKNormRoPEAttention):
         self._use_gating = bool(gating)
         self._gate_per_head = gating == "per-head" or gating is True
 
+        # Temporary workaround: Hopper fails without unfused RoPE for Laguna
+        # While Blackwell has issues when RoPE is unfused.
+        # This check is to unblock Blackwell on main while we find proper fixes
+        # https://nvbugs/6211185
+        rope_fusion = get_sm_version() in (100, 103)
+
         # fuse_qk_norm_rope=False is required: the fused kernel reads
         # partial_rotary_factor and yarn params from pretrained_config
         # globally, ignoring per-layer RopeParams. Laguna has different
@@ -259,7 +266,7 @@ class LagunaAttention(QKNormRoPEAttention):
             bias=getattr(config, "qkv_bias", False) or getattr(config, "attention_bias", False),
             pos_embd_params=pos_embd_params,
             fuse_qk_norm_rope=False,
-            rope_fusion=False,
+            rope_fusion=rope_fusion,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,

@@ -73,8 +73,8 @@ class TestVisualGenArgsStrictValidation:
 class TestAttentionConfigQuantValidation:
     """Unsupported quantized-attention recipes are rejected with ValueError."""
 
-    def test_quant_config_rejected_on_non_trtllm_backend(self):
-        with pytest.raises(ValidationError, match="requires backend='TRTLLM'"):
+    def test_quant_config_rejected_on_unsupported_backend(self):
+        with pytest.raises(ValidationError, match="requires backend in"):
             AttentionConfig(
                 backend="VANILLA",
                 quant_attention_config=QuantAttentionConfig(),
@@ -84,13 +84,25 @@ class TestAttentionConfigQuantValidation:
         with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
             AttentionConfig(
                 backend="TRTLLM",
-                quant_attention_config=QuantAttentionConfig(k_block_size=127),
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
+                ),
             )
 
-    def test_supported_quant_configs(self):
+    def test_supported_quant_config_sage(self):
         attention = AttentionConfig(
             backend="TRTLLM",
-            quant_attention_config=QuantAttentionConfig(),
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="int8", q_block_size=1, k_block_size=16, v_block_size=1
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    def test_supported_quant_config_cute(self):
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
         )
 
         assert attention.quant_attention_config is not None
@@ -301,6 +313,13 @@ class TestParallelConfigValidation:
     def test_parallel_vae_size_must_be_positive(self):
         with pytest.raises(ValidationError):
             ParallelConfig(parallel_vae_size=0)
+
+    def test_attn2d_and_ulysses_seq_parallel_size(self):
+        pc = ParallelConfig(
+            attn2d_size=(2, 2),
+            ulysses_size=2,
+        )
+        assert pc.seq_parallel_size == 8
 
 
 class TestVisualGenArgsPickle:

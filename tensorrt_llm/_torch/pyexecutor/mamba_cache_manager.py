@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 import tensorrt_llm.bindings
 
@@ -28,9 +30,11 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
+    PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
@@ -53,6 +57,79 @@ def get_tensor_size_bytes(tensor):
     elif isinstance(tensor, list):
         return sum(get_tensor_size_bytes(t) for t in tensor)
     return 0
+
+
+# Mamba SSM stochastic-rounding Philox seed plumbing.
+#
+# Both the replay kernel and flashinfer's selective_state_update consume a
+# `rand_seed` int64 tensor.  Historically the non-replay paths created this
+# tensor via `torch.randint(..., (1,))` on every decode step, which (a) is
+# non-deterministic across runs, (b) allocates a fresh CUDA tensor per call
+# and is therefore unfriendly to CUDA-graph capture, and (c) has no notion
+# of cache-slot identity (so slot reuse cannot rotate the stream).
+#
+# The functions below produce per-slot int64 seeds via SplitMix64 finalization
+# of (counter, slot, rank).  Adjacent inputs yield uncorrelated outputs so
+# consecutive cache slots and consecutive request counters do not leave
+# structural fingerprints in the Philox input stream.  All outputs live in
+# (0, 2**62) so they avoid Philox's degenerate seed=0 case while staying
+# within int64.
+_MAMBA_SSM_SEED_MASK = (1 << 62) - 1
+_MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
+_MAMBA_SSM_SEED_BASE = 0x6A09E667F3BCC908
+_MAMBA_SSM_SEED_MIX_COUNTER = 0x2545F4914F6CDD1D
+_MAMBA_SSM_SEED_MIX_SLOT = 0x1B873593CC9E2D51
+_MAMBA_SSM_SEED_MIX_RANK = 0x9E3779B97F4A7C15
+
+
+def _splitmix64(x: int) -> int:
+    """SplitMix64 finalizer; pure function, no torch."""
+    x = (x + 0x9E3779B97F4A7C15) & _MAMBA_SSM_UINT64_MASK
+    x ^= (x >> 30)
+    x = (x * 0xBF58476D1CE4E5B9) & _MAMBA_SSM_UINT64_MASK
+    x ^= (x >> 27)
+    x = (x * 0x94D049BB133111EB) & _MAMBA_SSM_UINT64_MASK
+    x ^= (x >> 31)
+    return x & _MAMBA_SSM_UINT64_MASK
+
+
+def _compute_deterministic_mamba_seed(counter: int, slot: int,
+                                      rank_offset: int) -> int:
+    """Deterministic int64 seed in (0, 2**62) from (counter, slot, rank).
+
+    Pure function (no RNG, no torch.randint).  Identical inputs across
+    process invocations produce identical outputs, which is what the
+    acceptance criteria require for cross-run reproducibility.
+    """
+    folded = (_MAMBA_SSM_SEED_BASE + counter * _MAMBA_SSM_SEED_MIX_COUNTER +
+              slot * _MAMBA_SSM_SEED_MIX_SLOT +
+              rank_offset * _MAMBA_SSM_SEED_MIX_RANK)
+    folded &= _MAMBA_SSM_UINT64_MASK
+    value = _splitmix64(folded) & _MAMBA_SSM_SEED_MASK
+    if value == 0:
+        value = 1
+    return value
+
+
+def _allocate_mamba_seed_buffer(cache_size: int, rank_offset: int,
+                                device: torch.device) -> torch.Tensor:
+    """Allocate a (cache_size,) int64 CUDA buffer of deterministic seeds.
+
+    counter=0 at allocation time; per-slot reset on fresh request assignment
+    bumps a host-side counter and rewrites only the freshly-assigned slot.
+    """
+    slot_seeds = [
+        _compute_deterministic_mamba_seed(0, i, rank_offset)
+        for i in range(cache_size)
+    ]
+    return torch.tensor(slot_seeds, dtype=torch.int64, device=device)
+
+
+def _mamba_rank_offset(mapping: Mapping) -> int:
+    """Distinct seed offset per (tp_rank, pp_rank) so independent ranks
+    don't draw identical streams when not coordinated."""
+    return (mapping.tp_rank * 1_000_003 + mapping.pp_rank * 1_000_033 +
+            mapping.rank * 1_009)
 
 
 def use_cpp_mamba_cache_manager() -> bool:
@@ -276,8 +353,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         - Legacy: caches full intermediate SSM states (intermediate_ssm)
         - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
         """
-        _SHARED_FIELDS = frozenset(
-            {"prev_num_accepted_tokens", "cache_buf_idx"})
+        _SHARED_FIELDS = frozenset({
+            "prev_num_accepted_tokens", "cache_buf_idx", "mamba_ssm_rand_seed"
+        })
 
         intermediate_conv_window: torch.Tensor  # always allocated
 
@@ -289,6 +367,10 @@ class PythonMambaCacheManager(BaseResourceManager):
         # 0 means temporal saved state is actually the last state, not two back.
         prev_num_accepted_tokens: torch.Tensor | None = None  # (cache,) int — shared across layers
         cache_buf_idx: torch.Tensor | None = None  # (cache,) int32 — shared across layers
+        # Per-cache-slot Philox seeds. Replay bumps them in-place per launch so
+        # CUDA graph replay uses fresh SR draws without allocating RNG tensors.
+        # (cache,) int64 - shared across layers
+        mamba_ssm_rand_seed: torch.Tensor | None = None
         old_x: torch.Tensor | None = None  # (layers, cache, T, nheads, dim)
         old_B: torch.Tensor | None = None  # (layers, cache, 2, T, ngroups, dstate)
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
@@ -312,12 +394,23 @@ class PythonMambaCacheManager(BaseResourceManager):
         speculative_num_draft_tokens: Optional[int] = None,
         model_type: str = "nemotron_hybrid",
         use_replay_state_update: bool = False,
+        mamba_ssm_stochastic_rounding: bool = False,
     ) -> None:
 
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.spec_state_size = spec_state_size
         self._use_replay_state_update = use_replay_state_update
+        # When True, allocate the per-slot Philox seed buffer even outside
+        # the replay path so the non-replay flashinfer SR kernel reads a
+        # persistent deterministic seed instead of a per-call torch.randint.
+        self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
+        self._seed_rank_offset = _mamba_rank_offset(mapping)
+        # Host-side counter bumped per fresh cache-slot assignment.  Combined
+        # with slot index and rank offset to produce reproducible per-slot
+        # seed values.  Starts at 0 so the post-init "reset" stream is
+        # disjoint from the counter=0 stream used at allocation time.
+        self._seed_request_counter = 0
 
         # get tp size
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
@@ -378,6 +471,17 @@ class PythonMambaCacheManager(BaseResourceManager):
             device=device,
         )
 
+        # Per-slot Philox seeds.  Allocated whenever stochastic rounding can
+        # fire, even outside the replay path and even when MTP/spec is off,
+        # so all consumers (replay kernel, MTP non-replay flashinfer,
+        # non-MTP flashinfer) read a persistent deterministic seed from the
+        # cache manager instead of calling torch.randint per forward.
+        self._mamba_ssm_rand_seed: Optional[torch.Tensor] = None
+        if (self._use_replay_state_update
+                or self._mamba_ssm_stochastic_rounding):
+            self._mamba_ssm_rand_seed = _allocate_mamba_seed_buffer(
+                max_batch_size, self._seed_rank_offset, device)
+
         # create state container
         if speculative_num_draft_tokens is not None:
             T = speculative_num_draft_tokens + 1
@@ -392,6 +496,10 @@ class PythonMambaCacheManager(BaseResourceManager):
 
             # SSM speculative cache — path-specific tensors
             spec_kwargs = {}
+            # Share the manager-level seed buffer through SpeculativeState
+            # so the MTP path can still read it via layer_cache.
+            if self._mamba_ssm_rand_seed is not None:
+                spec_kwargs['mamba_ssm_rand_seed'] = self._mamba_ssm_rand_seed
             if self._use_replay_state_update:
                 assert n_groups % tp_size == 0, \
                     "replay state update requires n_groups divisible by tp_size"
@@ -490,6 +598,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         # see MixedMambaHybridCacheManager.
         self._padding_slot: int = self.mamba_cache_free_blocks.pop()
 
+        # Reserved slot for the attention-DP padding dummy. Keep it out of the
+        # free pool so dummy insertion never consumes real-request capacity.
+        self._attention_dp_dummy_slot: Optional[int] = (
+            self.mamba_cache_free_blocks.pop()
+            if mapping.enable_attention_dp else None)
+
         # save intermediate state indices for requests
         self.intermediate_state_indices = torch.arange(max_batch_size,
                                                        dtype=torch.int32,
@@ -534,6 +648,16 @@ class PythonMambaCacheManager(BaseResourceManager):
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
+            if self._mamba_ssm_rand_seed is not None:
+                # Deterministic per-slot rotation on fresh assignment.
+                # `block` is pulled from mamba_cache_free_blocks, which
+                # excludes _padding_slot by construction (see __init__),
+                # so padding sentinels never reach this branch.
+                self._seed_request_counter += 1
+                self._mamba_ssm_rand_seed[block] = (
+                    _compute_deterministic_mamba_seed(
+                        self._seed_request_counter, block,
+                        self._seed_rank_offset))
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -566,6 +690,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                 continue
             if self._is_padding_sentinel(r):
                 self.mamba_cache_index[r] = self._padding_slot
+            elif (r == ATTENTION_DP_DUMMY_REQUEST_ID
+                  and self._attention_dp_dummy_slot is not None):
+                self.mamba_cache_index[r] = self._attention_dp_dummy_slot
             else:
                 if len(self.mamba_cache_free_blocks) == 0:
                     raise RuntimeError("run out of mamba cache blocks")
@@ -577,8 +704,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         if request_id not in self.mamba_cache_index:
             return
         block = self.mamba_cache_index.pop(request_id)
-        # _padding_slot stays reserved; only non-sentinel blocks return.
-        if not self._is_padding_sentinel(request_id):
+        # Reserved slots must not re-enter the real-request free pool.
+        if block != self._padding_slot and \
+                block != self._attention_dp_dummy_slot:
             self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self, request_ids: List[int],
@@ -609,6 +737,41 @@ class PythonMambaCacheManager(BaseResourceManager):
         return self.mamba_cache.at_layer_idx(
             layer_offset).intermediate_conv_window
 
+    def get_replay_old_x(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_x[layer_offset]
+
+    def get_replay_old_B(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_B[layer_offset]
+
+    def get_replay_old_dt(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_dt[layer_offset]
+
+    def get_replay_old_dA_cumsum(self,
+                                 layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_dA_cumsum[layer_offset]
+
+    def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        return self.mamba_cache.cache_buf_idx
+
+    def get_replay_prev_num_accepted_tokens(self) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        return self.mamba_cache.prev_num_accepted_tokens
+
     def is_speculative(self) -> bool:
         return isinstance(self.mamba_cache, self.SpeculativeState)
 
@@ -619,6 +782,16 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.mamba_ssm_cache_dtype
+
+    def get_mamba_ssm_rand_seed(self) -> Optional[torch.Tensor]:
+        """Return the persistent (cache_size,) int64 Philox seed buffer or
+        None when stochastic rounding is not active for this manager.
+
+        Used by mamba2_mixer non-MTP paths that don't hold a SpeculativeState.
+        Callers must bump in-place (`.add_(1)` or slice-and-add) and pass a
+        view that matches the consuming kernel's expected shape.
+        """
+        return self._mamba_ssm_rand_seed
 
     @property
     def use_replay_state_update(self) -> bool:
@@ -641,6 +814,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 prev_num_accepted_tokens=_drop(
                     self.mamba_cache.prev_num_accepted_tokens),
                 cache_buf_idx=_drop(self.mamba_cache.cache_buf_idx),
+                mamba_ssm_rand_seed=_drop(self.mamba_cache.mamba_ssm_rand_seed),
                 old_x=_drop(self.mamba_cache.old_x),
                 old_B=_drop(self.mamba_cache.old_B),
                 old_dt=_drop(self.mamba_cache.old_dt),
@@ -713,6 +887,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         speculative_num_draft_tokens: Optional[int] = None,
         model_type: str = "nemotron_hybrid",
         use_replay_state_update: bool = False,
+        mamba_ssm_stochastic_rounding: bool = False,
     ) -> None:
         max_num_sequences = max_batch_size * mapping.pp_size
         self._use_cpp = use_cpp_mamba_cache_manager()
@@ -751,6 +926,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
                 model_type=model_type,
                 use_replay_state_update=use_replay_state_update,
+                mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             )
 
     def get_max_resource_count(self) -> int:
@@ -799,6 +975,13 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self._impl.get_mamba_ssm_cache_dtype()
 
+    def get_mamba_ssm_rand_seed(self) -> Optional[torch.Tensor]:
+        """Delegate to the underlying Python manager.  The C++ manager does
+        not allocate this buffer because it does not support speculative
+        decoding (and the SR-on-non-replay bug only fires under MTP)."""
+        getter = getattr(self._impl, 'get_mamba_ssm_rand_seed', None)
+        return getter() if getter is not None else None
+
     @property
     def use_replay_state_update(self) -> bool:
         return getattr(self._impl, 'use_replay_state_update', False)
@@ -812,6 +995,31 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
                                      layer_idx: int) -> Optional[torch.Tensor]:
         assert not self._use_cpp, "get_intermediate_conv_states is not supported in CppMambaCacheManager"
         return self._impl.get_intermediate_conv_states(layer_idx)
+
+    def get_replay_old_x(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_x is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_x(layer_idx)
+
+    def get_replay_old_B(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_B is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_B(layer_idx)
+
+    def get_replay_old_dt(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_dt is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_dt(layer_idx)
+
+    def get_replay_old_dA_cumsum(self,
+                                 layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_dA_cumsum is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_dA_cumsum(layer_idx)
+
+    def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_cache_buf_idx is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_cache_buf_idx()
+
+    def get_replay_prev_num_accepted_tokens(self) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_prev_num_accepted_tokens is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_prev_num_accepted_tokens()
 
     def is_speculative(self) -> bool:
         return self._impl.is_speculative()
@@ -848,6 +1056,19 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     to the family without caring about the concrete implementation. Concrete
     selection (Mixed vs Cpp) lives in ``_util.py:_get_model_kv_cache_manager_cls``.
     """
+
+
+def _get_mamba_hybrid_pool_size(max_batch_size: int, mapping: Mapping) -> int:
+    """Return the internal Mamba state pool size for MixedMambaHybridCacheManager."""
+    pool_size = max_batch_size
+    # One permanent slot is shared by every CUDA-graph padding sentinel.
+    pool_size += 1
+    if mapping.enable_attention_dp:
+        # Attention-DP can insert a transient dummy request on an otherwise
+        # idle rank. Keep this headroom internal so scheduler-visible
+        # max_batch_size still limits real requests.
+        pool_size += 1
+    return pool_size
 
 
 class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
@@ -892,15 +1113,17 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         model_type: str = "nemotron_hybrid",
         is_draft: bool = False,
         use_replay_state_update: bool = False,
+        mamba_ssm_stochastic_rounding: bool = False,
+        # Per-pool configurations forwarded to the C++ KVCacheManager ctor.
+        # Lets a single manager host pools with mixed shapes (e.g. Gemma4
+        # hybrid attention). See KVCacheManager.__init__.
+        pool_configurations: Optional[List[PoolConfiguration]] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
-        # +1 headroom for PythonMambaCacheManager._padding_slot, which
-        # is shared by every CUDA-graph padding sentinel regardless of
-        # max_draft_len.
-        pool_size = max_batch_size + 1
+        pool_size = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
 
         MambaCacheManager.__init__(
             self,
@@ -921,6 +1144,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                                           if spec_config is not None else None),
             model_type=model_type,
             use_replay_state_update=use_replay_state_update,
+            mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
         )
 
         # initialize kv cache manager
@@ -941,6 +1165,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             is_estimating_kv_cache=is_estimating_kv_cache,
             execution_stream=execution_stream,
             is_draft=is_draft,
+            pool_configurations=pool_configurations,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -987,6 +1212,97 @@ def calc_context_stop_positions(prompt_len: int,
     return stop_positions
 
 
+@triton.jit
+def _promote_mamba_state_kernel(
+    src_ptr,
+    dst_ptr,
+    src_idx_ptr,
+    acc_ptr,
+    blk_ptr,
+    num_gens,
+    count,
+    src_s_layer,
+    src_s_row,
+    src_s_step,
+    dst_s_layer,
+    dst_s_block,
+    BLOCK: tl.constexpr,
+):
+    # One program copies a BLOCK-sized tile of the contiguous inner state for a
+    # single (layer, gen) pair. grid = (num_layers * num_gens, ceil(count/BLOCK)).
+    pair = tl.program_id(0)
+    tile = tl.program_id(1)
+    layer = (pair // num_gens).to(tl.int64)
+    g = pair % num_gens
+    row = tl.load(src_idx_ptr + g).to(tl.int64)
+    acc = tl.load(acc_ptr + g).to(tl.int64)
+    blk = tl.load(blk_ptr + g).to(tl.int64)
+    # int64 throughout: per-layer strides are O(1e8), so layer*stride overflows
+    # int32 and would corrupt addresses / fault.
+    src_base = layer * src_s_layer + row * src_s_row + acc * src_s_step
+    dst_base = layer * dst_s_layer + blk * dst_s_block
+    offs = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < count
+    v = tl.load(src_ptr + src_base + offs, mask=mask)
+    tl.store(dst_ptr + dst_base + offs, v, mask=mask)
+
+
+def _promote_mamba_state_triton(dst: torch.Tensor,
+                                intermediate: torch.Tensor,
+                                src_state_indices: torch.Tensor,
+                                accepted_draft: torch.Tensor,
+                                dst_state_indices: torch.Tensor,
+                                BLOCK: int = 2048) -> None:
+    """Scatter each generation request's accepted draft-step recurrent state
+    from the per-request intermediate buffer into the unified C++ pool view.
+
+    Args:
+        dst: ``[num_layers, num_blocks, *state_shape]`` view of the C++ pool.
+            The block dim (dim 1) is strided (the pool interleaves
+            ``ssm_bytes | conv_bytes`` per block), so ``dst`` is non-contiguous.
+            The kernel writes through ``dst``'s real strides, touching only this
+            state's bytes -- the case that defeats torch.compile / aot_autograd
+            (dtype-view mutation) and Inductor codegen (``XBLOCK`` on the uint8
+            pool).
+        intermediate: ``[num_layers, max_batch_size, T, *state_shape]`` dense.
+        src_state_indices, accepted_draft, dst_state_indices: ``[num_gens]`` int.
+
+    For each gen ``g``::
+
+        dst[:, dst_state_indices[g]] = intermediate[:, src_state_indices[g], accepted_draft[g]]
+
+    Pure gather->scatter copy; bandwidth-bound (~85% of HBM peak), one launch.
+    """
+    num_layers = dst.shape[0]
+    num_gens = src_state_indices.shape[0]
+    if num_gens == 0:
+        return
+    count = 1
+    for s in dst.shape[2:]:
+        count *= s
+    # Grid dim order matters: dim 0 -> CUDA grid.x (limit 2^31-1), dim 1 ->
+    # grid.y (limit 65535). Put the (layer, gen) pairs in dim 0 since that is
+    # what grows with batch size (num_layers*num_gens stays far below 2^31 for
+    # any real config); the tile count in dim 1 is small (~count/BLOCK). Do NOT
+    # swap them: pairs would hit the 65535 y-limit at num_layers*num_gens>65535.
+    grid = (num_layers * num_gens, triton.cdiv(count, BLOCK))
+    _promote_mamba_state_kernel[grid](
+        intermediate,
+        dst,
+        src_state_indices,
+        accepted_draft,
+        dst_state_indices,
+        num_gens,
+        count,
+        intermediate.stride(0),
+        intermediate.stride(1),
+        intermediate.stride(2),
+        dst.stride(0),
+        dst.stride(1),
+        BLOCK=BLOCK,
+    )
+
+
 class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     """Hybrid cache manager storing mamba states inside the KVCacheManager pool.
 
@@ -1027,6 +1343,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         is_estimating_kv_cache: bool = False,
         is_draft: bool = False,
         use_replay_state_update: bool = False,
+        mamba_ssm_stochastic_rounding: bool = False,
         model_type: str = "nemotron_hybrid",
         **kwargs,
     ) -> None:
@@ -1066,6 +1383,14 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
         # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
+        # Same allocation gate as PythonMambaCacheManager: the rand_seed
+        # buffer must exist whenever SR can fire, not only on the replay path.
+        self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
+        self._seed_rank_offset = _mamba_rank_offset(mapping)
+        # Host-side counter bumped per fresh context-slot assignment; combined
+        # with the slot index and rank offset to produce reproducible per-slot
+        # seed values without any torch.randint.
+        self._seed_request_counter = 0
         self.ssm_state_dtype = mamba_ssm_cache_dtype
 
         if self.local_num_mamba_layers == 0:
@@ -1207,6 +1532,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             is_estimating_kv_cache=is_estimating_kv_cache,
             is_draft=is_draft,
             linear_attention_metadata=self.linear_attention_metadata,
+            **kwargs,
         )
 
         assert self.local_num_mamba_layers > 0, "At least one mamba layer is required"
@@ -1320,6 +1646,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.intermediate_state_indices = None
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
+        self.mamba_ssm_rand_seed = None
         self.old_x = None
         self.old_B = None
         self.old_dt = None
@@ -1388,17 +1715,41 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if self._pending_state_transfers:
             logger.info(f"Need to transfer mamba state blocks")
         self._setup_state_indices()
-        # Reset replay double-buffer state for fresh context blocks. A reused
-        # block (prefix-cache hit or block recycled across requests) may carry
-        # stale prev_num_accepted_tokens / cache_buf_idx values from a prior
-        # owner; the replay kernel reads these on the first decode step.
-        if self._use_replay_state_update and self.prev_num_accepted_tokens is not None:
-            num_contexts = len(scheduled_batch.context_requests)
-            if num_contexts > 0:
-                ctx_slots = self.cuda_state_indices[:num_contexts].long()
+        num_contexts = len(scheduled_batch.context_requests)
+        if num_contexts > 0:
+            ctx_slots = self.cuda_state_indices[:num_contexts].long()
+            if self._use_replay_state_update and self.prev_num_accepted_tokens is not None:
                 self.prev_num_accepted_tokens[ctx_slots] = 0
-                # don't care which half of doulbe-buffer is using
-                # self.cache_buf_idx[ctx_slots] = 0
+                self.cache_buf_idx[ctx_slots] = 0
+                if self.old_x is not None:
+                    self.old_x[:, ctx_slots] = 0
+                if self.old_B is not None:
+                    self.old_B[:, ctx_slots] = 0
+                if self.old_dt is not None:
+                    self.old_dt[:, ctx_slots] = 0
+                if self.old_dA_cumsum is not None:
+                    self.old_dA_cumsum[:, ctx_slots] = 0
+            # Deterministic per-context-slot seed rotation.  Runs whenever
+            # the seed buffer exists, including the non-replay SR path.
+            # Bump the host counter once per batch and write one new seed
+            # per fresh context slot from a pure function of
+            # (counter, slot, rank).  No torch.randint involved.
+            if self.mamba_ssm_rand_seed is not None:
+                self._seed_request_counter += 1
+                counter = self._seed_request_counter
+                rank_offset = self._seed_rank_offset
+                host_slots = ctx_slots.cpu().tolist()
+                new_seeds = [
+                    _compute_deterministic_mamba_seed(counter, slot,
+                                                      rank_offset)
+                    for slot in host_slots
+                ]
+                seed_tensor = torch.tensor(
+                    new_seeds,
+                    dtype=torch.int64,
+                    device=self.mamba_ssm_rand_seed.device,
+                )
+                self.mamba_ssm_rand_seed[ctx_slots] = seed_tensor
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -1419,51 +1770,59 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def is_speculative(self) -> bool:
         return self.spec_config is not None
 
+    @nvtx_range("hybrid_update_mamba_states")
     def update_mamba_states(self,
                             attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor,
                             state_indices: Optional[torch.Tensor] = None):
         if self.local_num_mamba_layers == 0:
             return
-        # Note: cannot use @torch.compile here because all_ssm_states and
-        # all_conv_states are dtype-reinterpreted views of the C++ pool
-        # (uint8 -> typed), and aot_autograd does not support mutations on
-        # views with different dtypes.
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
-        num_accepted_draft_tokens = num_accepted_tokens[
-            num_contexts:num_contexts + num_gens] - 1
+        num_accepted_draft_tokens = (
+            num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
+                torch.int32)
         # Match the API of MambaCacheManager.update_mamba_states: callers
         # may pass per-request state slot indices explicitly (e.g. MTP via
         # attn_metadata.mamba_metadata.state_indices). Fall back to this
         # manager's own slot mapping when not provided.
         if state_indices is None:
             state_indices = self.get_state_indices()
-        state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
-
+        state_indices_d = state_indices[num_contexts:num_contexts +
+                                        num_gens].to(torch.int32)
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
+        # The accepted SSM/conv promotion is a bandwidth-bound gather->scatter
+        # into the dtype-reinterpreted, strided C++ pool view. torch.compile
+        # can't handle the dtype-view mutation (and Inductor chokes on the
+        # uint8 pool with "XBLOCK too large"), so a dedicated Triton kernel
+        # writes through the view's real strides (~85% of HBM peak, one launch
+        # per state).
         if self._use_replay_state_update:
             # SSM state is handled incrementally by the replay kernel.  Update
             # the per-slot accepted-token counter and flip the double-buffer
             # index so the next step reads from the buffer that was just
             # written by the precompute kernel.
+            slots = state_indices_d.long()
             accepted = num_accepted_tokens[num_contexts:num_contexts + num_gens]
-            self.prev_num_accepted_tokens[state_indices_d] = accepted.to(
+            self.prev_num_accepted_tokens[slots] = accepted.to(
                 self.prev_num_accepted_tokens.dtype)
-            self.cache_buf_idx[state_indices_d] = \
-                1 - self.cache_buf_idx[state_indices_d]
+            self.cache_buf_idx[slots] = 1 - self.cache_buf_idx[slots]
         else:
-            # Legacy: copy accepted SSM states from intermediate buffer back to pool
-            accepted_ssm = self.intermediate_ssm_states[:, src_state_indices,
-                                                        num_accepted_draft_tokens]
-            self.all_ssm_states[:, state_indices_d, :] = accepted_ssm
+            # Legacy: copy the accepted SSM state from the intermediate buffer.
+            _promote_mamba_state_triton(self.all_ssm_states,
+                                        self.intermediate_ssm_states,
+                                        src_state_indices,
+                                        num_accepted_draft_tokens,
+                                        state_indices_d)
 
-        # Conv: both paths save all intermediate conv windows, carry over the accepted one.
-        accepted_conv = self.intermediate_conv_states[:, src_state_indices,
-                                                      num_accepted_draft_tokens]
-        self.all_conv_states[:, state_indices_d, :] = accepted_conv
+        # Conv: both paths save all intermediate conv windows, carry over the
+        # accepted one.
+        _promote_mamba_state_triton(self.all_conv_states,
+                                    self.intermediate_conv_states,
+                                    src_state_indices,
+                                    num_accepted_draft_tokens, state_indices_d)
 
     def get_num_available_tokens(self,
                                  token_num_upper_bound: int,
@@ -1521,6 +1880,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if self.spec_config is not None:
             layer_offset = self.mamba_layer_offsets[layer_idx]
             spec_kwargs = {}
+            # Per-cache-slot Philox seed buffer is shared across replay and
+            # non-replay MTP paths.  The mixer asserts non-None on both
+            # branches when SR is enabled, so pass it through whenever it
+            # exists — not just on the replay branch.
+            if self.mamba_ssm_rand_seed is not None:
+                spec_kwargs['mamba_ssm_rand_seed'] = self.mamba_ssm_rand_seed
             if self._use_replay_state_update:
                 # Per-layer slices for the replay kernel; shared 1D tensors
                 # (cache_buf_idx, prev_num_accepted_tokens) are passed
@@ -1713,24 +2078,40 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         ``prev_num_accepted_tokens`` by these block indices, so the buffers
         must match the pool extent rather than ``max_batch_size``.
         """
+        # Replay tensors require spec_config + replay path enabled.  The
+        # rand_seed buffer is separable from replay and must also be
+        # allocated for non-replay SR so the flashinfer path has a
+        # persistent deterministic seed source.
+        self.prev_num_accepted_tokens = None
+        self.cache_buf_idx = None
+        self.mamba_ssm_rand_seed = None
+        self.old_x = None
+        self.old_B = None
+        self.old_dt = None
+        self.old_dA_cumsum = None
+
+        if (not self._use_replay_state_update
+                and not self._mamba_ssm_stochastic_rounding):
+            return
+
+        cache_size = self.all_ssm_states.shape[1]
+        device = self.all_ssm_states.device
+        # Always-available deterministic seed buffer when SR (or replay)
+        # is on.  Works for non-MTP runs because we don't depend on
+        # spec_config to allocate it.
+        self.mamba_ssm_rand_seed = _allocate_mamba_seed_buffer(
+            cache_size, self._seed_rank_offset, device)
+
         if spec_config is None or not self._use_replay_state_update:
-            # Replay tensors are sized by the recurrent-state pool block count and
-            # are allocated in _setup_replay_buffers after _setup_states().
-            self.prev_num_accepted_tokens = None
-            self.cache_buf_idx = None
-            self.old_x = None
-            self.old_B = None
-            self.old_dt = None
-            self.old_dA_cumsum = None
+            # Without spec_config or replay we still keep the seed buffer
+            # (above) so the non-MTP flashinfer SR path has a persistent
+            # rand_seed source.
             return
 
         T = spec_config.max_draft_len + 1
         num_local_mamba_layers = self.local_num_mamba_layers
-        # all_ssm_states: [num_local_mamba_layers, num_blocks_in_pool, ...]
-        cache_size = self.all_ssm_states.shape[1]
         nheads, head_dim, d_state = self.ssm_state_shape
         n_groups_per_rank = self._n_groups_per_rank
-        device = self.all_ssm_states.device
 
         # Shared across layers (consumed by the replay kernel via slot index).
         self.prev_num_accepted_tokens = torch.zeros(cache_size,
@@ -1777,3 +2158,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype
+
+    def get_mamba_ssm_rand_seed(self) -> Optional[torch.Tensor]:
+        """Return the persistent (cache_size,) int64 Philox seed buffer or
+        None when stochastic rounding is not active for this manager."""
+        return getattr(self, 'mamba_ssm_rand_seed', None)
