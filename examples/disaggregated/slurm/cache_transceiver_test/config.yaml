@@ -1,0 +1,113 @@
+# Configuration for the 2-node KV cache transceiver bandwidth / UCX-tuning harness.
+#
+# Fill in the placeholders (<...>) and run:
+#     python3 submit.py -c config.yaml
+#
+# The job allocates 2 nodes; one runs the context (ctx) group, the other the
+# generation (gen) group, each using `hardware.gpus_per_node` GPUs. For every
+# UCX env-var set in `ucx_env_sweep`, every transceiver combination in
+# `test_matrix.combinations`, and every request length, the harness transfers KV cache
+# ctx -> gen, verifies correctness, and reports the achieved bandwidth.
+
+slurm:
+  partition: "<partition>"
+  account: "<account>"
+  job_time: "00:30:00"
+  job_name: "kvxfer_tune"
+  # Optional extra raw "#SBATCH" argument lines, e.g. ["--exclusive"].
+  extra_sbatch: []
+
+hardware:
+  # GPUs per node. N = gpus_per_node is the per-instance world size (ctx and gen
+  # each use N GPUs on their own node). Typically 4 or 8.
+  gpus_per_node: 4
+
+environment:
+  # Container image with a TensorRT-LLM build (wheel pre-installed, or installed
+  # below via trtllm_wheel_path / build_wheel).
+  container_image: "<container_image>"
+  # Comma-separated bind mounts, format: src:dst,src:dst
+  container_mount: "<container_mount>"
+  # Mounted path of this TensorRT-LLM repo inside the container ("" to skip).
+  trtllm_repo: "<trtllm_repo>"
+  # Writable output directory for logs, per-rank CSVs and results.json.
+  work_dir: "<full_path_to_work_dir>"
+
+  # --- TensorRT-LLM install selection (same precedence as benchmark/disaggr_torch.slurm) ---
+  # 1) If trtllm_wheel_path is set: `pip install <wheel>[devel]`.
+  trtllm_wheel_path: ""
+  # 2) Else if build_wheel is true: build from trtllm_repo then `pip install -e .[devel]`.
+  build_wheel: false
+  # Optional CUDA arch filter for build_wheel (e.g. "90-real;100-real"). Empty = all.
+  cuda_architectures: ""
+  # 3) If neither is set: use the TensorRT-LLM already installed in the container.
+
+test_matrix:
+  # Transceiver implementations to test. runtime "CPP" -> C++ transceiver,
+  # "PYTHON" -> Python transceiver (only NIXL / DEFAULT backend supported).
+  combinations:
+    - {backend: "UCX", runtime: "CPP"}
+    - {backend: "NIXL", runtime: "CPP"}
+    - {backend: "NIXL", runtime: "PYTHON"}
+  # KV cache manager versions to test. The full matrix is combinations x versions;
+  # the V2 manager only supports the Python transceiver, so V2+CPP is skipped.
+  cache_manager_versions: ["V1", "V2"]
+  # Request lengths (prompt tokens) to transfer.
+  request_lengths: [100, 1000, 8000]
+  # Number of timed requests per length (bandwidth is aggregated over these).
+  num_requests_per_length: 8
+  # Warmup requests per (combination, length); excluded from bandwidth stats.
+  warmup_requests: 2
+
+kv_cache:
+  # KV cache geometry. Sized so transfers are large enough to measure bandwidth.
+  num_layers: 32
+  num_kv_heads: 8        # per instance; must be divisible by tensor_parallel size
+  head_dim: 128
+  tokens_per_block: 32
+  dtype: "HALF"          # one of FP8 | HALF | BF16
+  # Transceiver buffer budget; MUST be >= max(request_lengths).
+  max_tokens_in_buffer: 16384
+
+parallel:
+  # Per-instance parallelism. ctx_tp*ctx_pp and gen_tp*gen_pp must both equal
+  # hardware.gpus_per_node. The harness requires a symmetric layout
+  # (ctx_tp == gen_tp and ctx_pp == gen_pp) for its local verification.
+  ctx_tp: 4
+  ctx_pp: 1
+  gen_tp: 4
+  gen_pp: 1
+
+ucx_env_sweep:
+  # Each entry is one full relaunch of both srun steps with the given UCX env
+  # vars exported. Add/edit entries to explore transports on your cluster.
+  - name: "all"
+    env:
+      UCX_TLS: "all"
+  - name: "cuda_ipc_and_tcp"
+    env:
+      UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+
+  - name: "put_zcopy"
+    env:
+      UCX_TLS: "all"
+      UCX_RNDV_SCHEME: "put_zcopy"
+      UCX_CUDA_IPC_ENABLE_MNNVL: "n"
+  - name: 'disable_ib'
+    env:
+      UCX_TLS: "^ib"
+
+
+run:
+  # Per (combination, request_length) cell hang threshold; a stuck transfer is reported as
+  # TIMEOUT and the harness moves on. The per-cell watchdog fires shortly after
+  # this and is always clamped below max_sweep_s.
+  timeout_per_cell_s: 60
+  # Hard wall-clock cap for ONE full sweep (all cases x request lengths). The
+  # outer `timeout` around each srun enforces this, so a hung sweep can never
+  # block the others: it is killed and the loop advances to the next UCX env
+  # set. Default 180 = 3 minutes (a healthy sweep finishes in ~1 min; raise this
+  # if you add many cases/sweeps or use slow links).
+  max_sweep_s: 180
+  # Set UCX_PROTO_INFO=used to capture the selected transport in stderr logs.
+  capture_proto_info: true
