@@ -171,7 +171,12 @@ def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dty
     num_blocks = case.num_seqs * pages_per_seq
     max_seq_len = pages_per_seq * tokens_per_block
 
-    kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
+    if kv_dtype == "nvfp4":
+        bindings_dtype = tensorrt_llm.bindings.DataType.NVFP4
+        kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block, dtype="nvfp4")
+    else:
+        bindings_dtype = _BINDINGS_DTYPE[kv_dtype]
+        kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
     cls = KVCacheManagerV2 if case.use_kv_cache_manager_v2 else KVCacheManager
@@ -186,7 +191,7 @@ def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dty
         max_seq_len=max_seq_len,
         max_batch_size=case.num_seqs,
         mapping=mapping,
-        dtype=_BINDINGS_DTYPE[kv_dtype],
+        dtype=bindings_dtype,
     )
     return mgr
 

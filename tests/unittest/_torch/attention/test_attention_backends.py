@@ -103,6 +103,10 @@ def _core_cases():
         num_cached_tokens=[0, 40, 8],
         num_contexts=1,
     )
+    # FP4 (NVFP4) KV cache is intentionally NOT exercised here: it cannot be
+    # tested in a standalone backend harness. See capability_matrix.BACKEND_CAPS
+    # (fp4_kv=False) for the rationale -- the NVFP4 attention op needs the full
+    # model's scale plumbing, and the packed cache cannot be manually prefilled.
     # Sliding window.
     add("sliding", seq_lens=[1, 1], num_cached_tokens=[100, 130], num_contexts=0, sliding_window=32)
     # RoPE on (non-fused; harness applies rope, all backends compare).

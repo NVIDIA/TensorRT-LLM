@@ -42,6 +42,12 @@ def fill_kv_cache_logical(
             match the layout the backend reads with, since the two interpret the
             physical block memory differently.
     """
+    if all(k.shape[0] == 0 for k in k_per_seq):
+        # Pure prefill (nothing cached): the backend populates the cache via its
+        # own append, so no manual fill is needed. Also avoids get_buffers, whose
+        # reshape cannot represent a packed NVFP4 pool (half the logical size).
+        return
+
     try:
         buf = kv_cache_manager.get_buffers(layer_idx, kv_layout=kv_layout)
     except TypeError:
