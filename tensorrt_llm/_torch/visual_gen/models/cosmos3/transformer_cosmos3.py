@@ -226,7 +226,7 @@ class Cosmos3CausalAttention(Attention):
             bias=False,
             config=model_config,
             layer_idx=layer_idx,
-            enable_ulysses=False,
+            enable_sequence_parallel=False,
         )
         self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
         self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
@@ -305,7 +305,7 @@ class Cosmos3CrossAttention(Attention):
             bias=False,
             config=model_config,
             layer_idx=layer_idx,
-            enable_ulysses=True,
+            enable_sequence_parallel=True,
         )
         model_config.attention.backend = original_backend
 

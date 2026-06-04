@@ -350,7 +350,8 @@ public:
         torch::Tensor workspace, torch::Tensor output, torch::optional<torch::Tensor> output_sf, torch::Tensor qkv_or_q,
         torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v, torch::Tensor sequence_length,
         torch::Tensor host_past_key_value_lengths, int32_t const total_kv_len, torch::Tensor context_lengths,
-        torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
+        torch::Tensor host_context_lengths, std::optional<int64_t> max_context_q_len_override,
+        torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
         torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -417,7 +418,8 @@ public:
         torch::Tensor workspace, torch::Tensor output, torch::optional<torch::Tensor> output_sf, torch::Tensor qkv_or_q,
         torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v, torch::Tensor sequence_length,
         torch::Tensor host_past_key_value_lengths, int32_t const total_kv_len, torch::Tensor context_lengths,
-        torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
+        torch::Tensor host_context_lengths, std::optional<int64_t> max_context_q_len_override,
+        torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
         torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -575,13 +577,33 @@ public:
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
         int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();
         // Note we still need context length during generation for MMHA optimization.
-        int32_t max_context_q_len = 0;
-        int32_t max_past_kv_length = 0;
+        // For encoder CUDA graphs compatibility, allow the caller to override the
+        // max context Q length so FMHA kernel launch params (mMaxSeqLenQ-driven grid
+        // and cluster dims) are stable across graph replays even when actual per-batch
+        // sequence lengths vary.
+        int32_t const max_context_q_len_computed
+            = host_context_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+        int32_t const max_past_kv_length_computed
+            = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+
+        if (max_context_q_len_override.has_value())
         {
-            max_context_q_len = host_context_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
-            max_past_kv_length
-                = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+            int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
+            TORCH_CHECK(override_value >= max_context_q_len_computed,
+                "max_context_q_len_override (%d) must be >= computed max context q length (%d).", override_value,
+                max_context_q_len_computed);
+            TORCH_CHECK(override_value >= max_past_kv_length_computed,
+                "max_context_q_len_override (%d) must be >= computed max past kv length (%d).", override_value,
+                max_past_kv_length_computed);
         }
+
+        int32_t const max_context_q_len = max_context_q_len_override.has_value()
+            ? static_cast<int32_t>(max_context_q_len_override.value())
+            : max_context_q_len_computed;
+        // Override the max_past_kv_length as well for encoder CUDA graph compatibility
+        int32_t const max_past_kv_length = max_context_q_len_override.has_value()
+            ? static_cast<int32_t>(max_context_q_len_override.value())
+            : max_past_kv_length_computed;
 
         // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
         // unless each layer has different attention window sizes.
@@ -902,18 +924,18 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> output_sf, std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length,
     torch::Tensor host_past_key_value_lengths, torch::Tensor host_total_kv_lens, torch::Tensor context_lengths,
     torch::Tensor host_context_lengths, torch::Tensor host_request_types,
-    std::optional<torch::Tensor> kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_pool_pointers,
-    std::optional<torch::Tensor> host_kv_cache_pool_mapping, std::optional<torch::Tensor> cache_indirection,
-    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
-    std::optional<torch::Tensor> out_scale, std::optional<torch::Tensor> rotary_inv_freq,
-    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
-    std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
-    std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const local_layer_idx, int64_t const num_heads,
-    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
-    int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode, double const q_scaling,
-    int64_t const position_embedding_type, int64_t const rope_dim, double const rope_base,
+    std::optional<int64_t> max_context_q_len_override, std::optional<torch::Tensor> kv_cache_block_offsets,
+    std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
+    std::optional<torch::Tensor> cache_indirection, std::optional<torch::Tensor> kv_scale_orig_quant,
+    std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> out_scale,
+    std::optional<torch::Tensor> rotary_inv_freq, std::optional<torch::Tensor> rotary_cos_sin,
+    std::optional<torch::Tensor> latent_cache, std::optional<torch::Tensor> q_pe,
+    std::optional<torch::Tensor> block_ids_per_seq, std::optional<torch::Tensor> attention_sinks,
+    bool const is_fused_qkv, bool const update_kv_cache, int64_t const predicted_tokens_per_seq,
+    int64_t const local_layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
+    int64_t const attention_window_size, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
+    double const q_scaling, int64_t const position_embedding_type, int64_t const rope_dim, double const rope_base,
     int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
     double const rope_long_m_scale, int64_t const rope_max_positions, int64_t const rope_original_max_positions,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
@@ -1208,9 +1230,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             /*num_seqs=*/num_contexts, token_offset,
             /*num_tokens=*/num_ctx_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv_or_q, k, v,
             sequence_length, host_past_key_value_lengths, ctx_total_kv_len, context_lengths, host_context_lengths,
-            kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
+            max_context_q_len_override, kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+            cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
+            latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
             helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
             spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
@@ -1230,9 +1252,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             /*num_seqs=*/num_generations, token_offset,
             /*num_tokens=*/num_gen_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv_or_q, k, v,
             sequence_length, host_past_key_value_lengths, gen_total_kv_len, context_lengths, host_context_lengths,
-            kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
+            max_context_q_len_override, kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+            cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
+            latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
             helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
             spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,

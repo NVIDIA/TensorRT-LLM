@@ -724,10 +724,7 @@ class ModelLoader:
                     checkpoint_dir=checkpoint_dir,
                     weights_preloaded=weights_preloaded)
 
-                for module in model.modules():
-                    if hasattr(module, 'post_load_weights') and not getattr(
-                            module, '_weights_removed', False):
-                        module.post_load_weights()
+                self._walk_full_post_load(model)
 
             # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
             # ``register_weight_slots_after_to_cuda`` and ``finalize_model``
@@ -750,10 +747,126 @@ class ModelLoader:
 
         return model, moe_load_balancer
 
+    @staticmethod
+    def _setup_aliases(model: DecoderModelForCausalLM) -> None:
+        """Run top-level structural alias setup if the model defines it.
+
+        Alias wiring is a model-level concern. It is intentionally not a
+        recursive module walk, because migrated aliases are expected to be set
+        by the root model that owns the layer graph.
+
+        Args:
+            model: Root decoder model whose top-level alias hook should run.
+
+        Returns:
+            None.
+        """
+        setup_aliases: Optional[Callable[[], None]] = getattr(
+            model, 'setup_aliases', None)
+        if setup_aliases is not None:
+            setup_aliases()
+
+    @staticmethod
+    def _walk_transform(model: DecoderModelForCausalLM) -> None:
+        """Run one-shot weight transforms on eligible modules.
+
+        The walk is duck-typed so modules can opt in without inheriting a shared
+        base class. Modules whose weights were removed are skipped, and modules
+        already marked ``_weights_transformed`` are left untouched until an
+        orchestrator resets the flag after rebinding fresh weight bytes.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            transform_weights: Optional[Callable[[], None]] = getattr(
+                module, 'transform_weights', None)
+            if transform_weights is not None and not getattr(
+                    module, '_weights_removed', False) and not getattr(
+                        module, '_weights_transformed', False):
+                transform_weights()
+
+    @staticmethod
+    def _walk_cache_state(model: DecoderModelForCausalLM) -> None:
+        """Recompute derived Python-side state on eligible modules.
+
+        This walk is separate from weight transforms so callers that already
+        have transformed weight bytes can refresh local Python state without
+        mutating tensor layouts again.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            cache_derived_state: Optional[Callable[[], None]] = getattr(
+                module, 'cache_derived_state', None)
+            if cache_derived_state is not None and not getattr(
+                    module, '_weights_removed', False):
+                cache_derived_state()
+
+    @staticmethod
+    def _walk_full_post_load(model: DecoderModelForCausalLM) -> None:
+        """Run the backward-compatible post-load hook on eligible modules.
+
+        This preserves the previous ``ModelLoader`` behavior for standard load
+        paths while staged-hook migration proceeds incrementally.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            post_load_weights: Optional[Callable[[], None]] = getattr(
+                module, 'post_load_weights', None)
+            if post_load_weights is not None and not getattr(
+                    module, '_weights_removed', False):
+                post_load_weights()
+
+    @staticmethod
+    def _reset_weights_transformed(model: DecoderModelForCausalLM) -> None:
+        """Mark transformed modules as needing a new transform pass.
+
+        Orchestrators call this before rebinding fresh, untransformed weights.
+        The reset only touches modules that already carry the flag so unrelated
+        modules do not grow staged-hook state eagerly.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            if hasattr(module, '_weights_transformed'):
+                module._weights_transformed = False
+
     def reload(self,
                model: DecoderModelForCausalLM,
                weights: dict,
-               allow_partial_loading: bool = False):
+               allow_partial_loading: bool = False) -> None:
+        """Reload model weights without running post-load hooks.
+
+        Reload is used by incremental update paths that may provide only a
+        partial set of replacement weights. The owner of the update lifecycle is
+        responsible for running post-load processing once all bytes are present.
+
+        Args:
+            model: Model instance receiving the replacement weights.
+            weights: Checkpoint weights to pass to ``model.load_weights``.
+            allow_partial_loading: Whether missing replacement weights are
+                allowed by models that support partial loading.
+
+        Returns:
+            None.
+        """
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot reload weights: weight_mapper was not initialized. "
@@ -871,6 +984,45 @@ class ModelLoader:
                 if hasattr(config.pretrained_config, sub_config):
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers_override
+
+        # Shared-weights vanilla MTP: build extra MTP layer instances beyond
+        # what the checkpoint provides (one ckpt MTP layer, multiple draft
+        # tokens, one KV cache per draft position) by sharing the single
+        # ckpt MTP layer's weights via mod-indexing in
+        # DeepseekV3WeightLoader. We expand
+        # pretrained_config.num_nextn_predict_layers to max_draft_len before
+        # model construction and preserve the original ckpt count as
+        # `_ckpt_num_nextn_predict_layers` for downstream mod-indexing.
+        #
+        # NOTE: this is a very special MTP mode that has not been used in
+        # any real-world workload to date; only DeepSeek has indicated they
+        # want to keep the path alive for their model. We therefore only
+        # support it on DeepSeek model_types for now. Other MTP-capable
+        # model families don't need this mode -- when their users request
+        # vanilla with max_draft_len > ckpt count, the natural
+        # `min(max_draft_len, ckpt_nextn)` clamp inside MTPForCausalLM
+        # silently caps the draft length to ckpt_nextn, which is the
+        # expected behavior for them.
+        _DEEPSEEK_MTP_MODEL_TYPES = {"deepseek_v3", "deepseek_v32"}
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+        spec_config = self.spec_config
+        if (isinstance(spec_config, MTPDecodingConfig)
+                and spec_config.use_mtp_vanilla
+                and spec_config.max_draft_len is not None
+                and getattr(config.pretrained_config, 'model_type',
+                            None) in _DEEPSEEK_MTP_MODEL_TYPES
+                and getattr(config.pretrained_config,
+                            'num_nextn_predict_layers', None)):
+            ckpt_nextn = config.pretrained_config.num_nextn_predict_layers
+            if spec_config.max_draft_len > ckpt_nextn:
+                config.pretrained_config._ckpt_num_nextn_predict_layers = ckpt_nextn
+                config.pretrained_config.num_nextn_predict_layers = \
+                    spec_config.max_draft_len
+                logger.warning(
+                    f"MTP vanilla: expanding num_nextn_predict_layers from "
+                    f"{ckpt_nextn} to {spec_config.max_draft_len} to match "
+                    f"max_draft_len. Extra MTP layer instances will share "
+                    f"checkpoint weights via mod-indexing.")
         return config
 
     def _call_load_weights(self,
