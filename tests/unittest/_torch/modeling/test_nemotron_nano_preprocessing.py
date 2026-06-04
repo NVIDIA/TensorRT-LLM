@@ -542,6 +542,87 @@ class TestNanoV2VLInputProcessor:
         embedding_lengths = extra["multimodal_data"]["multimodal_embedding_lengths"]
         assert embedding_lengths[image_slot] == actual_image_context
 
+    def test_expand_mixed_text_threads_precomputed_item_order(self):
+        """A passed `item_order` skips the redundant re-scan in the text expand.
+
+        `_process_mixed_modalities` already scans the post-hoist prompt once to
+        build `item_order`, then hands it to `_expand_mixed_prompt_text_for_mm`.
+        That callee used to unconditionally re-scan the identical text, a
+        deterministic duplicate. This asserts (a) the whole mixed path scans
+        exactly once, (b) the callee does NOT re-scan when `item_order` is
+        provided but DOES when it is omitted, and (c) both callee paths produce
+        byte-identical `input_ids` / `mm_data` updates.
+        """
+        proc = _make_audio_processor(max_model_len=1000, max_num_patches=512, min_num_patches=4)
+        img = Image.new("RGB", (320, 320))
+        audio = np.random.randn(16000).astype(np.float32)
+        mm_data = {"image": [img], "audio": [audio]}
+        prompt = f"{proc.img_context_token} then {AUDIO_PLACEHOLDER}"
+
+        real_scan = proc._get_mm_item_order_from_text
+
+        # (a) End-to-end: the full mixed path must scan the prompt order exactly
+        # once -- the duplicate inside the text expand is gone. Capture the
+        # reconciled per-item `num_mm_tokens` the real build feeds to the expand
+        # (the image slot is a deferred sentinel until image prep tiles it, so we
+        # cannot reconstruct it standalone) along with the resulting `input_ids`,
+        # then reuse them to drive the direct-call equivalence below. The
+        # token-id hooks are stubbed (the lightweight Mock config leaves them as
+        # non-integer Mocks); the real `compute_mm_embedding_lengths` runs AFTER
+        # the expand, so this does not touch the scan count under test.
+        captured = {}
+
+        def _spy_lengths(input_ids, num_mm_tokens, **kw):
+            # Only the reconciled per-item lengths are needed; the real
+            # embed-length computation is irrelevant here (and would choke on the
+            # lightweight Mock token-id config), so stub its return.
+            captured["num_mm_tokens"] = list(num_mm_tokens)
+            return []
+
+        with (
+            mock.patch.object(
+                proc, "_get_mm_item_order_from_text", side_effect=real_scan
+            ) as scan_spy,
+            mock.patch.object(proc, "get_mm_token_ids", return_value=None),
+            mock.patch.object(proc, "get_mm_special_token_ids", return_value=None),
+            mock.patch.object(proc, "get_vocab_size", return_value=1000),
+            mock.patch(
+                "tensorrt_llm._torch.models.modeling_nemotron_nano.compute_mm_embedding_lengths",
+                side_effect=_spy_lengths,
+            ),
+        ):
+            input_ids_e2e, _ = proc._process_mixed_modalities(prompt, mm_data)
+        assert scan_spy.call_count == 1
+
+        # Rebuild the inputs the text expand consumes, mirroring the process path
+        # (hoist, then order scan) and reusing the reconciled per-item token
+        # lengths the real build resolved.
+        hoisted_prompt, hoisted_mm_data = proc._hoist_video_embedded_audio(prompt, mm_data)
+        item_order = proc._get_mm_item_order_from_text(hoisted_prompt, hoisted_mm_data)
+        num_mm_tokens = captured["num_mm_tokens"]
+
+        # (b) Passing `item_order` must skip the scan entirely...
+        with mock.patch.object(
+            proc, "_get_mm_item_order_from_text", side_effect=real_scan
+        ) as scan_spy_threaded:
+            ids_threaded, updates_threaded = proc._expand_mixed_prompt_text_for_mm(
+                hoisted_prompt, num_mm_tokens, hoisted_mm_data, item_order=item_order
+            )
+        scan_spy_threaded.assert_not_called()
+
+        # ...while omitting it must fall back to a single re-scan.
+        with mock.patch.object(
+            proc, "_get_mm_item_order_from_text", side_effect=real_scan
+        ) as scan_spy_fallback:
+            ids_scanned, updates_scanned = proc._expand_mixed_prompt_text_for_mm(
+                hoisted_prompt, num_mm_tokens, hoisted_mm_data
+            )
+        assert scan_spy_fallback.call_count == 1
+
+        # (c) Both callee paths -- and the end-to-end build -- are identical.
+        assert ids_threaded == ids_scanned == input_ids_e2e
+        assert updates_threaded == updates_scanned
+
     def test_process_images_dynamic_mismatched_placeholders_raises(self):
         """Mismatch between <image> placeholders and image count should raise."""
         proc = _make_processor(max_num_patches=256, min_num_patches=4)

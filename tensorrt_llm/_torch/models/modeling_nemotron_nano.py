@@ -1729,9 +1729,16 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         text_prompt: str,
         num_mm_tokens_per_placeholder: List[int],
         mm_data: Dict[str, Any],
+        item_order: Optional[List[Tuple[str, int]]] = None,
     ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
-        """Expand mixed Nano placeholders from decoded text when token matching is insufficient."""
-        item_order = self._get_mm_item_order_from_text(text_prompt, mm_data)
+        """Expand mixed Nano placeholders from decoded text when token matching is insufficient.
+
+        Callers that already scanned the same `text_prompt` + `mm_data` may pass the
+        resulting `item_order` to skip a redundant deterministic re-scan; when omitted
+        it is derived here via `_get_mm_item_order_from_text`, preserving prior behavior.
+        """
+        if item_order is None:
+            item_order = self._get_mm_item_order_from_text(text_prompt, mm_data)
         if len(item_order) != len(num_mm_tokens_per_placeholder):
             raise ValueError(
                 f"Expected {len(item_order)} multimodal token length entries, "
@@ -2891,6 +2898,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             text_prompt,
             num_mm_tokens,
             mm_data,
+            item_order=item_order,
         )
         # Same modality can appear twice. Keep per-item embed lengths so chunks follow prompt order.
         multimodal_data["multimodal_embedding_lengths"] = compute_mm_embedding_lengths(
