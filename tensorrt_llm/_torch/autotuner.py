@@ -1468,8 +1468,7 @@ class AutoTuner:
         if dtype == torch.float4_e2m1fn_x2:
             return (torch.rand(shapes, device=device) * 10 - 5).to(
                 torch.uint8).view(dtype)
-        else:
-            return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
+        return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,
