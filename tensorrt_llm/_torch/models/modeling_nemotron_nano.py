@@ -473,20 +473,18 @@ def _nano_extract_items(
     # PER-ITEM: one ModalityItem per prompt-order slot, payload sliced per item.
     # Parse the two wire keys (`multimodal_item_order` +
     # `multimodal_embedding_lengths`) into one validated typed view at the point
-    # of use. `from_metadata` returns None when the order key is absent.
+    # of use. `from_metadata` returns None when the order key is absent, and its
+    # `MixedModalEncodeContext.__post_init__` owns the order/embedding_lengths
+    # length invariant, so no pre-guard is needed for the mismatch case. The
+    # None guard below stays: a present order key with absent lengths would
+    # otherwise reach `from_metadata` and raise an opaque TypeError when it
+    # iterates `None`.
     embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
     if embedding_lengths is None and "multimodal_item_order" in multimodal_data:
         raise KeyError(
             f"Nano multi-modality param {param_idx} is missing "
             "'multimodal_embedding_lengths'; the per-item extractor needs the "
             "per-slot row counts."
-        )
-    item_order = multimodal_data.get("multimodal_item_order")
-    if item_order is not None and len(item_order) != len(embedding_lengths):
-        raise ValueError(
-            "multimodal_item_order length "
-            f"({len(item_order)}) != multimodal_embedding_lengths length "
-            f"({len(embedding_lengths)})"
         )
     ctx = MixedModalEncodeContext.from_metadata(multimodal_data, embedding_lengths)
     if ctx is None:

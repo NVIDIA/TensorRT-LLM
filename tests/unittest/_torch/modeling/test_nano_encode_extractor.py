@@ -280,14 +280,17 @@ class TestNanoExtractMultiModalityPerItem:
             list(_nano_extract_items(0, param, slice_payload=_StubSlicer()))
 
     def test_multi_modality_embedding_lengths_mismatch_raises(self):
-        # item_order length must match multimodal_embedding_lengths length.
+        # item_order length must match multimodal_embedding_lengths length. The
+        # invariant is owned by MixedModalEncodeContext.__post_init__, which
+        # raises with an "embedding_lengths length" message; the extractor no
+        # longer pre-guards it.
         order = [("image", 0), ("video", 0), ("image", 1)]
         param = _multi_modality_param(
             order,
             embedding_lengths=[5, 8],  # one short
             payloads={"image": {"pixel_values": "i"}, "video": {"pixel_values": "v"}},
         )
-        with pytest.raises(ValueError, match="multimodal_embedding_lengths"):
+        with pytest.raises(ValueError, match="embedding_lengths length"):
             list(_nano_extract_items(0, param, slice_payload=_StubSlicer()))
 
     def test_multi_modality_requires_encode_context(self):
