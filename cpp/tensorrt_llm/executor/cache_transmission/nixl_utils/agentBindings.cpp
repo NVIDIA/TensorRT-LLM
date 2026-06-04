@@ -230,7 +230,7 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             "submit_transfer_requests",
             [](kvc::BaseTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership)
+            nb::arg("request"), nb::rv_policy::take_ownership, nb::keep_alive<0, 1>())
         .def(
             "notify_sync_message", &kvc::BaseTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
         .def("get_notified_sync_messages", &kvc::BaseTransferAgent::getNotifiedSyncMessages)
@@ -263,7 +263,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             "submit_transfer_requests",
             [](kvc::NixlTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>(),
+            nb::keep_alive<0, 1>())
         .def(
             "notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
         .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages)

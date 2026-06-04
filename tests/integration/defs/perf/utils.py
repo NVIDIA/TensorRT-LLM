@@ -278,8 +278,9 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 else:
                     cmd = prepare_cmd
                     dataset_file = None
-                output += subprocess.check_output(cmd.split(),
-                                                  env=envs).decode()
+                # Pipe stderr separately so subprocess tracebacks land in e.stderr (forwarded to Allure), not just the inherited console fd.
+                output += subprocess.check_output(
+                    cmd.split(), env=envs, stderr=subprocess.PIPE).decode()
                 if dataset_file:
                     with open(f"{dataset_file}", 'w+') as f:
                         f.write(output)
@@ -421,8 +422,9 @@ class PerfServeScriptTestCmds:
                 else:
                     cmd = sub_cmd
                     dataset_file = None
-                output += subprocess.check_output(cmd.split(),
-                                                  env=envs).decode()
+                # Pipe stderr separately so subprocess tracebacks land in e.stderr (forwarded to Allure), not just the inherited console fd.
+                output += subprocess.check_output(
+                    cmd.split(), env=envs, stderr=subprocess.PIPE).decode()
                 if dataset_file:
                     with open(f"{dataset_file}", 'w+') as f:
                         f.write(output)

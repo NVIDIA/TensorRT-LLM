@@ -11,10 +11,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaCacheManager,
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
+    _get_mamba_hybrid_pool_size,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -25,9 +27,9 @@ from tensorrt_llm.mapping import Mapping
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _make_mgr(max_batch_size=4, max_draft_len=2):
-    # +1 headroom matches MixedMambaHybridCacheManager.pool_size.
-    pool = max_batch_size + 1
+def _make_mgr(max_batch_size=4, max_draft_len=2, enable_attention_dp=False):
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=enable_attention_dp)
+    pool = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
     return PythonMambaCacheManager(
         d_state=8,
         d_conv=4,
@@ -37,7 +39,7 @@ def _make_mgr(max_batch_size=4, max_draft_len=2):
         num_layers=2,
         max_batch_size=pool,
         spec_state_size=max_batch_size,
-        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        mapping=mapping,
         dtype=torch.float16,
         ssm_cache_dtype=torch.float16,
         speculative_num_draft_tokens=max_draft_len,
@@ -113,6 +115,21 @@ def test_padding_slot_is_permanent():
         assert shared not in mgr.mamba_cache_free_blocks
 
     assert mgr._padding_slot == shared
+
+
+@skip_no_cuda
+def test_attention_dp_dummy_has_reserved_slot_with_batch_size_one():
+    mgr = _make_mgr(max_batch_size=1, max_draft_len=0, enable_attention_dp=True)
+    mgr._prepare_mamba_cache_blocks([100])
+
+    mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID])
+
+    assert mgr.mamba_cache_free_blocks == []
+    assert mgr.mamba_cache_index[100] != mgr._attention_dp_dummy_slot
+    assert mgr.mamba_cache_index[ATTENTION_DP_DUMMY_REQUEST_ID] == mgr._attention_dp_dummy_slot
+
+    mgr.free_resources(SimpleNamespace(py_request_id=ATTENTION_DP_DUMMY_REQUEST_ID))
+    assert mgr._attention_dp_dummy_slot not in mgr.mamba_cache_free_blocks
 
 
 @skip_no_cuda

@@ -1,5 +1,6 @@
 from .create_moe import create_moe, get_moe_cls
 from .fused_moe_cute_dsl import CuteDslFusedMoE
+from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -26,6 +27,7 @@ __all__ = [
     "BaseMoeRoutingMethod",
     "create_load_balanced_logits",
     "create_moe",
+    "CuteDslB12xFusedMoE",
     "CuteDslFusedMoE",
     "CutlassFusedMoE",
     "DeepSeekV3MoeRoutingMethod",

@@ -496,18 +496,26 @@ def load_pretrained_config(model_name_or_path: str,
             # needed — model_config.rope_theta (if any) is already canonical.
             rope_theta = rope_scaling.get("rope_theta")
             if rope_theta is not None:
-                existing = getattr(model_config, "rope_theta", None)
-                if existing is None:
-                    model_config.rope_theta = rope_theta
-                elif existing != rope_theta:
-                    # Both values are set but disagree. Keep the top-level value
-                    # (canonical in transformers 4.x and 5.x), but warn loudly
-                    # so that any future transformers upgrade that breaks this
-                    # invariant is easy to spot.
+                # `rope_scaling.rope_theta` mirrors `rope_parameters.rope_theta`
+                # and is the canonical value in transformers 5.x. Adopt it as
+                # `model_config.rope_theta` so downstream code can read it.
+                # Note: `model_config.rope_theta` may be absent entirely
+                # (transformers 5.x dropped it from some configs) or may be a
+                # config-class default that does NOT reflect the user's
+                # config.json (e.g. DeepseekV3Config default 10000 vs. user's
+                # 1000000 — the original bug).
+                user_top_level = config_dict.get("rope_theta")
+                if user_top_level is not None and user_top_level != rope_theta:
+                    # User explicitly set both top-level rope_theta and
+                    # rope_parameters.rope_theta to disagreeing values — keep
+                    # the top-level value but warn loudly.
                     logger.warning(
                         f"rope_scaling.rope_theta ({rope_theta}) differs from "
-                        f"model_config.rope_theta ({existing}); keeping the "
+                        f"config rope_theta ({user_top_level}); keeping the "
                         f"top-level value.")
+                    model_config.rope_theta = user_top_level
+                else:
+                    model_config.rope_theta = rope_theta
             model_config.rope_scaling = None
 
     return model_config

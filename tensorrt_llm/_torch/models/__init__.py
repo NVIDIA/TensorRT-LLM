@@ -46,6 +46,8 @@ from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_starcoder2 import Starcoder2ForCausalLM
+from .modeling_step3p7 import Step3p7ForCausalLM
+from .modeling_step3p7vl import Step3p7VLForConditionalGeneration
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
@@ -98,6 +100,8 @@ __all__ = [
     "Qwen3VLModel",
     "MiniMaxM2ForCausalLM",
     "Cohere2ForCausalLM",
+    "Step3p7ForCausalLM",
+    "Step3p7VLForConditionalGeneration",
 ]
 
 if transformers.__version__ >= "4.45.1":
