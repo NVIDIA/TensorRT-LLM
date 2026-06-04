@@ -314,6 +314,13 @@ class TestParallelConfigValidation:
         with pytest.raises(ValidationError):
             ParallelConfig(parallel_vae_size=0)
 
+    def test_attn2d_and_ulysses_seq_parallel_size(self):
+        pc = ParallelConfig(
+            attn2d_size=(2, 2),
+            ulysses_size=2,
+        )
+        assert pc.seq_parallel_size == 8
+
 
 class TestVisualGenArgsPickle:
     """VisualGenArgs must survive pickle round-trip (mp.Process spawn)."""

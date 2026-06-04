@@ -254,6 +254,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         };
         auto bufferEleSizes = getBufferSizeForTarget();
         auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        BufferIndexHolder sendHolder(
+            *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false);
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -380,7 +382,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             sendBufferFun(deviceId, pickUpConnections[0]);
         }
-        mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
+        sendHolder.release();
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);
@@ -459,6 +461,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         int deviceId = bufferManager.getStream().getDevice();
 
         std::optional<int> cacheBufferId = std::nullopt;
+        BufferIndexHolder recvHolder;
 
         if (common::getEnvTryZCopyForKVCacheTransfer()
             && destConfig.getParallelConfig().mPipelineParallelism
@@ -495,6 +498,8 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             {
                 cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecv();
             }
+            recvHolder
+                = BufferIndexHolder(*mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
 
             auto targetNum = pickUpConnections.size();
 
@@ -642,10 +647,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             bufferManager.getStream().synchronize();
         }
 
-        if (cacheBufferId.has_value())
-        {
-            mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForRecv(cacheBufferId);
-        }
+        recvHolder.release();
     }
     session.setTime(TransferSession::kTimePostprocess);
 

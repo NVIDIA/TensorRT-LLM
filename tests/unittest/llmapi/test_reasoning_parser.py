@@ -18,7 +18,8 @@ import os
 
 import pytest
 
-from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
+from tensorrt_llm.llmapi.reasoning_parser import (NemotronV3ReasoningParser,
+                                                  ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 
 R1_START, R1_END = "<think>", "</think>"
@@ -653,6 +654,25 @@ def test_auto_detect_laguna(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "laguna"
+
+
+@pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
+def test_auto_detect_nemotron_h(tmp_path, model_type):
+    """Nemotron-H models → 'nemotron-v3' parser (preferred over 'nano-v3')."""
+    model_dir = str(tmp_path / model_type)
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "nemotron-v3"
+
+
+def test_nemotron_v3_alias_same_parser():
+    """'nemotron-v3' and the legacy 'nano-v3' resolve to the same parser."""
+    nemotron = ReasoningParserFactory.create_reasoning_parser("nemotron-v3")
+    nano = ReasoningParserFactory.create_reasoning_parser("nano-v3")
+    assert isinstance(nemotron, NemotronV3ReasoningParser)
+    assert isinstance(nano, NemotronV3ReasoningParser)
 
 
 # ---------------------------------------------------------------------------
