@@ -1018,6 +1018,7 @@ def _handle_prefill_thop(
         context_lengths[:pf],  # context_lengths
         host_context_lengths[:pf],  # host_context_lengths
         host_request_types[:pf],  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets (device-filled)
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         planner.host_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1308,6 +1309,7 @@ def _handle_prefill_thop_cached_kv(
             context_lengths[:pf],
             host_context_lengths[:pf],
             host_request_types[:pf],
+            None,  # max_context_q_len_override
             kv_cache_block_offsets,
             host_kv_cache_pool_pointers,
             planner.host_pool_mapping,
@@ -1436,6 +1438,7 @@ def _handle_prefill_thop_cached_kv(
         context_lengths[:pf],
         host_context_lengths[:pf],
         host_request_types[:pf],
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
@@ -1694,6 +1697,7 @@ def _handle_decode_impl(
         context_lengths,  # context_lengths
         host_context_lengths,  # host_context_lengths
         host_request_types,  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping

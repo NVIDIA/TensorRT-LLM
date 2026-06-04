@@ -381,29 +381,39 @@ def update_spec_config_from_model_config(spec_config, model_config):
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
     if not isinstance(spec_config, MTPDecodingConfig):
         return
-    # Read num_nextn_predict_layers from the model's pretrained config.
-    # This determines the actual MTP layer count in the checkpoint and drives
-    # the spec_dec_mode decision (EAGLE vs vanilla MTP).
-    spec_config.num_nextn_predict_layers = model_config.num_nextn_predict_layers
-    # For vanilla MTP (>1 MTP layers in the checkpoint): set max_draft_len to the
-    # minimum of the user-requested value and the model's layer count.
-    # If the user explicitly requested fewer draft tokens than the model has layers,
-    # honour that and warn. Otherwise default to using all model layers.
-    if spec_config.spec_dec_mode.is_mtp_vanilla():
-        model_layers = spec_config.num_nextn_predict_layers
-        user_set = 'max_draft_len' in spec_config.model_fields_set
-        if user_set and spec_config.max_draft_len < model_layers:
-            logger.warning(
-                f"MTP: max_draft_len ({spec_config.max_draft_len}) is less than the model's "
-                f"num_nextn_predict_layers ({model_layers}). "
-                f"Using max_draft_len={spec_config.max_draft_len} draft tokens."
-            )
-            # Keep the user-set max_draft_len as-is
-        else:
-            spec_config.max_draft_len = model_layers
-        spec_config.max_total_draft_tokens = spec_config.max_draft_len
-    # For Eagle MTP (1 MTP layer): max_draft_len controls how many times the
-    # single layer is run. It was already set by the user (defaults to 1).
+    # Read the MTP layer count from the model's pretrained config. This
+    # determines the actual MTP layer count in the checkpoint and drives the
+    # spec_dec_mode decision (EAGLE vs vanilla MTP). Different checkpoints expose
+    # this under different names: DeepSeek-style configs use
+    # `num_nextn_predict_layers`, while Qwen3Next-style configs (including
+    # Qwen3.5) use `mtp_num_hidden_layers`. Fall back to a single shared MTP /
+    # EAGLE layer when neither field is present.
+    num_nextn_predict_layers = getattr(model_config, "num_nextn_predict_layers",
+                                       None)
+    if num_nextn_predict_layers is None:
+        num_nextn_predict_layers = getattr(model_config,
+                                           "mtp_num_hidden_layers", None)
+    if num_nextn_predict_layers is None:
+        num_nextn_predict_layers = 1
+    spec_config.num_nextn_predict_layers = num_nextn_predict_layers
+    is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
+
+    # Resolve max_draft_len when the user didn't set it:
+    #   vanilla MTP -> use all checkpoint MTP heads
+    #   MTP-Eagle   -> replay the single head once
+    if spec_config.max_draft_len is None:
+        spec_config.max_draft_len = (spec_config.num_nextn_predict_layers
+                                     if is_vanilla else 1)
+    elif is_vanilla and spec_config.max_draft_len != spec_config.num_nextn_predict_layers:
+        effective_draft_len = min(spec_config.max_draft_len,
+                                  spec_config.num_nextn_predict_layers)
+        logger.warning(
+            f"MTP: max_draft_len ({spec_config.max_draft_len}) does not match "
+            f"num_nextn_predict_layers ({spec_config.num_nextn_predict_layers}); "
+            f"using max_draft_len={effective_draft_len} draft tokens.")
+        spec_config.max_draft_len = effective_draft_len
+
+    spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
 
 @dataclass

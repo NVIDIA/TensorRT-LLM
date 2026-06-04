@@ -9,6 +9,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 from ...model_config import ModelConfig
+from ...peft.lora.validation import check_moe_lora_supported
 from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
@@ -185,7 +186,20 @@ def resolve_moe_cls(
     if (moe_cls == TRTLLMGenFusedMoE and not has_quant
             and not TRTLLMGenFusedMoE._supports_flashinfer_bf16_routing_method(
                 routing_method)):
-        return CutlassFusedMoE
+        moe_cls = CutlassFusedMoE
+
+    # Routed-expert LoRA is supported only on CutlassFusedMoE with unquantized
+    # base weights. Fail loudly here rather than at runtime if the user-selected
+    # backend cannot serve the LoRA request. Use the resolved class name, so a
+    # fallback to CutlassFusedMoE keeps LoRA supportable even when the user
+    # requested TRTLLM/CUTEDSL.
+    resolved_backend = "CUTLASS" if moe_cls is CutlassFusedMoE else model_config.moe_backend
+    check_moe_lora_supported(
+        moe_backend_name=resolved_backend,
+        lora_config=getattr(model_config, "lora_config", None),
+        quant_config=effective_quant_config,
+        layer_idx=layer_idx,
+    )
 
     return moe_cls
 

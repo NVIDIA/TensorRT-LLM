@@ -12,7 +12,6 @@ GPT2=$LLM_MODELS_ROOT/gpt2
 GPT2_MEDIUM=$LLM_MODELS_ROOT/gpt2-medium
 GPT2_NEXT_PTUNING=$LLM_MODELS_ROOT/email_composition
 OPT_125M=$LLM_MODELS_ROOT/opt-125m
-LLAMA=$LLM_MODELS_ROOT/llama-models/llama-7b-hf
 GPTJ=$LLM_MODELS_ROOT/gpt-j-6b
 MISTRAL=$LLM_MODELS_ROOT/mistral-7b-v0.1
 GPT_2B=$LLM_MODELS_ROOT/GPT-2B-001_bf16_tp1.nemo
@@ -85,27 +84,6 @@ if [ "$MODEL" = "opt" ]; then
 
 
     popd # examples/models/contrib/opt
-
-fi
-
-if [ "$MODEL" = "llama" ]; then
-
-    pushd examples/models/core/llama
-
-    install_requirements
-
-    echo "Convert LLaMA from HF"
-    python3 convert_checkpoint.py --dtype float16 --n_layer 2 --output_dir ./c-model/llama-7b/fp16
-
-    echo "Build LLaMA"
-    trtllm-build --model_config ./c-model/llama-7b/fp16/config.json  \
-        --context_fmha=enable \
-        --gpt_attention_plugin float16 \
-        --gemm_plugin float16 \
-        --max_batch_size 8 \
-        --output_dir llama_outputs
-
-    popd # examples/models/core/llama
 
 fi
 

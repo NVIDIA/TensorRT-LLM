@@ -17,14 +17,9 @@ Differences vs the Triton path are absorbed inside this wrapper:
     ``use_qk_l2norm_in_kernel`` parameter on ``flashinfer.chunk_gated_delta_rule``
     is currently a dead arg, see ``flashinfer/gdn_prefill.py:317-356``).
   * Pre-gather and post-scatter of indexed SSM state (FlashInfer requires
-    packed ``[num_seqs, H, D, D]`` fp32 initial/output state).
-  * State layout: TRT-LLM's Triton uses ``[N, H, K, V]`` ordering of the last
-    two dims; FlashInfer's prefill kernel uses ``[N, H, V, K]`` (per docstring
-    in ``flashinfer/gdn_prefill.py``: "The final state layout is ``[N, H, V, K]``";
-    confirmed by ``flashinfer/tests/gdn/test_prefill_delta_rule.py`` which
-    transposes the last two dims to compare with the reference implementation).
-    The wrapper transposes initial_state on the way in and output_state on the
-    way out so callers see TRT-LLM's ``[N, H, K, V]`` everywhere.
+    packed ``[num_seqs, H, V, K]`` fp32 initial/output state). TRT-LLM's GDN
+    state pool uses the same ``[N, H, V, K]`` logical layout, so the adapter
+    casts/gathers/scatters without transposing the last two dims.
 
 This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
@@ -35,8 +30,8 @@ from typing import Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.modules.fla.fused_state_io import (
-    gather_cast_transpose_kv_to_fp32_vk,
-    transpose_cast_scatter_fp32_vk_to_kv,
+    cast_scatter_fp32_vk_to_vk,
+    gather_cast_vk_to_fp32_vk,
 )
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 
@@ -107,12 +102,10 @@ def chunk_gated_delta_rule(
         q3 = l2norm_fwd(q3)
         k3 = l2norm_fwd(k3)
 
-    # --- Step 4: gather initial state and convert layout -----------------
-    # TRT-LLM stores SSM state with last two dims as (K, V); FlashInfer expects
-    # (V, K). Fuse gather + cast-to-fp32 + transpose + contiguous into a single
-    # Triton kernel so we get one HBM pass and one launch instead of three
-    # (``[indices]`` gather, ``.to(fp32)`` cast, ``.transpose.contiguous()`` copy).
-    gathered_init = gather_cast_transpose_kv_to_fp32_vk(initial_state, initial_state_indices)
+    # --- Step 4: gather initial state and cast dtype ---------------------
+    # TRT-LLM's GDN kernels and FlashInfer both use [N, H, V, K] state layout.
+    # Fuse gather + cast-to-fp32 + contiguous into a single Triton kernel.
+    gathered_init = gather_cast_vk_to_fp32_vk(initial_state, initial_state_indices)
 
     # --- Step 5+6: call FlashInfer with pre-allocated output/state buffers
     # FI 0.6.10 accepts `output=` / `output_state=`; pre-allocating skips its
@@ -160,26 +153,24 @@ def chunk_gated_delta_rule(
         )
         out_state = None
 
-    # --- Step 7: convert state layout back, scatter / return -----------
-    # Fuse transpose + cast (fp32 → initial_state.dtype) + optional indexed
-    # scatter into a single Triton pass, mirroring Step 4. The non-inplace
-    # branch allocates a fresh (K, V) buffer and writes every row; the inplace
-    # branch writes only the slots named by ``initial_state_indices`` and
-    # leaves the rest of ``initial_state`` untouched.
+    # --- Step 7: cast state back, scatter / return ---------------------
+    # Fuse cast (fp32 -> initial_state.dtype) + optional indexed scatter into a
+    # single Triton pass, mirroring Step 4. The inplace branch writes only the
+    # slots named by ``initial_state_indices`` and leaves the rest untouched.
     if inplace_indexed_state_update:
-        transpose_cast_scatter_fp32_vk_to_kv(out_state, initial_state, initial_state_indices)
+        cast_scatter_fp32_vk_to_vk(out_state, initial_state, initial_state_indices)
         final_to_return: Optional[torch.Tensor] = None
     elif output_final_state:
         num_seqs_out, num_h_out, v_out, k_out = out_state.shape
         final_to_return = torch.empty(
             num_seqs_out,
             num_h_out,
-            k_out,
             v_out,
+            k_out,
             dtype=initial_state.dtype,
             device=out_state.device,
         )
-        transpose_cast_scatter_fp32_vk_to_kv(out_state, final_to_return, None)
+        cast_scatter_fp32_vk_to_vk(out_state, final_to_return, None)
     else:
         final_to_return = None
 
