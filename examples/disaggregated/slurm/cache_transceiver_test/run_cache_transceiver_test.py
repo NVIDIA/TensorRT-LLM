@@ -45,6 +45,7 @@ from typing import List, Optional
 import torch
 import yaml
 from mpi4py import MPI
+from report import build_cases  # shared case enumeration (same dir on sys.path)
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -52,18 +53,12 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
-    create_kv_cache_transceiver
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
-                                                        LlmRequestState,
-                                                        LlmRequestType)
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             KVCacheManagerV2)
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
-
-from report import build_cases  # shared case enumeration (same dir on sys.path)
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -78,8 +73,17 @@ DTYPE_MAP = {"FP8": DataType.FP8, "HALF": DataType.HALF, "BF16": DataType.BF16}
 
 @dataclass
 class KvCacheConfigV2:
-    """KvCacheConfig wrapper for KVCacheManagerV2 (mirrors the single-process
-    reference test_cache_transceiver_single_process.py)."""
+    """KvCacheConfig wrapper for KVCacheManagerV2.
+
+    Mirrors the single-process reference test_cache_transceiver_single_process.py.
+    KVCacheManagerV2 reads these fields off the config object directly (no
+    pydantic defaults are filled in for a bare dataclass), so every attribute it
+    accesses MUST exist here -- a missing one surfaces as an AttributeError at
+    transceiver setup time (seen with kv_cache_event_hash_algo / pool_ratio).
+    Keep this in sync with the reference dataclass in
+    tests/unittest/disaggregated/test_cache_transceiver_single_process.py.
+    """
+
     max_tokens: Optional[int] = None
     enable_block_reuse: bool = False
     max_attention_window: Optional[List[int]] = None
@@ -90,10 +94,13 @@ class KvCacheConfigV2:
     cross_kv_cache_fraction: Optional[float] = None
     secondary_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
+    kv_cache_event_hash_algo: str = "auto"
     max_gpu_total_bytes: Optional[int] = None
     enable_partial_reuse: bool = False
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
+    pool_ratio: Optional[List[float]] = None
+    avg_seq_len: Optional[int] = None
     max_util_for_resume: float = 0.95
 
 
@@ -143,14 +150,18 @@ def build_kv_cache_manager(cfg_kv, mapping, use_v2):
     )
     if use_v2:
         return KVCacheManagerV2(
-            KvCacheConfigV2(max_tokens=max_tokens, enable_block_reuse=False,
-                            max_attention_window=[max_seq_len]),
+            KvCacheConfigV2(
+                max_tokens=max_tokens, enable_block_reuse=False, max_attention_window=[max_seq_len]
+            ),
             CacheTypeCpp.SELF,
             vocab_size=cfg_kv.get("vocab_size", 32000),
-            **common)
+            **common,
+        )
     return KVCacheManager(
         trtllm.KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
-        CacheTypeCpp.SELF, **common)
+        CacheTypeCpp.SELF,
+        **common,
+    )
 
 
 def add_sequence(mgr, req, prompt_len, use_v2):
@@ -180,8 +191,10 @@ def free_sequence(mgr, req, kv_handle, use_v2):
 
 
 def _seeded_like(view, seed):
-    """Deterministic CPU-generated tensor matching view's shape/dtype, then cast.
-    Generated on CPU so it is bit-identical across nodes/GPUs."""
+    """Deterministic CPU-generated tensor matching view's shape/dtype.
+
+    Generated on CPU so it is bit-identical across nodes/GPUs.
+    """
     g = torch.Generator(device="cpu").manual_seed(int(seed))
     rnd = torch.rand(view.shape, dtype=torch.float32, generator=g)
     return rnd.to(view.dtype)
@@ -191,7 +204,8 @@ def _request_block_views(mgr, rid, n_local_layers):
     """Yield (layer, buffer, valid_block_indices) for the request, per local layer.
 
     get_buffers() returns an aliasing view of the real KV pool (works for both V1
-    and V2), so writes persist and reads see transferred data."""
+    and V2), so writes persist and reads see transferred data.
+    """
     for layer in range(n_local_layers):
         blocks = mgr.get_batch_cache_indices([rid], layer)[0]
         valid = [b for b in blocks if b >= 0]
@@ -228,24 +242,20 @@ def make_request(is_ctx, rid, req_len, runtime, ctx_params=None):
         request_id=rid,
         max_new_tokens=1,
         input_tokens=list(range(req_len)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling._get_sampling_config()),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(sampling._get_sampling_config()),
         is_streaming=False,
     )
     if is_ctx:
-        req = LlmRequest(
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
-            **common)
+        req = LlmRequest(llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY, **common)
         if runtime == "PYTHON":
             req.py_disaggregated_params = DisaggregatedParams(
-                request_type="context_only", disagg_request_id=rid)
+                request_type="context_only", disagg_request_id=rid
+            )
         return req
 
     # gen side
     if runtime == "PYTHON":
-        req = LlmRequest(
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-            **common)
+        req = LlmRequest(llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY, **common)
         req.py_disaggregated_params = DisaggregatedParams(
             request_type="generation_only",
             disagg_request_id=rid,
@@ -253,12 +263,14 @@ def make_request(is_ctx, rid, req_len, runtime, ctx_params=None):
             ctx_dp_rank=ctx_params.ctx_dp_rank,
             ctx_info_endpoint=ctx_params.disagg_info_endpoint,
             first_gen_tokens=ctx_params.first_gen_tokens,
-            draft_tokens=ctx_params.draft_tokens)
+            draft_tokens=ctx_params.draft_tokens,
+        )
     else:  # C++ transceiver: carry the ctx context phase params directly
         req = LlmRequest(
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
             context_phase_params=ctx_params,
-            **common)
+            **common,
+        )
     return req
 
 
@@ -266,8 +278,41 @@ class _TransferError(Exception):
     pass
 
 
-def run_one_request(role, comm, kvm, xcvr, runtime, use_v2, n_local_layers,
-                    rid, req_len, rank, zmq_sock):
+def _wait_gen_complete(xcvr, req, runtime):
+    """Block until this gen request's receive finishes (or errors).
+
+    Block-all is the only safe wait here: returning while the receive is still
+    in flight frees the request mid-transfer (gen hang + the ctx sender
+    asserting on a freed session). How block-all is expressed depends on the
+    transceiver:
+
+    * PYTHON transceiver: check_gen_transfer_status(None) -> block_all.
+    * C++ transceiver: the bound check_gen_transfer_status takes an int and
+      returns as soon as >= N receives are *ready*; on a cold-start/slow link
+      that can be BEFORE this request's transfer completes (some wheel builds
+      also reject None outright with a TypeError). So poll the int API until the
+      request reaches a terminal state. The per-cell signal.alarm and the hang
+      detector bound this loop, so a genuinely stuck transfer is still caught.
+    """
+    if runtime == "PYTHON":
+        xcvr.check_gen_transfer_status(None)  # block_all
+        return
+    import time
+
+    terminal = (
+        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+        LlmRequestState.DISAGG_TRANS_ERROR,
+    )
+    while req.state not in terminal:
+        xcvr.check_gen_transfer_status(1)
+        if req.state in terminal:
+            break
+        time.sleep(0.001)
+
+
+def run_one_request(
+    role, comm, kvm, xcvr, runtime, use_v2, n_local_layers, rid, req_len, rank, zmq_sock
+):
     """Transfer one request and verify it (gen side).
 
     The per-request ZMQ handshake is lockstep-safe: the ctx leader ALWAYS sends
@@ -277,8 +322,8 @@ def run_one_request(role, comm, kvm, xcvr, runtime, use_v2, n_local_layers,
     DISAGG_TRANS_ERROR) are raised so the caller records TRANSFER_ERROR.
     Returns the gen-side verification result (True/False), or None on ctx.
     """
-    is_ctx = (role == "ctx")
-    is_leader = (rank == 0)
+    is_ctx = role == "ctx"
+    is_leader = rank == 0
 
     if is_ctx:
         local_err = None
@@ -288,7 +333,8 @@ def run_one_request(role, comm, kvm, xcvr, runtime, use_v2, n_local_layers,
             kv_handle = add_sequence(kvm, req, req_len, use_v2)
             fill_request(kvm, req.py_request_id, rank, n_local_layers)
             tensorrt_llm.logger.info(
-                f"[ctx r{rank}] rid={rid} len={req_len}: transfer START (send)")
+                f"[ctx r{rank}] rid={rid} len={req_len}: transfer START (send)"
+            )
             xcvr.respond_and_send_async(req)
         except Exception as e:  # noqa: BLE001 - relay failure to gen, then raise
             local_err = e
@@ -311,13 +357,15 @@ def run_one_request(role, comm, kvm, xcvr, runtime, use_v2, n_local_layers,
                     free_sequence(kvm, req, kv_handle, use_v2)
                 except Exception:  # noqa: BLE001
                     pass
-            raise local_err if local_err is not None else \
-                _TransferError("peer ctx rank failed")
-        # Python blocks only with count None (block_all); C++ blocks with 1.
-        xcvr.check_context_transfer_status(None if runtime == "PYTHON" else 1)
+            raise local_err if local_err is not None else _TransferError("peer ctx rank failed")
+        # Always block_all (None): with a request count, C++ only waits up to
+        # kv_transfer_sender_future_timeout_ms (1000ms) and returns even if the
+        # transfer is still in progress. NIXL/UCX cold-start connection setup can
+        # exceed that, so the harness would free the request mid-transfer, leaving
+        # the gen side hung and the ctx sender thread asserting on a freed session.
+        xcvr.check_context_transfer_status(None)
         state = req.state
-        tensorrt_llm.logger.info(
-            f"[ctx r{rank}] rid={rid}: transfer DONE (send), state={state}")
+        tensorrt_llm.logger.info(f"[ctx r{rank}] rid={rid}: transfer DONE (send), state={state}")
         free_sequence(kvm, req, kv_handle, use_v2)
         if state == LlmRequestState.DISAGG_TRANS_ERROR:
             raise _TransferError("ctx transfer reported DISAGG_TRANS_ERROR")
@@ -339,8 +387,7 @@ def run_one_request(role, comm, kvm, xcvr, runtime, use_v2, n_local_layers,
     try:
         req = make_request(False, rid, req_len, runtime, ctx_params=ctx_params)
         kv_handle = add_sequence(kvm, req, req_len, use_v2)
-        tensorrt_llm.logger.info(
-            f"[gen r{rank}] rid={rid} len={req_len}: transfer START (recv)")
+        tensorrt_llm.logger.info(f"[gen r{rank}] rid={rid} len={req_len}: transfer START (recv)")
         xcvr.request_and_receive_async(req)
     except Exception as e:  # noqa: BLE001
         local_err = e
@@ -352,18 +399,22 @@ def run_one_request(role, comm, kvm, xcvr, runtime, use_v2, n_local_layers,
                 free_sequence(kvm, req, kv_handle, use_v2)
             except Exception:  # noqa: BLE001
                 pass
-        raise local_err if local_err is not None else \
-            _TransferError("peer gen rank failed")
-    xcvr.check_gen_transfer_status(None if runtime == "PYTHON" else 1)
+        raise local_err if local_err is not None else _TransferError("peer gen rank failed")
+    # Block until the receive actually completes (mirrors the ctx side) instead
+    # of returning on the sender timeout. See _wait_gen_complete for why the C++
+    # path polls an int rather than passing None.
+    _wait_gen_complete(xcvr, req, runtime)
     # The receive may land on a side CUDA stream; sync before reading.
     torch.cuda.synchronize()
 
     state = req.state
-    ok = (state != LlmRequestState.DISAGG_TRANS_ERROR
-          and verify_request(kvm, req.py_request_id, rank, n_local_layers))
+    ok = state != LlmRequestState.DISAGG_TRANS_ERROR and verify_request(
+        kvm, req.py_request_id, rank, n_local_layers
+    )
     tensorrt_llm.logger.info(
         f"[gen r{rank}] rid={rid}: transfer DONE (recv), state={state}, "
-        f"verify={'PASS' if ok else 'FAIL'}")
+        f"verify={'PASS' if ok else 'FAIL'}"
+    )
     free_sequence(kvm, req, kv_handle, use_v2)
     if state == LlmRequestState.DISAGG_TRANS_ERROR:
         raise _TransferError("gen transfer reported DISAGG_TRANS_ERROR")
@@ -371,16 +422,18 @@ def run_one_request(role, comm, kvm, xcvr, runtime, use_v2, n_local_layers,
 
 
 def _preserve_cpp_csvs(csv_dir, ci, rank):
-    """Rename THIS rank's C++ rank_<rank>_{send,recv}.csv before the next combination's
-    transceiver truncates them. TRTLLM_KVCACHE_TIME_OUTPUT_PATH is cached by C++
-    on first read, so every C++ transceiver instance writes the same filenames;
-    one transceiver serves all request lengths of a combination and appends a row per
-    request, so we move the whole combination's output aside (rid encodes req_len).
+    """Rename THIS rank's C++ CSV files before the next combination truncates them.
+
+    TRTLLM_KVCACHE_TIME_OUTPUT_PATH is cached by C++ on first read, so every C++
+    transceiver instance writes the same filenames; one transceiver serves all
+    request lengths of a combination and appends a row per request, so we move
+    the whole combination's output aside (rid encodes req_len).
 
     Each rank touches ONLY its own files: all ranks share `csv_dir`, so a glob
     over `rank_*` would race -- multiple ranks renaming the same file, leaving
     some with FileNotFoundError, crashing those ranks and deadlocking the rest on
-    the next case's collective KVCacheManager allreduce."""
+    the next case's collective KVCacheManager allreduce.
+    """
     for tag in ("send", "recv"):
         path = os.path.join(csv_dir, f"rank_{rank}_{tag}.csv")
         if os.path.exists(path):
@@ -392,7 +445,7 @@ def main():
     ap.add_argument("--role", required=True, choices=["ctx", "gen"])
     args = ap.parse_args()
     role = args.role
-    is_ctx = (role == "ctx")
+    is_ctx = role == "ctx"
 
     cfg_path = os.environ["CTT_CONFIG"]
     sweep = int(os.environ.get("CTT_SWEEP", "0"))
@@ -408,14 +461,15 @@ def main():
     n_cfg = int(cfg["hardware"]["gpus_per_node"])
     assert n == n_cfg, (
         f"MPI world size {n} != gpus_per_node {n_cfg}; each srun step must be "
-        f"its own MPI world of size N (see plan Risk #3).")
-    is_leader = (rank == 0)
+        f"its own MPI world of size N (see plan Risk #3)."
+    )
+    is_leader = rank == 0
     torch.cuda.set_device(rank % torch.cuda.device_count())
 
     tensorrt_llm.logger.set_level("info")
-    print(f"[sweep={sweep_name} {role} rank={rank}] "
-          f"UCX_TLS={os.getenv('UCX_TLS')} UCX_NET_DEVICES={os.getenv('UCX_NET_DEVICES')}",
-          flush=True)
+    ucx_env = {k: v for k, v in sorted(os.environ.items()) if k.startswith("UCX_")}
+    ucx_env_str = " ".join(f"{k}={v}" for k, v in ucx_env.items()) or "<none>"
+    print(f"[sweep={sweep_name} {role} rank={rank}] UCX env: {ucx_env_str}", flush=True)
 
     work_dir = cfg["environment"]["work_dir"]
     csv_dir = os.path.join(work_dir, "csv", str(sweep), role)
@@ -445,6 +499,7 @@ def main():
         import time
 
         import zmq
+
         nonlocal zmq_ctx
         if zmq_ctx is None:
             zmq_ctx = zmq.Context.instance()
@@ -489,8 +544,7 @@ def main():
 
     tp = cfg["parallel"][f"{role}_tp"]
     pp = cfg["parallel"][f"{role}_pp"]
-    mapping = Mapping(world_size=n, rank=rank, tp_size=tp, pp_size=pp,
-                      gpus_per_node=n)
+    mapping = Mapping(world_size=n, rank=rank, tp_size=tp, pp_size=pp, gpus_per_node=n)
     dist_obj = Distributed.get(mapping)
     pp_rank = rank // tp
     n_local_layers = local_layer_count(cfg["kv_cache"]["num_layers"], pp, pp_rank)
@@ -500,9 +554,17 @@ def main():
     def record(combination_idx, reqlen_idx, status, reason=""):
         if not is_leader:
             return
-        status_f.write(json.dumps({
-            "combination_idx": combination_idx, "reqlen_idx": reqlen_idx,
-            "status": status, "reason": reason}) + "\n")
+        status_f.write(
+            json.dumps(
+                {
+                    "combination_idx": combination_idx,
+                    "reqlen_idx": reqlen_idx,
+                    "status": status,
+                    "reason": reason,
+                }
+            )
+            + "\n"
+        )
         status_f.flush()
 
     timeout_s = cfg["run"]["timeout_per_cell_s"]
@@ -533,15 +595,17 @@ def main():
 
     def _on_hang():
         ci = hang_cell["ci"]
-        targets = (range(len(req_lens)) if hang_cell["li"] is None
-                   else [hang_cell["li"]])
+        targets = range(len(req_lens)) if hang_cell["li"] is None else [hang_cell["li"]]
         for li in targets:
-            record(ci, li, "TIMEOUT",
-                   f"hang detected during {hang_cell['what']} "
-                   f"(>{watchdog_deadline}s)")
+            record(
+                ci,
+                li,
+                "TIMEOUT",
+                f"hang detected during {hang_cell['what']} (>{watchdog_deadline}s)",
+            )
         sys.stderr.write(
-            f"[{role} rank={rank}] HANG KILL {hang_cell['what']} "
-            f"ci={ci} li={hang_cell['li']}\n")
+            f"[{role} rank={rank}] WATCHDOG_KILL {hang_cell['what']} ci={ci} li={hang_cell['li']}\n"
+        )
         sys.stderr.flush()
         os.kill(os.getpid(), signal.SIGKILL)
 
@@ -570,7 +634,8 @@ def main():
         cache_cfg = CacheTransceiverConfig(
             backend=backend,
             transceiver_runtime=(None if runtime == "CPP" else "PYTHON"),
-            max_tokens_in_buffer=cfg["kv_cache"]["max_tokens_in_buffer"])
+            max_tokens_in_buffer=cfg["kv_cache"]["max_tokens_in_buffer"],
+        )
 
         # Build the cache manager + transceiver ONCE per case (the manager is
         # sized for the largest request length and serves all of them).
@@ -581,22 +646,29 @@ def main():
             arm_watchdog(ci, None, f"setup {case['label']}")
             kvm = build_kv_cache_manager(cfg["kv_cache"], mapping, use_v2)
             xcvr = create_kv_cache_transceiver(
-                mapping, dist_obj, kvm, AttentionTypeCpp.DEFAULT, cache_cfg)
+                mapping, dist_obj, kvm, AttentionTypeCpp.DEFAULT, cache_cfg
+            )
             signal.alarm(0)
             cancel_watchdog()
         except Exception as e:  # noqa: BLE001 - setup failed for the whole case
             signal.alarm(0)
             cancel_watchdog()
             setup_err = e
-            print(f"[{role} rank={rank}] SETUP ERROR {case['label']}: {e!r}",
-                  file=sys.stderr, flush=True)
+            print(
+                f"[{role} rank={rank}] SETUP ERROR {case['label']}: {e!r}",
+                file=sys.stderr,
+                flush=True,
+            )
         # Instance-wide consensus: if ANY rank failed setup, every rank skips the
         # case together. Without this, a UCX init error on only some ranks/GPUs
         # would deadlock the instance's collectives (the real failure mode seen
         # with a bad UCX_TLS/UCX_NET_DEVICES on a subset of devices).
         if comm.allreduce(1 if setup_err is not None else 0, op=MPI.MAX):
-            reason = (f"setup failed: {setup_err!r}" if setup_err is not None
-                      else "setup failed on another rank in the instance")
+            reason = (
+                f"setup failed: {setup_err!r}"
+                if setup_err is not None
+                else "setup failed on another rank in the instance"
+            )
             for li in range(len(req_lens)):
                 record(ci, li, "TRANSFER_ERROR", reason)
             if xcvr is not None and hasattr(xcvr, "shutdown"):
@@ -616,9 +688,19 @@ def main():
                 all_ok = True
                 for r in range(warmup + num_req):
                     rid = make_rid(ci, li, r)
-                    ok = run_one_request(role, comm, kvm, xcvr, runtime, use_v2,
-                                         n_local_layers, rid, req_len, rank,
-                                         zmq_sock)
+                    ok = run_one_request(
+                        role,
+                        comm,
+                        kvm,
+                        xcvr,
+                        runtime,
+                        use_v2,
+                        n_local_layers,
+                        rid,
+                        req_len,
+                        rank,
+                        zmq_sock,
+                    )
                     if role == "gen" and r >= warmup and ok is False:
                         all_ok = False
                 signal.alarm(0)
@@ -628,8 +710,11 @@ def main():
                 signal.alarm(0)
                 cancel_watchdog()
                 record(ci, li, "TIMEOUT", f"exceeded {timeout_s}s")
-                print(f"[{role} rank={rank}] TIMEOUT {case['label']} req_len={req_len}",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"[{role} rank={rank}] TIMEOUT {case['label']} req_len={req_len}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 reset_sock()
                 # The native transfer may still be wedged; the watchdog thread
                 # (and launch.slurm's outer `timeout -k`) will hard-kill this
@@ -638,8 +723,11 @@ def main():
                 signal.alarm(0)
                 cancel_watchdog()
                 record(ci, li, "TRANSFER_ERROR", repr(e))
-                print(f"[{role} rank={rank}] ERROR {case['label']} req_len={req_len}: {e!r}",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"[{role} rank={rank}] ERROR {case['label']} req_len={req_len}: {e!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 # The lockstep handshake leaves the sockets clean after a
                 # local/transfer error, so no reset is needed here.
             comm.Barrier()

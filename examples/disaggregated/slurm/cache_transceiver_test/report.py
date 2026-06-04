@@ -42,11 +42,20 @@ import yaml
 RID_COMBINATION_STRIDE = 1_000_000
 RID_REQLEN_STRIDE = 10_000
 
-# Transport tokens we surface from UCX_PROTO_INFO=used, ranked most→least
+# Transport tokens we surface from UCX_PROTO_INFO=y, ranked most→least
 # interesting (network transports before intra-node fallbacks).
 TRANSPORT_TOKENS = [
-    "dc_mlx5", "rc_mlx5", "rc_verbs", "ud_mlx5", "ud_verbs", "srd", "gdr_copy",
-    "cuda_ipc", "cuda_copy", "tcp", "self"
+    "dc_mlx5",
+    "rc_mlx5",
+    "rc_verbs",
+    "ud_mlx5",
+    "ud_verbs",
+    "srd",
+    "gdr_copy",
+    "cuda_ipc",
+    "cuda_copy",
+    "tcp",
+    "self",
 ]
 
 
@@ -70,7 +79,8 @@ def build_cases(cfg):
 
     Shared with the driver so case indices (encoded in RequestID) agree. Each
     case is one (backend, runtime, cache_manager) tuple tested at every request
-    length."""
+    length.
+    """
     combinations = cfg["test_matrix"].get("combinations") or cfg["test_matrix"]["combos"]
     versions = cfg["test_matrix"].get("cache_manager_versions", ["V1"])
     cases = []
@@ -79,12 +89,14 @@ def build_cases(cfg):
             # The V2 cache manager only supports the Python cache transceiver.
             if ver == "V2" and combination["runtime"] == "CPP":
                 continue
-            cases.append({
-                "backend": combination["backend"],
-                "runtime": combination["runtime"],
-                "cache_manager": ver,
-                "label": f"{combination['backend']}/{combination['runtime']}/{ver}",
-            })
+            cases.append(
+                {
+                    "backend": combination["backend"],
+                    "runtime": combination["runtime"],
+                    "cache_manager": ver,
+                    "label": f"{combination['backend']}/{combination['runtime']}/{ver}",
+                }
+            )
     return cases
 
 
@@ -101,6 +113,22 @@ def emit_launch_vars(cfg):
     # 5 min). The per-cell watchdog (run_cache_transceiver_test.py) fires before
     # this to record TIMEOUT status; this is the final backstop.
     per_sweep_timeout = int(cfg["run"].get("max_sweep_s", 300))
+    # UCX_PROTO_INFO value that launch.slurm exports (UCX then prints protocol-
+    # selection info that report.py parses into selected_transport). Selected by
+    # run.capture_proto_info:
+    #   true  -> "used"  (default): compact, keeps the per-rank logs small. NOTE
+    #            on current UCX builds "used" prints little/nothing, so
+    #            selected_transport may be empty -- this is the low-noise default.
+    #   false -> "" (disabled, UCX_PROTO_INFO not exported).
+    #   <str> -> that literal value, e.g. "y" to emit the full per-size tables
+    #            (fills selected_transport, but is very verbose: ~50x log size).
+    cap = cfg["run"].get("capture_proto_info", True)
+    if cap is True:
+        proto_info_value = "used"
+    elif cap in (False, None, ""):
+        proto_info_value = ""
+    else:
+        proto_info_value = str(cap)
     out = {
         "N": n,
         "IMAGE": env["container_image"],
@@ -112,6 +140,7 @@ def emit_launch_vars(cfg):
         "CUDA_ARCH": env.get("cuda_architectures", ""),
         "NUM_SWEEPS": num_sweeps,
         "PER_SWEEP_TIMEOUT": per_sweep_timeout,
+        "PROTO_INFO_VALUE": proto_info_value,
     }
     for k, v in out.items():
         print(f"{k}={shlex.quote(str(v))}")
@@ -121,7 +150,27 @@ def emit_launch_vars(cfg):
 # Mode: emit-ucx-env
 # --------------------------------------------------------------------------- #
 def emit_ucx_env(cfg, sweep_idx):
-    sweep = cfg["ucx_env_sweep"][sweep_idx]
+    sweeps = cfg["ucx_env_sweep"]
+    sweep = sweeps[sweep_idx]
+    # Union of every env var ANY sweep sets, in first-seen order. We `unset`
+    # all of them before exporting this sweep's, so a variable set only by an
+    # earlier sweep (e.g. UCX_RNDV_FRAG_MEM_TYPES from "mem_type_host") cannot
+    # leak into a later sweep that does not set it. launch.slurm eval's this
+    # block twice -- in the batch shell (which then feeds `srun --export=ALL`)
+    # and inside the container prelude (after the image entrypoint/profile and
+    # ALL-propagation have run) -- so both leak paths are cleared each sweep.
+    # UCX_TLS is ALWAYS managed: a sweep that doesn't set it (including a sweep
+    # with no env at all) must still start from a clean UCX_TLS, so a value from
+    # an earlier sweep, the container profile, or the submitting shell can't leak
+    # in. It is unset here and only re-exported below if this sweep sets it.
+    managed = ["UCX_TLS"]
+    seen = {"UCX_TLS"}
+    for s in sweeps:
+        for k in s.get("env") or {}:
+            if k not in seen:
+                seen.add(k)
+                managed.append(k)
+    print(f"unset {' '.join(managed)}")
     # Always echo the sweep name so logs are easy to correlate.
     print(f"export CTT_SWEEP_NAME={shlex.quote(sweep.get('name', str(sweep_idx)))}")
     for k, v in (sweep.get("env") or {}).items():
@@ -154,8 +203,7 @@ def _parse_cpp_recv_csvs(csv_dir):
             header = next(reader, None)
             if not header:
                 continue
-            bw_cols = [i for i, name in enumerate(header)
-                       if name.strip() == "Bandwidth(Gbps)"]
+            bw_cols = [i for i, name in enumerate(header) if name.strip() == "Bandwidth(Gbps)"]
             rid_col = header.index("RequestID") if "RequestID" in header else 0
             for row in reader:
                 if not row or len(row) <= rid_col:
@@ -206,7 +254,7 @@ def _parse_python_csvs(csv_dir):
     return per_rid  # {rid: [per-rank GB/s]}
 
 
-# Transport in the last column of a UCX_PROTO_INFO=used table row, e.g.
+# Transport in the last column of a UCX_PROTO_INFO=y table row, e.g.
 #   "... | rendezvous zero-copy read from remote | cuda_ipc/cuda |"
 # Group 1 is the transport name, group 2 the memory/device suffix.
 _PROTO_LAST_COL = re.compile(r"\|\s*([a-z0-9_]+)(?:/([a-z0-9_]+))?\s*\|\s*$")
@@ -221,10 +269,12 @@ _CONTROL_OPS = ("tagged message", "active message")
 
 
 def _is_kv_data_header(line):
-    """True if this config header describes a GPU (cuda) bulk-data transfer --
-    the KV cache movement -- rather than control traffic. We attribute transport
+    """True if this config header describes a GPU (cuda) bulk-data transfer.
+
+    The KV cache movement -- rather than control traffic. We attribute transport
     only from such configs so an incidental cuda_ipc control row never masks the
-    real data path (e.g. a NIXL put that fell back to tcp 'software emulation')."""
+    real data path (e.g. a NIXL put that fell back to tcp 'software emulation').
+    """
     if "cuda" not in line:
         return False
     if any(c in line for c in _CONTROL_OPS):
@@ -233,15 +283,17 @@ def _is_kv_data_header(line):
 
 
 class _TransportAcc:
-    """Scans a UCX_PROTO_INFO=used table, tracking the current config header so
-    transport is taken from the GPU bulk-data (KV) configs. `kv` holds the
+    """Scans a UCX_PROTO_INFO=y table, tracking the current config header.
+
+    Transport is taken from the GPU bulk-data (KV) configs. `kv` holds the
     data-path transports; `any` is a fallback for cases that never reached a
-    data transfer (e.g. setup hang)."""
+    data transfer (e.g. setup hang).
+    """
 
     def __init__(self):
-        self.kv = set()         # transports on GPU bulk-data config rows
-        self.any = set()        # transport on any proto-table row (fallback)
-        self.sw_emul = False    # a KV data row used 'software emulation' (slow)
+        self.kv = set()  # transports on GPU bulk-data config rows
+        self.any = set()  # transport on any proto-table row (fallback)
+        self.sw_emul = False  # a KV data row used 'software emulation' (slow)
         self._in_kv = False
 
     def feed(self, line):
@@ -270,7 +322,7 @@ class _TransportAcc:
 def _parse_proto_info(log_glob):
     """Sweep-level transport(s) UCX selected for the KV transfer.
 
-    UCX_PROTO_INFO=used prints a protocol-selection table; the transport that
+    UCX_PROTO_INFO=y prints a protocol-selection table; the transport that
     carries each (operation, size-range) is the LAST '|'-delimited column
     (e.g. `cuda_ipc/cuda`, `rc_mlx5/cuda`, `tcp/eth0`). We parse that column
     instead of grepping token substrings anywhere in the log -- the latter also
@@ -279,7 +331,8 @@ def _parse_proto_info(log_glob):
     back to a substring scan only if no parseable table is present (older logs).
 
     This is sweep-granular; prefer `_parse_proto_info_by_case` when the per-case
-    CTT_CASE_BEGIN markers are present."""
+    CTT_CASE_BEGIN markers are present.
+    """
     acc = _TransportAcc()
     for path in glob.glob(log_glob):
         try:
@@ -307,11 +360,14 @@ def _parse_proto_info(log_glob):
 
 
 def _parse_proto_info_by_case(log_glob):
-    """Return {case_idx: [transports]} attributed per (sweep, combination) by splitting
-    each rank log on the driver's `[CTT_CASE_BEGIN] ci=N` markers. Transport is
-    constant across a case's request lengths (one transceiver per case), so this
-    is the right granularity. Returns {} if no markers are present (older logs),
-    so the caller can fall back to sweep-level `_parse_proto_info`."""
+    """Return {case_idx: [transports]} attributed per (sweep, combination).
+
+    Splits each rank log on the driver's `[CTT_CASE_BEGIN] ci=N` markers.
+    Transport is constant across a case's request lengths (one transceiver per
+    case), so this is the right granularity. Returns {} if no markers are
+    present (older logs), so the caller can fall back to sweep-level
+    `_parse_proto_info`.
+    """
     accs = {}  # ci -> _TransportAcc
     saw_marker = False
     for path in glob.glob(log_glob):
@@ -343,9 +399,11 @@ _UCX_TS = re.compile(r"^\s*\[(\d{6,}\.\d+)\]")
 
 
 def _case_start_times(log_glob):
-    """{ci: earliest transfer-START epoch} from the driver's per-request logs.
+    """Return {ci: earliest transfer-START epoch} from per-request logs.
+
     Used to attribute UCX proto configs to cases by time (robust to UCX's
-    buffered / out-of-order log writes, which break line-position attribution)."""
+    buffered / out-of-order log writes, which break line-position attribution).
+    """
     starts = {}
     for path in glob.glob(log_glob):
         try:
@@ -372,12 +430,15 @@ def _case_start_times(log_glob):
 
 
 def _parse_proto_info_by_case_ts(log_glob, case_starts):
-    """Return {ci: [transports]} attributing each KV-data proto config to the
-    case whose transfer window it falls in, matched by UCX timestamp vs per-case
-    start times. A config with timestamp T belongs to the latest case that had
-    started by T. Robust to UCX writing its (earlier-timestamped) proto table
-    out of order relative to the driver's CTT_CASE_BEGIN markers. Returns {} if
-    there are no driver start times (older logs without per-request logging)."""
+    """Return {ci: [transports]} by timestamp-correlating proto configs.
+
+    Attributes each KV-data proto config to the case whose transfer window it
+    falls in, matched by UCX timestamp vs per-case start times. A config with
+    timestamp T belongs to the latest case that had started by T. Robust to UCX
+    writing its (earlier-timestamped) proto table out of order relative to the
+    driver's CTT_CASE_BEGIN markers. Returns {} if there are no driver start
+    times (older logs without per-request logging).
+    """
     if not case_starts:
         return {}
     ordered = sorted(case_starts.items(), key=lambda kv: kv[1])  # (ci, start)
@@ -471,8 +532,7 @@ def aggregate(cfg, out_path):
         # the driver's per-request transfer windows (robust to UCX's buffered,
         # out-of-order log writes). Fall back to CTT_CASE_BEGIN line position,
         # then sweep-level, for logs lacking per-request timestamps.
-        per_case_transport = _parse_proto_info_by_case_ts(
-            log_glob, _case_start_times(log_glob))
+        per_case_transport = _parse_proto_info_by_case_ts(log_glob, _case_start_times(log_glob))
         if not per_case_transport:
             per_case_transport = _parse_proto_info_by_case(log_glob)
         sweep_transport = _parse_proto_info(log_glob)
@@ -487,8 +547,8 @@ def aggregate(cfg, out_path):
         # Each rid maps to a list of per-rank (per-GPU) GB/s; we collect them all
         # so the headline can be per-GPU median (not a sum across ranks, which
         # would overstate throughput when ranks finish at different times).
-        buckets = {}   # (ci, li) -> list[per-rank GB/s across all timed requests]
-        nranks = {}    # (ci, li) -> number of ranks (GPUs) observed
+        buckets = {}  # (ci, li) -> list[per-rank GB/s across all timed requests]
+        nranks = {}  # (ci, li) -> number of ranks (GPUs) observed
         for rid, vals in list(cpp_bw.items()) + list(py_bw.items()):
             ci, li, r = decode_rid(rid)
             if r < warmup:
@@ -507,28 +567,38 @@ def aggregate(cfg, out_path):
             detail = rec.get("reason", "") if rec else ""
             # Headline = per-GPU bandwidth (median across ranks & requests).
             per_gpu = round(statistics.median(bws), 2) if bws else None
-            combination_entries[case["label"]].append({
-                "sweep": sweep_name,
-                "UCX_TLS": ucx_env.get("UCX_TLS", ""),
-                "UCX_NET_DEVICES": ucx_env.get("UCX_NET_DEVICES", ""),
-                "selected_transport": ",".join(transport),
-                "status": status,
-                "per_gpu_BW_GBps": per_gpu,
-                # Nearest-rank p90 (>= median even for tiny sample counts).
-                "p90_BW_GBps": round(bws[max(0, math.ceil(0.9 * len(bws)) - 1)], 2) if bws else None,
-                # All GPUs combined, as per-GPU-median x #GPUs. Labeled so it is
-                # not mistaken for per-GPU; avoids summing unequal-duration rates.
-                "aggregate_BW_GBps": round(per_gpu * ng, 2) if per_gpu is not None else None,
-                "num_gpus": ng,
-                "num_samples": len(bws),
-                "error_detail": detail,
-            })
+            combination_entries[case["label"]].append(
+                {
+                    "sweep": sweep_name,
+                    # Full env set this sweep configured (every var, not just
+                    # UCX_TLS/UCX_NET_DEVICES), so the report shows exactly what was
+                    # tuned -- e.g. UCX_RNDV_FRAG_MEM_TYPES, UCX_RNDV_SCHEME.
+                    "env": dict(ucx_env),
+                    "selected_transport": ",".join(transport),
+                    "status": status,
+                    "per_gpu_BW_GBps": per_gpu,
+                    # Nearest-rank p90 (>= median even for tiny sample counts).
+                    "p90_BW_GBps": round(bws[max(0, math.ceil(0.9 * len(bws)) - 1)], 2)
+                    if bws
+                    else None,
+                    # All GPUs combined, as per-GPU-median x #GPUs. Labeled so it is
+                    # not mistaken for per-GPU; avoids summing unequal-duration rates.
+                    "aggregate_BW_GBps": round(per_gpu * ng, 2) if per_gpu is not None else None,
+                    "num_gpus": ng,
+                    "num_samples": len(bws),
+                    "error_detail": detail,
+                }
+            )
 
-    by_combination = [{"combination": case["label"], "sweeps": combination_entries[case["label"]]}
-                for case in cases]
+    by_combination = [
+        {"combination": case["label"], "sweeps": combination_entries[case["label"]]}
+        for case in cases
+    ]
     best = _rank_best_per_combination(by_combination)
-    results = {"req_len": rep_req_len,  # stats are for this (longest) length
-               "by_combination": by_combination}
+    results = {
+        "req_len": rep_req_len,  # stats are for this (longest) length
+        "by_combination": by_combination,
+    }
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     # The best-UCX-per-combination summary (the deliverable) goes to its own file,
@@ -543,8 +613,10 @@ def aggregate(cfg, out_path):
 
 
 def _rank_best_per_combination(by_combination):
-    """For each combination pick the sweep with the best per-GPU bandwidth (at the
-    representative/longest request length)."""
+    """Pick the sweep with the best per-GPU bandwidth for each combination.
+
+    Uses the representative/longest request length.
+    """
     out = []
     for c in by_combination:
         best = None
@@ -554,36 +626,66 @@ def _rank_best_per_combination(by_combination):
             if best is None or s["per_gpu_BW_GBps"] > best["per_gpu_BW_GBps"]:
                 best = s
         if best is not None:
-            out.append({"combination": c["combination"], "best_sweep": best["sweep"],
-                        "per_gpu_BW_GBps": best["per_gpu_BW_GBps"],
-                        "aggregate_BW_GBps": best["aggregate_BW_GBps"],
-                        "UCX_TLS": best["UCX_TLS"],
-                        "UCX_NET_DEVICES": best["UCX_NET_DEVICES"],
-                        "selected_transport": best["selected_transport"]})
+            out.append(
+                {
+                    "combination": c["combination"],
+                    "best_sweep": best["sweep"],
+                    "per_gpu_BW_GBps": best["per_gpu_BW_GBps"],
+                    "aggregate_BW_GBps": best["aggregate_BW_GBps"],
+                    "env": best["env"],
+                    "selected_transport": best["selected_transport"],
+                }
+            )
     return out
 
 
 def _print_table(by_combination, rep_req_len, best):
     print(f"\n=== KV cache transceiver results (per combination, req_len={rep_req_len}) ===")
-    print("# Bandwidth is PER-GPU, GB/s (bytes, /1e9): median across ranks & "
-          "requests at the longest request length. C++ Bandwidth(Gbps)/8; Python "
-          "throughput_mbs (MiB/s) x 1024^2 / 1e9. aggr = perGPU x nGPU (all GPUs "
-          "combined). transport = GPU<->GPU data path UCX selected.")
-    hdr = ["combination", "sweep", "transport", "perGPU_GB/s", "p90_GB/s", "aggr_GB/s",
-           "nGPU", "status"]
+    print(
+        "# Bandwidth is PER-GPU, GB/s (bytes, /1e9): median across ranks & "
+        "requests at the longest request length. C++ Bandwidth(Gbps)/8; Python "
+        "throughput_mbs (MiB/s) x 1024^2 / 1e9. aggr = perGPU x nGPU (all GPUs "
+        "combined). transport = GPU<->GPU data path UCX selected."
+    )
+    hdr = [
+        "combination",
+        "sweep",
+        "transport",
+        "perGPU_GB/s",
+        "p90_GB/s",
+        "aggr_GB/s",
+        "nGPU",
+        "status",
+    ]
     print("\t".join(hdr))
     for c in by_combination:
         for s in c["sweeps"]:
-            print("\t".join(str(x) for x in [
-                c["combination"], s["sweep"], s["selected_transport"],
-                s["per_gpu_BW_GBps"], s["p90_BW_GBps"], s["aggregate_BW_GBps"],
-                s["num_gpus"], s["status"]]))
-    print(f"\n=== Best UCX env set per combination by per-GPU bandwidth (req_len={rep_req_len}) ===")
+            print(
+                "\t".join(
+                    str(x)
+                    for x in [
+                        c["combination"],
+                        s["sweep"],
+                        s["selected_transport"],
+                        s["per_gpu_BW_GBps"],
+                        s["p90_BW_GBps"],
+                        s["aggregate_BW_GBps"],
+                        s["num_gpus"],
+                        s["status"],
+                    ]
+                )
+            )
+    print(
+        f"\n=== Best UCX env set per combination by per-GPU bandwidth (req_len={rep_req_len}) ==="
+    )
     for b in best:
-        print(f"  {b['combination']:18s} -> {b['best_sweep']:18s} "
-              f"{b['per_gpu_BW_GBps']:.2f} GB/s/GPU  "
-              f"[{b['selected_transport']}]  "
-              f"UCX_TLS={b['UCX_TLS']} UCX_NET_DEVICES={b['UCX_NET_DEVICES']}")
+        env_str = " ".join(f"{k}={v}" for k, v in (b.get("env") or {}).items()) or "(none)"
+        print(
+            f"  {b['combination']:18s} -> {b['best_sweep']:18s} "
+            f"{b['per_gpu_BW_GBps']:.2f} GB/s/GPU  "
+            f"[{b['selected_transport']}]  "
+            f"{env_str}"
+        )
     if not best:
         print("  (no successful transfers)")
 

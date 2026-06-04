@@ -86,8 +86,16 @@ for SWEEP_IDX in $(seq 0 $((NUM_SWEEPS - 1))); do
     # entrypoint/profile, which would override anything passed through
     # `srun --export`. So we (re-)export the sweep's UCX vars INSIDE the
     # container `bash -c`, after the profile has run, where they win.
-    PRELUDE="${UCX_ENV}
-export UCX_PROTO_INFO=used"
+    #
+    # UCX_PROTO_INFO makes UCX print protocol-selection info that report.py parses
+    # into selected_transport. PROTO_INFO_VALUE comes from run.capture_proto_info
+    # (default "used" = compact/quiet; "y" = full per-size tables, ~50x log size;
+    # empty = disabled). See report.emit_launch_vars.
+    PRELUDE="${UCX_ENV}"
+    if [ -n "${PROTO_INFO_VALUE}" ]; then
+        PRELUDE="${PRELUDE}
+export UCX_PROTO_INFO=${PROTO_INFO_VALUE}"
+    fi
 
     EXPORTS="ALL,CTX_NODE=${CTX_NODE},ZMQ_PORT=${ZMQ_PORT},CTT_CONFIG=${CONFIG},CTT_SWEEP=${SWEEP_IDX}"
 
