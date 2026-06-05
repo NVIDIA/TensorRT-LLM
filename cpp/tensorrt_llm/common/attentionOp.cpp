@@ -1584,8 +1584,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     // cross attn's seqlen info is from encoder input lengths, not decoder input lengths!
     // moreover, attn mask for cross attn should be set separately (see below)
     BuildDecoderInfoParams<T> decoder_params{};
+    int32_t const* precomputedCuQSeqlens = params.cu_q_seqlens;
+    int32_t const* precomputedCuKvSeqlens = params.cu_kv_seqlens != nullptr ? params.cu_kv_seqlens
+        : params.cu_q_seqlens != nullptr                                    ? params.cu_q_seqlens
+                                                                            : nullptr;
     decoder_params.seqQOffsets = workspaceViews.cuQSeqlens;
     decoder_params.seqKVOffsets = workspaceViews.cuKvSeqlens;
+    decoder_params.precomputedSeqQOffsets = precomputedCuQSeqlens;
+    decoder_params.precomputedSeqKVOffsets = precomputedCuKvSeqlens;
     decoder_params.seqCpPartialOffsets = workspaceViews.cuCpPartialSeqlens;
     decoder_params.cpSize = mCpSize;
     decoder_params.packedMaskRowOffsets = workspaceViews.cuMaskRows;
@@ -1629,10 +1635,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     invokeBuildDecoderInfo(decoder_params, stream);
     sync_check_cuda_error(stream);
 
-    int32_t const* contextCuQSeqlens = params.cu_q_seqlens != nullptr ? params.cu_q_seqlens : workspaceViews.cuQSeqlens;
-    int32_t const* contextCuKvSeqlens = params.cu_kv_seqlens != nullptr ? params.cu_kv_seqlens
-        : params.cu_q_seqlens != nullptr                                ? params.cu_q_seqlens
-                                                                        : workspaceViews.cuKvSeqlens;
+    int32_t const* contextCuQSeqlens
+        = precomputedCuQSeqlens != nullptr ? precomputedCuQSeqlens : workspaceViews.cuQSeqlens;
+    int32_t const* contextCuKvSeqlens
+        = precomputedCuKvSeqlens != nullptr ? precomputedCuKvSeqlens : workspaceViews.cuKvSeqlens;
 
     // In cross attention context phase, the attention mask should be a matrix of all ones.
     // Override the attention mask produced by invokeBuildDecoderInfo().
