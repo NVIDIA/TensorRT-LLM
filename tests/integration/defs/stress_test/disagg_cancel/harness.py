@@ -28,6 +28,7 @@ suite matures.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -587,6 +588,140 @@ def _fetch_kv_cache_utilization(
 
 
 # ---------------------------------------------------------------------------
+# Canary helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_canary_prompts(path: Path) -> list[dict[str, Any]]:
+    """Load and validate the canary prompts JSON.
+
+    Expected schema (produced by the Step 6 reference generator)::
+
+        {
+            "prompts": [
+                {
+                    "prompt": "<deterministic prompt text>",
+                    "reference_token_ids": [int, ...],  # greedy-decode reference
+                    "reference_text": "<optional detokenized text>",
+                },
+                ...,
+            ]
+        }
+
+    Args:
+        path: Path to ``stress_canary_prompts.json`` (resolved by the
+            caller relative to the marathon YAML directory).
+
+    Returns:
+        The list of prompt entries (``prompts``). Each entry is a dict
+        with at least a ``prompt`` key; ``reference_token_ids`` is
+        optional but required for token-equivalence checking.
+
+    Raises:
+        OSError: If the file cannot be opened.
+        ValueError: If the JSON is malformed, the top-level object is
+            not a mapping, ``prompts`` is missing/not a list, or any
+            entry lacks a string ``prompt``.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        try:
+            doc = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"canary prompts file {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or "prompts" not in doc:
+        raise ValueError(f"canary prompts file {path} must be an object with a 'prompts' list")
+    prompts = doc["prompts"]
+    if not isinstance(prompts, list):
+        raise ValueError(f"canary prompts file {path}: 'prompts' must be a list")
+    for i, entry in enumerate(prompts):
+        if not isinstance(entry, dict) or not isinstance(entry.get("prompt"), str):
+            raise ValueError(
+                f"canary prompts file {path}: prompts[{i}] must be an object with a string 'prompt'"
+            )
+    return prompts
+
+
+def _send_canary_request(
+    server_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    seed: int,
+    timeout_s: float,
+) -> tuple[Optional[list[int]], Optional[str], Optional[str]]:
+    """POST a greedy, deterministic completion to ``/v1/completions``.
+
+    Requests ``detokenize=False`` so the server returns generated
+    ``token_ids`` on ``choices[0]`` for token-equivalence checking
+    (see ``CompletionResponseChoice.token_ids`` in
+    ``tensorrt_llm/serve/openai_protocol.py``). Greedy determinism is
+    requested via ``temperature=0.0`` plus a fixed ``seed``.
+
+    All failures (HTTP error, connection refused, timeout, malformed
+    body) are folded into ``(None, None, error_string)`` rather than
+    raising — the canary thread records an error and continues; only
+    the log scanner is fail-fast.
+
+    Args:
+        server_url: Disagg server base URL, e.g. ``http://host:port``.
+        model: Model name for the OpenAI request envelope.
+        prompt: Prompt text to send.
+        max_tokens: Maximum generated tokens.
+        seed: Fixed seed for greedy determinism.
+        timeout_s: Per-request HTTP timeout in seconds.
+
+    Returns:
+        Tuple ``(token_ids, text, error)``. On success ``error`` is
+        ``None`` and ``token_ids`` carries the generated tokens
+        (``text`` may also be present); on failure ``token_ids`` and
+        ``text`` are ``None`` and ``error`` is a short reason string.
+    """
+    url = f"{server_url.rstrip('/')}/v1/completions"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "seed": seed,
+        "stream": False,
+        "detokenize": False,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        # HTTPError is a subclass of URLError — catch it first.
+        return None, None, f"http_error: {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, None, f"url_error: {exc.reason}"
+    except (TimeoutError, OSError) as exc:
+        return None, None, f"io_error: {exc}"
+    try:
+        obj = json.loads(body)
+        choice = obj["choices"][0]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        return None, None, f"parse_error: {exc}"
+    token_ids = choice.get("token_ids") if isinstance(choice, dict) else None
+    text = choice.get("text") if isinstance(choice, dict) else None
+    return token_ids, text, None
+
+
+def _tokens_equivalent(returned: Optional[list[int]], reference: Optional[list[int]]) -> bool:
+    """Return True iff ``returned`` exactly matches the ``reference`` token IDs.
+
+    A ``None`` on either side (no tokens returned, or no reference
+    recorded) is treated as not-equivalent.
+    """
+    if returned is None or reference is None:
+        return False
+    return list(returned) == list(reference)
+
+
+# ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
 
@@ -607,10 +742,12 @@ class DisaggCancellationStressHarness:
       wind down promptly.
 
     Thread-based composition (rather than asyncio) keeps the
-    subprocess-control injector, the file-tailing log scanner, and
-    the HTTP/Prometheus metrics scraper failure-isolated and debugged
-    independently. The load and canary threads each run their own
-    asyncio event loops internally for HTTP I/O.
+    subprocess-control injector, the file-tailing log scanner, the
+    HTTP/Prometheus metrics scraper, and the HTTP canary client
+    failure-isolated and debugged independently. The metrics and
+    canary threads use blocking ``urllib`` for their low-rate request
+    streams; the load thread runs its own asyncio event loop
+    internally (wrapping ``run_cancel_stress_test``).
     """
 
     def __init__(
@@ -621,6 +758,8 @@ class DisaggCancellationStressHarness:
         metrics_scrape_interval_s: float = 30.0,
         metrics_scrape_timeout_s: float = 5.0,
         injector_poll_interval_s: float = 1.0,
+        canary_request_timeout_s: float = 10.0,
+        canary_interval_s: Optional[float] = None,
     ) -> None:
         """Construct a marathon harness.
 
@@ -645,6 +784,15 @@ class DisaggCancellationStressHarness:
                 injector thread while waiting for the next scheduled
                 event. Tests pass a smaller value to keep wall-clock
                 latency bounded.
+            canary_request_timeout_s: Per-request HTTP timeout for a
+                canary completion. A slow/hung request is recorded as
+                an error rather than blocking the canary stream
+                indefinitely.
+            canary_interval_s: Optional override (seconds) for the gap
+                between consecutive canary requests. ``None`` (default)
+                derives the interval from ``canary.rate_per_min`` in
+                the YAML (``60 / rate_per_min``); tests pass a small
+                value to keep wall-clock latency bounded.
 
         Raises:
             ValueError: If the YAML is malformed or its
@@ -664,12 +812,21 @@ class DisaggCancellationStressHarness:
         self._metrics_scrape_interval_s: float = metrics_scrape_interval_s
         self._metrics_scrape_timeout_s: float = metrics_scrape_timeout_s
         self._injector_poll_interval_s: float = injector_poll_interval_s
+        self._canary_request_timeout_s: float = canary_request_timeout_s
+        self._canary_interval_s: Optional[float] = canary_interval_s
 
         # Cluster + worker tracking (populated by setup()).
         self._cluster: Any = None  # tuple returned by setup_disagg_cluster
         self._worker_specs: list[WorkerLaunchSpec] = []
         self._tracked_workers: list[_TrackedWorker] = []
         self._marathon_start_monotonic: float = 0.0
+
+        # Disagg-server front-end endpoint the canary client targets.
+        # Populated by setup() once setup_disagg_cluster returns (or by
+        # tests via bind_server_endpoint). None until then; the canary
+        # thread logs a warning and exits if it is still None.
+        self._server_url: Optional[str] = None
+        self._model_name: Optional[str] = None
 
         # Thread handles (populated by start()).
         self._load_thread: Optional[threading.Thread] = None
@@ -721,6 +878,22 @@ class DisaggCancellationStressHarness:
             for spec, wrapper in zip(gen_specs, gen_workers, strict=True)
         ]
         self._worker_specs = list(ctx_specs) + list(gen_specs)
+
+    def bind_server_endpoint(self, server_url: str, model_name: str) -> None:
+        """Register the disagg server front-end the canary client targets.
+
+        Called by ``setup()`` once ``setup_disagg_cluster`` returns the
+        server host/port. Until this is called, the canary thread logs
+        a warning and exits (the lifecycle smoke has no live server).
+
+        Args:
+            server_url: Base URL of the disagg server, e.g.
+                ``http://localhost:8000``.
+            model_name: Model name to put in the OpenAI request
+                envelope (the disagg server routes regardless).
+        """
+        self._server_url = server_url
+        self._model_name = model_name
 
     def start(self) -> None:
         """Spawn the five worker threads. Returns immediately.
@@ -896,13 +1069,105 @@ class DisaggCancellationStressHarness:
         self.stop_event.set()
 
     def _canary_thread_body(self) -> None:
-        """Send greedy-decode canaries, check token-equivalence.
+        """Send greedy-decode canaries and check token-equivalence.
 
-        Stub: no-op. Real implementation loads
-        ``stress_canary_prompts.json``, sends 5 reqs/min, asserts
-        token IDs match the recorded reference.
+        Loads ``canary.prompts_file`` (resolved relative to the
+        marathon YAML), then sends deterministic greedy completions to
+        the disagg server's ``/v1/completions`` at
+        ``canary.rate_per_min`` cadence (overridable via the
+        ``canary_interval_s`` ctor param for tests). Each response is
+        compared against the recorded ``reference_token_ids`` and a
+        per-request record is appended to ``self._canary_records``::
+
+            {timestamp, elapsed_s, prompt_index, success, token_equivalent, latency_s, error}
+
+        ``success`` is ``True`` when the HTTP request returned without
+        error. ``token_equivalent`` is ``True``/``False`` when a
+        reference is available and the check is enabled, else ``None``
+        (request failed, checking disabled, or no reference recorded).
+        Request failures are recorded — not fail-fast — because errors
+        during bursts / injections are expected; the end-of-marathon
+        gates (error rate, recovery time) are computed from these
+        records by the load thread / pytest assertion in a later step.
+
+        Exits when ``stop_event`` or ``failed_event`` is set, honoring
+        either signal between requests via ``stop_event.wait``. No-ops
+        with a warning if the server endpoint or prompts file is
+        absent (the lifecycle smoke before ``setup()`` is wired).
         """
-        logger.debug("[canary_thread] stub — exiting immediately")
+        canary_cfg = self.config.raw.get("canary") or {}
+        if not self._server_url:
+            logger.warning("[canary] no server endpoint bound (setup() not wired); exiting")
+            return
+        prompts_file = canary_cfg.get("prompts_file")
+        if not prompts_file:
+            logger.warning("[canary] no canary.prompts_file in config; exiting")
+            return
+        prompts_path = Path(prompts_file)
+        if not prompts_path.is_absolute():
+            prompts_path = self.yaml_path.parent / prompts_path
+        try:
+            prompts = _load_canary_prompts(prompts_path)
+        except (OSError, ValueError) as exc:
+            logger.warning("[canary] cannot load prompts %s: %s; exiting", prompts_path, exc)
+            return
+        if not prompts:
+            logger.warning("[canary] prompts file %s has no prompts; exiting", prompts_path)
+            return
+
+        rate_per_min = float(canary_cfg.get("rate_per_min", 5) or 5)
+        if self._canary_interval_s is not None:
+            interval_s = self._canary_interval_s
+        else:
+            interval_s = 60.0 / rate_per_min if rate_per_min > 0 else 12.0
+        max_tokens = int(canary_cfg.get("max_tokens", 128))
+        seed = int(canary_cfg.get("seed", 42))
+        check_token_equiv = bool(canary_cfg.get("check_token_equivalent", True))
+        model = self._model_name or "canary"
+
+        logger.info(
+            "[canary] %.1f req/min (interval %.2fs) over %d prompt(s) to %s",
+            rate_per_min,
+            interval_s,
+            len(prompts),
+            self._server_url,
+        )
+
+        idx = 0
+        while not self.stop_event.is_set() and not self.failed_event.is_set():
+            send_start = time.monotonic()
+            prompt_index = idx % len(prompts)
+            entry = prompts[prompt_index]
+            idx += 1
+            reference = entry.get("reference_token_ids")
+            token_ids, _text, err = _send_canary_request(
+                self._server_url,
+                model,
+                entry["prompt"],
+                max_tokens,
+                seed,
+                self._canary_request_timeout_s,
+            )
+            success = err is None
+            token_equivalent: Optional[bool] = None
+            if success and check_token_equiv and reference is not None:
+                token_equivalent = _tokens_equivalent(token_ids, reference)
+            self._canary_records.append(
+                {
+                    "timestamp": time.time(),
+                    "elapsed_s": time.monotonic() - self._marathon_start_monotonic,
+                    "prompt_index": prompt_index,
+                    "success": success,
+                    "token_equivalent": token_equivalent,
+                    "latency_s": time.monotonic() - send_start,
+                    "error": err,
+                }
+            )
+            remaining = interval_s - (time.monotonic() - send_start)
+            if remaining > 0.0:
+                self.stop_event.wait(timeout=remaining)
+
+        logger.debug("[canary] exiting; %d record(s)", len(self._canary_records))
 
     def _injector_thread_body(self) -> None:
         """Fire SIGSTOP / SIGCONT / SIGKILL+respawn on the configured schedule.
