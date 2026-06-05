@@ -61,7 +61,9 @@ def main():
     # LTX-2 requires pipeline_config.text_encoder_path for the Gemma3 text
     # encoder. The YAML path is preferred for production configs; the default
     # below keeps this script runnable as a minimal offline example.
-    extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else VisualGenArgs()
+    extra_args = (
+        VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else VisualGenArgs()
+    )
     text_encoder_path = args.text_encoder_path
     if text_encoder_path is None and not args.visual_gen_args:
         text_encoder_path = "google/gemma-3-12b-it"
