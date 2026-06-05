@@ -355,7 +355,7 @@ class Qwen3ForEmbedding(Qwen3ForCausalLM):
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
-    ):
+    ) -> dict[str, torch.Tensor]:
         hidden_states = self.model(
             attn_metadata=attn_metadata,
             input_ids=input_ids,

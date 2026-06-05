@@ -1603,25 +1603,42 @@ UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
 class EmbeddingRequest(OpenAIBaseModel):
     """OpenAI-compatible embedding request with optional normalization and dimension truncation."""
 
-    input: Union[str, List[str]]
-    model: str
-    encoding_format: Optional[str] = "base64"
-    dimensions: Optional[int] = None
-    normalize: bool = True
+    input: Union[str, List[str]] = Field(
+        description=
+        "Input text(s) to embed. Can be a single string or list of strings.")
+    model: str = Field(description="ID of the model to use.")
+    encoding_format: Literal["base64", "float"] = Field(
+        default="base64",
+        description=
+        "Format to return embeddings in. 'base64' for base64-encoded bytes or 'float' for arrays.",
+    )
+    dimensions: Optional[int] = Field(
+        default=None,
+        description=
+        "Optional number of dimensions to truncate embeddings to (MRL support).",
+    )
+    normalize: bool = Field(
+        default=True,
+        description="Whether to apply L2 normalization to embeddings.",
+    )
 
 
 class EmbeddingData(OpenAIBaseModel):
     """Single embedding result with index and vector (float list or base64-encoded)."""
 
-    object: str = "embedding"
-    index: int
-    embedding: Union[str, List[float]]
+    object: str = Field(default="embedding",
+                        description="Object type, always 'embedding'.")
+    index: int = Field(description="Index of the embedding in the request.")
+    embedding: Union[str, List[float]] = Field(
+        description=
+        "The embedding vector, as float array or base64-encoded string.", )
 
 
 class EmbeddingResponse(OpenAIBaseModel):
     """OpenAI-compatible embedding response containing a list of embeddings and token usage."""
 
-    object: str = "list"
-    data: List[EmbeddingData]
-    model: str
-    usage: UsageInfo
+    object: str = Field(default="list",
+                        description="Object type, always 'list'.")
+    data: List[EmbeddingData] = Field(description="List of embedding objects.")
+    model: str = Field(description="ID of the model used.")
+    usage: UsageInfo = Field(description="Token usage information.")
