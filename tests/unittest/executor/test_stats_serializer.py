@@ -409,9 +409,8 @@ class TestStatsSerializer:
         storage.secondary_stats[0].available = 4  # secondary used = 1
         storage.secondary_stats[0].evictable = 1
 
-        peak_by_cache_level = manager.get_and_reset_iteration_peak_block_stats()
-        primary_peak = peak_by_cache_level[GPU_LEVEL]
-        secondary_peak = peak_by_cache_level[CacheLevel(1)]
+        primary_peak = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        secondary_peak = manager.get_and_reset_iteration_peak_block_stats(CacheLevel(1))
         assert [stats.available for stats in primary_peak] == [8, 9]
         assert [stats.unavailable for stats in primary_peak] == [5, 4]
         assert [stats.evictable for stats in primary_peak] == [3, 4]
@@ -420,9 +419,8 @@ class TestStatsSerializer:
         assert [stats.evictable for stats in secondary_peak] == [2, 0]
 
         # The next interval starts from current usage, not zero.
-        peak_by_cache_level = manager.get_and_reset_iteration_peak_block_stats()
-        primary_peak = peak_by_cache_level[GPU_LEVEL]
-        secondary_peak = peak_by_cache_level[CacheLevel(1)]
+        primary_peak = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        secondary_peak = manager.get_and_reset_iteration_peak_block_stats(CacheLevel(1))
         assert [stats.available for stats in primary_peak] == [7, 6]
         assert [stats.unavailable for stats in primary_peak] == [3, 4]
         assert [stats.evictable for stats in primary_peak] == [1, 4]

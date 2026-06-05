@@ -32,6 +32,8 @@ from typing import (
     Union,
 )
 
+from ._utils import TypedIndexList
+
 # From _common.py
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
@@ -88,6 +90,12 @@ class KVCacheIterationStatsDelta:
     iter_intra_device_copy_bytes: int = 0
     iter_host_dropped_blocks: int = 0
     iter_host_dropped_bytes: int = 0
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupPeakBlockStats:
+    available: int
+    unavailable: int
+    evictable: int
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -447,7 +455,9 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...
     def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
-    def get_and_reset_iteration_peak_block_stats(self) -> Sequence[Any]: ...
+    def get_and_reset_iteration_peak_block_stats(
+        self, cache_level: CacheLevel
+    ) -> TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]: ...
     def mark_stats_dirty(self, kv_cache_id: int | None) -> None: ...
     def clear_stats_dirty(self, kv_cache_id: int | None) -> None: ...
     def get_dirty_stats_kv_cache_ids(self) -> set[int]: ...
