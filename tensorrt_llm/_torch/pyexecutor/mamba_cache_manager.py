@@ -1712,8 +1712,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # we skip refresh_blocks entirely when nothing was scheduled.
         self._pending_state_transfers = self.impl.copy_linear_attention_block_batch(
             self.requests)
-        if self._pending_state_transfers:
-            logger.info(f"Need to transfer mamba state blocks")
         self._setup_state_indices()
         num_contexts = len(scheduled_batch.context_requests)
         if num_contexts > 0:
