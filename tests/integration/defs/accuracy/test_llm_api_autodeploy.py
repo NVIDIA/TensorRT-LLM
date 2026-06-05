@@ -876,8 +876,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for GLM-4.7-Flash variants."""
 
     MODEL_NAME = "GLM-4.7-Flash"
-    MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
-    MODEL_PATH_NVFP4 = hf_id_to_local_model_dir("DeepInfra/GLM-4.7-Flash-NVFP4")
+    MODEL_HF_ID_BF16 = "zai-org/GLM-4.7-Flash"
+    MODEL_HF_ID_NVFP4 = "DeepInfra/GLM-4.7-Flash-NVFP4"
 
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
@@ -939,8 +939,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, enable_chunked_prefill, attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH_BF16,
-                           tokenizer=self.MODEL_PATH_BF16,
+        model_path = hf_id_to_local_model_dir(self.MODEL_HF_ID_BF16)
+        with AutoDeployLLM(model=model_path, tokenizer=model_path,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -953,8 +953,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
-                           tokenizer=self.MODEL_PATH_NVFP4,
+        model_path = hf_id_to_local_model_dir(self.MODEL_HF_ID_NVFP4)
+        with AutoDeployLLM(model=model_path, tokenizer=model_path,
                            **kwargs) as llm:
             # Manually set quant_config for NVFP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
