@@ -469,7 +469,8 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
-    elif architectures and architectures[0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES:
+    elif architectures and architectures[
+            0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES:
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
         # Keep the composite VLM config so the vision encoder and multimodal

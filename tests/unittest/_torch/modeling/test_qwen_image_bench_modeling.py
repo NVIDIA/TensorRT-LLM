@@ -1,9 +1,10 @@
 import json
+from types import SimpleNamespace
 
 import torch
 
 
-def _write_qwen3_5_vlm_config(model_dir):
+def _write_qwen_image_bench_config(model_dir):
     config = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "dtype": "bfloat16",
@@ -72,7 +73,7 @@ def _write_qwen3_5_vlm_config(model_dir):
     (model_dir / "config.json").write_text(json.dumps(config))
 
 
-def test_qwen3_5_conditional_config_preserves_vlm_and_normalizes_text(tmp_path):
+def test_qwen_image_bench_config_preserves_multimodal_and_normalizes_text(tmp_path):
     import transformers
 
     from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -81,7 +82,7 @@ def test_qwen3_5_conditional_config_preserves_vlm_and_normalizes_text(tmp_path):
         load_pretrained_config,
     )
 
-    _write_qwen3_5_vlm_config(tmp_path)
+    _write_qwen_image_bench_config(tmp_path)
 
     config = load_pretrained_config(str(tmp_path))
 
@@ -98,24 +99,48 @@ def test_qwen3_5_conditional_config_preserves_vlm_and_normalizes_text(tmp_path):
         "linear_attention",
         "full_attention",
     ]
-    assert extract_mamba_kv_cache_params(
-        config.text_config).mamba_ssm_cache_dtype is torch.float32
+    assert extract_mamba_kv_cache_params(config.text_config).mamba_ssm_cache_dtype is torch.float32
 
 
-def test_qwen3_5_vlm_model_and_mapper_registration():
+def test_qwen_image_bench_model_and_mapper_registration():
     from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import (
         Qwen3_5MoeHfWeightMapper,
     )
-    from tensorrt_llm._torch.models.modeling_qwen3_5vl import Qwen3_5VLModel
+    from tensorrt_llm._torch.models.modeling_qwen_image_bench import QwenImageBenchModel
     from tensorrt_llm._torch.models.modeling_utils import (
-        MODEL_CLASS_MAPPING,
         MODEL_CLASS_MAPPER_MAPPING,
+        MODEL_CLASS_MAPPING,
         MODEL_CLASS_VISION_ENCODER_MAPPING,
     )
 
-    assert MODEL_CLASS_MAPPING["Qwen3_5ForConditionalGeneration"] is Qwen3_5VLModel
+    assert MODEL_CLASS_MAPPING["Qwen3_5ForConditionalGeneration"] is QwenImageBenchModel
     assert "Qwen3_5ForConditionalGeneration" in MODEL_CLASS_VISION_ENCODER_MAPPING
     assert (
-        MODEL_CLASS_MAPPER_MAPPING["Qwen3_5ForConditionalGeneration_HF"]
-        is Qwen3_5MoeHfWeightMapper
+        MODEL_CLASS_MAPPER_MAPPING["Qwen3_5ForConditionalGeneration_HF"] is Qwen3_5MoeHfWeightMapper
     )
+
+
+def test_qwen_image_bench_forwards_speculative_interface():
+    from tensorrt_llm._torch.models.modeling_qwen_image_bench import QwenImageBenchModel
+
+    draft_config = object()
+    draft_model = object()
+    text_model = object()
+    lm_head = object()
+    sentinel = object()
+
+    llm = SimpleNamespace(
+        draft_config=draft_config,
+        draft_model=draft_model,
+        model=text_model,
+        lm_head=lm_head,
+        load_draft_weights=lambda *args, **kwargs: sentinel,
+    )
+    model = QwenImageBenchModel.__new__(QwenImageBenchModel)
+    object.__setattr__(model, "llm", llm)
+
+    assert model.draft_config is draft_config
+    assert model.draft_model is draft_model
+    assert model.model is text_model
+    assert model.lm_head is lm_head
+    assert model.load_draft_weights("weights") is sentinel

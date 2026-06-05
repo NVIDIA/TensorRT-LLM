@@ -22,8 +22,7 @@ from .modeling_qwen3vl import (
 )
 from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
 
-
-_QWEN3_5_PLACEHOLDERS = MultimodalPlaceholderMetadata(
+_QWEN_IMAGE_BENCH_PLACEHOLDERS = MultimodalPlaceholderMetadata(
     placeholder_map={
         "image": "<|vision_start|><|image_pad|><|vision_end|>",
         "video": "<|vision_start|><|video_pad|><|vision_end|>",
@@ -34,8 +33,7 @@ _QWEN3_5_PLACEHOLDERS = MultimodalPlaceholderMetadata(
 )
 
 
-class _Qwen3_5VLModelMixin:
-
+class _QwenImageBenchModelMixin:
     @property
     def multimodal_data_device_paths(self) -> List[str]:
         return [
@@ -60,9 +58,9 @@ class _Qwen3_5VLModelMixin:
 @register_input_processor(
     Qwen3VLInputProcessorBase,
     model_type="qwen3_5",
-    placeholder_metadata=_QWEN3_5_PLACEHOLDERS,
+    placeholder_metadata=_QWEN_IMAGE_BENCH_PLACEHOLDERS,
 )
-class Qwen3_5VLModel(_Qwen3_5VLModelMixin, Qwen3VLModelBase):
+class QwenImageBenchModel(_QwenImageBenchModelMixin, Qwen3VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
         kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)
@@ -75,9 +73,9 @@ class Qwen3_5VLModel(_Qwen3_5VLModelMixin, Qwen3VLModelBase):
 @register_input_processor(
     Qwen3VLInputProcessorBase,
     model_type="qwen3_5_moe",
-    placeholder_metadata=_QWEN3_5_PLACEHOLDERS,
+    placeholder_metadata=_QWEN_IMAGE_BENCH_PLACEHOLDERS,
 )
-class Qwen3_5MoeVLModel(_Qwen3_5VLModelMixin, Qwen3VLModelBase):
+class QwenImageBenchMoeModel(_QwenImageBenchModelMixin, Qwen3VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
         kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)
