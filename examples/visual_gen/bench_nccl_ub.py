@@ -128,7 +128,7 @@ def run_micro_benchmark(args) -> Dict:
 
     # Shapes representative of FLUX (seq=4096 after patch) and Wan-1.3B (seq=7680)
     configs = [
-        # (name, B, S/world_size, H/world_size, D, collective)
+        # (name, collective, shape=(B, S/world_size, H/world_size, D))
         ("flux_all_to_all",    "all_to_all",   (1, 4096 // world_size, 24 // world_size, 128)),
         ("flux_all_gather",    "all_gather",   (1, 4096 // world_size, 24, 128)),
         ("wan_all_to_all",     "all_to_all",   (1, 7680 // world_size, 40 // world_size, 128)),
@@ -160,21 +160,22 @@ def run_micro_benchmark(args) -> Dict:
 def _bench_pipeline_one(model_path: str, config_path: str, prompt: str, n_steps: int,
                          warmup: int, iters: int, height: int, width: int) -> Dict:
     """Run trtllm VisualGen for n_steps, measure wall-clock per-image latency."""
-    from tensorrt_llm import VisualGen, VisualGenArgs
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
     args = VisualGenArgs.from_yaml(config_path)
     args.model = model_path
 
     vg = VisualGen(args)
+    params = VisualGenParams(height=height, width=width, num_inference_steps=n_steps)
 
     # Warmup
     for _ in range(warmup):
-        vg.generate(prompt=prompt, height=height, width=width, num_inference_steps=n_steps)
+        vg.generate(inputs=prompt, params=params)
 
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        vg.generate(prompt=prompt, height=height, width=width, num_inference_steps=n_steps)
+        vg.generate(inputs=prompt, params=params)
         times.append((time.perf_counter() - t0) * 1000.0)
 
     vg.shutdown()
