@@ -7,7 +7,6 @@ from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
 
 class _DraftPretrainedConfig:
-
     def __init__(self, num_hidden_layers: int):
         self.num_hidden_layers = num_hidden_layers
 
@@ -44,8 +43,7 @@ def test_update_spec_config_from_draft_model_config():
         speculative_model="/path/to/draft",
     )
 
-    update_spec_config_from_draft_model_config(spec_config,
-                                               _DraftPretrainedConfig(3))
+    update_spec_config_from_draft_model_config(spec_config, _DraftPretrainedConfig(3))
 
     assert spec_config._num_draft_hidden_layers == 3
     assert get_num_spec_layers(spec_config) == 3
@@ -58,15 +56,17 @@ def test_update_spec_config_from_loaded_model():
     )
 
     class _Model:
-
         class _Config:
-
             num_hidden_layers = 32
 
         config = _Config()
-        draft_config = type("DraftConfig", (), {
-            "pretrained_config": _DraftPretrainedConfig(2),
-        })()
+        draft_config = type(
+            "DraftConfig",
+            (),
+            {
+                "pretrained_config": _DraftPretrainedConfig(2),
+            },
+        )()
 
     update_spec_config_from_loaded_model(spec_config, _Model())
 
