@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import hashlib
+from array import array
 from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
@@ -90,11 +91,21 @@ class Hasher:
         elif type(data) is bytes:
             self._hasher.update(data)
         else:
-            for item in data:  # type: ignore
-                assert (
-                    NDEBUG or (type(item) is int and (0 <= item < (1 << 64))) or type(item) is bytes
-                )
-                self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
+            # Hash the whole token block in one C call instead of one per token.
+            # array("Q", data).tobytes() packs each int as 8 native-endian bytes;
+            # all NVIDIA GPU host platforms (x86_64, aarch64/Grace) are little-endian
+            # so this is byte-identical to the per-token to_bytes(8, "little") loop.
+            # Falls back to that loop for multimodal blocks (which contain bytes items).
+            try:
+                self._hasher.update(array("Q", data).tobytes())  # type: ignore
+            except (TypeError, OverflowError):
+                for item in data:  # type: ignore
+                    assert (
+                        NDEBUG
+                        or (type(item) is int and (0 <= item < (1 << 64)))
+                        or type(item) is bytes
+                    )
+                    self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
         return self
 
     @property
