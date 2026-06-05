@@ -2217,22 +2217,6 @@ class PyExecutor:
             f"count={len(dummy_requests)}",
             all_ranks=True)
 
-    def _revert_ctx_alloc(self, dropped_context_requests):
-        """Revert KV cache capacity growth for ctx requests deferred by
-        delay batching.
-
-        With KV cache manager V2 + scheduler V2, ctx KV cache is grown
-        during scheduling (``resize_context``).  When delay batching
-        (``_balance_adp_requests`` for ADP, or ``_waiting_requests``
-        for non-ADP batch waiting) defers ctx requests, the
-        freshly-allocated pages would otherwise sit idle until the
-        request is re-scheduled, blocking pool space — particularly
-        painful for long-context workloads where each deferred ctx can
-        hold GBs of KV.
-        """
-        for req in dropped_context_requests:
-            self.kv_cache_manager.revert_allocate_context(req)
-
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
         if self._scheduler_manages_kv_suspend and isinstance(
@@ -3938,12 +3922,12 @@ class PyExecutor:
                 or getattr(self.dist, "world_size", 1) == 1):
             return local_skip_iteration
         all_skip_flags = self.dist.tp_allgather(int(local_skip_iteration))
-        skip_iteration = all(all_skip_flags)
+        skip_iteration = any(all_skip_flags)
         if skip_iteration:
             self._delay_batch_log(
                 f"global skip enabled all_rank_delay_flags={all_skip_flags}")
-        elif any(all_skip_flags):
-            self._delay_batch_log(f"global run forced by ready rank "
+        else:
+            self._delay_batch_log(f"global run enabled all ranks ready "
                                   f"all_rank_delay_flags={all_skip_flags}")
         return skip_iteration
 
@@ -3954,9 +3938,6 @@ class PyExecutor:
             f"ctx_requests={scheduled_requests.num_context_requests} "
             f"gen_requests={scheduled_requests.num_generation_requests}",
             all_ranks=True)
-        if (self._scheduler_manages_kv_suspend
-                and scheduled_requests.num_context_requests > 0):
-            self._revert_ctx_alloc(scheduled_requests.context_requests)
         self._revert_gen_alloc(scheduled_requests)
         self._cleanup_attention_dp_dummy_requests("delay_batch_skip")
         scheduled_requests.reset_context_requests([])
@@ -4002,7 +3983,6 @@ class PyExecutor:
             self._log_delay_batch_generation_sources(
                 scheduler_output.generation_requests, "scheduler_candidate")
         if delay_batch_runtime_enabled:
-            delay_candidate_context_requests = scheduled_context_requests
             scheduled_context_requests, local_skip_iteration = (
                 self._waiting_context_requests_with_timeout(
                     scheduled_context_requests))
@@ -4024,10 +4004,7 @@ class PyExecutor:
 
         skip_iteration = (self._sync_delay_batch_skip(local_skip_iteration)
                           if delay_batch_runtime_enabled else False)
-        forced_run_iteration = (delay_batch_runtime_enabled
-                                and local_skip_iteration and not skip_iteration)
-        if forced_run_iteration:
-            scheduled_context_requests = delay_candidate_context_requests
+        forced_run_iteration = False
 
         if delay_batch_runtime_enabled:
             self._delay_batch_log(

@@ -2890,45 +2890,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{req.py_request_id} from {kv_cache.capacity} to "
                 f"{reverted_cap}")
 
-    def revert_allocate_context(self, req: LlmRequest) -> None:
-        """Undo the capacity growth from this iter's ``resize_context``.
-
-        When delay batching defers a context request after V2 scheduling,
-        the scheduler has already grown KV capacity.  SWA scratch reuse
-        cannot always undo that with a normal ``resize(pre_cap)`` because
-        the new chunk has not been committed and ``history_length`` may be
-        far behind the current capacity.  Use the resize rollback snapshot
-        captured before scheduling-side growth.
-        """
-        snapshot = getattr(req, "py_ctx_resize_rollback_snapshot", None)
-        if snapshot is None:
-            return
-
-        # Mark as consumed even if the rollback below is skipped, so a later
-        # iter does not see a stale snapshot.
-        req.py_ctx_resize_rollback_snapshot = None
-        req.py_ctx_pre_resize_cap = None
-
-        kv_cache = self.kv_cache_map.get(req.py_request_id)
-        if kv_cache is None or not kv_cache.is_active:
-            return
-
-        target_cap = snapshot[0]
-        if target_cap >= kv_cache.capacity:
-            return
-
-        if kv_cache.enable_swa_scratch_reuse:
-            success = kv_cache.rollback_uncommitted_context_resize(snapshot)
-        else:
-            success = kv_cache.resize(target_cap)
-        if not success:
-            raise RuntimeError(
-                f"Failed to revert KV cache capacity for context "
-                f"request {req.py_request_id} from "
-                f"{kv_cache.capacity} to {target_cap}")
-        if target_cap > 0:
-            kv_cache.suspend()
-
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
 
@@ -3027,9 +2988,6 @@ class KVCacheManagerV2(BaseResourceManager):
         Returns True on success, False if resize failed (first chunk is
         suspended on failure).
 
-        Snapshots the pre-resize state when growth happens so
-        ``revert_allocate_context`` can undo it if delay batching defers the
-        request.
         """
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init")
@@ -3039,22 +2997,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
-        pre_cap = kv_cache.capacity
-        rollback_snapshot = kv_cache.make_context_resize_rollback_snapshot()
-
-        req.py_ctx_resize_rollback_snapshot = None
-        req.py_ctx_pre_resize_cap = None
         success = kv_cache.resize(capacity, history_length)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
 
-        # None means "no growth this iter, nothing to revert"; this also
-        # invalidates a stale snapshot from a prior iter on the same req.
-        if capacity > pre_cap:
-            req.py_ctx_resize_rollback_snapshot = rollback_snapshot
-            req.py_ctx_pre_resize_cap = pre_cap
         return True
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
