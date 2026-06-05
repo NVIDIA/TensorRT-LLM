@@ -669,7 +669,13 @@ def llms_and_encoder(
     pd_disagg: bool,
 ) -> Generator[tuple[tuple[LLM, LLM | None], MultimodalEncoder, LLM], None,
                None]:
-    """Get LLM instances, a multimodal encoder, and a prefill worker, initialized in parallel."""
+    """Get LLM instances, a multimodal encoder, and a prefill worker.
+
+    The LLM and encoder are initialized in parallel to overlap init time.
+    The prefill worker (TLLM_MULTIMODAL_DISAGGREGATED=1) is created sequentially
+    afterwards — concurrent init in a ThreadPoolExecutor worker can deadlock
+    depending on CUDA multiprocessing context, so we serialize it here.
+    """
     if model_dir == _NANO_V2_VL_FP8_DIR:
         if get_sm_version() < 90:
             pytest.skip("Nemotron-Nano-12B-v2-VL FP8 requires Hopper+ (SM90)")
@@ -678,7 +684,6 @@ def llms_and_encoder(
             # simultaneously — four 12B FP8 instances OOM a single 80GB H100.
             pytest.skip("Nemotron-Nano-12B-v2-VL FP8 pd_disagg needs >1 H100 "
                         "(4 simultaneous 12B instances OOM a single 80GB GPU)")
-    # Build all instances in one _instantiate_models call so init overlaps.
     encoder_max_batch_size = _get_encoder_max_batch_size(model_dir)
     initializers = _create_llm_initializers(model_dir, pd_disagg)
     initializers.append(
@@ -689,19 +694,20 @@ def llms_and_encoder(
             trust_remote_code=True,
             **_get_fake_checkpoint_kwargs(model_dir),
         ))
-    initializers.append(
-        functools.partial(
-            _create_llm,
-            model_dir,
-            pd_disagg,
-            disable_overlap_scheduler=pd_disagg,
-            env_overrides={"TLLM_MULTIMODAL_DISAGGREGATED": "1"},
-        ))
     instances = _instantiate_models(*initializers)
     llm = instances[0]
     llm_decode = instances[1] if pd_disagg else None
-    encoder = instances[-2]
-    prefill_llm = instances[-1]
+    encoder = instances[-1]
+
+    # Prefill worker must be created AFTER the parallel init: creating it inside
+    # a ThreadPoolExecutor thread can deadlock when TLLM_MULTIMODAL_DISAGGREGATED=1
+    # triggers subprocess spawning that depends on main-thread process state.
+    prefill_llm = _create_llm(
+        model_dir,
+        pd_disagg,
+        disable_overlap_scheduler=pd_disagg,
+        env_overrides={"TLLM_MULTIMODAL_DISAGGREGATED": "1"},
+    )
 
     with ExitStack() as stack:
         stack.enter_context(llm)

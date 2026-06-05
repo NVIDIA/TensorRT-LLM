@@ -4721,6 +4721,10 @@ class PyTorchModelEngine(ModelEngine):
                 continue
             multimodal_embedding_lengths = get_multimodal_embedding_lengths(
                 request)
+            if multimodal_embedding_lengths is None:
+                # Vision payload keys present but no pre-computed embedding
+                # lengths — skip to avoid a downstream sum(None) TypeError.
+                continue
             mm_request_indices_with_payload.append(request_idx)
             mm_params_with_payload.append(multimodal_param)
             mm_embedding_lengths.append(multimodal_embedding_lengths)
