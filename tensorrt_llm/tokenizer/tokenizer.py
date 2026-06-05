@@ -175,6 +175,7 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
 
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
+    
     This is the default tokenizer for LLM. '''
 
     def __init__(self, tokenizer):
@@ -620,10 +621,12 @@ def load_hf_tokenizer(model_dir: str,
                       use_fast: bool = True,
                       **kwargs) -> Optional[TransformersTokenizer]:
     ''' Load a tokenizer from a Hugging Face model directory.
+    
     Args:
         model_dir (str): The model directory.
         trust_remote_code (bool): Whether to trust the remote code.
         use_fast (bool): Whether to use the fast tokenizer.
+        
     Returns:
         A TransformersTokenizer object if the tokenizer is loaded successfully.
     '''
