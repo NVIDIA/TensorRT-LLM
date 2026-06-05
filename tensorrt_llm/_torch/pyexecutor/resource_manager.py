@@ -673,17 +673,19 @@ class KVCacheManager(BaseResourceManager):
             self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens,
                                                 draft_loop_tokens)
 
+        # Resolve the per-layer window vector and clamp the pool windows to
+        # the same max_seq_len bound, so their window keys agree.
         self.max_attention_window_vec = self._resolve_max_attention_window_vec(
             kv_cache_config=kv_cache_config,
             max_seq_len=max_seq_len,
             num_layers=num_layers,
             layer_mask=layer_mask,
+            pool_configurations=self.pool_configurations,
         )
 
-        # Now that max_attention_window_vec is known, build layer -> pool_idx
-        # from the (pre-clamp) pool_configurations.  Stays valid through the
-        # window clamping below because that only rewrites per-pool
-        # window_size fields; pool indices don't shift.
+        # Build layer -> pool_idx now that the windows agree. Stays valid
+        # through the block-budget clamping below, which only rewrites
+        # per-pool window_size fields; pool indices don't shift.
         self._layer_to_pool_idx = self._build_layer_to_pool_idx()
 
         # Determine if this is VSWA (Variable Sliding Window Attention).
@@ -1263,6 +1265,7 @@ class KVCacheManager(BaseResourceManager):
         max_seq_len: int,
         num_layers: int,
         layer_mask: Optional[List[bool]],
+        pool_configurations: Optional[List["PoolConfiguration"]] = None,
     ) -> List[int]:
         """Compute the per-local-layer attention window vector.
 
@@ -1277,7 +1280,13 @@ class KVCacheManager(BaseResourceManager):
         * Otherwise: use the user-supplied vector verbatim, clamped
           element-wise to ``max_seq_len`` so the largest window can't skew
           the KV cache pool sizing.
+
+        ``pool_configurations`` (if given) are clamped in place to the same
+        ``max_seq_len`` bound so their window keys stay consistent with the
+        returned vector; ``_build_layer_to_pool_idx`` relies on that match.
         """
+        for pc in pool_configurations or []:
+            pc.window_size = min(pc.window_size, max_seq_len)
         if kv_cache_config.max_attention_window is None:
             return [max_seq_len]
         if len(kv_cache_config.max_attention_window) == num_layers:
