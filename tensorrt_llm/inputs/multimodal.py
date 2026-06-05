@@ -1068,6 +1068,30 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
     return result
 
 
+def int32_to_hexdigest(int32_values: List[int]) -> str:
+    """Convert 8 int32 values back to a 64-character hexadecimal digest.
+
+    This is the inverse of hexdigest_to_int32.
+
+    Args:
+        int32_values: List of 8 signed int32 values
+
+    Returns:
+        64-character hexadecimal string representing the 32-byte hash
+    """
+    if len(int32_values) != 8:
+        raise ValueError(f"Expected 8 int32 values, got {len(int32_values)}")
+
+    result = []
+    for value in int32_values:
+        # Convert signed int32 back to unsigned
+        if value < 0:
+            value = value + 0x100000000
+        # Format as 8 hex characters (zero-padded)
+        result.append(f'{value:08x}')
+    return ''.join(result)
+
+
 def find_mm_token_lengths(
     mm_data: Dict[str, Any],
     input_processor: Any,
@@ -1410,10 +1434,11 @@ def _find_mm_embedding_lengths_from_masks(
 
     mm_positions = torch.where(mm_mask)[0]
     lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
+    if mm_positions.numel() != lengths_t.sum().item():
+        raise ValueError(
+            f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
+            f"sum of per-unit lengths ({lengths_t.sum().item()}): "
+            f"num_mm_tokens={num_mm_tokens}")
 
     embedding_lengths: List[int] = []
     offset = 0
@@ -1440,9 +1465,18 @@ def compute_mm_embedding_lengths(
     embedding-length derivation shared by the Nano and Qwen3-VL preprocess paths
     and the registry hashing path.
 
+    Invariant: `num_mm_tokens` MUST be ordered to match the PHYSICAL left-to-right
+    prompt positions of the multimodal items. The mask helpers extract MM token
+    positions via `torch.where(mm_mask)[0]` (left-to-right) and slice them
+    sequentially by `num_mm_tokens`; any other ordering (e.g. modality-major)
+    silently mis-attributes token spans across items. Producers must project the
+    per-item counts through the resolved prompt-item order (see
+    `MixedModalItemOrder`) before calling this.
+
     Args:
         input_ids: Prompt token ids (CPU-resident); coerced to a tensor.
-        num_mm_tokens: Per-item multimodal token counts in prompt order.
+        num_mm_tokens: Per-item multimodal token counts in PHYSICAL left-to-right
+            prompt order (see Invariant above).
         vocab_size: Tokenizer/model vocab size; positions >= this are embed
             slots when `mm_token_ids` is not provided.
         mm_token_ids: Optional explicit embed-slot token ids (takes precedence
