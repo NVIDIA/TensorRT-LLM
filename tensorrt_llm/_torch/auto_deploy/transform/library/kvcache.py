@@ -385,7 +385,11 @@ class _InsertCachedOperator(BaseTransform):
         # --- Pass 1: register resources and assign per-layer group_idx ---
         # Group identity comes from KVPagedResourceHandler.__eq__ (which
         # includes sliding_window).  A group IS a pool IS a metadata set.
-        from ...custom_ops.attention_interface import KVPagedResourceHandler
+        from ...custom_ops.attention_interface import (
+            KVPagedResourceHandler,
+            SpecCausalConvResourceHandler,
+            SpecSSMResourceHandler,
+        )
 
         handler_groups: list[KVPagedResourceHandler] = []
         per_layer_group_idx: list[int] = []
@@ -434,6 +438,16 @@ class _InsertCachedOperator(BaseTransform):
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
+                    # Speculative intermediate state buffers are never bound by the
+                    # cache manager when spec decoding is off (see
+                    # CachedSequenceInterface._create_and_assign_state_views), so allocating
+                    # them would waste a full per-layer state buffer and OOM. Drop them to
+                    # the None sentinel instead of registering an unmanaged resource.
+                    if cm._spec_config is None and isinstance(
+                        resource_handler,
+                        (SpecSSMResourceHandler, SpecCausalConvResourceHandler),
+                    ):
+                        resource_handler = None
                     if resource_handler is None:
                         # None sentinel: pass literal None positionally, no resource allocated.
                         cache_in_nodes.append(None)
