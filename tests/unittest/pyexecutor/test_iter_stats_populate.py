@@ -141,7 +141,10 @@ class _StubQueueItem:
         self.id = _StubQueueItem._next_id
 
 
-def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
+def _build_fake_self(queued_items,
+                     model_engine_iter_states,
+                     *,
+                     enable_attention_dp=False):
     """Minimal 'self' for ``PyExecutor._update_iter_stats(self, ...)``.
 
     Stubs only the ``self.*`` attributes the method actually reads:
@@ -162,7 +165,7 @@ def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
         ``num_queued_context_requests`` / ``num_queued_ctx_tokens``
       * ``model_engine.iter_states`` — stubbed as the post-forward side
         channel so regression tests can verify ``_update_iter_stats`` uses
-        the explicit batch snapshot argument instead.
+        the explicit scheduled-batch stats argument instead.
     """
     fake = MagicMock()
     fake.max_num_active_requests = 64
@@ -171,7 +174,7 @@ def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
     fake.executor_request_queue.get_request_queue.return_value.queue = queued_items
     fake.resource_manager.resource_managers.get.return_value = None
     fake.drafter = None
-    fake.model_engine = types.SimpleNamespace(iter_states=iter_states)
+    fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
     return fake
 
@@ -182,7 +185,7 @@ def _invoke_update_iter_stats(
     *,
     num_ctx_tokens,
     enable_attention_dp=False,
-    iter_states=None,
+    scheduled_batch_stats=None,
 ):
     """Call real ``PyExecutor._update_iter_stats`` unbound; return the stats.
 
@@ -197,16 +200,21 @@ def _invoke_update_iter_stats(
     queued_items    : list[_StubQueueItem]
     num_ctx_tokens  : int | None
         If int, wired into the fake ``model_engine.iter_states`` side channel.
-    iter_states     : dict | None
-        Explicit batch snapshot passed to ``_update_iter_stats``. When None,
-        defaults to the same ``num_ctx_tokens`` snapshot used by older tests.
+    scheduled_batch_stats : ScheduledBatchStats | None
+        Explicit scheduled-batch counters passed to ``_update_iter_stats``.
+        When None, defaults to the same partial ``num_ctx_tokens`` payload used
+        by older tests.
     """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.py_executor import (
+        PyExecutor,
+        ScheduledBatchStats,
+    )
 
     model_engine_iter_states = (
         None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
     )
-    batch_iter_states = model_engine_iter_states if iter_states is None else iter_states
+    if scheduled_batch_stats is None:
+        scheduled_batch_stats = ScheduledBatchStats(num_ctx_tokens=num_ctx_tokens)
 
     fake_self = _build_fake_self(
         queued_items,
@@ -230,7 +238,7 @@ def _invoke_update_iter_stats(
             num_completed_requests=0,
             scheduled_batch=scheduled_batch,
             micro_batch_id=0,
-            iter_states=batch_iter_states,
+            scheduled_batch_stats=scheduled_batch_stats,
         )
     return stats
 
@@ -547,28 +555,32 @@ def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
     assert ifb.num_ctx_kv_tokens == 256
 
 
-def test_num_ctx_tokens_uses_batch_iter_states_not_model_engine_side_channel():
-    """Regression guard: num_ctx_tokens must come from the batch snapshot."""
+def test_num_ctx_tokens_uses_scheduled_batch_stats_not_model_engine_side_channel():
+    """Regression guard: num_ctx_tokens must come from scheduled-batch stats."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
     ctx = [_StubRequest(context_chunk_size=744, context_current_position=256)]
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=ctx),
         [],
         num_ctx_tokens=99999,
-        iter_states={"num_ctx_tokens": 744},
+        scheduled_batch_stats=ScheduledBatchStats(num_ctx_tokens=744),
     )
 
     ifb = stats.inflight_batching_stats
     assert ifb.num_ctx_tokens == 744
 
 
-def test_num_gen_kv_tokens_uses_pre_forward_snapshot():
+def test_num_gen_kv_tokens_uses_scheduled_batch_stats():
     """Regression guard: decode KV must not include post-sample token growth."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
     gen = [_StubRequest(num_tokens=1025)]
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(gen_reqs=gen),
         [],
         num_ctx_tokens=0,
-        iter_states={"num_gen_kv_tokens": 1024},
+        scheduled_batch_stats=ScheduledBatchStats(num_gen_kv_tokens=1024),
     )
 
     ifb = stats.inflight_batching_stats
@@ -906,7 +918,8 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
     """
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    fake_self = _build_fake_self(queued_items=[], iter_states={"num_ctx_tokens": 0})
+    fake_self = _build_fake_self(
+        queued_items=[], model_engine_iter_states={"num_ctx_tokens": 0})
     # Live counter is several loops ahead of when the batch was built; any
     # accidental re-stamp would surface here.
     fake_self.iter_counter = 999
