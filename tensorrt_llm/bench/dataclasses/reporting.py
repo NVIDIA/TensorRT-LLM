@@ -207,6 +207,28 @@ class StatsKeeper:
         acceptance_length_percentiles = PercentileStats.from_iterable(
             acceptance_length) if acceptance_length else None
 
+        # Determine whether every request produced the same number of output
+        # tokens. When the output lengths differ, an equally-weighted mean over
+        # per-request AR/AL biases the result toward short requests (which run
+        # fewer decoding iterations). In that case report an output-length
+        # weighted average so longer requests contribute proportionally.
+        output_lengths_consistent = len(set(output_tokens)) <= 1
+        if not output_lengths_consistent:
+            total_output_tokens = sum(output_tokens)
+            if total_output_tokens > 0:
+                if draft_acceptance_rate_percentiles is not None:
+                    draft_acceptance_rate_percentiles.average = sum(
+                        w * v
+                        for w, v in zip(output_tokens,
+                                        draft_acceptance_rate,
+                                        strict=True)) / total_output_tokens
+                if acceptance_length_percentiles is not None:
+                    acceptance_length_percentiles.average = sum(
+                        w * v
+                        for w, v in zip(output_tokens,
+                                        acceptance_length,
+                                        strict=True)) / total_output_tokens
+
         requests = list(self.requests.values())
         stats = BenchmarkStatistics(
             num_requests=num_requests,
