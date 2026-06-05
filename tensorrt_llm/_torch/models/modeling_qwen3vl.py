@@ -1086,6 +1086,25 @@ class Qwen3VLModelBase(PreTrainedModel):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    @property
+    def model(self):
+        return self.llm.model
+
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
+    def load_draft_weights(self, *args, **kwargs):
+        return self.llm.load_draft_weights(*args, **kwargs)
+
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config.text_config
         pos_embd_params = PositionalEmbeddingParams(

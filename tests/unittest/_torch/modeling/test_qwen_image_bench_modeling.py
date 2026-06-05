@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import torch
 
@@ -117,3 +118,29 @@ def test_qwen_image_bench_model_and_mapper_registration():
     assert (
         MODEL_CLASS_MAPPER_MAPPING["Qwen3_5ForConditionalGeneration_HF"] is Qwen3_5MoeHfWeightMapper
     )
+
+
+def test_qwen_image_bench_forwards_speculative_interface():
+    from tensorrt_llm._torch.models.modeling_qwen_image_bench import QwenImageBenchModel
+
+    draft_config = object()
+    draft_model = object()
+    text_model = object()
+    lm_head = object()
+    sentinel = object()
+
+    llm = SimpleNamespace(
+        draft_config=draft_config,
+        draft_model=draft_model,
+        model=text_model,
+        lm_head=lm_head,
+        load_draft_weights=lambda *args, **kwargs: sentinel,
+    )
+    model = QwenImageBenchModel.__new__(QwenImageBenchModel)
+    object.__setattr__(model, "llm", llm)
+
+    assert model.draft_config is draft_config
+    assert model.draft_model is draft_model
+    assert model.model is text_model
+    assert model.lm_head is lm_head
+    assert model.load_draft_weights("weights") is sentinel
