@@ -327,7 +327,6 @@ triton_server/test_triton_llm.py::test_llmapi_backend[4-0-disableDecoupleMode-te
 triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False-ensemble] SKIP
 triton_server/test_triton_rcca.py::test_mistral_beam_search[rcca_4714407-True-10---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-ensemble] SKIP (https://nvbugs/5240060)
 triton_server/test_triton_rcca.py::test_rcca_bug_4934893[Temperature:0.5-TOP_P:0.95-TOP_K:10-False-1---False-True-False-0-2048-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization---1-1-1-False-ensemble] SKIP (https://nvbugs/5619369)
-unittest/_torch/executor SKIP (https://nvbugs/6272598)
 unittest/_torch/modeling/test_modeling_step3p7.py::TestStep3p7Checkpoint::test_config_and_weight_accounting_1_nvfp4 SKIP
 unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
 unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=IGNORE-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_DEEPGEMM-quant=W4A8_MXFP4_MXFP8-routing=DeepSeekV3] SKIP (https://nvbugs/6175060)
@@ -347,7 +346,6 @@ unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_qwen_next-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_topk_4-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined SKIP (https://nvbugs/6199854)
-unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py SKIP (https://nvbugs/6272608)
 unittest/auto_deploy/singlegpu/models/test_qwen3_5_moe.py::test_vision_attention_matches_reference SKIP (https://nvbugs/6189450)
 unittest/auto_deploy/singlegpu/models/test_qwen3_5_moe.py::test_vision_block_matches_reference SKIP (https://nvbugs/6189450)
 unittest/auto_deploy/singlegpu/models/test_qwen3_5_moe.py::test_vlm_wrapper_delta_is_request_scoped_no_cross_call_leakage SKIP (https://nvbugs/6189450)
