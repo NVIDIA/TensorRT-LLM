@@ -1072,13 +1072,13 @@ class DecodingBaseConfig(StrictBaseModel):
         "PyTorch backend only.")
 
     use_rejection_sampling: bool = Field(
-        default=True,
+        default=False,
         status="prototype",
         description=
-        "If true (default), enables rejection sampling for one-model speculative "
-        "decoding paths when the batch contains any non-greedy request. All-greedy "
-        "batches always take the argmax fast path regardless of this flag. Set to "
-        "false to fall back to exact-match verification on non-greedy batches. "
+        "If true, enables rejection sampling for one-model speculative decoding "
+        "paths when the batch contains any non-greedy request. All-greedy batches "
+        "always take the argmax fast path regardless of this flag. Set to false "
+        "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
     allow_advanced_sampling: bool = Field(
