@@ -25,6 +25,8 @@ from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 
+from ...utils import ActType_TrtllmGen
+
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
@@ -164,6 +166,35 @@ class MoEOpBackend:
         use_dp: bool = False,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation."""
+        raise NotImplementedError
+
+    def run_bf16_moe(
+        self,
+        router_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        gated_act_type: int = 0,
+        output: Optional[torch.Tensor] = None,
+        use_shuffled_weight: bool = False,
+        weight_layout: int = 0,
+        do_finalize: bool = True,
+        enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 8192,
+    ) -> torch.Tensor:
+        """Run BF16 MoE computation."""
         raise NotImplementedError
 
 
@@ -417,6 +448,37 @@ class TRTLLMOpBackend(MoEOpBackend):
                 use_dp=use_dp,
             )
 
+    def run_bf16_moe(
+        self,
+        router_logits,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        topk_weights=None,
+        topk_ids=None,
+        gated_act_type=0,
+        output=None,
+        use_shuffled_weight=False,
+        weight_layout=0,
+        do_finalize=True,
+        enable_pdl=None,
+        tune_max_num_tokens=8192,
+    ):
+        raise NotImplementedError(
+            "TRTLLM native op backend does not support unquantized BF16 TRTLLM-Gen fused MoE. "
+            "Enable FlashInfer fused MoE for TRTLLM backend."
+        )
+
 
 # ==================== Flashinfer Backend ====================
 @register_op_backend("flashinfer")
@@ -427,8 +489,19 @@ class FlashinferOpBackend(MoEOpBackend):
         import flashinfer.fused_moe as _flashinfer_fused_moe
         from flashinfer.fp4_quantization import fp4_quantize as _flashinfer_fp4_quantize
         from flashinfer.fp8_quantization import mxfp8_quantize as _flashinfer_mxfp8_quantize
-        from flashinfer.fused_moe import RoutingMethodType as _flashinfer_routing_method_type
-        from flashinfer.fused_moe.core import ActivationType as _flashinfer_activation_type
+
+        # Flashinfer reorganised these enums across releases:
+        #   - 0.6.9 release (main):    RoutingMethodType in flashinfer.fused_moe,
+        #                              ActivationType    in flashinfer.fused_moe.core
+        #   - nightly 9f7adfb8+:       both moved to flashinfer.tllm_enums
+        # Try the upstream-main path first for forward compatibility, then
+        # fall back to tllm_enums for the nightly pin this branch uses.
+        try:
+            from flashinfer.fused_moe import RoutingMethodType as _flashinfer_routing_method_type
+            from flashinfer.fused_moe.core import ActivationType as _flashinfer_activation_type
+        except ImportError:
+            from flashinfer.tllm_enums import ActivationType as _flashinfer_activation_type
+            from flashinfer.tllm_enums import RoutingMethodType as _flashinfer_routing_method_type
 
         from ..fused_moe.routing import RoutingMethodType as _trtllmgen_routing_method_type
 
@@ -465,6 +538,8 @@ class FlashinferOpBackend(MoEOpBackend):
             _trtllm.DeepSeekV3: _flashinfer.DeepSeekV3,
             _trtllm.Llama4: _flashinfer.Llama4,
             _trtllm.RenormalizeNaive: _flashinfer.RenormalizeNaive,
+            _trtllm.MiniMax2: _flashinfer.MiniMax2,
+            _trtllm.SigmoidRenorm: _flashinfer.SigmoidRenorm,
             _trtllm.Unspecified: _flashinfer.Unspecified,
         }
         if routing_method_type not in _mapping:
@@ -703,3 +778,87 @@ class FlashinferOpBackend(MoEOpBackend):
         else:
             final_hidden_states = outputs[0]
             return final_hidden_states
+
+    def run_bf16_moe(
+        self,
+        router_logits,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        topk_weights=None,
+        topk_ids=None,
+        gated_act_type=0,
+        output=None,
+        use_shuffled_weight=False,
+        weight_layout=0,
+        do_finalize=True,
+        enable_pdl=None,
+        tune_max_num_tokens=8192,
+    ):
+        # FlashInfer BF16 MoE does not expose an activation_type argument.
+        # TRTLLMGen constrains the BF16 path to Swiglu, so reject anything
+        # else here instead of silently calling a mismatched kernel.
+        if gated_act_type != ActType_TrtllmGen.SwiGlu:
+            raise ValueError("FlashInfer BF16 fused MoE only supports Swiglu activation.")
+
+        if router_logits is not None:
+            result = self._fused_moe.trtllm_bf16_moe(
+                routing_logits=router_logits,
+                routing_bias=routing_bias,
+                hidden_states=hidden_states,
+                gemm1_weights=gemm1_weights,
+                gemm2_weights=gemm2_weights,
+                num_experts=num_experts,
+                top_k=top_k,
+                n_group=n_group,
+                topk_group=topk_group,
+                intermediate_size=intermediate_size,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=local_num_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=self.cvt_routing_method_type(routing_method_type),
+                use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
+                do_finalize=do_finalize,
+                enable_pdl=enable_pdl,
+                tune_max_num_tokens=tune_max_num_tokens,
+            )
+        else:
+            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
+                torch.bfloat16
+            ).contiguous().view(torch.int16).to(torch.int32)
+            result = self._fused_moe.trtllm_bf16_routed_moe(
+                packed_topk_ids,
+                hidden_states,
+                gemm1_weights,
+                gemm2_weights,
+                num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                intermediate_size,
+                local_expert_offset,
+                local_num_experts,
+                routed_scaling_factor,
+                self.cvt_routing_method_type(routing_method_type),
+                use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
+                do_finalize=do_finalize,
+                enable_pdl=enable_pdl,
+                tune_max_num_tokens=tune_max_num_tokens,
+            )
+
+        if output is not None and do_finalize:
+            output.copy_(result)
+            return output
+        return result

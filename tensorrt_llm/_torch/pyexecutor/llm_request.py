@@ -1,6 +1,6 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 import torch
 
@@ -8,7 +8,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
-from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
@@ -39,6 +39,10 @@ REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_GENERATION_ONLY:
     LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
 }
+
+# Internal request id for the attention-DP padding dummy. Generated real
+# request ids do not use 0; disaggregated global ids use a separate high range.
+ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
 if TYPE_CHECKING:
     from .sampling_utils import Strategy
@@ -213,19 +217,21 @@ class LogitsStorage:
 
 class LogProbStorage:
     beam_width: int = -1
-    log_probs: list[TokenLogprobs]
+    log_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs]
     cum_log_probs: list[float]
 
-    def _init(self, first_input: list[TokenLogprobs]):
+    def _init(self, first_input: list[TokenLogprobs]
+              | list[SimpleTokenLogprobs]):
         self.beam_width = len(first_input)
         self.log_probs = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
 
     def append(self,
-               new_probs: list[TokenLogprobs],
+               new_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs],
                cum_log_probs: Optional[list[float]] = None):
         """
-        new_probs: [beam_width, num_tokens]
+        new_probs: [beam_width, num_tokens]; per-token entry is either a
+            ``dict[int, Logprob]`` (default) or a ``float`` (simple format).
         cum_log_probs: [beam_width]
         """
         if self.beam_width == -1:
@@ -236,14 +242,19 @@ class LogProbStorage:
             self.log_probs[beam_idx].extend(probs)
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
-            else:
-                # FIXME: This relies on the ordering of LogProb's in the dictionary. TorchSampler ensures
-                #        that the sampled logprob is in the first position.
-                self.cum_log_probs[beam_idx] += sum(
-                    next(iter(prob.values())).logprob for prob in probs)
+            elif probs:
+                if isinstance(probs[0], dict):
+                    # FIXME: This relies on the ordering of LogProb's in the dictionary.
+                    #        TorchSampler ensures that the sampled logprob is in the
+                    #        first position.
+                    self.cum_log_probs[beam_idx] += sum(
+                        next(iter(prob.values())).logprob for prob in probs)
+                else:
+                    # Simple format: probs is SimpleTokenLogprobs (list[float]).
+                    self.cum_log_probs[beam_idx] += sum(probs)
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+    def set_log_probs(self, log_probs: list[TokenLogprobs]
+                      | list[SimpleTokenLogprobs], cum_log_probs: list[float]):
         """
         Reset the storage and refill it with new values
         log_probs: [beam_width, num_tokens]
@@ -268,7 +279,7 @@ class PyResult:
         exclude_last_generation_logits: bool | None = None
         context_logits_list: list[torch.Tensor] = field(default_factory=list)
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
-        reset_log_probs: tuple[list[TokenLogprobs],
+        reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
@@ -377,7 +388,8 @@ class PyResult:
             self.diff.generation_logits_list.append(generation_logits)
 
     def append_log_probs(self,
-                         log_probs: list[TokenLogprobs],
+                         log_probs: list[TokenLogprobs]
+                         | list[SimpleTokenLogprobs],
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
@@ -435,8 +447,8 @@ class PyResult:
         self.diff.additional_generation_outputs_list.append(
             (name, self._additional_generation_outputs[name][-1]))
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+    def set_log_probs(self, log_probs: list[TokenLogprobs]
+                      | list[SimpleTokenLogprobs], cum_log_probs: list[float]):
         """
         Set log_probs and cum_log_probs to the new values
         log_probs: [beam_width, num_tokens]
@@ -484,7 +496,8 @@ class PyResult:
         return storage.transpose(0, 1)
 
     @property
-    def log_probs(self) -> list[TokenLogprobs] | None:
+    def log_probs(
+            self) -> list[TokenLogprobs] | list[SimpleTokenLogprobs] | None:
         if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
             return None
         return self._log_probs.log_probs
@@ -626,6 +639,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
+            logprobs_simple_format: bool = False,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -683,11 +697,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
+        self.py_logprobs_simple_format = logprobs_simple_format
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_additional_outputs = additional_outputs
 
+        self.py_beam_width = cast(int, self.sampling_config.beam_width)
         self.py_is_draft = is_draft
         # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
         self.py_seq_slot = seq_slot
@@ -791,7 +807,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.
-        need_deep_copy_logprobs = self.py_result.log_probs and self.sampling_config.beam_width <= 1
+        need_deep_copy_logprobs = self.py_result.log_probs and self.py_beam_width <= 1
         need_deep_copy_generation_logits = self.py_result._generation_logits is not None
         need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
         # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
@@ -946,11 +962,20 @@ def executor_request_to_llm_request(
     multimodal_positions = None
     multimodal_lengths = None
     multimodal_uuids = None
+    multimodal_item_run_cu_offsets = None
+    multimodal_run_positions = None
+    multimodal_run_lengths = None
     if executor_request.multimodal_input is not None:
         multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
         multimodal_positions = executor_request.multimodal_input.multimodal_positions
         multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
         multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
+        multimodal_item_run_cu_offsets = (
+            executor_request.multimodal_input.multimodal_item_run_cu_offsets)
+        multimodal_run_positions = (
+            executor_request.multimodal_input.multimodal_run_positions)
+        multimodal_run_lengths = (
+            executor_request.multimodal_input.multimodal_run_lengths)
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
@@ -958,6 +983,10 @@ def executor_request_to_llm_request(
     if executor_request.mrope_config is not None:
         mrope_rotary_cos_sin = executor_request.mrope_config.mrope_rotary_cos_sin
         mrope_position_deltas = executor_request.mrope_config.mrope_position_deltas
+
+    agent_hierarchy = None
+    if getattr(executor_request, "py_scheduling_params", None) is not None:
+        agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
 
     llm_request = LlmRequest(
         request_id=req_id,
@@ -981,6 +1010,9 @@ def executor_request_to_llm_request(
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
         multimodal_uuids=multimodal_uuids,
+        multimodal_item_run_cu_offsets=multimodal_item_run_cu_offsets,
+        multimodal_run_positions=multimodal_run_positions,
+        multimodal_run_lengths=multimodal_run_lengths,
         multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
@@ -1026,8 +1058,11 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
+        agent_hierarchy=agent_hierarchy,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
                               LogprobMode.RAW),
+        logprobs_simple_format=getattr(executor_request,
+                                       "py_logprobs_simple_format", False),
     )
 
     llm_request.py_original_end_id = getattr(executor_request,

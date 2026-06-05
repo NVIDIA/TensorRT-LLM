@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Common utils for torch fx graph transformation."""
 
 import functools
@@ -30,6 +44,10 @@ except ImportError:
 
 OpOrOverload = Union[OpOverloadPacket, OpOverload]
 OperatorLike = Union[OpOrOverload, Callable]
+
+
+def _auto_deploy_op(name: str) -> Optional[OpOverloadPacket]:
+    return getattr(torch.ops.auto_deploy, name, None)
 
 
 class LayerType(Enum):
@@ -425,27 +443,48 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     return is_match
 
 
-def is_trivial_passthrough_user(node: Node) -> bool:
+_VIEW_METHOD_TARGETS = {"view", "reshape", "transpose", "permute", "contiguous"}
+
+
+def is_call_method_view_op(node: Node) -> bool:
+    """Check whether a node is a method-style tensor view/layout op."""
+    return (
+        node.op == "call_method"
+        and node.target in _VIEW_METHOD_TARGETS
+        and bool(node.args)
+        and isinstance(node.args[0], Node)
+    )
+
+
+def is_view_like_op(node: Node) -> bool:
+    """Check whether a node is a tensor view/layout passthrough op."""
+    if is_call_method_view_op(node):
+        return True
+    return (
+        is_op(node, torch.ops.aten.view)
+        or is_op(node, torch.ops.aten.reshape)
+        or is_op(node, torch.ops.aten.transpose)
+        or is_op(node, torch.ops.aten.permute)
+        or is_op(node, torch.ops.aten.contiguous)
+        or is_op(node, torch.ops.auto_deploy.view)
+    )
+
+
+def is_dtype_cast_op(node: Node) -> bool:
+    """Check whether a node casts only tensor dtype."""
+    return is_op(node, torch.ops.aten.to.dtype)
+
+
+def is_trivial_passthrough_user(node: Node, *, allow_dtype_cast: bool = False) -> bool:
     """Check whether a node is a trivial layout/index passthrough op."""
-    if node.op == "call_method":
-        return node.target in {
-            "view",
-            "reshape",
-            "transpose",
-            "permute",
-            "contiguous",
-            "__getitem__",
-        }
+    if allow_dtype_cast and is_dtype_cast_op(node):
+        return True
+    if is_view_like_op(node):
+        return True
+    if node.op == "call_method" and node.target == "__getitem__":
+        return True
     if node.op == "call_function":
-        if node.target is operator.getitem:
-            return True
-        return (
-            is_op(node, torch.ops.aten.view)
-            or is_op(node, torch.ops.aten.reshape)
-            or is_op(node, torch.ops.aten.transpose)
-            or is_op(node, torch.ops.aten.permute)
-            or is_op(node, torch.ops.aten.contiguous)
-        )
+        return node.target is operator.getitem
     return False
 
 
@@ -453,6 +492,7 @@ def collect_terminal_users_through_passthrough(
     source_node: Node,
     *,
     max_traversal_nodes: int = 256,
+    allow_dtype_cast: bool = False,
 ) -> Tuple[List[Node], bool]:
     """Collect terminal users while traversing trivial passthrough users.
 
@@ -475,13 +515,36 @@ def collect_terminal_users_through_passthrough(
         seen.add(user)
         if len(seen) > max_traversal_nodes:
             return [], False
-        if is_trivial_passthrough_user(user):
+        if is_trivial_passthrough_user(user, allow_dtype_cast=allow_dtype_cast):
             if user.args and isinstance(user.args[0], Node) and user.args[0] in data_nodes:
                 data_nodes.add(user)
                 stack.extend(list(user.users))
                 continue
         terminal_users.append(user)
     return terminal_users, True
+
+
+def unwrap_input_through_passthrough(
+    node: Node,
+    *,
+    allow_dtype_cast: bool = False,
+) -> Tuple[Node, List[Node]]:
+    """Walk backward through view-like passthrough ops from a consumer input.
+
+    The returned post_nodes are ordered from consumer input back toward the
+    source producer. Transforms that can absorb dtype casts may opt in with
+    allow_dtype_cast=True.
+    """
+    current = node
+    post_nodes: List[Node] = []
+    while isinstance(current, Node) and (
+        is_view_like_op(current) or (allow_dtype_cast and is_dtype_cast_op(current))
+    ):
+        if not current.args or not isinstance(current.args[0], Node):
+            break
+        post_nodes.append(current)
+        current = current.args[0]
+    return current, post_nodes
 
 
 def get_shared_input_scale_for_fp8_linears(
@@ -611,13 +674,17 @@ def is_any_moe_op(node: Node) -> bool:
     return is_op(
         node,
         ops=[
-            torch.ops.auto_deploy.torch_moe,
-            torch.ops.auto_deploy.torch_quant_fp8_moe,
-            torch.ops.auto_deploy.torch_quant_nvfp4_moe,
-            torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
-            torch.ops.auto_deploy.triton_mxfp4_moe,
-            torch.ops.auto_deploy.torch_moe_fused,
-            torch.ops.auto_deploy.torch_moe_dense_mlp,
+            op
+            for op in [
+                _auto_deploy_op("torch_moe"),
+                _auto_deploy_op("torch_quant_fp8_moe"),
+                _auto_deploy_op("torch_quant_nvfp4_moe"),
+                _auto_deploy_op("torch_quant_finegrained_fp8_moe"),
+                _auto_deploy_op("triton_mxfp4_moe"),
+                _auto_deploy_op("torch_moe_fused"),
+                _auto_deploy_op("torch_moe_dense_mlp"),
+            ]
+            if op is not None
         ],
     )
 

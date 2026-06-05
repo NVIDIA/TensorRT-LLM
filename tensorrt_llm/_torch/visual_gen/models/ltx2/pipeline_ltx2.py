@@ -5,9 +5,10 @@
 import copy
 import gc
 import json
+import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import safetensors.torch
 import torch
@@ -16,11 +17,10 @@ from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -44,6 +44,95 @@ from .ltx2_core.types import (
 )
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
 from .transformer_ltx2 import LTXModel, LTXModelType
+
+LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def ltx2_force_one_stage_enabled() -> bool:
+    return os.environ.get(LTX2_FORCE_ONE_STAGE_ENV, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _get_ltx2_auxiliary_search_dir(checkpoint_path: Path) -> Optional[Path]:
+    if checkpoint_path.is_dir():
+        return checkpoint_path
+    if checkpoint_path.is_file():
+        return checkpoint_path.parent
+    return None
+
+
+def _pick_unique_file(search_dir: Path, pattern: str) -> str:
+    matches = sorted(search_dir.glob(pattern))
+    if len(matches) == 1:
+        return str(matches[0])
+    if len(matches) > 1:
+        logger.warning(
+            f"Multiple files matching {pattern!r} under {search_dir}: "
+            f"{[m.name for m in matches]}. Pass the path explicitly to disambiguate."
+        )
+    return ""
+
+
+def discover_ltx2_two_stage_paths(
+    checkpoint_path: Path,
+    spatial_upsampler_path: str = "",
+    distilled_lora_path: str = "",
+) -> Tuple[str, str]:
+    """Resolve LTX2 two-stage auxiliary checkpoint paths."""
+    search_dir = _get_ltx2_auxiliary_search_dir(checkpoint_path)
+    if search_dir is None:
+        return spatial_upsampler_path, distilled_lora_path
+
+    if not spatial_upsampler_path:
+        spatial_upsampler_path = _pick_unique_file(
+            search_dir, "*spatial-upscaler*.safetensors"
+        ) or _pick_unique_file(search_dir, "*upsampler*.safetensors")
+    if not distilled_lora_path:
+        distilled_lora_path = _pick_unique_file(
+            search_dir, "*distilled-lora*.safetensors"
+        ) or _pick_unique_file(search_dir, "*distilled*lora*.safetensors")
+
+    return spatial_upsampler_path, distilled_lora_path
+
+
+def resolve_ltx2_pipeline_extra_attrs(
+    checkpoint_path: Path,
+    extra_attrs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve LTX2 pipeline-selection attributes before variant selection."""
+    extra_attrs = dict(extra_attrs or {})
+    spatial_upsampler_path = extra_attrs.get("spatial_upsampler_path", "")
+    distilled_lora_path = extra_attrs.get("distilled_lora_path", "")
+    resolved_upsampler_path, resolved_lora_path = discover_ltx2_two_stage_paths(
+        checkpoint_path,
+        spatial_upsampler_path,
+        distilled_lora_path,
+    )
+    if not resolved_upsampler_path and not resolved_lora_path:
+        return {}
+
+    if bool(resolved_upsampler_path) != bool(resolved_lora_path):
+        if spatial_upsampler_path or distilled_lora_path:
+            missing = "distilled_lora_path" if resolved_upsampler_path else "spatial_upsampler_path"
+            raise ValueError(
+                "LTX2 two-stage pipeline requires both spatial_upsampler_path "
+                f"and distilled_lora_path, but {missing} was not provided or discovered."
+            )
+        logger.warning(
+            "Found only one LTX2 two-stage auxiliary checkpoint in "
+            f"{checkpoint_path}; falling back to the one-stage pipeline. "
+            "Pass both paths explicitly to enable two-stage inference."
+        )
+        return {}
+
+    if not spatial_upsampler_path:
+        logger.info(f"Discovered LTX2 spatial upsampler: {resolved_upsampler_path}")
+    if not distilled_lora_path:
+        logger.info(f"Discovered LTX2 distilled LoRA: {resolved_lora_path}")
+    return {
+        "spatial_upsampler_path": resolved_upsampler_path,
+        "distilled_lora_path": resolved_lora_path,
+    }
 
 
 def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -> None:
@@ -475,7 +564,32 @@ def _load_component_weights(
 # ---------------------------------------------------------------------------
 
 
-@register_pipeline("LTX2Pipeline")
+# ``LTX2Pipeline`` owns the canonical ``Lightricks/LTX-2`` discovery
+# surface. ``_detect_from_checkpoint()`` returns ``"LTX2Pipeline"`` from
+# ``model_index.json`` / safetensors metadata, and the pipeline_config
+# validator runs against this entry's ``defaults`` BEFORE
+# ``resolve_variant()`` swaps in ``LTX2TwoStagesPipeline``. So the
+# superset of knobs (``text_encoder_path`` + the two two-stage paths)
+# lives here; the two-stage class registers without ``hf_ids`` /
+# ``defaults`` to avoid duplicating the discovery entry.
+@register_pipeline(
+    "LTX2Pipeline",
+    hf_ids=[
+        "Lightricks/LTX-2",
+    ],
+    defaults={
+        "text_encoder_path": "google/gemma-3-12b-it",
+        "spatial_upsampler_path": None,
+        "distilled_lora_path": None,
+    },
+    doc=(
+        "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
+        "superset of knobs for one-stage and two-stage. Pipeline will "
+        "run two-stage if both ``spatial_upsampler_path`` and "
+        "``distilled_lora_path`` are not ``None``, either set by the "
+        "user or auto-discovered from the checkpoint."
+    ),
+)
 class LTX2Pipeline(BasePipeline):
     """Pipeline for text-to-video generation with audio using LTX2 model.
 
@@ -487,6 +601,19 @@ class LTX2Pipeline(BasePipeline):
 
     @classmethod
     def resolve_variant(cls, config):
+        if getattr(config, "cache_backend", None) == "cache_dit":
+            logger.info("Cache-DiT is enabled; forcing one-stage LTX2 pipeline.")
+            return cls
+
+        if ltx2_force_one_stage_enabled():
+            logger.info(f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled; forcing one-stage LTX2 pipeline.")
+            return cls
+
+        checkpoint_path = getattr(config.pretrained_config, "_name_or_path", "")
+        if checkpoint_path:
+            config.extra_attrs.update(
+                resolve_ltx2_pipeline_extra_attrs(Path(checkpoint_path), config.extra_attrs)
+            )
         if config.extra_attrs.get("spatial_upsampler_path") and config.extra_attrs.get(
             "distilled_lora_path"
         ):
@@ -586,6 +713,12 @@ class LTX2Pipeline(BasePipeline):
         the reference ``LTXModelConfigurator.from_config()``.  Missing keys
         fall back to the same defaults the reference uses.
         """
+        attn_cfg = getattr(self.model_config, "attention", None)
+        if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
+            raise NotImplementedError(
+                "Quantized attention is not yet supported for the LTX-2 pipeline."
+            )
+
         cfg = self.model_config.pretrained_config
 
         rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
@@ -653,13 +786,11 @@ class LTX2Pipeline(BasePipeline):
         iterations (WARMUP_STEPS=2), so the captured graph contains the
         optimized compiled kernels.
         """
-        if not self.model_config.cuda_graph.enable_cuda_graph:
+        if not self.model_config.cuda_graph.enable:
             return
 
         runner = _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
-        compile_note = (
-            " (with torch.compile)" if self.model_config.torch_compile.enable_torch_compile else ""
-        )
+        compile_note = " (with torch.compile)" if self.model_config.torch_compile.enable else ""
         logger.info(
             f"CUDA graph runner: wrapping transformer.forward (Modality-aware){compile_note}"
         )
@@ -691,7 +822,8 @@ class LTX2Pipeline(BasePipeline):
             checkpoint_dir: Path to the native LTX-2 checkpoint
                 (directory containing ``*.safetensors`` files).
             device: Target device.
-            skip_components: Components to skip.
+            skip_components: Components to skip loading (internal escape
+                hatch for memory-constrained unit tests).
             text_encoder_path: Path to the Gemma3 model directory.
                 Must contain model weights (``model*.safetensors``),
                 tokenizer files, and ``preprocessor_config.json``.
@@ -706,8 +838,8 @@ class LTX2Pipeline(BasePipeline):
         if needs_text and not text_encoder_path:
             raise ValueError(
                 "text_encoder_path is required for loading the tokenizer "
-                "and text encoder. Set VisualGenArgs.text_encoder_path to "
-                "the Gemma3 model directory."
+                "and text encoder. Set the LTX-2 pipeline_config "
+                "'text_encoder_path' entry to the Gemma3 model directory."
             )
 
         # --- Tokenizer & text encoder (from separate Gemma directory) -----
@@ -755,9 +887,10 @@ class LTX2Pipeline(BasePipeline):
         sft_paths: List[str],
         device: torch.device,
         dtype: torch.dtype,
-        skip_components: List,
+        skip_components: Optional[list] = None,
     ) -> None:
         """Instantiate and load weights for native LTX-2 components."""
+        skip_components = skip_components or []
 
         # Video decoder — native checkpoint stores decoder weights under
         # "vae.decoder." and statistics under "vae.per_channel_statistics.".
@@ -1314,8 +1447,7 @@ class LTX2Pipeline(BasePipeline):
         # STG/modality passes run on every GPU before the guidance formula.
         vgm = self.model_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
-        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else (vgm.ulysses_size if vgm else 1)
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
         if do_cfg_parallel_mm and cfg_size != 2:
             raise ValueError(

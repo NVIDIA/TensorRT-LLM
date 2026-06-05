@@ -20,8 +20,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tensorrt_llm._torch.visual_gen.cache.teacache import TeaCacheBackend
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, TeaCacheConfig
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm.visual_gen.args import TeaCacheConfig
 
 
 class TestSetupTeacache:

@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import importlib
 import logging
 import os
@@ -7,31 +21,60 @@ _logger = logging.getLogger(__name__)
 # Import each custom model individually so that models with transitive TRT-LLM
 # dependencies (e.g., NemotronH needing mamba layernorm_gated) don't prevent
 # other models from loading in standalone mode.
+#
+# NOTE: deepseek, nemotron_h, qwen3, qwen3_5_moe entries are the sharding-IR
+# variants (see PR for #13429). The legacy non-IR versions of these four files
+# were removed in the same change; the canonical name now points to the
+# IR-aware implementation that uses ``apply_sharding_hints`` for TP/EP/BMM.
 _MODEL_MODULES = {
+    "modeling_cohere": ["CohereForCausalLM"],
+    "modeling_decilm": ["DeciLMForCausalLM"],
     "modeling_deepseek": ["DeepSeekV3ForCausalLM"],
+    "modeling_deepseek_v2": ["DeepSeekV2ForCausalLM"],
+    "modeling_exaone": ["ExaoneForCausalLM"],
+    "modeling_gemma": ["GemmaADForCausalLM"],
+    "modeling_gemma2": ["Gemma2ForCausalLM"],
     "modeling_gemma3n": ["Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"],
     "modeling_gemma4": ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"],
+    "modeling_glm4_moe": ["Glm4MoeForCausalLM"],
     "modeling_glm4_moe_lite": ["Glm4MoeLiteForCausalLM"],
+    "modeling_glm_moe_dsa": ["GlmMoeDsaForCausalLM"],
+    "modeling_gpt_oss": ["GptOssForCausalLM"],
+    "modeling_granite": ["GraniteForCausalLM"],
+    "modeling_granite_moe_hybrid": ["GraniteMoeHybridForCausalLM"],
+    "modeling_hunyuan_dense": ["HunYuanDenseForCausalLM"],
+    "modeling_hunyuan_moe": ["HunYuanMoEForCausalLM"],
+    "modeling_internlm3": ["InternLM3ForCausalLM"],
     "modeling_kimi_k2": ["KimiK2ForCausalLM", "KimiK25ForConditionalGeneration"],
+    "modeling_llama3": ["Llama3ForCausalLM"],
     "modeling_llama4": ["Llama4ForCausalLM", "Llama4ForConditionalGeneration"],
     "modeling_minimax_m2": ["MiniMaxM2ForCausalLM"],
+    "modeling_mistral": ["MistralForCausalLM"],
     "modeling_mistral3": ["Mistral3ForConditionalGenerationAD", "Mistral4ForCausalLM"],
     "modeling_nemotron_flash": ["NemotronFlashForCausalLM", "NemotronFlashPreTrainedTokenizerFast"],
     "modeling_nemotron_h": ["NemotronHForCausalLM"],
+    "modeling_olmo3": ["Olmo3ForCausalLM"],
+    "modeling_openelm": ["OpenELMForCausalLM"],
+    "modeling_qwen3": ["Qwen3ForCausalLM"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
     "modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
+    "modeling_qwen3_next": ["Qwen3NextForCausalLM"],
+    "modeling_seed_oss": ["SeedOssForCausalLM"],
+    "modeling_skywork_r1v2": ["SkyworkR1V2ForConditionalGeneration"],
+    "modeling_smollm3": ["SmolLM3ForCausalLM"],
     "modeling_starcoder2": ["Starcoder2ForCausalLM"],
+    "modeling_step3p7": ["Step3p7ForCausalLM"],
 }
 
+# AD_USE_IR_MODELS: opt-in flag for staging additional ``_ir.py`` modeling
+# variants alongside the canonical models above. PR #13478 promoted the
+# deepseek/nemotron_h/qwen3/qwen3_5_moe ``_ir.py`` variants to canonical
+# names, so the gate currently has no entries to load. Keep the hook in
+# place: future model onboardings may stage an ``_ir.py`` variant here
+# for side-by-side comparison while the legacy ``detect_sharding`` path
+# is still supported and the canonical rename hasn't happened yet.
 if os.environ.get("AD_USE_IR_MODELS"):
-    _MODEL_MODULES["modeling_deepseek_ir"] = ["DeepSeekV3ForCausalLM"]
-    _MODEL_MODULES["modeling_llama3_ir"] = ["Llama3ForCausalLM"]
-    _MODEL_MODULES["modeling_nemotron_h_ir"] = ["NemotronHForCausalLM"]
-    _MODEL_MODULES["modeling_qwen3_5_moe_ir"] = [
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    ]
-    _MODEL_MODULES["modeling_qwen3_ir"] = ["Qwen3ForCausalLM"]
+    pass  # no staged _ir.py variants at the moment
 
 __all__ = []
 for _module_name, _names in _MODEL_MODULES.items():

@@ -59,7 +59,8 @@ To enable dynamic tree mode, set `use_dynamic_tree=True` on the `Eagle3DecodingC
 * `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation. Mutually exclusive with `eagle_choices` (static tree).
 * `dynamic_tree_max_topK` (`int`): Maximum number of tokens to expand per node at each draft layer.
 * `max_total_draft_tokens` (`int`, optional): Total draft token budget for the tree. Must satisfy `max_draft_len <= max_total_draft_tokens <= dynamic_tree_max_topK * max_draft_len`. Defaults to `dynamic_tree_max_topK * max_draft_len` if not set.
-* `max_batch_size` (`int`): Required when `use_dynamic_tree=True` for pre-allocating dynamic tree CUDA buffers.
+
+When `use_dynamic_tree=True`, the dynamic tree CUDA buffers are pre-allocated based on the `LLM`'s `max_batch_size`, which is propagated internally and must not be passed directly to `Eagle3DecodingConfig`.
 
 ```python
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
@@ -70,7 +71,6 @@ speculative_config = Eagle3DecodingConfig(
     use_dynamic_tree=True,
     dynamic_tree_max_topK=10,
     max_total_draft_tokens=60,
-    max_batch_size=4,
 )
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
@@ -103,7 +103,7 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config, disabl
 
 ### MTP
 
-MTP is currently only supported by Deepseek. MTP can be tuned with the following configuration options:
+MTP is supported by DeepSeek models and other architectures that ship native MTP modules (including Step-3.x). MTP can be tuned with the following configuration options:
 
 * `max_draft_len`: Maximum draft candidate length.
 * `num_nextn_predict_layers`: Number of MTP modules to use. Currently must match `max_draft_len`.
@@ -141,6 +141,26 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
 
 PARD can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
+
+### DFlash
+
+DFlash is a target-dependent speculative decoding method that uses hidden states from specific target model layers as cross-attention context in the draft model to predict multiple draft tokens in parallel.
+
+Reference: [DFlash: Distilled Flash Speculative Decoding](https://arxiv.org/pdf/2602.06036)
+
+* `max_draft_len`: Maximum draft candidate length.
+* `speculative_model`: Path or HuggingFace model ID for the DFlash draft model.
+* `mask_token_id`: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.
+* `target_layer_ids`: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.
+
+```python
+from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+speculative_config = DFlashDecodingConfig(
+    max_draft_len=4, speculative_model="/path/to/dflash_model")
+
+llm = LLM("/path/to/target_model", speculative_config=speculative_config)
+```
 
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
@@ -206,6 +226,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `NGram`
 * `DraftTarget`
 * `PARD`
+* `DFlash`
 * `SA`
 
 > Note: The PyTorch backend supports only `Eagle3`. `decoding_type: Eagle` is accepted as a backward-compatible alias for `Eagle3`, but EAGLE (v1/v2) draft checkpoints are incompatible.

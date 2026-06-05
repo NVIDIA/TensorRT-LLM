@@ -111,6 +111,13 @@ _SHARDING_HINT_NAMES = frozenset(
     }
 )
 
+
+def _auto_deploy_ops(*names: str) -> Tuple[OpOverloadPacket, ...]:
+    return tuple(
+        op for name in names if (op := getattr(torch.ops.auto_deploy, name, None)) is not None
+    )
+
+
 # =============================================================================
 # ShardableNode abstract base class
 # =============================================================================
@@ -135,6 +142,8 @@ class ShardableNode(ABC):
 
         def decorator(subcls):
             for target in op_targets:
+                if target is None:
+                    continue
                 if isinstance(target, OpOverloadPacket):
                     for overload_name in target.overloads():
                         cls._REGISTRY[getattr(target, overload_name)] = subcls
@@ -524,10 +533,7 @@ class WeightedParamShardableNode(ShardableNode):
         return 1 if count > 0 else 0
 
 
-@ShardableNode.register(
-    torch.ops.auto_deploy.torch_rmsnorm_gated,
-    torch.ops.auto_deploy.triton_rmsnorm_gated,
-)
+@ShardableNode.register(*_auto_deploy_ops("torch_rmsnorm_gated", "triton_rmsnorm_gated"))
 class NormShardableNode(ShardableNode):
     """Gated RMSNorm op: shard weight parameter."""
 

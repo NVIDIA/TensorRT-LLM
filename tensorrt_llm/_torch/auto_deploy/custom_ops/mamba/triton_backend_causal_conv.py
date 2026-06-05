@@ -100,6 +100,10 @@ def _triton_cached_causal_conv1d(
     else:
         w2d = weight
 
+    # Pre-hoist index type conversions so they run as early kernels, not between
+    # the extend conv1d update and the downstream replay precompute kernel.
+    slot_idx_i32 = slot_idx.to(torch.int32)
+
     # PREFILL: concatenate all prefill tokens and run one varlen forward
     if num_prefill > 0:
         # x_varlen: (dim, cu_seq_len)
@@ -117,7 +121,7 @@ def _triton_cached_causal_conv1d(
             conv_state_cache,
             prefill_cu_seqlen,
             seq_lens_cpu,
-            cache_indices=slot_idx[:num_prefill].to(torch.int32),
+            cache_indices=slot_idx_i32[:num_prefill],
             has_initial_state=use_initial_states[:num_prefill],
             activation=activation,
             pad_slot_id=PAD_SLOT_ID,
@@ -125,7 +129,40 @@ def _triton_cached_causal_conv1d(
         # Scatter outputs back to input buffer
         inp_flat[:num_prefill_tokens] = y_varlen.transpose(0, 1)
 
+    # DECODE: process decode before extend so decode-related kernels (slot index
+    # conversions, scatter-back) don't land in the gap between the extend
+    # causal_conv1d_update kernel and the downstream PDL-dependent replay precompute
+    # kernel. Decode and extend access disjoint slot indices so reordering is safe.
+    if num_decode > 0:
+        x_decode = inp_flat[
+            num_prefill_tokens + num_extend_tokens : num_total_tokens
+        ]  # [num_decode_tokens, C_in]
+
+        # Note: Triton causal_conv1d_update returns a new tensor (not in-place like CUDA version)
+        # so we need to capture the output and write it back
+        y_decode = causal_conv1d_update(
+            x_decode,  # [batch, dim]
+            conv_state_cache,
+            w2d,
+            bias,
+            activation=activation,
+            cache_seqlens=None,
+            conv_state_indices=slot_idx_i32[num_prefill + num_extend : num_seq],
+            pad_slot_id=PAD_SLOT_ID,
+        )
+        inp_flat[num_prefill_tokens + num_extend_tokens : num_total_tokens] = y_decode
+
+    # Zero padding positions beyond valid tokens (for piecewise CUDA graph).
+    # Run before extend so the zero_() kernel doesn't land after extend conv.
+    if num_total_tokens < bs:
+        inp_flat[num_total_tokens:].zero_()
+
     # EXTEND: use the update kernel so extend tokens write the intermediate state cache.
+    # This block runs last so that:
+    #   1. All non-extend kernels (decode, zero_()) have already executed.
+    #   2. After causal_conv1d_update emits gdc_launch_dependents(), the very next
+    #      kernel in this stream is the extend scatter-back — just one copy_ — before
+    #      the downstream flashinfer_ssm precompute kernel starts via PDL.
     if num_extend > 0:
         # num_extend_tokens == num_extend * (max_draft_len + 1) for static draft lengths
         # (dynamic lengths not supported)
@@ -136,7 +173,7 @@ def _triton_cached_causal_conv1d(
                 "that is too small for the extend branch"
             )
 
-        slot_idx_extend = slot_idx[num_prefill : num_prefill + num_extend].to(torch.int32)
+        slot_idx_extend = slot_idx_i32[num_prefill : num_prefill + num_extend]
 
         # The intermediate state cache will be stored in these indices and read by the mamba_cache_manager,
         # which expects them in the indices arange(num_extend). They are not used across requests, so we
@@ -161,34 +198,15 @@ def _triton_cached_causal_conv1d(
             intermediate_conv_window=intermediate_conv_state_cache,
             intermediate_state_indices=intermediate_state_indices,
             pad_slot_id=PAD_SLOT_ID,
+            launch_dependent_kernels=True,  # PDL signal to downstream replay precompute
         )
-        inp_flat[num_prefill_tokens : num_prefill_tokens + num_extend_tokens] = y_extend.transpose(
-            1, 2
-        ).view(-1, inp_flat.shape[1])
-
-    # DECODE: batch update for single-token sequences
-    if num_decode > 0:
-        x_decode = inp_flat[
-            num_prefill_tokens + num_extend_tokens : num_total_tokens
-        ]  # [num_decode_tokens, C_in]
-
-        # Note: Triton causal_conv1d_update returns a new tensor (not in-place like CUDA version)
-        # so we need to capture the output and write it back
-        y_decode = causal_conv1d_update(
-            x_decode,  # [batch, dim]
-            conv_state_cache,
-            w2d,
-            bias,
-            activation=activation,
-            cache_seqlens=None,
-            conv_state_indices=slot_idx[num_prefill + num_extend : num_seq].to(torch.int32),
-            pad_slot_id=PAD_SLOT_ID,
-        )
-        inp_flat[num_prefill_tokens + num_extend_tokens : num_total_tokens] = y_decode
-
-    # Zero padding positions beyond valid tokens (for piecewise CUDA graph)
-    if num_total_tokens < bs:
-        inp_flat[num_total_tokens:].zero_()
+        # Single copy_ scatter-back: y_extend [N,C,T] → inp_flat slice [N*T,C].
+        # Uses one efficient non-contiguous-to-contiguous copy instead of
+        # transpose+view+assign (previously 2+ kernels). This is now the only kernel
+        # between causal_conv1d_update and the PDL-dependent precompute.
+        inp_flat[num_prefill_tokens : num_prefill_tokens + num_extend_tokens].view(
+            num_extend, tokens_per_extend, -1
+        ).copy_(y_extend.permute(0, 2, 1))
 
 
 @_triton_cached_causal_conv1d.register_fake

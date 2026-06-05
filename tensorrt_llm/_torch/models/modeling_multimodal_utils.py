@@ -72,17 +72,31 @@ def bypass_processor_output_validation():
     argument 'video_grid_thw'`` even when no caller passes such keys.
 
     Patches ``validate_typed_dict`` in *all* transformers modules that bind
-    it (``processing_utils``, ``image_processing_utils_fast``,
-    ``video_processing_utils``) — each has its own ``from
-    huggingface_hub.dataclasses import validate_typed_dict``, so patching
-    only one is insufficient to cover sub-processor validation paths. The
-    originals are restored on exit.
+    it — each module has its own ``from huggingface_hub.dataclasses import
+    validate_typed_dict``, so patching only one is insufficient to cover
+    sub-processor validation paths. The set of binder modules differs
+    across transformers versions (5.3.x re-binds it on
+    ``image_processing_utils_fast``; 5.5.x dropped that module and re-binds
+    it on ``image_processing_utils`` instead), so we discover the binders
+    by ``hasattr`` rather than hard-coding the list. The originals are
+    restored on exit.
     """
-    import transformers.image_processing_utils_fast as _ipuf
     import transformers.processing_utils as _pu
     import transformers.video_processing_utils as _vpu
 
-    binders = (_pu, _ipuf, _vpu)
+    _candidate_binders = [_pu, _vpu]
+    for _name in ("transformers.image_processing_utils",
+                  "transformers.image_processing_utils_fast"):
+        try:
+            _candidate_binders.append(__import__(_name, fromlist=[""]))
+        except ImportError:
+            pass
+    binders = tuple(b for b in _candidate_binders
+                    if hasattr(b, "validate_typed_dict"))
+    if not binders:
+        raise RuntimeError(
+            "No transformers module exposes validate_typed_dict; "
+            "cannot patch processor output validation.")
     originals = {b: b.validate_typed_dict for b in binders}
     base_orig = next(iter(originals.values()))
 
@@ -166,7 +180,7 @@ def _cache_multimodal_embeddings(
     logger.debug(
         f"Caching {len(split_embeddings)} multimodal embedding chunks in {len(multimodal_params)} params"
     )
-    for param, embed_chunk in zip(valid_params, split_embeddings):
+    for param, embed_chunk in zip(valid_params, split_embeddings, strict=True):
         param.multimodal_data["multimodal_embedding"] = embed_chunk
 
     logger.debug(
@@ -409,9 +423,7 @@ def fuse_input_embeds(
     if mm_token_indices.shape[0] != mm_embed.shape[0]:
         raise ValueError(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
-            f"but received {mm_embed.shape[0]} image embeddings. "
-            "This is likely due to KV cache reuse, chunk prefill, or other optimizations that "
-            "cause token count mismatches within the inference batch.")
+            f"but received {mm_embed.shape[0]} image embeddings.")
 
     text_embed = embedding_layer(input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],
@@ -895,7 +907,7 @@ def multiscale_forward(model,
     num_splits = [math.ceil(size / max_split_size)
                   for size in img_sizes]  # number of splits each scale
     input_multiscale = []
-    for size, num_split in zip(img_sizes, num_splits):
+    for size, num_split in zip(img_sizes, num_splits, strict=True):
         x = F.interpolate(input.to(torch.float32), size=size,
                           mode='bicubic').to(input.dtype)
         x = s2_split_chessboard(x, num_split=num_split)
@@ -922,7 +934,7 @@ def multiscale_forward(model,
     # merge outputs of different splits for each scale separately
     outs_multiscale = [
         s2_merge_chessboard(out, num_split=num_split)
-        for num_split, out in zip(num_splits, outs_multiscale)
+        for num_split, out in zip(num_splits, outs_multiscale, strict=True)
     ]
 
     # interpolate outputs from different scales and concat together

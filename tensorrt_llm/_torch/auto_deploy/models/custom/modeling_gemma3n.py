@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -25,12 +29,14 @@ supports only text-only export.
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import AutoTokenizer
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.gemma3n.configuration_gemma3n import (
     Gemma3nAudioConfig,
@@ -40,7 +46,9 @@ from transformers.models.gemma3n.configuration_gemma3n import (
 )
 from transformers.utils import ModelOutput
 
+from ..factory import ModelFactoryRegistry
 from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
 def _get_rope_theta(config: Gemma3nTextConfig, layer_type: str = "full_attention") -> float:
@@ -51,21 +59,22 @@ def _get_rope_theta(config: Gemma3nTextConfig, layer_type: str = "full_attention
     ``config.rope_parameters[layer_type]["rope_theta"]`` or
     ``config.default_theta``.
     """
-    # Explicit attribute (set e.g. by deepcopy + manual override)
-    if hasattr(config, "rope_theta") and config.rope_theta is not None:
-        return float(config.rope_theta)
-
-    # transformers 5.x: per-layer-type parameters
     rope_params = getattr(config, "rope_parameters", None)
     if isinstance(rope_params, dict) and layer_type in rope_params:
         theta = rope_params[layer_type].get("rope_theta")
         if theta is not None:
             return float(theta)
 
-    # Fallback: default_theta dict
+    is_local_layer = "sliding" in layer_type or "local" in layer_type
+    if is_local_layer and hasattr(config, "rope_local_base_freq"):
+        return float(config.rope_local_base_freq)
+
+    if hasattr(config, "rope_theta") and config.rope_theta is not None:
+        return float(config.rope_theta)
+
     default_theta = getattr(config, "default_theta", None)
     if isinstance(default_theta, dict):
-        key = "local" if "sliding" in layer_type or "local" in layer_type else "global"
+        key = "local" if is_local_layer else "global"
         return float(default_theta.get(key, 10000.0))
     if default_theta is not None:
         return float(default_theta)
@@ -73,24 +82,39 @@ def _get_rope_theta(config: Gemma3nTextConfig, layer_type: str = "full_attention
     return 10000.0
 
 
-def _build_rope_cache(
+def _get_rope_type(config: Gemma3nTextConfig, layer_type: str = "full_attention") -> str:
+    rope_params = getattr(config, "rope_parameters", None)
+    if isinstance(rope_params, dict):
+        layer_params = rope_params.get(layer_type)
+        if isinstance(layer_params, dict):
+            return layer_params.get("rope_type", layer_params.get("type", "default"))
+        return rope_params.get("rope_type", rope_params.get("type", "default"))
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        return rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+
+    return "default"
+
+
+def _build_rope_inv_freq(
     config: Gemma3nTextConfig,
     layer_type: str = "full_attention",
-) -> Tuple[torch.Tensor, torch.Tensor, float]:
-    """Build RoPE cos/sin cache with default (no-scaling) computation.
+) -> tuple[torch.Tensor, float]:
+    rope_type = _get_rope_type(config, layer_type)
+    if rope_type == "default":
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        base = _get_rope_theta(config, layer_type)
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        return inv_freq, 1.0
 
-    In transformers 5.x the ``"default"`` key was removed from
-    ``ROPE_INIT_FUNCTIONS``, so we inline the standard computation.
-    """
-    head_dim = config.head_dim
-    base = _get_rope_theta(config, layer_type)
-    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-    attention_scaling = 1.0
-
-    positions = torch.arange(config.max_position_embeddings, dtype=inv_freq.dtype)
-    freqs = torch.outer(positions, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos(), emb.sin(), attention_scaling
+    try:
+        inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](
+            config, device=None, layer_type=layer_type
+        )
+    except TypeError:
+        inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
+    return inv_freq, attention_scaling
 
 
 class Gemma3nRMSNorm(nn.Module):
@@ -221,20 +245,20 @@ class Gemma3nTextAltUp(nn.Module):
         )
 
 
-class Gemma3nTextRotaryEmbedding(nn.Module):
+class Gemma3nTextRotaryEmbedding(RotaryEmbeddingBase):
     def __init__(self, config: Gemma3nTextConfig, layer_type: str = "full_attention"):
         super().__init__()
-        cos, sin, attention_scaling = _build_rope_cache(config, layer_type=layer_type)
-        self.register_buffer("_ad_cos_cached", cos * attention_scaling, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin * attention_scaling, persistent=False)
+        inv_freq, self.attention_scaling = _build_rope_inv_freq(config, layer_type=layer_type)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         del position_ids
-        cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
-        return cos, sin
+        return build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
+        )
 
 
 def _slice_rope_cache(
@@ -875,7 +899,21 @@ class Gemma3nForConditionalGeneration(Gemma3nPreTrainedModel, GenerationMixin):
         return Gemma3nConditionalOutput(logits=logits)
 
 
+@ModelFactoryRegistry.register("Gemma3nForConditionalGeneration")
+class Gemma3nForConditionalGenerationFactory(AutoModelForCausalLMFactory):
+    """Factory that wires native HF tokenizer support for Gemma 3n."""
+
+    def init_tokenizer(self) -> Optional[Any]:
+        if self.tokenizer is None:
+            return None
+        return AutoTokenizer.from_pretrained(self.tokenizer)
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
 AutoModelForCausalLMFactory.register_custom_model_cls("Gemma3nTextConfig", Gemma3nForCausalLM)
-AutoModelForCausalLMFactory.register_custom_model_cls(
+Gemma3nForConditionalGenerationFactory.register_custom_model_cls(
     "Gemma3nConfig", Gemma3nForConditionalGeneration
 )

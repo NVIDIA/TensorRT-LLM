@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -957,10 +957,12 @@ def preprocess_weights_for_mixed_gemm(
         sm_: int = -1,
         do_weight_interleave: bool = True) -> torch.Tensor:
     sm_ = sm_ if sm_ > 0 else get_sm_version()
+    # 3-D inputs (MoE) on Hopper+ and any input on SM120/SM121 reuse the SM80
+    # interleaved layout. Check the original rank before unsqueeze.
+    if (len(tensor.shape) == 3 and sm_ >= 90) or sm_ >= 120:
+        sm_ = 80
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
-    elif sm_ >= 90:
-        sm_ = 80
     if sm_ == 100 or sm_ == 103:
         do_weight_interleave = False
 

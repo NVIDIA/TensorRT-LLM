@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import json
 import math
 import os
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Union
 
 import pytest
 import scipy
+import torch
 import yaml
 
 import tensorrt_llm.evaluate
@@ -38,6 +40,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
 from ..trt_test_alternative import check_call, exists
+from .video_mme import VideoMME as VideoMMEEvaluator
 
 
 def compute_theta(num_samples: int,
@@ -282,6 +285,31 @@ class VoxPopuli(AccuracyTask):
         "dataset_path": DATASET_DIR,
         "split": "test",
         "text_column": "normalized_text",
+    }
+
+
+class VideoMME(AccuracyTask):
+    """Multiple-choice video QA accuracy task on the local Video-MME short shard."""
+
+    DATASET = "videomme"
+    DATASET_DIR = f"{llm_models_root()}/datasets/lmms-lab__Video-MME-short-v1"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = 300
+
+    MAX_BATCH_SIZE = 128
+    MAX_INPUT_LEN = 32768
+    # The prompt asks for one option letter; keep a compact cap with room for
+    # short extra text.
+    MAX_OUTPUT_LEN = 32
+
+    EVALUATOR_CLS = VideoMMEEvaluator
+    EVALUATOR_KWARGS = {
+        "dataset_path": DATASET_DIR,
+        "random_seed": 0,
+        "num_frames": 8,
     }
 
 
@@ -948,6 +976,19 @@ class LlmapiAccuracyTestHarness:
         logger.set_level("info")
         yield
         logger.set_level(original_level)
+
+    @pytest.fixture(autouse=True)
+    def _cleanup_cuda_between_tests(self):
+        # Force Python GC + CUDA cache release after each test method.
+        # The LLM context manager's __exit__ schedules destruction of CUDA
+        # resources (streams, graph captures, KV cache pools), but objects in
+        # reference cycles aren't reclaimed until the next GC cycle. Without
+        # this teardown, a leftover CUDA stream/graph from a previous test can
+        # land in the next test's allocations and corrupt them, producing
+        # cross-test IMA reports that look like the current test crashed.
+        yield
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def get_accuracy_task(dataset_name: str):

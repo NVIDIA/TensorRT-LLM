@@ -189,12 +189,31 @@ def _target_in_filter_subtree(target: str, filter_prefix: str) -> bool:
     )
 
 
+def _path_lookup_anchor(yaml_path: str) -> str:
+    """Return the lineage anchor for a YAML-namespace path.
+
+    Files whose basename does not start with `test_` (conftest.py,
+    __init__.py, helper modules like `disagg_test_utils.py`) anchor on
+    their enclosing directory: they're typically imported by tests in
+    the same dir; the blast-radius cap protects against helpers that
+    cover most blocks. Test files anchor on themselves. A top-level
+    helper with no enclosing dir returns "" — caller treats as no-match.
+    """
+    base = yaml_path.rsplit("/", 1)[-1]
+    if not base.startswith("test_"):
+        return yaml_path.rsplit("/", 1)[0] if "/" in yaml_path else ""
+    return yaml_path
+
+
 class YAMLIndex:
     """Index of all blocks across test-db YAMLs, with reverse lookup by test id."""
 
     def __init__(self) -> None:
         self.blocks: list[Block] = []
         self._test_to_blocks: dict[str, list[Block]] = {}
+        # Top-level path components of YAML canonical targets — drives the
+        # namespace boundary in `git_path_to_yaml_key`.
+        self._yaml_first_components: set[str] = set()
 
     @classmethod
     def load(cls, test_db_dir: Path) -> "YAMLIndex":
@@ -232,15 +251,15 @@ class YAMLIndex:
             for test in tests:
                 seen: set[str] = set()
                 norm = normalize_test_id(test)
-                for key in (
-                    test,
-                    norm,
-                    _strip_pytest_options(norm),
-                    _strip_params(_strip_pytest_options(norm)),
-                ):
+                canonical = _strip_params(_strip_pytest_options(norm))
+                for key in (test, norm, _strip_pytest_options(norm), canonical):
                     if key and key not in seen:
                         seen.add(key)
                         self._test_to_blocks.setdefault(key, []).append(block)
+                if canonical:
+                    head = canonical.split("/", 1)[0].split("::", 1)[0].split("[", 1)[0]
+                    if head:
+                        self._yaml_first_components.add(head)
 
     def find_match_for_waive(self, waive_id: str) -> Optional[tuple[str, list[Block]]]:
         """Walk up the pytest parent chain; first level with a match wins.
@@ -289,6 +308,62 @@ class YAMLIndex:
             if matched:
                 return level, matched
         return None
+
+    def git_path_to_yaml_key(self, git_path: str) -> Optional[str]:
+        """Translate a repo-relative git path to its YAML namespace form.
+
+        Returns the suffix of `git_path` starting at the first path
+        component that appears at the top of any YAML entry's canonical
+        target. Returns None when no component matches (file lives
+        outside any YAML-referenced tree, e.g. tests/microbenchmarks/).
+        """
+        parts = git_path.split("/")
+        for i, part in enumerate(parts):
+            if part in self._yaml_first_components:
+                return "/".join(parts[i:])
+        return None
+
+    def _lookup_at_anchor(self, anchor: str) -> Optional[list[tuple[Block, str]]]:
+        result: list[tuple[Block, str]] = []
+        for block in self.blocks:
+            covering: list[str] = []
+            for entry in block.tests:
+                t = _entry_target(entry)
+                if _target_in_filter_subtree(t, anchor) or _target_in_filter_subtree(anchor, t):
+                    covering.append(t)
+            if not covering:
+                continue
+            ancestors = [t for t in covering if _target_in_filter_subtree(anchor, t)]
+            prefix = min(ancestors, key=len) if ancestors else anchor
+            result.append((block, prefix))
+        return result or None
+
+    def find_match_for_path(self, path: str) -> Optional[list[tuple[Block, str]]]:
+        """Find YAML entries that share pytest-tree lineage with `path`.
+
+        Returns per-block (Block, filter_prefix) pairs, or None if no
+        entry covers `path`. Per block, prefix is the most-ancestral
+        covering target (clamped at the anchor when only descendants
+        match). `path` is in YAML namespace; translate via
+        `git_path_to_yaml_key` upstream.
+
+        For non-`test_*.py` paths (conftest.py, helpers, data files like
+        `references/*.yaml`), the lookup walks up enclosing directories
+        until one is covered by some YAML entry, picking the narrowest
+        such ancestor. `test_*.py` paths anchor on the file itself
+        without walking up.
+        """
+        anchor = _path_lookup_anchor(path)
+        if not anchor:
+            return None
+        is_file_anchor = anchor == path
+        while True:
+            matches = self._lookup_at_anchor(anchor)
+            if matches is not None:
+                return matches
+            if is_file_anchor or "/" not in anchor:
+                return None
+            anchor = anchor.rsplit("/", 1)[0]
 
     def all_test_ids(self) -> Iterable[str]:
         return self._test_to_blocks.keys()

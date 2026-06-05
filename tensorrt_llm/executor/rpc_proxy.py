@@ -1,12 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import threading
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
+from .proxy import _check_collective_rpc_guard
 from .result import IterationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
@@ -48,6 +63,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             is_llm_executor=is_llm_executor,
         )
 
+        self.model_world_size = model_world_size
         self._create_mpi_session(model_world_size, mpi_session)
 
         # Inject the generated HMAC key into worker_kwargs for workers
@@ -175,6 +191,48 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
         self._iter_kv_events_result.set_timeout(timeout)
         return self._iter_kv_events_result
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        target_ranks: Optional[Union[int, List[int]]] = None,
+    ) -> List:
+        """Execute a method call on the rank-0 RpcWorker via the RPC client.
+
+        Rank-0-only shim; only ``model_world_size == 1`` is supported.
+        See :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
+        for details.
+
+        Args:
+            method: Name of the
+                :class:`~tensorrt_llm.executor.rpc_worker.RpcWorker` method
+                to invoke.
+            args: Positional arguments forwarded to the worker method.
+            kwargs: Keyword arguments forwarded to the worker method.
+            non_block: If ``True``, return a ``Future`` without waiting.
+            unique_reply_rank: Must be ``None``.
+            target_ranks: Must be ``None``.
+
+        Returns:
+            A list containing the single return value (blocking) or a list
+            containing the pending :class:`~concurrent.futures.Future`
+            (non-blocking).
+
+        Raises:
+            NotImplementedError: If ``model_world_size > 1``, or if
+                ``unique_reply_rank`` or ``target_ranks`` are provided.
+        """
+        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
+                                    target_ranks)
+        kwargs = kwargs or {}
+        remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
+        if non_block:
+            return [remote_call.remote_future()]
+        return [remote_call.remote()]
 
     def setup_engine_remote(self):
         return self.rpc_client.setup_engine().remote(need_response=True)

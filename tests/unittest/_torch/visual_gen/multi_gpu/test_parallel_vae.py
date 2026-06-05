@@ -109,6 +109,16 @@ def _create_small_vae(device):
     return vae
 
 
+def _create_parallel_vae(vae, world_size, split_dim):
+    ranks = list(range(world_size))
+    pg = dist.new_group(ranks, use_local_synchronization=False)
+    adj_groups = [
+        dist.new_group([ranks[i], ranks[i + 1]], use_local_synchronization=False)
+        for i in range(world_size - 1)
+    ]
+    return ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec(split_dim), adj_groups)
+
+
 # ===========================================================================
 # Test-logic functions
 # ===========================================================================
@@ -128,8 +138,7 @@ def _logic_decode_width(rank, world_size):
     with torch.no_grad():
         ref = vae.decode(latent, return_dict=False)[0].detach().clone()
 
-    pg = dist.new_group(list(range(world_size)))
-    parallel = ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec("width"))
+    parallel = _create_parallel_vae(vae, world_size, "width")
 
     with torch.no_grad():
         par = parallel.decode(latent, return_dict=False)[0]
@@ -153,8 +162,7 @@ def _logic_encode_width(rank, world_size):
     with torch.no_grad():
         ref = vae.encode(video).latent_dist.mode().detach().clone()
 
-    pg = dist.new_group(list(range(world_size)))
-    parallel = ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec("width"))
+    parallel = _create_parallel_vae(vae, world_size, "width")
 
     with torch.no_grad():
         par = parallel.encode(video).latent_dist.mode()
@@ -176,8 +184,7 @@ def _logic_encode_width_return_dict_false(rank, world_size):
     with torch.no_grad():
         ref = vae.encode(video, return_dict=False)[0].mode().detach().clone()
 
-    pg = dist.new_group(list(range(world_size)))
-    parallel = ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec("width"))
+    parallel = _create_parallel_vae(vae, world_size, "width")
 
     with torch.no_grad():
         out = parallel.encode(video, return_dict=False)
@@ -202,8 +209,7 @@ def _logic_encode_width_sample(rank, world_size):
     with torch.no_grad():
         ref = vae.encode(video).latent_dist.sample(generator=generator).detach().clone()
 
-    pg = dist.new_group(list(range(world_size)))
-    parallel = ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec("width"))
+    parallel = _create_parallel_vae(vae, world_size, "width")
 
     generator = torch.Generator(device=device).manual_seed(42)
     with torch.no_grad():
@@ -226,8 +232,7 @@ def _logic_decode_width_return_dict_true(rank, world_size):
     with torch.no_grad():
         ref = vae.decode(latent).sample.detach().clone()
 
-    pg = dist.new_group(list(range(world_size)))
-    parallel = ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec("width"))
+    parallel = _create_parallel_vae(vae, world_size, "width")
 
     with torch.no_grad():
         out = parallel.decode(latent)
@@ -252,8 +257,7 @@ def _logic_decode_height(rank, world_size):
     with torch.no_grad():
         ref = vae.decode(latent, return_dict=False)[0].detach().clone()
 
-    pg = dist.new_group(list(range(world_size)))
-    parallel = ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec("height"))
+    parallel = _create_parallel_vae(vae, world_size, "height")
 
     with torch.no_grad():
         par = parallel.decode(latent, return_dict=False)[0]
@@ -276,8 +280,7 @@ def _logic_encode_height(rank, world_size):
     with torch.no_grad():
         ref = vae.encode(video).latent_dist.mode().detach().clone()
 
-    pg = dist.new_group(list(range(world_size)))
-    parallel = ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec("height"))
+    parallel = _create_parallel_vae(vae, world_size, "height")
 
     with torch.no_grad():
         par = parallel.encode(video).latent_dist.mode()

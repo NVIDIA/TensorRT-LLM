@@ -71,10 +71,10 @@ class TestExtractModule:
 class TestFormatModule:
     """Tests for _format_module which produces fixed-width display names."""
 
-    def test_short_name_padded(self):
+    def test_short_name(self):
         result = _format_module("serve")
-        assert len(result) == 8
-        assert result == "serve   "
+        assert len(result) == 5
+        assert result == "serve"
 
     def test_exact_8_char(self):
         result = _format_module("executor")
@@ -191,7 +191,7 @@ class TestLoggerOutput:
         exec(code, fake_globals)
 
         output = capture_log.getvalue()
-        assert "[serve   ]" in output
+        assert "[serve]" in output
         assert "from serve" in output
 
 

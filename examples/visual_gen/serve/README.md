@@ -18,11 +18,7 @@ These examples show how to interact with the visual generation server using both
 
 Before running these examples, ensure you have:
 
-1. **Install modules**: Install required dependencies before running examples:
-
-   ```bash
-   pip install "diffusers>=0.37.0"
-   ```
+1. **Install modules**: Install optional dependency:
 
    **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
    ```bash
@@ -44,6 +40,7 @@ Before running these examples, ensure you have:
    trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
    trtllm-serve $LLM_MODEL_DIR/LTX-2/ --extra_visual_gen_options ./configs/ltx2.yml
+   trtllm-serve $LLM_MODEL_DIR/Qwen-Image --extra_visual_gen_options ./configs/qwen_image.yml
 
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan21.yml > /tmp/serve.log 2>&1 &
@@ -62,6 +59,7 @@ Current supported & tested models:
 2. FLUX.1 for image generation (t2i)
 3. FLUX.2 for image generation (t2i)
 4. LTX-2 for video generation with audio (t2v, ti2v)
+5. Qwen-Image for image generation (t2i)
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 

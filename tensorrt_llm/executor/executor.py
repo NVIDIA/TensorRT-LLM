@@ -242,7 +242,11 @@ class GenerationExecutor(ABC):
                 or self.postproc_config.num_postprocess_workers > 0,
                 drop_generation_logits=(
                     not request.sampling_params._need_return_generation_logits)
-                or self.postproc_config.num_postprocess_workers > 0)
+                or self.postproc_config.num_postprocess_workers > 0,
+                logprobs_simple_format=request.sampling_params.
+                logprobs_simple_format,
+                prompt_logprobs_simple_format=request.sampling_params.
+                prompt_logprobs_simple_format)
 
         return logprob_params
 
@@ -369,6 +373,11 @@ class GenerationExecutor(ABC):
     @abstractmethod
     def shutdown(self):
         pass
+
+    @property
+    def resource_governor_queue(self):
+        """Return the resource governor queue if this executor supports it."""
+        return None
 
     @property
     def enable_postprocess_parallel(self) -> bool:

@@ -526,6 +526,19 @@ class DecoderModelForCausalLM(nn.Module,
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
+                        # Reset _weights_created so create_weights() in
+                        # __post_init__ will re-create this module's weights
+                        # with the updated (non-quantized) config. Some
+                        # wrappers (e.g. ConfigurableMoE) expose
+                        # _weights_created as a read-only property that
+                        # delegates to a child backend module — that backend
+                        # is itself an nn.Module child and will be visited
+                        # separately, so swallow the resulting AttributeError.
+                        if hasattr(module, '_weights_created'):
+                            try:
+                                module._weights_created = False
+                            except AttributeError:
+                                pass
 
     def __post_init__(self):
         self.apply_layerwise_quant_config()
@@ -565,6 +578,63 @@ class DecoderModelForCausalLM(nn.Module,
     @property
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
+
+    def setup_aliases(self) -> None:
+        """Wire structural Python references between modules.
+
+        This stage is for module-tree structure only, such as assigning
+        cross-layer module references or shared module aliases. It must not
+        read or mutate tensor values, so callers may run it before weight bytes
+        are available, materialized, or transformed.
+
+        The method is intentionally idempotent. Reassigning the same module
+        reference should preserve the same module graph, matching
+        ``torch.nn.Module.__setattr__`` semantics.
+
+        Returns:
+            None.
+        """
+
+    def transform_weights(self) -> None:
+        """Apply one-shot post-load transformations to weight tensors.
+
+        This stage is for irreversible or layout-changing tensor operations,
+        such as fusing weights or converting quantized weight representations.
+        Subclasses that migrate transform logic here should return early when
+        ``_weights_transformed`` is already true, and set it only after the
+        transform succeeds. Orchestrators that replace the underlying tensors
+        with fresh, untransformed bytes are responsible for resetting that flag.
+
+        Returns:
+            None.
+        """
+
+    def cache_derived_state(self) -> None:
+        """Recompute Python-side state derived from currently loaded weights.
+
+        This stage is reserved for idempotent recomputation from real tensors,
+        such as cached scalars, validation results, or fingerprints. It should
+        not perform one-shot weight transforms. Callers may run it after weight
+        bytes arrive from any loading or sharing mechanism.
+
+        Returns:
+            None.
+        """
+
+    def post_load_weights(self) -> None:
+        """Run the default staged post-load hook sequence.
+
+        Existing model-loading paths continue to call this method for backward
+        compatibility. More specialized loaders can call individual stages when
+        they need a subset of alias setup, tensor transformation, or derived
+        state recomputation.
+
+        Returns:
+            None.
+        """
+        self.setup_aliases()
+        self.transform_weights()
+        self.cache_derived_state()
 
     def forward(
         self,
@@ -754,6 +824,12 @@ def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
 
 
+_GEMMA4_ARCHITECTURES = (
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+)
+
+
 def get_model_architecture(
         model_config: TConfig) -> Tuple[Type[nn.Module], str]:
     cls = None
@@ -764,8 +840,13 @@ def get_model_architecture(
         raise RuntimeError(f"Model architecture is not provided.")
 
     if cls is None:
-        raise RuntimeError(
-            f"Unknown model architecture: {model_config.architectures[0]}")
+        arch = model_config.architectures[0]
+        if arch in _GEMMA4_ARCHITECTURES:
+            raise RuntimeError(
+                f"Gemma4 model support requires transformers>=5.5.0, "
+                f"please upgrade: pip install 'transformers>=5.5.0' "
+                f"(architecture: {arch}).")
+        raise RuntimeError(f"Unknown model architecture: {arch}")
     return cls, model_config.architectures[0]
 
 

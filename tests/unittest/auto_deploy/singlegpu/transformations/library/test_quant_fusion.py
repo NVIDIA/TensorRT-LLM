@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import operator
 
 # test_quant_fusion.py
@@ -17,8 +31,15 @@ from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8 im
     FuseRMSNormQuantFP8,
     _get_out_dtype_str,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_nvfp4 import (
+    FuseRMSNormQuantNVFP4,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
+    collect_terminal_users_through_passthrough,
+    is_op,
+    unwrap_input_through_passthrough,
+)
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale, fp8_scale
 
 
@@ -734,3 +755,476 @@ def test_get_out_dtype_str_returns_none_when_norm_meta_missing():
     norm.meta.pop("val", None)
 
     assert _get_out_dtype_str(norm) is None
+
+
+def test_passthrough_helpers_handle_method_views_and_optional_dtype_cast():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    view = graph.call_method("reshape", args=(x, (2, 4)))
+    cast = graph.call_function(torch.ops.aten.to.dtype, args=(view, torch.bfloat16))
+    user = graph.call_function(torch.ops.aten.neg.default, args=(cast,))
+    graph.output(user)
+
+    source, post_nodes = unwrap_input_through_passthrough(view)
+    assert source is x
+    assert post_nodes == [view]
+
+    source, post_nodes = unwrap_input_through_passthrough(cast, allow_dtype_cast=True)
+    assert source is x
+    assert post_nodes == [cast, view]
+
+    terminal_users, traversal_ok = collect_terminal_users_through_passthrough(x)
+    assert traversal_ok
+    assert terminal_users == [cast]
+
+    terminal_users, traversal_ok = collect_terminal_users_through_passthrough(
+        x, allow_dtype_cast=True
+    )
+    assert traversal_ok
+    assert terminal_users == [user]
+
+
+def _make_nvfp4_graph_root(hidden_size=64):
+    root = nn.Module()
+    root.register_buffer("norm_weight", torch.empty(hidden_size, dtype=torch.bfloat16))
+    root.register_buffer("weight_fp4", torch.empty(32, hidden_size // 2, dtype=torch.uint8))
+    root.register_buffer("input_scale", torch.empty(1, dtype=torch.float32))
+    root.register_buffer("weight_scale", torch.empty(128, 4, dtype=torch.uint8))
+    root.register_buffer("alpha", torch.empty(1, dtype=torch.float32))
+    return root
+
+
+def _get_fused_getitem(gm, fused_op, index):
+    matches = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and n.target is operator.getitem
+        and len(n.args) == 2
+        and isinstance(n.args[0], torch.fx.Node)
+        and is_op(n.args[0], fused_op)
+        and n.args[1] == index
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_fuse_gated_rmsnorm_quant_nvfp4_rewrites_graph():
+    root = _make_nvfp4_graph_root()
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    gate = graph.placeholder("gate")
+    norm_weight = graph.get_attr("norm_weight")
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+
+    norm_out = graph.call_function(
+        torch.ops.auto_deploy.triton_rmsnorm_gated.default,
+        args=(x, norm_weight, gate, 1e-5, 256, False),
+    )
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output(gemm_out)
+    norm_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.auto_deploy.trtllm_fused_gated_rmsnorm_quant_nvfp4)
+        for n in gm.graph.nodes
+    )
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.triton_rmsnorm_gated) for n in gm.graph.nodes)
+    fp4_node = _get_fused_getitem(
+        gm, torch.ops.auto_deploy.trtllm_fused_gated_rmsnorm_quant_nvfp4, 0
+    )
+    scale_node = _get_fused_getitem(
+        gm, torch.ops.auto_deploy.trtllm_fused_gated_rmsnorm_quant_nvfp4, 1
+    )
+    assert tuple(fp4_node.meta["val"].shape) == (2, 32)
+    assert fp4_node.meta["val"].dtype == torch.uint8
+    assert tuple(scale_node.meta["val"].shape) == (512,)
+    assert scale_node.meta["val"].dtype == torch.uint8
+
+
+def test_fuse_gated_rmsnorm_quant_nvfp4_accepts_dtype_cast():
+    root = _make_nvfp4_graph_root()
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    gate = graph.placeholder("gate")
+    norm_weight = graph.get_attr("norm_weight")
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+
+    norm_out = graph.call_function(
+        torch.ops.auto_deploy.triton_rmsnorm_gated.default,
+        args=(x, norm_weight, gate, 1e-5, 256, False),
+    )
+    cast_out = graph.call_function(torch.ops.aten.to.dtype, args=(norm_out, torch.bfloat16))
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(cast_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output(gemm_out)
+    norm_out.meta["val"] = torch.empty((2, 64), dtype=torch.float32)
+    cast_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.auto_deploy.trtllm_fused_gated_rmsnorm_quant_nvfp4)
+        for n in gm.graph.nodes
+    )
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.aten.to.dtype) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
+
+
+def test_fuse_gated_rmsnorm_quant_nvfp4_preserves_mixed_consumer_dtypes():
+    root = _make_nvfp4_graph_root()
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    gate = graph.placeholder("gate")
+    norm_weight = graph.get_attr("norm_weight")
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+
+    norm_out = graph.call_function(
+        torch.ops.auto_deploy.triton_rmsnorm_gated.default,
+        args=(x, norm_weight, gate, 1e-5, 256, False),
+    )
+    direct_gemm = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    cast_out = graph.call_function(torch.ops.aten.to.dtype, args=(norm_out, torch.bfloat16))
+    casted_gemm = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(cast_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output((direct_gemm, casted_gemm))
+    norm_out.meta["val"] = torch.empty((2, 64), dtype=torch.float32)
+    cast_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    direct_gemm.meta["val"] = torch.empty((2, 32), dtype=torch.float32)
+    casted_gemm.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    out_dtypes = {
+        n.kwargs["out_dtype"]
+        for n in gm.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear)
+    }
+
+    assert info.num_matches == 2
+    assert out_dtypes == {torch.float32, torch.bfloat16}
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
+
+
+def test_fuse_allreduce_rmsnorm_quant_nvfp4_rewrites_graph():
+    root = _make_nvfp4_graph_root()
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    residual = graph.placeholder("residual")
+    norm_weight = graph.get_attr("norm_weight")
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+
+    fused_allreduce = graph.call_function(
+        torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm.default,
+        args=(x, residual, norm_weight, 1e-5, "AUTO"),
+    )
+    norm_out = graph.call_function(operator.getitem, args=(fused_allreduce, 0))
+    residual_out = graph.call_function(operator.getitem, args=(fused_allreduce, 1))
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output((gemm_out, residual_out))
+    norm_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    residual_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4)
+        for n in gm.graph.nodes
+    )
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
+    assert not any(
+        is_op(n, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm) for n in gm.graph.nodes
+    )
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
+
+
+def test_fuse_allreduce_rmsnorm_quant_nvfp4_keeps_norm_for_mixed_consumers():
+    root = _make_nvfp4_graph_root()
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    residual = graph.placeholder("residual")
+    norm_weight = graph.get_attr("norm_weight")
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+
+    fused_allreduce = graph.call_function(
+        torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm.default,
+        args=(x, residual, norm_weight, 1e-5, "AUTO"),
+    )
+    norm_out = graph.call_function(operator.getitem, args=(fused_allreduce, 0))
+    residual_out = graph.call_function(operator.getitem, args=(fused_allreduce, 1))
+    extra_consumer = graph.call_function(torch.ops.aten.add.Tensor, args=(norm_out, 1.0))
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output((gemm_out, extra_consumer, residual_out))
+    norm_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    residual_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+    extra_consumer.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4)
+        for n in gm.graph.nodes
+    )
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
+    assert any(is_op(n, torch.ops.aten.add.Tensor) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
+
+
+def test_fuse_allreduce_rmsnorm_quant_nvfp4_clones_late_input_scale():
+    root = _make_nvfp4_graph_root()
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    residual = graph.placeholder("residual")
+    norm_weight = graph.get_attr("norm_weight")
+
+    fused_allreduce = graph.call_function(
+        torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm.default,
+        args=(x, residual, norm_weight, 1e-5, "AUTO"),
+    )
+    norm_out = graph.call_function(operator.getitem, args=(fused_allreduce, 0))
+    residual_out = graph.call_function(operator.getitem, args=(fused_allreduce, 1))
+    extra_consumer = graph.call_function(torch.ops.aten.add.Tensor, args=(norm_out, 1.0))
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output((gemm_out, extra_consumer, residual_out))
+    norm_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    residual_out.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+    extra_consumer.meta["val"] = torch.empty((2, 64), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    gm.graph.lint()
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4)
+        for n in gm.graph.nodes
+    )
+
+
+def test_fuse_add_rmsnorm_quant_nvfp4_rewrites_graph():
+    hidden_size = 2048
+    root = _make_nvfp4_graph_root(hidden_size)
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    residual = graph.placeholder("residual")
+    norm_weight = graph.get_attr("norm_weight")
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+
+    add_out = graph.call_function(torch.ops.aten.add.Tensor, args=(x, residual))
+    norm_out = graph.call_function(
+        torch.ops.auto_deploy.flashinfer_rms_norm.default,
+        args=(add_out, norm_weight, 1e-5),
+    )
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output((gemm_out, add_out))
+    add_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    norm_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.auto_deploy.trtllm_fused_add_rmsnorm_quant_nvfp4) for n in gm.graph.nodes
+    )
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.aten.add.Tensor) for n in gm.graph.nodes)
+
+
+def test_fuse_add_cast_rmsnorm_quant_nvfp4_rewrites_graph():
+    hidden_size = 2048
+    root = _make_nvfp4_graph_root(hidden_size)
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    residual = graph.placeholder("residual")
+    norm_weight = graph.get_attr("norm_weight")
+    weight_fp4 = graph.get_attr("weight_fp4")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+
+    add_out = graph.call_function(torch.ops.aten.add.Tensor, args=(x, residual))
+    cast_out = graph.call_function(torch.ops.aten.to.dtype, args=(add_out, torch.bfloat16))
+    norm_out = graph.call_function(
+        torch.ops.auto_deploy.flashinfer_rms_norm.default,
+        args=(cast_out, norm_weight, 1e-5),
+    )
+    input_scale = graph.get_attr("input_scale")
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output((gemm_out, add_out))
+    add_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    cast_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    norm_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    gm.graph.lint()
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.auto_deploy.trtllm_fused_add_rmsnorm_quant_nvfp4) for n in gm.graph.nodes
+    )
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.aten.to.dtype) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.aten.add.Tensor) for n in gm.graph.nodes)
+
+
+def test_fuse_add_cast_rmsnorm_quant_nvfp4_clones_late_norm_weight():
+    hidden_size = 2048
+    root = _make_nvfp4_graph_root(hidden_size)
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    residual = graph.placeholder("residual")
+
+    add_out = graph.call_function(torch.ops.aten.add.Tensor, args=(x, residual))
+    cast_out = graph.call_function(torch.ops.aten.to.dtype, args=(add_out, torch.bfloat16))
+    norm_weight = graph.get_attr("norm_weight")
+    norm_out = graph.call_function(
+        torch.ops.auto_deploy.flashinfer_rms_norm.default,
+        args=(cast_out, norm_weight, 1e-5),
+    )
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output((gemm_out, add_out))
+    add_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    cast_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    norm_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    gm.graph.lint()
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.auto_deploy.trtllm_fused_add_rmsnorm_quant_nvfp4) for n in gm.graph.nodes
+    )
+
+
+def test_fuse_add_rmsnorm_quant_nvfp4_keeps_norm_for_mixed_consumers():
+    hidden_size = 2048
+    root = _make_nvfp4_graph_root(hidden_size)
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    residual = graph.placeholder("residual")
+    norm_weight = graph.get_attr("norm_weight")
+    weight_fp4 = graph.get_attr("weight_fp4")
+    input_scale = graph.get_attr("input_scale")
+    weight_scale = graph.get_attr("weight_scale")
+    alpha = graph.get_attr("alpha")
+
+    add_out = graph.call_function(torch.ops.aten.add.Tensor, args=(x, residual))
+    norm_out = graph.call_function(
+        torch.ops.auto_deploy.flashinfer_rms_norm.default,
+        args=(add_out, norm_weight, 1e-5),
+    )
+    extra_consumer = graph.call_function(torch.ops.aten.mul.Tensor, args=(norm_out, 2.0))
+    gemm_out = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(norm_out, weight_fp4, None, input_scale, weight_scale, alpha),
+    )
+    graph.output((gemm_out, extra_consumer, add_out))
+    add_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    norm_out.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    extra_consumer.meta["val"] = torch.empty((2, hidden_size), dtype=torch.bfloat16)
+    gemm_out.meta["val"] = torch.empty((2, 32), dtype=torch.bfloat16)
+
+    gm = torch.fx.GraphModule(root, graph)
+    transform = FuseRMSNormQuantNVFP4(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    assert info.num_matches == 1
+    assert any(
+        is_op(n, torch.ops.auto_deploy.trtllm_fused_add_rmsnorm_out_quant_nvfp4)
+        for n in gm.graph.nodes
+    )
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
+    assert any(is_op(n, torch.ops.aten.mul.Tensor) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)

@@ -29,6 +29,21 @@ TensorRT LLM classifies APIs into two categories:
 - Schema stored in: `tests/unittest/api_stability/references/`
 - See [API status documentation](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html) for complete details
 
+### LLM API Change Classification
+
+Any backwards-incompatible LLM API change is breaking, regardless of whether the
+affected API is committed, prototype, beta, deprecated, or otherwise
+non-committed. Examples include removing arguments or methods, making optional
+arguments required, changing defaults in a way existing callers observe,
+narrowing accepted values, or changing return shapes/types.
+
+Do not break committed APIs. Prefer deprecation and migration paths. Breaking a
+non-committed API is less strict, but should still be avoided unless justified.
+If a pull request updates API stability reference files, classify the accepted
+contract change with exactly one GitHub label enforced by the LLM API
+Compatibility workflow: `api-compatible` or `api-breaking`. For `api-breaking`,
+include `BREAKING` in the PR title.
+
 ## API Schema Management
 
 All API schemas are:
@@ -264,12 +279,15 @@ When modifying existing methods:
 1. **Non-breaking changes** (adding optional parameters):
    - Update the method signature
    - Update the schema file
+   - Apply the `api-compatible` label if API stability reference files change
    - No status change needed
 
 2. **Breaking changes** (changing required parameters, return types):
-   - Only allowed for non-committed APIs
-   - Consider deprecation path for beta APIs
-   - Update documentation with migration guide
+   - Treat as breaking regardless of committed, prototype, beta, or deprecated status
+   - Do not break committed APIs; prefer deprecation and migration paths
+   - Avoid breaking non-committed APIs too, unless justified
+   - Apply the `api-breaking` label
+   - Include `BREAKING` in the PR title
 
 ### Best Practices
 

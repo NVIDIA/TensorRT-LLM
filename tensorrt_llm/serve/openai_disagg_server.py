@@ -36,8 +36,9 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               get_ctx_gen_server_addrs,
                                               get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
-                                                create_cluster_storage)
+from tensorrt_llm.serve.cluster_storage import (
+    HttpClusterStorageServer, create_cluster_storage,
+    validate_http_cluster_storage_scope)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
@@ -80,6 +81,12 @@ class RawRequestResponseHooks(ResponseHooks):
 
 
 class OpenAIDisaggServer:
+    _CONVERSATION_ID_HEADERS = (
+        "x-session-id",
+        "x-correlation-id",
+        "x-session-affinity",
+        "x-multi-turn-session-id",
+    )
 
     def __init__(self,
                  config: DisaggServerConfig,
@@ -99,7 +106,13 @@ class OpenAIDisaggServer:
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
-        self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
+        self._disagg_cluster_storage = None
+        if config.disagg_cluster_config:
+            validate_http_cluster_storage_scope(
+                config.disagg_cluster_config.cluster_uri, config.hostname)
+            self._disagg_cluster_storage = create_cluster_storage(
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name)
 
         self._service = OpenAIDisaggregatedService(
             self._config, self._ctx_router, self._gen_router, self._create_client,
@@ -164,15 +177,16 @@ class OpenAIDisaggServer:
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_id from the X-Correlation-ID header.
+        """Populate conversation_id from supported session headers.
 
         When not already set in the request body, copies the header value
         into ``disaggregated_params.conversation_id``.
 
-        aiperf sends multi-turn session IDs via the ``X-Correlation-ID``
-        header (see aiperf ``base_transports.build_headers``).  We mirror
-        that convention so the ConversationRouter can provide session
-        affinity without requiring clients to set the body field.
+        Supported headers are checked in priority order: ``X-Session-ID``,
+        ``X-Correlation-ID``, ``x-session-affinity``, and
+        ``x-multi-turn-session-id``.  We mirror these conventions so the
+        ConversationRouter can provide session affinity without requiring
+        clients to set the body field.
 
         When ``disaggregated_params`` is ``None`` (standard OpenAI
         requests without disagg fields), a minimal instance is created
@@ -180,9 +194,14 @@ class OpenAIDisaggServer:
         ``disaggregated_params`` in ``_get_ctx_request`` /
         ``_get_gen_request`` before forwarding to workers.
         """
-        header_conv_id = raw_req.headers.get("x-correlation-id")
-        if header_conv_id is None:
+        header_conv_id = None
+        for header_name in OpenAIDisaggServer._CONVERSATION_ID_HEADERS:
+            header_conv_id = raw_req.headers.get(header_name)
+            if header_conv_id is not None and header_conv_id.strip():
+                break
+        else:
             return
+
         if req.disaggregated_params is None:
             req.disaggregated_params = DisaggregatedParams(
                 request_type="context_only",

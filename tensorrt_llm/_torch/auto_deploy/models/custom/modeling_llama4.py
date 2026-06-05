@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -25,7 +29,6 @@ This implementation differs from the original HuggingFace version in the followi
 * Removed gradient checkpointing and training code paths
 * Removed attention dropout (inference only)
 * No repeat_kv — AD attention ops handle GQA natively
-* Complex RoPE frequencies precomputed once at model level
 
 The Llama 4 family features:
 * GQA with complex-frequency RoPE (with llama3-style scaling)
@@ -48,6 +51,7 @@ from transformers.models.llama4.configuration_llama4 import Llama4Config, Llama4
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_complex_cache
 
 # =========================================================================
 # Normalization
@@ -90,14 +94,11 @@ class Llama4L2Norm(nn.Module):
 # =========================================================================
 
 
-class Llama4RotaryEmbedding(nn.Module):
+class Llama4RotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for Llama 4 using complex frequencies.
 
     Supports llama3-style rope scaling via transformers ROPE_INIT_FUNCTIONS.
-    Precomputes and caches complex freqs_cis values. Slices by position_ids
-    once and returns pre-sliced freqs to all layers.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    Keeps only the small inv_freq buffer before graph-cache transforms.
     """
 
     def __init__(self, config: Llama4TextConfig):
@@ -122,16 +123,11 @@ class Llama4RotaryEmbedding(nn.Module):
             # Use HF's ROPE_INIT_FUNCTIONS to compute inv_freq with proper scaling
             inv_freq, self.attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
 
-        # Precompute complex frequencies for all positions
-        max_pos = config.max_position_embeddings
-        t = torch.arange(max_pos, dtype=inv_freq.dtype)
-        freqs = torch.outer(t, inv_freq)  # [max_pos, head_dim//2]
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex [max_pos, D//2]
-        freqs_cis = freqs_cis * self.attention_scaling
-        self.register_buffer("_ad_freqs_cis", freqs_cis, persistent=False)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return the full precomputed complex freqs_cis table.
+        """Return the full graph-computed complex freqs_cis table.
 
         Args:
             x: Input tensor (used only for device).
@@ -139,7 +135,9 @@ class Llama4RotaryEmbedding(nn.Module):
         Returns:
             freqs_cis: [max_pos, head_dim//2] complex tensor (full table).
         """
-        return self._ad_freqs_cis.to(device=x.device)
+        return build_rope_complex_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
+        )
 
 
 # =========================================================================

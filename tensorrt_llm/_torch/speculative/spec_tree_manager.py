@@ -10,6 +10,108 @@ from tensorrt_llm._utils import prefer_pinned
 logger = logging.getLogger(__name__)
 
 
+class DynamicTreeSlotStorage:
+    """Per-slot GPU storage for dynamic tree data, indexed by py_seq_slot.
+
+    Buffers are [S, ...] where S = num_slots + 1 (+1 for CUDA graph dummy).
+    """
+
+    def __init__(self, num_slots: int, n_dt: int, mask_width: int):
+        S = num_slots + 1
+        self.dummy_slot_id = num_slots
+
+        # Slot buffers — C++ kernel writes directly via slotIds
+        self.packed_mask = torch.zeros((S, n_dt, mask_width),
+                                       dtype=torch.int32,
+                                       device='cuda')
+        self.position_offsets = torch.zeros((S, n_dt),
+                                            dtype=torch.int32,
+                                            device='cuda')
+        self.retrieve_index = torch.zeros((S, n_dt),
+                                          dtype=torch.int32,
+                                          device='cuda')
+        self.retrieve_next_token = torch.full((S, n_dt),
+                                              -1,
+                                              dtype=torch.int32,
+                                              device='cuda')
+        self.retrieve_next_sibling = torch.full((S, n_dt),
+                                                -1,
+                                                dtype=torch.int32,
+                                                device='cuda')
+        self.has_tree = torch.zeros(S, dtype=torch.bool, device='cuda')
+
+        # Slot-ID buffers
+        self.all_ids_buf = torch.zeros(num_slots,
+                                       dtype=torch.long,
+                                       device='cuda')
+        self._pin_batch = torch.empty(num_slots,
+                                      dtype=torch.long,
+                                      pin_memory=prefer_pinned())
+        self._verify_staging = torch.empty((num_slots, n_dt, 3),
+                                           dtype=torch.int32,
+                                           device='cuda')
+        self._next_token_staging = torch.empty((num_slots, n_dt),
+                                               dtype=torch.int32,
+                                               device='cuda')
+        self._next_sibling_staging = torch.empty((num_slots, n_dt),
+                                                 dtype=torch.int32,
+                                                 device='cuda')
+
+    def fill_all_slot_ids(self, context_requests, generation_requests):
+        """Fill all_ids_buf for full batch [ctx | gen] via one HtoD copy."""
+        dummy_slot = self.dummy_slot_id
+        pin = self._pin_batch
+        cursor = 0
+        for req in context_requests:
+            pin[cursor] = req.py_seq_slot if req.py_seq_slot is not None else dummy_slot
+            cursor += 1
+        for req in generation_requests:
+            slot = req.py_seq_slot if (
+                not getattr(req, 'is_cuda_graph_dummy', False)
+                and req.py_seq_slot is not None) else dummy_slot
+            pin[cursor] = slot
+            cursor += 1
+        if cursor > 0:
+            self.all_ids_buf[:cursor].copy_(pin[:cursor], non_blocking=True)
+
+    def mark_valid(self, slot_ids, count):
+        if count == 0:
+            return
+        self.has_tree.index_fill_(0, slot_ids[:count], True)
+        self.has_tree.narrow(0, self.dummy_slot_id, 1).fill_(False)
+
+    def mark_invalid(self, slot_id):
+        """Clear validity and reset slot data."""
+        self.has_tree[slot_id] = False
+        self.packed_mask[slot_id] = 0
+        self.position_offsets[slot_id] = 0
+        self.retrieve_index[slot_id] = 0
+        self.retrieve_next_token[slot_id] = -1
+        self.retrieve_next_sibling[slot_id] = -1
+
+    def pack_retrieve_from_slots(self, slot_ids, count):
+        """Pack retrieve data into [count, n_dt, 3] staging buffer."""
+        if count == 0:
+            return self._verify_staging[:0]
+        ids = slot_ids[:count]
+        staging = self._verify_staging[:count]
+        staging[:, :, 0] = self.retrieve_index[ids]
+        staging[:, :, 1] = self.retrieve_next_token[ids]
+        staging[:, :, 2] = self.retrieve_next_sibling[ids]
+        return staging
+
+    def next_links_from_slots(self, slot_ids, count):
+        """Gather next-token and next-sibling links into contiguous staging buffers."""
+        if count == 0:
+            return self._next_token_staging[:0], self._next_sibling_staging[:0]
+        ids = slot_ids[:count]
+        next_token = self._next_token_staging[:count]
+        next_sibling = self._next_sibling_staging[:count]
+        torch.index_select(self.retrieve_next_token, 0, ids, out=next_token)
+        torch.index_select(self.retrieve_next_sibling, 0, ids, out=next_sibling)
+        return next_token, next_sibling
+
+
 class SpecTreeManager:
     use_dynamic_tree: bool  # Whether using dynamic tree
     max_total_draft_tokens: int  # The number of all nodes in the tree (except the root)
@@ -70,13 +172,11 @@ class SpecTreeManager:
     # shape: [max_draft_len + 1], device tensor.
     draft_tokens_indices_cumsum: torch.Tensor = None
 
-    ############################ Auxiliary buffers for the dynamic tree. ############################
-    # CUDA kernel outputs for dynamic tree verification.
-    # These are produced by build_dynamic_tree CUDA kernel and used by verify_dynamic_tree_greedy.
-    # shape: [num_trees, max_total_draft_tokens + 1], int32, device tensor.
+    # Work buffers for dynamic tree build kernel output
     retrieve_index: torch.Tensor = None
     retrieve_next_token: torch.Tensor = None
     retrieve_next_sibling: torch.Tensor = None
+    slot_storage: 'DynamicTreeSlotStorage | None' = None
 
     def __init__(self, max_num_requests: int, use_dynamic_tree: bool,
                  max_total_draft_tokens: int, max_draft_len: int,
@@ -120,17 +220,14 @@ class SpecTreeManager:
                 device='cuda',
             ).unsqueeze(0).repeat(self.num_trees, 1, 1)
 
-        # CUDA kernel facing — rows = max_total_draft_tokens + 1,
-        # columns widened to match attn_metadata mask_width so that the
-        # Hopper flat copy in update_spec_dec_param needs no per-row padding.
+        n_dt = self.max_total_draft_tokens + 1
         self.spec_dec_packed_mask = torch.zeros(
-            (self.num_trees, self.max_total_draft_tokens + 1,
-             math.ceil(self._internal_buf_dim / 32)),
+            (self.num_trees, n_dt, math.ceil(n_dt / 32)),
             dtype=torch.int32,
             device='cuda',
         )
         self.spec_dec_position_offsets = torch.zeros(
-            (self.num_trees, self.max_total_draft_tokens + 1),
+            (self.num_trees, n_dt),
             dtype=torch.int32,
             device='cuda',
         )
@@ -158,8 +255,16 @@ class SpecTreeManager:
             self.init_tree_info_for_static_tree()
 
     def init_tree_info_for_dynamic_tree(self):
-        # Allocate retrieve buffers for CUDA kernel outputs
         num_draft_with_root = self.max_total_draft_tokens + 1
+
+        self.top_k_list = [
+            torch.ones(self.dynamic_tree_max_topK,
+                       dtype=torch.int32,
+                       device='cpu',
+                       pin_memory=prefer_pinned()) * self.dynamic_tree_max_topK
+        ]
+
+        # Work buffers for build_dynamic_tree kernel output
         self.retrieve_index = torch.zeros((self.num_trees, num_draft_with_root),
                                           dtype=torch.int32,
                                           device='cuda')
@@ -174,109 +279,27 @@ class SpecTreeManager:
             dtype=torch.int32,
             device='cuda')
 
-        # For the dynamic tree
-        # To the internal layer, the number of nodes is the same as the dynamic_tree_max_topK.
-        self.top_k_list = [
-            torch.ones(self.dynamic_tree_max_topK,
-                       dtype=torch.int32,
-                       device='cpu',
-                       pin_memory=prefer_pinned()) * self.dynamic_tree_max_topK
-        ]
+        mask_width = math.ceil(num_draft_with_root / 32)
+        self.slot_storage = DynamicTreeSlotStorage(
+            num_slots=self.num_trees,
+            n_dt=num_draft_with_root,
+            mask_width=mask_width,
+        )
 
-        # Per-py_seq_slot storage (+1 dummy row for graph); survives batch reorder.
-        S = self.num_trees + 1
-        self._slot_packed_mask = torch.zeros(
-            (S, ) + self.spec_dec_packed_mask.shape[1:],
-            dtype=self.spec_dec_packed_mask.dtype,
-            device='cuda')
-        self._slot_position_offsets = torch.zeros(
-            (S, ) + self.spec_dec_position_offsets.shape[1:],
-            dtype=self.spec_dec_position_offsets.dtype,
-            device='cuda')
-        # [S, n_dt, 3]: index / next_token / next_sibling in one tensor (fewer gathers).
-        self._slot_retrieve_packed = torch.full((S, num_draft_with_root, 3),
-                                                -1,
-                                                dtype=torch.int32,
-                                                device='cuda')
-        self._slot_retrieve_packed[:, :, 0] = 0  # match retrieve_index default
-        self._all_slot_ids_buf = torch.zeros(self.num_trees,
-                                             dtype=torch.long,
-                                             device='cuda')
-        self._dummy_slot_id = self.num_trees
-
-        # True after scatter; dummy row stays False.
-        self.slot_has_tree = torch.zeros(S, dtype=torch.bool, device='cuda')
-
-        # Graph-safe: no per-forward host-to-device slot-id tensor alloc.
-        self._gather_gen_slot_ids_buf = torch.zeros(self.num_trees,
-                                                    dtype=torch.long,
-                                                    device='cuda')
-
-        # Scatter staging (no per-call torch.stack).
-        self._scatter_retrieve_staging = torch.empty(
-            (self.num_trees, num_draft_with_root, 3),
-            dtype=torch.int32,
-            device='cuda')
-
-    def fill_gen_slot_ids(self, gen_requests):
-        """Fill _gather_gen_slot_ids_buf; return (buf[:count], count). Gen LlmRequest only."""
-        buf = self._gather_gen_slot_ids_buf
-        dummy = self._dummy_slot_id
-        count = 0
-        for r in gen_requests:
-            buf[count] = r.py_seq_slot if r.py_seq_slot is not None else dummy
-            count += 1
-        return buf[:count], count
-
-    def mark_tree_valid(self, slot_ids, count):
-        """Set slot_has_tree True for scattered slots."""
-        if count == 0:
+    def scatter_to_slot_storage(self, ss, gen_slots, num_gens):
+        """Scatter work buffers to slot storage via index_copy_."""
+        if num_gens == 0:
             return
-        # index_fill_: graph-capture-safe (no fancy indexing).
-        self.slot_has_tree.index_fill_(0, slot_ids[:count], True)
-
-    def mark_tree_invalid(self, slot_id):
-        """Clear validity when a slot is freed."""
-        self.slot_has_tree[slot_id] = False
-
-    def scatter_trees_to_slots(self, slot_ids, count):
-        """Copy work buffers [:count] into per-slot storage (index_copy_ for graph capture)."""
-        if count == 0:
-            return
-        ids = slot_ids[:count]
-        self._slot_packed_mask.index_copy_(0, ids,
-                                           self.spec_dec_packed_mask[:count])
-        self._slot_position_offsets.index_copy_(
-            0, ids, self.spec_dec_position_offsets[:count])
-        staging = self._scatter_retrieve_staging[:count]
-        staging[:, :, 0] = self.retrieve_index[:count]
-        staging[:, :, 1] = self.retrieve_next_token[:count]
-        staging[:, :, 2] = self.retrieve_next_sibling[:count]
-        self._slot_retrieve_packed.index_copy_(0, ids, staging)
-
-    def gather_attn_params_from_slots(self, slot_ids, count):
-        """Copy mask and position offsets from slots into work buffers [:count]."""
-        if count == 0:
-            return
-        ids = slot_ids[:count]
-        self.spec_dec_packed_mask[:count] = self._slot_packed_mask[ids]
-        self.spec_dec_position_offsets[:count] = self._slot_position_offsets[
-            ids]
-
-    def gather_retrieve_from_slots(self, slot_ids, count):
-        """Copy retrieve tensors from slots into work buffers [:count]."""
-        if count == 0:
-            return
-        ids = slot_ids[:count]
-        packed = self._slot_retrieve_packed[ids]
-        self.retrieve_index[:count] = packed[..., 0]
-        self.retrieve_next_token[:count] = packed[..., 1]
-        self.retrieve_next_sibling[:count] = packed[..., 2]
-
-    def gather_trees_from_slots(self, slot_ids, count):
-        """gather_attn_params_from_slots + gather_retrieve_from_slots."""
-        self.gather_attn_params_from_slots(slot_ids, count)
-        self.gather_retrieve_from_slots(slot_ids, count)
+        ids = gen_slots[:num_gens]
+        ss.packed_mask.index_copy_(0, ids, self.spec_dec_packed_mask[:num_gens])
+        ss.position_offsets.index_copy_(
+            0, ids, self.spec_dec_position_offsets[:num_gens])
+        ss.retrieve_index.index_copy_(0, ids, self.retrieve_index[:num_gens])
+        ss.retrieve_next_token.index_copy_(0, ids,
+                                           self.retrieve_next_token[:num_gens])
+        ss.retrieve_next_sibling.index_copy_(
+            0, ids, self.retrieve_next_sibling[:num_gens])
+        ss.mark_valid(ids, num_gens)
 
     def init_tree_info_for_static_tree(self):
         self.index_mapping_set = {}
@@ -434,13 +457,21 @@ class SpecTreeManager:
 
         # Use cached bit weights
         weights = self._pack_weights
+        src = mask_matrix if mask_matrix.dtype == torch.int32 else mask_matrix.to(
+            torch.int32)
+
+        if num_blocks == 1 and num_tokens_attend <= 32:
+            result = self._pack_result_buf[:bs, :num_tokens, :1]
+            torch.sum(src * weights[:num_tokens_attend],
+                      dim=-1,
+                      out=result[:, :, 0])
+            packed_mask[:, :num_tokens, :1] = result
+            return packed_mask
 
         # Pad into pre-allocated buffer
         total_bits = num_blocks * 32
         padded_m = self._padded_mask_buf[:bs, :num_tokens, :total_bits]
         padded_m.zero_()
-        src = mask_matrix if mask_matrix.dtype == torch.int32 else mask_matrix.to(
-            torch.int32)
         padded_m[:, :, :num_tokens_attend].copy_(src)
 
         # Reshape last dim into [num_blocks, 32] for blocked packing
