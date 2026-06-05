@@ -192,7 +192,6 @@ examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padd
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-RobertaForQuestionAnswering-bert/roberta-base-squad2] SKIP (https://nvbugs/5234058)
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1] SKIP (https://nvbugs/5546507)
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2] SKIP (https://nvbugs/5546507)
-examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8] SKIP (https://nvbugs/5546507)
 examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b] SKIP (https://nvbugs/5606233)
 examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] SKIP (https://nvbugs/5431132)
 examples/test_granite.py::test_llm_granite[granite-3.0-1b-a400m-instruct-bfloat16] SKIP (https://nvbugs/5608979)
