@@ -51,13 +51,13 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image** [^2] | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **HunyuanDiT** [^3] | No | No | No | No | No | No | No | No | Yes | Yes | No | No |
+| **HunyuanDiT** [^3] | No | No | No | No | Yes | No | No | No | Yes | Yes | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
 [^2]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required.
 
-[^3]: HunyuanDiT uses bilingual (Chinese/English) text conditioning via a BertModel CLIP encoder and an MT5EncoderModel. The initial integration wraps the diffusers `HunyuanDiT2DModel` and supports BF16/FP16 inference via `trtllm-serve`. Quantization and parallel optimizations are planned for future releases.
+[^3]: HunyuanDiT uses bilingual (Chinese/English) text conditioning via a BertModel CLIP encoder and an MT5EncoderModel. Ulysses sequence parallelism is supported: after the patch-embed the latent sequence is sharded across ranks; a custom attention processor injects all-to-all collectives around self-attention while text cross-attention remains standard SDPA (text tokens are replicated). Set `ulysses_size` to the desired number of sequence-parallel ranks (must divide `num_attention_heads=16`). Quantization and ring-attention optimizations are planned for future releases.
 
 ## Quick Start
 
