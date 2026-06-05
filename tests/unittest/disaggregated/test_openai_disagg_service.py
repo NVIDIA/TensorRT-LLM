@@ -442,6 +442,17 @@ class TestVerifyCtxResponseDiagnostics:
         result = await svc._verify_ctx_response(resp)
         assert result is resp
 
+    @pytest.mark.asyncio
+    async def test_finished_ctx_with_none_ctx_request_id_is_accepted(self):
+        # MTP early-termination: ctx phase finishes the whole request (EOS)
+        # before the KV-cache handoff, so ctx_request_id is never populated.
+        # A terminal finish_reason makes this a valid context-only completion.
+        svc = _make_service("context_first")
+        resp = _make_completion_response("done", finish_reason="stop", disagg_request_id=7)
+        resp.choices[0].disaggregated_params.ctx_request_id = None
+        result = await svc._verify_ctx_response(resp)
+        assert result is resp
+
 
 class TestFirstGenLogProbsSerializeRoundtrip:
     """Roundtrip tests for _serialize/_deserialize_first_gen_log_probs."""

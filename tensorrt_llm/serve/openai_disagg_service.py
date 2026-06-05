@@ -394,6 +394,14 @@ class OpenAIDisaggregatedService(OpenAIService):
                     f" finish_reason={choice.finish_reason!r}"
                 )
             if choice.disaggregated_params.ctx_request_id is None:
+                # MTP early-termination edge case: the context phase may finish
+                # the whole request (e.g. EOS) before the KV-cache handoff is
+                # initiated, so ctx_request_id is never populated. When the ctx
+                # response is already a finished generation there is nothing to
+                # hand off to gen; treat it as a valid context-only completion
+                # (the caller short-circuits via _need_gen and returns it).
+                if choice.finish_reason not in (None, "length", "not_finished"):
+                    return ctx_response
                 raise ValueError(
                     f"Invalid disaggregated params: ctx_request_id is None."
                     f" finish_reason={choice.finish_reason!r},"
