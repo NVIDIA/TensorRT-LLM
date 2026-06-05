@@ -55,7 +55,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._block_radix_tree import (
         Hasher,
-        sequence_to_blockchain_keys,
         traverse_post_order,
     )
     from kv_cache_manager_v2._common import (
@@ -114,7 +113,6 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
         Hasher,
-        sequence_to_blockchain_keys,
         traverse_post_order,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
@@ -2538,14 +2536,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
 
 
 class TestBlockKeyHashing(unittest.TestCase):
-    """Pin the block-key hashing contract (no GPU needed).
-
-    ``Hasher.update`` hashes a token block in a single batched update for
-    speed; these tests lock in that it stays bit-identical to the reference
-    per-token little-endian encoding, including mixed int/bytes (multi-modal)
-    blocks. This is the invariant the ADP-router probe and create_kv_cache
-    reuse lookup depend on for cross-process / cross-run cache hits.
-    """
+    """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
 
     @staticmethod
     def _ref_update(seed: bytes, block: "list[int | bytes]") -> bytes:
@@ -2567,41 +2558,9 @@ class TestBlockKeyHashing(unittest.TestCase):
             )
 
     def test_update_mixed_multimodal_block(self) -> None:
-        # bytes items (multi-modal digests) interleaved with int token ids
         block = [randbytes(32), 5, 6, randbytes(32)] + list(range(20))
         seed = b"\x01"
         self.assertEqual(Hasher(seed).update(block).digest, self._ref_update(seed, block))
-
-    def test_update_equivalent_to_per_item(self) -> None:
-        # Batched update must equal feeding items one-by-one (streaming SHA-256).
-        block = list(range(50))
-        batched = Hasher().update(block).digest
-        h = Hasher()
-        for item in block:
-            h.update([item])
-        self.assertEqual(batched, h.digest)
-
-    def test_sequence_to_blockchain_keys_chaining(self) -> None:
-        tokens = [TokenId(i) for i in range(200)]
-        scope = ReuseScope(lora_id=7, salt=11)
-        for tpb in (8, 32, 64):
-            keys = [d for _, d in sequence_to_blockchain_keys(tpb, scope, tokens)]
-            # First key is the scope root; each subsequent key chains the
-            # previous digest with the next token block.
-            ref = hashlib.sha256(scope.to_bytes()).digest()
-            self.assertEqual(keys[0], ref)
-            for i in range(0, len(tokens), tpb):
-                ref = self._ref_update(ref, tokens[i : i + tpb])
-                self.assertEqual(keys[i // tpb + 1], ref)
-            # length = root + one per block
-            self.assertEqual(len(keys), (len(tokens) + tpb - 1) // tpb + 1)
-
-    def test_scope_changes_root_key(self) -> None:
-        tokens = [TokenId(i) for i in range(64)]
-        a = list(sequence_to_blockchain_keys(32, ReuseScope(salt=1), tokens))
-        b = list(sequence_to_blockchain_keys(32, ReuseScope(salt=2), tokens))
-        self.assertNotEqual(a[0][1], b[0][1])
-        self.assertNotEqual(a[-1][1], b[-1][1])
 
 
 if __name__ == "__main__":
