@@ -108,12 +108,8 @@ def _snapshot_and_force_fusion(model: Any, *, active: bool) -> None:
         if not isinstance(mlp, MLP):
             continue
         if not hasattr(mlp, "_use_fused_gelu_tanh_quant_orig"):
-            mlp._use_fused_gelu_tanh_quant_orig = getattr(
-                mlp, "_use_fused_gelu_tanh_quant", False
-            )
-        mlp._use_fused_gelu_tanh_quant = (
-            mlp._use_fused_gelu_tanh_quant_orig if active else False
-        )
+            mlp._use_fused_gelu_tanh_quant_orig = getattr(mlp, "_use_fused_gelu_tanh_quant", False)
+        mlp._use_fused_gelu_tanh_quant = mlp._use_fused_gelu_tanh_quant_orig if active else False
 
 
 # Latent shape presets. The transformer takes a 5-D latent
@@ -146,8 +142,8 @@ def _build_inputs(resolution: str, device: str = "cuda") -> tuple[Any, Any, Any]
 
     if resolution not in _RESOLUTION_PRESETS:
         raise ValueError(
-            f"unknown resolution {resolution!r}; choose from "
-            f"{sorted(_RESOLUTION_PRESETS)}")
+            f"unknown resolution {resolution!r}; choose from {sorted(_RESOLUTION_PRESETS)}"
+        )
     cfg = _RESOLUTION_PRESETS[resolution]
     B, C, T, H, W = cfg["B"], cfg["C"], cfg["T"], cfg["H"], cfg["W"]
     num_tokens = B * T * (H // 2) * (W // 2)
@@ -158,9 +154,7 @@ def _build_inputs(resolution: str, device: str = "cuda") -> tuple[Any, Any, Any]
     text_seq_len = 77
     hidden_states = torch.randn(B, C, T, H, W, device=device, dtype=torch.bfloat16)
     timestep = torch.tensor([500.0], device=device, dtype=torch.float32)
-    encoder_hidden_states = torch.randn(
-        B, text_seq_len, 4096, device=device, dtype=torch.bfloat16
-    )
+    encoder_hidden_states = torch.randn(B, text_seq_len, 4096, device=device, dtype=torch.bfloat16)
     return hidden_states, timestep, encoder_hidden_states
 
 
@@ -192,13 +186,8 @@ def _load_model(ckpt_path: str) -> Any:
     import safetensors.torch as st
     import torch
 
-    from tensorrt_llm._torch.visual_gen.config import (
-        DiffusionModelConfig,
-        VisualGenArgs,
-    )
-    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
-        WanTransformer3DModel,
-    )
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGenArgs
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
     args = VisualGenArgs(model=ckpt_path)
     model_config = DiffusionModelConfig.from_pretrained(ckpt_path, args=args)
@@ -337,7 +326,7 @@ def main() -> None:
         print(f"  output shape: {tuple(out.shape)}")
         print(f"  matches input shape: {tuple(out.shape) == tuple(inputs[0].shape)}")
         print(f"  all finite: {finite}")
-        peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
         print(f"  peak CUDA memory: {peak_mb:.1f} MB")
         print("-" * 72)
         return
