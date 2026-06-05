@@ -1224,6 +1224,14 @@ private:
 
     // List of allocated blocks for each sequences
     std::unordered_map<LlmRequest::RequestIdType, std::vector<BlockPtr>> mAllocatedBlocksPerSeq;
+    // Guards mutation of mAllocatedBlocksPerSeq (extract/erase) and the associated
+    // per-block refcount + eviction-policy release. The normal teardown path
+    // (releaseBlocks, driven by removeSequence) and the orphaned-block reclamation path
+    // (releaseOrphanedBlocks, driven by storeContextBlocks when the sequence was already
+    // removed) can run concurrently for the same request; without this lock both could
+    // extract() the same node and double-decrement refcounts. Leaf lock: never held while
+    // calling into storeBlocks()/the reuse trie (mLookupTree mutex) to avoid lock inversion.
+    mutable std::mutex mAllocatedBlocksMtx;
 
     // Pool per unique numKvHeads in the model
     std::vector<KVCacheBlockPool> mPools;
