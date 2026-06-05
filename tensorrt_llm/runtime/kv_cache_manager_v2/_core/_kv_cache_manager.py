@@ -562,8 +562,6 @@ class KVCacheManager:
         return peak
 
     def mark_stats_dirty(self, kv_cache_id: int | None) -> None:
-        if self._stats_enabled:
-            self._update_iteration_peak_num_blocks()
         if kv_cache_id is not None:
             self._dirty_stats_kv_cache_ids.add(kv_cache_id)
 
