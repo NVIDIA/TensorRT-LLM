@@ -47,6 +47,7 @@ from ._core import (
     BeamIndex,
     KVCacheManager,
     PageIndexConverter,
+    PoolGroupPeakBlockStats,
     ScratchDesc,
     _KVCache,
 )
@@ -108,6 +109,7 @@ __all__ = [
     "AggregatedPageDesc",
     "BufferId",
     "PageIndexConverter",
+    "PoolGroupPeakBlockStats",
     "PageIndexMode",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",
