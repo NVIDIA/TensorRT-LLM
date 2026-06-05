@@ -2146,22 +2146,6 @@ class PyExecutor:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
-    def _revert_ctx_alloc(self, dropped_context_requests):
-        """Revert KV cache capacity growth for ctx requests deferred by
-        delay batching.
-
-        With KV cache manager V2 + scheduler V2, ctx KV cache is grown
-        during scheduling (``resize_context``).  When delay batching
-        (``_balance_adp_requests`` for ADP, or ``_waiting_requests``
-        for non-ADP batch waiting) defers ctx requests, the
-        freshly-allocated pages would otherwise sit idle until the
-        request is re-scheduled, blocking pool space — particularly
-        painful for long-context workloads where each deferred ctx can
-        hold GBs of KV.
-        """
-        for req in dropped_context_requests:
-            self.kv_cache_manager.revert_allocate_context(req)
-
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
         if self._scheduler_manages_kv_suspend and isinstance(
@@ -3482,8 +3466,7 @@ class PyExecutor:
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
-        original_ctx_requests = scheduler_output.context_requests
-        scheduled_context_requests = original_ctx_requests
+        scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
             scheduled_context_requests = self._balance_adp_requests(
                 scheduler_output.context_requests,
@@ -3494,6 +3477,8 @@ class PyExecutor:
             scheduler_output.context_requests) > 0 and len(
                 scheduler_output.generation_requests) > 0
         if should_check_waiting:
+            # With KV cache manager V2, scheduling has already grown context request KV cache capacity. Requests dropped
+            # for batch waiting still occupy KV cache and may reduce the batch size available for generation requests.
             scheduled_context_requests = self._waiting_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
@@ -3506,19 +3491,6 @@ class PyExecutor:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
-
-        # V2 scheduler grew KV cache for ctx during scheduling; release
-        # those pages for any ctx that delay batching has dropped, so
-        # the wait window does not hold pool capacity hostage.  V1
-        # allocates after delay batching, so skip the dropped-set
-        # computation entirely on V1.
-        if (self._scheduler_manages_kv_suspend and
-                len(scheduled_context_requests) < len(original_ctx_requests)):
-            kept = {r.py_request_id for r in scheduled_context_requests}
-            dropped = [
-                r for r in original_ctx_requests if r.py_request_id not in kept
-            ]
-            self._revert_ctx_alloc(dropped)
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.reset_context_requests(scheduled_context_requests)
