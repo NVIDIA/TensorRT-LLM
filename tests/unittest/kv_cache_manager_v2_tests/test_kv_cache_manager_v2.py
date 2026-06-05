@@ -53,10 +53,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         TokenIdExt,
         _KVCache,
     )
-    from kv_cache_manager_v2._block_radix_tree import (
-        Hasher,
-        traverse_post_order,
-    )
+    from kv_cache_manager_v2._block_radix_tree import Hasher, traverse_post_order
     from kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,

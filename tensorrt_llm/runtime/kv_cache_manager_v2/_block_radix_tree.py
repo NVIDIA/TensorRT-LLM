@@ -101,7 +101,8 @@ class Hasher:
             except (TypeError, OverflowError):
                 for item in data:  # type: ignore
                     assert (
-                        NDEBUG or (type(item) is int and (0 <= item < (1 << 64)))
+                        NDEBUG
+                        or (type(item) is int and (0 <= item < (1 << 64)))
                         or type(item) is bytes
                     )
                     self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
