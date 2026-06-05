@@ -310,7 +310,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         md = _vision_attn_metadata([seq, seq])
         rope = Step3VisionRope2D(dim=16, max_grid_height=gh, max_grid_width=gw).cuda()
         freqs = rope.freqs_for_grid((gh, gw), x.device).unsqueeze(1).repeat(2, 1, 1)
-        out = attn(x, md, freqs)
+        out = attn(x, md, (freqs.cos(), freqs.sin()))
         self.assertEqual(out.shape, (2 * seq, hidden))
 
     def test_vision_attention_rejects_indivisible_heads(self):
@@ -354,7 +354,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         rope = Step3VisionRope2D(dim=hf, max_grid_height=gh, max_grid_width=gw).cuda()
         freqs = rope.freqs_for_grid((gh, gw), x.device).unsqueeze(1)
 
-        out = attn(x, _vision_attn_metadata([seq]), freqs)
+        out = attn(x, _vision_attn_metadata([seq]), (freqs.cos(), freqs.sin()))
 
         # Reference: real (unpadded) channels + SDPA with scale = hf ** -0.5.
         qkv_w = attn.qkv_proj.weight.view(3, nh, pd, hidden)[:, :, :hf, :].reshape(
@@ -415,7 +415,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         x = torch.randn(seq, hidden, device="cuda", dtype=_GPU_DTYPE)
         rope = Step3VisionRope2D(dim=16, max_grid_height=gh, max_grid_width=gw).cuda()
         freqs = rope.freqs_for_grid((gh, gw), x.device).unsqueeze(1)
-        out = block(x, _vision_attn_metadata([seq]), freqs)
+        out = block(x, _vision_attn_metadata([seq]), (freqs.cos(), freqs.sin()))
         # ls=0 ⇒ both residual branches contribute nothing ⇒ output == input.
         self.assertTrue(torch.allclose(out.float(), x.float(), atol=1e-6))
 

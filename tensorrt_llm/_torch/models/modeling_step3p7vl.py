@@ -83,13 +83,25 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(*x.shape[:-2], -1)
 
 
-def _apply_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+def _apply_rotary_emb_cos_sin(
+    cos: torch.Tensor, sin: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    """Apply 2D RoPE from precomputed ``cos``/``sin`` tables.
+
+    The encoder computes ``cos``/``sin`` once per forward and threads them
+    through every layer, so the same RoPE table is not recomputed per layer
+    (47 layers x q/k = 94 cos+sin evaluations otherwise).
+    """
     dtype = t.dtype
-    rot_dim = freqs.shape[-1]
+    rot_dim = cos.shape[-1]
     t_rot = t[..., :rot_dim]
     t_pass = t[..., rot_dim:]
-    t_rot = (t_rot * freqs.cos()) + (_rotate_half(t_rot) * freqs.sin())
+    t_rot = (t_rot * cos) + (_rotate_half(t_rot) * sin)
     return torch.cat((t_rot, t_pass), dim=-1).to(dtype)
+
+
+def _apply_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    return _apply_rotary_emb_cos_sin(freqs.cos(), freqs.sin(), t)
 
 
 class Step3VisionRope2D(nn.Module):
@@ -296,11 +308,12 @@ class Step3VisionAttention(Attention):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        freqs: Optional[torch.Tensor] = None,
+        rope_cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # Flat (num_tokens, hidden) layout; per-image segments are described by
-        # ``attn_metadata`` (FULL mask, context-only). ``freqs`` is the flat
-        # per-token 2D-RoPE frequency tensor (num_tokens, 1, hf_head_dim).
+        # ``attn_metadata`` (FULL mask, context-only). ``rope_cos_sin`` is the
+        # flat per-token 2D-RoPE ``(cos, sin)`` pair, each shaped
+        # (num_tokens, 1, hf_head_dim), precomputed once by the encoder.
         num_tokens = hidden_states.shape[0]
         qkv = self.qkv_proj(hidden_states)
         q, k, v = self.split_qkv(qkv)
@@ -316,9 +329,10 @@ class Step3VisionAttention(Attention):
         else:
             q_real, k_real, v_real = q, k, v
 
-        if freqs is not None:
-            q_real = _apply_rotary_emb(freqs, q_real)
-            k_real = _apply_rotary_emb(freqs, k_real)
+        if rope_cos_sin is not None:
+            cos, sin = rope_cos_sin
+            q_real = _apply_rotary_emb_cos_sin(cos, sin, q_real)
+            k_real = _apply_rotary_emb_cos_sin(cos, sin, k_real)
 
         # Re-pad with zeros for the FMHA kernel. Zeros in q/k pad don't change
         # QK^T; zeros in v pad produce zero output channels stripped by o_proj.
@@ -358,8 +372,8 @@ class Step3VisionBlock(nn.Module):
     """Single vision transformer block (Pre-LN + LayerScale).
 
     Operates on a flat ``(num_tokens, hidden)`` stream; the 2D-RoPE
-    frequencies (``freqs``) and ``attn_metadata`` are owned by the encoder and
-    threaded through unchanged.
+    ``(cos, sin)`` tables (``rope_cos_sin``) and ``attn_metadata`` are owned by
+    the encoder and threaded through unchanged.
     """
 
     def __init__(
@@ -399,11 +413,11 @@ class Step3VisionBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        freqs: Optional[torch.Tensor] = None,
+        rope_cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        hidden_states = self.attn(hidden_states, attn_metadata, freqs)
+        hidden_states = self.attn(hidden_states, attn_metadata, rope_cos_sin)
         hidden_states = residual + self.ls_1(hidden_states)
 
         residual = hidden_states
@@ -424,10 +438,10 @@ class Step3VisionTransformer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        freqs: Optional[torch.Tensor] = None,
+        rope_cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         for block in self.resblocks:
-            hidden_states = block(hidden_states, attn_metadata, freqs)
+            hidden_states = block(hidden_states, attn_metadata, rope_cos_sin)
         return hidden_states
 
 
@@ -582,21 +596,23 @@ class Step3p7VisionEncoder(nn.Module):
         md.prepare()
         return md
 
-    def _flat_freqs(
+    def _flat_rope_cos_sin(
         self, grid_hw: Tuple[int, int], batch: int, device: torch.device
-    ) -> Optional[torch.Tensor]:
-        """Flat per-token 2D-RoPE frequencies for ``batch`` same-grid images.
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Flat per-token 2D-RoPE ``(cos, sin)`` for ``batch`` same-grid images.
 
-        Shape ``(batch * seq, 1, hf_head_dim)``; the head axis is left as 1 so
-        it broadcasts over attention heads. All images in a single ``_encode``
-        call share the grid, so the single-image frequencies are simply tiled.
+        Each table has shape ``(batch * seq, 1, hf_head_dim)``; the head axis is
+        left as 1 so it broadcasts over attention heads. All images in a single
+        ``_encode`` call share the grid, so the single-image frequencies are
+        simply tiled. ``cos``/``sin`` are evaluated once here and reused across
+        all layers instead of being recomputed inside every attention call.
         """
         if self.rope is None:
             return None
         freqs = self.rope.freqs_for_grid(grid_hw, device).unsqueeze(1)  # (seq, 1, hf_hd)
         if batch > 1:
             freqs = freqs.repeat(batch, 1, 1)
-        return freqs
+        return freqs.cos(), freqs.sin()
 
     def _sample_abs_posemb(self, grid_h: int, grid_w: int) -> torch.Tensor:
         if self.posemb_grid_size == grid_h and self.posemb_grid_size == grid_w:
@@ -648,9 +664,9 @@ class Step3p7VisionEncoder(nn.Module):
         hidden, grid_hw = self._embed(pixel_values)  # (B, P, D)
         bsz, num_tokens, hidden_dim = hidden.shape
         flat = hidden.reshape(bsz * num_tokens, hidden_dim)
-        freqs = self._flat_freqs(grid_hw, bsz, flat.device)
+        rope_cos_sin = self._flat_rope_cos_sin(grid_hw, bsz, flat.device)
         attn_metadata = self._prepare_attn_metadata([num_tokens] * bsz)
-        flat = self.transformer(flat, attn_metadata, freqs)
+        flat = self.transformer(flat, attn_metadata, rope_cos_sin)
         if self.use_ln_post:
             flat = self.ln_post(flat)
         hidden = flat.reshape(bsz, num_tokens, hidden_dim)
@@ -1228,6 +1244,19 @@ class Step3p7VLForConditionalGeneration(nn.Module):
     # ----- engine-facing surface (delegate to the inner causal LM) -------
 
     @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        # Restrict the H2D copy to the tensors the vision tower actually
+        # consumes on GPU. ``num_patches`` / ``patch_newline_mask`` are metadata
+        # used host-side for reassembly, so keeping them on CPU avoids needless
+        # copies and a potential GPU sync if ``num_patches`` ever reached
+        # ``Step3p7VisionTower.forward`` as a CUDA tensor and hit ``.tolist()``.
+        return [
+            "image.pixel_values",
+            "image.patch_pixel_values",
+            "multimodal_embedding",
+        ]
+
+    @property
     def vocab_size_padded(self) -> int:
         return self.llm.vocab_size_padded
 
@@ -1327,13 +1356,17 @@ class Step3p7VLForConditionalGeneration(nn.Module):
 
         spec_input_ids = input_ids
         if input_ids is not None and mm_embeds:
-            vocab_size = self.llm.model.embed_tokens.num_embeddings
-            image_token_id = int(getattr(self.config, "image_token_id", 128001))
-            spec_input_ids = torch.where(
-                input_ids >= vocab_size,
-                input_ids.new_full((), image_token_id),
-                input_ids,
-            )
+            # ``spec_input_ids`` only feeds the MTP draft path; skip the
+            # ``torch.where`` rewrite of the OOV sentinels back to the image
+            # token id entirely when speculative decoding is off.
+            if self.spec_worker is not None:
+                vocab_size = self.llm.model.embed_tokens.num_embeddings
+                image_token_id = int(getattr(self.config, "image_token_id", 128001))
+                spec_input_ids = torch.where(
+                    input_ids >= vocab_size,
+                    input_ids.new_full((), image_token_id),
+                    input_ids,
+                )
             input_ids, inputs_embeds = fuse_input_embeds(
                 self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs
             )
