@@ -294,10 +294,10 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.helix_position_offsets = generationsParams.helix_position_offsets;
     xqaParams.helix_is_inactive_rank = generationsParams.helix_is_inactive_rank;
     xqaParams.softmax_stats = generationsParams.softmax_stats;
-    xqaParams.trtllmGenJITWarmup = generationsParams.trtllmGenJITWarmup;
-    xqaParams.trtllmGenJITWarmupMaxNumRequests = generationsParams.trtllmGenJITWarmupMaxNumRequests;
-    xqaParams.trtllmGenJITWarmupMaxSeqLenQ = generationsParams.trtllmGenJITWarmupMaxSeqLenQ;
-    xqaParams.trtllmGenJITWarmupMaxSeqLenKv = generationsParams.trtllmGenJITWarmupMaxSeqLenKv;
+    xqaParams.trtllm_gen_jit_warmup = generationsParams.trtllm_gen_jit_warmup;
+    xqaParams.trtllm_gen_jit_warmup_max_num_requests = mMaxNumRequests;
+    xqaParams.trtllm_gen_jit_warmup_max_seq_len_q = mMaxContextLength;
+    xqaParams.trtllm_gen_jit_warmup_max_seq_len_kv = mMaxSeqLen;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
@@ -1130,10 +1130,10 @@ int AttentionOp::mlaGeneration(
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
         tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
-        tllmRunnerParams.mJITWarmup = generation_params.trtllmGenJITWarmup;
-        tllmRunnerParams.mJITWarmupMaxNumRequests = generation_params.trtllmGenJITWarmupMaxNumRequests;
-        tllmRunnerParams.mJITWarmupMaxSeqLenQ = generation_params.trtllmGenJITWarmupMaxSeqLenQ;
-        tllmRunnerParams.mJITWarmupMaxSeqLenKv = generation_params.trtllmGenJITWarmupMaxSeqLenKv;
+        tllmRunnerParams.mJITWarmup = generation_params.trtllm_gen_jit_warmup;
+        tllmRunnerParams.mJITWarmupMaxNumRequests = mMaxNumRequests;
+        tllmRunnerParams.mJITWarmupMaxSeqLenQ = mMaxContextLength;
+        tllmRunnerParams.mJITWarmupMaxSeqLenKv = mMaxSeqLen;
         tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
@@ -1984,10 +1984,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
         fmhaParams.softmaxStatsPtr = params.softmax_stats;
-        fmhaParams.trtllmGenJITWarmup = params.trtllmGenJITWarmup;
-        fmhaParams.trtllmGenJITWarmupMaxNumRequests = params.trtllmGenJITWarmupMaxNumRequests;
-        fmhaParams.trtllmGenJITWarmupMaxSeqLenQ = params.trtllmGenJITWarmupMaxSeqLenQ;
-        fmhaParams.trtllmGenJITWarmupMaxSeqLenKv = params.trtllmGenJITWarmupMaxSeqLenKv;
+        fmhaParams.trtllmGenJITWarmup = params.trtllm_gen_jit_warmup;
+        fmhaParams.trtllmGenJITWarmupMaxNumRequests = mMaxNumRequests;
+        fmhaParams.trtllmGenJITWarmupMaxSeqLenQ = mMaxContextLength;
+        fmhaParams.trtllmGenJITWarmupMaxSeqLenKv = mMaxSeqLen;
 
         // Sparse attention parameters
         if (useTllmGenSparseAttention())

@@ -125,10 +125,7 @@ public:
         float const* sage_attn_sfs_k = nullptr;
         float const* sage_attn_sfs_v = nullptr;
         // Optional TRTLLM-Gen FMHA JIT warmup shape.
-        bool trtllmGenJITWarmup = false;
-        int32_t trtllmGenJITWarmupMaxNumRequests = 0;
-        int32_t trtllmGenJITWarmupMaxSeqLenQ = 0;
-        int32_t trtllmGenJITWarmupMaxSeqLenKv = 0;
+        bool trtllm_gen_jit_warmup = false;
     };
 
     template <typename T>
@@ -476,6 +473,7 @@ public:
     nvinfer1::DataType mType;
     int32_t mMaxContextLength = 0;
     int32_t mMaxSeqLen = 0;
+    int32_t mMaxNumRequests = 0;
     bool mQKVBiasEnabled = false;
     bool mCrossAttention = false;
     int mMaxDistance = 0;
@@ -557,9 +555,9 @@ public:
             mRotaryEmbeddingLongMscale, mRotaryEmbeddingMaxPositions, mRotaryEmbeddingOriginalMaxPositions,
             (int8_t) mPositionEmbeddingType, mUseLognScaling, mRemovePadding, (int32_t) mMaskType,
             mBlockSparseParams.data(), mPagedKVCache, mTokensPerBlock, mKVCacheQuantMode.value(), mTpSize, mTpRank,
-            mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mMaxSeqLen, mQKVBiasEnabled, mCrossAttention,
-            mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput, mFP8ContextMLA,
-            mFP8GenerationMLA, mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask,
+            mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mMaxSeqLen, mMaxNumRequests, mQKVBiasEnabled,
+            mCrossAttention, mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput,
+            mFP8ContextMLA, mFP8GenerationMLA, mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree, mSpecDecodingIsGenerationLengthVariable,
             mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mUseSparseAttention,
             mUseTllmGenSparseAttentionPaged, mUseTllmGenSparseAttention, mMLAParams.data(), mCpSize, mCpRank, mCpGroup,

@@ -4458,7 +4458,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
                                                    draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
-            attn_metadata.trtllm_gen_jit_warmup = (self._trtllm_gen_jit_warmup)
+            attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)

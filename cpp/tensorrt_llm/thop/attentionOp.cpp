@@ -1065,6 +1065,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mFuseFp4Quant = is_fp4_out;
     op->mMaxContextLength = max_context_length;
     op->mMaxSeqLen = max_seq_len;
+    op->mMaxNumRequests = max_num_requests;
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
         = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));

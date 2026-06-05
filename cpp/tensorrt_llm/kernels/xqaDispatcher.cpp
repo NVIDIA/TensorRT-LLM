@@ -495,10 +495,10 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
         tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
-        tllmRunnerParams.mJITWarmup = params.trtllmGenJITWarmup;
-        tllmRunnerParams.mJITWarmupMaxNumRequests = params.trtllmGenJITWarmupMaxNumRequests;
-        tllmRunnerParams.mJITWarmupMaxSeqLenQ = params.trtllmGenJITWarmupMaxSeqLenQ;
-        tllmRunnerParams.mJITWarmupMaxSeqLenKv = params.trtllmGenJITWarmupMaxSeqLenKv;
+        tllmRunnerParams.mJITWarmup = params.trtllm_gen_jit_warmup;
+        tllmRunnerParams.mJITWarmupMaxNumRequests = params.trtllm_gen_jit_warmup_max_num_requests;
+        tllmRunnerParams.mJITWarmupMaxSeqLenQ = params.trtllm_gen_jit_warmup_max_seq_len_q;
+        tllmRunnerParams.mJITWarmupMaxSeqLenKv = params.trtllm_gen_jit_warmup_max_seq_len_kv;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
