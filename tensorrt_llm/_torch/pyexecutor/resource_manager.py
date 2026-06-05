@@ -3147,10 +3147,10 @@ class KVCacheManagerV2(BaseResourceManager):
             primary_stats[pool_group_id].evictable
             for pool_group_id in pool_group_ids)
         stats.primary_peak_free_num_blocks = sum(
-            primary_peak_stats.free[pool_group_id]
+            primary_peak_stats.available[pool_group_id]
             for pool_group_id in pool_group_ids)
         stats.primary_peak_used_num_blocks = sum(
-            primary_peak_stats.used[pool_group_id]
+            primary_peak_stats.unavailable[pool_group_id]
             for pool_group_id in pool_group_ids)
         stats.primary_peak_evictable_num_blocks = sum(
             primary_peak_stats.evictable[pool_group_id]
@@ -3170,12 +3170,12 @@ class KVCacheManagerV2(BaseResourceManager):
             for level_stats in secondary_stats_by_level
             for pool_group_id in pool_group_ids)
         stats.secondary_peak_free_num_blocks = sum(
-            peak_block_stats_by_cache_level[cache_level].free[pool_group_id]
-            for cache_level in secondary_cache_levels
+            peak_block_stats_by_cache_level[cache_level].
+            available[pool_group_id] for cache_level in secondary_cache_levels
             for pool_group_id in pool_group_ids)
         stats.secondary_peak_used_num_blocks = sum(
-            peak_block_stats_by_cache_level[cache_level].used[pool_group_id]
-            for cache_level in secondary_cache_levels
+            peak_block_stats_by_cache_level[cache_level].
+            unavailable[pool_group_id] for cache_level in secondary_cache_levels
             for pool_group_id in pool_group_ids)
         stats.secondary_peak_evictable_num_blocks = sum(
             peak_block_stats_by_cache_level[cache_level].
@@ -3297,13 +3297,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
-        storage_stats = self.impl._get_storage_level_stats(GPU_LEVEL)
-        pool_group_stats = storage_stats.pool_group_stats
+        pool_group_stats = self.impl._storage.get_statistics(GPU_LEVEL)
+        max_num_blocks = sum(stat.total for stat in pool_group_stats)
+        free_num_blocks = sum(stat.available for stat in pool_group_stats)
         committed_stats = self.impl.get_committed_stats()
 
-        kv_cache_stats.max_num_blocks = storage_stats.max_num_blocks
-        kv_cache_stats.free_num_blocks = storage_stats.free_num_blocks
-        kv_cache_stats.used_num_blocks = storage_stats.used_num_blocks
+        kv_cache_stats.max_num_blocks = max_num_blocks
+        kv_cache_stats.free_num_blocks = free_num_blocks
+        kv_cache_stats.used_num_blocks = max_num_blocks - free_num_blocks
         kv_cache_stats.tokens_per_block = self.tokens_per_block
         kv_cache_stats.alloc_total_blocks = committed_stats.alloc_total_blocks
         kv_cache_stats.alloc_new_blocks = committed_stats.alloc_new_blocks
@@ -3320,7 +3321,7 @@ class KVCacheManagerV2(BaseResourceManager):
             for window_size, pool_group_ids in
             self._storage_pool_groups_by_window().items()
         }
-        kv_cache_stats.allocated_bytes = storage_stats.allocated_bytes
+        kv_cache_stats.allocated_bytes = self.impl.get_quota(GPU_LEVEL)
 
         return kv_cache_stats
 

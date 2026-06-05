@@ -42,7 +42,7 @@ from .._page import Page, _PageHolder
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from .._storage._config import BufferId, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
-from .._storage_manager import StorageManager, StorageStatistics
+from .._storage_manager import StorageManager
 from .._utils import (
     HalfOpenRange,
     HomoTuple,
@@ -183,18 +183,9 @@ class PageIndexConverter:
 
 
 @dataclass(slots=True, frozen=True)
-class _StorageLevelStats:
-    pool_group_stats: TypedIndexList[PoolGroupIndex, StorageStatistics]
-    max_num_blocks: int
-    free_num_blocks: int
-    used_num_blocks: int
-    allocated_bytes: int
-
-
-@dataclass(slots=True, frozen=True)
-class _PoolGroupBlockStats:
-    free: TypedIndexList[PoolGroupIndex, int]
-    used: TypedIndexList[PoolGroupIndex, int]
+class _PoolGroupPeakBlockStats:
+    available: TypedIndexList[PoolGroupIndex, int]
+    unavailable: TypedIndexList[PoolGroupIndex, int]
     evictable: TypedIndexList[PoolGroupIndex, int]
 
 
@@ -247,7 +238,7 @@ class KVCacheManager:
     _stats_enabled: bool
     _committed_stats: KVCacheStatsDelta
     _iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
-    _iteration_peak_num_blocks_by_cache_level: TypedIndexList[CacheLevel, _PoolGroupBlockStats]
+    _iteration_peak_num_blocks_by_cache_level: TypedIndexList[CacheLevel, _PoolGroupPeakBlockStats]
     _dirty_stats_kv_cache_ids: set[int]
     _stats_excluded_kv_cache_ids: set[int]
 
@@ -468,32 +459,22 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int:
         return self._storage._levels[cache_level].storage.total_quota
 
-    def _get_storage_level_stats(self, cache_level: CacheLevel) -> _StorageLevelStats:
-        pool_group_stats = self._storage.get_statistics(cache_level)
-        max_num_blocks = sum(stat.total for stat in pool_group_stats)
-        free_num_blocks = sum(stat.available for stat in pool_group_stats)
-        return _StorageLevelStats(
-            pool_group_stats=pool_group_stats,
-            max_num_blocks=max_num_blocks,
-            free_num_blocks=free_num_blocks,
-            used_num_blocks=max_num_blocks - free_num_blocks,
-            allocated_bytes=self.get_quota(cache_level),
-        )
-
     def _current_block_stats_by_cache_level(
         self,
-    ) -> TypedIndexList[CacheLevel, _PoolGroupBlockStats]:
-        def collect(cache_level: CacheLevel) -> _PoolGroupBlockStats:
-            free = filled_list(0, self._storage.num_pool_groups)
-            used = filled_list(0, self._storage.num_pool_groups)
+    ) -> TypedIndexList[CacheLevel, _PoolGroupPeakBlockStats]:
+        def collect(cache_level: CacheLevel) -> _PoolGroupPeakBlockStats:
+            available = filled_list(0, self._storage.num_pool_groups)
+            unavailable = filled_list(0, self._storage.num_pool_groups)
             evictable = filled_list(0, self._storage.num_pool_groups)
             for pool_group_index, stats in typed_enumerate(
                 self._storage.get_statistics(cache_level)
             ):
-                free[pool_group_index] = stats.available
-                used[pool_group_index] = stats.unavailable
+                available[pool_group_index] = stats.available
+                unavailable[pool_group_index] = stats.unavailable
                 evictable[pool_group_index] = stats.evictable
-            return _PoolGroupBlockStats(free=free, used=used, evictable=evictable)
+            return _PoolGroupPeakBlockStats(
+                available=available, unavailable=unavailable, evictable=evictable
+            )
 
         return make_typed(collect, self._storage.num_cache_levels)
 
@@ -506,13 +487,13 @@ class KVCacheManager:
             peak = self._iteration_peak_num_blocks_by_cache_level[cache_level]
             current_level = current[cache_level]
             for pool_group_index in typed_range(self._storage.num_pool_groups):
-                peak.free[pool_group_index] = max(
-                    peak.free[pool_group_index],
-                    current_level.free[pool_group_index],
+                peak.available[pool_group_index] = max(
+                    peak.available[pool_group_index],
+                    current_level.available[pool_group_index],
                 )
-                peak.used[pool_group_index] = max(
-                    peak.used[pool_group_index],
-                    current_level.used[pool_group_index],
+                peak.unavailable[pool_group_index] = max(
+                    peak.unavailable[pool_group_index],
+                    current_level.unavailable[pool_group_index],
                 )
                 peak.evictable[pool_group_index] = max(
                     peak.evictable[pool_group_index],
@@ -552,16 +533,16 @@ class KVCacheManager:
 
     def get_and_reset_iteration_peak_block_stats(
         self,
-    ) -> TypedIndexList[CacheLevel, _PoolGroupBlockStats]:
-        def copy_block_stats(stats: _PoolGroupBlockStats) -> _PoolGroupBlockStats:
+    ) -> TypedIndexList[CacheLevel, _PoolGroupPeakBlockStats]:
+        def copy_block_stats(stats: _PoolGroupPeakBlockStats) -> _PoolGroupPeakBlockStats:
             num_pool_groups = self._storage.num_pool_groups
-            return _PoolGroupBlockStats(
-                free=make_typed(
-                    lambda pool_group_index: stats.free[pool_group_index],
+            return _PoolGroupPeakBlockStats(
+                available=make_typed(
+                    lambda pool_group_index: stats.available[pool_group_index],
                     num_pool_groups,
                 ),
-                used=make_typed(
-                    lambda pool_group_index: stats.used[pool_group_index],
+                unavailable=make_typed(
+                    lambda pool_group_index: stats.unavailable[pool_group_index],
                     num_pool_groups,
                 ),
                 evictable=make_typed(

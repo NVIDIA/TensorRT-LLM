@@ -412,20 +412,20 @@ class TestStatsSerializer:
         peak_by_cache_level = manager.get_and_reset_iteration_peak_block_stats()
         primary_peak = peak_by_cache_level[GPU_LEVEL]
         secondary_peak = peak_by_cache_level[CacheLevel(1)]
-        assert list(primary_peak.free) == [8, 9]
-        assert list(primary_peak.used) == [5, 4]
+        assert list(primary_peak.available) == [8, 9]
+        assert list(primary_peak.unavailable) == [5, 4]
         assert list(primary_peak.evictable) == [3, 4]
-        assert list(secondary_peak.free) == [4, 5]
-        assert list(secondary_peak.used) == [3, 0]
+        assert list(secondary_peak.available) == [4, 5]
+        assert list(secondary_peak.unavailable) == [3, 0]
         assert list(secondary_peak.evictable) == [2, 0]
 
         # The next interval starts from current usage, not zero.
         peak_by_cache_level = manager.get_and_reset_iteration_peak_block_stats()
         primary_peak = peak_by_cache_level[GPU_LEVEL]
         secondary_peak = peak_by_cache_level[CacheLevel(1)]
-        assert list(primary_peak.free) == [7, 6]
-        assert list(primary_peak.used) == [3, 4]
+        assert list(primary_peak.available) == [7, 6]
+        assert list(primary_peak.unavailable) == [3, 4]
         assert list(primary_peak.evictable) == [1, 4]
-        assert list(secondary_peak.free) == [4, 5]
-        assert list(secondary_peak.used) == [1, 0]
+        assert list(secondary_peak.available) == [4, 5]
+        assert list(secondary_peak.unavailable) == [1, 0]
         assert list(secondary_peak.evictable) == [1, 0]
