@@ -38,7 +38,7 @@ from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, get_cache_salt_id,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
-from ..sampling_params import SamplingParams
+from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
@@ -116,6 +116,82 @@ class EncoderOutput:
     logits: torch.Tensor
     prompt_token_ids: List[int]
     prompt: Optional[str] = None
+
+
+class _BartForcedTokensLogitsProcessor(LogitsProcessor):
+    """Apply BART forced BOS/EOS tokens from Hugging Face generation config."""
+
+    _DECODER_PROMPT_LEN = 1
+
+    def __init__(
+        self,
+        *,
+        forced_bos_token_id: Optional[int],
+        forced_eos_token_id: Optional[int],
+        max_tokens: int,
+    ) -> None:
+        self.forced_bos_token_id = forced_bos_token_id
+        self.forced_eos_token_id = forced_eos_token_id
+        self.max_tokens = max_tokens
+
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: List[List[int]],
+        stream_ptr: Optional[int],
+        client_id: Optional[int],
+    ) -> None:
+        del req_id, client_id
+        if stream_ptr is None:
+            self._apply(token_ids, logits)
+            return
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            self._apply(token_ids, logits)
+
+    def _apply(self, token_ids: List[List[int]], logits: torch.Tensor) -> None:
+        for beam_idx, beam_token_ids in enumerate(token_ids):
+            forced_token_id = self._forced_token_id(beam_token_ids)
+            if forced_token_id is not None:
+                self._force_token(logits, beam_idx, len(token_ids),
+                                  forced_token_id)
+
+    def _forced_token_id(self, token_ids: List[int]) -> Optional[int]:
+        generated_len = max(len(token_ids) - self._DECODER_PROMPT_LEN, 0)
+        if generated_len == 0:
+            return self.forced_bos_token_id
+        if (self.max_tokens > 0 and generated_len == self.max_tokens - 1):
+            return self.forced_eos_token_id
+        return None
+
+    @staticmethod
+    def _force_token(logits: torch.Tensor, beam_idx: int, beam_count: int,
+                     token_id: int) -> None:
+        if token_id < 0 or token_id >= logits.shape[-1]:
+            raise ValueError(
+                f"Forced BART token id {token_id} is outside the logits "
+                f"vocabulary dimension {logits.shape[-1]}")
+
+        target = logits
+        if logits.dim() > 1 and logits.shape[0] == beam_count:
+            target = logits[beam_idx]
+        target[:] = float("-inf")
+        target[..., token_id] = 0
+
+
+def _contains_bart_forced_tokens_logits_processor(processor: Any) -> bool:
+    if isinstance(processor, _BartForcedTokensLogitsProcessor):
+        return True
+    if isinstance(processor, list):
+        return any(
+            _contains_bart_forced_tokens_logits_processor(item)
+            for item in processor)
+    processors = getattr(processor, "processors", None)
+    if isinstance(processors, list):
+        return any(
+            _contains_bart_forced_tokens_logits_processor(item)
+            for item in processors)
+    return False
 
 
 TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -1093,6 +1169,7 @@ class BaseLLM:
                     )
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
+            self._add_bart_forced_tokens_logits_processor(sampling_params)
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,
@@ -1117,6 +1194,38 @@ class BaseLLM:
                                                        "stream_interval", 1)
         sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
+
+    def _add_bart_forced_tokens_logits_processor(
+            self, sampling_params: SamplingParams) -> None:
+        if self.args.backend != "pytorch":
+            return
+        if getattr(self._hf_model_config, "model_type", None) != "bart":
+            return
+        if self._generation_config is None:
+            return
+
+        forced_bos_token_id = getattr(self._generation_config,
+                                      "forced_bos_token_id", None)
+        forced_eos_token_id = getattr(self._generation_config,
+                                      "forced_eos_token_id", None)
+        if forced_bos_token_id is None and forced_eos_token_id is None:
+            return
+
+        existing = sampling_params.logits_processor
+        if _contains_bart_forced_tokens_logits_processor(existing):
+            return
+
+        processor = _BartForcedTokensLogitsProcessor(
+            forced_bos_token_id=forced_bos_token_id,
+            forced_eos_token_id=forced_eos_token_id,
+            max_tokens=sampling_params.max_tokens,
+        )
+        if existing is None:
+            sampling_params.logits_processor = processor
+        elif isinstance(existing, list):
+            existing.append(processor)
+        else:
+            sampling_params.logits_processor = [existing, processor]
 
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams,

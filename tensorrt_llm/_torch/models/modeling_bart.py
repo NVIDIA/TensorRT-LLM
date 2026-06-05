@@ -86,6 +86,22 @@ def _bart_head_dim(config: BartConfig) -> int:
     return config.d_model // config.encoder_attention_heads
 
 
+def _packed_position_ids(
+    position_ids: Optional[torch.IntTensor],
+    hidden_states: torch.Tensor,
+) -> Optional[torch.IntTensor]:
+    if position_ids is None:
+        return None
+
+    position_ids = position_ids.reshape(-1)
+    if position_ids.numel() != hidden_states.shape[0]:
+        raise ValueError(
+            "BART packed position_ids must match hidden_states tokens: "
+            f"got {position_ids.numel()} positions for {hidden_states.shape[0]} tokens."
+        )
+    return position_ids
+
+
 # ---------------------------------------------------------------------------
 # BART Attention
 # ---------------------------------------------------------------------------
@@ -347,6 +363,7 @@ class BartEncoder(nn.Module):
         attn_metadata: AttentionMetadata,
         position_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
+        position_ids = _packed_position_ids(position_ids, hidden_states)
         if position_ids is not None:
             hidden_states = hidden_states + self.embed_positions(position_ids)
         hidden_states = self.layernorm_embedding(hidden_states)
@@ -392,6 +409,7 @@ class BartDecoder(nn.Module):
         cross_attn_metadata: Optional[AttentionMetadata] = None,
         skip_cross_kv_projection: bool = False,
     ) -> torch.Tensor:
+        position_ids = _packed_position_ids(position_ids, hidden_states)
         if position_ids is not None:
             hidden_states = hidden_states + self.embed_positions(position_ids)
         hidden_states = self.layernorm_embedding(hidden_states)
@@ -429,7 +447,9 @@ class BartModel(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
         )
-        self.embed_scale = math.sqrt(config.d_model)
+        self.embed_scale = (
+            math.sqrt(config.d_model) if getattr(config, "scale_embedding", False) else 1.0
+        )
         # HF BART learned position embeddings reserve indices 0 and 1.
         self.position_id_offset = 2
 
