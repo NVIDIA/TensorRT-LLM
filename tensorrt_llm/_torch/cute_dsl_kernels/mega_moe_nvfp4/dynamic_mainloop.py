@@ -12,7 +12,6 @@ import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import builtin, llvm
 from cutlass._mlir.dialects import nvvm as _nvvm_raw
-
 # auto-Int32/Boolean -> ir.Value wrapper for nvvm.* calls.
 from cutlass.cute.arch.nvvm_wrappers import nvvm
 from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
@@ -44,7 +43,8 @@ def compute_non_leader_cta_load_shift(
     The result ∈ (-mma_tiler_n/2, 0]; apply via
     ``cute.domain_offset((shift, 0, 0), real_b)`` on non-leader CTA only.
     """
-    return (_align16(valid_tokens_in_tile) >> Int32(1)) - Int32(mma_tiler_n // 2)
+    return (_align16(valid_tokens_in_tile) >> Int32(1)) - Int32(
+        mma_tiler_n // 2)
 
 
 # =============================================================================
@@ -86,14 +86,14 @@ _UMMA_K_NVFP4 = 64
 
 
 def build_static_idesc_base(
-    *,
-    umma_m: int,  # 64, 128, or 256
-    a_format: int = 1,  # NVFP4 mxf4nvf4
-    b_format: int = 1,
-    a_major: int = 0,  # 0 = K-major
-    b_major: int = 0,
-    scale_format: int = 0,  # 0 = E4M3 SF
-    k_size_bit: int = 0,  # 0 for NVFP4 (K=64)
+        *,
+        umma_m: int,  # 64, 128, or 256
+        a_format: int = 1,  # NVFP4 mxf4nvf4
+        b_format: int = 1,
+        a_major: int = 0,  # 0 = K-major
+        b_major: int = 0,
+        scale_format: int = 0,  # 0 = E4M3 SF
+        k_size_bit: int = 0,  # 0 for NVFP4 (K=64)
 ) -> int:
     """Pack the static-field portion of the idesc into a u32.
 
@@ -272,32 +272,50 @@ def issue_dynamic_block_scaled_mma_tile(
         with cute.arch.elect_one():
             if compatible_to_old_nvvm:
                 nvvm_args = {
-                    "mma_kind": _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
-                    "cta_group": _nvvm_raw.Tcgen05GroupKind.CTA_2
-                    if mma_tiler_mnk[0] == 256
+                    "mma_kind":
+                    _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
+                    "cta_group":
+                    _nvvm_raw.Tcgen05GroupKind.CTA_2 if mma_tiler_mnk[0] == 256
                     else _nvvm_raw.Tcgen05GroupKind.CTA_1,
-                    "d": operand_d_ptr,
-                    "a": operand_a,
-                    "b": operand_b,
-                    "idesc": idesc.ir_value(),
-                    "enable_input_d": Boolean(accum_flag).ir_value(),
-                    "scale_a": operand_sfa_ptr,
-                    "scale_b": operand_sfb_ptr,
-                    "scale_vec_size": _nvvm_raw.Tcgen05MMAScaleVecSize.X4,
+                    "d":
+                    operand_d_ptr,
+                    "a":
+                    operand_a,
+                    "b":
+                    operand_b,
+                    "idesc":
+                    idesc.ir_value(),
+                    "enable_input_d":
+                    Boolean(accum_flag).ir_value(),
+                    "scale_a":
+                    operand_sfa_ptr,
+                    "scale_b":
+                    operand_sfb_ptr,
+                    "scale_vec_size":
+                    _nvvm_raw.Tcgen05MMAScaleVecSize.X4,
                 }
             else:
                 nvvm_args = {
-                    "kind": _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
-                    "cta_group": _nvvm_raw.CTAGroupKind.CTA_2
-                    if mma_tiler_mnk[0] == 256
-                    else _nvvm_raw.CTAGroupKind.CTA_1,
-                    "matrix_d": operand_d_ptr,
-                    "matrix_a": operand_a,
-                    "matrix_b": operand_b,
-                    "idesc": idesc.ir_value(),
-                    "enable_input_d": Boolean(accum_flag).ir_value(),
-                    "scale_a": operand_sfa_ptr,
-                    "scale_b": operand_sfb_ptr,
-                    "block_scale": _nvvm_raw.Tcgen05MMABlockScale.BLOCK16,
+                    "kind":
+                    _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
+                    "cta_group":
+                    _nvvm_raw.CTAGroupKind.CTA_2 if mma_tiler_mnk[0] == 256 else
+                    _nvvm_raw.CTAGroupKind.CTA_1,
+                    "matrix_d":
+                    operand_d_ptr,
+                    "matrix_a":
+                    operand_a,
+                    "matrix_b":
+                    operand_b,
+                    "idesc":
+                    idesc.ir_value(),
+                    "enable_input_d":
+                    Boolean(accum_flag).ir_value(),
+                    "scale_a":
+                    operand_sfa_ptr,
+                    "scale_b":
+                    operand_sfb_ptr,
+                    "block_scale":
+                    _nvvm_raw.Tcgen05MMABlockScale.BLOCK16,
                 }
             nvvm.tcgen05_mma_block_scale(**nvvm_args)

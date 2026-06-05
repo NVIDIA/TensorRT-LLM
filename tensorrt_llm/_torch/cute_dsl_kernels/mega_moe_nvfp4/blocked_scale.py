@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Blocked-scale swizzle helpers for the MegaMoE CuteDSL NVFP4 backend.
 
 Ported byte-for-byte from the upstream runner_fc12.py helpers used by the
@@ -64,7 +63,7 @@ def to_blocked(scale_2d: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"Expected 2D scale tensor, got {scale_2d.dim()}D.")
     rows, cols = scale_2d.shape
     if rows == 0 or cols == 0:
-        return scale_2d.new_empty((0,))
+        return scale_2d.new_empty((0, ))
 
     row_blocks = ceil_div(rows, SfPaddingBlock)
     col_blocks = ceil_div(cols, 4)
@@ -73,17 +72,20 @@ def to_blocked(scale_2d: torch.Tensor) -> torch.Tensor:
 
     padded = scale_2d
     if (rows, cols) != (padded_rows, padded_cols):
-        padded = torch.zeros(
-            (padded_rows, padded_cols), dtype=scale_2d.dtype, device=scale_2d.device
-        )
+        padded = torch.zeros((padded_rows, padded_cols),
+                             dtype=scale_2d.dtype,
+                             device=scale_2d.device)
         padded[:rows, :cols] = scale_2d
 
-    blocks = padded.view(row_blocks, SfPaddingBlock, col_blocks, 4).permute(0, 2, 1, 3)
-    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+    blocks = padded.view(row_blocks, SfPaddingBlock, col_blocks,
+                         4).permute(0, 2, 1, 3)
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1,
+                                                        2).reshape(-1, 32, 16)
     return rearranged.flatten()
 
 
-def from_blocked(flat: torch.Tensor, raw_rows: int, raw_cols: int) -> torch.Tensor:
+def from_blocked(flat: torch.Tensor, raw_rows: int,
+                 raw_cols: int) -> torch.Tensor:
     """Inverse of :func:`to_blocked`: un-swizzle a flat 1-D FP8 atom buffer.
 
     Used by tests to read back the kernel-written ``fc1_output_sf``
@@ -123,7 +125,8 @@ def from_blocked(flat: torch.Tensor, raw_rows: int, raw_cols: int) -> torch.Tens
     return padded[:raw_rows, :raw_cols].contiguous()
 
 
-def cat_byte_reinterpretable_tensors(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+def cat_byte_reinterpretable_tensors(tensors: List[torch.Tensor],
+                                     dim: int = 0) -> torch.Tensor:
     """Concatenate byte-backed float tensors via uint8 view.
 
     Works around the lack of ``torch.cat`` support for FP8 dtypes on
@@ -133,12 +136,14 @@ def cat_byte_reinterpretable_tensors(tensors: List[torch.Tensor], dim: int = 0) 
         raise ValueError("Expected at least one tensor to concatenate.")
     first = tensors[0]
     if first.is_floating_point() and first.element_size() == 1:
-        concatenated = torch.cat([t.view(torch.uint8) for t in tensors], dim=dim)
+        concatenated = torch.cat([t.view(torch.uint8) for t in tensors],
+                                 dim=dim)
         return concatenated.view(first.dtype)
     return torch.cat(tensors, dim=dim)
 
 
-def stack_byte_reinterpretable_tensors(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+def stack_byte_reinterpretable_tensors(tensors: List[torch.Tensor],
+                                       dim: int = 0) -> torch.Tensor:
     """Stack byte-backed float tensors via uint8 view.
 
     Works around the lack of ``torch.stack`` support for FP8 dtypes on

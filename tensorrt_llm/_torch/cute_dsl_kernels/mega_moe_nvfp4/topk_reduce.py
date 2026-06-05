@@ -138,7 +138,8 @@ def logical_io_bytes(
     if nvfp4_sfc_scale is not None:
         read_bytes += nvfp4_sfc_scale.numel() * nvfp4_sfc_scale.element_size()
     if nvfp4_global_scale is not None:
-        read_bytes += nvfp4_global_scale.numel() * nvfp4_global_scale.element_size()
+        read_bytes += nvfp4_global_scale.numel(
+        ) * nvfp4_global_scale.element_size()
     write_bytes = reduced_output.numel() * reduced_output.element_size()
     return int(read_bytes), int(write_bytes), int(read_bytes + write_bytes)
 
@@ -156,7 +157,8 @@ def make_mxfp8_input(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize FP32 ``src`` to MXFP8 data plus UE8M0 dequant scale."""
     if src.dim() != 3:
-        raise ValueError(f"src must have shape (T, K, H), got {tuple(src.shape)}.")
+        raise ValueError(
+            f"src must have shape (T, K, H), got {tuple(src.shape)}.")
     if src.dtype != torch.float32:
         raise TypeError(f"src must be torch.float32, got {src.dtype}.")
     if not src.is_cuda:
@@ -253,7 +255,8 @@ def unpack_fp4_to_f32(packed: torch.Tensor) -> torch.Tensor:
     """Unpack a last-dim-packed FP4 tensor or uint8 byte tensor to FP32."""
     if packed.dtype == torch.uint8:
         raw = packed
-    elif hasattr(torch, "float4_e2m1fn_x2") and packed.dtype == torch.float4_e2m1fn_x2:
+    elif hasattr(torch,
+                 "float4_e2m1fn_x2") and packed.dtype == torch.float4_e2m1fn_x2:
         raw = packed.view(torch.uint8)
     else:
         raise TypeError(
@@ -264,15 +267,16 @@ def unpack_fp4_to_f32(packed: torch.Tensor) -> torch.Tensor:
     lut = _Fp4DecodeTable.to(raw.device)
     unpacked_shape = list(raw.shape)
     unpacked_shape[-1] *= 2
-    unpacked = torch.empty(unpacked_shape, dtype=torch.float32, device=raw.device)
+    unpacked = torch.empty(unpacked_shape,
+                           dtype=torch.float32,
+                           device=raw.device)
     unpacked[..., 0::2] = lut[lo]
     unpacked[..., 1::2] = lut[hi]
     return unpacked
 
 
 def make_nvfp4_input(
-    src: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    src: torch.Tensor, ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize FP32 ``src`` to NVFP4 plus per-16 FP8 and per-128 FP32 scales.
 
     The returned scales are dequant scales along hidden:
@@ -281,13 +285,16 @@ def make_nvfp4_input(
     if not hasattr(torch, "float8_e4m3fn"):
         raise TypeError("NVFP4 mode requires torch float8_e4m3fn.")
     if src.dim() != 3:
-        raise ValueError(f"src must have shape (T, K, H), got {tuple(src.shape)}.")
+        raise ValueError(
+            f"src must have shape (T, K, H), got {tuple(src.shape)}.")
     if src.dtype != torch.float32:
         raise TypeError(f"src must be torch.float32, got {src.dtype}.")
     if not src.is_cuda:
         raise ValueError("src must be a CUDA tensor.")
     if src.shape[-1] % 2 != 0:
-        raise ValueError(f"NVFP4 input hidden must be even for fp4x2 packing, got {src.shape[-1]}.")
+        raise ValueError(
+            f"NVFP4 input hidden must be even for fp4x2 packing, got {src.shape[-1]}."
+        )
 
     T, K, H = src.shape
     sfc_block = NVFP4_SFC_SCALE_BLOCK_SIZE
@@ -309,7 +316,8 @@ def make_nvfp4_input(
         dtype=torch.float32,
     )
     padded_abs_global[:, :, :H] = src.abs()
-    amax128 = padded_abs_global.reshape(T, K, global_cols, global_block).amax(dim=-1)
+    amax128 = padded_abs_global.reshape(T, K, global_cols,
+                                        global_block).amax(dim=-1)
 
     global_scale = torch.clamp(
         amax128 / (NVFP4_E2M1_MAX * FP8_E4M3FN_MAX),
@@ -325,7 +333,8 @@ def make_nvfp4_input(
     sfc_rt = sfc_fp8.to(torch.float32)
 
     expanded_sfc = sfc_rt.repeat_interleave(sfc_block, dim=-1)[:, :, :H]
-    expanded_global = global_scale.repeat_interleave(global_block, dim=-1)[:, :, :H]
+    expanded_global = global_scale.repeat_interleave(global_block,
+                                                     dim=-1)[:, :, :H]
     q = _pack_f32_to_fp4(src / (expanded_sfc * expanded_global))
     return q, sfc_fp8, global_scale
 
@@ -463,7 +472,7 @@ def topk_reduce_bf16_vec_kernel(
     base_h = vec_idx * Int32(BF16_HIDDEN_PER_THREAD)
 
     if base_h < Int32(hidden):
-        acc = cute.make_rmem_tensor((BF16_HIDDEN_PER_THREAD,), cutlass.Float32)
+        acc = cute.make_rmem_tensor((BF16_HIDDEN_PER_THREAD, ), cutlass.Float32)
         for i in cutlass.range_constexpr(0, BF16_HIDDEN_PER_THREAD, 1):
             acc[i] = Float32(0.0)
 
@@ -480,14 +489,14 @@ def topk_reduce_bf16_vec_kernel(
             score_pair = (score_value, score_value)
 
             in_regs = cute.make_rmem_tensor(
-                (BF16_HIDDEN_PER_THREAD,),
+                (BF16_HIDDEN_PER_THREAD, ),
                 cutlass.BFloat16,
             )
             in_row = combine_output[token_idx, Int32(k), None]
             in_tile = cute.local_tile(
                 in_row,
-                (BF16_HIDDEN_PER_THREAD,),
-                (base_h // Int32(BF16_HIDDEN_PER_THREAD),),
+                (BF16_HIDDEN_PER_THREAD, ),
+                (base_h // Int32(BF16_HIDDEN_PER_THREAD), ),
             )
             in_aligned_iter = cute.make_ptr(
                 in_tile.element_type,
@@ -503,9 +512,9 @@ def topk_reduce_bf16_vec_kernel(
             )
 
             for pair_i in cutlass.range_constexpr(
-                0,
-                BF16_HIDDEN_PER_THREAD // 2,
-                1,
+                    0,
+                    BF16_HIDDEN_PER_THREAD // 2,
+                    1,
             ):
                 val_pair = (
                     Float32(in_regs[2 * pair_i]),
@@ -529,12 +538,12 @@ def topk_reduce_bf16_vec_kernel(
         out_row = reduced_output[token_idx, None]
         out_tile = cute.local_tile(
             out_row,
-            (BF16_HIDDEN_PER_THREAD,),
-            (base_h // Int32(BF16_HIDDEN_PER_THREAD),),
+            (BF16_HIDDEN_PER_THREAD, ),
+            (base_h // Int32(BF16_HIDDEN_PER_THREAD), ),
         )
         if cutlass.const_expr(store_dtype == "bf16"):
             out_regs = cute.make_rmem_tensor(
-                (BF16_HIDDEN_PER_THREAD,),
+                (BF16_HIDDEN_PER_THREAD, ),
                 cutlass.BFloat16,
             )
             out_regs.store(acc.load().to(cutlass.BFloat16))
@@ -574,7 +583,8 @@ def topk_reduce_mxfp8_vec_kernel(
     base_h = vec_idx * Int32(MXFP8_HIDDEN_PER_THREAD)
 
     if base_h < Int32(hidden):
-        acc = cute.make_rmem_tensor((MXFP8_HIDDEN_PER_THREAD,), cutlass.Float32)
+        acc = cute.make_rmem_tensor((MXFP8_HIDDEN_PER_THREAD, ),
+                                    cutlass.Float32)
         for i in cutlass.range_constexpr(0, MXFP8_HIDDEN_PER_THREAD, 1):
             acc[i] = Float32(0.0)
 
@@ -602,14 +612,14 @@ def topk_reduce_mxfp8_vec_kernel(
             score_pair = (score_value, score_value)
 
             in_regs = cute.make_rmem_tensor(
-                (MXFP8_HIDDEN_PER_THREAD,),
+                (MXFP8_HIDDEN_PER_THREAD, ),
                 cutlass.Float8E4M3FN,
             )
             in_row = combine_output[token_idx, Int32(k), None]
             in_tile = cute.local_tile(
                 in_row,
-                (MXFP8_HIDDEN_PER_THREAD,),
-                (base_h // Int32(MXFP8_HIDDEN_PER_THREAD),),
+                (MXFP8_HIDDEN_PER_THREAD, ),
+                (base_h // Int32(MXFP8_HIDDEN_PER_THREAD), ),
             )
             in_aligned_iter = cute.make_ptr(
                 in_tile.element_type,
@@ -624,15 +634,15 @@ def topk_reduce_mxfp8_vec_kernel(
                 cute.coalesce(in_regs),
             )
             in_vals = cute.make_rmem_tensor(
-                (MXFP8_HIDDEN_PER_THREAD,),
+                (MXFP8_HIDDEN_PER_THREAD, ),
                 cutlass.Float32,
             )
             in_vals.store(in_regs.load().to(cutlass.Float32))
 
             for pair_i in cutlass.range_constexpr(
-                0,
-                MXFP8_HIDDEN_PER_THREAD // 2,
-                1,
+                    0,
+                    MXFP8_HIDDEN_PER_THREAD // 2,
+                    1,
             ):
                 val_pair = (
                     in_vals[2 * pair_i],
@@ -660,21 +670,23 @@ def topk_reduce_mxfp8_vec_kernel(
 
         out_row = reduced_output[token_idx, None]
         for chunk in cutlass.range_constexpr(
-            0,
-            MXFP8_HIDDEN_PER_THREAD // BF16_STORE_ELEMENTS_PER_256B,
-            1,
+                0,
+                MXFP8_HIDDEN_PER_THREAD // BF16_STORE_ELEMENTS_PER_256B,
+                1,
         ):
             out_regs = cute.make_rmem_tensor(
-                (BF16_STORE_ELEMENTS_PER_256B,),
+                (BF16_STORE_ELEMENTS_PER_256B, ),
                 cutlass.BFloat16,
             )
-            for i in cutlass.range_constexpr(0, BF16_STORE_ELEMENTS_PER_256B, 1):
-                out_regs[i] = acc[chunk * BF16_STORE_ELEMENTS_PER_256B + i].to(cutlass.BFloat16)
+            for i in cutlass.range_constexpr(0, BF16_STORE_ELEMENTS_PER_256B,
+                                             1):
+                out_regs[i] = acc[chunk * BF16_STORE_ELEMENTS_PER_256B + i].to(
+                    cutlass.BFloat16)
             out_h = base_h + Int32(chunk * BF16_STORE_ELEMENTS_PER_256B)
             out_tile = cute.local_tile(
                 out_row,
-                (BF16_STORE_ELEMENTS_PER_256B,),
-                (out_h // Int32(BF16_STORE_ELEMENTS_PER_256B),),
+                (BF16_STORE_ELEMENTS_PER_256B, ),
+                (out_h // Int32(BF16_STORE_ELEMENTS_PER_256B), ),
             )
             out_aligned_iter = cute.make_ptr(
                 out_tile.element_type,
@@ -730,14 +742,16 @@ def topk_reduce_kernel(
                 sfc_col = h // Int32(NVFP4_SFC_SCALE_BLOCK_SIZE)
                 global_col = h // Int32(NVFP4_GLOBAL_SCALE_BLOCK_SIZE)
                 sfc = Float32(nvfp4_sfc_scale[token_idx, Int32(k), sfc_col])
-                global_sf = Float32(nvfp4_global_scale[token_idx, Int32(k), global_col])
+                global_sf = Float32(nvfp4_global_scale[token_idx,
+                                                       Int32(k), global_col])
                 contrib = contrib * sfc * global_sf
             else:
                 contrib = Float32(combine_output[token_idx, Int32(k), h])
                 if cutlass.const_expr(mxfp8_scale is not None):
                     scale_col = h // Int32(MXFP8_SCALE_BLOCK_SIZE)
                     if cutlass.const_expr(mxfp8_scale_rank == 3):
-                        scale = Float32(mxfp8_scale[token_idx, Int32(k), scale_col])
+                        scale = Float32(mxfp8_scale[token_idx,
+                                                    Int32(k), scale_col])
                     else:
                         scale = Float32(mxfp8_scale[token_idx, scale_col])
                     contrib = contrib * scale
@@ -786,28 +800,30 @@ def topk_reduce_nvfp4_vec_kernel(
             num_bits_per_copy=256,
         )
 
-        global_regs = cute.make_rmem_tensor((num_topk,), cutlass.Float32)
+        global_regs = cute.make_rmem_tensor((num_topk, ), cutlass.Float32)
         for k in cutlass.range_constexpr(0, num_topk, 1):
-            global_regs[k] = Float32(nvfp4_global_scale[token_idx, Int32(k), global_col])
+            global_regs[k] = Float32(nvfp4_global_scale[token_idx,
+                                                        Int32(k), global_col])
         if cutlass.const_expr(topk_score is not None):
-            score_regs = cute.make_rmem_tensor((num_topk,), cutlass.Float32)
+            score_regs = cute.make_rmem_tensor((num_topk, ), cutlass.Float32)
             for k in cutlass.range_constexpr(0, num_topk, 1):
                 score_regs[k] = Float32(topk_score[token_idx, Int32(k)])
 
         out_row = reduced_output[token_idx, None]
         for sfc_block_i in cutlass.range_constexpr(
-            0,
-            NVFP4_HIDDEN_PER_THREAD // NVFP4_SFC_SCALE_BLOCK_SIZE,
-            1,
+                0,
+                NVFP4_HIDDEN_PER_THREAD // NVFP4_SFC_SCALE_BLOCK_SIZE,
+                1,
         ):
             acc = cute.make_rmem_tensor(
-                (NVFP4_SFC_SCALE_BLOCK_SIZE,),
+                (NVFP4_SFC_SCALE_BLOCK_SIZE, ),
                 cutlass.Float32,
             )
             for i in cutlass.range_constexpr(0, NVFP4_SFC_SCALE_BLOCK_SIZE, 1):
                 acc[i] = Float32(0.0)
 
-            sfc_base_h = base_h + Int32(sfc_block_i * NVFP4_SFC_SCALE_BLOCK_SIZE)
+            sfc_base_h = base_h + Int32(
+                sfc_block_i * NVFP4_SFC_SCALE_BLOCK_SIZE)
             for k in cutlass.range_constexpr(0, num_topk, 1):
                 global_sf = global_regs[k]
                 global_pair = (global_sf, global_sf)
@@ -817,14 +833,14 @@ def topk_reduce_nvfp4_vec_kernel(
                 score_pair = (score_value, score_value)
 
                 q_bytes = cute.make_rmem_tensor(
-                    (NVFP4_SFC_PACKED_BYTES,),
+                    (NVFP4_SFC_PACKED_BYTES, ),
                     cutlass.Uint8,
                 )
                 q_row = combine_output[token_idx, Int32(k), None]
                 q_tile = cute.local_tile(
                     q_row,
-                    (NVFP4_SFC_PACKED_BYTES,),
-                    (sfc_base_h // Int32(NVFP4_SFC_SCALE_BLOCK_SIZE),),
+                    (NVFP4_SFC_PACKED_BYTES, ),
+                    (sfc_base_h // Int32(NVFP4_SFC_SCALE_BLOCK_SIZE), ),
                 )
                 q_aligned_iter = cute.make_ptr(
                     q_tile.element_type,
@@ -840,24 +856,23 @@ def topk_reduce_nvfp4_vec_kernel(
                 )
                 q_fp4 = cute.recast_tensor(q_bytes, cutlass.Float4E2M1FN)
                 q_vals = q_fp4.load().to(cutlass.Float32)
-                sfc = Float32(
-                    nvfp4_sfc_scale[
-                        token_idx,
-                        Int32(k),
-                        sfc_col_base + Int32(sfc_block_i),
-                    ]
-                )
+                sfc = Float32(nvfp4_sfc_scale[
+                    token_idx,
+                    Int32(k),
+                    sfc_col_base + Int32(sfc_block_i),
+                ])
                 sfc_pair = (sfc, sfc)
                 for byte_offset in cutlass.range_constexpr(
-                    0,
-                    NVFP4_SFC_SCALE_BLOCK_SIZE // 2,
-                    1,
+                        0,
+                        NVFP4_SFC_SCALE_BLOCK_SIZE // 2,
+                        1,
                 ):
                     val_pair = (
                         q_vals[2 * byte_offset],
                         q_vals[2 * byte_offset + 1],
                     )
-                    contrib_pair = cute.arch.mul_packed_f32x2(val_pair, sfc_pair)
+                    contrib_pair = cute.arch.mul_packed_f32x2(
+                        val_pair, sfc_pair)
                     old_acc_pair = (
                         acc[2 * byte_offset],
                         acc[2 * byte_offset + 1],
@@ -883,15 +898,17 @@ def topk_reduce_nvfp4_vec_kernel(
 
             if cutlass.const_expr(store_dtype == "bf16"):
                 out_regs = cute.make_rmem_tensor(
-                    (BF16_STORE_ELEMENTS_PER_256B,),
+                    (BF16_STORE_ELEMENTS_PER_256B, ),
                     cutlass.BFloat16,
                 )
-                for i in cutlass.range_constexpr(0, BF16_STORE_ELEMENTS_PER_256B, 1):
+                for i in cutlass.range_constexpr(0,
+                                                 BF16_STORE_ELEMENTS_PER_256B,
+                                                 1):
                     out_regs[i] = acc[i].to(cutlass.BFloat16)
                 out_tile = cute.local_tile(
                     out_row,
-                    (BF16_STORE_ELEMENTS_PER_256B,),
-                    (sfc_base_h // Int32(BF16_STORE_ELEMENTS_PER_256B),),
+                    (BF16_STORE_ELEMENTS_PER_256B, ),
+                    (sfc_base_h // Int32(BF16_STORE_ELEMENTS_PER_256B), ),
                 )
                 out_aligned_iter = cute.make_ptr(
                     out_tile.element_type,
@@ -908,10 +925,11 @@ def topk_reduce_nvfp4_vec_kernel(
             else:
                 out_tile = cute.local_tile(
                     out_row,
-                    (NVFP4_SFC_SCALE_BLOCK_SIZE,),
-                    (sfc_base_h // Int32(NVFP4_SFC_SCALE_BLOCK_SIZE),),
+                    (NVFP4_SFC_SCALE_BLOCK_SIZE, ),
+                    (sfc_base_h // Int32(NVFP4_SFC_SCALE_BLOCK_SIZE), ),
                 )
-                for i in cutlass.range_constexpr(0, NVFP4_SFC_SCALE_BLOCK_SIZE, 1):
+                for i in cutlass.range_constexpr(0, NVFP4_SFC_SCALE_BLOCK_SIZE,
+                                                 1):
                     out_tile[i] = acc[i]
 
 
@@ -936,24 +954,25 @@ def _validate_tensors(
             f"reduced_output must be torch.float32 or torch.bfloat16, got {reduced_output.dtype}."
         )
     if not combine_output.is_cuda or not reduced_output.is_cuda:
-        raise ValueError("combine_output and reduced_output must both be CUDA tensors.")
+        raise ValueError(
+            "combine_output and reduced_output must both be CUDA tensors.")
     if combine_output.device != reduced_output.device:
         raise ValueError(
             f"combine_output and reduced_output must be on the same device, got "
-            f"{combine_output.device} and {reduced_output.device}."
-        )
+            f"{combine_output.device} and {reduced_output.device}.")
 
-    if mxfp8_scale is not None and (nvfp4_sfc_scale is not None or nvfp4_global_scale is not None):
+    if mxfp8_scale is not None and (nvfp4_sfc_scale is not None
+                                    or nvfp4_global_scale is not None):
         raise ValueError("MXFP8 and NVFP4 modes are mutually exclusive.")
     if (nvfp4_sfc_scale is None) != (nvfp4_global_scale is None):
-        raise ValueError("nvfp4_sfc_scale and nvfp4_global_scale must be provided together.")
+        raise ValueError(
+            "nvfp4_sfc_scale and nvfp4_global_scale must be provided together.")
 
     T, K, H_storage = combine_output.shape
     if T <= 0 or K <= 0 or H_storage <= 0:
         raise ValueError(
             f"combine_output shape must have positive dimensions, got "
-            f"{tuple(combine_output.shape)}."
-        )
+            f"{tuple(combine_output.shape)}.")
 
     nvfp4_mode = nvfp4_sfc_scale is not None
     H = int(H_storage) * 2 if nvfp4_mode else int(H_storage)
@@ -967,17 +986,20 @@ def _validate_tensors(
         if combine_output.dtype != torch.bfloat16:
             raise TypeError(
                 f"combine_output must be torch.bfloat16 unless mxfp8_scale is "
-                f"or NVFP4 scales are provided, got {combine_output.dtype}."
-            )
+                f"or NVFP4 scales are provided, got {combine_output.dtype}.")
     elif mxfp8_scale is not None:
-        if not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"):
-            raise TypeError("MXFP8 mode requires torch float8_e4m3fn and float8_e8m0fnu.")
+        if not hasattr(torch, "float8_e4m3fn") or not hasattr(
+                torch, "float8_e8m0fnu"):
+            raise TypeError(
+                "MXFP8 mode requires torch float8_e4m3fn and float8_e8m0fnu.")
         if combine_output.dtype != torch.float8_e4m3fn:
             raise TypeError(
                 f"MXFP8 combine_output must be torch.float8_e4m3fn, got {combine_output.dtype}."
             )
         if mxfp8_scale.dtype != torch.float8_e8m0fnu:
-            raise TypeError(f"mxfp8_scale must be torch.float8_e8m0fnu, got {mxfp8_scale.dtype}.")
+            raise TypeError(
+                f"mxfp8_scale must be torch.float8_e8m0fnu, got {mxfp8_scale.dtype}."
+            )
         if reduced_output.dtype != torch.bfloat16:
             raise TypeError(
                 f"MXFP8 reduced_output must be torch.bfloat16, got {reduced_output.dtype}."
@@ -996,8 +1018,7 @@ def _validate_tensors(
         else:
             raise ValueError(
                 "mxfp8_scale must have shape (T, ceil_div(H, 32)) or "
-                f"(T, K, ceil_div(H, 32)), got {tuple(mxfp8_scale.shape)}."
-            )
+                f"(T, K, ceil_div(H, 32)), got {tuple(mxfp8_scale.shape)}.")
         if mxfp8_scale.shape != expected_scale_shape:
             raise ValueError(
                 f"mxfp8_scale shape must be {expected_scale_shape}, got {tuple(mxfp8_scale.shape)}."
@@ -1027,27 +1048,31 @@ def _validate_tensors(
         if nvfp4_global_scale.device != combine_output.device:
             raise ValueError(
                 f"nvfp4_global_scale must be on {combine_output.device}, got "
-                f"{nvfp4_global_scale.device}."
-            )
-        sfc_cols = (H + NVFP4_SFC_SCALE_BLOCK_SIZE - 1) // NVFP4_SFC_SCALE_BLOCK_SIZE
-        global_cols = (H + NVFP4_GLOBAL_SCALE_BLOCK_SIZE - 1) // NVFP4_GLOBAL_SCALE_BLOCK_SIZE
+                f"{nvfp4_global_scale.device}.")
+        sfc_cols = (H + NVFP4_SFC_SCALE_BLOCK_SIZE -
+                    1) // NVFP4_SFC_SCALE_BLOCK_SIZE
+        global_cols = (H + NVFP4_GLOBAL_SCALE_BLOCK_SIZE -
+                       1) // NVFP4_GLOBAL_SCALE_BLOCK_SIZE
         expected_sfc_shape = (T, K, sfc_cols)
         expected_global_shape = (T, K, global_cols)
-        if nvfp4_sfc_scale.dim() != 3 or nvfp4_sfc_scale.shape != expected_sfc_shape:
+        if nvfp4_sfc_scale.dim(
+        ) != 3 or nvfp4_sfc_scale.shape != expected_sfc_shape:
             raise ValueError(
                 f"nvfp4_sfc_scale shape must be {expected_sfc_shape}, got "
-                f"{tuple(nvfp4_sfc_scale.shape)}."
-            )
-        if nvfp4_global_scale.dim() != 3 or nvfp4_global_scale.shape != expected_global_shape:
+                f"{tuple(nvfp4_sfc_scale.shape)}.")
+        if nvfp4_global_scale.dim(
+        ) != 3 or nvfp4_global_scale.shape != expected_global_shape:
             raise ValueError(
                 f"nvfp4_global_scale shape must be {expected_global_shape}, got "
-                f"{tuple(nvfp4_global_scale.shape)}."
-            )
+                f"{tuple(nvfp4_global_scale.shape)}.")
     if topk_score is not None:
         if topk_score.dim() != 2:
-            raise ValueError(f"topk_score must have shape (T, K), got {tuple(topk_score.shape)}.")
+            raise ValueError(
+                f"topk_score must have shape (T, K), got {tuple(topk_score.shape)}."
+            )
         if topk_score.dtype != torch.float32:
-            raise TypeError(f"topk_score must be torch.float32, got {topk_score.dtype}.")
+            raise TypeError(
+                f"topk_score must be torch.float32, got {topk_score.dtype}.")
         if not topk_score.is_cuda:
             raise ValueError("topk_score must be a CUDA tensor.")
         if topk_score.device != combine_output.device:
@@ -1055,7 +1080,9 @@ def _validate_tensors(
                 f"topk_score must be on {combine_output.device}, got {topk_score.device}."
             )
         if topk_score.shape != (T, K):
-            raise ValueError(f"topk_score shape must be {(T, K)}, got {tuple(topk_score.shape)}.")
+            raise ValueError(
+                f"topk_score shape must be {(T, K)}, got {tuple(topk_score.shape)}."
+            )
     return int(T), int(K), int(H), int(mxfp8_scale_rank)
 
 
@@ -1109,47 +1136,37 @@ def compile_topk_reduce(
 
     combine_cute = _to_cute_tensor(combine_output)
     reduced_cute = _to_cute_tensor(reduced_output)
-    topk_score_cute = _to_cute_tensor(topk_score) if topk_score is not None else None
-    mxfp8_scale_cute = _to_cute_tensor(mxfp8_scale) if mxfp8_scale is not None else None
-    nvfp4_sfc_scale_cute = _to_cute_tensor(nvfp4_sfc_scale) if nvfp4_sfc_scale is not None else None
-    nvfp4_global_scale_cute = (
-        _to_cute_tensor(nvfp4_global_scale) if nvfp4_global_scale is not None else None
-    )
+    topk_score_cute = _to_cute_tensor(
+        topk_score) if topk_score is not None else None
+    mxfp8_scale_cute = _to_cute_tensor(
+        mxfp8_scale) if mxfp8_scale is not None else None
+    nvfp4_sfc_scale_cute = _to_cute_tensor(
+        nvfp4_sfc_scale) if nvfp4_sfc_scale is not None else None
+    nvfp4_global_scale_cute = (_to_cute_tensor(nvfp4_global_scale)
+                               if nvfp4_global_scale is not None else None)
     nvfp4_mode = nvfp4_sfc_scale is not None
     bf16_vectorized = (
-        not nvfp4_mode
-        and mxfp8_scale is None
+        not nvfp4_mode and mxfp8_scale is None
         and combine_output.dtype == torch.bfloat16
-        and H % BF16_HIDDEN_PER_THREAD == 0
-        and combine_output.stride(-1) == 1
+        and H % BF16_HIDDEN_PER_THREAD == 0 and combine_output.stride(-1) == 1
         and combine_output.stride(-2) % BF16_HIDDEN_PER_THREAD == 0
         and reduced_output.stride(-1) == 1
-        and (
-            reduced_output.dtype != torch.bfloat16
-            or reduced_output.stride(0) % BF16_HIDDEN_PER_THREAD == 0
-        )
-    )
+        and (reduced_output.dtype != torch.bfloat16
+             or reduced_output.stride(0) % BF16_HIDDEN_PER_THREAD == 0))
     mxfp8_vectorized = (
-        mxfp8_scale is not None
-        and not nvfp4_mode
-        and H % MXFP8_HIDDEN_PER_THREAD == 0
-        and combine_output.stride(-1) == 1
+        mxfp8_scale is not None and not nvfp4_mode
+        and H % MXFP8_HIDDEN_PER_THREAD == 0 and combine_output.stride(-1) == 1
         and combine_output.stride(-2) % MXFP8_HIDDEN_PER_THREAD == 0
         and reduced_output.dtype == torch.bfloat16
         and reduced_output.stride(-1) == 1
-        and reduced_output.stride(0) % MXFP8_HIDDEN_PER_THREAD == 0
-    )
+        and reduced_output.stride(0) % MXFP8_HIDDEN_PER_THREAD == 0)
     nvfp4_vectorized = (
-        nvfp4_mode
-        and H % NVFP4_HIDDEN_PER_THREAD == 0
+        nvfp4_mode and H % NVFP4_HIDDEN_PER_THREAD == 0
         and combine_output.stride(-1) == 1
         and combine_output.stride(-2) % (NVFP4_HIDDEN_PER_THREAD // 2) == 0
         and reduced_output.stride(-1) == 1
-        and (
-            reduced_output.dtype != torch.bfloat16
-            or reduced_output.stride(0) % NVFP4_HIDDEN_PER_THREAD == 0
-        )
-    )
+        and (reduced_output.dtype != torch.bfloat16
+             or reduced_output.stride(0) % NVFP4_HIDDEN_PER_THREAD == 0))
     if bf16_vectorized:
         hidden_per_thread = BF16_HIDDEN_PER_THREAD
     elif mxfp8_vectorized:
@@ -1169,9 +1186,8 @@ def compile_topk_reduce(
             launch_threads = DEFAULT_THREADS
     else:
         launch_threads = threads
-    hidden_blocks = (H + launch_threads * hidden_per_thread - 1) // (
-        launch_threads * hidden_per_thread
-    )
+    hidden_blocks = (H + launch_threads * hidden_per_thread -
+                     1) // (launch_threads * hidden_per_thread)
     launch_grid = [hidden_blocks, T, 1]
 
     @cute.jit
@@ -1389,9 +1405,11 @@ def benchmark_topk_reduce_vs_torch_sum(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required for topk_reduce benchmark.")
     if output_dtype not in (torch.float32, torch.bfloat16):
-        raise ValueError(f"output_dtype must be FP32 or BF16, got {output_dtype}.")
+        raise ValueError(
+            f"output_dtype must be FP32 or BF16, got {output_dtype}.")
     if use_mxfp8 and use_nvfp4:
-        raise ValueError("MXFP8 and NVFP4 benchmark modes are mutually exclusive.")
+        raise ValueError(
+            "MXFP8 and NVFP4 benchmark modes are mutually exclusive.")
     if use_mxfp8 and output_dtype != torch.bfloat16:
         raise ValueError("MXFP8 benchmark requires BF16 output.")
     if threads is None:
@@ -1418,8 +1436,7 @@ def benchmark_topk_reduce_vs_torch_sum(
         input_dtype_name = "mxfp8"
     elif use_nvfp4:
         combine_output_ref, nvfp4_sfc_scale, nvfp4_global_scale = make_nvfp4_input(
-            combine_output_fp32,
-        )
+            combine_output_fp32, )
         mxfp8_scale = None
         input_dtype_name = "nvfp4"
     else:
@@ -1435,7 +1452,9 @@ def benchmark_topk_reduce_vs_torch_sum(
     )
     topk_score = None
     if use_topk_score:
-        topk_score = torch.rand((tokens, topk), device="cuda", dtype=torch.float32)
+        topk_score = torch.rand((tokens, topk),
+                                device="cuda",
+                                dtype=torch.float32)
 
     if print_result:
         print(
@@ -1493,12 +1512,18 @@ def benchmark_topk_reduce_vs_torch_sum(
             ).to(output_dtype)
         if topk_score is None:
             if output_dtype == torch.bfloat16 and not timed_baseline:
-                return ordered_reference_sum(combine_output_ref).to(output_dtype)
-            return combine_output_ref.to(torch.float32).sum(dim=1).to(output_dtype)
-        return weighted_reference_sum(combine_output_ref, topk_score).to(output_dtype)
+                return ordered_reference_sum(combine_output_ref).to(
+                    output_dtype)
+            return combine_output_ref.to(
+                torch.float32).sum(dim=1).to(output_dtype)
+        return weighted_reference_sum(combine_output_ref,
+                                      topk_score).to(output_dtype)
 
     expected_result = reference_result(timed_baseline=False)
-    torch.testing.assert_close(topk_output, expected_result, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(topk_output,
+                               expected_result,
+                               atol=1e-5,
+                               rtol=1e-5)
 
     def measure_cuda_ms(fn) -> float:
         for _ in range(warmup):
@@ -1547,22 +1572,20 @@ def benchmark_topk_reduce_vs_torch_sum(
     torch_bw = bandwidth_gbps(total_bytes, torch_ms)
 
     if print_result:
-        print(
-            "topk_reduce_vs_torch_sum "
-            f"shape={(tokens, topk, hidden)} output_dtype={output_dtype} "
-            f"input_dtype={input_dtype_name} "
-            f"mxfp8_scale_rank={mxfp8_scale_rank if use_mxfp8 else 'none'} "
-            f"topk_score={'on' if topk_score is not None else 'off'} "
-            f"threads={threads} "
-            f"warmup={warmup} iters={iters} "
-            f"topk_reduce_ms={topk_ms:.6f} "
-            f"torch_sum_ms={torch_ms:.6f} "
-            f"speedup_vs_torch={speedup:.3f}x "
-            f"read_gb={read_bytes / 1.0e9:.6f} "
-            f"write_gb={write_bytes / 1.0e9:.6f} "
-            f"topk_reduce_bw_gbps={topk_bw:.3f} "
-            f"torch_sum_bw_gbps={torch_bw:.3f}"
-        )
+        print("topk_reduce_vs_torch_sum "
+              f"shape={(tokens, topk, hidden)} output_dtype={output_dtype} "
+              f"input_dtype={input_dtype_name} "
+              f"mxfp8_scale_rank={mxfp8_scale_rank if use_mxfp8 else 'none'} "
+              f"topk_score={'on' if topk_score is not None else 'off'} "
+              f"threads={threads} "
+              f"warmup={warmup} iters={iters} "
+              f"topk_reduce_ms={topk_ms:.6f} "
+              f"torch_sum_ms={torch_ms:.6f} "
+              f"speedup_vs_torch={speedup:.3f}x "
+              f"read_gb={read_bytes / 1.0e9:.6f} "
+              f"write_gb={write_bytes / 1.0e9:.6f} "
+              f"topk_reduce_bw_gbps={topk_bw:.3f} "
+              f"torch_sum_bw_gbps={torch_bw:.3f}")
 
     return {
         "topk_reduce_ms": topk_ms,
@@ -1580,21 +1603,24 @@ def benchmark_topk_reduce_vs_torch_sum(
 
 
 def _parse_bench_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Benchmark CuTeDSL topk_reduce against combine_output_ref.to(torch.float32).sum(dim=1)."
-        )
-    )
+    parser = argparse.ArgumentParser(description=(
+        "Benchmark CuTeDSL topk_reduce against combine_output_ref.to(torch.float32).sum(dim=1)."
+    ))
     parser.add_argument("--tokens", type=int, default=192)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--output_dtype", choices=["fp32", "bf16"], default="bf16")
+    parser.add_argument("--output_dtype",
+                        choices=["fp32", "bf16"],
+                        default="bf16")
     parser.add_argument("--use_topk_score", action="store_true")
     parser.add_argument("--use_mxfp8", action="store_true")
     parser.add_argument("--use_nvfp4", action="store_true")
-    parser.add_argument("--mxfp8_scale_rank", type=int, choices=[2, 3], default=3)
+    parser.add_argument("--mxfp8_scale_rank",
+                        type=int,
+                        choices=[2, 3],
+                        default=3)
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--seed", type=int, default=20260531)
     return parser.parse_args()
