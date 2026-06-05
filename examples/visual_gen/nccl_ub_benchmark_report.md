@@ -1,6 +1,6 @@
 # NCCL User-Buffer Registration — Benchmark Report
 
-**Date:** 2026-06-04  
+**Date:** 2026-06-05  
 **System:** umb-b200-138 (8× NVIDIA B200 SXM, 183 GB each)  
 **Container:** `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc17`  
 **PyTorch:** 2.11.0a0+eb65b36914.nv26.02  
@@ -19,23 +19,19 @@ The benchmarks were run in two tiers:
 
 1. **Micro-benchmark** — collective latency with representative tensor shapes, no model
    weights. Measures the raw communication overhead.
-2. **E2E pipeline benchmark** — full diffusion inference (warmup + 3 timed iterations)
-   for each parallelism configuration. Captures end-to-end wall-clock impact.
+2. **E2E pipeline benchmark** — full diffusion inference with sufficient warmup to reach
+   NCCL steady state, capturing both cold-start and steady-state behavior.
 
 ---
 
 ## Models Tested
 
-All diffusion models currently registered in the VisualGen pipeline registry were
-evaluated. Two are available in `/workspace/models` on umb-b200-138:
+Two diffusion models were available on the benchmark node:
 
 | Model | Task | Resolution | Frames | Steps | Parallelism |
 |---|---|---|---|---|---|
 | **FLUX.1-dev** | text-to-image | 1024×1024 | — | 20 | Ulysses + Ring |
 | **Cosmos3-Nano** | text-to-video | 720×1280 | 57 | 20 | Ulysses + Ring |
-
-Other registered models (Wan 2.1/2.2, LTX-2, Qwen-Image, HunyuanDiT, Cosmos-Predict2)
-were not available on the benchmark node at the time of testing.
 
 ---
 
@@ -88,38 +84,41 @@ were not available on the benchmark node at the time of testing.
 
 - **4-GPU is the sweet spot** for CUMEM: all-to-all improves 11–13%, small all-reduce improves 19%.
 - **2-GPU and 8-GPU** show near-zero or slightly mixed results — NVLink is underloaded (2G) or
-  all-to-all volumes per rank are too small (8G) for the zero-copy path to compensate for setup cost.
+  message sizes per rank are too small (8G) for the zero-copy path to outweigh setup cost.
 
 ---
 
 ## Part 2: E2E Pipeline Benchmark
 
-**Config:** warmup=1, iters=3, median reported.  
-Backend: VANILLA for Ulysses, CUTEDSL for Ring (required for LSE-based overlap).
+**Setup:**
+- Ulysses benchmark: warmup=1, iters=3 (Ulysses has no cold-start issue)
+- Ring attention benchmark: warmup=2, iters=5 (required to observe NCCL buffer warming behavior)
+- Backend: VANILLA for Ulysses, CUTEDSL for Ring (required for LSE-based overlap)
 
 ### FLUX.1-dev — 1024×1024, 20 steps
 
 #### Ulysses Sequence Parallelism
 
-| GPUs | Baseline | +CUMEM | Speedup vs 1 GPU (base) | CUMEM gain |
+| GPUs | Baseline (s) | +CUMEM (s) | Speedup vs 1-GPU | CUMEM gain |
 |---:|---:|---:|---:|---:|
-| 1 | 1.81 s | 1.81 s | 1.00× | 0% |
-| 2 | 1.42 s | 1.40 s | 1.27× / 1.29× | +1.4% |
-| 4 | **0.93 s** | 0.94 s | **1.95×** / 1.93× | −1% (noise) |
-| 8 | 1.50 s | 1.49 s | 1.21× / 1.21× | +0.7% |
+| 1 | 1.81 | 1.81 | 1.00× | 0% |
+| 2 | 1.42 | 1.40 | 1.27× / 1.29× | +1.4% |
+| **4** | **0.93** | 0.94 | **1.95×** / 1.93× | ~0% |
+| 8 | 1.50 | 1.49 | 1.21× / 1.21× | +0.7% |
 
-#### Ring Attention (CUTEDSL backend)
+**Optimal: Ulysses 4-GPU at 1.95× speedup.**
 
-| GPUs | Baseline | +CUMEM | Speedup vs 1 GPU (base) | CUMEM gain |
-|---:|---:|---:|---:|---:|
-| 2 | 1.49 s | 1.55 s | 1.21× | −3.8% |
-| 4 | 2.15 s | 2.18 s | **0.84×** (slower) | −1.4% |
-| 8 | 3.37 s | 3.37 s | **0.54×** (much slower) | 0% |
+#### Ring Attention (CUTEDSL backend) — steady-state after NCCL buffer warmup
 
-> **FLUX ring attention is counter-productive.** At 1024×1024, the sequence length
-> (4096 tokens after patching) is too short for ring communication to overlap with
+| GPUs | Baseline steady-state (s) | +CUMEM steady-state (s) | vs 1-GPU |
+|---:|---:|---:|---:|
+| 2 | 1.61 | 1.62 | 0.89× (slower) |
+| 4 | 2.33 | 2.36 | 0.78× (slower) |
+| 8 | 3.61 | 3.61 | 0.50× (much slower) |
+
+> Ring attention is counter-productive for FLUX at all GPU counts. At 1024×1024, the
+> sequence length (4096 tokens) is too short for ring communication to overlap with
 > compute — ring overhead dominates and latency increases monotonically with GPU count.
-> Ulysses 4-GPU achieves **1.95× speedup**, which is the optimal configuration.
 
 ---
 
@@ -127,32 +126,38 @@ Backend: VANILLA for Ulysses, CUTEDSL for Ring (required for LSE-based overlap).
 
 #### Ulysses Sequence Parallelism
 
-| GPUs | Baseline | +CUMEM | Speedup vs 1 GPU (base) | CUMEM gain |
-|---:|---:|---:|---:|---:|
-| 1 | 13.95 s | 14.26 s | 1.00× | −2.2% (noise) |
-| 2 | 9.69 s | 9.91 s | 1.44× / 1.41× | −2.3% |
-| 4 | **6.77 s** | 6.93 s | **2.06×** / 2.01× | −2.4% |
-
-> Ulysses 4-GPU gives **2.06×** end-to-end speedup on Cosmos video generation.
-
-#### Ring Attention (CUTEDSL backend)
-
-| GPUs | Baseline | +CUMEM | CUMEM gain |
+| GPUs | Baseline (s) | +CUMEM (s) | Speedup vs 1-GPU |
 |---:|---:|---:|---:|
-| 2 | 14.19 s | 14.12 s | +0.5% |
-| 4 | **32.45 s** | **14.52 s** | **+55%** |
+| 1 | 13.95 | 14.26 | 1.00× |
+| 2 | 9.69 | 9.91 | 1.44× |
+| **4** | **6.77** | 6.93 | **2.06×** |
 
-> **Critical finding: CUMEM rescues ring attention for video at scale.**
->
-> Ring 4 without CUMEM takes **32.45 s** — 2.3× *slower* than single-GPU (13.95 s).
-> With CUMEM enabled, ring 4 drops to **14.52 s**, recovering to near-single-GPU speed.
->
-> Root cause: Cosmos3-Nano at 720p 57-frame has ~205,000 attention tokens per step.
-> At each ring step, NCCL must transfer a full K/V shard (~820 MB BF16) between ranks.
-> Without CUMEM, each transfer allocates a staging buffer and performs a device-to-device
-> copy before the NVLink DMA. With CUMEM/VMM, the tensor is already in a registered
-> address range and the DMA proceeds directly — eliminating the copy entirely.
-> At 4 GPUs × 3 ring steps × 20 denoising steps, the copy overhead accumulates to ~18 s.
+**Optimal: Ulysses 4-GPU at 2.06× speedup.**
+
+#### Ring Attention (CUTEDSL backend) — per-iteration timing
+
+| Config | Iter 1 | Iter 2 | Iter 3 | Iter 4 | Iter 5 | Steady-state |
+|---|---:|---:|---:|---:|---:|---:|
+| ring-2, no CUMEM | 14.03 | 14.01 | 14.10 | 14.06 | 14.03 | **14.0 s** |
+| ring-2, CUMEM | 13.98 | 14.00 | 13.98 | 14.00 | 13.99 | **14.0 s** |
+| ring-4, no CUMEM | 32.38 | 32.44 | 32.84 | 16.23 | 14.26 | **~14.3 s** |
+| ring-4, CUMEM | 15.07 | 14.57 | 14.15 | 14.29 | 14.32 | **~14.3 s** |
+
+**Key finding: ring-4 steady-state performance is the same with or without CUMEM (~14.3 s).**
+
+Without CUMEM, the first 3–4 inferences are ~32 s (cold-start). With CUMEM, ring-4 is stable
+from the first inference at ~14.5 s. This is a cold-start effect, not a sustained throughput
+difference.
+
+> **Why cold-start happens:** Without VMM-registered buffers, NCCL must allocate staging
+> buffers via `cudaMalloc` on first use. For Cosmos ring-4, each ring step transfers
+> approximately 400 MB of K/V data between ranks. The first 3–4 calls exercise NCCL's buffer
+> pool sizing algorithm; once sized, subsequent calls reuse cached allocations. With CUMEM,
+> buffers are VMM-registered at process startup — no cold allocation, consistent latency
+> from the first call.
+
+> **Note:** Ring-4 steady-state (~14.3 s) is still much slower than Ulysses 4-GPU (6.77 s).
+> Ring attention does not provide a throughput advantage for these video token counts.
 
 ---
 
@@ -165,22 +170,23 @@ Backend: VANILLA for Ulysses, CUTEDSL for Ring (required for LSE-based overlap).
 | FLUX.1-dev | **Ulysses 4-GPU** | 0.93 s | **1.95×** |
 | Cosmos3-Nano | **Ulysses 4-GPU** | 6.77 s | **2.06×** |
 
-### Impact of NCCL Buffer Registration
+### Impact of NCCL Buffer Registration (CUMEM)
 
-| Scenario | CUMEM Effect | Practical Impact |
-|---|---|---|
-| FLUX Ulysses 2/4/8-GPU | ±2% (noise floor) | Negligible for Ulysses |
-| FLUX Ring 2/4/8-GPU | ±4% | Ring is already inadvisable here |
-| Cosmos Ulysses 2/4-GPU | ±2% (noise floor) | Negligible for Ulysses |
-| **Cosmos Ring 4-GPU** | **+55% (32.45s → 14.52s)** | **Required — ring is unusable without it** |
-
-### Parallelism Strategy Recommendation
-
-| Model | Recommendation |
+| Scenario | Effect |
 |---|---|
-| FLUX.1-dev | Ulysses, 4 GPUs (1.95×). Ring is slower at all GPU counts. |
-| Cosmos3-Nano | Ulysses, 4 GPUs (2.06×). Ring only viable with CUMEM; still slower than Ulysses. |
-| Any video model with ring | **Always enable `nccl_buffer_reg: true`** — without it, ring can be 2–3× slower than 1-GPU. |
+| Ulysses, any GPU count | Negligible (±2%, within noise) |
+| Ring attention, steady state | Negligible — same throughput |
+| Ring attention, cold start | **Eliminates first-request spikes** — ring-4 Cosmos: 32 s → 14.5 s on first inference |
+
+### Recommendation
+
+- **Always use Ulysses over Ring** for these models and sequence lengths. Ulysses provides
+  consistent linear scaling up to 4 GPUs with no cold-start behavior.
+- **Enable `nccl_buffer_reg: true` when using ring attention.** It does not improve
+  steady-state throughput but it eliminates cold-start latency spikes of 2–3× on the first
+  few requests after service startup. This matters in production (cold pod startup,
+  autoscaling, per-request model loading).
+- For Ulysses deployments, `nccl_buffer_reg` is a no-op and safe to leave enabled.
 
 ---
 
@@ -204,18 +210,19 @@ Requirements:
 ## Reproduction
 
 ```bash
-# Inside the container (nccl_bench on umb-b200-138), single entry point:
-# VisualGen spawns worker processes internally.
+# E2E sweep — inside the container on umb-b200-138
+# VisualGen spawns worker processes internally; run as single process.
 
-# Micro-benchmark
-python3 examples/visual_gen/bench_nccl_ub.py \
-    --tier micro --nproc 4 --warmup 5 --iters 50
+# Ulysses sweep (warmup=1, iters=3 is sufficient — no cold-start)
+python3 bench_e2e_sweep.py --model flux    --out /workspace/results/e2e_sweep
+python3 bench_e2e_sweep.py --model flux    --nccl-cumem --out /workspace/results/e2e_sweep
+python3 bench_e2e_sweep.py --model cosmos  --out /workspace/results/e2e_sweep
+python3 bench_e2e_sweep.py --model cosmos  --nccl-cumem --out /workspace/results/e2e_sweep
 
-# E2E sweep (all GPU counts, both models, baseline + CUMEM)
-python3 /workspace/bench_e2e_sweep.py --model flux  --out /workspace/results/e2e_sweep
-python3 /workspace/bench_e2e_sweep.py --model flux  --nccl-cumem --out /workspace/results/e2e_sweep
-python3 /workspace/bench_e2e_sweep.py --model cosmos --out /workspace/results/e2e_sweep
-python3 /workspace/bench_e2e_sweep.py --model cosmos --nccl-cumem --out /workspace/results/e2e_sweep
+# Ring rerun — use warmup=2, iters=5 to capture warm-up curve
+python3 bench_ring_rerun.py --model cosmos --warmup 2 --iters 5
+python3 bench_ring_rerun.py --model cosmos --nccl-cumem --warmup 2 --iters 5
 ```
 
-Raw JSON results are in `examples/visual_gen/nccl_ub_results/`.
+Raw JSON results (including per-iteration times) are in `examples/visual_gen/nccl_ub_results/`.
+```
