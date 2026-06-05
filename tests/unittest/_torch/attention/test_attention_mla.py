@@ -408,7 +408,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
     output = torch.empty((1, 8), dtype=torch.float16)
     latent_cache = torch.empty((1, 1, 8), dtype=torch.float16)
 
-    result = attention_module.Attention.forward_context(
+    result = attention_module.MLA.forward_context(
         FakeAttention(),
         q,
         compressed_kv,
