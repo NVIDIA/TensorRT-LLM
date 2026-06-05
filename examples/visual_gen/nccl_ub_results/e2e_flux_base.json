@@ -1,0 +1,55 @@
+{
+  "model": "flux",
+  "nccl_cumem": "0",
+  "runs": {
+    "ulysses1_base": {
+      "mean_s": 1.811,
+      "median_s": 1.81,
+      "min_s": 1.81,
+      "max_s": 1.812,
+      "n": 3
+    },
+    "ulysses2_base": {
+      "mean_s": 1.423,
+      "median_s": 1.417,
+      "min_s": 1.41,
+      "max_s": 1.441,
+      "n": 3
+    },
+    "ulysses4_base": {
+      "mean_s": 0.927,
+      "median_s": 0.925,
+      "min_s": 0.925,
+      "max_s": 0.93,
+      "n": 3
+    },
+    "ulysses8_base": {
+      "mean_s": 1.508,
+      "median_s": 1.505,
+      "min_s": 1.503,
+      "max_s": 1.515,
+      "n": 3
+    },
+    "ring2_base": {
+      "mean_s": 1.49,
+      "median_s": 1.488,
+      "min_s": 1.484,
+      "max_s": 1.497,
+      "n": 3
+    },
+    "ring4_base": {
+      "mean_s": 2.155,
+      "median_s": 2.155,
+      "min_s": 2.153,
+      "max_s": 2.157,
+      "n": 3
+    },
+    "ring8_base": {
+      "mean_s": 3.727,
+      "median_s": 3.372,
+      "min_s": 3.354,
+      "max_s": 4.456,
+      "n": 3
+    }
+  }
+}

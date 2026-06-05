@@ -1,0 +1,41 @@
+{
+  "model": "cosmos",
+  "nccl_cumem": "1",
+  "runs": {
+    "ulysses1_ub": {
+      "mean_s": 14.299,
+      "median_s": 14.262,
+      "min_s": 14.116,
+      "max_s": 14.518,
+      "n": 3
+    },
+    "ulysses2_ub": {
+      "mean_s": 9.929,
+      "median_s": 9.906,
+      "min_s": 9.73,
+      "max_s": 10.152,
+      "n": 3
+    },
+    "ulysses4_ub": {
+      "mean_s": 7.023,
+      "median_s": 6.934,
+      "min_s": 6.923,
+      "max_s": 7.212,
+      "n": 3
+    },
+    "ring2_ub": {
+      "mean_s": 14.131,
+      "median_s": 14.12,
+      "min_s": 14.092,
+      "max_s": 14.181,
+      "n": 3
+    },
+    "ring4_ub": {
+      "mean_s": 14.776,
+      "median_s": 14.516,
+      "min_s": 14.259,
+      "max_s": 15.552,
+      "n": 3
+    }
+  }
+}
