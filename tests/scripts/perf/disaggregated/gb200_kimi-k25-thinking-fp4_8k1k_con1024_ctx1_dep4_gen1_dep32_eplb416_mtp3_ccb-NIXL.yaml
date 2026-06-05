@@ -3,7 +3,7 @@ metadata:
   precision: fp4
   model_dir_name: Kimi-K2.5-NVFP4
   supported_gpus:
-  - GB300
+  - GB200
   script_file: disaggr_torch.slurm
   benchmark_type: 8k1k
 slurm:
@@ -39,6 +39,17 @@ environment:
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+  env_var:
+    HF_HOME: <hf_home_path>
+  tasks:
+    gsm8k_local:
+      model: local-completions
+      model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
+      extra_kwargs:
+        trust_remote_code: true
+        custom_config: tests/integration/lm_eval_configs/gsm8k_local.yaml
 worker_config:
   gen:
     print_iter_log: true
@@ -60,6 +71,9 @@ worker_config:
     moe_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
+      load_balancer:
+        num_slots: 416
+        layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
