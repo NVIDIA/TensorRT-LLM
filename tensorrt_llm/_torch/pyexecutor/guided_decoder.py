@@ -295,22 +295,22 @@ class GuidedDecoder:
             self.bitmask_host[:num_bitmask_tokens], non_blocking=True)
         self.token_mask[:num_bitmask_tokens].copy_(
             self.token_mask_host[:num_bitmask_tokens], non_blocking=True)
-
     @torch.inference_mode()
     def _apply_bitmask(self,
-                       requests: GuidedRequests,
-                       logits: torch.Tensor,
-                       d2t: Optional[torch.Tensor] = None,
-                       num_bitmask_tokens: Optional[int] = None) -> None:
+                    requests: GuidedRequests,
+                    logits: torch.Tensor,
+                    d2t: Optional[torch.Tensor] = None,
+                    num_bitmask_tokens: Optional[int] = None) -> None:
         """Apply the bitmask to the corresponding logits for requests with guided decoding enabled.
 
         This method inplace modifies the logits tensor so that any tokens that violate the grammar constraints are masked out.
         """
         if num_bitmask_tokens is None:
-            num_bitmask_tokens = requests.num_bitmask_tokens
+            num_bitmask_tokens = requests.num_bitmask_tokens if requests is not None else logits.size(0)
 
-        # In general, the logits passed to GuidedDecoder are complete in the vocabulary dimension.
-        # In some special cases (e.g., MTP), the logits are sharded in the vocabulary dimension.
+        # Force strict equality with logits batch dimension to prevent both padding issues and slice mismatches
+        num_bitmask_tokens = logits.size(0)
+
         vocab_size_padded = self.vocab_size_padded if d2t is None else d2t.size(
             0)
         assert vocab_size_padded % logits.size(1) == 0
@@ -325,6 +325,10 @@ class GuidedDecoder:
             d2t_end = d2t_start + vocab_size_padded // tp_size
             d2t = d2t[d2t_start:d2t_end]
 
+        # Hard boundary protection against buffer overflows
+        if self.bitmask.size(0) < num_bitmask_tokens:
+            num_bitmask_tokens = self.bitmask.size(0)
+            
         torch.ops.trtllm.logits_bitmask(
             logits[:num_bitmask_tokens],
             self.bitmask[:num_bitmask_tokens, bitmask_start:bitmask_end],
