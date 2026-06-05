@@ -2490,7 +2490,7 @@ class DeepseekV4Model(DecoderModel):
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        return {"kv_cache_config": {"tokens_per_block": 128}}
+        return {"kv_cache_config": {"tokens_per_block": 128, "use_kv_cache_manager_v2": True}}
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
