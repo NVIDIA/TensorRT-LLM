@@ -18,10 +18,11 @@ for feature details.
 # Defaults
 python quickstart_example.py
 python models/wan_t2v.py
+python models/ltx2.py
 
 # With engine config (quant, parallelism, etc.)
 python models/wan_t2v.py --visual_gen_args configs/wan2.2-t2v-fp4-1gpu.yaml
-python models/ltx2.py --visual_gen_args configs/ltx2.yaml
+python models/ltx2.py --visual_gen_args configs/ltx2-t2v-fp8-1-gpu.yaml
 ```
 
 Install deps from the repo root: `pip install -r requirements-dev.txt`.

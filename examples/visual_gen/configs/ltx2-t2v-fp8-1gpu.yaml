@@ -15,19 +15,13 @@
 
 # 1-GPU LTX-2 text-to-video with audio.
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
-#
-# LTX-2 stores the Gemma text encoder separately from the diffusion checkpoint.
-# Set text_encoder_path to the local Gemma3 checkpoint directory before running
-# against a local LTX-2 checkpoint.
-pipeline_config:
-  text_encoder_path: google/gemma-3-12b-it
-
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
 attention_config:
   backend: VANILLA
-
 parallel_config:
   cfg_size: 1
   ulysses_size: 1
-
 cuda_graph_config:
   enable: false
