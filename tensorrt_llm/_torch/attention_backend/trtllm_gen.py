@@ -573,6 +573,8 @@ class FlashInferTrtllmGenAttention:
     def is_supported(
         self,
         q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         attn: "TrtllmAttention",
         meta: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,

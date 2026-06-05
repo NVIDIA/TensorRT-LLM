@@ -1517,6 +1517,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             trtllm_gen_backend = self._get_trtllm_gen_backend()
             use_trtllm_gen = trtllm_gen_backend.is_supported(
                 q,
+                k,
+                v,
                 attn=self,
                 meta=metadata,
                 fwd=forward_args,
