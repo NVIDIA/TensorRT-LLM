@@ -1,6 +1,7 @@
 import copy
 import os
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
@@ -13,8 +14,13 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
-from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase, Qwen3VLModel
+from tensorrt_llm._torch.models.modeling_qwen3vl import (
+    Qwen3VisionModelBase,
+    Qwen3VLInputProcessorBase,
+    Qwen3VLModel,
+)
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -74,6 +80,141 @@ QWEN3_VL_8B_CONFIG = {
     "_attn_implementation": "flash_attention_2",
     "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3", "Qwen3-VL-8B-Instruct")),
 }
+
+
+class _FakeQwenVisual(torch.nn.Module):
+    """Minimal stand-in for the real Qwen3VL visual encoder.
+
+    `Qwen3VisionModelBase._encode_visual_inputs` calls `self.visual(pixel_values,
+    grid_thw=...)` and concatenates `[embeds] + deepstack_embeds` along dim=1.
+    This fake returns the pixel values verbatim as `embeds` plus a single
+    deepstack level (`embeds + 100`), so the post-merger hidden width is 2.
+    It carries a dummy parameter so `_plan_device` (which reads
+    `next(self.visual.parameters()).device`) resolves to a real device.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Dummy parameter so `_plan_device()` can read a device off the encoder.
+        self.register_parameter("_anchor", torch.nn.Parameter(torch.zeros(1)))
+
+    def forward(self, pixel_values, grid_thw=None):
+        del grid_thw
+        base_embeds = pixel_values.to(torch.float32)
+        return base_embeds, [base_embeds + 100]
+
+
+def _make_qwen_vision_model_for_mixed_tests():
+    model = Qwen3VisionModelBase.__new__(Qwen3VisionModelBase)
+    torch.nn.Module.__init__(model)
+    model.model_dtype = torch.float32
+    model.visual = _FakeQwenVisual()
+    # `_plan_hidden_dim` = out_hidden_size * (1 + num_deepstack_levels). The fake
+    # emits 1 base column + 1 deepstack level, so out_hidden_size=1 and a single
+    # deepstack index gives the expected concatenated width of 2.
+    model.config = SimpleNamespace(
+        spatial_merge_size=2,
+        out_hidden_size=1,
+        deepstack_visual_indexes=[0],
+    )
+    return model
+
+
+def _qwen_image_video_param(include_order=True, include_lengths=True):
+    """A mixed image+video param exercising the assembly-based encode path.
+
+    The assembly extractor (`_qwen3vl_extract_items`) emits one item per modality and
+    orders them by `multimodal_item_order` (tuple form `(modality, index)`, which
+    is what `MultimodalPromptOrder` normalizes to). Per-item token counts come from the
+    explicit `num_tokens` payload key (test convention; mirrors the Task 13
+    extractor tests) so the assembled output is deterministic.
+    """
+    multimodal_data = {
+        "image": {
+            "pixel_values": torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
+            # ONE image sub-grid whose post-merge row count is the source of
+            # truth: t*(h//m)*(w//m) = 1*(4//2)*(4//2) = 4, matching the 4-row
+            # pixel_values and num_tokens. (A 2-row grid would describe TWO
+            # images, but this param carries a single `(image, 0)` item.)
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+            "num_tokens": 4,
+        },
+        "video": {
+            "pixel_values_videos": torch.tensor([[10.0], [11.0], [12.0]]),
+            "video_grid_thw": torch.tensor([[3, 2, 2]]),
+            "num_tokens": 3,
+        },
+    }
+    if include_order:
+        # Prompt order: video item first, then image item.
+        multimodal_data["multimodal_item_order"] = [("video", 0), ("image", 0)]
+    if include_lengths:
+        # Per-item encoder rows in PROMPT order (video=3, then image=4), aligned
+        # with `multimodal_item_order`. The producer emits this key alongside the
+        # order, and the refactored extractor sources per-item rows from it (via
+        # `MixedModalItemOrder.from_metadata`).
+        multimodal_data["multimodal_embedding_lengths"] = [3, 4]
+    else:
+        # Drop the explicit per-item counts so the token-count fallback chain has
+        # nothing to resolve (no num_tokens, no embedding lengths, no runtime).
+        del multimodal_data["image"]["num_tokens"]
+        del multimodal_data["video"]["num_tokens"]
+        multimodal_data["multimodal_embedding_lengths"] = None
+    return MultimodalParams(multimodal_data=multimodal_data)
+
+
+def test_qwen3vl_mixed_image_video_encoder_returns_single_tensor_in_prompt_order():
+    model = _make_qwen_vision_model_for_mixed_tests()
+
+    embeddings = model.forward([_qwen_image_video_param()])
+
+    # `forward` returns a single assembled tensor (the cache contract) whose rows
+    # are laid out in MultimodalPromptOrder order: the video item (3 rows) precedes the
+    # image item (4 rows), even though the extractor walks modalities image-first.
+    assert len(embeddings) == 1
+    expected = torch.tensor(
+        [
+            [10.0, 110.0],
+            [11.0, 111.0],
+            [12.0, 112.0],
+            [1.0, 101.0],
+            [2.0, 102.0],
+            [3.0, 103.0],
+            [4.0, 104.0],
+        ]
+    )
+    torch.testing.assert_close(embeddings[0], expected)
+
+
+# NOTE: the per-request uniqueness (`duplicate prompt_pos`) and the
+# length-agreement invariants previously exercised here against
+# `MixedModalityAssembly.from_params` now live in
+# `MixedModalItemOrder.__post_init__` and are covered by the context
+# construction tests (test_mixed_modal_encode_context.py) and the per-item
+# length-mismatch test in test_qwen3vl_encode_extractor.py.
+
+
+def test_qwen3vl_video_token_count_sums_multirow_grid():
+    processor = Qwen3VLInputProcessorBase.__new__(Qwen3VLInputProcessorBase)
+    processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
+
+    num_tokens = processor.get_num_tokens_per_video(
+        video=[],
+        video_grid_thw=torch.tensor([[1, 4, 4], [2, 4, 4]]),
+    )
+
+    assert num_tokens == 12
+
+
+def test_qwen3vl_item_order_from_prompt_handles_image_video_interleave():
+    processor = Qwen3VLInputProcessorBase.__new__(Qwen3VLInputProcessorBase)
+
+    item_order = processor._get_mm_item_order_from_text(
+        "v <|vision_start|><|video_pad|><|vision_end|> i <|vision_start|><|image_pad|><|vision_end|>",
+        {"image": [object()], "video": [object()]},
+    )
+
+    assert item_order == [("video", 0), ("image", 0)]
 
 
 @dataclass(repr=False)
