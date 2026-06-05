@@ -68,11 +68,7 @@ def main():
     params.image = args.image
 
     output = visual_gen.generate(
-        inputs=(
-            "A cat playfully presses the piano keys with its paws, its head gently "
-            "bobbing as soft melodic notes fill the warmly lit room, the camera slowly "
-            "pulling back to reveal the cozy interior."
-        ),
+        inputs="A cat presses the piano keys with its paws, soft notes filling the quiet room.",
         params=params,
     )
 
