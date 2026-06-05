@@ -620,8 +620,12 @@ def _load_canary_prompts(path: Path) -> list[dict[str, Any]]:
     Raises:
         OSError: If the file cannot be opened.
         ValueError: If the JSON is malformed, the top-level object is
-            not a mapping, ``prompts`` is missing/not a list, or any
-            entry lacks a string ``prompt``.
+            not a mapping, ``prompts`` is missing/not a list, any
+            entry lacks a string ``prompt``, or any entry's
+            ``reference_token_ids`` is present but not a list of
+            ints. Strict validation here keeps a malformed reference
+            from later raising ``TypeError`` inside the daemon canary
+            thread (which would silently freeze ``_canary_records``).
     """
     with path.open("r", encoding="utf-8") as f:
         try:
@@ -637,6 +641,14 @@ def _load_canary_prompts(path: Path) -> list[dict[str, Any]]:
         if not isinstance(entry, dict) or not isinstance(entry.get("prompt"), str):
             raise ValueError(
                 f"canary prompts file {path}: prompts[{i}] must be an object with a string 'prompt'"
+            )
+        ref = entry.get("reference_token_ids")
+        if ref is not None and (
+            not isinstance(ref, list) or not all(isinstance(t, int) for t in ref)
+        ):
+            raise ValueError(
+                f"canary prompts file {path}: prompts[{i}].reference_token_ids "
+                "must be a list of ints (or omitted)"
             )
     return prompts
 
@@ -673,8 +685,12 @@ def _send_canary_request(
     Returns:
         Tuple ``(token_ids, text, error)``. On success ``error`` is
         ``None`` and ``token_ids`` carries the generated tokens
-        (``text`` may also be present); on failure ``token_ids`` and
-        ``text`` are ``None`` and ``error`` is a short reason string.
+        (``text`` may also be present); on failure ``token_ids`` is
+        ``None`` and ``error`` is a short reason string. A 200 response
+        that omits ``token_ids`` (e.g. the server ignored
+        ``detokenize=False``) is folded into a ``missing_token_ids``
+        error so the marathon gate counts it as a server-side problem
+        rather than miscounting it as a token-equivalence mismatch.
     """
     url = f"{server_url.rstrip('/')}/v1/completions"
     payload = {
@@ -707,6 +723,8 @@ def _send_canary_request(
         return None, None, f"parse_error: {exc}"
     token_ids = choice.get("token_ids") if isinstance(choice, dict) else None
     text = choice.get("text") if isinstance(choice, dict) else None
+    if token_ids is None:
+        return None, text, "missing_token_ids"
     return token_ids, text, None
 
 
@@ -1090,10 +1108,15 @@ class DisaggCancellationStressHarness:
         gates (error rate, recovery time) are computed from these
         records by the load thread / pytest assertion in a later step.
 
-        Exits when ``stop_event`` or ``failed_event`` is set, honoring
-        either signal between requests via ``stop_event.wait``. No-ops
-        with a warning if the server endpoint or prompts file is
-        absent (the lifecycle smoke before ``setup()`` is wired).
+        Exits when ``stop_event`` or ``failed_event`` is set. The
+        between-request wait only observes ``stop_event``, so a
+        ``failed_event`` fired mid-interval is acted on at the next
+        request boundary (worst-case lag = one canary interval). The
+        metrics thread has the same characteristic; a shared
+        ``wait_for_any([stop_event, failed_event], ...)`` helper is
+        deferred to a follow-up PR. No-ops with a warning if the
+        server endpoint or prompts file is absent (the lifecycle
+        smoke before ``setup()`` is wired).
         """
         canary_cfg = self.config.raw.get("canary") or {}
         if not self._server_url:
@@ -1115,19 +1138,23 @@ class DisaggCancellationStressHarness:
             logger.warning("[canary] prompts file %s has no prompts; exiting", prompts_path)
             return
 
-        rate_per_min = float(canary_cfg.get("rate_per_min", 5) or 5)
         if self._canary_interval_s is not None:
             interval_s = self._canary_interval_s
         else:
-            interval_s = 60.0 / rate_per_min if rate_per_min > 0 else 12.0
+            rate_per_min = float(canary_cfg.get("rate_per_min") or 0)
+            if rate_per_min <= 0:
+                logger.warning(
+                    "[canary] canary.rate_per_min is missing/zero/negative; defaulting to 5/min"
+                )
+                rate_per_min = 5.0
+            interval_s = 60.0 / rate_per_min
         max_tokens = int(canary_cfg.get("max_tokens", 128))
         seed = int(canary_cfg.get("seed", 42))
         check_token_equiv = bool(canary_cfg.get("check_token_equivalent", True))
         model = self._model_name or "canary"
 
         logger.info(
-            "[canary] %.1f req/min (interval %.2fs) over %d prompt(s) to %s",
-            rate_per_min,
+            "[canary] interval %.2fs over %d prompt(s) to %s",
             interval_s,
             len(prompts),
             self._server_url,
@@ -1140,7 +1167,7 @@ class DisaggCancellationStressHarness:
             entry = prompts[prompt_index]
             idx += 1
             reference = entry.get("reference_token_ids")
-            token_ids, _text, err = _send_canary_request(
+            token_ids, _, err = _send_canary_request(
                 self._server_url,
                 model,
                 entry["prompt"],
