@@ -772,6 +772,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
+        last_tokens_idx = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
@@ -1192,7 +1194,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 logits, spec_metadata, batch_size, d2t, draft_step)
         return self._draft_sampler_advanced(logits, spec_metadata, batch_size,
                                             d2t)
-
 
     def prepare_1st_drafter_inputs(
         self,
