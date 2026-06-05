@@ -299,10 +299,12 @@ class TestAfmoeSanity(unittest.TestCase):
         device = torch.device("cuda")
         with _force_mpi_topology_mapping():
             mapping = Mapping(world_size=1, tp_size=1, rank=0)
+            # Keep this model-wiring smoke test off backend-native attention kernels.
             model_config = ModelConfig(
                 pretrained_config=afmoe_config,
                 quant_config=QuantConfig(),
                 mapping=mapping,
+                attn_backend="VANILLA",
             )
             model = AfmoeForCausalLM(model_config).to(device)
 
@@ -332,7 +334,12 @@ class TestAfmoeSanity(unittest.TestCase):
         else:
             raise ValueError("Invalid dtype")
 
-        kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            copy_on_partial_reuse=False,
+            max_tokens=num_blocks * tokens_per_block,
+        )
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -644,7 +651,12 @@ class TestAfmoeAllCloseToHF(unittest.TestCase):
         afmoe_config = AfmoeConfig.from_dict(trt_config_dict)
         with _force_mpi_topology_mapping():
             mapping = Mapping(world_size=1, tp_size=1, rank=0)
-            model_config = ModelConfig(pretrained_config=afmoe_config, mapping=mapping)
+            # Keep HF parity focused on AFMoE weights/model math, not attention-kernel coverage.
+            model_config = ModelConfig(
+                pretrained_config=afmoe_config,
+                mapping=mapping,
+                attn_backend="VANILLA",
+            )
             model = AfmoeForCausalLM(model_config).to(dtype).to(device)
 
         weights = self._convert_hf_experts(
@@ -664,14 +676,20 @@ class TestAfmoeAllCloseToHF(unittest.TestCase):
         position_ids = torch.arange(input_len, dtype=torch.int32, device=device).unsqueeze(0)
 
         num_blocks, tokens_per_block = 4, 128
+        max_seq_len = num_blocks * tokens_per_block
         kv_cache_manager = KVCacheManager(
-            KvCacheConfig(max_tokens=num_blocks * tokens_per_block),
+            KvCacheConfig(
+                enable_block_reuse=False,
+                enable_partial_reuse=False,
+                copy_on_partial_reuse=False,
+                max_tokens=num_blocks * tokens_per_block,
+            ),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=hf_config.num_hidden_layers,
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
             tokens_per_block=tokens_per_block,
-            max_seq_len=num_blocks * tokens_per_block,
+            max_seq_len=max_seq_len,
             max_batch_size=1,
             mapping=mapping,
             dtype=tensorrt_llm.bindings.DataType.BF16,
