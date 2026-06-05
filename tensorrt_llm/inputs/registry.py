@@ -19,11 +19,17 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+# yapf: disable
+from .multimodal import (_SUPPORTED_HASHING_MODALITIES, MixedModalItemOrder,
+                         MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+                         _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         default_hasher, find_mm_token_lengths,
-                         hexdigest_to_int32, validate_mm_inputs)
+                         compute_mm_embedding_lengths, default_hasher,
+                         find_mm_token_lengths, hexdigest_to_int32,
+                         validate_mm_inputs)
+
+# yapf: enable
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -99,7 +105,7 @@ class DefaultInputProcessor(InputProcessor):
                     inputs["prompt"],
                     add_special_tokens=sampling_params.add_special_tokens,
                     **kwargs)
-            except:
+            except Exception:
                 # Tiktoken path
                 token_ids = self.tokenizer.encode(
                     inputs["prompt"], allowed_special=toktoken_special_tokens)
@@ -111,7 +117,7 @@ class DefaultInputProcessor(InputProcessor):
                         inputs["query"],
                         add_special_tokens=sampling_params.add_special_tokens,
                         **kwargs)
-                except:
+                except Exception:
                     # Tiktoken path
                     query_token_ids = self.tokenizer.encode(
                         inputs["query"],
@@ -316,8 +322,7 @@ class BaseMultimodalInputProcessor(ABC):
             corresponding number of MM feature tokens. Returns the expanded
             token IDs and optional `mm_data_updates` — per-modality fields to
             merge into `extra_processed_inputs["multimodal_data"]` (e.g. video
-            `evs_ids` for Nano OMNI V3 rebuilt from the real prompt instead
-            of the dummy one).
+            `evs_ids` rebuilt from the real prompt instead of the dummy one).
         """
         if not self.supports_token_id_mm_expansion:
             raise NotImplementedError(
@@ -342,16 +347,46 @@ class BaseMultimodalInputProcessor(ABC):
             sampling_params,
         )
 
-        num_mm_tokens = _get_single_mm_token_lengths(
+        # Mixed-modality: resolve the logical prompt-item order and flatten the
+        # per-modality token-length lists into a single prompt-ordered list, so
+        # `expand_prompt_token_ids_for_mm` sees per-item counts across all
+        # modalities.
+        num_mm_tokens_by_key = find_mm_token_lengths(
             mm_data,
             self,
             multimodal_data=(extra_processed_inputs
                              or {}).get("multimodal_data"),
         )
-        if num_mm_tokens is None:
+        if not num_mm_tokens_by_key:
             raise ValueError(
                 "call_with_token_ids: find_mm_token_lengths returned no token "
                 "lengths for the provided multi_modal_data.")
+        # The dummy-placeholder pass ran the text path on synthetic placeholder
+        # text built modality-major by `get_text_with_mm_placeholders`, which for
+        # a mixed request bakes a stale modality-major `multimodal_item_order`
+        # into the processed metadata. Drop it: the real (possibly interleaved)
+        # order is derived below from the actual prompt token IDs and re-baked.
+        dummy_multimodal_data = (extra_processed_inputs
+                                 or {}).get("multimodal_data")
+        if dummy_multimodal_data is not None:
+            dummy_multimodal_data.pop("multimodal_item_order", None)
+        # Resolve the prompt-item order directly from the real prompt token IDs.
+        # Single-modality requests keep the deterministic modality-major order;
+        # mixed requests delegate to the model's own `get_mm_item_order` hook
+        # (the same scan the expand step uses), which walks the placeholder
+        # layout of the real prompt. The framework `resolve_order` is metadata-
+        # only, so it cannot derive this interleaved order — the model must.
+        mm_items = MixedModalItemOrder._normalize(mm_data)
+        if len(mm_items) <= 1:
+            item_order = MixedModalItemOrder.default_order(mm_items)
+        else:
+            item_order = MixedModalItemOrder.from_raw_entries(
+                self.get_mm_item_order(prompt_token_ids, mm_data),
+                source=f"{type(self).__name__}.get_mm_item_order",
+            )
+        MixedModalItemOrder.validate_order(item_order, mm_items)
+        num_mm_tokens = MixedModalItemOrder.project_by_order(
+            item_order, num_mm_tokens_by_key)
 
         expanded_ids, mm_data_updates = self.expand_prompt_token_ids_for_mm(
             prompt_token_ids,
@@ -370,6 +405,47 @@ class BaseMultimodalInputProcessor(ABC):
                 "multimodal_data", {})
             for modality, field_updates in mm_data_updates.items():
                 mm_container.setdefault(modality, {}).update(field_updates)
+
+        # Bake the resolved prompt-item order into the processed metadata so the
+        # hashing wrapper (and any downstream consumer) inherits the order
+        # derived from the real prompt token IDs, matching the wire format the
+        # text path produces. Replaces the stale dummy-text order dropped above.
+        mm_container = extra_processed_inputs.setdefault("multimodal_data", {})
+        mm_container["multimodal_item_order"] = [{
+            "modality": modality,
+            "index": idx,
+        } for modality, idx in item_order]
+
+        # Re-bake per-item embedding lengths in the real interleaved prompt
+        # order too. The dummy-placeholder pass ran the text path on synthetic
+        # modality-major placeholder text, so any `multimodal_embedding_lengths`
+        # the processor pre-baked there is in that stale modality-major order
+        # (the lengths-shaped twin of the stale `multimodal_item_order` dropped
+        # above). Consumers index lengths by the interleaved item order, so a
+        # surviving modality-major list reports the wrong item's row count.
+        # Recompute from the real expanded prompt IDs and the real-order
+        # `num_mm_tokens`, mirroring the hashing path's mask -> per-item length
+        # derivation. We re-bake (rather than pop-and-defer to that hashing
+        # recompute) because a non-hashing path can reach the consumer: when
+        # `multimodal_hashing_supported` is False (or a first hashing attempt
+        # raises), `process_prompt_maybe_hash` calls the processor directly and
+        # the hashing recompute never runs — popping there would leave lengths
+        # absent, re-introducing the None-lengths class the Qwen fix just closed.
+        # Skip when the processor exposes neither `vocab_size` nor
+        # `mm_token_ids` (no embed-mask predicate): such a processor cannot have
+        # baked mask-derived lengths to begin with, and `compute_mm_embedding_lengths`
+        # would have nothing to scan against (mirrors `maybe_compute_mm_embed_cumsum`).
+        vocab_size = self.get_vocab_size()
+        mm_token_ids = self.get_mm_token_ids()
+        if vocab_size is not None or mm_token_ids is not None:
+            mm_container["multimodal_embedding_lengths"] = (
+                compute_mm_embedding_lengths(
+                    expanded_ids,
+                    num_mm_tokens,
+                    vocab_size=vocab_size,
+                    mm_token_ids=mm_token_ids,
+                    mm_special_token_ids=self.get_mm_special_token_ids(),
+                ))
 
         return expanded_ids, extra_processed_inputs
 
@@ -476,9 +552,7 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def get_num_multimodal_tokens(self):
-        """
-        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        """
+        """Get the Hugging Face processor's '_get_num_multimodal_tokens' method."""
         if hasattr(self.processor, '_get_num_multimodal_tokens'):
             return self.processor._get_num_multimodal_tokens
         else:
@@ -560,9 +634,7 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """
-    Base class for generating dummy inputs. Specially for profiling
-    """
+    """Base class for generating dummy inputs. Specially for profiling."""
 
     DEFAULT_IMAGE_MAX_DIM = 16384
     DEFAULT_IMAGE_MIN_DIM = 128
@@ -683,9 +755,7 @@ class MultimodalPlaceholderMetadata:
 
 
 class MultimodalPlaceholderRegistry:
-    """
-    Registry for the multimodal models to keep track of the placeholder information.
-    """
+    """Registry for the multimodal models to keep track of the placeholder information."""
 
     def __init__(self) -> None:
         self._multimodal_placeholder_by_model_type: Dict[
@@ -957,28 +1027,6 @@ def _process_multimodal_with_dummy_placeholders(
     return extra_processed_inputs
 
 
-def _get_single_mm_token_lengths(
-    mm_data: Dict[str, Any],
-    input_processor: BaseMultimodalInputProcessor,
-    *,
-    multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Optional[List[int]]:
-    """Get the single set of MM token lengths (first value from find_mm_token_lengths). Returns None if empty."""
-    # TODO: Just like in multimodal_hashing_process, here we assume there is only one modality for now
-    num_mm_tokens_by_key = find_mm_token_lengths(
-        mm_data, input_processor, multimodal_data=multimodal_data)
-    if not num_mm_tokens_by_key:
-        return None
-    # find_mm_token_lengths returns Dict[modality, List[int]], e.g. {"image": [2928, 2928]}.
-    # We need the list of per-item lengths (for _find_mm_token_start_pos_from_masks). We take
-    # the first modality's list; multi-modality is not yet supported
-    # (see TODO in multimodal_hashing_process).
-    num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
-    if len(num_mm_tokens) <= 0:
-        return None
-    return num_mm_tokens
-
-
 def maybe_compute_mm_embed_cumsum(
     prompt_token_ids: List[int],
     extra_processed_inputs: Optional[ExtraProcessedInputs],
@@ -998,8 +1046,11 @@ def maybe_compute_mm_embed_cumsum(
     """
     if extra_processed_inputs is None:
         return
-    mm_data = extra_processed_inputs.get("multimodal_data")
-    if mm_data is None:
+    # The processed multimodal_data dict (NOT the raw multi_modal_data payload
+    # that `mm_data` denotes elsewhere); name it accordingly to avoid the
+    # same-name-opposite-meaning trap.
+    multimodal_data = extra_processed_inputs.get("multimodal_data")
+    if multimodal_data is None:
         return
 
     # Always backfill the bidirectional-MM gate first (cheap; instance attr
@@ -1011,12 +1062,12 @@ def maybe_compute_mm_embed_cumsum(
     # get_flashinfer_attention_mask's `cached_token_lens == 0` assert on
     # 26B/31B once an image block is split across chunks. Gemma4 sets this
     # per-instance from text_config.use_bidirectional_attention.
-    mm_data.setdefault(
+    multimodal_data.setdefault(
         "mm_bidirectional_blocks",
         bool(getattr(input_processor, "mm_bidirectional_blocks", False)),
     )
 
-    if "multimodal_embed_mask_cumsum" in mm_data:
+    if "multimodal_embed_mask_cumsum" in multimodal_data:
         return
 
     vocab_size = input_processor.get_vocab_size()
@@ -1035,7 +1086,7 @@ def maybe_compute_mm_embed_cumsum(
         mm_special_token_ids=input_processor.get_mm_special_token_ids(),
     )
     # Cache the int64 cumsum; request-invariant, read once per chunk.
-    mm_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
+    multimodal_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
         0, dtype=torch.int64)
 
 
@@ -1075,12 +1126,11 @@ def create_input_processor_with_hash(
         # Extract optional UUIDs (can be None, or dict with same structure as mm_data)
         mm_uuids = inputs.get('multi_modal_uuids', None)
 
-        mm_hashes, mm_uuid_list = apply_mm_hashes(mm_data, mm_uuids, hash_lib)
+        mm_hashes, _ = apply_mm_hashes(mm_data, mm_uuids, hash_lib)
 
         prompt_token_ids, extra_processed_inputs = input_processor(
             inputs, sampling_params)
 
-        # TODO: here we assume there is only one modality for now
         num_mm_tokens_by_key = find_mm_token_lengths(
             mm_data,
             input_processor,
@@ -1096,10 +1146,33 @@ def create_input_processor_with_hash(
             raise ValueError(
                 "multimodal hashing could not determine multimodal token "
                 "lengths for the provided input.")
-        num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
+        # Mixed-modality: resolve logical prompt-item order, then flatten the
+        # per-modality token-length lists into one prompt-ordered list
+        # (supersedes the single-modality next(iter(...)) assumption). The order
+        # is read from the processed metadata, which every preprocess path now
+        # bakes (text paths and the token-id fast path alike).
+        item_order = MixedModalItemOrder.resolve_order(
+            mm_data,
+            multimodal_data=(extra_processed_inputs
+                             or {}).get("multimodal_data"),
+        )
+        num_mm_tokens = MixedModalItemOrder.project_by_order(
+            item_order, num_mm_tokens_by_key)
         if len(num_mm_tokens) <= 0:
             raise ValueError("multimodal hashing produced an empty multimodal "
                              "token-length list.")
+
+        if extra_processed_inputs is None:
+            extra_processed_inputs = {}
+        multimodal_data = extra_processed_inputs.setdefault(
+            "multimodal_data", {})
+        multimodal_data.setdefault(
+            "multimodal_item_order",
+            [{
+                "modality": modality,
+                "index": idx,
+            } for modality, idx in item_order],
+        )
 
         vocab_size = input_processor.get_vocab_size()
         mm_ids = input_processor.get_mm_token_ids()
@@ -1116,6 +1189,11 @@ def create_input_processor_with_hash(
         if input_ids_tensor.numel() == 0:
             start_positions, start_special_token_positions = [], []
             item_run_cu_offsets, run_positions, run_lengths = [0], [], []
+            # Empty prompt has no embed slots; only fill the fallback if the
+            # processor didn't already pre-bake lengths (it won't here, but the
+            # guard keeps the two branches symmetric).
+            if "multimodal_embedding_lengths" not in multimodal_data:
+                multimodal_data["multimodal_embedding_lengths"] = []
         else:
             mm_mask, embed_mask, special_mask = _compute_mm_masks(
                 input_ids_tensor,
@@ -1123,21 +1201,31 @@ def create_input_processor_with_hash(
                 mm_token_ids=mm_ids,
                 mm_special_token_ids=mm_special_token_ids,
             )
-            extra_processed_inputs["multimodal_data"].setdefault(
-                "multimodal_embed_mask_cumsum",
-                embed_mask.cumsum(0, dtype=torch.int64))
+            multimodal_data.setdefault("multimodal_embed_mask_cumsum",
+                                       embed_mask.cumsum(0, dtype=torch.int64))
             start_positions, start_special_token_positions = (
                 _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
                                                     num_mm_tokens))
             item_run_cu_offsets, run_positions, run_lengths = (
                 _find_mm_token_runs_from_mask(mm_mask, num_mm_tokens))
+            # The mask -> per-item embedding-length derivation is the only piece
+            # a processor may have pre-baked. Skip recomputing it
+            # when present; the masks above are still needed for start_positions,
+            # runs, and the embed cumsum, so _compute_mm_masks stays. Reuse those
+            # masks here rather than re-scanning via compute_mm_embedding_lengths.
+            if "multimodal_embedding_lengths" not in multimodal_data:
+                multimodal_data["multimodal_embedding_lengths"] = (
+                    _find_mm_embedding_lengths_from_masks(
+                        mm_mask, embed_mask, num_mm_tokens))
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:
-            extra_processed_inputs["multimodal_data"][
+            multimodal_data[
                 "special_token_offsets"] = start_special_token_positions
-        # flatten the hashes from dict to a single list
-        mm_hashes_flat = [h for hashes in mm_hashes.values() for h in hashes]
+        mm_hashes_flat = MixedModalItemOrder.project_by_order(
+            item_order, mm_hashes)
+        mm_uuid_list = MixedModalItemOrder.project_uuids_by_order(
+            item_order, mm_uuids)
         validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
                            num_mm_tokens)
         mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
@@ -1154,14 +1242,14 @@ def create_input_processor_with_hash(
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         try_multimodal_hashing = False  # only used for first time
         use_multimodal_hashing = False  # used for subsequent calls
-        modalities = list(set(inputs['multi_modal_data'].keys())
-                          ) if 'multi_modal_data' in inputs else []
+        modalities = [
+            modality
+            for modality, data in inputs.get('multi_modal_data', {}).items()
+            if data is not None
+        ]
         if len(modalities) > 0:
-            # TODO: support multimodal hashing for multiple modalities within the same request.
-            if len(modalities) == 1 and modalities[0] in [
-                    'image', 'video', 'audio'
-            ]:
-                # only try multimodal hashing if the inputs only contain a single modality.
+            if all(modality in _SUPPORTED_HASHING_MODALITIES
+                   for modality in modalities):
                 if input_processor.multimodal_hashing_supported is not None:
                     use_multimodal_hashing = input_processor.multimodal_hashing_supported
                 else:
