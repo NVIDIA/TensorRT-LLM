@@ -97,13 +97,29 @@ def apply_parametrization_norm(module: nn.Module, norm: str = "none") -> nn.Modu
     return module
 
 
+class ConvLayerNorm(nn.Module):
+    """LayerNorm over the channel dim of a ``[N, C, T]`` conv output.
+
+    ``nn.LayerNorm`` normalizes the trailing dimension, so it cannot be applied
+    directly to ``[N, C, T]`` tensors. This wrapper moves the channel axis last,
+    normalizes, then restores the original layout.
+    """
+
+    def __init__(self, num_channels: int, **norm_kwargs: Any) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, **norm_kwargs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
 def get_norm_module(
     module: nn.Module, causal: bool = False, norm: str = "none", **norm_kwargs
 ) -> nn.Module:
     assert norm in CONV_NORMALIZATIONS
-    if norm == "layer_norm":
+    if norm in ("layer_norm", "time_layer_norm"):
         assert isinstance(module, nn.modules.conv._ConvNd)
-        return nn.LayerNorm(module.out_channels, **norm_kwargs)
+        return ConvLayerNorm(module.out_channels, **norm_kwargs)
     elif norm == "time_group_norm":
         if causal:
             raise ValueError("GroupNorm doesn't support causal evaluation.")
@@ -112,7 +128,9 @@ def get_norm_module(
     return nn.Identity()
 
 
-def pad1d(x: torch.Tensor, paddings: tuple, mode: str = "zero", value: float = 0.0) -> torch.Tensor:
+def pad1d(
+    x: torch.Tensor, paddings: tuple, mode: str = "constant", value: float = 0.0
+) -> torch.Tensor:
     """Tiny wrapper around F.pad that handles reflect padding on short inputs."""
     length = x.shape[-1]
     padding_left, padding_right = paddings

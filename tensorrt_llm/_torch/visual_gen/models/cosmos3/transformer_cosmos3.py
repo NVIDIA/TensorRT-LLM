@@ -705,14 +705,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.enable_fps_modulation = pretrained_config.enable_fps_modulation
 
         if self.audio_gen:
-            self.audio_dim = getattr(pretrained_config, "audio_dim", pretrained_config.sound_dim)
-            self.audio_latent_fps = getattr(
-                pretrained_config, "audio_latent_fps", pretrained_config.sound_latent_fps
-            )
-            self.temporal_compression_factor_audio = getattr(
-                pretrained_config,
-                "temporal_compression_factor_audio",
-                pretrained_config.temporal_compression_factor_sound,
+            self.audio_dim = pretrained_config.sound_dim
+            self.audio_latent_fps = pretrained_config.sound_latent_fps
+            self.temporal_compression_factor_audio = (
+                pretrained_config.temporal_compression_factor_sound
             )
 
         if pretrained_config.position_embedding_type != "unified_3d_mrope":
@@ -1138,6 +1134,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             if k.startswith(skip_prefixes):
                 continue
 
+            # Normalize a leading "model." prefix up front so every remap below
+            # matches whether or not the checkpoint namespaces top-level tensors
+            # (e.g. "model.audio_proj_in.weight") under "model.".
+            if k.startswith("model."):
+                k = k[len("model.") :]
+
             if k.startswith("proj_in."):
                 remapped[k.replace("proj_in.", "vae2llm.", 1)] = value
                 continue
@@ -1163,9 +1165,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 k = k.replace("time_embedder.linear_2.", "time_embedder.mlp.linear_2.")
                 remapped[k] = value
                 continue
-
-            if k.startswith("model."):
-                k = k[len("model.") :]
 
             # embed_tokens and norm → language_model.*
             if k.startswith("embed_tokens.") or k.startswith("norm."):
