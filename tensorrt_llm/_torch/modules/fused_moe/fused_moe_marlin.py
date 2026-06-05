@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Marlin-based MoE backend for NVFP4 on SM80+ (especially for Hopper).
+"""Marlin-based MoE backend for NVFP4 on SM90 (Hopper).
 
 Uses a fused ``marlin_nvfp4_moe_gemm`` CUDA kernel that processes ALL experts
 in a single launch.  W4A16 approach: BF16 activations + FP4 weights,
@@ -140,7 +140,7 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
 
 class MarlinFusedMoE(CutlassFusedMoE):
-    """MoE backend using Marlin W4A16 NVFP4 GEMM for SM80+.
+    """MoE backend using Marlin W4A16 NVFP4 GEMM for SM90 (Hopper).
 
     Uses ``marlin_nvfp4_moe_gemm`` with BF16 activations to process all experts
     in a single kernel launch via sorted token dispatch. In-kernel topk_weights
@@ -169,8 +169,10 @@ class MarlinFusedMoE(CutlassFusedMoE):
                 f"MarlinFusedMoE only supports NVFP4 (got quant_algo={quant_algo})"
             )
 
-        if sm_version < 80:
-            return _warn_and_return(f"MarlinFusedMoE requires at least SM 80, got SM{sm_version}")
+        if sm_version != 90:
+            return _warn_and_return(
+                f"MarlinFusedMoE only supports SM90 (Hopper), got SM{sm_version}"
+            )
 
         if swiglu_gptoss_style:
             return _warn_and_return("MarlinFusedMoE does not support swiglu_gptoss_style")
@@ -185,7 +187,6 @@ class MarlinFusedMoE(CutlassFusedMoE):
     def quantize_input(
         self, x: torch.Tensor | Fp4QuantizedTensor, post_quant_comm: bool = True, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        # print(f"xuantengh debug: {x.shape = }, {x.dtype = }, {post_quant_comm = }")
         return x, None
 
     def _get_quant_method(self):
@@ -234,14 +235,31 @@ class MarlinFusedMoE(CutlassFusedMoE):
             )
         return self._marlin_workspace
 
-    def _run_moe_fused(
+    # ====================================================================
+    # Main entry point
+    # ====================================================================
+
+    def run_moe(
         self,
         x: torch.Tensor,
         token_selected_experts: torch.Tensor,
-        token_final_scales: Optional[torch.Tensor],
-        output_dtype: torch.dtype,
+        token_final_scales: torch.Tensor,
+        x_sf: Optional[torch.Tensor] = None,
+        is_sf_swizzled: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        tuner_num_tokens: Optional[int] = None,
+        tuner_top_k: Optional[int] = None,
+        moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: Optional[bool] = None,
     ) -> torch.Tensor:
+        assert output_dtype is None or output_dtype == torch.bfloat16
+        assert _has_fused_moe_kernel(), (
+            "marlin_nvfp4_moe_gemm is not available. Rebuild TensorRT-LLM "
+            "with the fused Marlin MoE kernel for NVFP4."
+        )
         assert x.dtype == torch.bfloat16
+
+        output_dtype = torch.bfloat16
 
         num_tokens = x.shape[0]
         top_k = token_selected_experts.shape[1]
@@ -384,28 +402,3 @@ class MarlinFusedMoE(CutlassFusedMoE):
         final_hidden_states.index_add_(0, orig_tokens, gemm2_out.to(output_dtype))
 
         return final_hidden_states
-
-    # ====================================================================
-    # Main entry point
-    # ====================================================================
-
-    def run_moe(
-        self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
-        is_sf_swizzled: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        tuner_num_tokens: Optional[int] = None,
-        tuner_top_k: Optional[int] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
-    ) -> torch.Tensor:
-        assert output_dtype is None or output_dtype == torch.bfloat16
-        assert _has_fused_moe_kernel(), (
-            "marlin_nvfp4_moe_gemm is not available. Rebuild TensorRT-LLM "
-            "with the fused Marlin MoE kernel for NVFP4."
-        )
-
-        return self._run_moe_fused(x, token_selected_experts, token_final_scales, torch.bfloat16)
