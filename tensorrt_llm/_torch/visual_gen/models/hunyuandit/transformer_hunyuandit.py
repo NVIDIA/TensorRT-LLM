@@ -273,6 +273,12 @@ class HunyuanDiT2DModelUlysses:
         ulysses_size = self._ulysses_size
         ulysses_group = self._ulysses_group
         rank = dist.get_rank(ulysses_group)
+        if S % ulysses_size != 0:
+            raise ValueError(
+                f"HunyuanDiT Ulysses: sequence length {S} is not divisible by "
+                f"ulysses_size={ulysses_size}. Adjust the image resolution so that "
+                f"(height // vae_scale_factor // patch_size)^2 is divisible by ulysses_size."
+            )
         shard_size = S // ulysses_size
         hidden_states = hidden_states[:, rank * shard_size : (rank + 1) * shard_size, :].contiguous()
 

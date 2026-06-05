@@ -343,7 +343,7 @@ class HunyuanDiTPipeline(BasePipeline):
         width: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Compute 2D RoPE embeddings for the latent grid.
 
         Follows diffusers' ``get_2d_rotary_pos_embed``.
@@ -504,7 +504,7 @@ class HunyuanDiTPipeline(BasePipeline):
         timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
 
-        for i, t in enumerate(timesteps):
+        for _, t in enumerate(timesteps):
             lat_in = torch.cat([latents] * 2) if do_cfg else latents
 
             noise_pred = self.transformer(
