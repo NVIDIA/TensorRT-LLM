@@ -180,6 +180,51 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+
+### NCCL User-Buffer Registration
+
+Setting `nccl_buffer_reg: true` in `parallel_config` enables NCCL zero-copy collectives for VisualGen's inter-GPU communication (Ulysses all-to-all, ring all-gather, VAE all-reduce). Two mechanisms activate automatically:
+
+| Mechanism | When active | NCCL requirement |
+|---|---|---|
+| **CUMEM mode** (`NCCL_CUMEM_ENABLE=1`) | Always when `nccl_buffer_reg: true` | ≥ 2.21 |
+| **Explicit `ncclCommRegister`** | When the raw `ncclComm_t` is accessible from the PyTorch process group | ≥ 2.19 |
+
+**CUMEM mode** instructs NCCL to allocate its internal scratch buffers via `cuMemCreate` (VMM). On NVLink-connected GPUs (e.g. H100, B200 NVL), this enables NCCL to fuse collectives with NVLS (NVLink SHARP), reducing SM usage and latency. On IB-connected multi-node setups, set `NCCL_PXN_DISABLE=1` alongside `NCCL_CUMEM_ENABLE=1` — PXN is incompatible with buffer registration.
+
+**Effect on VisualGen parallelism modes:**
+- **Ulysses** (all-to-all around self-attention): most impactful — the all-to-all is on the critical path of every denoising step.
+- **Ring Attention** (K/V streaming all-gather): moderate — one all-gather per layer per step.
+- **CFG parallel** (all-gather of noise predictions): minor — one collective per step.
+
+**Example config** (`examples/visual_gen/serve/configs/flux1_nccl_ub.yml`):
+
+```yaml
+attention_config:
+  backend: VANILLA
+parallel_config:
+  ulysses_size: 2          # Ulysses across 2 GPUs
+  nccl_buffer_reg: true    # enables NCCL_CUMEM_ENABLE + ncclCommRegister
+```
+
+**Benchmarking** — collect baseline vs. UB-registration numbers with:
+
+```bash
+# Baseline (no UB registration)
+torchrun --nproc-per-node=2 examples/visual_gen/bench_nccl_ub.py --tier micro
+
+# With NCCL_CUMEM_ENABLE=1
+torchrun --nproc-per-node=2 examples/visual_gen/bench_nccl_ub.py --tier micro --nccl-cumem
+
+# Full pipeline (requires model weights)
+torchrun --nproc-per-node=2 examples/visual_gen/bench_nccl_ub.py \
+    --tier pipeline \
+    --flux-path /path/to/FLUX.1-dev \
+    --wan-path  /path/to/Wan2.1-T2V-1.3B-Diffusers
+```
+
+Results are saved to `bench_nccl_ub_results.json`.
+
 ## Developer Guide
 
 ### Architecture Overview
