@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig
 from tensorrt_llm.llmapi.llm import EncoderOutput
 
 # isort: off
@@ -38,6 +39,21 @@ def bert_encode_llm():
     """Create an LLM with encode_only=True for BERT, shared across tests."""
     model_dir = get_model_path(BERT_MODEL_PATH)
     llm = LLM(model=model_dir, encode_only=True)
+    yield llm
+    llm.shutdown()
+
+
+@pytest.fixture(scope="module")
+def bert_encode_llm_cuda_graph():
+    """BERT encode_only LLM with a tight encoder CUDA graph bucket grid."""
+    model_dir = get_model_path(BERT_MODEL_PATH)
+    cgc = EncodeCudaGraphConfig(
+        batch_sizes=[1, 4],
+        num_tokens=[16, 64],
+        seq_lens=[8, 32],
+        enable_padding=True,
+    )
+    llm = LLM(model=model_dir, encode_only=True, cuda_graph_config=cgc)
     yield llm
     llm.shutdown()
 
@@ -215,3 +231,41 @@ def test_encode_add_special_tokens_false(bert_encode_llm):
 def test_check_health_encoder_only(bert_encode_llm):
     """_check_health() returns True for a live encoder-only LLM."""
     assert bert_encode_llm._check_health() is True
+
+
+# --------------------------------------------------------------------------- #
+# CUDA graph + return_raw_logits (contract only — accuracy lives in the
+# integration tests under tests/integration/defs/accuracy/)
+# --------------------------------------------------------------------------- #
+
+
+def test_encode_cuda_graph_and_return_raw_logits(bert_encode_llm_cuda_graph):
+    """Exercises both the encoder CUDA graph path and the return_raw_logits flag.
+
+    Contract checks only:
+    - Default wrapping (batched input) returns a list of EncoderOutput, each
+      with .logits of shape [num_classes].
+    - return_raw_logits=True returns a single torch.Tensor of shape
+      [batch_size, num_classes] regardless of whether the input was batched.
+      Note the asymmetry: the default path unwraps a single-prompt input back
+      to a single EncoderOutput, but the raw path always returns the full
+      tensor (still 2D for BERT, [1, num_classes] for a single prompt).
+    """
+    # Batched input — default wrapping.
+    outs = bert_encode_llm_cuda_graph.encode(PROMPTS)
+    assert isinstance(outs, list)
+    assert len(outs) == len(PROMPTS)
+    for o in outs:
+        assert isinstance(o, EncoderOutput)
+        assert o.logits.shape == (2,)  # yelp-polarity: 2 classes
+
+    # Batched input — return_raw_logits=True returns a single 2D tensor.
+    raw = bert_encode_llm_cuda_graph.encode(PROMPTS, return_raw_logits=True)
+    assert isinstance(raw, torch.Tensor)
+    assert raw.shape == (len(PROMPTS), 2)
+
+    # Single-prompt input — raw path stays 2D [1, num_classes], unlike the
+    # default path which unwraps to a single EncoderOutput with 1D .logits.
+    raw_single = bert_encode_llm_cuda_graph.encode(PROMPTS[0], return_raw_logits=True)
+    assert isinstance(raw_single, torch.Tensor)
+    assert raw_single.shape == (1, 2)

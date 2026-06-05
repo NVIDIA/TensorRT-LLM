@@ -7423,3 +7423,84 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
                  **pytorch_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestStep3_7(LlmapiAccuracyTestHarness):
+    # Step-3.7-Flash is a MoE model registered under the multimodal
+    # architecture (Step3p7ForConditionalGeneration); text-only GSM8K exercises
+    # the text decoder path. The custom HF config requires trust_remote_code.
+    MODEL_NAME = "stepfun-ai/Step-3.7-Flash"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_auto_dtype(self, tp_size, ep_size):
+        model_path = f"{llm_models_root()}/Step-3.7-Flash"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 trust_remote_code=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @parametrize_with_ids("mtp_nextn", [0, 3])
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    def test_fp8_block_scales(self, tp_size, ep_size, mtp_nextn):
+        model_path = f"{llm_models_root()}/Step-3.7-Flash-FP8"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        use_kv_cache_manager_v2=True)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True),
+            moe_config=MoeConfig(backend="TRTLLM"),
+        )
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 attn_backend="TRTLLM",
+                 speculative_config=mtp_config,
+                 trust_remote_code=True,
+                 **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    def test_nvfp4(self, tp_size, ep_size):
+        # The NVFP4 export does not ship MTP weights, so this checkpoint is only
+        # exercised without speculative decoding (unlike the FP8/BF16 ones).
+        model_path = f"{llm_models_root()}/Step-3.7-Flash-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        use_kv_cache_manager_v2=True)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True),
+            moe_config=MoeConfig(backend="TRTLLM"),
+        )
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 attn_backend="TRTLLM",
+                 trust_remote_code=True,
+                 **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

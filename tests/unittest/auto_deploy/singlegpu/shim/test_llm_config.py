@@ -160,6 +160,23 @@ def test_config_flow(
         pass
 
 
+def test_build_model_replaces_parent_model_specific_input_processor():
+    """Parent model build can create a registered multimodal input processor."""
+    llm = object.__new__(LLM)
+    llm.input_processor = object()
+    llm._tokenizer = None
+    replacement_processor = object()
+
+    with (
+        patch.object(LLM, "_prefetch_model"),
+        patch("tensorrt_llm._torch.auto_deploy.llm._TorchLLM._build_model"),
+        patch.object(LLM, "_create_input_processor", return_value=replacement_processor),
+    ):
+        LLM._build_model(llm)
+
+    assert llm.input_processor is replacement_processor
+
+
 @pytest.mark.parametrize(
     "model_factory",
     [
