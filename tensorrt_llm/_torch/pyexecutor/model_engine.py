@@ -2634,7 +2634,8 @@ class PyTorchModelEngine(ModelEngine):
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
             self.guided_decoder.add_batch(scheduled_requests,
-                                          new_tokens=new_tokens_device)
+                                          new_tokens=new_tokens_device,
+                                          runtime_draft_len=self.runtime_draft_len)
 
         if self._can_use_incremental_update(scheduled_requests,
                                             new_tokens_device,
