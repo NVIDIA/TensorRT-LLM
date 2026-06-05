@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import hashlib
-import sys
 from array import array
 from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
@@ -75,24 +74,6 @@ def gen_multi_modal_tokens(
     ]
 
 
-# True on every platform we run on (x86_64, aarch64/Grace). Gates the
-# array-based fast path in Hasher.update, which relies on native byte order
-# matching the little-endian encoding used by the per-token fallback.
-_NATIVE_LE = sys.byteorder == "little"
-
-
-def _pack_le(data: "Sequence[int | bytes]") -> bytes:
-    """Concatenate a token block into its little-endian byte encoding.
-
-    Mirrors the per-token ``int.to_bytes(8, "little")`` packing while passing
-    ``bytes`` items (multi-modal digests) through unchanged. Used as the
-    big-endian / mixed-content fallback for ``Hasher.update``.
-    """
-    return b"".join(
-        [item.to_bytes(8, "little") if type(item) is int else item for item in data]  # type: ignore
-    )
-
-
 class Hasher:
     __slots__ = "_hasher"
     _hasher: "hashlib._Hash"
@@ -110,21 +91,20 @@ class Hasher:
         elif type(data) is bytes:
             self._hasher.update(data)
         else:
-            # Hash the whole token block in a single update(). SHA-256 is a
-            # streaming hash, so update(a) + update(b) == update(a + b); packing
-            # each int as 8 little-endian bytes and concatenating yields the
-            # exact same digest as the per-token loop, but with one C call
-            # instead of one per token. This roughly halves the cost of long
-            # warm prefix matches, which dominate the ADP router's reuse probe
-            # (KVCacheAwareADPRouter) and the create_kv_cache reuse lookup.
-            if _NATIVE_LE:
-                try:
-                    buf = array("Q", data).tobytes()  # all-int fast path
-                except (TypeError, OverflowError, ValueError):
-                    buf = _pack_le(data)  # mixed int/bytes (multi-modal)
-            else:
-                buf = _pack_le(data)
-            self._hasher.update(buf)
+            # Hash the whole token block in one C call instead of one per token.
+            # array("Q", data).tobytes() packs each int as 8 native-endian bytes;
+            # all NVIDIA GPU host platforms (x86_64, aarch64/Grace) are little-endian
+            # so this is byte-identical to the per-token to_bytes(8, "little") loop.
+            # Falls back to that loop for multimodal blocks (which contain bytes items).
+            try:
+                self._hasher.update(array("Q", data).tobytes())  # type: ignore
+            except (TypeError, OverflowError):
+                for item in data:  # type: ignore
+                    assert (
+                        NDEBUG or (type(item) is int and (0 <= item < (1 << 64)))
+                        or type(item) is bytes
+                    )
+                    self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
         return self
 
     @property
