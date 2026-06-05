@@ -115,8 +115,6 @@ private:
 ///          ``ENCODER_INIT`` state may be admitted for encoder compute
 ///          without consuming self- or cross-KV blocks.  The later
 ///          ``CONTEXT_INIT`` decoder admission owns cross-pool budgeting.
-///          A non-const ``OptionalRef`` is accepted for API uniformity
-///          with ``MaxUtilizationScheduler``.
 class GuaranteedNoEvictScheduler : public BaseCapacityScheduler
 {
 public:
@@ -126,14 +124,14 @@ public:
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 
 protected:
     template <bool StaticBatchScheduling>
     [[nodiscard]] std::tuple<RequestVector, RequestVector> impl(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 
 private:
@@ -150,7 +148,7 @@ public:
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 };
 

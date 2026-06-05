@@ -40,7 +40,7 @@ namespace
 std::tuple<std::unordered_set<BlockKey, BlockKeyHasher>, std::unordered_set<BlockKey, BlockKeyHasher>>
 prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
     kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-    OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager = std::nullopt)
+    OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt)
 {
     std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedContextBlocks;
     std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedCrossContextBlocks;
@@ -115,8 +115,9 @@ bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const&
     return false;
 }
 
+template <typename KVCacheManagerT>
 void checkRequiredCrossKvCacheManager(
-    LlmRequestState noScheduleUntilState, OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager)
+    LlmRequestState noScheduleUntilState, OptionalRef<KVCacheManagerT> crossKvCacheManager)
 {
     if (noScheduleUntilState != LlmRequestState::kENCODER_INIT)
     {
@@ -183,7 +184,7 @@ std::tuple<RequestVector, RequestVector> MaxRequestsScheduler::operator()(Reques
 
 std::tuple<RequestVector, RequestVector> StaticBatchScheduler::operator()(
     kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-    OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+    OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
     return this->impl<true>(kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);
@@ -191,7 +192,7 @@ std::tuple<RequestVector, RequestVector> StaticBatchScheduler::operator()(
 
 std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::operator()(
     kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-    OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+    OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
     return impl<false>(kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);
@@ -200,7 +201,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::operator()(
 template <bool StaticBatchScheduling>
 std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-    OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+    OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
     RequestVector scheduledRequests;
