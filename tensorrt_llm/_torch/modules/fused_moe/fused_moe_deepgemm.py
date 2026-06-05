@@ -610,12 +610,17 @@ def _preprocess_after_permute_kernel(
 
 @nvtx_range("[DG] preprocess_after_permute")
 def preprocess_after_permute(expert_first_token_offset_tensor,
-                             permuted_data_tensor):
+                             num_permuted_tokens):
     """
     Python wrapper that launches a single fused kernel to get the token-to-expert map
     and the number of tokens per expert.
+
+    Only the number of permuted (expanded) tokens is needed here, not the
+    permuted activations themselves. Callers that run moe_permute_op with
+    skip_data_expand=True leave permuted_data_tensor uninitialized, so the count
+    must come from a populated tensor (e.g. permuted_row_to_unpermuted_row_tensor.shape[0]).
     """
-    total_tokens = permuted_data_tensor.shape[0]
+    total_tokens = num_permuted_tokens
     num_experts = expert_first_token_offset_tensor.shape[0] - 1
 
     # create output tensors
@@ -962,13 +967,20 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         assert token_selected_experts is not None
         assert token_final_scales is not None
 
-        # Permutation
+        # Permutation.
+        # skip_data_expand=True computes the permutation maps but skips the
+        # data-copy step (expandInputRowsKernel), so permuted_data_tensor and
+        # permuted_token_final_scales_tensor are returned with UNINITIALIZED
+        # contents (still full-size, just never written). The fused expand+quant
+        # kernel re-derives the activations from x via
+        # permuted_row_to_unpermuted_row_tensor instead, so all unused outputs are
+        # discarded with `_`.
         (
             permuted_row_to_unpermuted_row_tensor,
-            permuted_token_selected_experts_tensor,
-            permuted_data_tensor,
+            _,  # permuted_token_selected_experts_tensor (unused)
+            _,  # permuted_data_tensor (uninitialized under skip_data_expand)
             expert_first_token_offset_tensor,
-            permuted_token_final_scales_tensor,
+            _,  # permuted_token_final_scales_tensor (uninitialized under skip_data_expand)
             unpermuted_row_to_permuted_row_tensor,
         ) = torch.ops.trtllm.moe_permute_op(
             x,
@@ -990,12 +1002,16 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             skip_data_expand=True,
         )
 
-        if permuted_data_tensor.numel() == 0:
+        # permuted_row_to_unpermuted_row_tensor has one entry per permuted
+        # (expanded) token, so its length is the expanded token count. Use it
+        # instead of the uninitialized permuted_data_tensor.
+        num_permuted_tokens = permuted_row_to_unpermuted_row_tensor.shape[0]
+        if num_permuted_tokens == 0:
             return torch.zeros_like(x)
 
         # Preprocess after permute
         masked_m, token_to_expert_map = preprocess_after_permute(
-            expert_first_token_offset_tensor, permuted_data_tensor)
+            expert_first_token_offset_tensor, num_permuted_tokens)
 
         expected_m = (token_selected_experts.numel() +
                       self.expert_size_per_partition -

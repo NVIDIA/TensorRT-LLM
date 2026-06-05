@@ -157,7 +157,7 @@ def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
     assert permuted_data_tensor.dtype == torch.float32
 
     _masked_m, token_to_expert_map = preprocess_after_permute(
-        expert_first_token_offset_tensor, permuted_data_tensor
+        expert_first_token_offset_tensor, permuted_data_tensor.shape[0]
     )
 
     m_max = _align(num_rows, 128)

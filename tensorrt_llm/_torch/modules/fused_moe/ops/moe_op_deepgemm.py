@@ -169,13 +169,17 @@ class DeepGemmMoEOp(MoEOp):
         intermediate_size = module.intermediate_size
         hidden_size = x.shape[1]
 
-        # Permute the data for expert-parallel processing
+        # Permute the data for expert-parallel processing.
+        # Unlike DeepGemmFusedMoE (which fuses gather+finalize and never touches
+        # permuted_data_tensor), this op reuses permuted_data_tensor as a
+        # write-before-read scratch buffer in the gather+finalize tail below, so
+        # it is kept; only the genuinely unused outputs are discarded with `_`.
         (
             permuted_row_to_unpermuted_row_tensor,
-            permuted_token_selected_experts_tensor,
+            _,  # permuted_token_selected_experts_tensor (unused)
             permuted_data_tensor,
             expert_first_token_offset_tensor,
-            permuted_token_final_scales_tensor,
+            _,  # permuted_token_final_scales_tensor (uninitialized under skip_data_expand)
             unpermuted_row_to_permuted_row_tensor,
         ) = torch.ops.trtllm.moe_permute_op(
             x,
@@ -197,12 +201,15 @@ class DeepGemmMoEOp(MoEOp):
             skip_data_expand=True,
         )
 
-        if permuted_data_tensor.numel() == 0:
+        # Take the expanded-token count from the populated permutation map (one
+        # entry per permuted token) rather than the uninitialized data tensor.
+        num_permuted_tokens = permuted_row_to_unpermuted_row_tensor.shape[0]
+        if num_permuted_tokens == 0:
             return torch.zeros_like(x)
 
         # Preprocess for masked operations
         masked_m, token_to_expert_map = preprocess_after_permute(
-            expert_first_token_offset_tensor, permuted_data_tensor)
+            expert_first_token_offset_tensor, num_permuted_tokens)
 
         expected_m = (token_selected_slots.numel() + expert_size_per_partition -
                       1) // expert_size_per_partition
