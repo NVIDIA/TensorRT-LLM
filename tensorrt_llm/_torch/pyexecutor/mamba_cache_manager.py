@@ -621,6 +621,10 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         # mamba cache index, maps request_id -> state indices
         self.mamba_cache_index: Dict[int, int] = {}
+        self._dummy_request_ids: set[int] = set()
+        self._dummy_slot_mask = torch.zeros(max_batch_size,
+                                            dtype=torch.bool,
+                                            device=device)
 
         # Permanent slot shared by every CUDA-graph padding sentinel id
         # (CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, one per
@@ -675,6 +679,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 raise RuntimeError("run out of mamba cache blocks")
             block = self.mamba_cache_free_blocks.pop()
             self.mamba_cache_index[r] = block
+            self._dummy_slot_mask[block] = False
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
@@ -715,28 +720,44 @@ class PythonMambaCacheManager(BaseResourceManager):
         # slot and are freed individually.
         if not request_ids:
             return
+        self._dummy_request_ids.update(request_ids)
         for r in request_ids:
             if r in self.mamba_cache_index:
+                block = self.mamba_cache_index[r]
+                self._dummy_slot_mask[block] = True
+                if (isinstance(self.mamba_cache, self.SpeculativeState)
+                        and self._use_replay_state_update):
+                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                    self.mamba_cache.cache_buf_idx[block] = 0
                 continue
             if self._is_padding_sentinel(r):
-                self.mamba_cache_index[r] = self._padding_slot
+                block = self._padding_slot
             elif (r == ATTENTION_DP_DUMMY_REQUEST_ID
                   and self._attention_dp_dummy_slot is not None):
-                self.mamba_cache_index[r] = self._attention_dp_dummy_slot
+                block = self._attention_dp_dummy_slot
             else:
                 if len(self.mamba_cache_free_blocks) == 0:
                     raise RuntimeError("run out of mamba cache blocks")
                 block = self.mamba_cache_free_blocks.pop()
-                self.mamba_cache_index[r] = block
+            self.mamba_cache_index[r] = block
+            self._dummy_slot_mask[block] = True
+            if (isinstance(self.mamba_cache, self.SpeculativeState)
+                    and self._use_replay_state_update):
+                self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                self.mamba_cache.cache_buf_idx[block] = 0
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
         if request_id not in self.mamba_cache_index:
             return
+        is_dummy = request_id in self._dummy_request_ids
+        self._dummy_request_ids.discard(request_id)
         block = self.mamba_cache_index.pop(request_id)
         # Reserved slots must not re-enter the real-request free pool.
         if block != self._padding_slot and \
                 block != self._attention_dp_dummy_slot:
+            if is_dummy:
+                self._dummy_slot_mask[block] = False
             self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self, request_ids: List[int],
@@ -900,10 +921,16 @@ class PythonMambaCacheManager(BaseResourceManager):
                 wrote_checkpoint, accepted_tokens,
                 prev_num_accepted_tokens + accepted_tokens)
             cache_buf_idx = self.mamba_cache.cache_buf_idx[state_indices_d]
+            is_dummy_slot = self._dummy_slot_mask[state_indices_d]
+            next_num_accepted_tokens = torch.where(is_dummy_slot,
+                                                   prev_num_accepted_tokens,
+                                                   next_num_accepted_tokens)
             self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = \
                 next_num_accepted_tokens
             self.mamba_cache.cache_buf_idx[state_indices_d] = \
-                torch.where(wrote_checkpoint, 1 - cache_buf_idx, cache_buf_idx)
+                torch.where(is_dummy_slot, cache_buf_idx,
+                            torch.where(wrote_checkpoint, 1 - cache_buf_idx,
+                                        cache_buf_idx))
         else:
             # Legacy: copy accepted SSM state from intermediate cache.
             ssm_states = self.mamba_cache.temporal
@@ -1634,6 +1661,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                          dtype=torch.long,
                                          device="cpu")
         self._request_id_to_state_index = {}
+        self._dummy_slot_mask = None
+        self._dummy_slot_mask_host = None
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -1723,6 +1752,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
+        self._dummy_slot_mask = None
+        self._dummy_slot_mask_host = None
         self.old_x = None
         self.old_B = None
         self.old_dt = None
@@ -1898,10 +1929,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             next_num_accepted_tokens = torch.where(
                 wrote_checkpoint, accepted, prev_num_accepted_tokens + accepted)
             cache_buf_idx = self.cache_buf_idx[slots]
+            is_dummy_slot = self._dummy_slot_mask[slots]
+            next_num_accepted_tokens = torch.where(is_dummy_slot,
+                                                   prev_num_accepted_tokens,
+                                                   next_num_accepted_tokens)
             self.prev_num_accepted_tokens[slots] = next_num_accepted_tokens
-            self.cache_buf_idx[slots] = torch.where(wrote_checkpoint,
-                                                    1 - cache_buf_idx,
-                                                    cache_buf_idx)
+            self.cache_buf_idx[slots] = torch.where(
+                is_dummy_slot, cache_buf_idx,
+                torch.where(wrote_checkpoint, 1 - cache_buf_idx,
+                            cache_buf_idx))
         else:
             # Legacy: copy the accepted SSM state from the intermediate buffer.
             _promote_mamba_state_triton(self.all_ssm_states,
@@ -2060,6 +2096,19 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
+        if self._dummy_slot_mask is not None:
+            self._dummy_slot_mask_host.zero_()
+            for i, req in enumerate(self.requests):
+                if req.is_dummy:
+                    self._dummy_slot_mask_host[
+                        self._host_state_indices[i].item()] = True
+            self._dummy_slot_mask.copy_(self._dummy_slot_mask_host,
+                                        non_blocking=True)
+            if (self.prev_num_accepted_tokens is not None
+                    and self.cache_buf_idx is not None):
+                self.prev_num_accepted_tokens.masked_fill_(
+                    self._dummy_slot_mask, 0)
+                self.cache_buf_idx.masked_fill_(self._dummy_slot_mask, 0)
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
@@ -2204,6 +2253,14 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # Without spec_config or replay we still keep the seed buffer
             # (above) so the non-MTP flashinfer SR path has a persistent
             # rand_seed source.
+            self.prev_num_accepted_tokens = None
+            self.cache_buf_idx = None
+            self.old_x = None
+            self.old_B = None
+            self.old_dt = None
+            self.old_dA_cumsum = None
+            self._dummy_slot_mask = None
+            self._dummy_slot_mask_host = None
             return
 
         history_size = self.replay_history_size
@@ -2218,6 +2275,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cache_buf_idx = torch.zeros(cache_size,
                                          dtype=torch.int32,
                                          device=device)
+        self._dummy_slot_mask = torch.zeros(cache_size,
+                                            dtype=torch.bool,
+                                            device=device)
+        self._dummy_slot_mask_host = torch.zeros(cache_size,
+                                                 dtype=torch.bool,
+                                                 pin_memory=prefer_pinned())
         self.old_x = torch.zeros(num_local_mamba_layers,
                                  cache_size,
                                  2,
