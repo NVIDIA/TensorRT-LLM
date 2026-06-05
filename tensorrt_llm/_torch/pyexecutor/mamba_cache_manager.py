@@ -487,13 +487,13 @@ class PythonMambaCacheManager(BaseResourceManager):
         ssm_state_shape = (nheads, head_dim, d_state)
 
         # create mamba conv and ssm states
-        conv_states = torch.empty(
+        conv_states = torch.zeros(
             size=(num_local_layers, max_batch_size) + conv_state_shape,
             dtype=dtype,
             device=device,
         )
 
-        ssm_states = torch.empty(
+        ssm_states = torch.zeros(
             size=(num_local_layers, max_batch_size) + ssm_state_shape,
             dtype=self.mamba_ssm_cache_dtype,
             device=device,
@@ -2127,6 +2127,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                             self.local_num_mamba_layers,
                                             num_blocks_in_pool
                                         ] + self.conv_state_shape)
+        self.all_ssm_states.zero_()
+        self.all_conv_states.zero_()
 
     def _setup_mtp_intermediate_states(self, spec_config,
                                        max_batch_size) -> None:
