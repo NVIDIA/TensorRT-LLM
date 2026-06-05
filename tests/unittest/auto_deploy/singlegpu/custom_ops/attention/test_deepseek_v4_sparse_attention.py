@@ -129,6 +129,25 @@ def _sparse_attention_reference(
     return output.to(q.dtype)
 
 
+def _empty_sparse_attention_tensors(q: torch.Tensor, kv: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    del kv
+    return (
+        q.new_empty(q.shape[0], q.shape[1], 0),
+        q.new_empty(q.shape[0], q.shape[1], 0),
+        q.new_empty(0, 0),
+        q.new_empty(0),
+        q.new_empty(0, 0),
+        q.new_empty(0, 0),
+        q.new_empty(q.shape[0], q.shape[1]),
+        q.new_empty(q.shape[0], q.shape[1], 0, 0),
+        q.new_empty(q.shape[0], q.shape[1], 0),
+        q.new_empty(q.shape[0], q.shape[1], 0),
+        q.new_empty(q.shape[0], q.shape[1], 0),
+        q.new_empty(0, 0),
+        q.new_empty(0),
+    )
+
+
 def _run_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -137,7 +156,13 @@ def _run_sparse_attention(
     softmax_scale: float = 1.0,
 ) -> torch.Tensor:
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
-        q, kv, attn_sink, topk_idxs, softmax_scale
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        *_empty_sparse_attention_tensors(q, kv),
+        softmax_scale,
+        compress_ratio=0,
     )
 
 
@@ -152,20 +177,34 @@ def _run_cached_sparse_attention(
     window_size: int | None = None,
     compress_ratio: int = 0,
 ) -> torch.Tensor:
+    mhc_cache = swa_cache.new_empty(swa_cache.shape)
+    compressor_kv_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
+    compressor_gate_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
+    indexer_compressor_kv_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
+    indexer_compressor_gate_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
         q,
         kv,
         attn_sink,
         topk_idxs,
+        *_empty_sparse_attention_tensors(q, kv),
         *metadata,
         swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        indexer_compressor_kv_cache,
+        indexer_compressor_gate_cache,
         softmax_scale,
         window_size,
         compress_ratio,
+        None,
+        1e-6,
+        None,
     )
 
 
-def _run_sparse_attention_v2(
+def _run_sparse_attention_with_compressor(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -208,7 +247,7 @@ def _run_sparse_attention_v2(
         if indexer_compressor_norm_weight is not None
         else q.new_empty(0)
     )
-    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2(
+    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
         q,
         kv,
         attn_sink,
@@ -239,7 +278,7 @@ def _run_sparse_attention_v2(
     )
 
 
-def _run_cached_sparse_attention_v2(
+def _run_cached_sparse_attention_with_compressor(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -299,7 +338,7 @@ def _run_cached_sparse_attention_v2(
         if indexer_compressor_gate_cache is not None
         else q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
     )
-    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2_with_cache(
+    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
         q,
         kv,
         attn_sink,
@@ -411,7 +450,7 @@ def _visible_source_topk(
     return torch.tensor([rows], dtype=torch.int64, device=device)
 
 
-def _make_v2_caches(
+def _make_sparse_attention_caches(
     max_seq_len: int,
     head_dim: int,
     compressor_state_dim: int,
@@ -469,7 +508,7 @@ def test_negative_indices_are_masked_before_softmax() -> None:
     assert output.abs().max() < 1.0
 
 
-def test_source_op_matches_reference_for_mixed_patterns() -> None:
+def test_source_ratio0_matches_reference_for_mixed_patterns() -> None:
     torch.manual_seed(11)
     q = torch.randn(2, 4, 3, 6)
     kv = torch.randn(2, 8, 6)
@@ -486,16 +525,6 @@ def test_source_op_matches_reference_for_mixed_patterns() -> None:
     expected = _sparse_attention_reference(q, kv, attn_sink, topk_idxs, softmax_scale=0.375)
 
     assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="mixed sparse attention: ")
-
-
-def test_source_op_rejects_positive_topk_out_of_bounds() -> None:
-    q = torch.randn(1, 1, 1, 2)
-    kv = torch.randn(1, 2, 2)
-    attn_sink = torch.randn(1)
-    topk_idxs = torch.tensor([[[0, 2]]], dtype=torch.int64)
-
-    with pytest.raises(ValueError, match="topk_idxs entries must be less than kv rows 2"):
-        _run_sparse_attention(q, kv, attn_sink, topk_idxs)
 
 
 def test_cached_ratio0_local_window_reads_past_kv_from_swa_cache() -> None:
@@ -659,7 +688,7 @@ def test_cached_ratio0_sink_only_negative_topk_yields_zero_output() -> None:
 
 
 @pytest.mark.parametrize("compress_ratio", [4, 128])
-def test_source_v2_matches_legacy_source_construction(compress_ratio: int) -> None:
+def test_source_matches_expanded_sparse_construction(compress_ratio: int) -> None:
     torch.manual_seed(123 + compress_ratio)
     seq_len = compress_ratio
     q = torch.randn(1, seq_len, 1, 8)
@@ -677,7 +706,7 @@ def test_source_v2_matches_legacy_source_construction(compress_ratio: int) -> No
     topk_idxs = torch.arange(seq_len + compressor.max_compressed_len).view(1, 1, -1)
     topk_idxs = topk_idxs.expand(1, seq_len, -1).to(torch.int64)
 
-    output = _run_sparse_attention_v2(
+    output = _run_sparse_attention_with_compressor(
         q,
         kv,
         attn_sink,
@@ -701,11 +730,11 @@ def test_source_v2_matches_legacy_source_construction(compress_ratio: int) -> No
         output,
         expected,
         rmse_ratio_tol=1e-6,
-        msg=f"source v2 ratio-{compress_ratio}: ",
+        msg=f"source ratio-{compress_ratio}: ",
     )
 
 
-def test_cached_v2_ratio0_prefill_and_decode_match_source() -> None:
+def test_cached_ratio0_prefill_and_decode_match_source() -> None:
     torch.manual_seed(37)
     total_len = 3
     prefill_len = 2
@@ -721,15 +750,17 @@ def test_cached_v2_ratio0_prefill_and_decode_match_source() -> None:
         sin_table,
         position_ids,
     ) = _compressor_case(4, total_len)
-    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
-        total_len,
-        kv.shape[-1],
-        compressor_kv.shape[-1],
-        fill_value=777.0,
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_sparse_attention_caches(
+            total_len,
+            kv.shape[-1],
+            compressor_kv.shape[-1],
+            fill_value=777.0,
+        )
     )
 
     topk_prefill = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.int64)
-    output_prefill = _run_cached_sparse_attention_v2(
+    output_prefill = _run_cached_sparse_attention_with_compressor(
         q[:, :prefill_len],
         kv[:, :prefill_len],
         attn_sink,
@@ -748,7 +779,7 @@ def test_cached_v2_ratio0_prefill_and_decode_match_source() -> None:
         window_size=None,
         compress_ratio=0,
     )
-    expected_prefill = _run_sparse_attention_v2(
+    expected_prefill = _run_sparse_attention_with_compressor(
         q[:, :prefill_len],
         kv[:, :prefill_len],
         attn_sink,
@@ -767,11 +798,11 @@ def test_cached_v2_ratio0_prefill_and_decode_match_source() -> None:
         output_prefill,
         expected_prefill,
         rmse_ratio_tol=1e-6,
-        msg="cached v2 ratio-0 prefill: ",
+        msg="cached ratio-0 prefill: ",
     )
 
     topk_decode = torch.tensor([[[0, 2]]], dtype=torch.int64)
-    output_decode = _run_cached_sparse_attention_v2(
+    output_decode = _run_cached_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
@@ -790,7 +821,7 @@ def test_cached_v2_ratio0_prefill_and_decode_match_source() -> None:
         window_size=None,
         compress_ratio=0,
     )
-    expected_decode = _run_sparse_attention_v2(
+    expected_decode = _run_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv,
         attn_sink,
@@ -810,12 +841,12 @@ def test_cached_v2_ratio0_prefill_and_decode_match_source() -> None:
         output_decode,
         expected_decode,
         rmse_ratio_tol=1e-6,
-        msg="cached v2 ratio-0 decode: ",
+        msg="cached ratio-0 decode: ",
     )
 
 
 @pytest.mark.parametrize("compress_ratio", [4, 128])
-def test_cached_v2_compressed_prefill_matches_source_v2(compress_ratio: int) -> None:
+def test_cached_compressed_prefill_matches_source(compress_ratio: int) -> None:
     torch.manual_seed(311 + compress_ratio)
     seq_len = compress_ratio
     q = torch.randn(1, seq_len, 1, 8)
@@ -830,16 +861,18 @@ def test_cached_v2_compressed_prefill_matches_source_v2(compress_ratio: int) -> 
         sin_table,
         position_ids,
     ) = _compressor_case(compress_ratio, seq_len)
-    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
-        seq_len,
-        kv.shape[-1],
-        compressor_kv.shape[-1],
-        fill_value=777.0,
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_sparse_attention_caches(
+            seq_len,
+            kv.shape[-1],
+            compressor_kv.shape[-1],
+            fill_value=777.0,
+        )
     )
     topk_idxs = torch.arange(seq_len + compressor.max_compressed_len).view(1, 1, -1)
     topk_idxs = topk_idxs.expand(1, seq_len, -1).to(torch.int64)
 
-    output = _run_cached_sparse_attention_v2(
+    output = _run_cached_sparse_attention_with_compressor(
         q,
         kv,
         attn_sink,
@@ -857,7 +890,7 @@ def test_cached_v2_compressed_prefill_matches_source_v2(compress_ratio: int) -> 
         compressor_gate_cache,
         compress_ratio=compress_ratio,
     )
-    expected = _run_sparse_attention_v2(
+    expected = _run_sparse_attention_with_compressor(
         q,
         kv,
         attn_sink,
@@ -875,11 +908,11 @@ def test_cached_v2_compressed_prefill_matches_source_v2(compress_ratio: int) -> 
         output,
         expected,
         rmse_ratio_tol=1e-6,
-        msg=f"cached v2 ratio-{compress_ratio} prefill: ",
+        msg=f"cached ratio-{compress_ratio} prefill: ",
     )
 
 
-def test_cached_ratio128_token_input_pos_matches_full_v2_source() -> None:
+def test_cached_ratio128_token_input_pos_matches_full_source() -> None:
     torch.manual_seed(183)
     compress_ratio = 128
     total_len = 128
@@ -903,11 +936,13 @@ def test_cached_ratio128_token_input_pos_matches_full_v2_source() -> None:
         compressed_capacity_tokens=compressed_capacity_tokens,
     )
     state_dim = compressor_kv.shape[-1]
-    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
-        compressed_capacity_tokens,
-        kv.shape[-1],
-        state_dim,
-        fill_value=777.0,
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_sparse_attention_caches(
+            compressed_capacity_tokens,
+            kv.shape[-1],
+            state_dim,
+            fill_value=777.0,
+        )
     )
 
     topk_prefill = _visible_source_topk(
@@ -919,7 +954,7 @@ def test_cached_ratio128_token_input_pos_matches_full_v2_source() -> None:
         compressor.max_compressed_len,
         q.device,
     )
-    _run_cached_sparse_attention_v2(
+    _run_cached_sparse_attention_with_compressor(
         q[:, :prefill_len],
         kv[:, :prefill_len],
         attn_sink,
@@ -939,7 +974,7 @@ def test_cached_ratio128_token_input_pos_matches_full_v2_source() -> None:
         compress_ratio=compress_ratio,
     )
 
-    output = _run_cached_sparse_attention_v2(
+    output = _run_cached_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
@@ -967,7 +1002,7 @@ def test_cached_ratio128_token_input_pos_matches_full_v2_source() -> None:
         compressor.max_compressed_len,
         q.device,
     )
-    expected = _run_sparse_attention_v2(
+    expected = _run_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv,
         attn_sink,
@@ -1016,12 +1051,14 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
         compressed_capacity_tokens=compressed_capacity_tokens,
         batch_size=batch_size,
     )
-    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
-        compressed_capacity_tokens,
-        kv.shape[-1],
-        compressor_kv.shape[-1],
-        fill_value=777.0,
-        num_slots=batch_size,
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_sparse_attention_caches(
+            compressed_capacity_tokens,
+            kv.shape[-1],
+            compressor_kv.shape[-1],
+            fill_value=777.0,
+            num_slots=batch_size,
+        )
     )
 
     topk_prefill = _visible_source_topk(
@@ -1033,7 +1070,7 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
         compressor.max_compressed_len,
         q.device,
     ).expand(batch_size, -1, -1)
-    _run_cached_sparse_attention_v2(
+    _run_cached_sparse_attention_with_compressor(
         q[:, :prefill_len],
         kv[:, :prefill_len],
         attn_sink,
@@ -1054,7 +1091,7 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
     )
     torch.testing.assert_close(mhc_cache[:, 0], torch.full_like(mhc_cache[:, 0], 777.0))
 
-    output = _run_cached_sparse_attention_v2(
+    output = _run_cached_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
@@ -1082,7 +1119,7 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
         compressor.max_compressed_len,
         q.device,
     ).expand(batch_size, -1, -1)
-    expected = _run_sparse_attention_v2(
+    expected = _run_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv,
         attn_sink,
@@ -1176,11 +1213,13 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         position_ids,
         total_len,
     )[:, prefill_len:]
-    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
-        8,
-        kv.shape[-1],
-        compressor_kv.shape[-1],
-        fill_value=777.0,
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_sparse_attention_caches(
+            8,
+            kv.shape[-1],
+            compressor_kv.shape[-1],
+            fill_value=777.0,
+        )
     )
     indexer_compressor_kv_cache = torch.full(
         (1, 8, indexer_compressor_kv.shape[-1]),
@@ -1198,7 +1237,7 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         0,
         q.device,
     )
-    _run_cached_sparse_attention_v2(
+    _run_cached_sparse_attention_with_compressor(
         q[:, :prefill_len],
         kv[:, :prefill_len],
         attn_sink,
@@ -1237,7 +1276,7 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         q.device,
     )
     expected_topk = torch.cat((local_decode, compressed_idxs_decode), dim=-1)
-    output = _run_cached_sparse_attention_v2(
+    output = _run_cached_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
@@ -1264,7 +1303,7 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         indexer_compressor_kv_cache=indexer_compressor_kv_cache,
         indexer_compressor_gate_cache=indexer_compressor_gate_cache,
     )
-    expected = _run_sparse_attention_v2(
+    expected = _run_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv,
         attn_sink,
@@ -1288,7 +1327,7 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         compressor.max_compressed_len,
         q.device,
     )
-    all_visible = _run_sparse_attention_v2(
+    all_visible = _run_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv,
         attn_sink,
@@ -1339,10 +1378,12 @@ def test_cached_ratio4_indexer_runtime_all_reduce_flips_selected_row(
     compressor_gate = torch.zeros_like(compressor_kv)
     cos_table, sin_table = _rope_tables(max_seq_len, compressor.rope_head_dim)
     position_ids = torch.tensor([[input_pos]], dtype=torch.int64)
-    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
-        max_seq_len,
-        head_dim,
-        compressor_kv.shape[-1],
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_sparse_attention_caches(
+            max_seq_len,
+            head_dim,
+            compressor_kv.shape[-1],
+        )
     )
     mhc_cache[0, 0, 0] = 4.0
     mhc_cache[0, 1, 1] = 4.0
@@ -1376,7 +1417,7 @@ def test_cached_ratio4_indexer_runtime_all_reduce_flips_selected_row(
     monkeypatch.setattr(dsv4_sparse.dist_common, "get_world_size", lambda: 2)
     monkeypatch.setattr(dsv4_sparse.dist_common, "all_reduce", fake_all_reduce)
 
-    output = _run_cached_sparse_attention_v2(
+    output = _run_cached_sparse_attention_with_compressor(
         q,
         kv,
         attn_sink,
@@ -1446,14 +1487,16 @@ def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
         total_len,
         compressed_capacity_tokens=256,
     )
-    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
-        256,
-        kv.shape[-1],
-        compressor_kv.shape[-1],
-        fill_value=777.0,
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_sparse_attention_caches(
+            256,
+            kv.shape[-1],
+            compressor_kv.shape[-1],
+            fill_value=777.0,
+        )
     )
 
-    _run_cached_sparse_attention_v2(
+    _run_cached_sparse_attention_with_compressor(
         q[:, :prefill_len],
         kv[:, :prefill_len],
         attn_sink,
@@ -1482,7 +1525,7 @@ def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
     )
     torch.testing.assert_close(mhc_cache[0, 0], torch.full_like(mhc_cache[0, 0], 777.0))
 
-    output = _run_cached_sparse_attention_v2(
+    output = _run_cached_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv[:, prefill_len:],
         attn_sink,
@@ -1510,7 +1553,7 @@ def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
         compressor.max_compressed_len,
         q.device,
     )
-    expected = _run_sparse_attention_v2(
+    expected = _run_sparse_attention_with_compressor(
         q[:, prefill_len:],
         kv,
         attn_sink,
@@ -1546,79 +1589,6 @@ def test_cached_sparse_attention_rejects_unsupported_compress_ratio() -> None:
             _decode_meta(input_pos=0),
             swa_cache,
             compress_ratio=2,
-        )
-
-
-def test_cached_sparse_attention_rejects_decode_topk_out_of_bounds() -> None:
-    q_prefill = torch.zeros(1, 1, 1, 2)
-    kv_prefill = torch.tensor([[[1.0, 0.0]]])
-    attn_sink = torch.tensor([-20.0])
-    swa_cache = torch.empty(1, 4, 2)
-
-    _run_cached_sparse_attention(
-        q_prefill,
-        kv_prefill,
-        attn_sink,
-        torch.zeros(1, 1, 1, dtype=torch.int64),
-        _context_meta(seq_len=1),
-        swa_cache,
-    )
-
-    with pytest.raises(ValueError, match="exceeds SWA cache length 4"):
-        _run_cached_sparse_attention(
-            torch.tensor([[[[1.0, 0.0]]]]),
-            torch.tensor([[[2.0, 0.0]]]),
-            attn_sink,
-            torch.tensor([[[4]]], dtype=torch.int64),
-            _decode_meta(input_pos=1),
-            swa_cache,
-        )
-
-
-def test_cached_sparse_attention_rejects_decode_topk_beyond_current_write_end() -> None:
-    q_prefill = torch.zeros(1, 1, 1, 2)
-    kv_prefill = torch.tensor([[[1.0, 0.0], [0.0, 1.0], [2.0, 0.0]]])
-    attn_sink = torch.tensor([-20.0])
-    swa_cache = torch.empty(1, 8, 2)
-
-    _run_cached_sparse_attention(
-        q_prefill,
-        kv_prefill,
-        attn_sink,
-        torch.tensor([[[0]]], dtype=torch.int64),
-        _context_meta(seq_len=1),
-        swa_cache,
-        compress_ratio=4,
-    )
-
-    with pytest.raises(ValueError, match="current sequence cache write end 4"):
-        _run_cached_sparse_attention(
-            torch.tensor([[[[1.0, 0.0]]]]),
-            torch.tensor([[[3.0, 0.0]]]),
-            attn_sink,
-            torch.tensor([[[-1, 4]]], dtype=torch.int64),
-            _decode_meta(input_pos=3),
-            swa_cache,
-            compress_ratio=4,
-        )
-
-
-def test_cached_sparse_attention_rejects_cache_write_past_length() -> None:
-    q = torch.randn(1, 1, 1, 2)
-    kv = torch.randn(1, 3, 2)
-    attn_sink = torch.randn(1)
-    topk_idxs = torch.zeros(1, 1, 1, dtype=torch.int64)
-    swa_cache = torch.empty(1, 2, 2)
-
-    with pytest.raises(ValueError, match=r"Sequence write \[0, 3\) exceeds SWA cache length 2"):
-        _run_cached_sparse_attention(
-            q,
-            kv,
-            attn_sink,
-            topk_idxs,
-            _context_meta(seq_len=1),
-            swa_cache,
-            compress_ratio=4,
         )
 
 
@@ -1794,7 +1764,7 @@ class _TinyDeepSeekSparseModule(torch.nn.Module):
         indexer_compressor_norm_weight = q.new_empty(0)
         max_compressed_len = 2 if self.compress_ratio else None
         rope_dim = 0 if self.compress_ratio else None
-        return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2(
+        return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
             q,
             kv,
             attn_sink,
@@ -1868,8 +1838,8 @@ def test_deepseek_sparse_cache_transform_rewrites_source_op_and_adds_resource(
 
     assert info.num_matches == 1
     targets = [node.target for node in gm.graph.nodes if node.op == "call_function"]
-    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default not in targets
-    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2_with_cache.default in targets
+    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default not in targets
+    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache.default in targets
 
     placeholder_names = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
     resource_names = list(cm._resource_lookup)
@@ -1935,6 +1905,5 @@ def test_dense_torch_attention_cache_insertion_remains_separate() -> None:
     targets = [node.target for node in gm_after_dense.graph.nodes if node.op == "call_function"]
     assert torch.ops.auto_deploy.torch_cached_attention_with_cache.default in targets
     assert (
-        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2_with_cache.default
-        not in targets
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache.default not in targets
     )

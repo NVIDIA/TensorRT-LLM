@@ -22,7 +22,11 @@ from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _shard_fp4_weight_scale
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    ceil_pow2_scale,
+    fake_fp4_act_quant,
+    fake_fp8_act_quant,
     fp4_global_scale,
+    hadamard_rotate,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
 
@@ -130,3 +134,165 @@ def test_fp8_load_hook_maps_prequantized_scales_with_prefix():
     )
     assert prefix + "layer.proj.activation_scale" not in mock_state_dict
     assert prefix + "layer.proj.weight_scale_inv" not in mock_state_dict
+
+
+def _ref_fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+    dim = x.shape[-1]
+    if dim == 0 or dim % block_size != 0:
+        return x
+
+    dtype = x.dtype
+    x_float = x.float()
+    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
+    scale = ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 448.0, 1.0e-4)
+    quant = torch.clamp(grouped / scale, -448.0, 448.0).to(dtype).float()
+    return (quant * scale).reshape_as(x_float).to(dtype)
+
+
+def _ref_fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    dim = x.shape[-1]
+    if dim == 0 or dim % block_size != 0:
+        return x
+
+    dtype = x.dtype
+    x_float = x.float()
+    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
+    scale = ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 6.0, 6.0 * 2.0**-126)
+    normalized = torch.clamp(grouped / scale, -6.0, 6.0)
+    levels = normalized.new_tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    level_idx = (normalized.abs().unsqueeze(-1) - levels).abs().argmin(dim=-1)
+    quant = levels[level_idx] * normalized.sign()
+    return (quant * scale).reshape_as(x_float).to(dtype)
+
+
+def _ref_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    dim = x.shape[-1]
+    if dim <= 1:
+        return x
+    if dim & (dim - 1):
+        raise ValueError(f"Hadamard rotation requires power-of-two dimension, got {dim}.")
+
+    original_shape = x.shape
+    out = x.float()
+    width = 1
+    while width < dim:
+        out = out.reshape(*out.shape[:-1], dim // (2 * width), 2, width)
+        left = out[..., 0, :]
+        right = out[..., 1, :]
+        out = torch.cat((left + right, left - right), dim=-1).reshape(original_shape)
+        width *= 2
+    return (out * (dim**-0.5)).to(x.dtype)
+
+
+def test_fake_fp4_act_quant_exports_with_block_aligned_dim() -> None:
+    class Wrapper(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return fake_fp4_act_quant(x, block_size=32)
+
+    x = torch.tensor(
+        [
+            0.0,
+            0.25,
+            0.2501,
+            0.75,
+            0.7501,
+            1.25,
+            1.2501,
+            1.75,
+            1.7501,
+            2.5,
+            2.5001,
+            3.5,
+            3.5001,
+            5.0,
+            5.0001,
+            6.0,
+            -0.25,
+            -0.2501,
+            -0.75,
+            -0.7501,
+            -1.25,
+            -1.2501,
+            -1.75,
+            -1.7501,
+            -2.5,
+            -2.5001,
+            -3.5,
+            -3.5001,
+            -5.0,
+            -5.0001,
+            -6.0,
+            4.0,
+        ],
+        dtype=torch.float32,
+    ).reshape(1, 32)
+    wrapper = Wrapper().eval()
+
+    expected = wrapper(x)
+    exported = torch.export.export(wrapper, (x,), strict=False).module()
+    actual = exported(x)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(expected, _ref_fake_fp4_act_quant(x), rtol=0, atol=0)
+    assert expected[0, 1] == 0.0
+    assert expected[0, 3] == 0.5
+    assert expected[0, 13] == 4.0
+    assert expected[0, 17] == -0.5
+
+
+@pytest.mark.parametrize(
+    ("quant_fn", "block_size", "groups"),
+    [
+        pytest.param(fake_fp8_act_quant, 64, 2, id="fp8"),
+        pytest.param(fake_fp4_act_quant, 32, 4, id="fp4"),
+    ],
+)
+def test_fake_act_quant_export_keeps_prefix_inferred_for_sharding(
+    quant_fn, block_size: int, groups: int
+) -> None:
+    class Wrapper(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return quant_fn(x, block_size=block_size)
+
+    x = torch.randn(2, 3, 64, 128)
+    gm = torch.export.export(Wrapper().eval(), (x,), strict=False).module()
+    grouping_shapes = []
+    for node in gm.graph.nodes:
+        if node.target != torch.ops.aten.reshape.default:
+            continue
+        shape = node.args[1]
+        if isinstance(shape, (list, tuple)) and list(shape[-2:]) == [groups, block_size]:
+            grouping_shapes.append(shape)
+
+    assert grouping_shapes
+    assert all(list(shape) == [-1, groups, block_size] for shape in grouping_shapes)
+
+
+@pytest.mark.parametrize("head_count", [1, 8, 64])
+def test_hadamard_rotate_matches_reference_for_sharded_prefix_shapes(head_count: int) -> None:
+    x = torch.randn(2, 3, head_count, 1024, dtype=torch.bfloat16)
+
+    actual = hadamard_rotate(x)
+    expected = _ref_hadamard_rotate(x)
+
+    assert actual.shape == x.shape
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_hadamard_rotate_export_keeps_prefix_inferred_for_sharding() -> None:
+    class Wrapper(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return hadamard_rotate(x)
+
+    x = torch.randn(2, 3, 64, 128)
+    gm = torch.export.export(Wrapper().eval(), (x,), strict=False).module()
+    hadamard_reshape_shapes = []
+    for node in gm.graph.nodes:
+        if node.target != torch.ops.aten.reshape.default:
+            continue
+        shape = node.args[1]
+        if isinstance(shape, (list, tuple)) and len(shape) == 4:
+            hadamard_reshape_shapes.append(shape)
+
+    assert hadamard_reshape_shapes
+    assert all(shape[0] == -1 for shape in hadamard_reshape_shapes)

@@ -108,11 +108,37 @@ class DeepSeekV4IRContractBlock(nn.Module):
 
         kv = torch.ops.auto_deploy.torch_linear_simple(x, self.kv_proj.weight, None)
         topk_idxs = torch.zeros((bsz, seq_len, 1), dtype=torch.int64, device=x.device)
+        compressor_kv = q.new_empty(bsz, seq_len, 0)
+        compressor_gate = q.new_empty(bsz, seq_len, 0)
+        compressor_ape = q.new_empty(0, 0)
+        compressor_norm_weight = q.new_empty(0)
+        cos_table = q.new_empty(0, 0)
+        sin_table = q.new_empty(0, 0)
+        position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(bsz, -1)
+        indexer_q = q.new_empty(bsz, seq_len, 0, 0)
+        indexer_weights = q.new_empty(bsz, seq_len, 0)
+        indexer_compressor_kv = q.new_empty(bsz, seq_len, 0)
+        indexer_compressor_gate = q.new_empty(bsz, seq_len, 0)
+        indexer_compressor_ape = q.new_empty(0, 0)
+        indexer_compressor_norm_weight = q.new_empty(0)
         attn_output = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
             q,
             kv,
             self.attn_sink,
             topk_idxs,
+            compressor_kv,
+            compressor_gate,
+            compressor_ape,
+            compressor_norm_weight,
+            cos_table,
+            sin_table,
+            position_ids,
+            indexer_q,
+            indexer_weights,
+            indexer_compressor_kv,
+            indexer_compressor_gate,
+            indexer_compressor_ape,
+            indexer_compressor_norm_weight,
             1.0,
             enable_sharding=True,
             layer_type="mla",

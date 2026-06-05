@@ -245,90 +245,6 @@ def _ref_fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tens
     return (quant * scale).reshape_as(x_float).to(dtype)
 
 
-def test_fake_fp4_act_quant_exports_with_block_aligned_dim() -> None:
-    class Wrapper(nn.Module):
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return dsv4._fake_fp4_act_quant(x, block_size=32)
-
-    x = torch.tensor(
-        [
-            0.0,
-            0.25,
-            0.2501,
-            0.75,
-            0.7501,
-            1.25,
-            1.2501,
-            1.75,
-            1.7501,
-            2.5,
-            2.5001,
-            3.5,
-            3.5001,
-            5.0,
-            5.0001,
-            6.0,
-            -0.25,
-            -0.2501,
-            -0.75,
-            -0.7501,
-            -1.25,
-            -1.2501,
-            -1.75,
-            -1.7501,
-            -2.5,
-            -2.5001,
-            -3.5,
-            -3.5001,
-            -5.0,
-            -5.0001,
-            -6.0,
-            4.0,
-        ],
-        dtype=torch.float32,
-    ).reshape(1, 32)
-    wrapper = Wrapper().eval()
-
-    expected = wrapper(x)
-    exported = torch.export.export(wrapper, (x,), strict=False).module()
-    actual = exported(x)
-
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(expected, _ref_fake_fp4_act_quant(x), rtol=0, atol=0)
-    assert expected[0, 1] == 0.0
-    assert expected[0, 3] == 0.5
-    assert expected[0, 13] == 4.0
-    assert expected[0, 17] == -0.5
-
-
-@pytest.mark.parametrize(
-    ("quant_fn", "block_size", "groups"),
-    [
-        pytest.param(dsv4._fake_fp8_act_quant, 64, 2, id="fp8"),
-        pytest.param(dsv4._fake_fp4_act_quant, 32, 4, id="fp4"),
-    ],
-)
-def test_fake_act_quant_export_keeps_prefix_inferred_for_sharding(
-    quant_fn, block_size: int, groups: int
-) -> None:
-    class Wrapper(nn.Module):
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return quant_fn(x, block_size=block_size)
-
-    x = torch.randn(2, 3, 64, 128)
-    gm = torch.export.export(Wrapper().eval(), (x,), strict=False).module()
-    grouping_shapes = []
-    for node in gm.graph.nodes:
-        if node.target != torch.ops.aten.reshape.default:
-            continue
-        shape = node.args[1]
-        if isinstance(shape, (list, tuple)) and list(shape[-2:]) == [groups, block_size]:
-            grouping_shapes.append(shape)
-
-    assert grouping_shapes
-    assert all(list(shape) == [-1, groups, block_size] for shape in grouping_shapes)
-
-
 def _ref_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
     dim = x.shape[-1]
     if dim <= 1:
@@ -346,36 +262,6 @@ def _ref_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
         out = torch.cat((left + right, left - right), dim=-1).reshape(original_shape)
         width *= 2
     return (out * (dim**-0.5)).to(x.dtype)
-
-
-@pytest.mark.parametrize("head_count", [1, 8, 64])
-def test_hadamard_rotate_matches_reference_for_sharded_prefix_shapes(head_count: int) -> None:
-    x = torch.randn(2, 3, head_count, 1024, dtype=torch.bfloat16)
-
-    actual = dsv4._hadamard_rotate(x)
-    expected = _ref_hadamard_rotate(x)
-
-    assert actual.shape == x.shape
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def test_hadamard_rotate_export_keeps_prefix_inferred_for_sharding() -> None:
-    class Wrapper(nn.Module):
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return dsv4._hadamard_rotate(x)
-
-    x = torch.randn(2, 3, 64, 128)
-    gm = torch.export.export(Wrapper().eval(), (x,), strict=False).module()
-    hadamard_reshape_shapes = []
-    for node in gm.graph.nodes:
-        if node.target != torch.ops.aten.reshape.default:
-            continue
-        shape = node.args[1]
-        if isinstance(shape, (list, tuple)) and len(shape) == 4:
-            hadamard_reshape_shapes.append(shape)
-
-    assert hadamard_reshape_shapes
-    assert all(shape[0] == -1 for shape in hadamard_reshape_shapes)
 
 
 def _ref_overlap_transform(tensor: torch.Tensor, head_dim: int, value: float) -> torch.Tensor:
@@ -1710,7 +1596,7 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
     assert torch.isfinite(out_2).all()
 
     target_names = [str(node.target) for node in gm.graph.nodes if node.op == "call_function"]
-    assert target_names.count("auto_deploy.torch_deepseek_v4_sparse_attention_v2.default") == 2
+    assert target_names.count("auto_deploy.torch_deepseek_v4_sparse_attention.default") == 2
     assert "auto_deploy.torch_linear_simple.default" in target_names
     assert "auto_deploy.torch_moe.default" in target_names
     assert "auto_deploy.torch_attention.default" not in target_names
@@ -1806,7 +1692,7 @@ def test_export_mxfp4_experts_apply_sharding_hints_rank1_ep_graph() -> None:
 
     sparse_nodes = _call_nodes(
         gm_out,
-        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default,
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default,
     )
     assert len(sparse_nodes) == 1
     attn_sink = sparse_nodes[0].args[2]
@@ -1910,7 +1796,7 @@ def test_export_mxfp4_experts_apply_sharding_hints_rank6_ep8_tp8_graph() -> None
 
     sparse_nodes = _call_nodes(
         gm_out,
-        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default,
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default,
     )
     assert len(sparse_nodes) == 1
     attn_sink = sparse_nodes[0].args[2]
@@ -1966,7 +1852,7 @@ def test_ratio4_sparse_attention_sharding_only_splits_sink() -> None:
 
     sparse_nodes = _call_nodes(
         gm_out,
-        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default,
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default,
     )
     assert len(sparse_nodes) == 1
     attn_sink = sparse_nodes[0].args[2]

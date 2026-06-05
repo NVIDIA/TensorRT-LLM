@@ -953,9 +953,7 @@ class AttentionSinkArgShardableNode(ShardableNode):
 
 for _sparse_attention_op_name in (
     "torch_deepseek_v4_sparse_attention",
-    "torch_deepseek_v4_sparse_attention_v2",
     "torch_deepseek_v4_sparse_attention_with_cache",
-    "torch_deepseek_v4_sparse_attention_v2_with_cache",
 ):
     try:
         ShardableNode.register(getattr(torch.ops.auto_deploy, _sparse_attention_op_name))(

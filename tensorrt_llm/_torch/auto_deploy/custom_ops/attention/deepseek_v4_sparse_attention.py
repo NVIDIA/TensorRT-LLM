@@ -25,6 +25,9 @@ from torch.fx import Node
 from ..._compat import KvCacheConfig
 from ...distributed import common as dist_common
 from ...utils.node_utils import extract_op_args
+from ...utils.quantization_utils import fake_fp4_act_quant as _fake_fp4_act_quant
+from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
+from ...utils.quantization_utils import hadamard_rotate as _hadamard_rotate
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -39,9 +42,7 @@ from ..attention_interface import (
 __all__ = [
     "DeepSeekV4SparseAttention",
     "torch_deepseek_v4_sparse_attention",
-    "torch_deepseek_v4_sparse_attention_v2",
     "torch_deepseek_v4_sparse_attention_with_cache",
-    "torch_deepseek_v4_sparse_attention_v2_with_cache",
 ]
 
 _SPARSE_ATTENTION_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
@@ -107,18 +108,6 @@ def _validate_deepseek_v4_sparse_attention_inputs(
         raise ValueError(f"attn_sink length must be {num_heads}, got {attn_sink.shape[0]}")
 
 
-def _validate_topk_idx_bounds(topk_idxs: torch.Tensor, kv_rows: int) -> None:
-    valid_topk_idxs = topk_idxs[topk_idxs >= 0]
-    if valid_topk_idxs.numel() == 0:
-        return
-
-    max_topk_idx = int(valid_topk_idxs.max().item())
-    if max_topk_idx >= kv_rows:
-        raise ValueError(
-            f"topk_idxs entries must be less than kv rows {kv_rows}, got {max_topk_idx}"
-        )
-
-
 def _validate_swa_cache_inputs(q: torch.Tensor, kv: torch.Tensor, swa_cache: torch.Tensor) -> None:
     _validate_rank("swa_cache", swa_cache, 3)
     if not swa_cache.is_floating_point():
@@ -129,64 +118,6 @@ def _validate_swa_cache_inputs(q: torch.Tensor, kv: torch.Tensor, swa_cache: tor
         raise ValueError(
             f"swa_cache head dimension must be {kv.shape[-1]}, got {swa_cache.shape[-1]}"
         )
-
-
-def _ceil_pow2_scale(amax: torch.Tensor, max_value: float, min_value: float) -> torch.Tensor:
-    return torch.pow(2.0, torch.ceil(torch.log2(amax.clamp_min(min_value) / max_value)))
-
-
-def _fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
-    dim = x.shape[-1]
-    if dim == 0 or dim % block_size != 0:
-        return x
-
-    dtype = x.dtype
-    x_float = x.float()
-    grouped = x_float.reshape(-1, dim // block_size, block_size)
-    scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 448.0, 1.0e-4)
-    quant = torch.clamp(grouped / scale, -448.0, 448.0).to(dtype).float()
-    return (quant * scale).reshape_as(x_float).to(dtype)
-
-
-def _fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-    dim = x.shape[-1]
-    if dim == 0 or dim % block_size != 0:
-        return x
-
-    dtype = x.dtype
-    x_float = x.float()
-    grouped = x_float.reshape(-1, dim // block_size, block_size)
-    scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 6.0, 6.0 * 2.0**-126)
-    normalized = torch.clamp(grouped / scale, -6.0, 6.0)
-    abs_normalized = normalized.abs()
-    quant_abs = torch.zeros_like(abs_normalized)
-    quant_abs = torch.where(abs_normalized > 0.25, torch.full_like(quant_abs, 0.5), quant_abs)
-    quant_abs = torch.where(abs_normalized > 0.75, torch.full_like(quant_abs, 1.0), quant_abs)
-    quant_abs = torch.where(abs_normalized > 1.25, torch.full_like(quant_abs, 1.5), quant_abs)
-    quant_abs = torch.where(abs_normalized > 1.75, torch.full_like(quant_abs, 2.0), quant_abs)
-    quant_abs = torch.where(abs_normalized > 2.5, torch.full_like(quant_abs, 3.0), quant_abs)
-    quant_abs = torch.where(abs_normalized > 3.5, torch.full_like(quant_abs, 4.0), quant_abs)
-    quant_abs = torch.where(abs_normalized > 5.0, torch.full_like(quant_abs, 6.0), quant_abs)
-    quant = quant_abs * normalized.sign()
-    return (quant * scale).reshape_as(x_float).to(dtype)
-
-
-def _hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
-    dim = x.shape[-1]
-    if dim <= 1:
-        return x
-    if dim & (dim - 1):
-        raise ValueError(f"Hadamard rotation requires power-of-two dimension, got {dim}.")
-
-    out = x.reshape(-1, dim).float()
-    width = 1
-    while width < dim:
-        out = out.reshape(-1, dim // (2 * width), 2, width)
-        left = out[..., 0, :]
-        right = out[..., 1, :]
-        out = torch.cat((left + right, left - right), dim=-1).flatten(-2)
-        width *= 2
-    return (out * (dim**-0.5)).reshape_as(x).to(x.dtype)
 
 
 def _rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -440,29 +371,15 @@ def _cached_sparse_attention_from_positions(
     slot_idx: int,
     positions: torch.Tensor,
     softmax_scale: float,
-    max_position_exclusive: Optional[int] = None,
 ) -> torch.Tensor:
     positions_long = positions.to(torch.long)
-    valid_positions = positions_long[positions_long >= 0]
-    if valid_positions.numel() > 0:
-        max_position = int(valid_positions.max().item())
-        if max_position >= swa_cache.shape[1]:
-            raise ValueError(
-                f"topk/cache position {max_position} exceeds SWA cache length {swa_cache.shape[1]}"
-            )
-        if max_position_exclusive is not None and max_position >= max_position_exclusive:
-            raise ValueError(
-                f"topk/cache position {max_position} must be less than current sequence "
-                f"cache write end {max_position_exclusive}"
-            )
-
     gather_positions = positions_long.clamp(min=0)
     selected_kv = swa_cache[slot_idx, gather_positions].to(q_token.dtype).unsqueeze(0)
     local_topk = torch.arange(positions_long.numel(), dtype=torch.long, device=q_token.device).view(
         1, 1, -1
     )
     local_topk = torch.where(positions_long.view(1, 1, -1) < 0, -1, local_topk)
-    return torch_deepseek_v4_sparse_attention(
+    return _deepseek_v4_sparse_attention(
         q_token.view(1, 1, *q_token.shape),
         selected_kv,
         attn_sink,
@@ -831,7 +748,7 @@ def _cached_compressed_attention(
             compressed_idxs = compressed_idxs + local_kv.shape[0]
         topk = torch.cat((local_idxs, compressed_idxs), dim=0).view(1, 1, -1)
         kv = torch.cat((local_kv, compressed_kv), dim=0)
-        out = torch_deepseek_v4_sparse_attention(
+        out = _deepseek_v4_sparse_attention(
             q_seq[token_offset : token_offset + 1].unsqueeze(0),
             kv.unsqueeze(0),
             attn_sink,
@@ -850,7 +767,6 @@ def _cached_topk_attention(
     topk_seq: torch.Tensor,
     swa_cache: torch.Tensor,
     slot_idx: int,
-    cache_end_pos: int,
     softmax_scale: float,
 ) -> torch.Tensor:
     outputs = []
@@ -863,7 +779,6 @@ def _cached_topk_attention(
                 slot_idx,
                 topk_seq[token_offset],
                 softmax_scale,
-                cache_end_pos,
             )
         )
     if not outputs:
@@ -917,23 +832,14 @@ def _sparse_attention_query_chunk_size(
     return min(num_tokens, chunk_size)
 
 
-@torch.library.custom_op("auto_deploy::torch_deepseek_v4_sparse_attention", mutates_args=())
-def torch_deepseek_v4_sparse_attention(
+def _deepseek_v4_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
     softmax_scale: float,
-    enable_sharding: bool = False,
-    layer_type: str = "mha_sparse",
-    layer_idx: Optional[int] = None,
-    window_size: Optional[int] = None,
-    compress_ratio: int = 0,
-    max_compressed_len: Optional[int] = None,
-    head_dim: Optional[int] = None,
-    rope_dim: Optional[int] = None,
 ) -> torch.Tensor:
-    """Reference DeepSeek V4 sparse attention source op.
+    """Reference DeepSeek V4 sparse attention implementation.
 
     Args:
         q: Query states with shape ``[batch, seq_len, num_heads, head_dim]``.
@@ -951,19 +857,7 @@ def torch_deepseek_v4_sparse_attention(
         The sink participates in softmax normalization but contributes no value
         vector.
     """
-    del (
-        enable_sharding,
-        layer_type,
-        layer_idx,
-        window_size,
-        compress_ratio,
-        max_compressed_len,
-        head_dim,
-        rope_dim,
-    )
-
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
-    _validate_topk_idx_bounds(topk_idxs, kv.shape[1])
 
     compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
     batch_size, seq_len, num_heads, q_head_dim = q.shape
@@ -1006,43 +900,8 @@ def torch_deepseek_v4_sparse_attention(
     return output
 
 
-@torch_deepseek_v4_sparse_attention.register_fake
-def torch_deepseek_v4_sparse_attention_fake(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    softmax_scale: float,
-    enable_sharding: bool = False,
-    layer_type: str = "mha_sparse",
-    layer_idx: Optional[int] = None,
-    window_size: Optional[int] = None,
-    compress_ratio: int = 0,
-    max_compressed_len: Optional[int] = None,
-    head_dim: Optional[int] = None,
-    rope_dim: Optional[int] = None,
-) -> torch.Tensor:
-    """Fake implementation for torch.export tracing."""
-    del (
-        softmax_scale,
-        enable_sharding,
-        layer_type,
-        layer_idx,
-        window_size,
-        compress_ratio,
-        max_compressed_len,
-        head_dim,
-        rope_dim,
-    )
-    _validate_rank("q", q, 4)
-    _validate_rank("kv", kv, 3)
-    _validate_rank("attn_sink", attn_sink, 1)
-    _validate_rank("topk_idxs", topk_idxs, 3)
-    return q.new_empty(q.shape).contiguous()
-
-
-@torch.library.custom_op("auto_deploy::torch_deepseek_v4_sparse_attention_v2", mutates_args=())
-def torch_deepseek_v4_sparse_attention_v2(
+@torch.library.custom_op("auto_deploy::torch_deepseek_v4_sparse_attention", mutates_args=())
+def torch_deepseek_v4_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -1106,11 +965,11 @@ def torch_deepseek_v4_sparse_attention_v2(
             max_compressed_len,
         ).to(kv.dtype)
         kv = torch.cat((kv, compressed_kv), dim=1)
-    return torch_deepseek_v4_sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale)
+    return _deepseek_v4_sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale)
 
 
-@torch_deepseek_v4_sparse_attention_v2.register_fake
-def torch_deepseek_v4_sparse_attention_v2_fake(
+@torch_deepseek_v4_sparse_attention.register_fake
+def torch_deepseek_v4_sparse_attention_fake(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -1174,171 +1033,6 @@ def torch_deepseek_v4_sparse_attention_v2_fake(
 
 @torch.library.custom_op(
     "auto_deploy::torch_deepseek_v4_sparse_attention_with_cache",
-    mutates_args=("swa_cache",),
-)
-def torch_deepseek_v4_sparse_attention_with_cache(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    batch_info_host: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    slot_idx: torch.Tensor,
-    cu_seqlen: torch.Tensor,
-    swa_cache: torch.Tensor,
-    softmax_scale: float,
-    window_size: Optional[int] = None,
-    compress_ratio: int = 0,
-) -> torch.Tensor:
-    """Reference cached DeepSeek V4 sparse attention.
-
-    The model forms query, KV, and top-k tensors before this op. The cached op
-    writes those formed KV rows to the unpaged cache and evaluates sparse
-    attention either directly for prefill or by reading cache-position top-k
-    entries for decode.
-    """
-    _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
-    _validate_swa_cache_inputs(q, kv, swa_cache)
-    _validate_compress_ratio(compress_ratio)
-    if window_size is not None and window_size <= 0:
-        raise ValueError(f"window_size must be positive when provided, got {window_size}")
-
-    batch_info = BatchInfo(batch_info_host)
-    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
-    num_seq = num_prefill + num_decode
-    active_tokens = num_prefill_tokens + num_decode
-    q_flat = q.reshape(-1, *q.shape[2:])
-    if active_tokens > q_flat.shape[0]:
-        raise ValueError(
-            f"active token count {active_tokens} exceeds flattened q tokens {q_flat.shape[0]}"
-        )
-
-    seq_len_host = _to_host_long("seq_len", seq_len, num_seq)
-    input_pos_host = _to_host_long("input_pos", input_pos, num_seq)
-    slot_idx_host = _to_host_long("slot_idx", slot_idx, num_seq)
-    cu_seqlen_host = _to_host_long("cu_seqlen", cu_seqlen, num_seq + 1)
-
-    output_flat = torch.zeros_like(q_flat)
-
-    for seq_idx in range(num_seq):
-        seq_len_i = int(seq_len_host[seq_idx].item())
-        if seq_len_i == 0:
-            continue
-        flat_start = int(cu_seqlen_host[seq_idx].item())
-        input_pos_i = int(input_pos_host[seq_idx].item())
-        slot_idx_i = int(slot_idx_host[seq_idx].item())
-        if slot_idx_i < 0 or slot_idx_i >= swa_cache.shape[0]:
-            raise ValueError(f"slot_idx must be in [0, {swa_cache.shape[0]}), got {slot_idx_i}")
-        q_seq = q_flat[flat_start : flat_start + seq_len_i]
-        kv_seq = _slice_sequence_kv_rows(
-            kv,
-            seq_idx,
-            flat_start,
-            seq_len_i,
-            num_seq,
-            compress_ratio,
-        )
-        topk_seq = _slice_sequence_tokens(topk_idxs, seq_idx, flat_start, seq_len_i)
-        if q_seq.shape[0] != seq_len_i:
-            raise ValueError(
-                f"Sequence {seq_idx} q slice has length {q_seq.shape[0]}, expected {seq_len_i}"
-            )
-        if kv_seq.shape[0] < seq_len_i:
-            raise ValueError(
-                f"Sequence {seq_idx} kv slice has length {kv_seq.shape[0]}, "
-                f"expected at least {seq_len_i}"
-            )
-        if topk_seq.shape[0] != seq_len_i:
-            raise ValueError(
-                f"Sequence {seq_idx} topk_idxs slice has length {topk_seq.shape[0]}, "
-                f"expected {seq_len_i}"
-            )
-        _write_swa_cache(kv_seq, swa_cache, slot_idx_i, input_pos_i)
-
-        if input_pos_i == 0:
-            kv_source = _prefill_kv_source(kv, kv_seq, seq_idx, num_seq)
-            _validate_topk_idx_bounds(topk_seq.unsqueeze(0), kv_source.shape[1])
-            output_flat[flat_start : flat_start + seq_len_i] = torch_deepseek_v4_sparse_attention(
-                q_seq.unsqueeze(0),
-                kv_source,
-                attn_sink,
-                topk_seq.unsqueeze(0),
-                softmax_scale,
-            ).squeeze(0)
-        elif compress_ratio == 0 and window_size is not None:
-            output_flat[flat_start : flat_start + seq_len_i] = _cached_local_window_attention(
-                q_seq,
-                attn_sink,
-                swa_cache,
-                slot_idx_i,
-                input_pos_i,
-                window_size,
-                softmax_scale,
-            )
-        else:
-            cached_topk_seq = _cached_decode_topk_positions(
-                topk_seq,
-                input_pos_i,
-                window_size,
-                compress_ratio,
-            )
-            output_flat[flat_start : flat_start + seq_len_i] = _cached_topk_attention(
-                q_seq,
-                attn_sink,
-                cached_topk_seq,
-                swa_cache,
-                slot_idx_i,
-                input_pos_i + kv_seq.shape[0],
-                softmax_scale,
-            )
-
-    if active_tokens < q_flat.shape[0]:
-        output_flat[active_tokens:].zero_()
-    return output_flat.view_as(q)
-
-
-@torch_deepseek_v4_sparse_attention_with_cache.register_fake
-def torch_deepseek_v4_sparse_attention_with_cache_fake(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    batch_info_host: torch.Tensor,
-    seq_len: torch.Tensor,
-    input_pos: torch.Tensor,
-    slot_idx: torch.Tensor,
-    cu_seqlen: torch.Tensor,
-    swa_cache: torch.Tensor,
-    softmax_scale: float,
-    window_size: Optional[int] = None,
-    compress_ratio: int = 0,
-) -> torch.Tensor:
-    _validate_compress_ratio(compress_ratio)
-    _validate_rank("q", q, 4)
-    _validate_rank("kv", kv, 3)
-    _validate_rank("attn_sink", attn_sink, 1)
-    _validate_rank("topk_idxs", topk_idxs, 3)
-    _validate_rank("swa_cache", swa_cache, 3)
-    del (
-        kv,
-        attn_sink,
-        topk_idxs,
-        batch_info_host,
-        seq_len,
-        input_pos,
-        slot_idx,
-        cu_seqlen,
-        swa_cache,
-        softmax_scale,
-        window_size,
-        compress_ratio,
-    )
-    return q.new_empty(q.shape).contiguous()
-
-
-@torch.library.custom_op(
-    "auto_deploy::torch_deepseek_v4_sparse_attention_v2_with_cache",
     mutates_args=(
         "swa_cache",
         "mhc_cache",
@@ -1348,7 +1042,7 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
         "indexer_compressor_gate_cache",
     ),
 )
-def torch_deepseek_v4_sparse_attention_v2_with_cache(
+def torch_deepseek_v4_sparse_attention_with_cache(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -1508,7 +1202,7 @@ def torch_deepseek_v4_sparse_attention_v2_with_cache(
                     position_ids, seq_idx, flat_start, seq_len_i
                 )
                 output_flat[flat_start : flat_start + seq_len_i] = (
-                    torch_deepseek_v4_sparse_attention_v2(
+                    torch_deepseek_v4_sparse_attention(
                         q_seq.unsqueeze(0),
                         kv_seq.unsqueeze(0),
                         attn_sink,
@@ -1560,8 +1254,7 @@ def torch_deepseek_v4_sparse_attention_v2_with_cache(
                 )
         elif input_pos_i == 0:
             kv_source = _prefill_kv_source(kv, kv_seq, seq_idx, num_seq)
-            _validate_topk_idx_bounds(topk_seq.unsqueeze(0), kv_source.shape[1])
-            output_flat[flat_start : flat_start + seq_len_i] = torch_deepseek_v4_sparse_attention(
+            output_flat[flat_start : flat_start + seq_len_i] = _deepseek_v4_sparse_attention(
                 q_seq.unsqueeze(0),
                 kv_source,
                 attn_sink,
@@ -1585,7 +1278,6 @@ def torch_deepseek_v4_sparse_attention_v2_with_cache(
                 topk_seq,
                 swa_cache,
                 slot_idx_i,
-                input_pos_i + kv_seq.shape[0],
                 softmax_scale,
             )
 
@@ -1594,8 +1286,8 @@ def torch_deepseek_v4_sparse_attention_v2_with_cache(
     return output_flat.view_as(q)
 
 
-@torch_deepseek_v4_sparse_attention_v2_with_cache.register_fake
-def torch_deepseek_v4_sparse_attention_v2_with_cache_fake(
+@torch_deepseek_v4_sparse_attention_with_cache.register_fake
+def torch_deepseek_v4_sparse_attention_with_cache_fake(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -1707,11 +1399,11 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2
+        return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2_with_cache.default
+        return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache.default
 
     @classmethod
     def get_standard_metadata_args(cls) -> list[str]:

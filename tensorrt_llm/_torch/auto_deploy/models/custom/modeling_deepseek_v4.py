@@ -40,6 +40,9 @@ from transformers.utils import ModelOutput
 
 from ... import custom_ops  # noqa: F401 -- register custom ops
 from ..._compat import ActivationType
+from ...utils.quantization_utils import fake_fp4_act_quant as _fake_fp4_act_quant
+from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
+from ...utils.quantization_utils import hadamard_rotate as _hadamard_rotate
 from ..factory import ModelFactoryRegistry
 from ..hf import AutoModelForCausalLMFactory
 from ..quant_checkpoint_layout import (
@@ -1042,68 +1045,6 @@ def _apply_interleaved_rope(
     return torch.stack((out_even, out_odd), dim=-1).flatten(-2).to(x.dtype)
 
 
-def _ceil_pow2_scale(amax: torch.Tensor, max_value: float, min_value: float) -> torch.Tensor:
-    return torch.pow(2.0, torch.ceil(torch.log2(amax.clamp_min(min_value) / max_value)))
-
-
-# These mirror DeepSeek V4 reference activation transforms for compressor/indexer
-# semantics; they are not the deferred PR2 checkpoint fake-quant or loader path.
-def _fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
-    dim = x.shape[-1]
-    if dim == 0 or dim % block_size != 0:
-        return x
-
-    dtype = x.dtype
-    x_float = x.float()
-    grouped = x_float.reshape(-1, dim // block_size, block_size)
-    scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 448.0, 1.0e-4)
-    quant = torch.clamp(grouped / scale, -448.0, 448.0).to(dtype).float()
-    return (quant * scale).reshape_as(x_float).to(dtype)
-
-
-def _fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-    dim = x.shape[-1]
-    if dim == 0 or dim % block_size != 0:
-        return x
-
-    dtype = x.dtype
-    x_float = x.float()
-    grouped = x_float.reshape(-1, dim // block_size, block_size)
-    scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 6.0, 6.0 * 2.0**-126)
-    normalized = torch.clamp(grouped / scale, -6.0, 6.0)
-    abs_normalized = normalized.abs()
-    quant_abs = torch.zeros_like(abs_normalized)
-    # Nearest E2M1 level. Use strict midpoint thresholds to match table argmin tie behavior:
-    # exact midpoint ties stay on the lower level.
-    quant_abs = torch.where(abs_normalized > 0.25, torch.full_like(quant_abs, 0.5), quant_abs)
-    quant_abs = torch.where(abs_normalized > 0.75, torch.full_like(quant_abs, 1.0), quant_abs)
-    quant_abs = torch.where(abs_normalized > 1.25, torch.full_like(quant_abs, 1.5), quant_abs)
-    quant_abs = torch.where(abs_normalized > 1.75, torch.full_like(quant_abs, 2.0), quant_abs)
-    quant_abs = torch.where(abs_normalized > 2.5, torch.full_like(quant_abs, 3.0), quant_abs)
-    quant_abs = torch.where(abs_normalized > 3.5, torch.full_like(quant_abs, 4.0), quant_abs)
-    quant_abs = torch.where(abs_normalized > 5.0, torch.full_like(quant_abs, 6.0), quant_abs)
-    quant = quant_abs * normalized.sign()
-    return (quant * scale).reshape_as(x_float).to(dtype)
-
-
-def _hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
-    dim = x.shape[-1]
-    if dim <= 1:
-        return x
-    if dim & (dim - 1):
-        raise ValueError(f"Hadamard rotation requires power-of-two dimension, got {dim}.")
-
-    out = x.reshape(-1, dim).float()
-    width = 1
-    while width < dim:
-        out = out.reshape(-1, dim // (2 * width), 2, width)
-        left = out[..., 0, :]
-        right = out[..., 1, :]
-        out = torch.cat((left + right, left - right), dim=-1).flatten(-2)
-        width *= 2
-    return (out * (dim**-0.5)).reshape_as(x).to(x.dtype)
-
-
 def _window_topk_idxs(
     window_size: int,
     batch_size: int,
@@ -1170,7 +1111,7 @@ def _sparse_attention(
     rope_dim: Optional[int],
     rms_norm_eps: float,
 ) -> torch.Tensor:
-    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2(
+    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
         q,
         kv,
         attn_sink,
