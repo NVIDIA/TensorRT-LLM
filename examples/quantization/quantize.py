@@ -28,9 +28,9 @@ if __name__ == "__main__":
         choices=['cuda', 'cpu'])
     parser.add_argument(
         "--device_map",
-        help="How to map the model on the devices",
+        help="How to map the model on the devices (e.g., auto, sequential, cpu, cuda, cuda:0). Note: 'gpu' is normalized to 'cuda' for backward-compatibility.",
         default="auto",
-        choices=["auto", "sequential", "cpu", "gpu"],
+        type=str,
     )
     parser.add_argument(
         '--calib_dataset',
@@ -147,6 +147,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Backward-compatibility shim: translates legacy "gpu" option into the explicit device name "cuda"
+    # so downstream logic expects a consistent device token.
+    if args.device_map == "gpu":
+        args.device_map = "cuda"
     # auto_quantize_bits check
     if args.autoq_format:
         lower_bound, upper_bound = 4 if '4' in args.autoq_format else 8, 16
