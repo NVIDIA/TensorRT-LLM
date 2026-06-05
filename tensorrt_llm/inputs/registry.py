@@ -632,6 +632,42 @@ class BaseMultimodalInputProcessor(ABC):
                 self, 'temporal_patch_size') else 1
             return num_tokens_per_frame * num_frames // temporal_patch_size
 
+    def get_mm_item_order(
+        self,
+        prompt_token_ids: List[int],
+        mm_data: Dict[str, Any],
+    ) -> List[Tuple[str, int]]:
+        """Resolve the prompt-item order for the tokenized + multimodal fast path.
+
+        Used by `call_with_token_ids` for mixed-modality requests to derive the
+        logical `(modality, item_index)` order of multimodal items from their
+        placeholder positions in the real prompt. The default detokenizes the
+        prompt token ids and delegates to `_get_mm_item_order_from_text`; a
+        processor that enables the token-id fast path
+        (`supports_token_id_mm_expansion`) must provide that hook (or override
+        this method).
+        """
+        text_prompt = self.tokenizer.decode(prompt_token_ids,
+                                            skip_special_tokens=False)
+        return self._get_mm_item_order_from_text(text_prompt, mm_data)
+
+    def _get_mm_item_order_from_text(
+        self,
+        text_prompt: str,
+        mm_data: Dict[str, Any],
+    ) -> List[Tuple[str, int]]:
+        """Derive `(modality, item_index)` order by scanning placeholder text.
+
+        Base implementation raises; any processor that enables the tokenized +
+        multimodal fast path (`supports_token_id_mm_expansion=True`) for 2+
+        distinct modalities MUST override this to return the prompt-physical item
+        order (left-to-right placeholder appearance).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} enables the tokenized multimodal fast path "
+            "but does not implement _get_mm_item_order_from_text(text_prompt, "
+            "mm_data) to resolve prompt-item order.")
+
 
 class BaseMultimodalDummyInputsBuilder(ABC):
     """Base class for generating dummy inputs. Specially for profiling."""
