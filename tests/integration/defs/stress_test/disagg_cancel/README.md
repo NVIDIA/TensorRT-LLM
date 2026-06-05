@@ -13,19 +13,20 @@ transceiver under heavy mid-flight cancellation).
 
 ## Status
 
-This is the **skeleton** stage. The harness class structure is in
-place; thread bodies are intentionally stubs that exit immediately.
-The pytest test exercises the lifecycle (`setup → start →
-wait_until_done → stop`) only.
+The harness class structure and lifecycle are in place. Thread bodies
+land incrementally:
 
-Thread bodies are implemented incrementally in subsequent commits,
-in roughly this order (read-only first, side-effecting later):
+| Thread | Status |
+|--------|--------|
+| `log_scanner_thread` | Implemented — hard-zero log fail-fast |
+| `metrics_thread` | Stub (Step 2) |
+| `injector_thread` | Implemented — SIGSTOP/SIGCONT/SIGKILL + respawn |
+| `canary_thread` | Stub |
+| `load_thread` | Stub |
 
-1. `log_scanner_thread` (read-only — easiest)
-2. `metrics_thread` (read-only — almost as easy)
-3. `injector_thread` (subprocess control)
-4. `canary_thread` (HTTP client + token-equivalence)
-5. `load_thread` (wraps existing `run_cancel_stress_test`)
+Component-level coverage: `test_log_scanner.py`, `test_injector.py`.
+The parametrized marathon pytest still runs a lifecycle smoke until
+`setup()` launches a real cluster and the remaining threads are wired.
 
 ## File layout
 
@@ -35,6 +36,8 @@ tests/integration/defs/stress_test/disagg_cancel/
 ├── __init__.py
 ├── harness.py                      (DisaggCancellationStressHarness)
 ├── test_disagg_cancel_stress.py    (pytest entry point)
+├── test_log_scanner.py             (log_scanner unit tests)
+├── test_injector.py                (injector unit tests)
 └── configs/
     ├── README.md                   (YAML schema + how to add a config)
     ├── marathon_cpp_v1_deepseek.yaml
@@ -57,24 +60,70 @@ nightly / weekly via
 `tests/integration/test_lists/qa/llm_function_stress.txt` (wiring
 lands together with the load-thread implementation).
 
-### Local smoke (skeleton stage)
+### Unit tests (no GPU, no cluster)
+
+Component tests for individual harness threads run in isolation. They
+do **not** need `LLM_MODELS_ROOT`, GPUs, or a TRT-LLM venv with
+`transformers` — use `--confcutdir` so pytest skips the parent
+`tests/integration/defs/conftest.py`.
+
+From the repository root:
 
 ```bash
 cd /path/to/TensorRT-LLM
-LLM_MODELS_ROOT=/path/to/models \
-  pytest -sv tests/integration/defs/stress_test/disagg_cancel/
+
+export PYTHONPATH=tests/integration/defs:tests/integration/defs/disaggregated
+
+# Step 3 — injector thread (SIGSTOP / SIGCONT / SIGKILL + respawn)
+python3 -m pytest -c /dev/null -o addopts= \
+  --confcutdir=tests/integration/defs/stress_test \
+  tests/integration/defs/stress_test/disagg_cancel/test_injector.py -v
+
+# Step 1 — log scanner (optional sanity alongside injector PR)
+python3 -m pytest -c /dev/null -o addopts= \
+  --confcutdir=tests/integration/defs/stress_test \
+  tests/integration/defs/stress_test/disagg_cancel/test_log_scanner.py -v
+
+# Marathon YAML parse/validate (includes stress_config.injections schedule)
+python3 -m pytest -c /dev/null -o addopts= \
+  --confcutdir=tests/integration/defs/stress_test \
+  tests/integration/defs/stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_all_marathon_yamls_parse_and_validate -v
 ```
 
-In the skeleton stage this should complete in seconds because all
-threads are no-ops; it only verifies the harness lifecycle compiles
-and the YAMLs parse.
+All three together:
 
-### Local marathon (once thread bodies are wired)
+```bash
+python3 -m pytest -c /dev/null -o addopts= \
+  --confcutdir=tests/integration/defs/stress_test \
+  tests/integration/defs/stress_test/disagg_cancel/test_injector.py \
+  tests/integration/defs/stress_test/disagg_cancel/test_log_scanner.py \
+  tests/integration/defs/stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_all_marathon_yamls_parse_and_validate -q
+```
 
-Once thread bodies are implemented, the same command will run the
-full 2-hour marathon against the C++ marathon config. To run a shorter smoke
-during development, set `duration_min: 10` and trim
-`injections:` in the YAML.
+In a full TRT-LLM dev container/venv (with `transformers` installed),
+the same tests also run under the normal integration pytest path:
+
+```bash
+pytest -sv tests/integration/defs/stress_test/disagg_cancel/test_injector.py
+```
+
+### Lifecycle smoke (injector not exercised on real workers)
+
+```bash
+pytest -sv tests/integration/defs/stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon
+```
+
+`setup()` is still a stub, so this only checks harness lifecycle
+(`setup` → `start` → `wait` → `stop`). The injector thread exits
+immediately because no workers are registered via
+`bind_tracked_workers()`.
+
+### Local marathon (after `setup()` + load/canary land)
+
+Once `setup()` launches a real 3P3D cluster and registers workers,
+the full 2-hour marathon runs via the same pytest entry point. For
+development, set `duration_min: 10` and trim `injections:` in the
+YAML.
 
 ## Pass criteria
 

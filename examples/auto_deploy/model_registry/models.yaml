@@ -404,6 +404,18 @@ models:
 # - name: XiaomiMiMo/MiMo-V2-Flash
 #   config_id: default_ws_8
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- StepFun Step-3.7-Flash (Feb 2026) ---
+# Text decoder of the Step-3.7-Flash VLM (model_type step3p7 / step3p5). 45 layers,
+# 288 routed experts top-8 + shared expert, mixed full/sliding GQA, head-wise attn gate.
+- name: stepfun-ai/Step-3.7-Flash
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
+- name: stepfun-ai/Step-3.7-Flash-FP8
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
+- name: stepfun-ai/Step-3.7-Flash-NVFP4
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
 # --- Kimi-K2.5 (Jan 2026) ---
 # TypeError: 'NoneType' object is not subscriptable
 # - name: moonshotai/Kimi-K2.5
