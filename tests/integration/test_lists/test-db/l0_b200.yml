@@ -105,6 +105,7 @@ l0_b200:
   - unittest/_torch/modules/test_moe_load_balancer.py
   - unittest/_torch/modules/test_moe_routing.py
   - unittest/_torch/modules/test_moe_host_sharer.py
+  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   # ------------- legacy MoE tests ---------------
   - unittest/_torch/modules/test_fused_moe.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
@@ -207,6 +208,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
+  - unittest/_torch/visual_gen/test_cosmos3_transformer.py
+  - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - examples/test_visual_gen.py::test_wan_t2v_example
   # - examples/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------

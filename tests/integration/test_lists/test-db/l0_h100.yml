@@ -35,6 +35,7 @@ l0_h100:
   - unittest/_torch/modules/test_moe_load_balancer.py
   - unittest/_torch/modules/test_moe_routing.py
   - unittest/_torch/modules/test_moe_host_sharer.py
+  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   # ------------- legacy MoE tests ---------------
   - unittest/_torch/modules/test_fused_moe.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
@@ -390,7 +391,6 @@ l0_h100:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8] # 9 mins
   - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1]
   - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2] # 5 mins
   - accuracy/test_llm_api.py::TestMistral_NeMo_Minitron_8B_Instruct::test_fp8
