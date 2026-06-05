@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # 2-node KV cache transceiver bandwidth / UCX-tuning harness.
@@ -47,12 +47,18 @@ if [ -n "${WHEEL_PATH}" ]; then
     INSTALL_CMD="pip install ${WHEEL_PATH}[devel]"
 elif [ -n "${REPO}" ]; then
     if [ "${BUILD_WHEEL}" = "true" ]; then
-        BUILD="cd ${REPO} && python3 scripts/build_wheel.py --trt_root /usr/local/tensorrt --use_ccache --clean"
-        [ -n "${CUDA_ARCH}" ] && BUILD="${BUILD} --cuda_architectures \"${CUDA_ARCH}\""
-        INSTALL_CMD="${BUILD} && cd ${REPO} && pip install -e .[devel]"
-    else
-        INSTALL_CMD="cd ${REPO} && pip install -e .[devel]"
+        echo "Building TensorRT-LLM wheel on one node..."
+        BUILD_CMD="cd ${REPO} && python3 scripts/build_wheel.py --trt_root /usr/local/tensorrt --use_ccache --clean"
+        [ -n "${CUDA_ARCH}" ] && BUILD_CMD="${BUILD_CMD} --cuda_architectures \"${CUDA_ARCH}\""
+        if ! srun --container-image="${IMAGE}" --container-name="${CONTAINER_NAME}" \
+                --container-mounts="${MOUNTS}" --mpi=pmix -N1 --ntasks-per-node=1 \
+                bash -c "${BUILD_CMD}" &> "${WORK}/logs/build.log"; then
+            echo "ERROR: build failed; see ${WORK}/logs/build.log" >&2
+            exit 1
+        fi
+        echo "Build OK."
     fi
+    INSTALL_CMD="cd ${REPO} && pip install -e .[devel]"
 else
     INSTALL_CMD="echo 'Using TensorRT-LLM pre-installed in the container'"
 fi
@@ -74,6 +80,8 @@ echo "Install OK."
 # the surviving ranks blocked in an MPI barrier waiting for the dead one.
 COMMON="--container-image=${IMAGE} --container-name=${CONTAINER_NAME} \
         --container-mounts=${MOUNTS} --mpi=pmix --kill-on-bad-exit=1"
+
+OVERALL_RC=0
 
 for SWEEP_IDX in $(seq 0 $((NUM_SWEEPS - 1))); do
     # This sweep's UCX_* exports (and CTT_SWEEP_NAME) as shell `export` lines.
@@ -121,11 +129,15 @@ ${DRIVER} --role gen" &
 
     wait "${CTX_PID}"; CTX_RC=$?
     wait "${GEN_PID}"; GEN_RC=$?
+    if [ "${CTX_RC}" -ne 0 ] || [ "${GEN_RC}" -ne 0 ]; then
+        OVERALL_RC=1
+    fi
     echo "sweep ${SWEEP_IDX} done (ctx_rc=${CTX_RC} gen_rc=${GEN_RC})"
 done
 
 # ---------------------------------------------------------------------------
 # Aggregate results.
 # ---------------------------------------------------------------------------
-python3 "${HERE}/report.py" "${CONFIG}" --aggregate --out "${WORK}/results.json"
+python3 "${HERE}/report.py" "${CONFIG}" --aggregate --out "${WORK}/results.json" || exit 1
 echo "Results written to ${WORK}/results.json"
+exit "${OVERALL_RC}"

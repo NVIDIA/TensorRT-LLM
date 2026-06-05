@@ -110,9 +110,8 @@ run:
   max_sweep_s: 180
   # Controls UCX_PROTO_INFO (the per-transfer transport shown as
   # selected_transport in results.json). Accepts:
-  #   true  -> UCX_PROTO_INFO=used: compact/quiet (default). Keeps rank logs
-  #            small; on current UCX builds prints little, so selected_transport
-  #            is usually empty.
+  #   true  -> UCX_PROTO_INFO=used: compact/quiet (default). Requires UCX >= 1.21
+  #            to emit the selected transport while keeping rank logs small.
   #   false -> do not set UCX_PROTO_INFO at all.
   #   "y"   -> UCX_PROTO_INFO=y: full per-size protocol tables. Fills
   #            selected_transport but is very verbose (~50x larger rank logs).

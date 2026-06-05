@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -116,9 +116,8 @@ def emit_launch_vars(cfg):
     # UCX_PROTO_INFO value that launch.slurm exports (UCX then prints protocol-
     # selection info that report.py parses into selected_transport). Selected by
     # run.capture_proto_info:
-    #   true  -> "used"  (default): compact, keeps the per-rank logs small. NOTE
-    #            on current UCX builds "used" prints little/nothing, so
-    #            selected_transport may be empty -- this is the low-noise default.
+    #   true  -> "used"  (default): compact, keeps the per-rank logs small.
+    #            Requires UCX >= 1.21 to emit selected transport details.
     #   false -> "" (disabled, UCX_PROTO_INFO not exported).
     #   <str> -> that literal value, e.g. "y" to emit the full per-size tables
     #            (fills selected_transport, but is very verbose: ~50x log size).
@@ -500,7 +499,11 @@ def _read_status(work_dir, sweep_idx):
                 line = line.strip()
                 if not line:
                     continue
-                rec = json.loads(line)
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    print(f"Skipping malformed status line in {path}", file=sys.stderr)
+                    continue
                 key = (rec.get("combination_idx", rec.get("combo_idx")), rec["reqlen_idx"])
                 cur = merged.get(key)
                 if cur is None or severity.get(rec["status"], 1) > severity.get(cur["status"], 1):

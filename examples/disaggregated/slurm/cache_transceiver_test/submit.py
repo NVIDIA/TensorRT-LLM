@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@ Usage:
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -59,33 +60,51 @@ def validate(cfg):
         errors.append("environment.container_image must be set")
     if not env.get("work_dir") or _is_placeholder(env.get("work_dir")):
         errors.append("environment.work_dir must be set")
+    if env.get("container_mount") and _is_placeholder(env.get("container_mount")):
+        errors.append("environment.container_mount must be set (not a placeholder)")
     if env.get("build_wheel") and (
         not env.get("trtllm_repo") or _is_placeholder(env.get("trtllm_repo"))
     ):
         errors.append("environment.trtllm_repo must be set when build_wheel is true")
 
-    n = cfg["hardware"]["gpus_per_node"]
-    par = cfg["parallel"]
-    if par["ctx_tp"] * par["ctx_pp"] != n:
-        errors.append(f"ctx_tp*ctx_pp ({par['ctx_tp']}*{par['ctx_pp']}) != gpus_per_node ({n})")
-    if par["gen_tp"] * par["gen_pp"] != n:
-        errors.append(f"gen_tp*gen_pp ({par['gen_tp']}*{par['gen_pp']}) != gpus_per_node ({n})")
-    if par["ctx_tp"] != par["gen_tp"] or par["ctx_pp"] != par["gen_pp"]:
-        errors.append(
-            "layout must be symmetric (ctx_tp==gen_tp and ctx_pp==gen_pp) "
-            "for the harness's local verification"
-        )
+    hardware = cfg.get("hardware")
+    if not isinstance(hardware, dict):
+        errors.append("hardware section must be set")
+        hardware = {}
+    par = cfg.get("parallel")
+    if not isinstance(par, dict):
+        errors.append("parallel section must be set")
+        par = {}
+    n = hardware.get("gpus_per_node")
+    if n is not None and par:
+        if par.get("ctx_tp") and par.get("ctx_pp") and par["ctx_tp"] * par["ctx_pp"] != n:
+            errors.append(f"ctx_tp*ctx_pp ({par['ctx_tp']}*{par['ctx_pp']}) != gpus_per_node ({n})")
+        if par.get("gen_tp") and par.get("gen_pp") and par["gen_tp"] * par["gen_pp"] != n:
+            errors.append(f"gen_tp*gen_pp ({par['gen_tp']}*{par['gen_pp']}) != gpus_per_node ({n})")
+        if par.get("ctx_tp") and par.get("gen_tp") and par.get("ctx_pp") and par.get("gen_pp"):
+            if par["ctx_tp"] != par["gen_tp"] or par["ctx_pp"] != par["gen_pp"]:
+                errors.append(
+                    "layout must be symmetric (ctx_tp==gen_tp and ctx_pp==gen_pp) "
+                    "for the harness's local verification"
+                )
 
-    kv = cfg["kv_cache"]
-    if kv["num_kv_heads"] % par["ctx_tp"] != 0:
+    kv = cfg.get("kv_cache")
+    if not isinstance(kv, dict):
+        errors.append("kv_cache section must be set")
+        kv = {}
+    if kv.get("num_kv_heads") and par.get("ctx_tp") and kv["num_kv_heads"] % par["ctx_tp"] != 0:
         errors.append(
             f"num_kv_heads ({kv['num_kv_heads']}) must be divisible by "
             f"tensor parallel size ({par['ctx_tp']})"
         )
-    if kv["dtype"].upper() not in ("FP8", "HALF", "BF16"):
+    if kv.get("dtype") and kv["dtype"].upper() not in ("FP8", "HALF", "BF16"):
         errors.append(f"kv_cache.dtype must be FP8|HALF|BF16, got {kv['dtype']}")
-    for rl in cfg["test_matrix"]["request_lengths"]:
-        if rl > kv["max_tokens_in_buffer"]:
+    tm = cfg.get("test_matrix")
+    if not isinstance(tm, dict):
+        errors.append("test_matrix section must be set")
+        tm = {}
+    for rl in tm.get("request_lengths", []):
+        if kv.get("max_tokens_in_buffer") and rl > kv["max_tokens_in_buffer"]:
             errors.append(
                 f"request_length {rl} > max_tokens_in_buffer ({kv['max_tokens_in_buffer']})"
             )
@@ -95,11 +114,10 @@ def validate(cfg):
     # decode_rid recovers reqlen_idx as (rid//10_000) % 100 and request_index as
     # rid % 10_000, so these fields must not overflow their strides or rids
     # alias across cases and bandwidth buckets get silently cross-contaminated.
-    tm = cfg["test_matrix"]
-    if len(tm["request_lengths"]) > 100:
+    req_lens = tm.get("request_lengths", [])
+    if len(req_lens) > 100:
         errors.append(
-            f"len(request_lengths) ({len(tm['request_lengths'])}) "
-            f"must be <= 100 (RequestID encoding limit)"
+            f"len(request_lengths) ({len(req_lens)}) must be <= 100 (RequestID encoding limit)"
         )
     reqs_per_len = tm.get("warmup_requests", 0) + tm.get("num_requests_per_length", 0)
     if reqs_per_len >= 10_000:
@@ -108,7 +126,7 @@ def validate(cfg):
             f"must be < 10000 (RequestID encoding limit)"
         )
 
-    for combination in cfg["test_matrix"].get("combinations") or cfg["test_matrix"]["combos"]:
+    for combination in tm.get("combinations") or tm.get("combos") or []:
         rt = combination.get("runtime")
         be = combination.get("backend")
         if rt not in ("CPP", "PYTHON"):
@@ -182,9 +200,7 @@ def main():
     ]
 
     slurm.setdefault("extra_args", "")
-    for arg in slurm["extra_args"].split():
-        if arg:
-            sbatch_cmd.append(arg)
+    sbatch_cmd.extend(shlex.split(slurm["extra_args"]))
     # Reset TMPDIR to a path that exists on the compute nodes. --export=ALL
     # propagates the submitting shell's TMPDIR, which may point at a login-node
     # -only temp dir; enroot/pyxis (GNU parallel) then fails to import the image

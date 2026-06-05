@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -169,7 +169,8 @@ def add_sequence(mgr, req, prompt_len, use_v2):
     if use_v2:
         kv = mgr._create_kv_cache(req.py_request_id, None, None)
         ok = kv.resume(torch.cuda.current_stream().cuda_stream)
-        assert ok, f"V2 resume failed for request {req.py_request_id}"
+        if not ok:
+            raise RuntimeError(f"V2 resume failed for request {req.py_request_id}")
         kv.resize(prompt_len)
         return kv
     mgr.impl.add_sequence_batch([(req.py_request_id, prompt_len, 1)], [req])
@@ -459,10 +460,11 @@ def main():
     rank = comm.Get_rank()
     n = comm.Get_size()
     n_cfg = int(cfg["hardware"]["gpus_per_node"])
-    assert n == n_cfg, (
-        f"MPI world size {n} != gpus_per_node {n_cfg}; each srun step must be "
-        f"its own MPI world of size N (see plan Risk #3)."
-    )
+    if n != n_cfg:
+        raise RuntimeError(
+            f"MPI world size {n} != gpus_per_node {n_cfg}; each srun step must be "
+            f"its own MPI world of size N (see plan Risk #3)."
+        )
     is_leader = rank == 0
     torch.cuda.set_device(rank % torch.cuda.device_count())
 
@@ -546,8 +548,7 @@ def main():
     pp = cfg["parallel"][f"{role}_pp"]
     mapping = Mapping(world_size=n, rank=rank, tp_size=tp, pp_size=pp, gpus_per_node=n)
     dist_obj = Distributed.get(mapping)
-    pp_rank = rank // tp
-    n_local_layers = local_layer_count(cfg["kv_cache"]["num_layers"], pp, pp_rank)
+    n_local_layers = local_layer_count(cfg["kv_cache"]["num_layers"], pp, mapping.pp_rank)
 
     signal.signal(signal.SIGALRM, _alarm_handler)
 
@@ -681,6 +682,7 @@ def main():
             torch.cuda.empty_cache()
             continue
 
+        case_timed_out = False
         for li, req_len in enumerate(req_lens):
             try:
                 signal.alarm(timeout_s)
@@ -710,15 +712,15 @@ def main():
                 signal.alarm(0)
                 cancel_watchdog()
                 record(ci, li, "TIMEOUT", f"exceeded {timeout_s}s")
+                for remaining_li in range(li + 1, len(req_lens)):
+                    record(ci, remaining_li, "TIMEOUT", "skipped after timeout in earlier req_len")
                 print(
                     f"[{role} rank={rank}] TIMEOUT {case['label']} req_len={req_len}",
                     file=sys.stderr,
                     flush=True,
                 )
                 reset_sock()
-                # The native transfer may still be wedged; the watchdog thread
-                # (and launch.slurm's outer `timeout -k`) will hard-kill this
-                # sweep if subsequent cases also hang.
+                case_timed_out = True
             except Exception as e:  # noqa: BLE001 - report any transceiver error
                 signal.alarm(0)
                 cancel_watchdog()
@@ -728,9 +730,9 @@ def main():
                     file=sys.stderr,
                     flush=True,
                 )
-                # The lockstep handshake leaves the sockets clean after a
-                # local/transfer error, so no reset is needed here.
-            comm.Barrier()
+            any_timed_out = comm.allreduce(1 if case_timed_out else 0, op=MPI.MAX)
+            if any_timed_out:
+                break
 
         # Tear down the case's transceiver and preserve its C++ CSVs.
         if hasattr(xcvr, "shutdown"):
