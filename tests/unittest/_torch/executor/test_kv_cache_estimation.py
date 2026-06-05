@@ -7,12 +7,14 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,6 +78,7 @@ def _make_creator(
     # behavior; production sets this in __init__ via
     # _get_model_kv_cache_manager_cls(), which we bypass here.
     c._kv_cache_manager_cls = KVCacheManagerV2
+    c._is_kv_cache_manager_v2 = True
 
     return c
 
@@ -300,6 +303,93 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
     per_pool_tokens = total_tokens // 2  # 2 pool groups
     # Must be enough to hold a max_seq_len request per pool.
     assert per_pool_tokens >= max_seq_len
+
+
+def test_v2_cache_size_per_token_models_generation_swa_cost():
+    class FakeModelConfig:
+        quant_config = None
+        pretrained_config = SimpleNamespace(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+
+        def get_num_attention_layers(self):
+            return 3
+
+    mapping = Mock(enable_attention_dp=False, tp_size=1)
+    mapping.pp_layers.return_value = [0, 1, 2]
+
+    no_scratch_size_per_token = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(),
+            mapping,
+            tokens_per_block=64,
+            max_seq_len=4096,
+            max_batch_size=3,
+            kv_cache_config=KvCacheConfig(max_attention_window=[2048, 2048, 4096]),
+        )
+    )
+    scratch_size_per_token = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(),
+            mapping,
+            tokens_per_block=64,
+            max_seq_len=4096,
+            max_batch_size=3,
+            kv_cache_config=KvCacheConfig(max_attention_window=[2048, 2048, 4096]),
+            enable_swa_scratch_reuse=True,
+        )
+    )
+
+    # Per layer: K+V * kv_heads * head_dim * bf16 bytes = 2 * 2 * 8 * 2.
+    expected = CacheCost(slope=64, intercept=3 * 2 * 2048 * 64)
+    assert no_scratch_size_per_token == expected
+    assert scratch_size_per_token == expected
+
+
+def test_creator_uses_v2_affine_cache_cost():
+    class FakeV2Manager(KVCacheManagerV2):
+        @staticmethod
+        def get_cache_size_per_token(model_config, mapping, **kwargs):
+            return 20, 21
+
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = Mock()
+    creator._tokens_per_block = 64
+    creator._max_seq_len = 1024
+    creator._max_batch_size = 3
+    creator._kv_cache_config = KvCacheConfig()
+    creator._speculative_config = None
+
+    cost = creator._per_manager_cache_cost(FakeV2Manager, Mock())
+
+    assert cost == CacheCost(slope=20, intercept=21)
+
+
+def test_v2_quota_from_max_tokens_models_context_swa_scratch():
+    manager = object.__new__(KVCacheManagerV2)
+    manager.num_local_layers = 3
+    manager.pp_layers = [0, 1, 2]
+    manager.max_attention_window_vec = [128, 128, None]
+    manager.tokens_per_block = 64
+    manager.max_batch_size = 4
+    manager.max_num_tokens = 1000
+    manager.get_layer_bytes_per_token = lambda local_layer_idx, data_role: [10, 10, 20][
+        local_layer_idx
+    ]
+
+    max_tokens = 1200
+
+    manager.enable_swa_scratch_reuse = False
+    no_scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
+    assert no_scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 20 + 4 * 2 * 128 * 10)
+    assert manager._get_max_tokens_from_quota(no_scratch_quota) == max_tokens
+
+    manager.enable_swa_scratch_reuse = True
+    scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
+    assert scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 10 + 4 * 2 * 128 * 10)
+    assert manager._get_max_tokens_from_quota(scratch_quota) == max_tokens
 
 
 # ---------------------------------------------------------------------------

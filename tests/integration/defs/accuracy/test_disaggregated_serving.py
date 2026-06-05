@@ -54,6 +54,7 @@ DEFAULT_TEST_TIMEOUT = 3600
 DEFAULT_SERVER_WAITING_TIMEOUT = 2100
 # Timeout for the accuracy evaluation
 DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
+DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 
 
 @functools.lru_cache(maxsize=1)
@@ -2326,6 +2327,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
             "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
@@ -2337,6 +2339,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "moe_expert_parallel_size": 2,
             "enable_attention_dp": True,
             "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
             "moe_config": {
                 "backend": "TRTLLM",
@@ -2377,6 +2380,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
             "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
@@ -2388,6 +2392,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "moe_expert_parallel_size": 2,
             "enable_attention_dp": True,
             "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
             "moe_config": {
                 "backend": "TRTLLM",
@@ -2455,7 +2460,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
             "moe_expert_parallel_size": 2,
             "enable_attention_dp": True,
             "disable_overlap_scheduler": True,
-            "max_batch_size": 16,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_num_tokens": 4096,
             "max_seq_len": 4096,
             "moe_config": {
