@@ -251,23 +251,6 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
-        # MiniMax-M2.5 FP8 on 8 GPUs: intermediate_size=1536 with weight_block_size=128
-        # is not divisible under TP=8 (1536/8=192), so route MoE through EP=8 and use
-        # attention DP instead of TP.
-        {
-            'patterns': [
-                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-gpus:8',
-                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-gpus:8',
-                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:2000,500-ep:8-gpus:8',
-                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:1000,1000-ep:8-gpus:8',
-                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-gpus:8',
-                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-ep:8-gpus:8',
-                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-input_output_len:1000,1000-con:512-ep:8-gpus:8',
-            ],
-            'config': {
-                'enable_attention_dp': True,
-            }
-        },
         {
             'patterns': [
                 'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4',
@@ -608,6 +591,18 @@ def get_model_yaml_config(model_label: str,
         if _get_sm_version_safe() >= 100:
             moe_config = base_config.setdefault('moe_config', {})
             moe_config.setdefault('backend', 'DEEPGEMM')
+
+    # MiniMax-M2.5 FP8 MoE: intermediate_size=1536 is not divisible by the FP8
+    # block-scale granularity (128) under TP=8 (1536/8=192), which trips the
+    # assertion in fused_moe quantization. Route the MoE through expert
+    # parallelism so moe_tp_size=1 and intermediate_size_per_partition stays
+    # 1536 (1536 % 128 == 0), pairing it with attention DP. The bench command
+    # passes only --tp=8, so moe_expert_parallel_size must be set here. The
+    # 4-GPU case (1536/4=384) shards cleanly and is left on the TP path.
+    if ('pytorch' in model_label and 'minimax_m2.5_fp8' in model_label.lower()
+            and 'gpus:8' in model_label.lower()):
+        base_config['moe_expert_parallel_size'] = 8
+        base_config['enable_attention_dp'] = True
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:
