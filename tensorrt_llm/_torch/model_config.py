@@ -688,7 +688,16 @@ class ModelConfig(Generic[TConfig]):
             if sparse_attention_config:
                 index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                 index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                # index_topk needs an explicit-set check rather than `or`: the
+                # DeepSeekV4SparseAttentionConfig default (512) is truthy, so a
+                # plain `or` shadows the checkpoint's index_topk (e.g. Pro's
+                # 1024) whenever the user did not set it. Mirror the window_size
+                # handling below and consult model_fields_set. (index_n_heads /
+                # index_head_dim stay on `or` since their defaults are None.)
+                if 'index_topk' in sparse_attention_config.model_fields_set:
+                    index_topk = sparse_attention_config.index_topk
+                else:
+                    index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                 skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                 # Pass-through DSA tuning flags so user-set values survive the
@@ -754,7 +763,13 @@ class ModelConfig(Generic[TConfig]):
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                        # Explicit-set check (see V4 path above): only honor a
+                        # user-provided index_topk; otherwise take the
+                        # checkpoint value rather than a truthy subclass default.
+                        if 'index_topk' in sparse_attention_config.model_fields_set:
+                            index_topk = sparse_attention_config.index_topk
+                        else:
+                            index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk

@@ -395,6 +395,27 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                         f"for non-Blackwell GPUs.")
         return self
 
+    @model_validator(mode="after")
+    def _warn_heuristic_topk_unsupported(self):
+        """Warn (not raise) when GVR Top-K is enabled with an index_topk the
+        kernel cannot accelerate.
+
+        The C++ ``indexer_topk_decode`` dispatcher silently falls back to the
+        radix Top-K path for unsupported K, so without this warning a user may
+        believe GVR is active when it is not. ``index_topk`` may still be None
+        here (it is filled from the checkpoint later), so only validate
+        concrete values.
+        """
+        supported_topk = (512, 1024, 2048)
+        if (self.enable_heuristic_topk and self.index_topk is not None
+                and self.index_topk not in supported_topk):
+            logger.warning(
+                f"enable_heuristic_topk=True but index_topk={self.index_topk} "
+                f"is not in the GVR-supported set {supported_topk}; the indexer "
+                f"will silently fall back to the radix Top-K path. Set "
+                f"index_topk to one of {supported_topk} to use GVR.")
+        return self
+
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
