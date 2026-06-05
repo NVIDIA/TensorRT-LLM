@@ -55,7 +55,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
-                           update_spec_config_from_model_config)
+                           update_spec_config_from_loaded_model)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
@@ -485,10 +485,9 @@ class PyTorchModelEngine(ModelEngine):
             self.llm_args.attn_backend,
             sparse_attn_config=self.sparse_attention_config)
 
-        if self.is_spec_decode:
+        if self.is_spec_decode and not self.is_draft_model:
             self.spec_metadata = None
-            update_spec_config_from_model_config(self.spec_config,
-                                                 self.model.config)
+            update_spec_config_from_loaded_model(self.spec_config, self.model)
             max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
