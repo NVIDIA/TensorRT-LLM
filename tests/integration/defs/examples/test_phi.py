@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,15 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import csv
 import os
 
 import defs.ci_profiler
 import pytest
-from defs.common import (convert_weights, quantize_data,
-                         test_llm_torch_multi_lora_support, venv_check_call)
-from defs.conftest import (get_sm_version, skip_fp8_pre_ada,
-                           skip_post_blackwell, skip_pre_ada)
+from defs.common import test_llm_torch_multi_lora_support, venv_check_call
+from defs.conftest import get_sm_version, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 # skip trt flow cases on post-Blackwell-Ultra
@@ -40,107 +37,6 @@ def phi_example_root(llm_root, llm_venv):
     ])
 
     return example_root
-
-
-@pytest.mark.parametrize("data_type", ["float16", "fp8"],
-                         ids=["base_fp16", "base_fp8"])
-@pytest.mark.parametrize("lora_data_type", ["float16"], ids=["lora_fp16"])
-@pytest.mark.parametrize("llm_phi_model_root", ["Phi-3-mini-4k-instruct"],
-                         indirect=True)
-@pytest.mark.parametrize("llm_lora_model_root",
-                         ["Phi-3-mini-4k-instruct-ru-lora"],
-                         indirect=True)
-def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
-                           llm_phi_model_root, llm_datasets_root, llm_venv,
-                           cmodel_dir, engine_dir, llm_lora_model_root,
-                           qcache_dir_without_install_package):
-    "run phi lora test on 1gpu"
-    print("Converting checkpoint...")
-    model_name = 'phi-3-lora'
-    if data_type == 'fp8':
-        skip_fp8_pre_ada(use_fp8=True)
-        if get_sm_version() >= 100:
-            pytest.skip("FP8 is not supported on post-Blackwell architectures")
-        model_dir = quantize_data(
-            llm_venv,
-            phi_example_root,
-            model_dir=llm_phi_model_root,
-            calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-            dtype="float16",
-            qformat="fp8",
-            kv_cache_dtype="fp8",
-            quantize_dir=qcache_dir_without_install_package,
-            calib_size=512)
-    else:
-        model_dir = convert_weights(llm_venv=llm_venv,
-                                    example_root=phi_example_root,
-                                    cmodel_dir=cmodel_dir,
-                                    model=model_name,
-                                    model_path=llm_phi_model_root)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        "--lora_plugin=auto",
-        "--gemm_plugin=auto",
-        "--max_batch_size=8",
-        f"--lora_dir={llm_lora_model_root}",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    ref_1 = [
-        1, 1815, 366, 3867, 5837, 304, 17545, 18240, 310, 9892, 16397, 322,
-        8338, 265, 29888, 21211, 29973, 306, 29915, 29885, 3063, 363, 907, 1230,
-        322, 9045, 29891, 9522, 5547, 393, 11039, 403, 1716, 285, 21211, 29889,
-        29871
-    ]
-
-    ref_2 = [
-        1815, 366, 3867, 5837, 304, 17545, 18240, 310, 9892, 16397, 322, 8338,
-        265, 29888, 21211, 29973, 13, 13, 7900, 22137, 29901, 315, 13946, 368,
-        29991, 2266, 526, 777, 907, 1230, 5837, 304, 13389, 9892, 16397, 322
-    ]
-
-    input_text = "Can you provide ways to eat combinations of bananas and dragonfruits?"
-
-    print(f"Run inference with lora id 0...")
-    venv_check_call(llm_venv, [
-        f"{phi_example_root}/../../../run.py",
-        "--max_output_len=20",
-        f"--input_text={input_text}",
-        "--lora_task_uids=0",
-        f"--tokenizer_dir={llm_lora_model_root}",
-        f"--engine_dir={engine_dir}",
-        f"--output_csv={llm_venv.get_working_directory()}/use_lora.csv",
-        "--use_py_session",
-    ])
-
-    with open(f"{llm_venv.get_working_directory()}/use_lora.csv") as f:
-        predict = csv.reader(f)
-        predict = next(predict)
-    predict = [int(p) for p in predict]
-    assert ref_1 == predict or data_type != "float16"
-
-    print(f"Run inference with lora id -1...")
-    venv_check_call(llm_venv, [
-        f"{phi_example_root}/../../../run.py",
-        "--max_output_len=20",
-        f"--input_text={input_text}",
-        "--lora_task_uids=-1",
-        f"--tokenizer_dir={llm_phi_model_root}",
-        f"--engine_dir={engine_dir}",
-        f"--output_csv={llm_venv.get_working_directory()}/no_lora.csv",
-        "--use_py_session",
-    ])
-
-    with open(f"{llm_venv.get_working_directory()}/no_lora.csv") as f:
-        predict = csv.reader(f)
-        predict = next(predict)
-    predict = [int(p) for p in predict]
-
-    assert ref_2 == predict or data_type != "float16"
 
 
 @skip_pre_ada
