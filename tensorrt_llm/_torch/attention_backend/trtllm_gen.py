@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 TrtLLM-Gen Attention Backend
 
@@ -434,8 +449,6 @@ class FlashInferTrtllmGenAttention:
                 f"trtllm-gen requires fused nanobind ops, missing: {', '.join(missing_ops)}."
             )
 
-        # Cached positive is_supported() results keyed by dynamic call shape.
-        self._support_results: dict[tuple[object, ...], Tuple[bool, str]] = {}
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
 
@@ -736,30 +749,7 @@ class FlashInferTrtllmGenAttention:
                 f"by trtllm-gen kernels. Supported: {supported}.",
             )
 
-        support_key = (
-            q_dtype,
-            kv_cache_dtype,
-            o_dtype,
-            int(attn_input_type),
-            attn.num_heads,
-            attn.num_kv_heads,
-            attn.head_dim,
-            attn.position_embedding_type,
-            is_mla_enable,
-            attn.kv_lora_rank,
-            attn.qk_rope_head_dim,
-            fwd.mask_type if check_context_phase else None,
-            meta.beam_width,
-            tokens_per_block,
-            meta.kv_cache_block_offsets is not None,
-            meta.is_spec_decoding_enabled,
-        )
-        if support_key in self._support_results:
-            return self._support_results[support_key]
-
-        result = (True, "")
-        self._support_results[support_key] = result
-        return result
+        return True, ""
 
     @staticmethod
     @lru_cache(maxsize=None)
