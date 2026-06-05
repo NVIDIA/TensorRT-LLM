@@ -29,6 +29,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [Phi-3-vision](#phi-3-vision)
 - [Phi-4-multimodal](#phi-4-multimodal)
 - [Qwen2-VL](#qwen2-vl)
+- [Qwen-Image-Bench Evaluator](#qwen-image-bench-evaluator)
 - [Video NeVA](#video-neva)
 - [Dataset Evaluation](#dataset-evaluation)
 - [Enabling Tensor Parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
@@ -66,6 +67,25 @@ Not all models supports end-to-end `cpp` mode, the checked ones below are suppor
 [^2]: Model requires post processing its encoder output features, which is not supported
 [^3]: Currently C++ runtime only supports single image per request (VILA mode 2)
 [^4]: Vision encoder requires additional inputs not supported by the C++ runtime
+
+## Qwen-Image-Bench Evaluator
+
+[`qwen_image_bench_eval.py`](qwen_image_bench_eval.py) runs the
+Qwen-Image-Bench VLM judge through TensorRT-LLM to evaluate an image generated
+by another image or vision-language model. Provide the original generation
+prompt and the generated image path:
+
+```bash
+python examples/models/core/multimodal/qwen_image_bench_eval.py \
+    --model_path /path/to/Qwen-Image-Bench \
+    --prompt "A cute cat playing piano" \
+    --image_path examples/visual_gen/cat_piano.png \
+    --output_path qwen_image_bench_result.json \
+    --include_raw_outputs
+```
+
+The script evaluates all five Qwen-Image-Bench level-1 dimensions by default:
+Quality, Aesthetics, Alignment, Real-world Fidelity, and Creative Generation.
 
 ## BLIP2
 

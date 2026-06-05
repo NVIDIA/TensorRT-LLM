@@ -24,7 +24,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     handling here:
 
     1. Weight namespace (handled in _normalize_weight_names):
-       Qwen3.5 VLM checkpoints nest text weights under model.language_model.*
+       Qwen-Image-Bench checkpoints nest text weights under model.language_model.*
        and include model.visual.* tensors.  This mapper strips the
        language_model prefix and drops vision tensors so the shared
        Qwen3NextModel can load them.
