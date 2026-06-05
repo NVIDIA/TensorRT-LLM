@@ -646,8 +646,7 @@ def load_hf_tokenizer(model_dir: str,
         logger.warning(
             f"Failed to load hf tokenizer from hub for {model_dir}: {e}. "
             f"The model may be gated and the token is unavailable in this "
-            f"environment. Retrying with local cache..."
-        )
+            f"environment. Retrying with local cache...")
     except Exception:
         raise
 
@@ -671,7 +670,6 @@ def load_hf_tokenizer(model_dir: str,
         logger.warning(
             f"Failed to load hf tokenizer from local cache for {model_dir}: {e}"
         )
-    
     return None
 
 
