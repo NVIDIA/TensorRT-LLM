@@ -29,7 +29,11 @@ suite matures.
 from __future__ import annotations
 
 import logging
+import os
+import random
 import re
+import signal
+import subprocess
 import threading
 import time
 import urllib.error
@@ -146,6 +150,28 @@ class StressConfig:
             )
         if self.transceiver not in ("cpp", "python"):
             raise ValueError(f"transceiver must be 'cpp' or 'python', got {self.transceiver!r}")
+
+
+_INJECTION_TARGET_RE = re.compile(r"^(ctx|gen)_worker_(\d+)$")
+
+
+@dataclass
+class _TrackedWorker:
+    """Runtime binding between a shadow ``WorkerLaunchSpec`` and its subprocess."""
+
+    spec: WorkerLaunchSpec
+    wrapper: Any  # disagg_test_utils.ProcessWrapper
+
+
+@dataclass(frozen=True)
+class _InjectionSpec:
+    """One entry from ``stress_config.injections`` after validation."""
+
+    at_min: float
+    type: str  # sigstop | sigkill
+    target: str
+    duration_s: Optional[float] = None
+    respawn_within_s: Optional[float] = None
 
 
 @dataclass
@@ -310,6 +336,183 @@ def _compile_patterns(raw_patterns: list[Any]) -> list[tuple[str, re.Pattern[str
     return compiled
 
 
+def _parse_injection_schedule(raw_injections: list[Any]) -> list[_InjectionSpec]:
+    """Normalize and validate the YAML ``injections:`` schedule.
+
+    Malformed entries are logged at ERROR and skipped so a typo in one
+    slot does not abort the whole marathon.
+
+    Args:
+        raw_injections: Value of ``stress_config.injections`` from YAML.
+
+    Returns:
+        Sorted list of validated injection specs (by ``at_min``).
+    """
+    specs: list[_InjectionSpec] = []
+    for idx, entry in enumerate(raw_injections):
+        if not isinstance(entry, dict):
+            logger.error("[injector] injections[%d] is not a mapping; skipping", idx)
+            continue
+        try:
+            at_min = float(entry["at_min"])
+            inj_type = str(entry["type"]).lower()
+            target = str(entry["target"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.error("[injector] injections[%d] missing required fields: %s", idx, exc)
+            continue
+        if inj_type not in ("sigstop", "sigkill"):
+            logger.error("[injector] injections[%d] unsupported type %r; skipping", idx, inj_type)
+            continue
+        duration_s = entry.get("duration_s")
+        respawn_within_s = entry.get("respawn_within_s")
+        if inj_type == "sigstop":
+            if duration_s is None:
+                logger.error("[injector] injections[%d] sigstop missing duration_s; skipping", idx)
+                continue
+            try:
+                duration_s = float(duration_s)
+            except (TypeError, ValueError):
+                logger.error(
+                    "[injector] injections[%d] invalid duration_s %r; skipping",
+                    idx,
+                    duration_s,
+                )
+                continue
+        if inj_type == "sigkill" and respawn_within_s is not None:
+            try:
+                respawn_within_s = float(respawn_within_s)
+            except (TypeError, ValueError):
+                logger.error(
+                    "[injector] injections[%d] invalid respawn_within_s %r; skipping",
+                    idx,
+                    respawn_within_s,
+                )
+                continue
+        specs.append(
+            _InjectionSpec(
+                at_min=at_min,
+                type=inj_type,
+                target=target,
+                duration_s=duration_s,
+                respawn_within_s=respawn_within_s,
+            )
+        )
+    specs.sort(key=lambda s: s.at_min)
+    return specs
+
+
+def _resolve_injection_target(target: str, tracked: list[_TrackedWorker]) -> _TrackedWorker:
+    """Map a YAML target string to a tracked worker.
+
+    Args:
+        target: One of ``gen_worker_random``, ``ctx_worker_random``,
+            or ``{ctx|gen}_worker_<index>``.
+        tracked: Workers registered at cluster setup.
+
+    Returns:
+        The selected ``_TrackedWorker``.
+
+    Raises:
+        ValueError: If ``target`` is unknown or no worker matches.
+    """
+    if target == "gen_worker_random":
+        pool = [t for t in tracked if t.spec.role == "gen"]
+    elif target == "ctx_worker_random":
+        pool = [t for t in tracked if t.spec.role == "ctx"]
+    else:
+        match = _INJECTION_TARGET_RE.match(target)
+        if match is None:
+            raise ValueError(f"unsupported injection target {target!r}")
+        role, index = match.group(1), int(match.group(2))
+        pool = [t for t in tracked if t.spec.role == role and t.spec.index == index]
+    if not pool:
+        raise ValueError(f"no worker matches injection target {target!r}")
+    if target.endswith("_random"):
+        return random.choice(pool)
+    return pool[0]
+
+
+def _worker_process_pid(wrapper: Any) -> Optional[int]:
+    """Return the worker subprocess PID, or ``None`` if unavailable."""
+    if wrapper is None or wrapper.process is None:
+        return None
+    return wrapper.process.pid
+
+
+def _signal_process(pid: int, sig: signal.Signals, label: str) -> bool:
+    """Send ``sig`` to ``pid``; log and return False on failure."""
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        logger.warning("[injector] %s: process %d already gone", label, pid)
+        return False
+    except OSError as exc:
+        logger.warning("[injector] %s: os.kill(%d, %s) failed: %s", label, pid, sig.name, exc)
+        return False
+
+
+def _execute_sigstop_pause(
+    wrapper: Any,
+    duration_s: float,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> dict[str, Any]:
+    """SIGSTOP a worker for ``duration_s``, then SIGCONT.
+
+    Args:
+        wrapper: ``ProcessWrapper`` for the victim worker.
+        duration_s: Pause length in seconds.
+        should_stop: Optional predicate polled during the pause; when
+            it returns True the pause is cut short (and ``interrupted``
+            is recorded), but SIGCONT is still sent so the worker is
+            never left stopped.
+
+    Returns:
+        Event metadata dict for ``_injection_events``.
+    """
+    pid = _worker_process_pid(wrapper)
+    outcome: dict[str, Any] = {"type": "sigstop", "duration_s": duration_s, "pid": pid}
+    if pid is None:
+        outcome["skipped"] = "no_process"
+        return outcome
+    stopped = _signal_process(pid, signal.SIGSTOP, "SIGSTOP")
+    outcome["sigstop_sent"] = stopped
+    cont_sent = False
+    try:
+        if stopped and duration_s > 0:
+            deadline = time.monotonic() + duration_s
+            while time.monotonic() < deadline:
+                if should_stop is not None and should_stop():
+                    outcome["interrupted"] = True
+                    break
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    finally:
+        if stopped:
+            cont_sent = _signal_process(pid, signal.SIGCONT, "SIGCONT")
+    outcome["sigcont_sent"] = cont_sent
+    return outcome
+
+
+def _execute_sigkill(wrapper: Any) -> dict[str, Any]:
+    """SIGKILL the worker subprocess.
+
+    Returns:
+        Event metadata dict for ``_injection_events``.
+    """
+    pid = _worker_process_pid(wrapper)
+    outcome: dict[str, Any] = {"type": "sigkill", "pid": pid}
+    if pid is None:
+        outcome["skipped"] = "no_process"
+        return outcome
+    outcome["sigkill_sent"] = _signal_process(pid, signal.SIGKILL, "SIGKILL")
+    if wrapper.process is not None:
+        try:
+            wrapper.process.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            logger.warning("[injector] SIGKILL: pid %d did not exit within 10s", pid)
+    return outcome
+
+
 # ---------------------------------------------------------------------------
 # Metrics-thread helpers
 # ---------------------------------------------------------------------------
@@ -417,6 +620,7 @@ class DisaggCancellationStressHarness:
         log_scanner_poll_interval_s: float = 0.5,
         metrics_scrape_interval_s: float = 30.0,
         metrics_scrape_timeout_s: float = 5.0,
+        injector_poll_interval_s: float = 1.0,
     ) -> None:
         """Construct a marathon harness.
 
@@ -437,6 +641,10 @@ class DisaggCancellationStressHarness:
                 the metrics scrape. Short by design — a slow scrape
                 is recorded as a miss rather than blocking the
                 metrics thread past its next scheduled scrape.
+            injector_poll_interval_s: Poll cadence (seconds) for the
+                injector thread while waiting for the next scheduled
+                event. Tests pass a smaller value to keep wall-clock
+                latency bounded.
 
         Raises:
             ValueError: If the YAML is malformed or its
@@ -455,10 +663,13 @@ class DisaggCancellationStressHarness:
         self._log_scanner_poll_interval_s: float = log_scanner_poll_interval_s
         self._metrics_scrape_interval_s: float = metrics_scrape_interval_s
         self._metrics_scrape_timeout_s: float = metrics_scrape_timeout_s
+        self._injector_poll_interval_s: float = injector_poll_interval_s
 
         # Cluster + worker tracking (populated by setup()).
         self._cluster: Any = None  # tuple returned by setup_disagg_cluster
         self._worker_specs: list[WorkerLaunchSpec] = []
+        self._tracked_workers: list[_TrackedWorker] = []
+        self._marathon_start_monotonic: float = 0.0
 
         # Thread handles (populated by start()).
         self._load_thread: Optional[threading.Thread] = None
@@ -487,6 +698,30 @@ class DisaggCancellationStressHarness:
         """
         logger.info("[harness] setup() — stub: cluster not actually launched")
 
+    def bind_tracked_workers(
+        self,
+        ctx_workers: list[Any],
+        gen_workers: list[Any],
+        ctx_specs: list[WorkerLaunchSpec],
+        gen_specs: list[WorkerLaunchSpec],
+    ) -> None:
+        """Register live ``ProcessWrapper`` handles for the injector thread.
+
+        Called by ``setup()`` once ``setup_disagg_cluster`` returns.
+        Shadow ``WorkerLaunchSpec`` entries must align 1:1 with the
+        wrapper lists (same ordering as ``setup_disagg_cluster``);
+        ``zip(..., strict=True)`` enforces this and raises ``ValueError``
+        on a length mismatch.
+        """
+        self._tracked_workers = [
+            _TrackedWorker(spec=spec, wrapper=wrapper)
+            for spec, wrapper in zip(ctx_specs, ctx_workers, strict=True)
+        ] + [
+            _TrackedWorker(spec=spec, wrapper=wrapper)
+            for spec, wrapper in zip(gen_specs, gen_workers, strict=True)
+        ]
+        self._worker_specs = list(ctx_specs) + list(gen_specs)
+
     def start(self) -> None:
         """Spawn the five worker threads. Returns immediately.
 
@@ -496,7 +731,8 @@ class DisaggCancellationStressHarness:
         stop()`` completes cleanly without waiting out the
         ``wait_until_done`` timeout.
         """
-        logger.info("[harness] start() — spawning 5 stub threads")
+        self._marathon_start_monotonic = time.monotonic()
+        logger.info("[harness] start() — spawning worker threads")
         self._load_thread = threading.Thread(
             target=self._load_thread_body, name="stress-load", daemon=True
         )
@@ -671,11 +907,183 @@ class DisaggCancellationStressHarness:
     def _injector_thread_body(self) -> None:
         """Fire SIGSTOP / SIGCONT / SIGKILL+respawn on the configured schedule.
 
-        Stub: no-op. Real implementation reads ``injections:`` schedule
-        from config and uses ``os.kill`` + ``_run_worker`` to act on
-        the shadow-tracked ``self._worker_specs``.
+        Reads ``injections:`` from ``stress_config``, waits until each
+        ``at_min`` offset from marathon start, then acts on
+        ``self._tracked_workers`` via ``os.kill``. SIGKILL entries
+        optionally relaunch the worker via ``disagg_test_utils._run_worker``
+        and fail-fast if ``/health`` does not return 200 within
+        ``respawn_within_s``.
         """
-        logger.debug("[injector_thread] stub — exiting immediately")
+        schedule = _parse_injection_schedule(self.config.raw.get("injections") or [])
+        if not schedule:
+            logger.warning("[injector] no injections in stress_config; exiting immediately")
+            return
+        if not self._tracked_workers:
+            logger.warning(
+                "[injector] no tracked workers (setup() did not register any); "
+                "exiting without running the injection schedule"
+            )
+            return
+
+        pending = list(schedule)
+        logger.info(
+            "[injector] armed with %d injection(s) across %d tracked worker(s)",
+            len(pending),
+            len(self._tracked_workers),
+        )
+
+        try:
+            while pending and not self.stop_event.is_set() and not self.failed_event.is_set():
+                elapsed_s = time.monotonic() - self._marathon_start_monotonic
+                next_inj = pending[0]
+                fire_at_s = next_inj.at_min * 60.0
+                if elapsed_s < fire_at_s:
+                    wait_s = min(self._injector_poll_interval_s, fire_at_s - elapsed_s)
+                    self.stop_event.wait(timeout=wait_s)
+                    continue
+
+                pending.pop(0)
+                try:
+                    tracked = _resolve_injection_target(next_inj.target, self._tracked_workers)
+                except ValueError as exc:
+                    logger.error(
+                        "[injector] skipping injection at T+%.1f min: %s",
+                        next_inj.at_min,
+                        exc,
+                    )
+                    self._record_injection_event(
+                        {
+                            "at_min": next_inj.at_min,
+                            "target": next_inj.target,
+                            "skipped": str(exc),
+                        }
+                    )
+                    continue
+
+                role_idx = f"{tracked.spec.role}_{tracked.spec.index}"
+                logger.info(
+                    "[injector] T+%.1f min: %s on %s (pid=%s)",
+                    next_inj.at_min,
+                    next_inj.type,
+                    role_idx,
+                    _worker_process_pid(tracked.wrapper),
+                )
+                event: dict[str, Any] = {
+                    "at_min": next_inj.at_min,
+                    "elapsed_s": elapsed_s,
+                    "target": next_inj.target,
+                    "role": tracked.spec.role,
+                    "index": tracked.spec.index,
+                }
+                if next_inj.type == "sigstop":
+                    event.update(
+                        _execute_sigstop_pause(
+                            tracked.wrapper,
+                            next_inj.duration_s or 0.0,
+                            should_stop=lambda: self.stop_event.is_set()
+                            or self.failed_event.is_set(),
+                        )
+                    )
+                elif next_inj.type == "sigkill":
+                    event.update(_execute_sigkill(tracked.wrapper))
+                    if next_inj.respawn_within_s is not None:
+                        respawned = self._respawn_tracked_worker(
+                            tracked, timeout_s=next_inj.respawn_within_s
+                        )
+                        event["respawned"] = respawned
+                        event["respawn_within_s"] = next_inj.respawn_within_s
+                        if not respawned:
+                            self.mark_failed(
+                                f"injector: {role_idx} did not become healthy within "
+                                f"{next_inj.respawn_within_s}s after SIGKILL"
+                            )
+                self._record_injection_event(event)
+        finally:
+            logger.debug("[injector] exiting; %d injection(s) remaining", len(pending))
+
+    def _record_injection_event(self, event: dict[str, Any]) -> None:
+        """Append one injector observation (thread-safe for single writer)."""
+        self._injection_events.append(event)
+
+    def _respawn_tracked_worker(self, tracked: _TrackedWorker, *, timeout_s: float) -> bool:
+        """Relaunch a SIGKILLed worker and wait for ``/health``.
+
+        Uses the shadow ``WorkerLaunchSpec`` recorded at setup time so
+        shared ``ProcessWrapper`` infrastructure stays unchanged.
+
+        Args:
+            tracked: Worker to relaunch.
+            timeout_s: Maximum seconds to wait for HTTP 200 on ``/health``.
+
+        Returns:
+            True if the respawned worker reports healthy within the
+            deadline; False otherwise.
+        """
+        from disagg_test_utils import _run_worker, get_free_port
+
+        spec = tracked.spec
+        old = tracked.wrapper
+
+        if old is not None and old.log_file is not None:
+            try:
+                old.log_file.close()
+            except OSError:
+                logger.debug("[injector] closing old log_file raised; ignoring")
+
+        role_key = "ctx" if spec.role == "ctx" else "gen"
+        save_log = spec.log_path is not None
+        new_port = get_free_port()
+        try:
+            new_wrapper = _run_worker(
+                spec.model_name,
+                spec.worker_config,
+                role_key,
+                port=new_port,
+                work_dir=spec.work_dir,
+                device=spec.device,
+                save_log=save_log,
+                env=spec.env,
+            )
+        except Exception:
+            logger.exception(
+                "[injector] failed to respawn %s_%d on port %d",
+                spec.role,
+                spec.index,
+                new_port,
+            )
+            return False
+        tracked.wrapper = new_wrapper
+        spec.port = new_wrapper.port
+        if new_wrapper.log_path is not None:
+            spec.log_path = new_wrapper.log_path
+
+        logger.info(
+            "[injector] respawned %s_%d on port %s; waiting up to %.0fs for /health",
+            spec.role,
+            spec.index,
+            new_wrapper.port,
+            timeout_s,
+        )
+
+        return self._wait_for_worker_health(new_wrapper.port, timeout_s=timeout_s)
+
+    def _wait_for_worker_health(self, port: int, *, timeout_s: float) -> bool:
+        """Poll a worker's ``/health`` endpoint until healthy or timed out."""
+        import requests
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set() or self.failed_event.is_set():
+                return False
+            try:
+                request_timeout = min(5.0, max(0.1, deadline - time.monotonic()))
+                response = requests.get(f"http://localhost:{port}/health", timeout=request_timeout)
+                if response.status_code == 200:
+                    return True
+            except requests.RequestException:
+                logger.debug("[injector] worker %d /health not ready yet", port)
+            self.stop_event.wait(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+        return False
 
     def _log_scanner_thread_body(self) -> None:
         """Tail all worker logs; fail-fast on any hard-zero pattern hit.
