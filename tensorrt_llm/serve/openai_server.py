@@ -1997,10 +1997,21 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content={"status": "success"})
 
     async def get_server_info(self) -> JSONResponse:
-        return JSONResponse(
-            content={
-                "disaggregated_params": self.generator.disaggregated_params
-            })
+        content = {"disaggregated_params": self.generator.disaggregated_params}
+        args = getattr(self.generator, "args", None)
+        if args is not None:
+            if args.max_batch_size is not None:
+                content["max_batch_size"] = args.max_batch_size
+            kv_cache_config = args.kv_cache_config
+            if kv_cache_config is not None:
+                content[
+                    "kv_cache_hash_algo"] = get_effective_kv_cache_event_hash_algo(
+                        kv_cache_config.kv_cache_event_hash_algo,
+                        kv_cache_config.use_kv_cache_manager_v2)
+                if kv_cache_config.tokens_per_block is not None:
+                    content[
+                        "tokens_per_block"] = kv_cache_config.tokens_per_block
+        return JSONResponse(content=content)
 
     async def openai_image_generation(self, request: ImageGenerationRequest,
                                       raw_request: Request) -> Response:

@@ -287,6 +287,13 @@ def extract_router_config(server_cfg: dict) -> RouterConfig:
         if key in server_cfg:
             args[key] = server_cfg[key]
 
+    # tokens_per_block lives under kv_cache_config; the cache-aware router must
+    # use the same block size as the worker or block hashes never match. Carry
+    # the explicit server value over unless the router block already set it.
+    kv_cache_config = server_cfg.get("kv_cache_config") or {}
+    if "tokens_per_block" not in args and "tokens_per_block" in kv_cache_config:
+        args["tokens_per_block"] = kv_cache_config["tokens_per_block"]
+
     return RouterConfig(type=router_type, args=args)
 
 
