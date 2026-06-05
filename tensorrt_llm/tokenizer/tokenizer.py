@@ -651,6 +651,9 @@ def load_hf_tokenizer(model_dir: str,
     except Exception:
         raise
 
+    # Same code block as before but with the specific usage of local_files_only to check if the tokenizer is available locally.
+    # Can come in handy in cases like when the model is in a gated repo, was correctly downloaded locally but the environment has no HF Auth Key present.
+    # See https://github.com/NVIDIA/TensorRT-LLM/issues/12805 for more details.
     try:
         kwargs['local_files_only'] = True
         tokenizer = TransformersTokenizer.from_pretrained(
