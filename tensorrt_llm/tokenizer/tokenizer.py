@@ -673,7 +673,6 @@ def load_hf_tokenizer(model_dir: str,
     return None
 
 
-
 def load_custom_tokenizer(
     tokenizer_identifier: str,
     model_dir: Union[str, Path],
