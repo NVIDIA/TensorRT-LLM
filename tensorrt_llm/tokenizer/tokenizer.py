@@ -631,7 +631,14 @@ def load_hf_tokenizer(model_dir: str,
     _ensure_gpt2_bytes_to_unicode_compat()
 
     try:
-        tokenizer = TransformersTokenizer.from_pretrained(model_dir, **kwargs)
+        tokenizer = TransformersTokenizer.from_pretrained(
+            model_dir,
+            legacy=False,
+            padding_side='left',
+            truncation_side='left',
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+            **kwargs)
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
         return tokenizer
