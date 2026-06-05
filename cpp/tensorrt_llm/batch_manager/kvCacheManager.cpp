@@ -3084,8 +3084,9 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     // aborting. Whichever path wins the extract() is the single owner; the other no-ops.
     if (node.empty())
     {
-        TLLM_LOG_DEBUG("%s::releaseBlocks - blocks for request %lu already released "
-                       "(claimed by releaseOrphanedBlocks); nothing to do",
+        TLLM_LOG_DEBUG(
+            "%s::releaseBlocks - blocks for request %lu already released "
+            "(claimed by releaseOrphanedBlocks); nothing to do",
             mLogPrefix.c_str(), requestId);
         return lastStoredId;
     }
