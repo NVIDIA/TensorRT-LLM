@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -63,6 +64,25 @@ except ImportError:
 # the same parameters during model construction.
 _HEURISTIC_TOPK_WARMUP_DONE: Set[Tuple[int, int, int, int]] = set()
 _HEURISTIC_TOPK_WARMUP_LOCK = threading.Lock()
+
+# SM120 (RTX PRO 6000 Blackwell) has no DeepGEMM lightning-indexer scorer
+# (fp8_(paged_)mqa_logits / get_paged_mqa_logits_metadata reject SM120). This
+# flag swaps the scorer for a CUDA-free torch replica of the exact DeepGEMM
+# "weighted ReLU" logits so the ratio-4/CSA layers get the correct top-k token
+# selection in long context (kv > index_topk*compress_ratio = 2048). Read once
+# at import as a module constant (mirrors the _DSV4_SM120_* diagnostics in
+# deepseek_v4.py). DEFAULT OFF: when unset, every code path below is
+# byte-identical to the committed "sequential attend-all-compressed" fix.
+_DSV4_SM120_REAL_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_REAL_INDEXER",
+                                          "0") == "1"
+# Perf step 2: route the SM120 real-indexer MXFP4 scorer through the fused Triton
+# kernel (triton_indexer_scorer.mqa_logits_mxfp4) instead of the torch einsum.
+# The fused kernel dequantizes inline + reduces over heads on the fly, so it
+# never materializes the [Nq, n_heads, Nk] accumulator (the ~64 GiB OOM at 32K)
+# or a dequantized k_f. DEFAULT OFF; fp4-only (torch fallback for fp8). Decode
+# uses it only for next_n==1 / num_gen==1 (the SM120 bs1 config).
+_DSV4_SM120_TRITON_SCORER = os.environ.get("TRTLLM_DSV4_SM120_TRITON_SCORER",
+                                           "0") == "1"
 
 
 def warmup_heuristic_topk_decode(top_k: int = 2048,
@@ -632,7 +652,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.slot_mapping_fp8[:self.num_tokens] = fp8_indices
             self.slot_mapping_scale[:self.num_tokens] = scale_indices
 
-        if self.num_generations > 0:
+        # The generation kv-length bookkeeping (gen_*_indptr, gen_indexer_kv_lens,
+        # kv_lens_cuda_2d) is arch-agnostic and IS consumed by the SM120 torch
+        # decode scorer (context_lens = kv_lens_cuda_2d), so compute it whenever
+        # the indexer runs. Only the DeepGEMM scheduler-metadata
+        # (get_paged_mqa_logits_metadata) is SM100-only and rejects SM120 -> skip
+        # just that on SM120 (the torch decode scorer ignores scheduler_metadata).
+        if self.num_generations > 0 and (get_sm_version() != 120
+                                         or _DSV4_SM120_REAL_INDEXER):
             torch.cumsum(
                 self.kv_lens_cuda[self.num_contexts:self.
                                   num_seqs],  # num_contexts should be 0
@@ -651,31 +678,32 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             next_n_cap = self.kv_lens_cuda_2d.shape[1]
             self.kv_lens_cuda_2d[:self.num_generations, :next_n_cap].copy_(
                 gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap))
-            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV,
-                self.num_sms)
-            self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
-                                                 non_blocking=True)
-            if (self.max_draft_tokens > 0
-                    and not self.use_expanded_buffers_for_mtp):
-                scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
-                    self.kv_lens_cuda_2d[:self.num_generations, :next_n_cap],
-                    _DG_SCHEDULE_BLOCK_KV, self.num_sms)
-                self.scheduler_metadata_buffer_full_next_n.copy_(
-                    scheduler_metadata_buffer_full_next_n, non_blocking=True)
-            if self.use_expanded_buffers_for_mtp:
-                num_draft_tokens = 1 + self.max_draft_tokens
-                num_tokens = self.num_generations * num_draft_tokens
-                kv_lens_expanded = torch.stack([gen_indexer_kv_lens] *
-                                               num_draft_tokens,
-                                               dim=0)
-                self.kv_lens_expanded_cuda[:num_tokens] = \
-                    kv_lens_expanded.transpose(0, 1).contiguous().flatten()
-                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
-                    _DG_SCHEDULE_BLOCK_KV, self.num_sms)
-                self.scheduler_metadata_buffer_expanded.copy_(
-                    scheduler_metadata_buffer_expanded, non_blocking=True)
+            if get_sm_version() != 120:
+                scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                    gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV,
+                    self.num_sms)
+                self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
+                                                     non_blocking=True)
+                if (self.max_draft_tokens > 0
+                        and not self.use_expanded_buffers_for_mtp):
+                    scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                        self.kv_lens_cuda_2d[:self.num_generations, :next_n_cap],
+                        _DG_SCHEDULE_BLOCK_KV, self.num_sms)
+                    self.scheduler_metadata_buffer_full_next_n.copy_(
+                        scheduler_metadata_buffer_full_next_n, non_blocking=True)
+                if self.use_expanded_buffers_for_mtp:
+                    num_draft_tokens = 1 + self.max_draft_tokens
+                    num_tokens = self.num_generations * num_draft_tokens
+                    kv_lens_expanded = torch.stack([gen_indexer_kv_lens] *
+                                                   num_draft_tokens,
+                                                   dim=0)
+                    self.kv_lens_expanded_cuda[:num_tokens] = \
+                        kv_lens_expanded.transpose(0, 1).contiguous().flatten()
+                    scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                        self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                        _DG_SCHEDULE_BLOCK_KV, self.num_sms)
+                    self.scheduler_metadata_buffer_expanded.copy_(
+                        scheduler_metadata_buffer_expanded, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
@@ -1470,6 +1498,10 @@ class Indexer(nn.Module):
                  aux_stream: Optional[torch.cuda.Stream] = None):
         """Initialize indexer with projection weights, norms, and TopK configuration."""
         super().__init__()
+        # On-device E2M1 (MXFP4) magnitude LUT, lazily built + cached on first
+        # _dequant_mxfp4 use (during eager prefill warmup, before any CUDA-graph
+        # capture) so the captured decode forward never does a host->device copy.
+        self._mxfp4_e2m1_table = None
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
         self.rope_dim = mla_params.qk_rope_head_dim
@@ -1528,11 +1560,16 @@ class Indexer(nn.Module):
         # dispatch to FP4xFP4 or FP8xFP8 (no mixed-precision variant) and
         # assert SM100 + head_dim=128 at launch time under FP4.
         self.use_fp4 = sparse_attention_config.indexer_k_dtype == "fp4"
+        # SM120: the cute-dsl indexer top-k / paged-mqa-logits kernels are
+        # SM100-only. When the real-indexer torch path is enabled, force both off
+        # so decode routes through _torch_paged_mqa_logits_sm120 + the torch top-k.
+        _sm120_real = _DSV4_SM120_REAL_INDEXER and get_sm_version() == 120
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
-                                  and IS_CUTLASS_DSL_AVAILABLE)
+                                  and IS_CUTLASS_DSL_AVAILABLE
+                                  and not _sm120_real)
         self.use_cute_dsl_paged_mqa_logits = (
             sparse_attention_config.use_cute_dsl_paged_mqa_logits
-            and IS_CUTLASS_DSL_AVAILABLE)
+            and IS_CUTLASS_DSL_AVAILABLE and not _sm120_real)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
         self._enable_heuristic_topk = (
@@ -1851,6 +1888,10 @@ class Indexer(nn.Module):
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
+        # SM120 real-indexer: the torch decode scorer needs gen_indexer_kv_lens +
+        # kv_lens_cuda_2d (computed below) but NOT the DeepGEMM scheduler metadata
+        # (get_paged_mqa_logits_metadata rejects SM120) -> skip just those calls.
+        _skip_dg = _DSV4_SM120_REAL_INDEXER and get_sm_version() == 120
         if not metadata.use_expanded_buffers_for_mtp:
             gen_seq_lens = metadata.get_indexer_kv_lens(
                 metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
@@ -1859,18 +1900,19 @@ class Indexer(nn.Module):
             next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
             metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
                 gen_seq_lens.unsqueeze(-1).expand(-1, next_n_cap))
-            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                gen_seq_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV,
-                metadata.num_sms)
-            metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
-                                                     non_blocking=True)
-            if metadata.max_draft_tokens > 0:
-                scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
-                    metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap],
-                    _DG_SCHEDULE_BLOCK_KV, metadata.num_sms)
-                metadata.scheduler_metadata_buffer_full_next_n.copy_(
-                    scheduler_metadata_buffer_full_next_n, non_blocking=True)
-        else:
+            if not _skip_dg:
+                scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                    gen_seq_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV,
+                    metadata.num_sms)
+                metadata.scheduler_metadata_buffer.copy_(
+                    scheduler_metadata_buffer, non_blocking=True)
+                if metadata.max_draft_tokens > 0:
+                    scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                        metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap],
+                        _DG_SCHEDULE_BLOCK_KV, metadata.num_sms)
+                    metadata.scheduler_metadata_buffer_full_next_n.copy_(
+                        scheduler_metadata_buffer_full_next_n, non_blocking=True)
+        elif not _skip_dg:
             # Expand schedule metadata buffer (only generation). The DeepGEMM
             # API requires 2D; each expanded token becomes a (1,) row.
             num_tokens = metadata.num_generations * (1 +
@@ -2057,6 +2099,209 @@ class Indexer(nn.Module):
 
         return k_fp8, k_scale
 
+    def _dequant_mxfp4(self, packed_u8: torch.Tensor, scale_raw: torch.Tensor,
+                       head_dim: int) -> torch.Tensor:
+        """Dequantize one MXFP4 indexer tensor (E2M1 data + UE8M0 block scales)
+        to float32.
+
+        `packed_u8`: [..., head_dim//2] uint8 — two E2M1 codes per byte (low
+        nibble = even logical index, high nibble = odd). `scale_raw`: any tensor
+        carrying 4 scale bytes per token (one int32 word, or 4xuint8) — four UE8M0
+        exponents, one per 32-element block at head_dim=128; normalized to
+        [*lead, 4] uint8 here. Mirrors test_dsa_fp4_indexer.py
+        (test_fp4_quantize_roundtrip_matches_bf16_kv): codes&0x07 index the E2M1
+        magnitude table, bit 0x08 is the sign (skip -0), and a UE8M0 byte e maps
+        to 2^(e-127) by placing it in the fp32 exponent field (<<23).
+        """
+        lead = packed_u8.shape[:-1]
+        low = packed_u8 & 0x0F
+        high = (packed_u8 >> 4) & 0x0F
+        codes = torch.stack([low, high], dim=-1).reshape(*lead, head_dim)
+        value_idx = (codes & 0x07).to(torch.int64)
+        sign = (codes & 0x08) != 0
+        # On-device E2M1 magnitude LUT, cached on first use. Building it via
+        # torch.tensor([...]) is a host->device copy that is illegal inside a
+        # CUDA-graph capture; the cache is populated during the eager prefill
+        # warmup that precedes capture, so the captured decode forward only
+        # indexes into it (capture-safe). The rebuild branch fires only on a
+        # cold cache / device change, never inside a capture.
+        table = self._mxfp4_e2m1_table
+        if table is None or table.device != packed_u8.device:
+            table = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.],
+                                 device=packed_u8.device, dtype=torch.float32)
+            self._mxfp4_e2m1_table = table
+        vals = table[value_idx]
+        vals = torch.where(sign & (value_idx != 0), -vals, vals)
+        n_blocks = head_dim // 32
+        # Normalize the scale to [*lead, 4] uint8 (UE8M0) whether it arrived as
+        # one int32 word/token or 4 separate uint8 bytes (4 scale bytes/token).
+        sb = scale_raw.reshape(-1).contiguous().view(torch.uint8).reshape(
+            *lead, 4)[..., :n_blocks].to(torch.int32)
+        sf = (sb << 23).view(torch.float32)  # UE8M0 e -> 2^(e-127)
+        block = head_dim // n_blocks
+        return (vals.reshape(*lead, n_blocks, block)
+                * sf.unsqueeze(-1)).reshape(*lead, head_dim)
+
+    def _torch_mqa_logits_sm120(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
+                                k_scale: torch.Tensor, weights: torch.Tensor,
+                                cu_seqlen_ks: torch.Tensor,
+                                cu_seqlen_ke: torch.Tensor,
+                                q_scale: Optional[torch.Tensor] = None
+                                ) -> torch.Tensor:
+        """CUDA-free (torch) replica of fp8_mqa_logits / fp8_fp4_mqa_logits for
+        SM120 prefill (no SM100 tcgen05/TMEM kernel).
+
+        FP8 path: logits[q,s] = k_scale[s] * Σ_h weights[q,h] * ReLU(q_fp8·k_fp8);
+        `weights` folds q_scale*(softmax*n_heads^-0.5), q/k are the raw fp8 bytes,
+        k_scale applied last (mirrors sm100_fp8_mqa_logits.cuh + _ref_fp8_mqa_logits).
+
+        FP4 path (indexer_k_dtype=='fp4'): q and k are MXFP4 (E2M1 + UE8M0 block
+        scales). Dequant both, then logits[q,s] = Σ_h weights[q,h] * ReLU(q_deq·
+        k_deq); here `weights` carries ONLY softmax*n_heads^-0.5 (q_scale lives in
+        the q dequant) — matches _prep_q_or_k's fp4 branch + fp8_fp4_mqa_logits.
+
+        Output: float32 [Nq, Nk] by ABSOLUTE kv position, -inf outside
+        [cu_seqlen_ks, cu_seqlen_ke).
+        """
+        if self.use_fp4:
+            hd = self.head_dim
+            if _DSV4_SM120_TRITON_SCORER:
+                # Fused Triton kernel: dequant inline + reduce over heads, no
+                # [Nq,H,Nk] accumulator. Masking is done in-kernel -> return.
+                from .triton_indexer_scorer import mqa_logits_mxfp4
+                qc = q_fp8.reshape(-1, self.n_heads,
+                                   hd // 2).contiguous().view(torch.uint8)
+                qs = q_scale.reshape(-1, self.n_heads,
+                                     1).contiguous().view(torch.uint8)
+                kc = k_fp8.reshape(-1, hd // 2).contiguous().view(torch.uint8)
+                ksc = k_scale.reshape(-1, 1).contiguous().view(torch.uint8)
+                return mqa_logits_mxfp4(qc, qs, kc, ksc, weights,
+                                        cu_seqlen_ks, cu_seqlen_ke)
+            q_f = self._dequant_mxfp4(
+                q_fp8.reshape(-1, self.n_heads, hd // 2).contiguous().view(
+                    torch.uint8),
+                q_scale.reshape(-1, self.n_heads, 1), hd)   # [Nq, H, D]
+            k_f = self._dequant_mxfp4(
+                k_fp8.reshape(-1, hd // 2).contiguous().view(torch.uint8),
+                k_scale.reshape(-1, 1), hd)                 # [Nk, D]
+            num_q, num_kv = q_f.shape[0], k_f.shape[0]
+            accum = torch.einsum('qhd,sd->qhs', q_f, k_f)
+            logits = (weights.float().unsqueeze(-1) *
+                      accum.clamp_min(0)).sum(dim=1)
+        else:
+            num_q = q_fp8.shape[0]
+            num_kv = k_fp8.shape[0]
+            # q_fp8: [Nq, n_heads, head_dim] fp8; k_fp8: [Nk, head_dim] fp8.
+            q_f = q_fp8.float()
+            k_f = k_fp8.float()
+            accum = torch.einsum('qhd,sd->qhs', q_f, k_f)
+            # weights fold q_scale+softmax; apply per-kv scale_kv at the end.
+            logits = (weights.float().unsqueeze(-1) *
+                      accum.clamp_min(0)).sum(dim=1)
+            logits = logits * k_scale.float().reshape(1, num_kv)
+        # Causal / window mask: keep s in [cu_seqlen_ks[q], cu_seqlen_ke[q]).
+        kv_pos = torch.arange(num_kv, device=logits.device).unsqueeze(0)
+        mask = (kv_pos >= cu_seqlen_ks.reshape(num_q, 1)) & \
+               (kv_pos < cu_seqlen_ke.reshape(num_q, 1))
+        return logits.masked_fill(~mask, float('-inf'))
+
+    def _torch_paged_mqa_logits_sm120(self, q_decode: torch.Tensor,
+                                      k_cache: torch.Tensor,
+                                      weights_decode: torch.Tensor,
+                                      context_lens: torch.Tensor,
+                                      block_table: torch.Tensor,
+                                      max_seq_len: int,
+                                      q_scale: Optional[torch.Tensor] = None
+                                      ) -> torch.Tensor:
+        """CUDA-free (torch) replica of fp8_(fp4_)paged_mqa_logits for SM120 decode.
+
+        Counterpart of _torch_mqa_logits_sm120; reachable once the SM120 indexer
+        is un-gated (TRTLLM_DSV4_SM120_REAL_INDEXER). Scope: next_n == 1 (the
+        SM120 bs1 decode config; no MTP) -> raises NotImplementedError otherwise.
+
+        k_cache (get_indexer_k_cache_buffers) is [num_blocks, tokens_per_block, 1,
+        per_token_size] of 1-byte elements. per_token = data_bytes + 4, where
+        data_bytes = head_dim (FP8: 128) or head_dim//2 (MXFP4: 64); the trailing
+        4 bytes are the scale word (FP8: one float32 scale_kv; MXFP4: four UE8M0
+        block exponents). Same arithmetic as _compute_slot_mappings.
+
+        Output: float32 [num_gen, max_seq_len] by ABSOLUTE kv position, -inf for
+        s >= context_lens[g].
+        """
+        hd = self.head_dim
+        last = hd // 2 if self.use_fp4 else hd
+        # q_decode: [num_gen, (next_n,) n_heads, last]. Collapse a unit next_n;
+        # reject real next_n>1 (the causal rowEnd offset is not handled here).
+        q = q_decode.reshape(q_decode.shape[0], -1, self.n_heads, last)
+        if q.shape[1] != 1:
+            raise NotImplementedError(
+                "TRTLLM_DSV4_SM120_REAL_INDEXER paged torch scorer supports "
+                f"next_n==1 only (got next_n={q.shape[1]}).")
+        q = q[:, 0]  # [G, H, last]
+        num_gen = q.shape[0]
+        device = q.device
+
+        tokens_per_block = k_cache.shape[1]
+        data_bytes = last   # quantized-k bytes/token (fp4: hd//2; fp8: hd)
+        scale_bytes = 4     # fp4: 4 UE8M0 bytes; fp8: one float32 -- both 4 bytes
+        # BLOCK-CONTIGUOUS cache layout (matches compressor_postprocess_scatter +
+        # the DeepGEMM kernel): per physical block the bytes are [tpb tokens of
+        # data][tpb tokens of scale], NOT per-token-interleaved [data|scale]. A
+        # naive reshape(nb, tpb, per_token) mis-groups them (only token 0 aligns;
+        # others read neighbouring data bytes as their scale -> garbage). Split
+        # the flat block into the data and scale regions explicitly.
+        kc = k_cache.view(torch.uint8).reshape(k_cache.shape[0], -1)  # [nb, blk]
+        data_region = kc[:, :tokens_per_block * data_bytes].reshape(
+            k_cache.shape[0], tokens_per_block, data_bytes)          # [nb, tpb, db]
+        scale_region = kc[:, tokens_per_block * data_bytes:tokens_per_block *
+                          (data_bytes + scale_bytes)].reshape(
+                              k_cache.shape[0], tokens_per_block,
+                              scale_bytes)                            # [nb, tpb, sb]
+
+        # Absolute kv positions [0, max_seq_len) -> (block-in-seq, pos-in-block).
+        pos = torch.arange(max_seq_len, device=device)
+        blk_in_seq = (pos // tokens_per_block).clamp(0, block_table.shape[1] - 1)
+        pos_in_blk = pos % tokens_per_block
+        block_ids = block_table[:, blk_in_seq].to(torch.int64)  # [G, S]
+        pos_in_blk_g = pos_in_blk.unsqueeze(0).expand(num_gen, -1)  # [G, S]
+        kdata = data_region[block_ids, pos_in_blk_g]   # [G, S, db] uint8
+        kscl = scale_region[block_ids, pos_in_blk_g]   # [G, S, sb] uint8
+
+        if self.use_fp4:
+            if _DSV4_SM120_TRITON_SCORER and num_gen == 1:
+                # Fused Triton kernel (bs1 decode): gathered kdata/kscl + q codes
+                # -> dequant inline + reduce over heads, mask in-kernel. Returns
+                # [1, max_seq_len].
+                from .triton_indexer_scorer import mqa_logits_mxfp4
+                qc = q.contiguous().view(torch.uint8).reshape(
+                    1, self.n_heads, hd // 2)
+                qs = q_scale.reshape(1, self.n_heads,
+                                     1).contiguous().view(torch.uint8)
+                ks = torch.zeros(1, device=device, dtype=torch.int32)
+                ke = context_lens.reshape(-1)[:1].to(torch.int32)
+                return mqa_logits_mxfp4(
+                    qc, qs, kdata[0].contiguous(), kscl[0].contiguous(),
+                    weights_decode.reshape(1, self.n_heads), ks, ke)
+            # MXFP4: dequant k from the cache + q from its per-head UE8M0 scale.
+            k_f = self._dequant_mxfp4(kdata.contiguous(), kscl, hd)
+            q_f = self._dequant_mxfp4(
+                q.contiguous().view(torch.uint8),
+                q_scale.reshape(num_gen, self.n_heads, 1), hd)  # [G, H, D]
+            accum = torch.einsum('ghd,gsd->ghs', q_f, k_f)
+            logits = (weights_decode.reshape(num_gen, self.n_heads).float()
+                      .unsqueeze(-1) * accum.clamp_min(0)).sum(dim=1)
+        else:
+            k_f = kdata.contiguous().view(torch.float8_e4m3fn).float()  # [G,S,D]
+            k_scale = kscl.contiguous().view(torch.float32).reshape(
+                num_gen, max_seq_len)  # [G, S]
+            accum = torch.einsum('ghd,gsd->ghs', q.float(), k_f)
+            logits = (weights_decode.reshape(num_gen, self.n_heads).float()
+                      .unsqueeze(-1) * accum.clamp_min(0)).sum(dim=1)  # [G, S]
+            logits = logits * k_scale
+        kv_pos = torch.arange(max_seq_len, device=device).unsqueeze(0)
+        mask = kv_pos < context_lens.reshape(num_gen, 1)
+        return logits.masked_fill(~mask, float('-inf'))
+
     def _call_mqa_logits(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
                          k_scale: torch.Tensor, weights: torch.Tensor,
                          cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
@@ -2068,6 +2313,10 @@ class Indexer(nn.Module):
         the DeepGEMM kernel expects. The scale tensor is collapsed to 1D for
         the kv side and 2D for the q side per the kernel's asserts.
         """
+        if _DSV4_SM120_REAL_INDEXER and get_sm_version() == 120:
+            return self._torch_mqa_logits_sm120(q_fp8, k_fp8, k_scale, weights,
+                                                 cu_seqlen_ks, cu_seqlen_ke,
+                                                 q_scale)
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
             k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
@@ -2093,6 +2342,11 @@ class Indexer(nn.Module):
                                max_seq_len: int,
                                q_scale: Optional[torch.Tensor]) -> torch.Tensor:
         """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits."""
+        if _DSV4_SM120_REAL_INDEXER and get_sm_version() == 120:
+            return self._torch_paged_mqa_logits_sm120(q_decode, k_cache,
+                                                      weights_decode,
+                                                      context_lens, block_table,
+                                                      max_seq_len, q_scale)
         if self.use_fp4:
             return fp8_fp4_paged_mqa_logits(
                 (q_decode, q_scale), k_cache, weights_decode, context_lens,
@@ -2313,9 +2567,15 @@ class Indexer(nn.Module):
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
-            max_decode_len = gen_seq_lens.max().item()
-            min_decode_len = gen_seq_lens.min().item()
-            assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
+            # The max==min equal-length check requires a device->host sync
+            # (.item()), which is illegal during CUDA-graph capture and
+            # invalidates it. The SM120 real-indexer path is bs1
+            # (num_generations==1 => max==min trivially), so skip the
+            # validating sync there to stay capture-safe; keep it elsewhere.
+            if not (_DSV4_SM120_REAL_INDEXER and get_sm_version() == 120):
+                max_decode_len = gen_seq_lens.max().item()
+                min_decode_len = gen_seq_lens.min().item()
+                assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,

@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
@@ -91,7 +92,11 @@ public:
 
     int getWorkspaceAlignment();
 
-    size_t getWorkspaceSize(int max_num_tokens);
+    // forceSingleBlockMla: size the MLA kernel scratch for a single split-K block (multi_block=1). Used by the
+    // multi-token MLA *context* path (useSm120ContextXqaMla), which forces single-CTA in the launch so the scratch
+    // (~multi_block * num_ctx_tokens * per-token) does not blow up. Generation leaves it false (keeps split-K).
+    size_t getWorkspaceSize(
+        int max_num_tokens, int max_num_sequences, int max_attention_window_size, bool forceSingleBlockMla = false);
 
     bool shouldUse(XQAParams const& params);
 
@@ -115,7 +120,11 @@ protected:
         XQAParams params, KVCacheBuffer const& kv_cache_buffer, KVCacheBuffer const& kv_cache_block_scales_buffer);
 };
 
-constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
+// sizeof(Vec<CgaXBuffer, nbProducerCtasPerCga>) in cpp/kernels/xqa/mla_sm120.cu
+// for HEAD_GRP_SIZE=128, HEAD_ELEMS=576.
+constexpr uint32_t xqaMlaCgaXBufSize = getXqaMlaCgaXBufSize(kXqaMlaKernelHeadGrpSize);
+// sizeof(PartialResult) in cpp/kernels/xqa/mla_sm120.cu for HEAD_GRP_SIZE=128, HEAD_ELEMS=576.
+constexpr uint32_t xqaMlaPartialResultSize = getXqaMlaPartialResultSize(kXqaMlaKernelHeadGrpSize);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

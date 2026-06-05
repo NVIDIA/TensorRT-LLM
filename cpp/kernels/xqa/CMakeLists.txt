@@ -19,7 +19,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 89-real 90a-real)
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 89-real 90a-real)
+endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_XQA_TESTS "Build XQA tests" OFF)
@@ -115,7 +117,8 @@ if(BUILD_XQA_TESTS)
     test/warmup.cu
     test/test.cpp
     test/refAttention.cpp)
-  target_include_directories(unitTests PUBLIC ${EIGEN3_INCLUDE_DIR})
+  target_include_directories(unitTests PUBLIC ${EIGEN3_INCLUDE_DIR}
+                                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
   target_link_libraries(unitTests PUBLIC GTest::gtest GTest::gtest_main cuda
                                          Eigen3::Eigen)
 
@@ -137,9 +140,10 @@ if(BUILD_XQA_TESTS)
       OUTPUT ${GENERATED_XQA_SOURCES}
       COMMAND
         ./gen_cpp_header.py -o ${GENERATED_XQA_SOURCES} --embed-cuda-headers
-        --cuda_root ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/..
+        --cuda_root ${CUDAToolkit_LIBRARY_ROOT}
       DEPENDS gen_cpp_header.py ${XQA_SOURCES}
-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      VERBATIM)
     target_sources(unitTests PUBLIC ${GENERATED_XQA_SOURCES})
   endif()
 

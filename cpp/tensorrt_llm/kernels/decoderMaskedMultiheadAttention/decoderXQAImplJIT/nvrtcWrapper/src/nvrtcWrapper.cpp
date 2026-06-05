@@ -73,8 +73,13 @@ std::string getMacroFlag(std::string const& name, std::string const& value)
     return "-D" + name + "=" + value;
 }
 
-std::string getSMFlag(int SM)
+std::string getSMFlag(tllmXqaJitContext const* context)
 {
+    int const SM = context->sm;
+    if ((SM == 120 || SM == 121) && context->kernel_type == TLLM_XQA_JIT_MLA)
+    {
+        return "-arch=sm_120a";
+    }
     // SM121 uses the same cubin target as SM120 (sm_120f) for compatibility.
     if (SM == 120 || SM == 121)
     {
@@ -148,6 +153,10 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     macros["GENERATE_CUBIN"] = "1";
     macros["NDEBUG"] = "1";
     macros["HEAD_ELEMS"] = std::to_string(head_size);
+    // HEAD_ELEMS_V is required for MLA kernels (DSV3=512, DSV4=448). For non-MLA kernels it's
+    // unused; fall back to head_size if the caller leaves it 0.
+    unsigned int const head_size_v_eff = context->head_size_v != 0 ? context->head_size_v : head_size;
+    macros["HEAD_ELEMS_V"] = std::to_string(head_size_v_eff);
     macros["BEAM_WIDTH"] = std::to_string(beam_width);
 
     if (context->kv_cache_data_type == tensorrt_llm::kernels::DATA_TYPE_INT8)
@@ -226,8 +235,8 @@ tllmXqaJitStatus getBuildOptions(_tllmXqaJitProgram const* prog, std::vector<std
     result->push_back("--use_fast_math");
     result->push_back("-default-device");
 
-    // Arch (sm120/sm121 both target sm_120f)
-    result->push_back(getSMFlag(prog->context->sm));
+    // Arch. MLA uses sm_120a because it relies on architecture-specific SM120 instructions.
+    result->push_back(getSMFlag(prog->context));
 
     std::vector<std::string> macros;
     CHECK_TLLM_XQA_JIT_ERROR(getMacroFlags(prog->context, &macros));

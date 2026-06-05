@@ -791,7 +791,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     int dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
     int dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
     int dim_v_per_head = (mMLAParams.v_head_dim);
-    if (useSparseMLA())
+    if (useSparseMLA() || useSm120ContextXqaMla())
     {
         dim_q_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
         dim_k_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
@@ -816,11 +816,12 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     size_t fp8_q_buf_size = 0;
     size_t fp8_k_buf_size = 0;
     size_t fp8_v_buf_size = 0;
-    if (mEnableContextFMHA && mFP8ContextMLA && mFmhaDispatcher->isSeparateQAndKvInput())
+    if (mEnableContextFMHA && mFP8ContextMLA
+        && (mFmhaDispatcher->isSeparateQAndKvInput() || useSm120ContextXqaMla()))
     {
         fp8_q_buf_size = max_num_tokens * static_cast<size_t>(total_q_dim_all_heads);
 
-        if (useSparseMLA())
+        if (useSparseMLA() || useSm120ContextXqaMla())
         {
             // Sparse MLA (absorption mode): K and V are stored directly in KV cache during MLA RoPE kernel.
             // No separate FP8 buffers needed for K/V since they're read from paged KV cache (Q_PAGED_KV layout).
@@ -869,7 +870,13 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 
     size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
 
-    int const NUM_BUFFERS = 27;
+    // XQA scratch for the SM120 sparse-MLA context path (0 otherwise). Carved as one extra region after the
+    // FMHA/MLA context buffers (the XQA gather kernel reads its Q from fp8_q_buf, which lives in those buffers,
+    // so the XQA scratch must not overlap them). enqueueContext carves the identical region.
+    size_t const xqa_context_workspace_size
+        = getXqaWorkspaceSizeForContext(max_num_tokens, max_num_seq, input_seq_length, /*max_blocks_per_sequence=*/0);
+
+    int const NUM_BUFFERS = 28;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
@@ -898,6 +905,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     workspaces[24] = sage_v_sfs_buffer_size;
     workspaces[25] = cpWorkspaceSize;
     workspaces[26] = fmha_multi_ctas_kv_scratch_size;
+    workspaces[27] = xqa_context_workspace_size;
     context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     return context_workspace_size;
@@ -1012,12 +1020,48 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         xqa_workspaces[5] = sizeof(float);
         xqa_workspaces[6] = sparse_attn_cache_size;
         xqa_workspaces[7] = mXqaDispatcher->getWorkspaceSize(
-            std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
+            std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens), max_num_seq,
+            max_attention_window_size);
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
 
     return std::max(std::max(generation_workspace_size, xqa_workspace_size), fmha_v2_mla_workspace_size);
+}
+
+size_t AttentionOp::getXqaWorkspaceSizeForContext(int32_t max_num_tokens, int32_t max_num_seq,
+    int32_t max_attention_window_size, int32_t max_blocks_per_sequence) const noexcept
+{
+    if (!useSm120ContextXqaMla() || max_num_tokens == 0)
+    {
+        return 0;
+    }
+    // The XQA dispatcher carves cu_seqlens / rotary / tokensInfo / bmm scales / io+kernel scratch from a single
+    // base pointer (buildXQALaunchParams). Mirror the generation-phase XQA sizing (getWorkspaceSizeForGeneration),
+    // but feed the context token count for the token-scaled buffers. The per-request buffers (cu_seqlens, rotary)
+    // grow with batch, so size them at max_num_seq; the kernel-scratch multi_block grows as ~mp/batch, so feed
+    // batch=1 to getWorkspaceSize() (worst case) — the launch uses the actual num_contexts, so this upper-bounds it.
+    int const batch_beam = max_num_seq;
+    int const XQA_NUM_BUFFERS = 8;
+    size_t xqa_workspaces[XQA_NUM_BUFFERS];
+    size_t const cu_seqlens_size = sizeof(int) * (batch_beam + 1);
+    size_t const cu_kv_seqlens_size = sizeof(int) * (batch_beam + 1);
+    size_t const rotary_inv_freq_size = sizeof(float) * batch_beam * mRotaryEmbeddingDim / 2;
+    size_t const sparse_attn_cache_size = useTllmGenSparseAttentionPaged()
+        ? sizeof(int) * (batch_beam + batch_beam * 2 * max_blocks_per_sequence) * mNumKVHeads
+        : 0;
+    xqa_workspaces[0] = cu_seqlens_size;
+    xqa_workspaces[1] = cu_kv_seqlens_size;
+    xqa_workspaces[2] = rotary_inv_freq_size;
+    xqa_workspaces[3] = static_cast<size_t>(max_num_tokens) * sizeof(int2);
+    xqa_workspaces[4] = sizeof(float) * 2;
+    xqa_workspaces[5] = sizeof(float);
+    xqa_workspaces[6] = sparse_attn_cache_size;
+    // The context launch forces multi_block=1 (single-CTA) for multi-token MLA, so size the scratch the same way
+    // (otherwise the split-K sizing — up to 48 blocks * num_ctx_tokens — would allocate multi-GiB and OOM).
+    xqa_workspaces[7] = mXqaDispatcher->getWorkspaceSize(
+        max_num_tokens, /*max_num_sequences=*/1, max_attention_window_size, /*forceSingleBlockMla=*/true);
+    return tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
 }
 
 int AttentionOp::getMaxNumSeqLenTile(int batch_beam_size) const
@@ -1413,6 +1457,11 @@ template <typename T, typename KVCacheBuffer>
 int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStream_t stream)
 {
     int const headSize = getHeadSize();
+    // SM120 DSV4 sparse-MLA context routes to the XQA mla_sm120 gather kernel (multi-token, inputSeqLen=prompt_len)
+    // instead of the FMHA dispatcher (which has no 512/448 MLA kernel on SM120). When active, the absorbed-MLA dims
+    // and absorption_mode (normally gated on useSparseMLA(), false on SM120) are enabled, and the FMHA run below is
+    // replaced by an XQA dispatcher launch. See useSm120ContextXqaMla().
+    bool const sm120CtxXqa = useSm120ContextXqaMla();
 
     int const local_hidden_units_qo = mNumHeads * headSize;
     int const local_hidden_units_kv = mNumAttnKVHeads * headSize;
@@ -1486,7 +1535,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     int dim_q_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
     int dim_k_per_head = (mMLAParams.qk_rope_head_dim + mMLAParams.qk_nope_head_dim);
     int dim_v_per_head = (mMLAParams.v_head_dim);
-    if (useSparseMLA())
+    if (useSparseMLA() || sm120CtxXqa)
     {
         dim_q_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
         dim_k_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
@@ -1510,11 +1559,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t fp8_v_buf_size = 0;
     bool const useSageAttnSeparateQkv = mEnableContextFMHA && !mIsMLAEnabled && mFmhaDispatcher->isSeparateQAndKvInput()
         && (mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0);
-    if (mEnableContextFMHA && mFP8ContextMLA && mFmhaDispatcher->isSeparateQAndKvInput())
+    if (mEnableContextFMHA && mFP8ContextMLA && (mFmhaDispatcher->isSeparateQAndKvInput() || sm120CtxXqa))
     {
         fp8_q_buf_size = params.num_tokens * static_cast<size_t>(total_q_dim_all_heads);
 
-        if (useSparseMLA())
+        if (useSparseMLA() || sm120CtxXqa)
         {
             // Sparse MLA (absorption mode): K and V are stored directly in KV cache during MLA RoPE kernel.
             // No separate FP8 buffers needed for K/V since they're read from paged KV cache (Q_PAGED_KV layout).
@@ -1624,6 +1673,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     // sparse attention MultiCtasKv scratch pool
     void* fmha_multi_ctas_kv_scratch_ptr
         = nextWorkspacePtr(workspace_byte_ptr, offset, fmha_multi_ctas_kv_scratch_size);
+
+    // SM120 sparse-MLA context-XQA scratch: a separate region carved AFTER all FMHA/MLA context buffers so it
+    // does not overlap fp8_q_buf (the XQA gather kernel reads Q from there). getWorkspaceSizeForContext sizes the
+    // identical region as workspaces[27]; keep the two in sync.
+    size_t const xqa_context_workspace_size = sm120CtxXqa
+        ? getXqaWorkspaceSizeForContext(params.num_tokens, params.batch_size, params.input_seq_length,
+              params.max_blocks_per_sequence)
+        : 0;
+    void* xqa_context_workspace_ptr
+        = sm120CtxXqa ? nextWorkspacePtr(workspace_byte_ptr, offset, xqa_context_workspace_size) : nullptr;
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     // Note: self attn and cross attn should use different params
@@ -1847,8 +1906,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             params.mla_param->dequant_scale_kv = params.kv_scale_quant_orig;
             params.mla_param->host_bmm1_scale
                 = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
-            // The sparse MLA is in the absorption mode for the context phase.
-            params.mla_param->absorption_mode = useSparseMLA();
+            // The sparse MLA is in the absorption mode for the context phase. On SM120 useSparseMLA() is false,
+            // so enable absorption explicitly for the XQA-context path (Q is already in latent form [*,H,576],
+            // RoPE kernel applies rotary to the rope segment via mla_param->q_pe and writes latent KV to the pool).
+            params.mla_param->absorption_mode = useSparseMLA() || sm120CtxXqa;
             // Fused FP8-Q-quant: RoPE kernel writes FP8 rope into `quant_q_buf`,
             // so we skip the standalone invokeMLAContextFp8Quantize call below.
             bool const useFusedQFp8 = params.mla_param->fuse_q_fp8_in_rope && mFP8ContextMLA
@@ -1951,6 +2012,46 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
         //    - total_kv_len: the total kv sequence length, needed for variable sequence length.
 
+        if (sm120CtxXqa)
+        {
+            // SM120 has no absorbed-MLA context FMHA kernel; run the XQA mla_sm120 gather kernel multi-token
+            // (inputSeqLen = prompt_len) over the per-token sparse selection (causal by construction). The latent
+            // KV was just written to the SWA pool by invokeMLARopeContext above; the compressed pool was written by
+            // the Compressor. Mirror mlaGeneration's XQA setup, adapting the context EnqueueParams into a
+            // generation-style params struct for convertMMHAParamsToXQAParams.
+            EnqueueGenerationParams<T> genParams{};
+            // Copy the shared EnqueueParams base (attention_input, context_buf, sequence_lengths, context_lengths,
+            // input_seq_length, num_tokens, kv scales, rotary caches, max_attention_window_size, etc.).
+            static_cast<EnqueueParams<T>&>(genParams) = static_cast<EnqueueParams<T> const&>(params);
+            genParams.workspace = xqa_context_workspace_ptr; // dedicated XQA scratch (carved above)
+            genParams.num_requests = params.batch_size;      // -> xqaParams.batch_size = num_contexts
+            genParams.beam_width = 1;
+            genParams.layer_idx = mLayerIdx;
+            // Pure prefill (no cached KV): the attended span per request equals its prompt length.
+            genParams.max_past_kv_length = params.input_seq_length;
+            genParams.host_past_key_value_lengths = nullptr; // unused by the MLA XQA path
+            genParams.semaphores = nullptr;                  // MLA uses separate-reduce; semaphores unused
+
+            XQAParams xqaParams{};
+            if (!this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(
+                    xqaParams, genParams, /*forConfigurePlugin=*/false))
+            {
+                TLLM_THROW("Failed to convert context params to XQA params for SM120 sparse-MLA context.");
+            }
+            // The XQA MLA kernel reads Q (already absorbed [*, H, kv_lora_rank+qk_rope]) from quant_q_buffer_ptr;
+            // invokeMLARopeContext + invokeMLAContextFp8Quantize produced the FP8 Q into mla_param->quant_q_buf above.
+            xqaParams.quant_q_buffer_ptr = params.mla_param->quant_q_buf;
+            xqaParams.q_scaling
+                = 1 / (mQScaling * sqrtf((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+            xqaParams.workspaces = xqa_context_workspace_ptr;
+            xqaParams.stream = stream;
+            TLLM_CHECK_WITH_INFO(mEnableXQA && mXqaDispatcher->shouldUse(xqaParams),
+                "SM120 sparse-MLA context requires the XQA mla_sm120 kernel but shouldUse() returned false.");
+            TLLM_LOG_DEBUG("XQA kernels are selected in the SM120 sparse-MLA context phase.");
+            mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
+        }
+        else
+        {
         // Construct the fmha params for running kernels.
         MHARunnerParams fmhaParams{};
         fmhaParams.b = params.batch_size;
@@ -2065,6 +2166,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
+        } // end else (non-SM120-context-XQA FMHA path)
         sync_check_cuda_error(stream);
 
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
@@ -3095,7 +3197,11 @@ int AttentionOp::initialize() noexcept
                 mDecoderFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
 
                 // Only deepseek must using fmha in the generation phase when flash mla is not enabled.
-                if (!mUseGenFlashMLA)
+                // On SM120 with MLA generation, the actual execution path is XQA (mEnableXQA was
+                // set earlier in this scope for SM120+MLA), so a missing fmha_v2 generation kernel
+                // is fine — the XQA mla_sm120 kernel handles decode. Skip the assert in that case.
+                bool const sm120MlaXqaWillHandleIt = (mSM == kSM_120) && mEnableXQA;
+                if (!mUseGenFlashMLA && !sm120MlaXqaWillHandleIt)
                 {
                     TLLM_CHECK_WITH_INFO(mDecoderFMHARunner->isFmhaSupported(),
                         "Deepseek should be supported by fmha in generation part.");

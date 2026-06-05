@@ -16,6 +16,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include <list>
 
@@ -188,7 +189,7 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
     {
         return false;
     }
-    if (SM != kSM_120)
+    if (SM != kSM_120 && SM != kSM_121)
     {
         return false;
     }
@@ -205,6 +206,11 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
         return false;
     }
     if (!xqaParams.isMLA())
+    {
+        return false;
+    }
+    int32_t const head_grp_size = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    if (head_grp_size <= 0 || head_grp_size > kXqaMlaKernelHeadGrpSize)
     {
         return false;
     }

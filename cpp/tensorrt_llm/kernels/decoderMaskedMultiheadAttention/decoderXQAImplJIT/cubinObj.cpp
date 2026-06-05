@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include <cuda_runtime_api.h>
 
@@ -79,6 +80,7 @@ CubinObj::CubinObj(CubinObj&& other)
         this->mDriver = std::move(other.mDriver);
         this->mLibrary = other.mLibrary;
         this->mKernel = other.mKernel;
+        this->mReduceKernel = other.mReduceKernel;
         this->mSharedMemBytes = other.mSharedMemBytes;
         this->mKernelType = other.mKernelType;
 
@@ -104,6 +106,7 @@ CubinObj& CubinObj::operator=(CubinObj&& other)
         this->mDriver = std::move(other.mDriver);
         this->mLibrary = other.mLibrary;
         this->mKernel = other.mKernel;
+        this->mReduceKernel = other.mReduceKernel;
         this->mSharedMemBytes = other.mSharedMemBytes;
         this->mKernelType = other.mKernelType;
 
@@ -134,16 +137,46 @@ void CubinObj::serialize(void* buffer_, size_t buffer_size) const noexcept
     memcpy(buffer, mContent.c_str(), len);
 }
 
-void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams) const
+void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams, dim3 clusterDim) const
 {
     TLLM_CHECK(mInitialized);
-    CUlaunchAttribute pdlAttr;
-    pdlAttr.id = CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-    pdlAttr.value.programmaticStreamSerializationAllowed = (tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0);
+    CUlaunchAttribute attrs[3]{};
+    uint32_t numAttrs = 0;
+    if (clusterDim.x * clusterDim.y * clusterDim.z > 1)
+    {
+        attrs[numAttrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attrs[numAttrs].value.clusterDim.x = clusterDim.x;
+        attrs[numAttrs].value.clusterDim.y = clusterDim.y;
+        attrs[numAttrs].value.clusterDim.z = clusterDim.z;
+        ++numAttrs;
+        attrs[numAttrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
+        attrs[numAttrs].value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_SPREAD;
+        ++numAttrs;
+    }
+    attrs[numAttrs].id = CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    attrs[numAttrs].value.programmaticStreamSerializationAllowed = (tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0);
+    ++numAttrs;
     CUlaunchConfig const cfg{
-        gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, mSharedMemBytes, hStream, &pdlAttr, 1};
+        gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, mSharedMemBytes, hStream, attrs, numAttrs};
 
     TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&cfg, kernel(), kernelParams, /*extra=*/nullptr));
+}
+
+void CubinObj::launchMlaReduce(void* output, void const* partialResults, uint32_t const* seqLenList,
+    uint32_t maxNbSubSeq, uint32_t inputSeqLen, uint32_t totalNumInputTokens, uint32_t kernelNumQHeads,
+    CUstream hStream) const
+{
+    TLLM_CHECK(mInitialized);
+    TLLM_CHECK(mReduceKernel != nullptr);
+
+    void* partialResultsArg = const_cast<void*>(partialResults);
+    uint32_t const* seqLenListArg = seqLenList;
+    void* kernelParams[] = {&output, &partialResultsArg, &seqLenListArg, &maxNbSubSeq, &inputSeqLen};
+    dim3 const gridDim{4, getXqaMlaPartialResultChunks(kernelNumQHeads), totalNumInputTokens};
+    dim3 const blockDim{256, 1, 1};
+    CUlaunchConfig const cfg{
+        gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, 0, hStream, nullptr, 0};
+    TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&cfg, reinterpret_cast<CUfunction>(mReduceKernel), kernelParams, nullptr));
 }
 
 void CubinObj::initialize()
@@ -158,10 +191,16 @@ void CubinObj::initialize()
         mKernel = nullptr;
         TLLM_CU_CHECK(mDriver->cuLibraryGetKernel(&mKernel, mLibrary, kFuncName));
         TLLM_CHECK(mKernel != nullptr);
+        mReduceKernel = nullptr;
 
         // Populate mSharedMemBytes and mKernelType.
         mSharedMemBytes = getGlobalVar<uint32_t>(mDriver, mLibrary, kSmemName, true).value();
         mKernelType = getGlobalVar<XQAKernelType>(mDriver, mLibrary, kKernelTypeName, true).value();
+        if (mKernelType == XQAKernelType::kSM120_MLA)
+        {
+            TLLM_CU_CHECK(mDriver->cuLibraryGetKernel(&mReduceKernel, mLibrary, "reduce_mla_flash_decode_partials"));
+            TLLM_CHECK(mReduceKernel != nullptr);
+        }
 
         TLLM_CHECK(mSharedMemBytes > 0);
 

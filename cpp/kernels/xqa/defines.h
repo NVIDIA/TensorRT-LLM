@@ -33,12 +33,24 @@
 #define HEAD_GRP_SIZE 8
 #endif
 
-#define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
+// MLA detection: any known DeepSeek MLA shape.
+//   DSV3 family: HEAD_ELEMS=576 (kv_lora_rank=512 + qk_rope_head_dim=64), HEAD_ELEMS_V=512
+//   DSV4 family: HEAD_ELEMS=512 (kv_lora_rank=448 + qk_rope_head_dim=64), HEAD_ELEMS_V=448
+#define IS_MLA ((HEAD_ELEMS == 576 || HEAD_ELEMS == 512) && HEAD_GRP_SIZE >= 32)
 
 #if IS_MLA
 #define INPUT_ELEM __nv_fp8_e4m3
 #define INPUT_ELEM2 __nv_fp8x2_e4m3
+// HEAD_ELEMS_V may be passed by the JIT context. Fall back to a per-family default.
+#ifndef HEAD_ELEMS_V
+#if HEAD_ELEMS == 576
 #define HEAD_ELEMS_V 512
+#elif HEAD_ELEMS == 512
+#define HEAD_ELEMS_V 448
+#else
+#error "HEAD_ELEMS_V must be defined for MLA kernels with unfamiliar HEAD_ELEMS."
+#endif
+#endif
 #else
 // 1 means fp16 and 0 means bf16 input/output
 #ifndef INPUT_FP16

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -193,6 +193,23 @@ __device__ inline void loadAsync(
     {
         static_assert(nbDims >= 1 && nbDims <= 5);
     }
+}
+
+// 2D tile::gather4 — gathers 4 rows (tokens) from a 2D global tensor, sharing the dim0 (feature)
+// coordinate `col` and using 4 independent dim1 (token-slot) coordinates row0..row3. The 4 gathered
+// rows are written into the swizzled shared-memory tile at `dst` (logical 4-row band); the hardware
+// applies the descriptor swizzle. Used by the DSV4 sparse-MLA dual-pool per-token KV gather on SM120.
+// Single-CTA variant only (no cta_group::2 — unsupported on sm_120a).
+__device__ inline void loadAsyncGather4(void* dst, CUtensorMap const& tensorMap, uint32_t col, uint32_t row0,
+    uint32_t row1, uint32_t row2, uint32_t row3, CtaBarrier& bar)
+{
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, "
+        "%4, %5, %6}], [%7];\n"
+        :
+        : "l"(__cvta_generic_to_shared(dst)), "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(col), "r"(row0),
+        "r"(row1), "r"(row2), "r"(row3), "l"(__cvta_generic_to_shared(&bar))
+        : "memory");
 }
 
 // shared::cta -> global

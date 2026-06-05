@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -196,6 +196,32 @@ template CUtensorMap makeTensorMapForXqaMlaKVCache(
     std::shared_ptr<CUDADriverWrapper> const&, XQAParams const&, KVBlockArray const&, bool);
 template CUtensorMap makeTensorMapForXqaMlaKVCache(
     std::shared_ptr<CUDADriverWrapper> const&, XQAParams const&, KVLinearBuffer const&, bool);
+
+CUtensorMap makeTensorMapForXqaMlaKVCacheGather(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver,
+    XQAParams const& xqaParams, void const* poolBase, bool forK)
+{
+    // Dual-pool gather descriptor: 2D {headElems, token_slots} with box {partElems, 1} (one token per
+    // gather row). The MLA latent pool has nbKHeads==1, so it is contiguous as [token_slot, headElems];
+    // a token's absolute slot (a sparse_attn_indices entry, already page->token converted in Python)
+    // directly indexes dim1. Swizzle matches makeTensorMapForXqaMlaKVCache (64B for K partElems=64, 128B
+    // for V partElems=128) so the gathered rows match the dense MLA KV smem layout the consumer reads.
+    CUtensorMapDataType_enum const dataType = getDataTypeFromXqaParams(xqaParams);
+    uint32_t const partElems = (forK ? 64 : 128);
+    uint32_t const headElems = xqaParams.head_size;
+    uint32_t const elemBytes = getElemBytes(dataType);
+    uint32_t const headBytes = elemBytes * headElems;
+    uint64_t const globalDims[] = {headElems, (1ULL << 31)};
+    uint64_t const globalStrides[] = {headBytes};
+    uint32_t const boxDims[] = {partElems, 1};
+    uint32_t const elemStrides[] = {1, 1};
+    auto const swizzle = getSwizzleMode(elemBytes * partElems);
+
+    CUtensorMap tensorMap{};
+    TLLM_CU_CHECK(driver->cuTensorMapEncodeTiled(&tensorMap, dataType, 2, const_cast<void*>(poolBase), globalDims,
+        globalStrides, boxDims, elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return tensorMap;
+}
 
 CUtensorMap makeTensorMapForXqaMlaQ(
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, XQAParams const& xqaParams, void const* q)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #include "compileEngine.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
@@ -27,6 +28,13 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <vector>
 
 namespace
 {
@@ -34,12 +42,501 @@ namespace
 using ::tensorrt_llm::kernels::XQAKernelRuntimeHashKey;
 using ::tensorrt_llm::kernels::XQAParams;
 using ::tensorrt_llm::kernels::XQAKernelMetaInfo;
+using ::tensorrt_llm::kernels::kXqaMlaMultiBlockMinTilesPerCta;
+using ::tensorrt_llm::kernels::kXqaMlaOutputHeadSize;
+using ::tensorrt_llm::kernels::kXqaMlaTokensPerTile;
+using ::tensorrt_llm::kernels::getXqaMlaCgaXBufSize;
+using ::tensorrt_llm::kernels::getXqaMlaRuntimeKernelHeadGrpSize;
+using ::tensorrt_llm::kernels::getXqaMlaPartialResultChunks;
+using ::tensorrt_llm::kernels::getXqaMlaPartialResultSize;
 
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const& kernelMeta)
 {
     return {kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth, kernelMeta.mNumQHeadsOverKV,
         kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache, kernelMeta.mMultiQueryTokens, false,
         std::nullopt};
+}
+
+void logUnsupportedXQAConfig(char const* prefix, XQAParams const& xqaParams, int sm, bool forConfigurePlugin)
+{
+    int const headGrpSize
+        = xqaParams.num_kv_heads == 0 ? 0 : (xqaParams.num_q_heads / xqaParams.num_kv_heads);
+    bool const supportQGMMA = tensorrt_llm::kernels::jit::supportConfigQGMMA(xqaParams, sm, forConfigurePlugin);
+    bool const supportHMMA = tensorrt_llm::kernels::jit::supportConfigHMMA(xqaParams, sm, forConfigurePlugin);
+    bool const supportMLA = tensorrt_llm::kernels::jit::supportConfigMLA(xqaParams, sm, forConfigurePlugin);
+
+    TLLM_LOG_DEBUG(
+        "%s: sm=%d for_configure_plugin=%d data_type=%d kv_cache_data_type=%d output_data_type=%d "
+        "head_size=%d num_q_heads=%d num_kv_heads=%d head_grp_size=%d tokens_per_block=%d paged_kv_cache=%d "
+        "beam_width=%d q_seq_len=%d total_num_input_tokens=%d is_mla=%d is_fp8_output=%d "
+        "chunked_attention_size=%d mask_type=%d unidirectional=%d position_embedding_type=%d position_shift_enabled=%d "
+        "sink_token_length=%d skip_softmax_threshold_scale_factor=%g support_qgmma=%d support_hmma=%d support_mla=%d",
+        prefix, sm, forConfigurePlugin, static_cast<int>(xqaParams.data_type),
+        static_cast<int>(xqaParams.kv_cache_data_type), static_cast<int>(xqaParams.output_data_type), xqaParams.head_size,
+        xqaParams.num_q_heads, xqaParams.num_kv_heads, headGrpSize, xqaParams.tokens_per_block, xqaParams.paged_kv_cache,
+        xqaParams.beam_width, xqaParams.generation_input_length, xqaParams.total_num_input_tokens, xqaParams.isMLA(),
+        xqaParams.is_fp8_output, xqaParams.chunked_attention_size, static_cast<int>(xqaParams.mask_type),
+        xqaParams.unidirectional, static_cast<int>(xqaParams.position_embedding_type), xqaParams.position_shift_enabled,
+        xqaParams.sink_token_length, xqaParams.skip_softmax_threshold_scale_factor, supportQGMMA, supportHMMA, supportMLA);
+}
+
+bool enableXqaMlaDebugSync()
+{
+    static bool const enabled = tensorrt_llm::common::getBoolEnv("XQA_MLA_DEBUG_SYNC");
+    return enabled;
+}
+
+bool isStreamCapturing(cudaStream_t stream, char const* stage)
+{
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    TLLM_CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, nullptr));
+    if (status != cudaStreamCaptureStatusNone)
+    {
+        TLLM_LOG_TRACE("XQA MLA debug action after %s skipped because stream capture status is %d", stage,
+            static_cast<int>(status));
+        return true;
+    }
+    return false;
+}
+
+void maybeSyncXqaMlaDebug(cudaStream_t stream, char const* stage)
+{
+    if (enableXqaMlaDebugSync())
+    {
+        if (isStreamCapturing(stream, stage))
+        {
+            return;
+        }
+        TLLM_LOG_TRACE("XQA MLA debug sync after %s", stage);
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+        TLLM_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+bool enableXqaMlaNanCheck()
+{
+    static bool const enabled = tensorrt_llm::common::getBoolEnv("XQA_MLA_NAN_CHECK");
+    return enabled;
+}
+
+bool enableXqaMlaReduceRefCheck()
+{
+    static bool const enabled = tensorrt_llm::common::getBoolEnv("XQA_MLA_REDUCE_REF_CHECK");
+    return enabled;
+}
+
+float bf16ToFloat(uint16_t raw)
+{
+    uint32_t bits = static_cast<uint32_t>(raw) << 16U;
+    float out = 0.F;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+struct XqaMlaDebugContext
+{
+    uint32_t runtimeNumQHeads;
+    uint32_t kernelNumQHeads;
+    uint32_t tokensPerPage;
+    void const* sequenceLengths;
+};
+
+void maybeCheckXqaMlaBf16BufferForInvalid(cudaStream_t stream, void const* output, uint32_t tokens,
+    uint32_t headsToCheck, uint32_t headPitch, char const* stage, XqaMlaDebugContext const& context)
+{
+    if (!enableXqaMlaNanCheck())
+    {
+        return;
+    }
+    if (isStreamCapturing(stream, stage))
+    {
+        return;
+    }
+
+    TLLM_CHECK_WITH_INFO(headsToCheck <= headPitch, "Invalid XQA MLA debug head layout");
+    uint32_t seqLen0 = 0xffffffffU;
+    if (context.sequenceLengths != nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(
+            &seqLen0, context.sequenceLengths, sizeof(seqLen0), cudaMemcpyDeviceToHost, stream));
+    }
+
+    size_t const elems = static_cast<size_t>(tokens) * headPitch * kXqaMlaOutputHeadSize;
+    std::vector<uint16_t> host(elems);
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(
+        host.data(), output, elems * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    TLLM_CUDA_CHECK(cudaGetLastError());
+
+    for (uint32_t token = 0; token < tokens; ++token)
+    {
+        for (uint32_t head = 0; head < headsToCheck; ++head)
+        {
+            for (uint32_t col = 0; col < kXqaMlaOutputHeadSize; ++col)
+            {
+                size_t const idx = (static_cast<size_t>(token) * headPitch + head) * kXqaMlaOutputHeadSize + col;
+                uint16_t const raw = host[idx];
+                if ((raw & 0x7F80U) == 0x7F80U)
+                {
+                    TLLM_CHECK_WITH_INFO(false,
+                        "XQA MLA BF16 buffer contains NaN/Inf after %s at token=%u head=%u col=%u raw=0x%04x "
+                        "(tokens=%u heads_to_check=%u head_pitch=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
+                        "seq_len0=%u tokens_per_page=%u)",
+                        stage, token, head, col, static_cast<unsigned>(raw), tokens, headsToCheck, headPitch,
+                        context.runtimeNumQHeads, context.kernelNumQHeads, seqLen0, context.tokensPerPage);
+                }
+            }
+        }
+    }
+    TLLM_LOG_TRACE(
+        "XQA MLA BF16 buffer NaN/Inf check passed after %s "
+        "(tokens=%u heads_to_check=%u head_pitch=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
+        "seq_len0=%u tokens_per_page=%u)",
+        stage, tokens, headsToCheck, headPitch, context.runtimeNumQHeads, context.kernelNumQHeads, seqLen0,
+        context.tokensPerPage);
+}
+
+void maybeCheckXqaMlaFp8QForInvalid(cudaStream_t stream, void const* q, uint32_t tokens, uint32_t headsToCheck,
+    uint32_t headPitch, uint32_t headSize, char const* stage, XqaMlaDebugContext const& context)
+{
+    if (!enableXqaMlaNanCheck())
+    {
+        return;
+    }
+    if (isStreamCapturing(stream, stage))
+    {
+        return;
+    }
+
+    TLLM_CHECK_WITH_INFO(headsToCheck <= headPitch, "Invalid XQA MLA debug Q head layout");
+    uint32_t seqLen0 = 0xffffffffU;
+    if (context.sequenceLengths != nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(
+            &seqLen0, context.sequenceLengths, sizeof(seqLen0), cudaMemcpyDeviceToHost, stream));
+    }
+
+    size_t const elems = static_cast<size_t>(tokens) * headPitch * headSize;
+    std::vector<uint8_t> host(elems);
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(host.data(), q, elems, cudaMemcpyDeviceToHost, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    TLLM_CUDA_CHECK(cudaGetLastError());
+
+    for (uint32_t token = 0; token < tokens; ++token)
+    {
+        for (uint32_t head = 0; head < headsToCheck; ++head)
+        {
+            for (uint32_t col = 0; col < headSize; ++col)
+            {
+                size_t const idx = (static_cast<size_t>(token) * headPitch + head) * headSize + col;
+                uint8_t const raw = host[idx];
+                if (raw == 0x7fU || raw == 0xffU)
+                {
+                    TLLM_CHECK_WITH_INFO(false,
+                        "XQA MLA FP8 Q contains NaN after %s at token=%u head=%u col=%u raw=0x%02x "
+                        "(tokens=%u heads_to_check=%u head_pitch=%u head_size=%u runtime_num_q_heads=%u "
+                        "kernel_num_q_heads=%u seq_len0=%u tokens_per_page=%u)",
+                        stage, token, head, col, static_cast<unsigned>(raw), tokens, headsToCheck, headPitch,
+                        headSize, context.runtimeNumQHeads, context.kernelNumQHeads, seqLen0, context.tokensPerPage);
+                }
+            }
+        }
+    }
+    TLLM_LOG_TRACE(
+        "XQA MLA FP8 Q NaN check passed after %s "
+        "(tokens=%u heads_to_check=%u head_pitch=%u head_size=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
+        "seq_len0=%u tokens_per_page=%u)",
+        stage, tokens, headsToCheck, headPitch, headSize, context.runtimeNumQHeads, context.kernelNumQHeads, seqLen0,
+        context.tokensPerPage);
+}
+
+void maybeCheckXqaMlaPartialsForInvalid(cudaStream_t stream, void const* partialResults, uint32_t tokens,
+    uint32_t maxNbSubSeq, uint32_t headsToCheck, char const* stage, XqaMlaDebugContext const& context)
+{
+    if (!enableXqaMlaNanCheck())
+    {
+        return;
+    }
+    if (isStreamCapturing(stream, stage))
+    {
+        return;
+    }
+
+    uint32_t const chunks = getXqaMlaPartialResultChunks(context.kernelNumQHeads);
+    uint32_t const rowsPerChunk = context.kernelNumQHeads / chunks;
+    constexpr size_t kOutputHeadBytes = static_cast<size_t>(kXqaMlaOutputHeadSize) * sizeof(uint16_t);
+    size_t const chunkDataBytes = static_cast<size_t>(rowsPerChunk) * kOutputHeadBytes;
+    size_t const chunkRowSumOffset = chunkDataBytes;
+    size_t const chunkRowMaxOffset = chunkRowSumOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
+    size_t const chunkBytes = chunkRowMaxOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
+    size_t const partialResultSize = getXqaMlaPartialResultSize(context.kernelNumQHeads);
+    TLLM_CHECK_WITH_INFO(chunkBytes * chunks == partialResultSize, "Invalid XQA MLA partial debug layout");
+
+    uint32_t seqLen0 = 0xffffffffU;
+    if (context.sequenceLengths != nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(
+            &seqLen0, context.sequenceLengths, sizeof(seqLen0), cudaMemcpyDeviceToHost, stream));
+    }
+
+    uint32_t const chunksToCheck = (headsToCheck + rowsPerChunk - 1) / rowsPerChunk;
+    TLLM_CHECK_WITH_INFO(chunksToCheck <= chunks, "Invalid XQA MLA partial debug head count");
+    size_t const copies = static_cast<size_t>(tokens) * maxNbSubSeq * chunksToCheck;
+    std::vector<uint8_t> host(copies * chunkBytes);
+    auto const* partialBytes = static_cast<uint8_t const*>(partialResults);
+    for (uint32_t token = 0; token < tokens; ++token)
+    {
+        for (uint32_t subSeq = 0; subSeq < maxNbSubSeq; ++subSeq)
+        {
+            for (uint32_t chunk = 0; chunk < chunksToCheck; ++chunk)
+            {
+                size_t const copyIdx = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * chunksToCheck + chunk;
+                size_t const srcOffset
+                    = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * partialResultSize
+                    + static_cast<size_t>(chunk) * chunkBytes;
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(
+                    host.data() + copyIdx * chunkBytes, partialBytes + srcOffset, chunkBytes,
+                    cudaMemcpyDeviceToHost, stream));
+            }
+        }
+    }
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    TLLM_CUDA_CHECK(cudaGetLastError());
+
+    for (uint32_t token = 0; token < tokens; ++token)
+    {
+        for (uint32_t subSeq = 0; subSeq < maxNbSubSeq; ++subSeq)
+        {
+            for (uint32_t chunk = 0; chunk < chunksToCheck; ++chunk)
+            {
+                size_t const copyIdx = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * chunksToCheck + chunk;
+                uint8_t const* chunkData = host.data() + copyIdx * chunkBytes;
+                uint32_t const rowLimit = std::min(rowsPerChunk, headsToCheck - chunk * rowsPerChunk);
+                for (uint32_t row = 0; row < rowLimit; ++row)
+                {
+                    float rowSum = 0.F;
+                    float rowMax = 0.F;
+                    std::memcpy(&rowSum, chunkData + chunkRowSumOffset + static_cast<size_t>(row) * sizeof(float),
+                        sizeof(float));
+                    std::memcpy(&rowMax, chunkData + chunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float),
+                        sizeof(float));
+                    uint32_t const head = chunk * rowsPerChunk + row;
+                    TLLM_CHECK_WITH_INFO(std::isfinite(rowSum) && rowSum > 0.F && std::isfinite(rowMax),
+                        "XQA MLA partial row stats invalid after %s at token=%u subseq=%u head=%u "
+                        "chunk=%u row=%u row_sum=%g row_max=%g "
+                        "(tokens=%u max_subseq=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
+                        "seq_len0=%u tokens_per_page=%u)",
+                        stage, token, subSeq, head, chunk, row, rowSum, rowMax, tokens, maxNbSubSeq,
+                        context.runtimeNumQHeads, context.kernelNumQHeads, seqLen0, context.tokensPerPage);
+                    uint8_t const* rowData = chunkData + static_cast<size_t>(row) * kOutputHeadBytes;
+                    for (uint32_t col = 0; col < kXqaMlaOutputHeadSize; ++col)
+                    {
+                        uint16_t raw = 0;
+                        std::memcpy(&raw, rowData + static_cast<size_t>(col) * sizeof(uint16_t), sizeof(uint16_t));
+                        if ((raw & 0x7F80U) == 0x7F80U)
+                        {
+                            TLLM_CHECK_WITH_INFO(false,
+                                "XQA MLA partial BF16 data contains NaN/Inf after %s at token=%u subseq=%u "
+                                "head=%u chunk=%u row=%u col=%u raw=0x%04x "
+                                "(tokens=%u max_subseq=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
+                                "seq_len0=%u tokens_per_page=%u)",
+                                stage, token, subSeq, head, chunk, row, col, static_cast<unsigned>(raw), tokens,
+                                maxNbSubSeq, context.runtimeNumQHeads, context.kernelNumQHeads, seqLen0,
+                                context.tokensPerPage);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    TLLM_LOG_TRACE(
+        "XQA MLA partial NaN/Inf check passed after %s "
+        "(tokens=%u max_subseq=%u heads_to_check=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
+        "seq_len0=%u tokens_per_page=%u)",
+        stage, tokens, maxNbSubSeq, headsToCheck, context.runtimeNumQHeads, context.kernelNumQHeads, seqLen0,
+        context.tokensPerPage);
+}
+
+void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const* output, void const* partialResults,
+    uint32_t tokens, uint32_t maxNbSubSeq, uint32_t inputSeqLen, uint32_t headsToCheck, uint32_t headPitch,
+    char const* stage, XqaMlaDebugContext const& context)
+{
+    if (!enableXqaMlaReduceRefCheck())
+    {
+        return;
+    }
+    if (isStreamCapturing(stream, stage))
+    {
+        return;
+    }
+
+    uint32_t const chunks = getXqaMlaPartialResultChunks(context.kernelNumQHeads);
+    uint32_t const rowsPerChunk = context.kernelNumQHeads / chunks;
+    constexpr size_t kOutputHeadBytes = static_cast<size_t>(kXqaMlaOutputHeadSize) * sizeof(uint16_t);
+    size_t const chunkDataBytes = static_cast<size_t>(rowsPerChunk) * kOutputHeadBytes;
+    size_t const chunkRowSumOffset = chunkDataBytes;
+    size_t const chunkRowMaxOffset = chunkRowSumOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
+    size_t const chunkBytes = chunkRowMaxOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
+    size_t const partialResultSize = getXqaMlaPartialResultSize(context.kernelNumQHeads);
+    TLLM_CHECK_WITH_INFO(chunkBytes * chunks == partialResultSize, "Invalid XQA MLA reduce reference layout");
+
+    TLLM_CHECK_WITH_INFO(inputSeqLen > 0, "Invalid XQA MLA reduce reference input sequence length");
+    TLLM_CHECK_WITH_INFO(headsToCheck <= headPitch, "Invalid XQA MLA reduce reference head layout");
+    uint32_t const chunksToCheck = (headsToCheck + rowsPerChunk - 1) / rowsPerChunk;
+    TLLM_CHECK_WITH_INFO(chunksToCheck <= chunks, "Invalid XQA MLA reduce reference head count");
+
+    uint32_t const batchSize = (tokens + inputSeqLen - 1) / inputSeqLen;
+    std::vector<uint32_t> seqLens(batchSize, 0xffffffffU);
+    if (context.sequenceLengths != nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(seqLens.data(), context.sequenceLengths,
+            static_cast<size_t>(batchSize) * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    }
+
+    size_t const partialCopies = static_cast<size_t>(tokens) * maxNbSubSeq * chunksToCheck;
+    std::vector<uint8_t> partialHost(partialCopies * chunkBytes);
+    auto const* partialBytes = static_cast<uint8_t const*>(partialResults);
+    for (uint32_t token = 0; token < tokens; ++token)
+    {
+        for (uint32_t subSeq = 0; subSeq < maxNbSubSeq; ++subSeq)
+        {
+            for (uint32_t chunk = 0; chunk < chunksToCheck; ++chunk)
+            {
+                size_t const copyIdx = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * chunksToCheck + chunk;
+                size_t const srcOffset
+                    = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * partialResultSize
+                    + static_cast<size_t>(chunk) * chunkBytes;
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(partialHost.data() + copyIdx * chunkBytes, partialBytes + srcOffset,
+                    chunkBytes, cudaMemcpyDeviceToHost, stream));
+            }
+        }
+    }
+
+    size_t const outputElems = static_cast<size_t>(tokens) * headPitch * kXqaMlaOutputHeadSize;
+    std::vector<uint16_t> outputHost(outputElems);
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(
+        outputHost.data(), output, outputElems * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    TLLM_CUDA_CHECK(cudaGetLastError());
+
+    auto chunkPtr = [&](uint32_t token, uint32_t subSeq, uint32_t chunk) -> uint8_t const*
+    {
+        size_t const copyIdx = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * chunksToCheck + chunk;
+        return partialHost.data() + copyIdx * chunkBytes;
+    };
+    auto readFloat = [](uint8_t const* ptr) -> float
+    {
+        float out = 0.F;
+        std::memcpy(&out, ptr, sizeof(out));
+        return out;
+    };
+    auto readBf16 = [](uint8_t const* ptr) -> float
+    {
+        uint16_t raw = 0;
+        std::memcpy(&raw, ptr, sizeof(raw));
+        return bf16ToFloat(raw);
+    };
+
+    double maxAbsDiff = 0.0;
+    double maxRelDiff = 0.0;
+    double maxAbsExpected = 0.0;
+    double maxAbsOutput = 0.0;
+    double maxAbsPartial = 0.0;
+    double maxExpectedAtDiff = 0.0;
+    double maxOutputAtDiff = 0.0;
+    uint32_t diffToken = 0;
+    uint32_t diffHead = 0;
+    uint32_t diffCol = 0;
+    uint32_t maxNbSubSeqObserved = 0;
+    uint32_t seqLen0 = seqLens.empty() ? 0xffffffffU : seqLens[0];
+
+    for (uint32_t token = 0; token < tokens; ++token)
+    {
+        uint32_t const idxReq = token / inputSeqLen;
+        uint32_t const reqIdxInputToken = token - idxReq * inputSeqLen;
+        uint32_t const cacheSeqLen = seqLens[idxReq] - (inputSeqLen - 1) + reqIdxInputToken;
+        uint32_t const nbTiles = (cacheSeqLen + kXqaMlaTokensPerTile - 1) / kXqaMlaTokensPerTile;
+        bool const isMultiBlockMode = (maxNbSubSeq > 1 && nbTiles >= kXqaMlaMultiBlockMinTilesPerCta * 2);
+        uint32_t const nbSubSeq = isMultiBlockMode
+            ? std::min<uint32_t>(nbTiles / kXqaMlaMultiBlockMinTilesPerCta, maxNbSubSeq)
+            : 1U;
+        maxNbSubSeqObserved = std::max(maxNbSubSeqObserved, nbSubSeq);
+        if (nbSubSeq <= 1)
+        {
+            continue;
+        }
+
+        for (uint32_t head = 0; head < headsToCheck; ++head)
+        {
+            uint32_t const chunk = head / rowsPerChunk;
+            uint32_t const row = head - chunk * rowsPerChunk;
+
+            double rowMax = -std::numeric_limits<double>::infinity();
+            for (uint32_t subSeq = 0; subSeq < nbSubSeq; ++subSeq)
+            {
+                uint8_t const* chunkData = chunkPtr(token, subSeq, chunk);
+                float const subSeqRowMax
+                    = readFloat(chunkData + chunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
+                rowMax = std::max(rowMax, static_cast<double>(subSeqRowMax));
+            }
+
+            double rowSum = 0.0;
+            for (uint32_t subSeq = 0; subSeq < nbSubSeq; ++subSeq)
+            {
+                uint8_t const* chunkData = chunkPtr(token, subSeq, chunk);
+                float const subSeqRowSum
+                    = readFloat(chunkData + chunkRowSumOffset + static_cast<size_t>(row) * sizeof(float));
+                float const subSeqRowMax
+                    = readFloat(chunkData + chunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
+                rowSum += static_cast<double>(subSeqRowSum) * std::exp2(static_cast<double>(subSeqRowMax) - rowMax);
+            }
+
+            for (uint32_t col = 0; col < kXqaMlaOutputHeadSize; ++col)
+            {
+                double expected = 0.0;
+                for (uint32_t subSeq = 0; subSeq < nbSubSeq; ++subSeq)
+                {
+                    uint8_t const* chunkData = chunkPtr(token, subSeq, chunk);
+                    float const subSeqRowSum
+                        = readFloat(chunkData + chunkRowSumOffset + static_cast<size_t>(row) * sizeof(float));
+                    float const subSeqRowMax
+                        = readFloat(chunkData + chunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
+                    double const weight
+                        = static_cast<double>(subSeqRowSum) * std::exp2(static_cast<double>(subSeqRowMax) - rowMax);
+                    uint8_t const* rowData = chunkData + static_cast<size_t>(row) * kOutputHeadBytes;
+                    double const partial = static_cast<double>(readBf16(rowData + static_cast<size_t>(col) * sizeof(uint16_t)));
+                    maxAbsPartial = std::max(maxAbsPartial, std::abs(partial));
+                    expected += partial * weight / std::max(rowSum, 1e-300);
+                }
+
+                size_t const outputIdx = (static_cast<size_t>(token) * headPitch + head) * kXqaMlaOutputHeadSize + col;
+                double const actual = static_cast<double>(bf16ToFloat(outputHost[outputIdx]));
+                double const diff = std::abs(expected - actual);
+                double const rel = diff / std::max(std::abs(expected), 1e-12);
+                maxAbsExpected = std::max(maxAbsExpected, std::abs(expected));
+                maxAbsOutput = std::max(maxAbsOutput, std::abs(actual));
+                if (diff > maxAbsDiff)
+                {
+                    maxAbsDiff = diff;
+                    maxRelDiff = rel;
+                    maxExpectedAtDiff = expected;
+                    maxOutputAtDiff = actual;
+                    diffToken = token;
+                    diffHead = head;
+                    diffCol = col;
+                }
+            }
+        }
+    }
+
+    TLLM_LOG_TRACE(
+        "XQA MLA reduce host reference check after %s: max_abs_diff=%g max_rel_diff=%g "
+        "expected_at_diff=%g output_at_diff=%g diff_token=%u diff_head=%u diff_col=%u "
+        "max_abs_expected=%g max_abs_output=%g max_abs_partial=%g tokens=%u max_subseq=%u "
+        "observed_subseq=%u runtime_num_q_heads=%u kernel_num_q_heads=%u seq_len0=%u tokens_per_page=%u",
+        stage, maxAbsDiff, maxRelDiff, maxExpectedAtDiff, maxOutputAtDiff, diffToken, diffHead, diffCol,
+        maxAbsExpected, maxAbsOutput, maxAbsPartial, tokens, maxNbSubSeq, maxNbSubSeqObserved,
+        context.runtimeNumQHeads, context.kernelNumQHeads, seqLen0, context.tokensPerPage);
 }
 
 } // anonymous namespace
@@ -113,6 +610,8 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
             }
         }
         TLLM_LOG_DEBUG("JIT XQA is not used: no supported configuration found for any beam_width");
+        logUnsupportedXQAConfig("JIT XQA unsupported configure-time umbrella config", umbrellaXQAParams, mSM,
+            forConfigurePlugin);
         return false;
     }
     else
@@ -122,6 +621,7 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
         if (!isConfigSupported)
         {
             TLLM_LOG_DEBUG("JIT XQA is not used: unsupported configuration");
+            logUnsupportedXQAConfig("JIT XQA unsupported runtime config", xqaParams, mSM, forConfigurePlugin);
             return false;
         }
         bool hasPerfGain = mayHavePerfGain(xqaParams);
@@ -163,6 +663,14 @@ void DecoderXQAImplJIT::prepareForActualXQAParams(XQAParams const& xqaParams)
     if (supportConfig(xqaParams, true))
     {
         jit::CubinObjKey key = getCubinObjKeyFromXQAParams(xqaParams);
+        int const headGrpSize = xqaParams.num_kv_heads == 0 ? 0 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
+        int const kernelHeadGrpSize = xqaParams.isMLA() ? getXqaMlaRuntimeKernelHeadGrpSize(headGrpSize) : headGrpSize;
+        bool const cacheHit = registryGlobal->getCubin(key) != nullptr;
+        TLLM_LOG_DEBUG(
+            "JIT XQA cubin cache %s: sm=%d is_mla=%d head_size=%d runtime_head_grp=%d kernel_head_grp=%d "
+            "tokens_per_block=%d q_seq_len=%d beam_width=%d",
+            cacheHit ? "hit" : "miss", mSM, xqaParams.isMLA(), xqaParams.head_size, headGrpSize, kernelHeadGrpSize,
+            xqaParams.tokens_per_block, xqaParams.generation_input_length, xqaParams.beam_width);
         registryGlobal->insertCubinIfNotExists(key, &compileEngine, /*initialize=*/true);
     }
 }
@@ -390,30 +898,191 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     void const* const kernel_input_tokens = (applyRoPEInXqaKernel ? launchParams.qkv : xqa_q_input_ptr);
     if (isMLAKernel)
     {
-        CUtensorMap const tensorMapQ = makeTensorMapForXqaMlaQ(mDriver, xqaParams, kernel_input_tokens);
+        auto const roundUpTo128 = [](size_t value) { return ((value + 127) / 128) * 128; };
+        uint32_t multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        // Multi-token MLA (DSV4 context/prefill: inputSeqLen = generation_input_length > 1, non-spec-dec)
+        // parallelizes over query tokens in gridDim.x. Split-K over the KV dim (gridDim.y = multi_block) would
+        // multiply the per-token cgaXBuf/partial scratch by multi_block (up to 48) * total_num_input_tokens
+        // (= num_ctx_tokens, up to thousands) -> multi-GiB scratch (OOM). Force single-CTA for this path; the
+        // query-token parallelism already saturates the grid. (Decode keeps split-K; MLA spec-dec is excluded
+        // via multi_query_tokens.)
+        if (xqaParams.isMLA() && xqaParams.generation_input_length > 1 && !xqaParams.multi_query_tokens)
+        {
+            multi_block = 1;
+        }
+        // DSV4 dynamic-sparse MLA decode attends over the sparse selection, so the main kernel uses
+        // cacheSeqLen = sparse_mla_topk_lens (the attended count). Split-K is enabled for the sparse path
+        // too: the separate-reduce launch below is fed sparse_mla_topk_lens (not the full kv_len) so its
+        // per-request nbSubSeq matches the main kernel's. NOTE: computeMultiBlockCountForMLA still sizes
+        // multi_block from the full kv_len, which over-provisions grid/scratch for sparse (correct but a
+        // future tuning opportunity — base it on topk_len for sparse).
+        uint32_t const kernelMlaHeadGrpSize = getXqaMlaRuntimeKernelHeadGrpSize(num_q_heads_over_kv);
+        auto* scratchBytes = static_cast<std::byte*>(launchParams.scratch);
+        size_t const cgaXBufBytes = static_cast<size_t>(getXqaMlaCgaXBufSize(kernelMlaHeadGrpSize)) * multi_block
+            * xqaParams.total_num_input_tokens;
+        size_t const partialResultBytes = static_cast<size_t>(getXqaMlaPartialResultSize(kernelMlaHeadGrpSize))
+            * multi_block
+            * xqaParams.total_num_input_tokens;
+        auto* partialResults = scratchBytes + cgaXBufBytes;
+
+        XQAParams kernelXQAParams = xqaParams;
+        void const* kernelInputTokens = kernel_input_tokens;
+        auto* kernelOutput = launchParams.output;
+        bool const padMlaHeadGroup = num_q_heads_over_kv < kernelMlaHeadGrpSize;
+        if (padMlaHeadGroup)
+        {
+            TLLM_CHECK_WITH_INFO(num_kv_heads == 1,
+                "The SM120 MLA padded wrapper only supports one KV head per rank.");
+            kernelXQAParams.num_q_heads = kernelMlaHeadGrpSize;
+            kernelXQAParams.num_kv_heads = 1;
+
+            size_t const realQPitch = static_cast<size_t>(xqaParams.head_size) * xqaParams.num_q_heads
+                * kXqaMlaQElemBytes;
+            size_t const paddedQPitch
+                = static_cast<size_t>(xqaParams.head_size) * kernelMlaHeadGrpSize * kXqaMlaQElemBytes;
+            size_t const paddedQBytes = paddedQPitch * xqaParams.total_num_input_tokens;
+            size_t const paddedOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * kernelMlaHeadGrpSize
+                * kXqaMlaOutputElemBytes;
+            size_t const paddedOutputBytes = paddedOutputPitch * xqaParams.total_num_input_tokens;
+            auto* paddedQ = partialResults + partialResultBytes;
+            auto* paddedOutput = paddedQ + roundUpTo128(paddedQBytes);
+
+            TLLM_LOG_DEBUG(
+                "Padding SM120 MLA XQA head group from %d to %u for the selected kernel: "
+                "tokens=%u real_q_pitch=%zu padded_q_pitch=%zu padded_q_bytes=%zu "
+                "real_output_pitch=%zu padded_output_pitch=%zu padded_output_bytes=%zu",
+                num_q_heads_over_kv, kernelMlaHeadGrpSize, xqaParams.total_num_input_tokens, realQPitch,
+                paddedQPitch, paddedQBytes, static_cast<size_t>(kXqaMlaOutputHeadSize) * xqaParams.num_q_heads
+                    * kXqaMlaOutputElemBytes,
+                paddedOutputPitch, paddedOutputBytes);
+            TLLM_CUDA_CHECK(cudaMemsetAsync(paddedQ, 0, paddedQBytes, stream));
+            TLLM_CUDA_CHECK(cudaMemcpy2DAsync(paddedQ, paddedQPitch, kernel_input_tokens, realQPitch, realQPitch,
+                xqaParams.total_num_input_tokens, cudaMemcpyDeviceToDevice, stream));
+            TLLM_CUDA_CHECK(cudaMemsetAsync(paddedOutput, 0, paddedOutputBytes, stream));
+            maybeSyncXqaMlaDebug(stream, "SM120 MLA Q/output padding");
+            kernelInputTokens = paddedQ;
+            kernelOutput = reinterpret_cast<uint8_t*>(paddedOutput);
+        }
+        XqaMlaDebugContext const debugContext{
+            static_cast<uint32_t>(xqaParams.num_q_heads),
+            static_cast<uint32_t>(kernelXQAParams.num_q_heads),
+            static_cast<uint32_t>(xqaParams.tokens_per_block),
+            xqaParams.sequence_lengths};
+        maybeCheckXqaMlaFp8QForInvalid(stream, kernelInputTokens, xqaParams.total_num_input_tokens,
+            kernelXQAParams.num_q_heads, kernelXQAParams.num_q_heads, xqaParams.head_size,
+            "XQA MLA Q before main kernel", debugContext);
+
+        CUtensorMap const tensorMapQ = makeTensorMapForXqaMlaQ(mDriver, kernelXQAParams, kernelInputTokens);
         appendParam(&tensorMapQ);
-        CUtensorMap const tensorMapK = makeTensorMapForXqaMlaKVCache(mDriver, xqaParams, kv_cache_buffer, true);
+        // DSV4 dynamic-sparse MLA: when sparse_attn_indices is present, the kernel gathers each attended
+        // token per-token from two pools. tensorMapK/V become COMPRESSED-pool gather descriptors and
+        // tensorMapKSwa/VSwa SWA-pool gather descriptors (2D {headElems, slot}, box {partElems, 1}). For the
+        // dense (non-sparse, e.g. DSV3) path tensorMapK/V are the paged descriptors and the SWA descriptors
+        // are unused dummies; globalIndices == nullptr selects the dense path in the kernel.
+        bool const isSparseMla = xqaParams.sparse_params.sparse_attn_indices != nullptr;
+        void const* const swaPoolBase = xqaParams.sparse_params.sliding_window_kv_cache_pool;
+        // ratio==1 (SWA-only) layers have no compressed pool; its descriptor is never read (all tiles are
+        // SWA) so fall back to the SWA base to build a valid (unused) descriptor.
+        void const* const cmpPoolBase = xqaParams.sparse_params.sparse_kv_cache_pool != nullptr
+            ? xqaParams.sparse_params.sparse_kv_cache_pool
+            : swaPoolBase;
+        CUtensorMap const tensorMapK = isSparseMla
+            ? makeTensorMapForXqaMlaKVCacheGather(mDriver, kernelXQAParams, cmpPoolBase, /*forK=*/true)
+            : makeTensorMapForXqaMlaKVCache(mDriver, kernelXQAParams, kv_cache_buffer, /*forK=*/true);
         appendParam(&tensorMapK);
-        CUtensorMap const tensorMapV = makeTensorMapForXqaMlaKVCache(mDriver, xqaParams, kv_cache_buffer, false);
+        CUtensorMap const tensorMapV = isSparseMla
+            ? makeTensorMapForXqaMlaKVCacheGather(mDriver, kernelXQAParams, cmpPoolBase, /*forK=*/false)
+            : makeTensorMapForXqaMlaKVCache(mDriver, kernelXQAParams, kv_cache_buffer, /*forK=*/false);
         appendParam(&tensorMapV);
+        CUtensorMap const tensorMapKSwa
+            = isSparseMla ? makeTensorMapForXqaMlaKVCacheGather(mDriver, kernelXQAParams, swaPoolBase, /*forK=*/true)
+                          : tensorMapK;
+        appendParam(&tensorMapKSwa);
+        CUtensorMap const tensorMapVSwa
+            = isSparseMla ? makeTensorMapForXqaMlaKVCacheGather(mDriver, kernelXQAParams, swaPoolBase, /*forK=*/false)
+                          : tensorMapV;
+        appendParam(&tensorMapVSwa);
         appendParam(&launchParams.qScale);
-        appendParam(&launchParams.output);
+        appendParam(&kernelOutput);
         appendParam(&launchParams.kvCacheParams);
         appendParam(&launchParams.batch_size);
         appendParam(&launchParams.kv_scale_quant_orig);
+        int32_t const* const sparseAttnIndices = isSparseMla ? xqaParams.sparse_params.sparse_attn_indices : nullptr;
+        uint32_t const sparseAttnIndicesStride
+            = static_cast<uint32_t>(xqaParams.sparse_params.sparse_attn_indices_stride);
+        int32_t const* const sparseMlaTopkLens = xqaParams.sparse_params.sparse_mla_topk_lens;
+        appendParam(&sparseAttnIndices);
+        appendParam(&sparseAttnIndicesStride);
+        appendParam(&sparseMlaTopkLens);
         appendParam(&launchParams.scratch);
-        appendParam(&launchParams.semaphores);
-        uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
-        std::byte* const partialResults = static_cast<std::byte*>(launchParams.scratch)
-            + xqaMlaCgaXBufSize * multi_block * xqaParams.total_num_input_tokens;
+        bool const useSeparateReduce = kernelMlaHeadGrpSize < 128
+            || tensorrt_llm::common::getBoolEnv("XQA_MLA_SEPARATE_REDUCE");
+        uint32_t* semaphores = useSeparateReduce ? nullptr : reinterpret_cast<uint32_t*>(launchParams.semaphores);
+        appendParam(&semaphores);
         appendParam(&partialResults);
         kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
         uint32_t const inputSeqLen = (xqaParams.multi_query_tokens || xqaParams.isMLA())
             ? static_cast<uint32_t>(xqaParams.generation_input_length)
             : 1U;
-        dim3 const dimGrid{4 * inputSeqLen, multi_block, xqaParams.batch_size};
+        dim3 const dimGrid{kXqaMlaCgaSize * inputSeqLen, multi_block, xqaParams.batch_size};
         dim3 const blockDim(128 * 3, 1, 1);
-        cubinObj->launch(dimGrid, blockDim, stream, kernelParams);
+        TLLM_LOG_DEBUG(
+            "Launching XQA MLA kernel: grid=(%u,%u,%u) block=(%u,%u,%u) cga=(%u,1,1) "
+            "input_seq_len=%u multi_block=%u total_tokens=%u num_q_heads=%d runtime_num_q_heads=%d "
+            "num_kv_heads=%d separate_reduce=%d padded=%d",
+            dimGrid.x, dimGrid.y, dimGrid.z, blockDim.x, blockDim.y, blockDim.z, kXqaMlaCgaSize, inputSeqLen,
+            multi_block, xqaParams.total_num_input_tokens, kernelXQAParams.num_q_heads, xqaParams.num_q_heads,
+            kernelXQAParams.num_kv_heads, useSeparateReduce, padMlaHeadGroup);
+        cubinObj->launch(dimGrid, blockDim, stream, kernelParams, dim3{kXqaMlaCgaSize, 1, 1});
+        maybeSyncXqaMlaDebug(stream, "XQA MLA main kernel");
+        if (useSeparateReduce && multi_block > 1)
+        {
+            // The reduce kernel recomputes per-request nbSubSeq from the seqLen array it is given; it must
+            // match the main kernel. Dense MLA uses the full kv_len (sequence_lengths); DSV4 dynamic-sparse
+            // decode uses the attended count (sparse_mla_topk_lens). Decode is single-token (inputSeqLen==1),
+            // so topk_lens[idxReq] feeds the reduce's `seqLenList[idxReq] - (inputSeqLen-1)` directly.
+            uint32_t const* const reduceSeqLens
+                = (xqaParams.sparse_params.sparse_attn_indices != nullptr
+                      && xqaParams.sparse_params.sparse_mla_topk_lens != nullptr)
+                ? reinterpret_cast<uint32_t const*>(xqaParams.sparse_params.sparse_mla_topk_lens)
+                : reinterpret_cast<uint32_t const*>(xqaParams.sequence_lengths);
+            maybeCheckXqaMlaPartialsForInvalid(stream, partialResults, xqaParams.total_num_input_tokens, multi_block,
+                xqaParams.num_q_heads, "XQA MLA partials before separate reduce", debugContext);
+            TLLM_LOG_DEBUG(
+                "Launching XQA MLA separate reduce: grid=(4,%u,%u) block=(256,1,1) "
+                "multi_block=%u input_seq_len=%u total_tokens=%u partial_result_bytes=%zu "
+                "cga_x_buf_bytes=%zu output=%p partial_results=%p seq_lens=%p",
+                getXqaMlaPartialResultChunks(kernelXQAParams.num_q_heads), xqaParams.total_num_input_tokens,
+                multi_block, inputSeqLen, xqaParams.total_num_input_tokens, partialResultBytes, cgaXBufBytes,
+                static_cast<void*>(kernelOutput), static_cast<void*>(partialResults),
+                static_cast<void const*>(reduceSeqLens));
+            cubinObj->launchMlaReduce(kernelOutput, partialResults, reduceSeqLens, multi_block, inputSeqLen,
+                xqaParams.total_num_input_tokens, kernelXQAParams.num_q_heads, stream);
+            maybeSyncXqaMlaDebug(stream, "XQA MLA separate reduce");
+            maybeCheckXqaMlaReduceAgainstHostReference(stream, kernelOutput, partialResults,
+                xqaParams.total_num_input_tokens, multi_block, inputSeqLen, xqaParams.num_q_heads,
+                kernelXQAParams.num_q_heads, "XQA MLA output after separate reduce", debugContext);
+            maybeCheckXqaMlaBf16BufferForInvalid(stream, kernelOutput, xqaParams.total_num_input_tokens,
+                xqaParams.num_q_heads, kernelXQAParams.num_q_heads, "XQA MLA output after separate reduce",
+                debugContext);
+        }
+        else
+        {
+            maybeCheckXqaMlaBf16BufferForInvalid(stream, kernelOutput, xqaParams.total_num_input_tokens,
+                xqaParams.num_q_heads, kernelXQAParams.num_q_heads, "XQA MLA main output", debugContext);
+        }
+        if (padMlaHeadGroup)
+        {
+            size_t const realOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * xqaParams.num_q_heads
+                * kXqaMlaOutputElemBytes;
+            size_t const paddedOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * kernelMlaHeadGrpSize
+                * kXqaMlaOutputElemBytes;
+            TLLM_CUDA_CHECK(cudaMemcpy2DAsync(launchParams.output, realOutputPitch, kernelOutput, paddedOutputPitch,
+                realOutputPitch, xqaParams.total_num_input_tokens, cudaMemcpyDeviceToDevice, stream));
+            maybeSyncXqaMlaDebug(stream, "SM120 MLA output unpadding");
+        }
+        maybeCheckXqaMlaBf16BufferForInvalid(stream, launchParams.output, xqaParams.total_num_input_tokens,
+            xqaParams.num_q_heads, xqaParams.num_q_heads, "XQA MLA final output after unpadding", debugContext);
     }
     else if (isSpecDec && isHMMAKernel)
     {

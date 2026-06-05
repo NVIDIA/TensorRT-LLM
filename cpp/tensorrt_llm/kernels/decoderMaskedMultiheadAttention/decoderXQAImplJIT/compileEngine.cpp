@@ -19,10 +19,13 @@
 #include "nvrtcWrapper/include/nvrtcWrapper.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -87,10 +90,17 @@ CubinObj CompileEngine::compile() const
     {
         TLLM_CHECK(ropeStyle == tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE);
     }
+    bool const isMlaKernel = mXqaParams.isMLA();
+    uint32_t const numQHeadsOverKv = static_cast<uint32_t>(mXqaParams.num_q_heads / mXqaParams.num_kv_heads);
+    uint32_t const kernelMlaHeadGrpSize = getXqaMlaRuntimeKernelHeadGrpSize(numQHeadsOverKv);
+    // For MLA, the v-head dim differs from head_size. mlaHeadSizeV() returns 512 for DSV3 and 448
+    // for DSV4. For non-MLA kernels we pass 0 and the JIT wrapper falls back to head_size.
+    uint32_t const headSizeV = isMlaKernel ? static_cast<uint32_t>(mXqaParams.mlaHeadSizeV()) : 0;
     tllmXqaJitContext context{/*sm=*/mSM,
         /*head_size=*/static_cast<uint32_t>(mXqaParams.head_size),
-        /*num_q_heads=*/static_cast<uint32_t>(mXqaParams.num_q_heads),
-        /*num_kv_heads=*/static_cast<uint32_t>(mXqaParams.num_kv_heads),
+        /*head_size_v=*/headSizeV,
+        /*num_q_heads=*/static_cast<uint32_t>(isMlaKernel ? kernelMlaHeadGrpSize : mXqaParams.num_q_heads),
+        /*num_kv_heads=*/static_cast<uint32_t>(isMlaKernel ? 1 : mXqaParams.num_kv_heads),
         /*beam_width=*/static_cast<uint32_t>(mXqaParams.beam_width),
         /*tokens_per_block=*/static_cast<uint32_t>(mXqaParams.tokens_per_block),
         /*multi_query_tokens=*/mXqaParams.multi_query_tokens,
@@ -98,8 +108,7 @@ CubinObj CompileEngine::compile() const
         /*paged_kv_cache=*/mXqaParams.paged_kv_cache,
         /*data_type=*/static_cast<int>(mXqaParams.data_type),
         /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type),
-        /*kernel_type=*/mXqaParams.isMLA() ? TLLM_XQA_JIT_MLA
-                                           : (useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA),
+        /*kernel_type=*/isMlaKernel ? TLLM_XQA_JIT_MLA : (useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA),
         /*fp8_output=*/mXqaParams.is_fp8_output,
         // If applyRoPEInXqaKernel, no scratch is needed for storing intermediate RoPE result. Use input KV instead of
         // scratch in this case.
@@ -110,11 +119,21 @@ CubinObj CompileEngine::compile() const
     if (context.kernel_type == TLLM_XQA_JIT_MLA)
     {
         auto const& c = context;
-        TLLM_CHECK(c.head_size == 576 && c.num_q_heads == 128 && c.num_kv_heads == 1 && c.beam_width == 1
-            && c.data_type == DATA_TYPE_E4M3 && c.kv_cache_data_type == DATA_TYPE_E4M3 && c.fp8_output == false
-            && !c.use_input_kv && ropeStyle == TLLM_XQA_JIT_ROPE_NONE);
+        // DSV3: head_size=576, head_size_v=512.   DSV4: head_size=512, head_size_v=448.
+        bool const isDsv3Shape = (c.head_size == 576 && c.head_size_v == 512);
+        bool const isDsv4Shape = (c.head_size == 512 && c.head_size_v == 448);
+        TLLM_CHECK((isDsv3Shape || isDsv4Shape) && (c.num_q_heads == 32 || c.num_q_heads == 64 || c.num_q_heads == 128)
+            && c.num_kv_heads == 1
+            && c.beam_width == 1 && c.data_type == DATA_TYPE_E4M3 && c.kv_cache_data_type == DATA_TYPE_E4M3
+            && c.fp8_output == false && !c.use_input_kv && ropeStyle == TLLM_XQA_JIT_ROPE_NONE);
     }
 
+    auto const compileStart = std::chrono::steady_clock::now();
+    TLLM_LOG_DEBUG(
+        "Compiling JIT XQA cubin: sm=%d kernel_type=%d head_size=%u runtime_head_grp=%u kernel_head_grp=%u "
+        "tokens_per_block=%u q_seq_len=%u beam_width=%u",
+        mSM, static_cast<int>(context.kernel_type), context.head_size, numQHeadsOverKv, context.num_q_heads,
+        context.tokens_per_block, context.q_seq_len, context.beam_width);
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitCreateAndCompileProgram(&program, &context));
 
     size_t cubinSize;
@@ -123,6 +142,11 @@ CubinObj CompileEngine::compile() const
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitGetCUBIN(program, const_cast<char*>(cubinContent.c_str())));
 
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitDestroyProgram(&program));
+    auto const compileEnd = std::chrono::steady_clock::now();
+    auto const compileMs = std::chrono::duration_cast<std::chrono::milliseconds>(compileEnd - compileStart).count();
+    TLLM_LOG_DEBUG(
+        "Compiled JIT XQA cubin: sm=%d kernel_type=%d kernel_head_grp=%u cubin_size=%zu compile_ms=%lld",
+        mSM, static_cast<int>(context.kernel_type), context.num_q_heads, cubinSize, static_cast<long long>(compileMs));
 
     return CubinObj(cubinContent);
 }

@@ -3753,7 +3753,7 @@ def _run_deepseekv4_eplb(model_name,
 
 
 @pytest.mark.timeout(14400)
-@pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.skip_less_device_memory(90000)  # SM120: 140000 was B200-178GB/B300-275GB only; RTX PRO 6000 Blackwell = 97887 MiB
 @skip_pre_blackwell
 class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
@@ -3766,14 +3766,44 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         # 4x B200 178GB. TRTLLM backend required because V4-Flash MXFP4
         # routed experts are unsupported by WIDEEP (raises "Unsupported
         # quantization mode: [65536]").
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=4,
-                 moe_expert_parallel_size=4,
-                 moe_config=MoeConfig(backend="TRTLLM"),
-                 enable_attention_dp=True,
-                 max_seq_len=4096,
-                 kv_cache_config=kv_cache_config) as llm:
+        #
+        # SM120 (RTX PRO 6000 Blackwell, 96GB) ADAPTATION — hardware necessities,
+        # none affect accuracy (the MMLU/GSM8K gate below is unchanged):
+        #   - tp8/ep8, attention_dp=False: the proven-stable SM120 path (8x96GB);
+        #     tp4 does not leave headroom for KV at these seq lens on 96GB cards.
+        #   - MoeConfig backend AUTO (not TRTLLM): TRTLLMGenFusedMoE raises
+        #     "does not support SM120 and above"; AUTO resolves to the SM120 MoE.
+        #   - max_batch_size=1: dodge the pre-existing batched-decode IMA
+        #     (TRTLLM-12620) on SM120.
+        #   - fp8 KV + enable_block_reuse=False + cuda_graph[1]: the SM120 decode
+        #     fixes (see the dsv4 SM120 handoff). Env vars TRTLLM_SM120_SKIP_GEN_
+        #     WARMUP=1, TRTLLM_DISABLE_FUSED_Q_FP8_QUANT=1 must be set in the env.
+        is_sm120 = get_sm_version() >= 120
+        if is_sm120:
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
+                                            dtype="fp8",
+                                            enable_block_reuse=False)
+            llm = LLM(self.MODEL_PATH,
+                      tensor_parallel_size=8,
+                      moe_expert_parallel_size=8,
+                      moe_config=MoeConfig(backend="AUTO"),
+                      enable_attention_dp=False,
+                      max_seq_len=8192,
+                      max_batch_size=1,
+                      max_num_tokens=4096,
+                      cuda_graph_config=CudaGraphConfig(batch_sizes=[1],
+                                                        enable_padding=True),
+                      kv_cache_config=kv_cache_config)
+        else:
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+            llm = LLM(self.MODEL_PATH,
+                      tensor_parallel_size=4,
+                      moe_expert_parallel_size=4,
+                      moe_config=MoeConfig(backend="TRTLLM"),
+                      enable_attention_dp=True,
+                      max_seq_len=4096,
+                      kv_cache_config=kv_cache_config)
+        with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)

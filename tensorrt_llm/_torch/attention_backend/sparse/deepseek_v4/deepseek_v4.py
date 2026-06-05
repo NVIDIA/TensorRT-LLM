@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
@@ -18,7 +19,7 @@ from tensorrt_llm._torch.modules.linear import Linear  # noqa: E402  (avoid cycl
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
@@ -26,6 +27,38 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 from ..dsa import HAS_FAST_HADAMARD, DSAtrtllmAttentionMetadata, Indexer, rotate_activation
 from ..kernel import deepseek_v4_local_to_global_indices
 from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
+
+# DIAGNOSTIC (2026-06-02): force SWA-only (no compressed long-range pool) to isolate whether the compressed pool is
+# the driver of the SM120 long-context reasoning degradation. Read once at import so it is a compile-time constant
+# inside the @maybe_compile'd index builder (no graph break). Set TRTLLM_DSV4_SM120_SWA_ONLY=1 to enable.
+_DSV4_SM120_SWA_ONLY = os.environ.get("TRTLLM_DSV4_SM120_SWA_ONLY", "0") == "1"
+# DIAGNOSTIC (2026-06-02): selectively disable ONE compressed sub-pool to localize the harm WITHIN the compressed
+# path. NO_HCA drops the ratio-128 heavily-compressed pool (keeps ratio-4 CSA); NO_CSA drops the ratio-4 compressed
+# pool (keeps ratio-128 HCA). Same compile-time-constant pattern as SWA-only. Both default off => no behavior change.
+_DSV4_SM120_NO_HCA = os.environ.get("TRTLLM_DSV4_SM120_NO_HCA", "0") == "1"  # ratio-128 (heavily-compressed) off
+_DSV4_SM120_NO_CSA = os.environ.get("TRTLLM_DSV4_SM120_NO_CSA", "0") == "1"  # ratio-4 (compressed-sparse) off
+# On SM120 there is no DeepGEMM lightning indexer, and its dense fallback is stale/wrong for kv > index_topk -> the
+# ratio-4/CSA layers gathered the wrong compressed tokens (the SM120 long-context accuracy bug). CSA's correct
+# selection while the compressed count (kv//4) <= index_topk (i.e. kv <= index_topk*4) is "attend ALL compressed
+# entries" (the top-k selects all). So on SM120 we build that selection SEQUENTIALLY ([0..count-1]) and bypass the
+# indexer entirely (default). Set TRTLLM_DSV4_SM120_RATIO4_USE_INDEXER=1 to force the (broken) indexer path for A/B.
+# NOTE kv > index_topk*4 attends only the OLDEST index_topk entries -- a stopgap until a real SM120 lightning-indexer
+# top-k is implemented.
+_DSV4_SM120_RATIO4_USE_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_RATIO4_USE_INDEXER", "0") == "1"
+# Item 2: run the REAL SM120 lightning-indexer top-k (torch scorers in dsa.py +
+# torch top-k) instead of the kv<=2048 sequential stopgap, so long context
+# (kv>2048) gets the correct learned selection. DEFAULT OFF -> the committed
+# stopgap remains the default; when set, un-gates the indexer prep + forward on
+# SM120. Pair with TRTLLM_DSV4_SM120_RATIO4_USE_INDEXER=1 so ratio-4 consumes the
+# real topk_indices. Mirrors dsa.py's _DSV4_SM120_REAL_INDEXER (same env var).
+_DSV4_SM120_REAL_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_REAL_INDEXER", "0") == "1"
+# Item 2 perf (step 1): on the SM120 real-indexer path, route the top-k through
+# the arch-agnostic C++ CUDA op (torch.ops.trtllm.indexer_topk_{prefill,decode},
+# guarded only by __CUDA_ARCH__>=900, so it runs on SM120) instead of the
+# unfused torch logits.topk fallback. DEFAULT OFF -> the validated torch.topk
+# path stays the default; set TRTLLM_DSV4_SM120_CXX_TOPK=1 to A/B the C++ op
+# (the eventual perf default once validated). Only meaningful with REAL_INDEXER.
+_DSV4_SM120_CXX_TOPK = os.environ.get("TRTLLM_DSV4_SM120_CXX_TOPK", "0") == "1"
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
@@ -531,7 +564,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # Hardcoded 128: compressed_local_indices only applies to ratio=128
         # layers. This is a design constraint — see compress_ratio_set
         # validation in __post_init__ which restricts ratios to {1, 4, 128}.
-        num_valid = (token_positions + 1) // 128
+        # SWA-only / NO_HCA diagnostic: zero ratio-128 compressed indices so the kernel gathers only the SWA window.
+        num_valid = (torch.zeros_like(token_positions) if (_DSV4_SM120_SWA_ONLY or _DSV4_SM120_NO_HCA)
+                     else (token_positions + 1) // 128)
         comp_col = torch.arange(max_compressed_indices_128, dtype=torch.int32, device=device)
         valid_mask = comp_col.unsqueeze(0) < num_valid.unsqueeze(1)
         comp_indices = torch.where(
@@ -553,15 +588,27 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For ratio>1, the SWA region always occupies exactly window_size (128)
         # slots. Invalid SWA positions are padded with -1 in the index buffer.
         kv_lens = token_positions + 1
+        swa_only_count = kv_lens.clamp(max=window_size)
         for compress_ratio in compress_ratios:
-            if compress_ratio == 1:
-                total_count = kv_lens.clamp(max=window_size)
+            if _DSV4_SM120_SWA_ONLY:
+                # SWA-only: attend just the local window, no compressed tokens (all ratios).
+                total_count = swa_only_count
+            elif compress_ratio == 1:
+                total_count = swa_only_count
             elif compress_ratio == 4:
-                compressed_count = (kv_lens // compress_ratio).clamp(max=sparse_mla_topk)
-                total_count = window_size + compressed_count
+                # NO_CSA diagnostic: drop the ratio-4 compressed pool (SWA window only for these layers).
+                if _DSV4_SM120_NO_CSA:
+                    total_count = swa_only_count
+                else:
+                    compressed_count = (kv_lens // compress_ratio).clamp(max=sparse_mla_topk)
+                    total_count = window_size + compressed_count
             elif compress_ratio == 128:
-                compressed_count = kv_lens // compress_ratio
-                total_count = window_size + compressed_count
+                # NO_HCA diagnostic: drop the ratio-128 heavily-compressed pool (SWA window only for these layers).
+                if _DSV4_SM120_NO_HCA:
+                    total_count = swa_only_count
+                else:
+                    compressed_count = kv_lens // compress_ratio
+                    total_count = window_size + compressed_count
             else:
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
             sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
@@ -617,6 +664,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             cached_token_lens[:num_requests], non_blocking=True
         )
 
+        # SM120 DSV4 uses the pure-torch REF_CONTEXT path, which calls the
+        # standalone mla_rope_append_paged_kv_assign_q to populate the paged
+        # (SWA) KV cache so DECODE has valid history. That op needs the context
+        # rope-append metadata (max_ctx_seq_len, ctx_cached_token_indptr,
+        # ctx_kv_indptr); the normal DSV4 path writes KV inside the C++ attention
+        # op and so skips this prep. Prepare it here so the REF_CONTEXT write works.
+        if get_sm_version() == 120:
+            self.prepare_for_mla_rope_append(cached_token_lens, kv_lens)
+
         # Prepare cu_seq_lens early — needed by prepare_for_deepseek_v4_indices
         self.cu_seq_lens[1 : num_requests + 1] = self.seq_lens.cumsum(0)
         self.cu_seq_lens_cuda[: num_requests + 1].copy_(
@@ -626,7 +682,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For indices conversion
         self.prepare_for_indices_conversion()
 
-        has_sparse_layers = DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
+        # SM120 (RTX) uses the explicit-K/V dense fallback for DSV4: it does not
+        # consume sparse top-k metadata, and DeepGEMM's indexer path
+        # (fp8_(paged_)mqa_logits / get_paged_mqa_logits_metadata) rejects SM120
+        # ("Unsupported architecture"). Skip the indexer K-cache + scheduler
+        # metadata prep so init/warmup don't hit those kernels.
+        has_sparse_layers = (DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
+                             and (get_sm_version() != 120
+                                  or _DSV4_SM120_REAL_INDEXER))
 
         # For block offsets
         self.prepare_for_block_tables()
@@ -1220,6 +1283,18 @@ class DeepseekV4Indexer(Indexer):
             Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
         ] = None,
     ):
+        # SM120 (RTX) has no DeepGEMM indexer. For short sequences the upstream
+        # skip-indexer dense fallback (prepare_for_skip_indexer ->
+        # prepare_dense_topk_indices -> metadata.topk_indices_buffer) already holds
+        # the correct "attend to all compressed tokens" selection (sparse == dense
+        # when kv_len <= index_topk). Return that dense buffer so sparse_attn_predict
+        # (compress_ratio=4) gets valid topk_indices instead of None. We avoid the
+        # DeepGEMM _run_serial_indexer_prepare entirely (it rejects SM120).
+        # NOTE: only correct while skip_indexer_for_{ctx,gen}_reqs hold (short seqs);
+        # true long-context sparse selection on SM120 still needs DeepGEMM kernels.
+        if get_sm_version() == 120 and not _DSV4_SM120_REAL_INDEXER:
+            return metadata.topk_indices_buffer[: hidden_states.shape[0]]
+
         if do_multi_stream() and self.aux_stream is not None:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
                 qr,
@@ -1245,6 +1320,16 @@ class DeepseekV4Indexer(Indexer):
                 k_fp8,
                 k_scale,
                 weights,
+                # SM120 has no DeepGEMM/cute-dsl indexer top-k kernel. By
+                # default use the arch-agnostic torch top-k fallback
+                # (logits.topk + masking). The C++ indexer_topk_{prefill,decode}
+                # CUDA op IS arch-agnostic (guarded only by __CUDA_ARCH__>=900),
+                # so opt into it on SM120 via TRTLLM_DSV4_SM120_CXX_TOPK=1 (the
+                # eventual perf default) -- it fuses the top-k and is
+                # CUDA-graph-capturable (has its own pre-capture warmup).
+                use_custom_topk=(not (get_sm_version() == 120
+                                      and _DSV4_SM120_REAL_INDEXER))
+                or _DSV4_SM120_CXX_TOPK,
                 q_scale=q_scale,
                 update_k_cache=False,
             )
@@ -1390,7 +1475,21 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if self.compress_ratio == 4:
                 topk_indices = forward_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
-                compressed_local_indices = topk_indices
+                if get_sm_version() == 120 and not _DSV4_SM120_RATIO4_USE_INDEXER:
+                    # SM120 has no DeepGEMM lightning indexer. Attend ALL compressed entries sequentially
+                    # [0..count-1] (count = kv//4 = sparse_mla_topk_lens[4] - window_size) -- the correct CSA
+                    # selection while count <= index_topk. Bypasses the stale/wrong indexer buffer with no
+                    # skip_indexer side-effects. (kv > index_topk*4 attends only the oldest index_topk -- stopgap.)
+                    window_size = self.sparse_attention_config.window_size
+                    count = (metadata.sparse_mla_topk_lens[4][start_idx:end_idx].to(torch.int32)
+                             - window_size).clamp(min=0)
+                    width = topk_indices.shape[1]
+                    col = torch.arange(width, device=topk_indices.device, dtype=torch.int32)
+                    seq = col.unsqueeze(0).expand(count.shape[0], width)
+                    compressed_local_indices = torch.where(
+                        col.unsqueeze(0) < count.unsqueeze(1), seq, torch.full_like(seq, -1))
+                else:
+                    compressed_local_indices = topk_indices
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
         else:

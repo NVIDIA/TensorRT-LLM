@@ -227,7 +227,20 @@ struct XQAParams
 
     bool isMLA() const
     {
-        return head_size == 576 && num_q_heads == 128 && num_kv_heads == 1;
+        // DSV3 family: head_size == 576 (kv_lora_rank=512 + qk_rope_head_dim=64), v_head_dim=512
+        // DSV4 family: head_size == 512 (kv_lora_rank=448 + qk_rope_head_dim=64), v_head_dim=448
+        return (head_size == 576 || head_size == 512) && num_q_heads > 0 && num_q_heads <= 128
+            && num_kv_heads == 1;
+    }
+
+    // V-head dim for MLA shapes. Returns 0 for non-MLA.
+    int mlaHeadSizeV() const
+    {
+        if (head_size == 576)
+            return 512;
+        if (head_size == 512)
+            return 448;
+        return 0;
     }
 };
 
