@@ -1042,14 +1042,21 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         info = self._server_info.get(server, {})
         worker_tpb = info.get("tokens_per_block")
         if worker_tpb is not None and worker_tpb != self._tokens_per_block:
-            # Block-hash chunking is router-side; a mismatch makes hashes never
-            # match the worker's KV cache. Fail fast.
-            self._prepared_ready_servers.discard(server)
-            self._server_info.pop(server, None)
-            raise RuntimeError(
-                f"tokens_per_block mismatch on {server}: "
-                f"router={self._tokens_per_block} worker={worker_tpb}. "
-                f"Align kv_cache_config.tokens_per_block to fix.")
+            larger = max(worker_tpb, self._tokens_per_block)
+            smaller = min(worker_tpb, self._tokens_per_block)
+            if larger % smaller != 0:
+                self._prepared_ready_servers.discard(server)
+                self._server_info.pop(server, None)
+                raise RuntimeError(
+                    f"tokens_per_block mismatch on {server}: "
+                    f"router={self._tokens_per_block} worker={worker_tpb} are not divisible. "
+                    f"Align kv_cache_config.tokens_per_block so that one evenly divides the other."
+                )
+            logger.warning(
+                "tokens_per_block mismatch on %s: router=%d worker=%d. "
+                "KV events from worker will not align with router block hashes; "
+                "use backfill_block_hashes_on_finish=true for best hit rate.",
+                server, self._tokens_per_block, worker_tpb)
         worker_algo = info.get("kv_cache_hash_algo")
         known_algos = {
             KV_CACHE_HASH_ALGO_V1,

@@ -946,7 +946,9 @@ async def test_kv_cache_aware_router_load_weight_scales_load_penalty(servers):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_prepare_server_raises_on_tpb_mismatch():
+async def test_kv_cache_aware_router_prepare_server_warns_on_tpb_mismatch_divisible(
+):
+    # router=32, worker=64: 64 % 32 == 0 → warning only, server stays ready
     router = KvCacheAwareRouter(server_role=None,
                                 servers=["server-a"],
                                 tokens_per_block=32)
@@ -956,7 +958,26 @@ async def test_kv_cache_aware_router_prepare_server_raises_on_tpb_mismatch():
 
     with mock.patch.object(router, "_fetch_server_info",
                            side_effect=fake_fetch):
-        with pytest.raises(RuntimeError, match="tokens_per_block mismatch"):
+        await router._prepare_server("server-a")
+
+    assert "server-a" in router._prepared_ready_servers
+    assert router._server_info["server-a"]["tokens_per_block"] == 64
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_raises_on_tpb_not_divisible(
+):
+    # router=32, worker=48: 48 % 32 != 0 → RuntimeError, server removed
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server-a"],
+                                tokens_per_block=32)
+
+    async def fake_fetch(server, timeout):
+        return {"tokens_per_block": 48, "kv_cache_hash_algo": "v1_block_key"}
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        with pytest.raises(RuntimeError, match="not divisible"):
             await router._prepare_server("server-a")
 
     assert "server-a" not in router._prepared_ready_servers
