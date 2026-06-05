@@ -1971,6 +1971,12 @@ def _persistent_main_kernel(
     pid = tl.program_id(axis=0)
     total_work = n_slots_local * NUM_PID_M_BLOCKS * nheads
 
+    if LAUNCH_WITH_PDL and total_work == 0:
+        # A kernel launched with PDL must wait for its upstream dependency
+        # before it can finish, even if this launch has no local work and does
+        # not launch its own dependents.
+        tl.extra.cuda.gdc_wait()
+
     # Persistent loop.  Decompose tile_id into (pid_h, pid_b_local, pid_m)
     # with pid_m varying fastest (M-tile cache locality on state load), then
     # slot, then head — mirrors the existing 3D grid's axis ordering
