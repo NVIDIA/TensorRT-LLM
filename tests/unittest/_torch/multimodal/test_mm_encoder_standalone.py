@@ -667,19 +667,18 @@ def llms(model_dir: Path,
 def llms_and_encoder(
     model_dir: Path,
     pd_disagg: bool,
-) -> Generator[tuple[tuple[LLM, LLM | None], MultimodalEncoder], None, None]:
-    """Get LLM instances and a multimodal encoder, initialized in parallel."""
+) -> Generator[tuple[tuple[LLM, LLM | None], MultimodalEncoder, LLM], None,
+               None]:
+    """Get LLM instances, a multimodal encoder, and a prefill worker, initialized in parallel."""
     if model_dir == _NANO_V2_VL_FP8_DIR:
         if get_sm_version() < 90:
             pytest.skip("Nemotron-Nano-12B-v2-VL FP8 requires Hopper+ (SM90)")
         if pd_disagg:
-            # pd_disagg instantiates ref_llm + llm_decode + encoder together here,
-            # and the test body then adds a prefill_llm worker. Three simultaneous
-            # 12B FP8 instances OOM a single 80GB H100 during KV-cache estimation,
-            # so single-GPU CI covers only the no_pd_disagg encode path.
+            # pd_disagg would instantiate ref_llm + llm_decode + encoder + prefill_llm
+            # simultaneously — four 12B FP8 instances OOM a single 80GB H100.
             pytest.skip("Nemotron-Nano-12B-v2-VL FP8 pd_disagg needs >1 H100 "
-                        "(3 simultaneous 12B instances OOM a single 80GB GPU)")
-    # Several tests need these instances live together; building them as one fixture lets setup overlap.
+                        "(4 simultaneous 12B instances OOM a single 80GB GPU)")
+    # Build all instances in one _instantiate_models call so init overlaps.
     encoder_max_batch_size = _get_encoder_max_batch_size(model_dir)
     initializers = _create_llm_initializers(model_dir, pd_disagg)
     initializers.append(
@@ -690,17 +689,27 @@ def llms_and_encoder(
             trust_remote_code=True,
             **_get_fake_checkpoint_kwargs(model_dir),
         ))
+    initializers.append(
+        functools.partial(
+            _create_llm,
+            model_dir,
+            pd_disagg,
+            disable_overlap_scheduler=pd_disagg,
+            env_overrides={"TLLM_MULTIMODAL_DISAGGREGATED": "1"},
+        ))
     instances = _instantiate_models(*initializers)
     llm = instances[0]
     llm_decode = instances[1] if pd_disagg else None
-    encoder = instances[-1]
+    encoder = instances[-2]
+    prefill_llm = instances[-1]
 
     with ExitStack() as stack:
         stack.enter_context(llm)
         if llm_decode is not None:
             stack.enter_context(llm_decode)
         stack.enter_context(encoder)
-        yield (llm, llm_decode), encoder
+        stack.enter_context(prefill_llm)
+        yield (llm, llm_decode), encoder, prefill_llm
 
 
 @pytest.fixture(scope="module")
@@ -801,7 +810,7 @@ def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
 def test_single_request_chat_multiple_images(
     model_dir: Path,
     pd_disagg: bool,
-    llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
+    llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder, LLM],
 ):
     """Test processing a single request with multiple images.
 
@@ -811,9 +820,9 @@ def test_single_request_chat_multiple_images(
     The disaggregated prefill is driven by a dedicated LLM built as a real E/P
     prefill worker (TLLM_MULTIMODAL_DISAGGREGATED=1 -> mm_encoder=None), so the
     prefill forward must consume the handed-off embeddings via the encoder-less
-    path. The fixture's encoder-loaded LLM is used only for the raw reference
+    path. The fixture's encoder-loaded LLM is used only for the raw reference.
     """
-    (ref_llm, llm_decode), encoder = llms_and_encoder
+    (ref_llm, llm_decode), encoder, prefill_llm = llms_and_encoder
 
     # Test configuration
     max_tokens = 64
@@ -852,38 +861,31 @@ def test_single_request_chat_multiple_images(
     # Real E/P prefill worker: no local encoder, so forward() must consume the
     # handed-off embeddings (get_attached_multimodal_embeddings) -- the path real
     # serving uses, which the encoder-loaded fixture LLM would otherwise mask.
-    prefill_llm = _create_llm(
-        model_dir,
-        pd_disagg,
-        disable_overlap_scheduler=pd_disagg,
-        env_overrides={"TLLM_MULTIMODAL_DISAGGREGATED": "1"})
-    with prefill_llm:
-        outputs = prefill_llm.generate(
+    outputs = prefill_llm.generate(inputs,
+                                   sampling_params=sampling_params,
+                                   disaggregated_params=ep_disaggregated_params)
+
+    if pd_disagg:
+        # Generation using llm_decode
+        assert len(outputs) == 1
+        pd_disaggregated_params = outputs[0].disaggregated_params
+
+        ep_handle = ep_disaggregated_params.mrope_position_ids_handle
+        pd_handle = pd_disaggregated_params.mrope_position_ids_handle
+        assert type(ep_handle) is type(pd_handle)
+        if ep_handle is not None:
+            _assert_handles_are_different(ep_handle, pd_handle)
+        pd_disaggregated_params.request_type = "generation_only"
+        sampling_params = SamplingParams(max_tokens=max_tokens)
+        # remove multimodal data from input as decoder worker doesn't need it
+        inputs[0]['multi_modal_data'] = None
+        # use prompt token ids from encoder output
+        inputs[0]['prompt_token_ids'] = outputs[0].prompt_token_ids
+
+        outputs = llm_decode.generate(
             inputs,
             sampling_params=sampling_params,
-            disaggregated_params=ep_disaggregated_params)
-
-        if pd_disagg:
-            # Generation using llm_decode
-            assert len(outputs) == 1
-            pd_disaggregated_params = outputs[0].disaggregated_params
-
-            ep_handle = ep_disaggregated_params.mrope_position_ids_handle
-            pd_handle = pd_disaggregated_params.mrope_position_ids_handle
-            assert type(ep_handle) is type(pd_handle)
-            if ep_handle is not None:
-                _assert_handles_are_different(ep_handle, pd_handle)
-            pd_disaggregated_params.request_type = "generation_only"
-            sampling_params = SamplingParams(max_tokens=max_tokens)
-            # remove multimodal data from input as decoder worker doesn't need it
-            inputs[0]['multi_modal_data'] = None
-            # use prompt token ids from encoder output
-            inputs[0]['prompt_token_ids'] = outputs[0].prompt_token_ids
-
-            outputs = llm_decode.generate(
-                inputs,
-                sampling_params=sampling_params,
-                disaggregated_params=pd_disaggregated_params)
+            disaggregated_params=pd_disaggregated_params)
 
     # Validate outputs
     assert len(outputs) == len(
@@ -999,7 +1001,7 @@ def test_pd_disagg_with_image_input(
 @pytest.mark.threadleak(enabled=False)
 def test_multi_request_batch_chat(
     model_dir: Path,
-    llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
+    llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder, LLM],
     use_mm_embeddings: bool,
     pass_embeddings_through_loader: bool,
 ):
@@ -1009,7 +1011,7 @@ def test_multi_request_batch_chat(
     embeddings alongside the prompt ("multi_modal_embeddings"), as well as the embedding
     handling within default_multimodal_input_loader.
     """
-    (llm, llm_decode), encoder = llms_and_encoder
+    (llm, llm_decode), encoder, _ = llms_and_encoder
     assert llm_decode is None, "Disagg support not implemented in test case"
     assert use_mm_embeddings or not pass_embeddings_through_loader
 

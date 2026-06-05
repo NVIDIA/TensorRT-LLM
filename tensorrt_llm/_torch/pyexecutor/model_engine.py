@@ -20,6 +20,7 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
+                                            _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
@@ -4700,10 +4701,8 @@ class PyTorchModelEngine(ModelEngine):
                 'mm_embedding_request_indices': [],
                 'mm_embedding_lengths': [],
             }
-        # Some ctx requests carry
-        # just mrope metadata in their py_multimodal_data. no encoder payload.
-        # so keep only ctx requests with explicit multimodal_embedding_lengths
-        # that's signal for the real encoder-payload.
+        # Some ctx requests carry only mrope metadata (no actual vision
+        # content). Skip them so the encoder only runs on real image payloads.
         mm_context_requests = [(request_idx, request) for request_idx, request
                                in enumerate(scheduled_requests.context_requests)
                                if request.py_multimodal_data is not None]
@@ -4717,11 +4716,11 @@ class PyTorchModelEngine(ModelEngine):
         for (request_idx,
              request), multimodal_param in zip(mm_context_requests,
                                                multimodal_params):
+            if not _has_mm_payload_keys(request.py_multimodal_data):
+                # mrope-only warmup request (no actual vision content) -> skip.
+                continue
             multimodal_embedding_lengths = get_multimodal_embedding_lengths(
                 request)
-            if multimodal_embedding_lengths is None:
-                # having no encoder payload -> skip vision encoder.
-                continue
             mm_request_indices_with_payload.append(request_idx)
             mm_params_with_payload.append(multimodal_param)
             mm_embedding_lengths.append(multimodal_embedding_lengths)
