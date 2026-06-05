@@ -137,6 +137,8 @@ class KvCacheAwareServerState(ServerState):
         self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         self._tokens_per_block = tokens_per_block
         self._poll_task: Optional[asyncio.Task] = None
+        self._poll_pending: bool = False
+        self._poll_session = None
 
     @property
     def hash_algo(self) -> str:
@@ -237,11 +239,34 @@ class KvCacheAwareServerState(ServerState):
                 f"Failed to poll KV cache events from {self._server}: {e}")
 
     def schedule_poll_and_update(self, session=None) -> None:
-        # Coalesce: skip if a poll is already in-flight for this server.
+        # Coalesce concurrent polls into one in-flight task, but record that a
+        # fresh poll was requested so the running task re-polls once more before
+        # exiting. Without the re-arm, a poll requested by the LAST
+        # finish_request while a poll is already in flight would be dropped and
+        # its KV events stranded until the next request (which may never come).
         # The strong ref on _poll_task keeps the task alive for the GC.
+        self._poll_pending = True
+        self._poll_session = session
         if self._poll_task is not None and not self._poll_task.done():
             return
-        self._poll_task = asyncio.create_task(self.poll_and_update(session))
+        self._poll_task = asyncio.create_task(self._drain_poll_and_update())
+
+    async def _drain_poll_and_update(self) -> None:
+        while self._poll_pending:
+            self._poll_pending = False
+            await self.poll_and_update(self._poll_session)
+
+    async def cancel_poll_task(self) -> None:
+        # Cancel and await the background poll so shutdown leaves no orphaned
+        # task polling a closed session.
+        self._poll_pending = False
+        if self._poll_task is not None and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+        self._poll_task = None
 
     def num_active_tokens(self):
         return self._num_active_tokens
@@ -957,7 +982,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  custom_tokenizer: Optional[str] = None,
                  backfill_block_hashes_on_finish: bool = False,
                  load_weight: float = 1.0,
-                 load_cap: float = 0.8,
+                 load_cap: float = float("inf"),
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -977,6 +1002,11 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         return KvCacheAwareServerState(server, self._use_tokens,
                                        self._tokens_per_block,
                                        lambda: self.session)
+
+    async def close(self):
+        for state in self._server_state.values():
+            await state.cancel_poll_task()
+        await super().close()
 
     def _stash_backfill_on_route(self, request: OpenAIRequest,
                                  block_hashes: list[list[BlockHash]],
@@ -1005,14 +1035,6 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # by update_with_events.
         return self._server_state[server].hash_algo
 
-    def _server_capacity(self, server: str) -> int:
-        # Per-server max_batch_size from /server_info; fallback for older workers.
-        info = self._server_info.get(server, {})
-        capacity = info.get("max_batch_size")
-        if capacity is not None and capacity > 0:
-            return capacity
-        return self._max_batch_size
-
     async def _prepare_server(self, server: str):
         await super()._prepare_server(server)
         if server not in self._prepared_ready_servers:
@@ -1028,15 +1050,6 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 f"tokens_per_block mismatch on {server}: "
                 f"router={self._tokens_per_block} worker={worker_tpb}. "
                 f"Align kv_cache_config.tokens_per_block to fix.")
-        worker_mbs = info.get("max_batch_size")
-        if worker_mbs is not None and worker_mbs != self._max_batch_size:
-            # Soft sanity: router will use the worker value via
-            # _server_capacity, but flag the disagreement so the operator
-            # notices an unintended config skew.
-            logger.warning(
-                f"max_batch_size mismatch on {server}: "
-                f"router_init={self._max_batch_size} worker={worker_mbs}. "
-                f"Router will use the worker value for load normalization.")
         worker_algo = info.get("kv_cache_hash_algo")
         known_algos = {
             KV_CACHE_HASH_ALGO_V1,
@@ -1098,8 +1111,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             for server in servers
         ]
         load_fractions = [
-            workloads[i] / self._server_capacity(servers[i])
-            for i in range(len(servers))
+            workloads[i] / self._max_batch_size for i in range(len(servers))
         ]
         scores = []
         matches = []
@@ -1114,7 +1126,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             score = matches[-1] / padded_tokens - self._load_weight * \
                 load_fractions[i]
             scores.append(score)
-        # Hard cap: drop overloaded servers; fall back to all if none remain.
+        # Optional hard cap: drop servers at/over load_cap; fall back to all if
+        # none remain. Disabled by default (load_cap=inf) to match the original
+        # score-only selection.
         candidate_idx = [
             i for i, lf in enumerate(load_fractions) if lf < self._load_cap
         ]

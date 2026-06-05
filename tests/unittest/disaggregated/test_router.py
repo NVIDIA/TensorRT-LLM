@@ -724,6 +724,51 @@ async def test_kv_cache_aware_server_state_schedule_poll_relaunches_after_done(
     assert calls == 2
 
 
+@pytest.mark.asyncio
+async def test_kv_cache_aware_server_state_schedule_poll_rearms_pending():
+    # A poll requested while one is in flight must re-run once more so the last
+    # finish_request can never strand its events behind a coalesced poll.
+    state = KvCacheAwareServerState("server-x", tokens_per_block=4)
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_poll(session=None):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+
+    with mock.patch.object(state, "poll_and_update", side_effect=slow_poll):
+        state.schedule_poll_and_update(session=None)
+        await started.wait()  # first poll is now actually in flight
+        started.clear()
+        # Second request arrives while the first poll is still blocked.
+        state.schedule_poll_and_update(session=None)
+        release.set()
+        await state._poll_task
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_server_state_cancel_poll_task():
+    state = KvCacheAwareServerState("server-x", tokens_per_block=4)
+    started = asyncio.Event()
+
+    async def blocking_poll(session=None):
+        started.set()
+        await asyncio.Event().wait()
+
+    with mock.patch.object(state, "poll_and_update", side_effect=blocking_poll):
+        state.schedule_poll_and_update(session=None)
+        await started.wait()
+        await state.cancel_poll_task()
+
+    assert state._poll_task is None
+    assert state._poll_pending is False
+
+
 def test_kv_cache_aware_server_state_remove_blocks_silent_on_missing():
     state = KvCacheAwareServerState("server-x", tokens_per_block=4)
     state.add_blocks([10, 20, 30], hash_algo=KV_CACHE_HASH_ALGO_V1)
@@ -838,50 +883,6 @@ async def test_kv_cache_aware_router_backfill_drops_on_failure(servers):
         info["block_hashes"], hash_algo=info["hash_algo"]) == 0
 
 
-def test_kv_cache_aware_router_server_capacity_uses_handshake(servers):
-    router = KvCacheAwareRouter(server_role=None,
-                                servers=servers,
-                                use_tokens=False,
-                                max_batch_size=64,
-                                tokens_per_block=4)
-    router._server_info[servers[0]] = {"max_batch_size": 16}
-    router._server_info[servers[1]] = {"max_batch_size": 256}
-    # servers[2] has no handshake entry — should fall back to the router default.
-
-    assert router._server_capacity(servers[0]) == 16
-    assert router._server_capacity(servers[1]) == 256
-    assert router._server_capacity(servers[2]) == 64
-
-    router._server_info[servers[0]] = {"max_batch_size": 0}
-    assert router._server_capacity(servers[0]) == 64
-    router._server_info[servers[0]] = {"max_batch_size": None}
-    assert router._server_capacity(servers[0]) == 64
-
-
-@pytest.mark.asyncio
-async def test_kv_cache_aware_router_per_server_capacity_changes_decision(
-        servers):
-    tokens_per_block = 4
-    token_lists = [[7000] * 16]
-    router = KvCacheAwareRouter(server_role=None,
-                                servers=servers,
-                                use_tokens=False,
-                                max_batch_size=64,
-                                tokens_per_block=tokens_per_block)
-    # Make all servers equally loaded with zero KV match — winner is decided
-    # purely by 1/capacity, so the largest capacity wins.
-    router._server_info[servers[0]] = {"max_batch_size": 8}
-    router._server_info[servers[1]] = {"max_batch_size": 256}
-    router._server_info[servers[2]] = {"max_batch_size": 32}
-    for server in servers:
-        router._server_state[server]._num_active_requests = 4
-
-    request = CompletionRequest(model="TinyLlama",
-                                prompt=copy.deepcopy(token_lists))
-    chosen, _ = await router.get_next_server(request)
-    assert chosen == servers[1]
-
-
 @pytest.mark.asyncio
 async def test_kv_cache_aware_router_load_cap_excludes_overloaded(servers):
     tokens_per_block = 4
@@ -994,32 +995,6 @@ async def test_kv_cache_aware_router_prepare_server_keeps_when_worker_omits_tpb(
         await router._prepare_server("server-a")
 
     assert "server-a" in router._prepared_ready_servers
-
-
-@pytest.mark.asyncio
-async def test_kv_cache_aware_router_prepare_server_warns_on_mbs_mismatch():
-    router = KvCacheAwareRouter(server_role=None,
-                                servers=["server-a"],
-                                max_batch_size=64,
-                                tokens_per_block=32)
-
-    async def fake_fetch(server, timeout):
-        return {
-            "tokens_per_block": 32,
-            "max_batch_size": 256,
-            "kv_cache_hash_algo": "v1_block_key",
-        }
-
-    with mock.patch("tensorrt_llm.serve.router.logger") as mock_logger:
-        with mock.patch.object(router,
-                               "_fetch_server_info",
-                               side_effect=fake_fetch):
-            await router._prepare_server("server-a")
-
-    assert "server-a" in router._prepared_ready_servers
-    assert any("max_batch_size mismatch" in str(call.args[0])
-               for call in mock_logger.warning.call_args_list)
-    assert router._server_capacity("server-a") == 256
 
 
 @pytest.mark.asyncio
