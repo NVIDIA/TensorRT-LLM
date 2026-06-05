@@ -22,6 +22,7 @@ python models/ltx2.py
 
 # With engine config (quant, parallelism, etc.)
 python models/wan_t2v.py --visual_gen_args configs/wan2.2-t2v-fp4-1gpu.yaml
+python models/wan_i2v.py --visual_gen_args configs/wan2.2-i2v-fp4-1gpu.yaml --image /path/to/image.png
 python models/ltx2.py --visual_gen_args configs/ltx2-t2v-fp8-1-gpu.yaml
 ```
 
