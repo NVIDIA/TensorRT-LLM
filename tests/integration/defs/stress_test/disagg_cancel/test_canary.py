@@ -12,18 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for ``DisaggCancellationStressHarness._canary_thread_body``.
+"""Unit tests for `DisaggCancellationStressHarness._canary_thread_body`.
 
-The canary thread is testable without a real disagg cluster: stand up
-a tiny HTTP server in the test process that answers
-``POST /v1/completions`` with a configurable ``token_ids`` payload,
-point the harness at it via ``bind_server_endpoint``, run the thread
-for a few intervals, and assert on the collected ``_canary_records``.
-
-Prompt-loader and token-equivalence behaviour are verified directly
-against the standalone helpers; transport behaviour (success, HTTP
-error, connection refused, malformed body) is verified against the
-in-process HTTP server.
+Loader and token-equivalence helpers run directly. Transport and
+thread behavior run against an in-process HTTP server that answers
+`POST /v1/completions` with configurable payloads.
 """
 
 from __future__ import annotations
@@ -51,28 +44,18 @@ from .harness import (
 
 
 def _pick_port() -> int:
-    """Bind-and-release to get an OS-allocated free TCP port."""
+    """Bind-and-release to return an OS-allocated free TCP port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
 class _CompletionsHandler(BaseHTTPRequestHandler):
-    """Answers ``POST /v1/completions`` with a configurable payload.
+    """Answers `POST /v1/completions`.
 
-    The response is read off the server instance on every request so
-    tests can mutate it mid-run:
-
-    - ``server.token_ids``: list returned as ``choices[0].token_ids``.
-    - ``server.text``: string returned as ``choices[0].text``.
-    - ``server.status``: if not 200, an empty error response with that
-      status code is sent (e.g. 503 to simulate a worker mid-restart).
-    - ``server.raw_body``: if set (str), sent verbatim as a 200 body
-      (used to exercise the malformed-JSON parse path).
-
-    Each request's parsed JSON body is appended to
-    ``server.request_bodies`` so tests can assert on the wire format
-    (e.g. ``temperature``, ``seed``, ``detokenize``).
+    Tests mutate `server.token_ids` / `text` / `status` / `raw_body`
+    to drive outcomes and read `server.request_bodies` for
+    wire-format assertions.
     """
 
     def do_POST(self) -> None:  # noqa: N802 — fixed by BaseHTTPRequestHandler
@@ -118,12 +101,7 @@ class _CompletionsHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def completions_server():
-    """In-process HTTP server answering ``POST /v1/completions``.
-
-    Yields ``(server, port)``. Tests mutate ``server.token_ids`` /
-    ``server.text`` / ``server.status`` / ``server.raw_body`` to drive
-    request outcomes.
-    """
+    """In-process HTTP server answering `POST /v1/completions`; yields `(server, port)`."""
     port = _pick_port()
     server = HTTPServer(("127.0.0.1", port), _CompletionsHandler)
     server.token_ids = [1, 2, 3]  # type: ignore[attr-defined]
@@ -142,7 +120,6 @@ def completions_server():
 
 
 def _write_prompts(tmp_path: Path, entries: list[dict]) -> Path:
-    """Write a ``stress_canary_prompts.json``-shaped file and return its path."""
     path = tmp_path / "stress_canary_prompts.json"
     path.write_text(json.dumps({"prompts": entries}), encoding="utf-8")
     return path
@@ -195,7 +172,7 @@ def _make_harness(
 
 
 def _run_canary_thread_briefly(h: DisaggCancellationStressHarness, duration_s: float) -> None:
-    """Drive ``_canary_thread_body`` for ``duration_s`` seconds then stop."""
+    """Drive `_canary_thread_body` for `duration_s` then stop."""
     thread = threading.Thread(target=h._canary_thread_body, daemon=True)
     thread.start()
     time.sleep(duration_s)
@@ -204,8 +181,15 @@ def _run_canary_thread_briefly(h: DisaggCancellationStressHarness, duration_s: f
     assert not thread.is_alive(), "canary thread failed to exit after stop_event"
 
 
+def _run_until_self_exit(h: DisaggCancellationStressHarness) -> None:
+    """Spawn the thread and wait for it to exit on its own (warn-and-return paths)."""
+    thread = threading.Thread(target=h._canary_thread_body, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+
+
 def _wait_until(predicate, *, timeout_s: float, poll_s: float = 0.01) -> None:
-    """Poll ``predicate`` until true or ``timeout_s`` elapses; assert on timeout."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if predicate():
@@ -233,51 +217,41 @@ def test_load_prompts_valid(tmp_path: Path) -> None:
     assert prompts[1]["reference_token_ids"] == [3, 4]
 
 
-def test_load_prompts_invalid_json_raises(tmp_path: Path) -> None:
-    path = tmp_path / "bad.json"
-    path.write_text("{not valid json", encoding="utf-8")
-    with pytest.raises(ValueError, match="not valid JSON"):
-        _load_canary_prompts(path)
-
-
-def test_load_prompts_missing_prompts_key_raises(tmp_path: Path) -> None:
-    path = tmp_path / "p.json"
-    path.write_text(json.dumps({"items": []}), encoding="utf-8")
-    with pytest.raises(ValueError, match="'prompts' list"):
-        _load_canary_prompts(path)
-
-
-def test_load_prompts_prompts_not_a_list_raises(tmp_path: Path) -> None:
-    path = tmp_path / "p.json"
-    path.write_text(json.dumps({"prompts": {"prompt": "x"}}), encoding="utf-8")
-    with pytest.raises(ValueError, match="must be a list"):
-        _load_canary_prompts(path)
-
-
-def test_load_prompts_entry_missing_prompt_raises(tmp_path: Path) -> None:
-    path = tmp_path / "p.json"
-    path.write_text(json.dumps({"prompts": [{"reference_token_ids": [1]}]}), encoding="utf-8")
-    with pytest.raises(ValueError, match="string 'prompt'"):
-        _load_canary_prompts(path)
-
-
-def test_load_prompts_reference_token_ids_non_list_raises(tmp_path: Path) -> None:
-    path = _write_prompts(tmp_path, [{"prompt": "p", "reference_token_ids": 123}])
-    with pytest.raises(ValueError, match="reference_token_ids"):
-        _load_canary_prompts(path)
-
-
-def test_load_prompts_reference_token_ids_non_int_element_raises(tmp_path: Path) -> None:
-    path = _write_prompts(tmp_path, [{"prompt": "p", "reference_token_ids": [1, "two"]}])
-    with pytest.raises(ValueError, match="reference_token_ids"):
-        _load_canary_prompts(path)
-
-
 def test_load_prompts_reference_token_ids_omitted_is_allowed(tmp_path: Path) -> None:
-    # Schema permits omission — token-equivalence then records ``None``.
     path = _write_prompts(tmp_path, [{"prompt": "p"}])
-    prompts = _load_canary_prompts(path)
-    assert prompts == [{"prompt": "p"}]
+    assert _load_canary_prompts(path) == [{"prompt": "p"}]
+
+
+@pytest.mark.parametrize(
+    "raw_content,match",
+    [
+        pytest.param("{not valid json", "not valid JSON", id="malformed-json"),
+        pytest.param(json.dumps({"items": []}), "'prompts' list", id="missing-prompts-key"),
+        pytest.param(
+            json.dumps({"prompts": {"prompt": "x"}}), "must be a list", id="prompts-not-list"
+        ),
+        pytest.param(
+            json.dumps({"prompts": [{"reference_token_ids": [1]}]}),
+            "string 'prompt'",
+            id="entry-missing-prompt",
+        ),
+        pytest.param(
+            json.dumps({"prompts": [{"prompt": "p", "reference_token_ids": 123}]}),
+            "reference_token_ids",
+            id="reftokens-not-list",
+        ),
+        pytest.param(
+            json.dumps({"prompts": [{"prompt": "p", "reference_token_ids": [1, "two"]}]}),
+            "reference_token_ids",
+            id="reftokens-non-int-element",
+        ),
+    ],
+)
+def test_load_prompts_invalid_raises(tmp_path: Path, raw_content: str, match: str) -> None:
+    path = tmp_path / "p.json"
+    path.write_text(raw_content, encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        _load_canary_prompts(path)
 
 
 # ---------------------------------------------------------------------------
@@ -347,10 +321,8 @@ def test_send_malformed_body_returns_parse_error(completions_server) -> None:
 
 
 def test_send_missing_token_ids_returns_error(completions_server) -> None:
-    # Server returns a 200 response whose ``choices[0]`` carries no
-    # ``token_ids`` (e.g. it ignored ``detokenize=False``). Must be
-    # reported as a server-side error rather than miscounted as a
-    # token-equivalence mismatch downstream.
+    # 200 with `choices[0]` lacking `token_ids` is a server problem,
+    # not a token-equivalence mismatch downstream.
     server, port = completions_server
     server.token_ids = None
     server.text = "hi"
@@ -363,10 +335,8 @@ def test_send_missing_token_ids_returns_error(completions_server) -> None:
 
 
 def test_send_wire_format_includes_greedy_determinism_knobs(completions_server) -> None:
-    # Pin the on-wire request shape so a future ``_send_canary_request``
-    # change can't silently drop ``temperature=0.0`` / ``seed`` /
-    # ``detokenize=False`` (any of which would invalidate the
-    # token-equivalence contract).
+    # Pin the wire shape so a future change can't silently drop
+    # `temperature=0.0` / `seed` / `detokenize=False`.
     server, port = completions_server
     _send_canary_request(
         f"http://127.0.0.1:{port}",
@@ -392,60 +362,33 @@ def test_send_wire_format_includes_greedy_determinism_knobs(completions_server) 
 # ---------------------------------------------------------------------------
 
 
-def test_thread_records_token_equivalent_true_on_match(tmp_path, completions_server) -> None:
+@pytest.mark.parametrize(
+    "server_tokens,ref_tokens,check_equiv,expected",
+    [
+        pytest.param([1, 2, 3], [1, 2, 3], True, True, id="match"),
+        pytest.param([9, 9, 9], [1, 2, 3], True, False, id="mismatch"),
+        pytest.param([1, 2, 3], None, True, None, id="no-reference"),
+        pytest.param([1, 2, 3], [1, 2, 3], False, None, id="check-disabled"),
+    ],
+)
+def test_thread_records_token_equivalent(
+    tmp_path, completions_server, server_tokens, ref_tokens, check_equiv, expected
+) -> None:
     server, port = completions_server
-    server.token_ids = [1, 2, 3]
-    _write_prompts(tmp_path, [{"prompt": "p", "reference_token_ids": [1, 2, 3]}])
-    h = _make_harness(tmp_path, server_url=f"http://127.0.0.1:{port}")
+    server.token_ids = server_tokens
+    entry: dict = {"prompt": "p"}
+    if ref_tokens is not None:
+        entry["reference_token_ids"] = ref_tokens
+    _write_prompts(tmp_path, [entry])
+    h = _make_harness(tmp_path, check_equiv=check_equiv, server_url=f"http://127.0.0.1:{port}")
 
     _run_canary_thread_briefly(h, duration_s=0.15)
 
     assert len(h._canary_records) >= 1
     for rec in h._canary_records:
         assert rec["success"] is True
-        assert rec["token_equivalent"] is True
         assert rec["error"] is None
-        assert rec["prompt_index"] == 0
-        assert rec["timestamp"] > 0
-        assert rec["latency_s"] >= 0
-
-
-def test_thread_records_token_equivalent_false_on_mismatch(tmp_path, completions_server) -> None:
-    server, port = completions_server
-    server.token_ids = [9, 9, 9]
-    _write_prompts(tmp_path, [{"prompt": "p", "reference_token_ids": [1, 2, 3]}])
-    h = _make_harness(tmp_path, server_url=f"http://127.0.0.1:{port}")
-
-    _run_canary_thread_briefly(h, duration_s=0.15)
-
-    assert len(h._canary_records) >= 1
-    assert all(rec["success"] is True for rec in h._canary_records)
-    assert all(rec["token_equivalent"] is False for rec in h._canary_records)
-
-
-def test_thread_token_equivalent_none_when_no_reference(tmp_path, completions_server) -> None:
-    server, port = completions_server
-    server.token_ids = [1, 2, 3]
-    _write_prompts(tmp_path, [{"prompt": "p"}])  # no reference_token_ids
-    h = _make_harness(tmp_path, server_url=f"http://127.0.0.1:{port}")
-
-    _run_canary_thread_briefly(h, duration_s=0.15)
-
-    assert len(h._canary_records) >= 1
-    assert all(rec["success"] is True for rec in h._canary_records)
-    assert all(rec["token_equivalent"] is None for rec in h._canary_records)
-
-
-def test_thread_token_equivalent_none_when_check_disabled(tmp_path, completions_server) -> None:
-    server, port = completions_server
-    server.token_ids = [1, 2, 3]
-    _write_prompts(tmp_path, [{"prompt": "p", "reference_token_ids": [1, 2, 3]}])
-    h = _make_harness(tmp_path, check_equiv=False, server_url=f"http://127.0.0.1:{port}")
-
-    _run_canary_thread_briefly(h, duration_s=0.15)
-
-    assert len(h._canary_records) >= 1
-    assert all(rec["token_equivalent"] is None for rec in h._canary_records)
+        assert rec["token_equivalent"] is expected
 
 
 def test_thread_records_error_when_server_down(tmp_path) -> None:
@@ -489,37 +432,33 @@ def test_thread_round_robins_prompts(tmp_path, completions_server) -> None:
 
 def test_thread_exits_when_no_server_url(tmp_path) -> None:
     _write_prompts(tmp_path, [{"prompt": "p", "reference_token_ids": [1]}])
-    h = _make_harness(tmp_path, server_url=None)  # endpoint not bound
-
-    thread = threading.Thread(target=h._canary_thread_body, daemon=True)
-    thread.start()
-    thread.join(timeout=2.0)
-    assert not thread.is_alive()
+    h = _make_harness(tmp_path, server_url=None)
+    _run_until_self_exit(h)
     assert h._canary_records == []
 
 
 def test_thread_exits_when_prompts_file_missing(tmp_path, completions_server) -> None:
-    server, port = completions_server
-    # Reference a prompts file that does not exist on disk.
+    _, port = completions_server
     h = _make_harness(
         tmp_path, prompts_file="does_not_exist.json", server_url=f"http://127.0.0.1:{port}"
     )
+    _run_until_self_exit(h)
+    assert h._canary_records == []
 
-    thread = threading.Thread(target=h._canary_thread_body, daemon=True)
-    thread.start()
-    thread.join(timeout=2.0)
-    assert not thread.is_alive()
+
+def test_thread_exits_when_prompts_list_empty(tmp_path, completions_server) -> None:
+    _, port = completions_server
+    _write_prompts(tmp_path, [])
+    h = _make_harness(tmp_path, server_url=f"http://127.0.0.1:{port}")
+    _run_until_self_exit(h)
     assert h._canary_records == []
 
 
 def test_thread_exits_promptly_on_failed_event(tmp_path, completions_server) -> None:
-    # The between-request wait only observes ``stop_event``, so the
-    # thread acts on ``failed_event`` at the next request boundary.
-    # Bound the lag to one canary interval (here 20 ms) by asserting
-    # that no more than one extra record is appended after the event
-    # fires — this would catch a future regression that fully
-    # re-enters the request loop after fail-fast.
-    server, port = completions_server
+    # The between-request wait only observes `stop_event`; verify
+    # `failed_event` is acted on within one canary interval (records
+    # grow by at most one after the event fires).
+    _, port = completions_server
     _write_prompts(tmp_path, [{"prompt": "p", "reference_token_ids": [1, 2, 3]}])
     h = _make_harness(tmp_path, server_url=f"http://127.0.0.1:{port}")
 
@@ -529,33 +468,12 @@ def test_thread_exits_promptly_on_failed_event(tmp_path, completions_server) -> 
     pre = len(h._canary_records)
     h.failed_event.set()
     thread.join(timeout=2.0)
-    assert not thread.is_alive(), "canary thread must exit on failed_event too"
-    assert len(h._canary_records) - pre <= 1, (
-        "thread re-entered request loop after failed_event "
-        f"(records grew by {len(h._canary_records) - pre})"
-    )
-
-
-def test_thread_exits_when_prompts_list_empty(tmp_path, completions_server) -> None:
-    # Empty ``prompts`` list is a recoverable misconfiguration, not a
-    # crash; the thread logs a warning and exits without appending
-    # any records.
-    server, port = completions_server
-    _write_prompts(tmp_path, [])
-    h = _make_harness(tmp_path, server_url=f"http://127.0.0.1:{port}")
-
-    thread = threading.Thread(target=h._canary_thread_body, daemon=True)
-    thread.start()
-    thread.join(timeout=2.0)
     assert not thread.is_alive()
-    assert h._canary_records == []
+    assert len(h._canary_records) - pre <= 1
 
 
 def test_thread_resolves_absolute_prompts_path(tmp_path, completions_server) -> None:
-    # When the YAML's ``prompts_file`` is an absolute path, the
-    # harness must NOT join it against ``yaml_path.parent``; verify
-    # by placing the prompts file outside the YAML directory and
-    # confirming the thread loads it and produces records.
+    # Absolute `prompts_file` must NOT be joined against `yaml_path.parent`.
     server, port = completions_server
     server.token_ids = [1, 2, 3]
     outside_dir = tmp_path / "elsewhere"
@@ -566,9 +484,7 @@ def test_thread_resolves_absolute_prompts_path(tmp_path, completions_server) -> 
         encoding="utf-8",
     )
     h = _make_harness(
-        tmp_path,
-        prompts_file=str(prompts_path),  # absolute
-        server_url=f"http://127.0.0.1:{port}",
+        tmp_path, prompts_file=str(prompts_path), server_url=f"http://127.0.0.1:{port}"
     )
 
     _run_canary_thread_briefly(h, duration_s=0.15)

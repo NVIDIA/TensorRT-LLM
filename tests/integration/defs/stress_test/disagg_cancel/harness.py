@@ -595,37 +595,21 @@ def _fetch_kv_cache_utilization(
 def _load_canary_prompts(path: Path) -> list[dict[str, Any]]:
     """Load and validate the canary prompts JSON.
 
-    Expected schema (produced by the Step 6 reference generator)::
+    Schema (Step 6 reference generator):
+        {"prompts": [{"prompt": str,
+                      "reference_token_ids": [int, ...]?,
+                      "reference_text": str?}, ...]}
 
-        {
-            "prompts": [
-                {
-                    "prompt": "<deterministic prompt text>",
-                    "reference_token_ids": [int, ...],  # greedy-decode reference
-                    "reference_text": "<optional detokenized text>",
-                },
-                ...,
-            ]
-        }
-
-    Args:
-        path: Path to ``stress_canary_prompts.json`` (resolved by the
-            caller relative to the marathon YAML directory).
-
-    Returns:
-        The list of prompt entries (``prompts``). Each entry is a dict
-        with at least a ``prompt`` key; ``reference_token_ids`` is
-        optional but required for token-equivalence checking.
+    Strict validation here keeps a malformed reference from raising
+    `TypeError` inside the daemon canary thread (which would
+    silently freeze `_canary_records`).
 
     Raises:
         OSError: If the file cannot be opened.
-        ValueError: If the JSON is malformed, the top-level object is
-            not a mapping, ``prompts`` is missing/not a list, any
-            entry lacks a string ``prompt``, or any entry's
-            ``reference_token_ids`` is present but not a list of
-            ints. Strict validation here keeps a malformed reference
-            from later raising ``TypeError`` inside the daemon canary
-            thread (which would silently freeze ``_canary_records``).
+        ValueError: On malformed JSON, top-level not a mapping,
+            missing/non-list `prompts`, entry without a string
+            `prompt`, or `reference_token_ids` present but not a
+            list of ints.
     """
     with path.open("r", encoding="utf-8") as f:
         try:
@@ -661,36 +645,20 @@ def _send_canary_request(
     seed: int,
     timeout_s: float,
 ) -> tuple[Optional[list[int]], Optional[str], Optional[str]]:
-    """POST a greedy, deterministic completion to ``/v1/completions``.
+    """POST a greedy, deterministic completion to `/v1/completions`.
 
-    Requests ``detokenize=False`` so the server returns generated
-    ``token_ids`` on ``choices[0]`` for token-equivalence checking
-    (see ``CompletionResponseChoice.token_ids`` in
-    ``tensorrt_llm/serve/openai_protocol.py``). Greedy determinism is
-    requested via ``temperature=0.0`` plus a fixed ``seed``.
-
-    All failures (HTTP error, connection refused, timeout, malformed
-    body) are folded into ``(None, None, error_string)`` rather than
-    raising — the canary thread records an error and continues; only
-    the log scanner is fail-fast.
-
-    Args:
-        server_url: Disagg server base URL, e.g. ``http://host:port``.
-        model: Model name for the OpenAI request envelope.
-        prompt: Prompt text to send.
-        max_tokens: Maximum generated tokens.
-        seed: Fixed seed for greedy determinism.
-        timeout_s: Per-request HTTP timeout in seconds.
+    Requests `detokenize=False` so the response carries generated
+    `token_ids` on `choices[0]` (see
+    `CompletionResponseChoice.token_ids` in
+    `tensorrt_llm/serve/openai_protocol.py`); `temperature=0.0` and
+    a fixed `seed` request greedy determinism.
 
     Returns:
-        Tuple ``(token_ids, text, error)``. On success ``error`` is
-        ``None`` and ``token_ids`` carries the generated tokens
-        (``text`` may also be present); on failure ``token_ids`` is
-        ``None`` and ``error`` is a short reason string. A 200 response
-        that omits ``token_ids`` (e.g. the server ignored
-        ``detokenize=False``) is folded into a ``missing_token_ids``
-        error so the marathon gate counts it as a server-side problem
-        rather than miscounting it as a token-equivalence mismatch.
+        `(token_ids, text, error)`. On success `error is None`. Any
+        failure — HTTP error, connection refused, timeout, malformed
+        body, or a 200 response that omits `token_ids` — folds into
+        a short `error` string so the canary thread records and
+        continues (only the log scanner is fail-fast).
     """
     url = f"{server_url.rstrip('/')}/v1/completions"
     payload = {
@@ -710,7 +678,7 @@ def _send_canary_request(
         with urllib.request.urlopen(req, timeout=timeout_s) as response:
             body = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        # HTTPError is a subclass of URLError — catch it first.
+        # HTTPError subclasses URLError — catch it first.
         return None, None, f"http_error: {exc.code}"
     except urllib.error.URLError as exc:
         return None, None, f"url_error: {exc.reason}"
@@ -729,11 +697,7 @@ def _send_canary_request(
 
 
 def _tokens_equivalent(returned: Optional[list[int]], reference: Optional[list[int]]) -> bool:
-    """Return True iff ``returned`` exactly matches the ``reference`` token IDs.
-
-    A ``None`` on either side (no tokens returned, or no reference
-    recorded) is treated as not-equivalent.
-    """
+    """True iff `returned` exactly matches `reference`; `None` on either side is non-equivalent."""
     if returned is None or reference is None:
         return False
     return list(returned) == list(reference)
@@ -763,9 +727,9 @@ class DisaggCancellationStressHarness:
     subprocess-control injector, the file-tailing log scanner, the
     HTTP/Prometheus metrics scraper, and the HTTP canary client
     failure-isolated and debugged independently. The metrics and
-    canary threads use blocking ``urllib`` for their low-rate request
+    canary threads use blocking `urllib` for their low-rate request
     streams; the load thread runs its own asyncio event loop
-    internally (wrapping ``run_cancel_stress_test``).
+    internally (wrapping `run_cancel_stress_test`).
     """
 
     def __init__(
@@ -802,15 +766,13 @@ class DisaggCancellationStressHarness:
                 injector thread while waiting for the next scheduled
                 event. Tests pass a smaller value to keep wall-clock
                 latency bounded.
-            canary_request_timeout_s: Per-request HTTP timeout for a
-                canary completion. A slow/hung request is recorded as
-                an error rather than blocking the canary stream
-                indefinitely.
-            canary_interval_s: Optional override (seconds) for the gap
-                between consecutive canary requests. ``None`` (default)
-                derives the interval from ``canary.rate_per_min`` in
-                the YAML (``60 / rate_per_min``); tests pass a small
-                value to keep wall-clock latency bounded.
+            canary_request_timeout_s: Per-request HTTP timeout for
+                one canary completion; a slow/hung request becomes
+                an error rather than blocking the canary stream.
+            canary_interval_s: Optional override (seconds) for the
+                gap between requests. `None` derives from
+                `canary.rate_per_min` (`60 / rate_per_min`); tests
+                pass a small value.
 
         Raises:
             ValueError: If the YAML is malformed or its
@@ -839,10 +801,9 @@ class DisaggCancellationStressHarness:
         self._tracked_workers: list[_TrackedWorker] = []
         self._marathon_start_monotonic: float = 0.0
 
-        # Disagg-server front-end endpoint the canary client targets.
-        # Populated by setup() once setup_disagg_cluster returns (or by
-        # tests via bind_server_endpoint). None until then; the canary
-        # thread logs a warning and exits if it is still None.
+        # Disagg-server front-end the canary targets; populated by
+        # setup() or bind_server_endpoint(). None until then — the
+        # canary thread warns and exits.
         self._server_url: Optional[str] = None
         self._model_name: Optional[str] = None
 
@@ -898,17 +859,12 @@ class DisaggCancellationStressHarness:
         self._worker_specs = list(ctx_specs) + list(gen_specs)
 
     def bind_server_endpoint(self, server_url: str, model_name: str) -> None:
-        """Register the disagg server front-end the canary client targets.
+        """Register the disagg server front-end for the canary client.
 
-        Called by ``setup()`` once ``setup_disagg_cluster`` returns the
-        server host/port. Until this is called, the canary thread logs
-        a warning and exits (the lifecycle smoke has no live server).
-
-        Args:
-            server_url: Base URL of the disagg server, e.g.
-                ``http://localhost:8000``.
-            model_name: Model name to put in the OpenAI request
-                envelope (the disagg server routes regardless).
+        Called by `setup()` (or tests). Until called, the canary
+        thread warns and exits — the lifecycle smoke has no live
+        server. `model_name` goes in the OpenAI envelope only; the
+        disagg server routes regardless.
         """
         self._server_url = server_url
         self._model_name = model_name
@@ -1087,36 +1043,22 @@ class DisaggCancellationStressHarness:
         self.stop_event.set()
 
     def _canary_thread_body(self) -> None:
-        """Send greedy-decode canaries and check token-equivalence.
+        """Send greedy canaries and append per-request records to `_canary_records`.
 
-        Loads ``canary.prompts_file`` (resolved relative to the
-        marathon YAML), then sends deterministic greedy completions to
-        the disagg server's ``/v1/completions`` at
-        ``canary.rate_per_min`` cadence (overridable via the
-        ``canary_interval_s`` ctor param for tests). Each response is
-        compared against the recorded ``reference_token_ids`` and a
-        per-request record is appended to ``self._canary_records``::
+        Each record: `{timestamp, elapsed_s, prompt_index, success,
+        token_equivalent, latency_s, error}`. `token_equivalent` is
+        True/False when a reference is recorded and the check is
+        enabled, else None. Failures are recorded — not fail-fast —
+        because errors during bursts/injections are expected; the
+        end-of-marathon gates (error rate, recovery time) are
+        computed from these records later.
 
-            {timestamp, elapsed_s, prompt_index, success, token_equivalent, latency_s, error}
-
-        ``success`` is ``True`` when the HTTP request returned without
-        error. ``token_equivalent`` is ``True``/``False`` when a
-        reference is available and the check is enabled, else ``None``
-        (request failed, checking disabled, or no reference recorded).
-        Request failures are recorded — not fail-fast — because errors
-        during bursts / injections are expected; the end-of-marathon
-        gates (error rate, recovery time) are computed from these
-        records by the load thread / pytest assertion in a later step.
-
-        Exits when ``stop_event`` or ``failed_event`` is set. The
-        between-request wait only observes ``stop_event``, so a
-        ``failed_event`` fired mid-interval is acted on at the next
-        request boundary (worst-case lag = one canary interval). The
-        metrics thread has the same characteristic; a shared
-        ``wait_for_any([stop_event, failed_event], ...)`` helper is
-        deferred to a follow-up PR. No-ops with a warning if the
-        server endpoint or prompts file is absent (the lifecycle
-        smoke before ``setup()`` is wired).
+        Exits on `stop_event` or `failed_event`. The between-request
+        wait only observes `stop_event`, so `failed_event` is acted
+        on at the next request boundary (max lag = one interval);
+        the metrics thread has the same gap, a shared `wait_for_any`
+        helper is deferred to a follow-up PR. Warns and exits if the
+        server endpoint or prompts file is absent.
         """
         canary_cfg = self.config.raw.get("canary") or {}
         if not self._server_url:
