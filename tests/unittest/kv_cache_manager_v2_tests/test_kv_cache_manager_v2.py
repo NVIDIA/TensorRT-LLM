@@ -889,6 +889,11 @@ class TestDisaggregatedServing(unittest.TestCase):
         def __iter__(self) -> Iterator[Node]:
             return iter(self._nodes)
 
+        def shutdown(self) -> None:
+            for node in reversed(self._nodes):
+                node.kv_cache.close()
+                node.manager.shutdown()
+
         def __init__(
             self, full_config: KVCacheManagerConfig, num_heads: int, tp_size: int, pp_size: int
         ):
@@ -932,6 +937,12 @@ class TestDisaggregatedServing(unittest.TestCase):
 
     def tearDown(self) -> None:
         gc.enable()
+        if hasattr(self, "decode"):
+            self.decode.shutdown()
+            del self.decode
+        if hasattr(self, "prefill"):
+            self.prefill.shutdown()
+            del self.prefill
 
     def next_token(self) -> TokenIdExt:
         token_id = next(self._token_id_gen)
