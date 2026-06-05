@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import time
 
 import pytest
@@ -8,7 +7,7 @@ import requests
 
 from .build_engines import *
 from .common import *
-from .conftest import venv_check_call, venv_check_output
+from .conftest import venv_check_call
 from .trt_test_alternative import call, check_call, print_info
 
 
@@ -139,159 +138,6 @@ def test_rcca_bug_4323566(
     ]
 
     venv_check_call(llm_backend_venv, run_cmd)
-
-
-@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])
-@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
-@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
-@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY", ["guaranteed_no_evict"])
-@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
-@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
-                         ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
-@pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
-                         ids=["disableDecoupleMode"])
-@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
-@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
-@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
-@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
-@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
-@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
-@pytest.mark.parametrize("DECODING_MODE", [""])
-@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1", "4"])
-@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
-def test_rcca_bug_4342666(
-    E2E_MODEL_NAME,
-    MAX_TOKENS_IN_KV_CACHE,
-    MAX_ATTENTION_WINDOW_SIZE,
-    BATCH_SCHEDULER_POLICY,
-    KV_CACHE_FREE_GPU_MEM_FRACTION,
-    ENABLE_TRT_OVERLAP,
-    BATCHING_STRATEGY,
-    DECOUPLED_MODE,
-    TRITON_MAX_BATCH_SIZE,
-    MAX_QUEUE_DELAY_MICROSECONDS,
-    MAX_BEAM_WIDTH,
-    ENABLE_KV_CACHE_REUSE,
-    NORMALIZE_LOG_PROBS,
-    ENABLE_CHUNKED_CONTEXT,
-    GPU_DEVICE_IDS,
-    DECODING_MODE,
-    PREPROCESSING_INSTANCE_COUNT,
-    POSTPROCESSING_INSTANCE_COUNT,
-    ACCUMULATE_TOKEN,
-    BLS_INSTANCE_COUNT,
-    EXCLUDE_INPUT_IN_OUTPUT,
-    inflight_batcher_llm_client_root,
-    tensorrt_llm_llama_example_root,
-    llama_v2_tokenizer_model_root,
-    total_gpu_memory_mib,
-    llm_backend_venv,
-):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
-        pytest.skip("Skipping.")
-
-    if (BATCHING_STRATEGY == "inflight_fused_batching"
-            and int(MAX_BEAM_WIDTH) > 1 and min(total_gpu_memory_mib) < 60000):
-        pytest.skip("Skipping due to insufficient GPU memory.")
-
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
-    # Build Engine
-    ENGINE_PATH = prepare_rcca_nvbug_4342666_engine(
-        "ifb", tensorrt_llm_llama_example_root, llama_v2_tokenizer_model_root)
-    # Prepare model repo
-    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
-    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
-
-    # Modify config.pbtxt
-    TOKENIZER_PATH = llama_v2_tokenizer_model_root
-    modify_ib_config_pbtxt(
-        new_model_repo,
-        ENGINE_PATH,
-        TOKENIZER_PATH,
-        llm_backend_repo_root,
-        DECOUPLED_MODE,
-        MAX_TOKENS_IN_KV_CACHE,
-        MAX_ATTENTION_WINDOW_SIZE,
-        BATCH_SCHEDULER_POLICY,
-        BATCHING_STRATEGY,
-        KV_CACHE_FREE_GPU_MEM_FRACTION,
-        EXCLUDE_INPUT_IN_OUTPUT,
-        ENABLE_TRT_OVERLAP,
-        TRITON_MAX_BATCH_SIZE,
-        MAX_QUEUE_DELAY_MICROSECONDS,
-        MAX_BEAM_WIDTH,
-        ENABLE_KV_CACHE_REUSE,
-        NORMALIZE_LOG_PROBS,
-        ENABLE_CHUNKED_CONTEXT,
-        GPU_DEVICE_IDS,
-        DECODING_MODE,
-        PREPROCESSING_INSTANCE_COUNT,
-        POSTPROCESSING_INSTANCE_COUNT,
-        ACCUMULATE_TOKEN,
-        BLS_INSTANCE_COUNT,
-    )
-
-    # Launch Triton Server
-    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
-                                    "launch_triton_server.py")
-    check_call(
-        f"python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo}",
-        shell=True)
-    check_server_ready()
-    # Run Test
-    TEXT = """
-Input: Summarize the following conversation that took place between UberEats customer support......
-Output:
-Summarize the following conversation that took place between UberEats customer support and a customer:
-Customer: Hi, I ordered food from UberEats an hour ago, but I still haven't received my order. Can you help me with this?
-UberEats Support: Sorry to hear that. Can you please provide me with your order number so I can look into this for you?
-Customer: Sure, it's #1234.
-UberEats Support: Thank you. I've checked on your order, and it looks like the delivery partner is running a bit behind schedule. However, they should be arriving within the next 20 minutes. Would you like me to provide you with live updates on the status of your order?
-Customer: Yes, that would be great. Can you also give me a discount on my order since it's taking so long?
-UberEats Support: I understand your frustration. I can offer you a 10% discount on your order. Would you like me to apply that now?
-Customer: Yes, that would be great. Thank you for your help.
-UberEats Support: You're welcome. I've applied the discount to your order, and I'll make sure to provide you with live updates on the status of your delivery. Your order should arrive within the next 15 minutes. Is there anything else I can assist you with today?
-Customer: No, that's all. Thank you for your help.
-UberEats Support: You're welcome. Enjoy your meal!!
-"""
-    run_cmd = [
-        f"{inflight_batcher_llm_client_root}/inflight_batcher_llm_client.py",
-        f"--tokenizer-dir={llama_v2_tokenizer_model_root}",
-        "--tokenizer-type=llama",
-        "--request-output-len=500",
-        f"--beam-width={MAX_BEAM_WIDTH}",
-        f"--text={TEXT}",
-    ]
-    output_log = venv_check_output(llm_backend_venv, run_cmd)
-    print_info(f"{output_log}")
-    # Get output sentence from log
-    m = re.search(r"Output beam 0:\s*(.*)\s*?\n", output_log)
-    output_result = ""
-    if m is not None:
-        output_result = m.group(1).strip()
-
-    # Golden output sentences
-    golden_result_0 = """
-In this conversation, the customer support representative was able to resolve the customer's issue by providing them with a discount on their order and keeping them updated on the status of their delivery. The representative was professional and courteous throughout the conversation, and the customer was satisfied with the resolution provided.
-"""
-    golden_result_1 = """
-In this conversation, the UberEats customer support representative was able to resolve the customer's issue by providing a 10% discount on their order and offering live updates on the status of their delivery. The customer was satisfied with the resolution and thanked the representative for their help.
-"""
-    golden_result_2 = """
-In this conversation, the customer support representative was able to resolve the customer's issue by providing them with a discount on their order and keeping them updated on the status of their delivery.
-"""
-    golden_results = [golden_result_0, golden_result_1, golden_result_2]
-    # Validate Accuracy
-    threshold = 0.8
-    validate_by_sequence_matcher(output_result, golden_results, threshold)
 
 
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])

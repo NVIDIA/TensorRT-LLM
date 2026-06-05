@@ -86,7 +86,7 @@ class LTX2Attention(Attention):
         apply_gated_attention: bool = False,
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: int = 0,
-        use_ulysses: bool = False,
+        enable_sequence_parallel: bool = False,
     ):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
@@ -103,13 +103,16 @@ class LTX2Attention(Attention):
         # Cross-attention: SEPARATE_QKV since K/V come from a different source.
         qkv_mode = QKVMode.SEPARATE_QKV if self._is_cross_attn else QKVMode.FUSE_QKV
 
-        # Decide whether to ask the base class for the Ulysses-wrapped path.
-        # Caller opts in via use_ulysses. Cross-attn additionally requires no
-        # other CP to be active (Ring/Attention2D + Ulysses cross-attn is
-        # unvalidated and falls through to the plain + AG path).
+        # Caller opts in via enable_sequence_parallel. Cross-attn supports
+        # Ulysses-only (SEPARATE_QKV + ring/attn2d is rejected in Attention);
+        # when ring/attn2d CP is active we disable wrappers and fall back to
+        # the plain backend + all-gather in the AV cross-attn forward path.
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
         cp_size = vgm.cp_size if vgm is not None else 1
-        enable_ulysses = use_ulysses and (cp_size == 1 or not self._is_cross_attn)
+        if self._is_cross_attn:
+            enable_sp = enable_sequence_parallel and cp_size == 1
+        else:
+            enable_sp = enable_sequence_parallel
 
         # Map LTX RoPE type to the fused-kernel INTERLEAVE template parameter:
         #   INTERLEAVED → pair (2i, 2i+1) pattern   → kernel INTERLEAVE=true
@@ -128,7 +131,7 @@ class LTX2Attention(Attention):
             fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
-            enable_ulysses=enable_ulysses,
+            enable_sequence_parallel=enable_sp,
         )
 
         # Build a runtime-toggleable Ulysses ↔ plain pair.
@@ -137,7 +140,7 @@ class LTX2Attention(Attention):
         # padded when divisible, plain backend is used otherwise. Plain has
         # to be built with the full (unsharded) head count.
         self._has_dual_attn = False
-        if enable_ulysses and ulysses_size > 1:
+        if enable_sp and ulysses_size > 1:
             U = ulysses_size
             H = self.num_attention_heads
             H_kv = self.num_key_value_heads
@@ -180,8 +183,8 @@ class LTX2Attention(Attention):
     def set_ulysses_active(self, active: bool):
         """Toggle between Ulysses-wrapped and plain attention at runtime.
 
-        Effective for modules created with ``use_ulysses=True`` (works for
-        both self-attn and cross-attn). No-op otherwise.
+        Effective for modules created with ``enable_sequence_parallel=True``
+        (works for both self-attn and cross-attn). No-op otherwise.
         """
         if self._has_dual_attn:
             self._modules.pop("attn", None)
@@ -478,7 +481,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
-            use_ulysses=True,
+            enable_sequence_parallel=True,
         )
         self.attn2 = LTX2Attention(
             query_dim=cfg.dim,
@@ -490,6 +493,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            enable_sequence_parallel=False,
         )
         self.ff = self._make_mlp(cfg, model_config, idx)
         self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
@@ -521,7 +525,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=audio_self_config,
             layer_idx=idx,
-            use_ulysses=True,
+            enable_sequence_parallel=True,
         )
         self.audio_attn2 = LTX2Attention(
             query_dim=cfg.dim,
@@ -533,6 +537,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            enable_sequence_parallel=False,
         )
         self.audio_ff = self._make_mlp(cfg, model_config, idx)
         self.audio_scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
@@ -548,6 +553,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=v_cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            enable_sequence_parallel=False,
         )
         self.video_to_audio_attn = LTX2Attention(
             query_dim=a_cfg.dim,
@@ -559,7 +565,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=a_cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
-            use_ulysses=True,
+            enable_sequence_parallel=True,
         )
         self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, a_cfg.dim))
         self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, v_cfg.dim))
@@ -1569,12 +1575,11 @@ class LTXModel(nn.Module):
                 audio_context, audio_context_mask, audio_positions, dtype
             )
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
-            # Extend audio PE to padded length once at cache-build time.
-            # seq_dim per rope type: SPLIT cos [B,H,T,D] → 2, INTERLEAVED [B,T,D] → 1.
+            # cos/sin are token-major: token axis is dim 1 for both SPLIT and
+            # INTERLEAVED rope, matching `_make_pe_local`'s `cos[:, s:e]` shard.
             if self._audio_pad > 0:
-                pe_seq_dim = 2 if (a_pe is not None and a_pe[0].ndim == 4) else 1
-                a_pe = self._pad_pe(a_pe, self._audio_pad, seq_dim=pe_seq_dim)
-                a_cross_pe = self._pad_pe(a_cross_pe, self._audio_pad, seq_dim=pe_seq_dim)
+                a_pe = self._pad_pe(a_pe, self._audio_pad, seq_dim=1)
+                a_cross_pe = self._pad_pe(a_cross_pe, self._audio_pad, seq_dim=1)
 
         # Build sharded-local PE in the form the attention consumer expects.
         # fuse_qk_norm_rope=True (LTX-2 default) -> 2D [T_local, H*D] contiguous,

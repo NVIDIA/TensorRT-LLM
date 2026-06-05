@@ -67,8 +67,9 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
 
 
 def _set_quant_config(llm, model_id: str) -> None:
-    """Set quant_config on *llm* based on *model_id* so the accuracy harness
-    can resolve the correct thresholds.
+    """Set quant_config on *llm* based on *model_id*.
+
+    This lets the accuracy harness resolve the correct thresholds.
     """
     QUANT_ALGO_BY_MODEL_ID = {
         "fp8": {
@@ -148,19 +149,18 @@ def low_memory_overrides(config,
                          max_batch_size=32,
                          free_gpu_memory_fraction=0.4,
                          max_seq_len=8192,
-                         max_num_tokens=8192,
-                         cuda_graph_batch_sizes=None):
+                         max_num_tokens=8192):
     """Update and return config that reduce memory footprint for unquantized (bf16) runs."""
-    if cuda_graph_batch_sizes is None:
-        cuda_graph_batch_sizes = [
-            s for s in [1, 2, 4, 8, 16, 32, 64, 128] if s <= max_batch_size
-        ]
+    cuda_graph_batch_sizes = [
+        s for s in [1, 2, 4, 8, 16, 32, 64, 128] if s <= max_batch_size
+    ]
     config.update({
         "max_batch_size": max_batch_size,
         "max_seq_len": max_seq_len,
         "max_num_tokens": max_num_tokens,
         "cuda_graph_config": {
-            "batch_sizes": cuda_graph_batch_sizes
+            "batch_sizes": cuda_graph_batch_sizes,
+            "max_batch_size": max_batch_size,
         },
     })
     kv_cache_config = config.setdefault("kv_cache_config", {})
@@ -769,7 +769,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         low_memory_overrides(
             kwargs,
             max_batch_size=8,
-            cuda_graph_batch_sizes=[1, 2, 4, 8],
         )
         kwargs["attn_backend"] = attn_backend
 
@@ -874,7 +873,7 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for GLM-4.7-Flash variants"""
+    """Accuracy regression tests for GLM-4.7-Flash variants."""
 
     MODEL_NAME = "GLM-4.7-Flash"
     MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
