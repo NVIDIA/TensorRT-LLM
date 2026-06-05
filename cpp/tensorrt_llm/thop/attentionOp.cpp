@@ -746,10 +746,7 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
-        common_enqueue_params.trtllmGenJITWarmup = trtllm_gen_jit_warmup;
-        common_enqueue_params.trtllmGenJITWarmupMaxNumRequests = max_num_requests;
-        common_enqueue_params.trtllmGenJITWarmupMaxSeqLenQ = op.mMaxContextLength;
-        common_enqueue_params.trtllmGenJITWarmupMaxSeqLenKv = op.mMaxSeqLen;
+        common_enqueue_params.trtllm_gen_jit_warmup = trtllm_gen_jit_warmup;
         if (softmax_stats_tensor.has_value())
         {
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().scalar_type() == at::ScalarType::Float,
