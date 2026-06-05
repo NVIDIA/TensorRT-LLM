@@ -50,10 +50,6 @@ if TYPE_CHECKING:
     )
 
 
-def _has_sparse_tensor(tensor: torch.Tensor) -> bool:
-    return tensor is not None and tensor.numel() > 0
-
-
 def _clear_multi_ctas_kv_counter_workspace(
     fmha_workspace: torch.Tensor,
     num_heads: int,
@@ -594,9 +590,11 @@ class FlashInferTrtllmGenAttention:
             return False, "trtllm-gen does not support sage attention."
         if meta.helix_position_offsets is not None:
             return False, "trtllm-gen does not support helix parallelism."
+        sparse_kv_indices = fwd.sparse.sparse_kv_indices
+        sparse_attn_indices = fwd.sparse.sparse_attn_indices
         if (
-            _has_sparse_tensor(fwd.sparse.sparse_kv_indices)
-            or _has_sparse_tensor(fwd.sparse.sparse_attn_indices)
+            (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
+            or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)
             or meta.num_sparse_topk > 0
         ):
             return False, "trtllm-gen does not support sparse attention."
