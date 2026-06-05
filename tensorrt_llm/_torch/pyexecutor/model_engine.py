@@ -1039,7 +1039,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_attention_warmup(self,
                               resource_manager: ResourceManager,
-                              can_run_general_warmup=True) -> None:
+                              can_run_general_warmup: bool = True) -> None:
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
@@ -1056,7 +1056,7 @@ class PyTorchModelEngine(ModelEngine):
 
         warmup_requests_configs = []
         if not self.is_draft_model and self.guided_decoder is None:
-            # doesn't support warmup for 2-model speculative decoding like eagle3
+            # doesn't support 2-model speculative draft and guided decoding
             warmup_requests_configs.append(
                 (1 + self.max_total_draft_tokens, 1))  # one generation request
         else:
