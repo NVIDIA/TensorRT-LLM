@@ -348,6 +348,7 @@ class Flux2Pipeline(BasePipeline):
             guidance_scale=req.params.guidance_scale,
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
+            num_images_per_prompt=req.params.num_images_per_prompt,
         )
 
     @torch.inference_mode()
@@ -360,6 +361,7 @@ class Flux2Pipeline(BasePipeline):
         guidance_scale: float = 3.5,
         seed: int = 42,
         max_sequence_length: int = 512,
+        num_images_per_prompt: int = 1,
     ):
         """Generate image(s) from text prompt(s).
 
@@ -373,9 +375,13 @@ class Flux2Pipeline(BasePipeline):
             guidance_scale: Embedded guidance scale
             seed: Random seed for reproducibility.
             max_sequence_length: Maximum text sequence length
+            num_images_per_prompt: Number of images to generate per prompt.
+                Each prompt's embeddings are repeated and independent noise is
+                sampled, producing N different images per prompt.
 
         Returns:
-            PipelineOutput with image tensor (B, H, W, C).
+            PipelineOutput with image tensor (B, H, W, C) where
+            B = len(prompt) * num_images_per_prompt.
         """
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -384,7 +390,9 @@ class Flux2Pipeline(BasePipeline):
         # Determine batch size
         if isinstance(prompt, str):
             prompt = [prompt]
-        batch_size = len(prompt)
+        if num_images_per_prompt < 1:
+            raise ValueError(f"num_images_per_prompt must be >= 1, got {num_images_per_prompt}")
+        batch_size = len(prompt) * num_images_per_prompt
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -393,6 +401,10 @@ class Flux2Pipeline(BasePipeline):
         encode_start = time.time()
         prompt_embeds, text_ids = self._encode_prompt(prompt, max_sequence_length)
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
+
+        # Repeat embeddings for num_images_per_prompt (diffusers convention)
+        if num_images_per_prompt > 1:
+            prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
 
         latents, latent_ids = self._prepare_latents(batch_size, height, width, generator)
         logger.info(f"Latents shape: {latents.shape}")

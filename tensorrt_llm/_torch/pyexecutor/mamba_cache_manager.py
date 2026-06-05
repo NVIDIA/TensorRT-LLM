@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 import tensorrt_llm.bindings
 
@@ -28,7 +30,8 @@ if TYPE_CHECKING:
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
@@ -595,6 +598,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         # see MixedMambaHybridCacheManager.
         self._padding_slot: int = self.mamba_cache_free_blocks.pop()
 
+        # Reserved slot for the attention-DP padding dummy. Keep it out of the
+        # free pool so dummy insertion never consumes real-request capacity.
+        self._attention_dp_dummy_slot: Optional[int] = (
+            self.mamba_cache_free_blocks.pop()
+            if mapping.enable_attention_dp else None)
+
         # save intermediate state indices for requests
         self.intermediate_state_indices = torch.arange(max_batch_size,
                                                        dtype=torch.int32,
@@ -681,6 +690,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                 continue
             if self._is_padding_sentinel(r):
                 self.mamba_cache_index[r] = self._padding_slot
+            elif (r == ATTENTION_DP_DUMMY_REQUEST_ID
+                  and self._attention_dp_dummy_slot is not None):
+                self.mamba_cache_index[r] = self._attention_dp_dummy_slot
             else:
                 if len(self.mamba_cache_free_blocks) == 0:
                     raise RuntimeError("run out of mamba cache blocks")
@@ -692,8 +704,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         if request_id not in self.mamba_cache_index:
             return
         block = self.mamba_cache_index.pop(request_id)
-        # _padding_slot stays reserved; only non-sentinel blocks return.
-        if not self._is_padding_sentinel(request_id):
+        # Reserved slots must not re-enter the real-request free pool.
+        if block != self._padding_slot and \
+                block != self._attention_dp_dummy_slot:
             self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self, request_ids: List[int],
@@ -723,6 +736,41 @@ class PythonMambaCacheManager(BaseResourceManager):
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.mamba_cache.at_layer_idx(
             layer_offset).intermediate_conv_window
+
+    def get_replay_old_x(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_x[layer_offset]
+
+    def get_replay_old_B(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_B[layer_offset]
+
+    def get_replay_old_dt(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_dt[layer_offset]
+
+    def get_replay_old_dA_cumsum(self,
+                                 layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_dA_cumsum[layer_offset]
+
+    def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        return self.mamba_cache.cache_buf_idx
+
+    def get_replay_prev_num_accepted_tokens(self) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        return self.mamba_cache.prev_num_accepted_tokens
 
     def is_speculative(self) -> bool:
         return isinstance(self.mamba_cache, self.SpeculativeState)
@@ -948,6 +996,31 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         assert not self._use_cpp, "get_intermediate_conv_states is not supported in CppMambaCacheManager"
         return self._impl.get_intermediate_conv_states(layer_idx)
 
+    def get_replay_old_x(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_x is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_x(layer_idx)
+
+    def get_replay_old_B(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_B is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_B(layer_idx)
+
+    def get_replay_old_dt(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_dt is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_dt(layer_idx)
+
+    def get_replay_old_dA_cumsum(self,
+                                 layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_dA_cumsum is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_dA_cumsum(layer_idx)
+
+    def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_cache_buf_idx is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_cache_buf_idx()
+
+    def get_replay_prev_num_accepted_tokens(self) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_prev_num_accepted_tokens is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_prev_num_accepted_tokens()
+
     def is_speculative(self) -> bool:
         return self._impl.is_speculative()
 
@@ -983,6 +1056,19 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     to the family without caring about the concrete implementation. Concrete
     selection (Mixed vs Cpp) lives in ``_util.py:_get_model_kv_cache_manager_cls``.
     """
+
+
+def _get_mamba_hybrid_pool_size(max_batch_size: int, mapping: Mapping) -> int:
+    """Return the internal Mamba state pool size for MixedMambaHybridCacheManager."""
+    pool_size = max_batch_size
+    # One permanent slot is shared by every CUDA-graph padding sentinel.
+    pool_size += 1
+    if mapping.enable_attention_dp:
+        # Attention-DP can insert a transient dummy request on an otherwise
+        # idle rank. Keep this headroom internal so scheduler-visible
+        # max_batch_size still limits real requests.
+        pool_size += 1
+    return pool_size
 
 
 class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
@@ -1037,10 +1123,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
-        # +1 headroom for PythonMambaCacheManager._padding_slot, which
-        # is shared by every CUDA-graph padding sentinel regardless of
-        # max_draft_len.
-        pool_size = max_batch_size + 1
+        pool_size = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
 
         MambaCacheManager.__init__(
             self,
@@ -1127,6 +1210,97 @@ def calc_context_stop_positions(prompt_len: int,
     if prompt_len not in stop_positions:
         stop_positions.append(prompt_len)
     return stop_positions
+
+
+@triton.jit
+def _promote_mamba_state_kernel(
+    src_ptr,
+    dst_ptr,
+    src_idx_ptr,
+    acc_ptr,
+    blk_ptr,
+    num_gens,
+    count,
+    src_s_layer,
+    src_s_row,
+    src_s_step,
+    dst_s_layer,
+    dst_s_block,
+    BLOCK: tl.constexpr,
+):
+    # One program copies a BLOCK-sized tile of the contiguous inner state for a
+    # single (layer, gen) pair. grid = (num_layers * num_gens, ceil(count/BLOCK)).
+    pair = tl.program_id(0)
+    tile = tl.program_id(1)
+    layer = (pair // num_gens).to(tl.int64)
+    g = pair % num_gens
+    row = tl.load(src_idx_ptr + g).to(tl.int64)
+    acc = tl.load(acc_ptr + g).to(tl.int64)
+    blk = tl.load(blk_ptr + g).to(tl.int64)
+    # int64 throughout: per-layer strides are O(1e8), so layer*stride overflows
+    # int32 and would corrupt addresses / fault.
+    src_base = layer * src_s_layer + row * src_s_row + acc * src_s_step
+    dst_base = layer * dst_s_layer + blk * dst_s_block
+    offs = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < count
+    v = tl.load(src_ptr + src_base + offs, mask=mask)
+    tl.store(dst_ptr + dst_base + offs, v, mask=mask)
+
+
+def _promote_mamba_state_triton(dst: torch.Tensor,
+                                intermediate: torch.Tensor,
+                                src_state_indices: torch.Tensor,
+                                accepted_draft: torch.Tensor,
+                                dst_state_indices: torch.Tensor,
+                                BLOCK: int = 2048) -> None:
+    """Scatter each generation request's accepted draft-step recurrent state
+    from the per-request intermediate buffer into the unified C++ pool view.
+
+    Args:
+        dst: ``[num_layers, num_blocks, *state_shape]`` view of the C++ pool.
+            The block dim (dim 1) is strided (the pool interleaves
+            ``ssm_bytes | conv_bytes`` per block), so ``dst`` is non-contiguous.
+            The kernel writes through ``dst``'s real strides, touching only this
+            state's bytes -- the case that defeats torch.compile / aot_autograd
+            (dtype-view mutation) and Inductor codegen (``XBLOCK`` on the uint8
+            pool).
+        intermediate: ``[num_layers, max_batch_size, T, *state_shape]`` dense.
+        src_state_indices, accepted_draft, dst_state_indices: ``[num_gens]`` int.
+
+    For each gen ``g``::
+
+        dst[:, dst_state_indices[g]] = intermediate[:, src_state_indices[g], accepted_draft[g]]
+
+    Pure gather->scatter copy; bandwidth-bound (~85% of HBM peak), one launch.
+    """
+    num_layers = dst.shape[0]
+    num_gens = src_state_indices.shape[0]
+    if num_gens == 0:
+        return
+    count = 1
+    for s in dst.shape[2:]:
+        count *= s
+    # Grid dim order matters: dim 0 -> CUDA grid.x (limit 2^31-1), dim 1 ->
+    # grid.y (limit 65535). Put the (layer, gen) pairs in dim 0 since that is
+    # what grows with batch size (num_layers*num_gens stays far below 2^31 for
+    # any real config); the tile count in dim 1 is small (~count/BLOCK). Do NOT
+    # swap them: pairs would hit the 65535 y-limit at num_layers*num_gens>65535.
+    grid = (num_layers * num_gens, triton.cdiv(count, BLOCK))
+    _promote_mamba_state_kernel[grid](
+        intermediate,
+        dst,
+        src_state_indices,
+        accepted_draft,
+        dst_state_indices,
+        num_gens,
+        count,
+        intermediate.stride(0),
+        intermediate.stride(1),
+        intermediate.stride(2),
+        dst.stride(0),
+        dst.stride(1),
+        BLOCK=BLOCK,
+    )
 
 
 class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
@@ -1538,8 +1712,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # we skip refresh_blocks entirely when nothing was scheduled.
         self._pending_state_transfers = self.impl.copy_linear_attention_block_batch(
             self.requests)
-        if self._pending_state_transfers:
-            logger.info(f"Need to transfer mamba state blocks")
         self._setup_state_indices()
         num_contexts = len(scheduled_batch.context_requests)
         if num_contexts > 0:
@@ -1596,51 +1768,59 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def is_speculative(self) -> bool:
         return self.spec_config is not None
 
+    @nvtx_range("hybrid_update_mamba_states")
     def update_mamba_states(self,
                             attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor,
                             state_indices: Optional[torch.Tensor] = None):
         if self.local_num_mamba_layers == 0:
             return
-        # Note: cannot use @torch.compile here because all_ssm_states and
-        # all_conv_states are dtype-reinterpreted views of the C++ pool
-        # (uint8 -> typed), and aot_autograd does not support mutations on
-        # views with different dtypes.
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
-        num_accepted_draft_tokens = num_accepted_tokens[
-            num_contexts:num_contexts + num_gens] - 1
+        num_accepted_draft_tokens = (
+            num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
+                torch.int32)
         # Match the API of MambaCacheManager.update_mamba_states: callers
         # may pass per-request state slot indices explicitly (e.g. MTP via
         # attn_metadata.mamba_metadata.state_indices). Fall back to this
         # manager's own slot mapping when not provided.
         if state_indices is None:
             state_indices = self.get_state_indices()
-        state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
-
+        state_indices_d = state_indices[num_contexts:num_contexts +
+                                        num_gens].to(torch.int32)
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
+        # The accepted SSM/conv promotion is a bandwidth-bound gather->scatter
+        # into the dtype-reinterpreted, strided C++ pool view. torch.compile
+        # can't handle the dtype-view mutation (and Inductor chokes on the
+        # uint8 pool with "XBLOCK too large"), so a dedicated Triton kernel
+        # writes through the view's real strides (~85% of HBM peak, one launch
+        # per state).
         if self._use_replay_state_update:
             # SSM state is handled incrementally by the replay kernel.  Update
             # the per-slot accepted-token counter and flip the double-buffer
             # index so the next step reads from the buffer that was just
             # written by the precompute kernel.
+            slots = state_indices_d.long()
             accepted = num_accepted_tokens[num_contexts:num_contexts + num_gens]
-            self.prev_num_accepted_tokens[state_indices_d] = accepted.to(
+            self.prev_num_accepted_tokens[slots] = accepted.to(
                 self.prev_num_accepted_tokens.dtype)
-            self.cache_buf_idx[state_indices_d] = \
-                1 - self.cache_buf_idx[state_indices_d]
+            self.cache_buf_idx[slots] = 1 - self.cache_buf_idx[slots]
         else:
-            # Legacy: copy accepted SSM states from intermediate buffer back to pool
-            accepted_ssm = self.intermediate_ssm_states[:, src_state_indices,
-                                                        num_accepted_draft_tokens]
-            self.all_ssm_states[:, state_indices_d, :] = accepted_ssm
+            # Legacy: copy the accepted SSM state from the intermediate buffer.
+            _promote_mamba_state_triton(self.all_ssm_states,
+                                        self.intermediate_ssm_states,
+                                        src_state_indices,
+                                        num_accepted_draft_tokens,
+                                        state_indices_d)
 
-        # Conv: both paths save all intermediate conv windows, carry over the accepted one.
-        accepted_conv = self.intermediate_conv_states[:, src_state_indices,
-                                                      num_accepted_draft_tokens]
-        self.all_conv_states[:, state_indices_d, :] = accepted_conv
+        # Conv: both paths save all intermediate conv windows, carry over the
+        # accepted one.
+        _promote_mamba_state_triton(self.all_conv_states,
+                                    self.intermediate_conv_states,
+                                    src_state_indices,
+                                    num_accepted_draft_tokens, state_indices_d)
 
     def get_num_available_tokens(self,
                                  token_num_upper_bound: int,

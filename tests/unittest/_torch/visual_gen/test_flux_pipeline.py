@@ -865,6 +865,95 @@ class TestFluxBatchGeneration:
         assert mse > 100, f"Batch images are too similar (MSE={mse:.1f}), seeding may be broken"
         print(f"\n[Batch FLUX.2] Inter-image MSE = {mse:.1f} (images differ as expected)")
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux1_num_images_per_prompt(self, flux1_pipeline):
+        """FLUX.1 num_images_per_prompt: single prompt with N>1 produces N images."""
+        prompt = "a sunset over mountains"
+        num_images = 3
+
+        result = flux1_pipeline.forward(
+            prompt=prompt,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+            num_images_per_prompt=num_images,
+        )
+        assert result.image.dim() == 4, f"Expected 4D, got {result.image.shape}"
+        assert result.image.shape[0] == num_images, (
+            f"Expected {num_images} images, got {result.image.shape[0]}"
+        )
+        assert result.image.shape[1:] == (256, 256, 3)
+
+        # Images should differ (independent noise samples)
+        mse_01 = ((result.image[0].float() - result.image[1].float()) ** 2).mean().item()
+        mse_02 = ((result.image[0].float() - result.image[2].float()) ** 2).mean().item()
+        assert mse_01 > 100, f"Images 0,1 too similar (MSE={mse_01:.1f})"
+        assert mse_02 > 100, f"Images 0,2 too similar (MSE={mse_02:.1f})"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_num_images_per_prompt(self, flux2_pipeline):
+        """FLUX.2 num_images_per_prompt: single prompt with N>1 produces N images."""
+        prompt = "a cat on a roof"
+        num_images = 2
+
+        result = flux2_pipeline.forward(
+            prompt=prompt,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+            num_images_per_prompt=num_images,
+        )
+        assert result.image.dim() == 4, f"Expected 4D, got {result.image.shape}"
+        assert result.image.shape == (num_images, 256, 256, 3), (
+            f"Unexpected shape: {result.image.shape}"
+        )
+
+        # Images should differ (independent noise samples)
+        mse = ((result.image[0].float() - result.image[1].float()) ** 2).mean().item()
+        assert mse > 100, f"Images too similar (MSE={mse:.1f}), seeding may be broken"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux1_num_images_per_prompt_batch(self, flux1_pipeline):
+        """FLUX.1 num_images_per_prompt with batch: 2 prompts * 2 images = 4 outputs."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+        num_images = 2
+
+        result = flux1_pipeline.forward(
+            prompt=prompts,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+            num_images_per_prompt=num_images,
+        )
+        expected_batch = len(prompts) * num_images
+        assert result.image.shape[0] == expected_batch, (
+            f"Expected {expected_batch} images, got {result.image.shape[0]}"
+        )
+        assert result.image.shape[1:] == (256, 256, 3)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_num_images_per_prompt_batch(self, flux2_pipeline):
+        """FLUX.2 num_images_per_prompt with batch: 2 prompts * 2 images = 4 outputs."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+        num_images = 2
+
+        result = flux2_pipeline.forward(
+            prompt=prompts,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+            num_images_per_prompt=num_images,
+        )
+        expected_batch = len(prompts) * num_images
+        assert result.image.shape[0] == expected_batch, (
+            f"Expected {expected_batch} images, got {result.image.shape[0]}"
+        )
+        assert result.image.shape[1:] == (256, 256, 3)
+
 
 # =============================================================================
 # Multi-GPU Parallelism Tests (Ulysses sequence parallelism)
