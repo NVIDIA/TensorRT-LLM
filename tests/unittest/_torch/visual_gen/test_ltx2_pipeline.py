@@ -21,6 +21,7 @@ from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages as ltx2_two_stages
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig, CacheDiTConfig, VisualGenArgs
@@ -1102,6 +1103,262 @@ def ltx2_two_stage_assets_exist():
             f"upsampler at {UPSAMPLER_PATH}, and LoRA at {LORA_PATH}."
         )
     return True
+
+
+class TestLTX2TwoStageLoRAHelpers:
+    """Test LTX-2 two-stage distilled LoRA helpers without model loading."""
+
+    def test_bf16_snapshot_gate_uses_preload_memory(self, monkeypatch):
+        """Pre-load memory is the whole-pipeline budget and wins over current memory."""
+        queried_devices = []
+
+        def fake_get_free_gpu_memory_gib(device=None):
+            queried_devices.append(device)
+            return 1.0
+
+        monkeypatch.setattr(
+            ltx2_two_stages,
+            "_get_free_gpu_memory_gib",
+            fake_get_free_gpu_memory_gib,
+        )
+
+        assert ltx2_two_stages._should_save_bf16_weights(
+            device="cuda:1",
+            preload_free_gib=120.0,
+            threshold_gib=115.0,
+        )
+        assert not ltx2_two_stages._should_save_bf16_weights(
+            device="cuda:1",
+            preload_free_gib=110.0,
+            threshold_gib=115.0,
+        )
+        assert queried_devices == []
+
+    def test_bf16_snapshot_gate_fallback_passes_device(self, monkeypatch):
+        """Fallback free-memory query must target the transformer's CUDA device."""
+        queried_devices = []
+
+        def fake_get_free_gpu_memory_gib(device=None):
+            queried_devices.append(device)
+            return 116.0
+
+        monkeypatch.setattr(
+            ltx2_two_stages,
+            "_get_free_gpu_memory_gib",
+            fake_get_free_gpu_memory_gib,
+        )
+
+        assert ltx2_two_stages._should_save_bf16_weights(
+            device="cuda:1",
+            preload_free_gib=None,
+            threshold_gib=115.0,
+        )
+        assert queried_devices == ["cuda:1"]
+
+    def test_persistent_bf16_cache_reuses_weight_storage(self):
+        """Persistent BF16 cache swaps between the same original and merged tensors."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.tensor(
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        dtype=torch.bfloat16,
+                    )
+                )
+
+        module = TinyModule()
+        original = module.weight.detach().clone()
+        delta = torch.full_like(module.weight, 0.5)
+
+        cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
+            module,
+            {"weight": delta},
+        )
+        assert cache.applied_count == 1
+        assert cache.precision_counts() == {"bf16": 1}
+
+        original_ptr = module.weight.data_ptr()
+        cache.bind_merged()
+        merged_ptr = module.weight.data_ptr()
+        assert merged_ptr != original_ptr
+        assert torch.allclose(module.weight, original + delta)
+
+        cache.bind_original()
+        assert module.weight.data_ptr() == original_ptr
+        assert torch.equal(module.weight, original)
+
+        cache.bind_merged()
+        assert module.weight.data_ptr() == merged_ptr
+        assert torch.allclose(module.weight, original + delta)
+
+        cache.bind_original()
+        assert module.weight.data_ptr() == original_ptr
+        assert torch.equal(module.weight, original)
+
+    def test_persistent_fp8_cache_reuses_weight_and_scale_storage(self):
+        """Persistent FP8 cache swaps both quantized weight and scale storage."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Module()
+                bf16_weight = torch.tensor(
+                    [[1.0, 2.0], [3.0, 4.0]],
+                    dtype=torch.bfloat16,
+                )
+                weight_scale = torch.tensor(0.25, dtype=torch.float32)
+                self.proj.weight = torch.nn.Parameter(
+                    (bf16_weight.float() / weight_scale).to(torch.float8_e4m3fn),
+                    requires_grad=False,
+                )
+                self.proj.weight_scale = torch.nn.Parameter(
+                    weight_scale,
+                    requires_grad=False,
+                )
+
+        module = TinyModule()
+        original_weight = module.proj.weight.detach().clone()
+        original_scale = module.proj.weight_scale.detach().clone()
+        delta = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
+
+        cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
+            module,
+            {"proj.weight": delta},
+        )
+        assert cache.applied_count == 1
+        assert cache.precision_counts() == {"fp8": 1}
+
+        original_weight_ptr = module.proj.weight.data_ptr()
+        original_scale_ptr = module.proj.weight_scale.data_ptr()
+        cache.bind_merged()
+        merged_weight_ptr = module.proj.weight.data_ptr()
+        merged_scale_ptr = module.proj.weight_scale.data_ptr()
+        assert merged_weight_ptr != original_weight_ptr
+        assert merged_scale_ptr != original_scale_ptr
+        assert module.proj.weight.dtype == torch.float8_e4m3fn
+
+        cache.bind_original()
+        assert module.proj.weight.data_ptr() == original_weight_ptr
+        assert module.proj.weight_scale.data_ptr() == original_scale_ptr
+        assert torch.equal(module.proj.weight, original_weight)
+        assert torch.equal(module.proj.weight_scale, original_scale)
+
+        cache.bind_merged()
+        assert module.proj.weight.data_ptr() == merged_weight_ptr
+        assert module.proj.weight_scale.data_ptr() == merged_scale_ptr
+
+        cache.bind_original()
+        assert module.proj.weight.data_ptr() == original_weight_ptr
+        assert module.proj.weight_scale.data_ptr() == original_scale_ptr
+
+    def test_persistent_fp4_cache_swaps_quant_method_and_weight_storage(self, monkeypatch):
+        """Persistent FP4 cache binds merged BF16 weight and restores packed state."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = Linear(
+                    2,
+                    2,
+                    bias=False,
+                    dtype=torch.bfloat16,
+                    skip_create_weights_in_init=True,
+                    reduce_output=False,
+                )
+                self.linear.weight = torch.nn.Parameter(
+                    torch.zeros((2, 1), dtype=torch.uint8),
+                    requires_grad=False,
+                )
+                self.linear.weight_scale = torch.nn.Parameter(
+                    torch.ones((128, 4), dtype=torch.uint8),
+                    requires_grad=False,
+                )
+                self.linear.weight_scale_2 = torch.nn.Parameter(
+                    torch.ones((), dtype=torch.float32),
+                    requires_grad=False,
+                )
+                self.linear.quant_method = object()
+
+        module = TinyModule()
+        original_quant_method = module.linear.quant_method
+        original_weight_ptr = module.linear.weight.data_ptr()
+        original_weight = module.linear.weight.detach().clone()
+        delta = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
+
+        def fake_dequantize_fp4_weight(
+            packed_weight,
+            interleaved_scale,
+            weight_scale_2,
+            out_features,
+            in_features,
+        ):
+            assert packed_weight.data_ptr() == original_weight_ptr
+            assert out_features == 2
+            assert in_features == 2
+            return torch.ones((2, 2), dtype=torch.bfloat16)
+
+        monkeypatch.setattr(
+            ltx2_two_stages,
+            "_dequantize_fp4_weight",
+            fake_dequantize_fp4_weight,
+        )
+
+        cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
+            module,
+            {"linear.weight": delta},
+        )
+        assert cache.applied_count == 1
+        assert cache.precision_counts() == {"fp4": 1}
+
+        cache.bind_merged()
+        merged_weight_ptr = module.linear.weight.data_ptr()
+        assert merged_weight_ptr != original_weight_ptr
+        assert module.linear.weight.dtype == torch.bfloat16
+        assert torch.equal(module.linear.weight, torch.ones_like(delta) + delta)
+        assert isinstance(module.linear.quant_method, ltx2_two_stages.UnquantizedLinearMethod)
+
+        cache.bind_original()
+        assert module.linear.weight.data_ptr() == original_weight_ptr
+        assert torch.equal(module.linear.weight, original_weight)
+        assert module.linear.quant_method is original_quant_method
+
+        cache.bind_merged()
+        assert module.linear.weight.data_ptr() == merged_weight_ptr
+        cache.bind_original()
+        assert module.linear.weight.data_ptr() == original_weight_ptr
+
+    def test_apply_lora_deltas_rolls_back_dense_weights_on_failure(self):
+        """A later merge failure must not leave earlier dense weights LoRA-merged."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.good = torch.nn.Parameter(
+                    torch.tensor(
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        dtype=torch.bfloat16,
+                    )
+                )
+                self.bad = torch.nn.Parameter(torch.zeros((2, 1), dtype=torch.bfloat16))
+
+        module = TinyModule()
+        original_good = module.good.detach().clone()
+        deltas = {
+            "good": torch.full_like(module.good, 0.5),
+            "bad": torch.ones((2, 2), dtype=torch.bfloat16),
+        }
+
+        with pytest.raises(RuntimeError, match="missing bad.weight_scale"):
+            ltx2_two_stages._apply_lora_deltas(
+                module,
+                deltas,
+                sign=1.0,
+                save_bf16_weights=False,
+            )
+
+        assert torch.equal(module.good, original_good)
 
 
 class TestLTX2TwoStagePipelineLoading:
