@@ -33,7 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from ...utils import ActivationType, is_gated_activation, relu2
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import _warn_and_return
-from .quantization import NVFP4CutlassFusedMoEMethod, float4_sf_dtype
+from .quantization import EplbSupportStatus, NVFP4CutlassFusedMoEMethod, float4_sf_dtype
 
 # Block size for moe_align_block_size — must match TILE_M in the kernel
 _MOE_BLOCK_SIZE = 16
@@ -55,6 +55,11 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     which folds in ``input_scale``.  We intercept alpha loading to save the
     raw ``weight_scale_2`` values.
     """
+
+    # Marlin's ``post_load_weights`` repacks weights into Marlin tiled format
+    # and rebuilds the module parameters, which is incompatible with dynamic
+    # EPLB weight migration.
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def load_expert_fc31_alpha_nvfp4(
         self, w1_weight_scale_2, w3_weight_scale_2, final_fc31_input_scale, dst_fc31_alpha
