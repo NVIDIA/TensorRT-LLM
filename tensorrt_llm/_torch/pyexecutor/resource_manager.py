@@ -3147,13 +3147,13 @@ class KVCacheManagerV2(BaseResourceManager):
             primary_stats[pool_group_id].evictable
             for pool_group_id in pool_group_ids)
         stats.primary_peak_free_num_blocks = sum(
-            primary_peak_stats.available[pool_group_id]
+            primary_peak_stats[pool_group_id].available
             for pool_group_id in pool_group_ids)
         stats.primary_peak_used_num_blocks = sum(
-            primary_peak_stats.unavailable[pool_group_id]
+            primary_peak_stats[pool_group_id].unavailable
             for pool_group_id in pool_group_ids)
         stats.primary_peak_evictable_num_blocks = sum(
-            primary_peak_stats.evictable[pool_group_id]
+            primary_peak_stats[pool_group_id].evictable
             for pool_group_id in pool_group_ids)
         stats.secondary_max_num_blocks = sum(
             level_stats[pool_group_id].total
@@ -3170,16 +3170,17 @@ class KVCacheManagerV2(BaseResourceManager):
             for level_stats in secondary_stats_by_level
             for pool_group_id in pool_group_ids)
         stats.secondary_peak_free_num_blocks = sum(
-            peak_block_stats_by_cache_level[cache_level].
-            available[pool_group_id] for cache_level in secondary_cache_levels
+            peak_block_stats_by_cache_level[cache_level]
+            [pool_group_id].available for cache_level in secondary_cache_levels
             for pool_group_id in pool_group_ids)
         stats.secondary_peak_used_num_blocks = sum(
-            peak_block_stats_by_cache_level[cache_level].
-            unavailable[pool_group_id] for cache_level in secondary_cache_levels
+            peak_block_stats_by_cache_level[cache_level]
+            [pool_group_id].unavailable
+            for cache_level in secondary_cache_levels
             for pool_group_id in pool_group_ids)
         stats.secondary_peak_evictable_num_blocks = sum(
-            peak_block_stats_by_cache_level[cache_level].
-            evictable[pool_group_id] for cache_level in secondary_cache_levels
+            peak_block_stats_by_cache_level[cache_level]
+            [pool_group_id].evictable for cache_level in secondary_cache_levels
             for pool_group_id in pool_group_ids)
         self._apply_iteration_stats_delta(stats, delta, field_names)
         return stats
