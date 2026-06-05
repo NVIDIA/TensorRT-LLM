@@ -416,6 +416,11 @@ def flashinfer_mha_with_cache(
             kv_layout=_GlobalFlashInferPlanner.kv_layout,
         )
 
+    if num_prefill > 0 and not read_cache_only:
+        # FlashInfer planning depends on the preceding paged-KV append completing.
+        # Keep the same append-before-plan synchronization used by the PyTorch backend.
+        torch.cuda.current_stream().synchronize()
+
     bs = b * s
     if out is not None:
         y = out.view(-1, n_heads, head_dim)
