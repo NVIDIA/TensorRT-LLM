@@ -142,7 +142,7 @@ def test_vsa_topk_collapses_to_dense_at_sparsity_zero():
 )
 def test_vsa_tile_untile_roundtrip(latent_shape):
     """VSAPreprocessor.tile then .untile must losslessly reproduce the input."""
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import VSAPreprocessor
+    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.vsa import VSAPreprocessor
 
     device = torch.device("cuda")
     dtype = torch.bfloat16

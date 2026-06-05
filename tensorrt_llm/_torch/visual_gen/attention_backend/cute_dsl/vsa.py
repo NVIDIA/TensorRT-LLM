@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-CuTe DSL (NVIDIA kernels) Backend for Visual Generation Models
+Video Sparse Attention (VSA) backend for visual generation models.
 
-CuTeDSLAttention runs the VSA sparse path when sparse_attention_config is set,
-otherwise the dense cubin path (with optional QK16PV8 quantization).
-Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
+VSAAttention implements hierarchical sparse attention:
+  - Coarse branch: mean-pooled cube attention (always dense)
+  - Fine branch: block-sparse top-K attention via CuTe JIT kernel (sm100+)
+    or dense SDPA fallback when CuTe is unavailable / head_dim != 128.
 """
 
 import contextvars
-import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from math import ceil
@@ -30,23 +30,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm.visual_gen.args import QuantAttentionConfig
-
-from ...attention_backend.interface import PredefinedAttentionMask
-from .interface import AttentionBackend, AttentionTensorLayout
-
-_cute_dsl_import_error = None
-try:
-    import tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.attention as cute_dsl
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.attention.fmha import (
-        _cute_runtime_import_error,
-    )
-
-    if _cute_runtime_import_error is not None:
-        raise ImportError(_cute_runtime_import_error)
-except (ImportError, OSError) as e:
-    cute_dsl = None
-    _cute_dsl_import_error = e
+from ..interface import AttentionBackend, AttentionTensorLayout
 
 _vsa_import_error = None
 try:
@@ -59,8 +43,6 @@ except (ImportError, OSError) as e:
     is_cute_supported = None
     _vsa_import_error = e
 
-
-# VSA (Video Sparse Attention) sparse-path helpers
 
 # Must match the Blackwell kernel's block_size expectation.
 VSA_TILE_SIZE: Tuple[int, int, int] = (4, 4, 4)
@@ -258,13 +240,16 @@ class VSAPreprocessor:
         return x.index_select(1, non_pad_index).index_select(1, reverse_tile_partition_indices)
 
 
-class CuTeDSLAttention(AttentionBackend):
+class VSAAttention(AttentionBackend):
     """
-    CuTe DSL (NVIDIA kernels) backend for diffusion models.
+    Video Sparse Attention (VSA) backend for diffusion models.
 
-    Dense path uses pre-compiled cubins and requires head_dim=128. The VSA
-    sparse path (sparse_attention_config set) uses a JIT-compiled CuTe kernel
-    when head_dim=128 / fp16-bf16 / sm100+, and otherwise falls back to dense SDPA.
+    Implements coarse mean-pool + fine block-sparse top-K attention.
+    The fine branch uses a JIT-compiled CuTe kernel on sm100+ for
+    head_dim=128 / fp16-bf16; otherwise falls back to dense SDPA.
+
+    Requires an active VSA forward context (set_vsa_forward_context) during
+    each forward call. Does not support LSE output.
     """
 
     def __init__(
@@ -274,183 +259,15 @@ class CuTeDSLAttention(AttentionBackend):
         head_dim: int = 64,
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
-        quant_attention_config: Optional[QuantAttentionConfig] = None,
         sparse_attention_config=None,
-        skip_softmax_threshold_scale: Optional[float] = None,
         **kwargs,
     ):
-        # Dense cubin path is head_dim=128-only (packaged cubins), so enforce it
-        # here. The VSA path needs no check: it is gated at runtime by
-        # is_cute_supported and falls back to dense SDPA when head_dim != 128.
-        if sparse_attention_config is None and head_dim != 128:
-            raise ValueError(f"CUTEDSL cubins require head_dim=128, got head_dim={head_dim}.")
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
-        self.quant_attention_config = quant_attention_config
         self.sparse_attention_config = sparse_attention_config
-        self.skip_softmax_threshold_scale = skip_softmax_threshold_scale
-        self.scale = 1.0 / math.sqrt(head_dim)
-
-        # CuTe DSL expects [B, S, H, D] format
-        self._preferred_layout = AttentionTensorLayout.NHD
-
-    def _prepare_inputs(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        attention_mask: PredefinedAttentionMask,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, torch.dtype]:
-        """Cast inputs to CuTeDSL-compatible dtype and resolve causal flag."""
-        if _cute_dsl_import_error is not None:
-            raise ImportError(
-                f"CuTe DSL kernels are not available. Import error: {_cute_dsl_import_error}"
-            ) from _cute_dsl_import_error
-
-        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
-
-        # Packaged cubins support float16 and bfloat16 only.
-        origin_dtype = q.dtype
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
-        return q, k, v, is_causal, origin_dtype
-
-    # cute_dsl.cute_dsl_fmha_fwd is already decorated with @torch.compiler.disable
-    # Allow torch.compile to fuse preceding linear/norm with quantization of V / seq-preprocess
-    def _fwd(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        is_causal: bool,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len_q, num_heads, _ = q.shape
-        _, seq_len_kv, _, value_head_dim = v.shape
-        out = torch.empty(
-            batch_size,
-            seq_len_q,
-            num_heads,
-            value_head_dim,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        lse = torch.empty(
-            batch_size,
-            seq_len_q,
-            num_heads,
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-        # Options that instructs quantization of V
-        scale_v = kwargs.get("scale_v", 1.0)
-        if self.quant_attention_config is not None:
-            v_qscale = 448.0 / v.abs().amax().clamp(min=1e-3)
-            v = (v * v_qscale).to(torch.float8_e4m3fn)
-            scale_v = scale_v / v_qscale
-
-        # Sequence preproc.
-        qo_indptr_host = [i * seq_len_q for i in range(batch_size + 1)]
-        qo_indptr = torch.tensor(qo_indptr_host).to(device=q.device, dtype=torch.int32)
-        kv_indptr_host = [i * seq_len_kv for i in range(batch_size + 1)]
-        kv_indptr = torch.tensor(kv_indptr_host).to(device=q.device, dtype=torch.int32)
-
-        # Skip softmax.
-        skip_softmax_threshold_scale = self.skip_softmax_threshold_scale
-        if skip_softmax_threshold_scale is not None and skip_softmax_threshold_scale <= 0.0:
-            skip_softmax_threshold_scale = None
-
-        cute_dsl.cute_dsl_fmha_fwd(
-            q.flatten(0, 1).contiguous(),
-            k.flatten(0, 1).contiguous(),
-            v.flatten(0, 1).contiguous(),
-            out.flatten(0, 1),
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            is_causal=is_causal,
-            sm_scale=self.scale,
-            lse=lse.flatten(0, 1).contiguous(),
-            scale_q=kwargs.get("scale_q", 1.0),
-            scale_k=kwargs.get("scale_k", 1.0),
-            scale_v=scale_v,
-            scale_o=kwargs.get("scale_o", 1.0),
-            max_qo_len=seq_len_q,
-            max_kv_len=seq_len_kv,
-            is_persistent=False,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale,
-        )
-        return out, lse
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
-        gate_compress: Optional[torch.Tensor] = None,
-        gate_fine: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Forward pass using CuTe DSL (NVIDIA kernels).
-
-        Dimensions are derived from tensor shapes (NHD layout: [B, S, H, D]).
-        Dispatches to _forward_vsa when sparse_attention_config is set
-        (VSA sparse path); otherwise runs the dense cubins via forward_with_lse.
-
-        Args:
-            q: Query tensor [batch_size, seq_len, num_heads, head_dim]
-            k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
-            v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
-            attention_mask: Attention mask type (CAUSAL or FULL) — dense path only.
-            gate_compress: VSA path only — G_c gate for the coarse branch.
-            gate_fine: VSA path only — G_f gate for the fine branch. None means
-                constant 1.
-
-        Returns:
-            Output tensor [batch_size, seq_len, num_heads, head_dim]
-        """
-        if self.sparse_attention_config is not None:
-            return self._forward_vsa(q, k, v, gate_compress=gate_compress, gate_fine=gate_fine)
-        output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
-        return output
-
-    def forward_with_lse(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass returning both output and log-sum-exp (LSE). Dense path
-        only — the VSA sparse path does not produce an LSE.
-
-        Returns:
-            output: [batch_size, seq_len, num_heads, head_dim]
-            lse:    [batch_size, num_heads, seq_len] - log-sum-exp per query position,
-                    always in float32. Used for numerically stable combination of
-                    partial attention results in Attention2D parallelism.
-        """
-        if self.sparse_attention_config is not None:
-            raise RuntimeError(
-                "CuTeDSLAttention.forward_with_lse() does not support the VSA "
-                "sparse path. Use forward() instead, or construct without "
-                "sparse_attention_config to use the dense path."
-            )
-        q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
-        output, lse = self._fwd(q, k, v, is_causal, **kwargs)
-        if output.dtype != origin_dtype:
-            output = output.to(origin_dtype)
-        return output, lse.transpose(1, 2)
 
     # Dynamo can't guard on the module-level mutable global, so this read
     # runs in eager.
@@ -459,7 +276,7 @@ class CuTeDSLAttention(AttentionBackend):
         ctx: Optional[VSAMetadata] = get_vsa_forward_context()
         if ctx is None:
             raise RuntimeError(
-                "CuTeDSLAttention._forward_vsa called without an active VSA forward context. "
+                "VSAAttention.forward called without an active VSA forward context. "
                 "Wrap each transformer call with set_vsa_forward_context()."
             )
         return (
@@ -472,16 +289,18 @@ class CuTeDSLAttention(AttentionBackend):
             ctx.vsa_sparsity,
         )
 
-    def _forward_vsa(
+    def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         *,
-        gate_compress: Optional[torch.Tensor],
-        gate_fine: Optional[torch.Tensor],
+        gate_compress: Optional[torch.Tensor] = None,
+        gate_fine: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
-        """VSA forward: coarse mean-pool + fine block-sparse top-K.
+        """
+        VSA forward: coarse mean-pool + fine block-sparse top-K.
 
         Args:
             q, k, v: [B, S, H, D] in original (un-tiled) token order.
@@ -494,7 +313,7 @@ class CuTeDSLAttention(AttentionBackend):
         """
         if gate_compress is None:
             raise ValueError(
-                "CuTeDSLAttention VSA path requires gate_compress. "
+                "VSAAttention requires gate_compress. "
                 "Ensure to_gate_compress is wired in the transformer block."
             )
 
@@ -577,12 +396,11 @@ class CuTeDSLAttention(AttentionBackend):
 
     @classmethod
     def support_lse(cls) -> bool:
-        return True
+        return False
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
-        """Return the preferred tensor layout for this backend."""
-        return self._preferred_layout
+        return AttentionTensorLayout.NHD
 
     @classmethod
     def support_fused_qkv(cls) -> bool:
