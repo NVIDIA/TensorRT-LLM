@@ -905,6 +905,15 @@ def create_input_processor(
             MistralConfigLoader
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
+        if getattr(config, "input_processor_type", None) == "mistral3_common":
+            from tensorrt_llm._torch.models.modeling_mistral import \
+                MistralNativeInputProcessor
+            return MistralNativeInputProcessor(
+                model_path_or_dir,
+                config,
+                tokenizer,
+                trust_remote_code=trust_remote_code,
+                **kwargs)
     else:
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")
