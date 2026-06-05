@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import unittest
 
 import torch
@@ -94,6 +96,53 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
                          self.image["image_height"])
         self.assertEqual(params.multimodal_data["image"]["image_width"],
                          self.image["image_width"])
+
+    def test_encode_context_keys_survive_handle_round_trip(self):
+        """The two encode-context wire keys survive the worker boundary.
+
+        `multimodal_item_order` and `multimodal_embedding_lengths` are CPU-only
+        plain-Python metadata (`_CPU_ONLY_MULTIMODAL_DATA_KEYS`); the encode
+        worker crosses the process boundary via `to_handle` (encode side) ->
+        pickle -> `to_tensor` (worker side). This guards that both keys round-trip
+        byte-identical for a SINGLE-modality param (the shape the B-lite producer
+        bake newly emits), riding alongside a real tensor that DOES go through the
+        shared-tensor handle conversion.
+        """
+        item_order = [
+            {
+                "modality": "image",
+                "index": 0
+            },
+            {
+                "modality": "image",
+                "index": 1
+            },
+        ]
+        embedding_lengths = [682, 357]
+
+        params = MultimodalParams()
+        params.multimodal_data = {
+            "image": {
+                "pixel_values": self.image["pixel_values"]
+            },
+            "multimodal_item_order": item_order,
+            "multimodal_embedding_lengths": embedding_lengths,
+        }
+
+        params.to_handle("multimodal_data")
+        params.to_tensor("multimodal_data")
+
+        # Both CPU-only ctx keys are unchanged across the round-trip.
+        self.assertEqual(params.multimodal_data["multimodal_item_order"],
+                         item_order)
+        self.assertEqual(params.multimodal_data["multimodal_embedding_lengths"],
+                         embedding_lengths)
+        # Sanity: the real tensor riding alongside still round-trips correctly.
+        self.assertIsInstance(params.multimodal_data["image"]["pixel_values"],
+                              torch.Tensor)
+        self.assertTrue(
+            torch.allclose(params.multimodal_data["image"]["pixel_values"],
+                           self.image["pixel_values"]))
 
 
 class TestMultimodalParamsDeviceTransfer(unittest.TestCase):
