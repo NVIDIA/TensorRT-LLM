@@ -14,6 +14,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
+    ConversationAwareADPRouter,
     DefaultADPRouter,
     KVCacheAwareADPRouter,
     RankState,
@@ -988,3 +989,177 @@ class TestKVCacheAwareADPRouterRouting:
         )
         assert len(result_strict[0]) == 2
         assert sum(len(result_strict[r]) for r in range(1, tp_size)) == 6
+
+
+def _make_conv_request_item(
+    req_id,
+    conversation_id,
+    target_dp_rank=None,
+    attention_dp_relax=True,
+    num_tokens=10,
+):
+    """Mock RequestQueueItem carrying a conversation_id on disaggregated_params."""
+    item = MagicMock()
+    item.id = req_id
+    item.child_req_ids = None
+    scheduling_params = MagicMock()
+    scheduling_params.attention_dp_rank = target_dp_rank
+    scheduling_params.attention_dp_relax = attention_dp_relax
+    item.request = MagicMock()
+    item.request.py_scheduling_params = scheduling_params
+    item.request.input_token_ids = list(range(num_tokens))
+    item.request.py_orig_prompt_len = num_tokens
+    if conversation_id is None:
+        item.request.py_disaggregated_params = None
+    else:
+        disagg = MagicMock()
+        disagg.conversation_id = conversation_id
+        item.request.py_disaggregated_params = disagg
+    return item
+
+
+class TestConversationAwareADPRouter:
+    """Routing behavior of ConversationAwareADPRouter (explicit conv->rank)."""
+
+    @staticmethod
+    def _router(tp_size=4, max_sessions=1 << 16):
+        return ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=tp_size), max_sessions=max_sessions
+        )
+
+    @staticmethod
+    def _states(tp_size, active=None):
+        active = active or [0] * tp_size
+        return [
+            RankState(rank=r, num_active_requests=active[r], num_active_tokens=active[r] * 10)
+            for r in range(tp_size)
+        ]
+
+    @staticmethod
+    def _route(router, states, items, cap=1000):
+        assign, _ = router.route_requests(states, items, max_num_active_requests=cap)
+        pos = {}
+        for rank, lst in assign.items():
+            for it in lst:
+                pos[it.id] = rank
+        return pos
+
+    def test_interface_compliance(self):
+        assert isinstance(self._router(), ADPRouter)
+
+    def test_first_turn_round_robin(self):
+        """First request of each conversation spreads one-per-rank (RR)."""
+        router = self._router(tp_size=4)
+        items = [_make_conv_request_item(i, f"conv{i}") for i in range(4)]
+        pos = self._route(router, self._states(4), items)
+        assert sorted(pos.values()) == [0, 1, 2, 3]
+
+    def test_subsequent_turns_are_sticky(self):
+        """Later turns of a conversation return to its first-turn rank."""
+        router = self._router(tp_size=4)
+        convs = ["A", "B", "C", "D"]
+        first = [_make_conv_request_item(i, convs[i]) for i in range(4)]
+        pos1 = self._route(router, self._states(4), first)
+        home = {convs[i]: pos1[i] for i in range(4)}
+        # A new batch of second turns (fresh ids) for the same conversations.
+        second = [_make_conv_request_item(100 + i, convs[i]) for i in range(4)]
+        pos2 = self._route(router, self._states(4), second)
+        for i in range(4):
+            assert pos2[100 + i] == home[convs[i]]
+
+    def test_no_conversation_id_falls_back_and_is_not_recorded(self):
+        router = self._router(tp_size=4)
+        items = [_make_conv_request_item(i, None) for i in range(8)]
+        pos = self._route(router, self._states(4), items)
+        assert len(pos) == 8
+        # Nothing recorded for conversation-less requests.
+        assert dict(router._conv_to_rank) == {}
+        # Round-robin spread keeps ranks within one of each other.
+        counts = [sum(1 for v in pos.values() if v == r) for r in range(4)]
+        assert max(counts) - min(counts) <= 1
+
+    def test_routing_is_deterministic_across_ranks(self):
+        """Two independent instances (= two TP ranks) must agree exactly, or
+        the no-broadcast allgather protocol would deadlock."""
+        convs = ["A", "B", "C", None, "A", "B", "E", None, "C"]
+
+        def run():
+            router = self._router(tp_size=4)
+            items = [_make_conv_request_item(i, convs[i]) for i in range(len(convs))]
+            return self._route(router, self._states(4), items)
+
+        assert run() == run()
+
+    def test_lru_eviction_bounds_map(self):
+        router = self._router(tp_size=2, max_sessions=2)
+        items = [_make_conv_request_item(i, f"c{i}") for i in range(5)]
+        self._route(router, self._states(2), items)
+        assert len(router._conv_to_rank) == 2
+        assert set(router._conv_to_rank) == {"c3", "c4"}
+
+    def test_explicit_target_dp_rank_respected(self):
+        router = self._router(tp_size=4)
+        item = _make_conv_request_item(
+            1, "A", target_dp_rank=2, attention_dp_relax=False
+        )
+        pos = self._route(router, self._states(4), [item])
+        assert pos[1] == 2
+
+    def test_sticky_overflow_keeps_mapping(self):
+        """When the home rank is at the hard cap, the turn overflows but the
+        conversation stays mapped home (returns next batch)."""
+        router = self._router(tp_size=2)
+        # Seed conv A -> rank 0.
+        self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
+        home = router._conv_to_rank["A"]
+        # Saturate the home rank, route A again -> must overflow off home...
+        states = self._states(2)
+        states[home] = RankState(rank=home, num_active_requests=5, num_active_tokens=50)
+        pos = self._route(router, states, [_make_conv_request_item(2, "A")], cap=5)
+        assert pos[2] != home
+        # ...but the mapping is unchanged so it can return home later.
+        assert router._conv_to_rank["A"] == home
+
+    def test_create_rank_state(self):
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_rank=2))
+        req1 = Mock(py_orig_prompt_len=100)
+        req2 = Mock(py_orig_prompt_len=50)
+        state = router.create_rank_state(active_requests=[req1, req2], new_requests=[])
+        assert state.rank == 2
+        assert state.num_active_requests == 2
+        assert state.num_active_tokens == 150
+
+    def test_factory_selects_conversation_router(self):
+        cfg = MagicMock()
+        cfg.kv_cache_routing_conversation_affinity = True
+        cfg.kv_cache_routing_max_sessions = 8
+        router = ADPRouter.create(
+            dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg
+        )
+        assert isinstance(router, ConversationAwareADPRouter)
+        assert router._max_sessions == 8
+
+    def test_factory_default_when_disabled(self):
+        cfg = MagicMock()
+        cfg.kv_cache_routing_conversation_affinity = False
+        cfg.enable_kv_cache_aware_routing = False
+        router = ADPRouter.create(
+            dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg
+        )
+        assert isinstance(router, DefaultADPRouter)
+
+    def test_returned_expected_covers_every_rank(self):
+        """Regression: returned expected_num_active_requests must be >= every
+        rank's post-assignment active count, else
+        py_executor._pad_attention_dp_dummy_request asserts and the executor
+        hangs. A sticky storm (one conversation hammered) must not push its home
+        rank past expected."""
+        router = self._router(tp_size=8)
+        states = self._states(8)
+        # 40 requests for the SAME conversation: with the old hard-cap sticky
+        # logic this concentrated > expected on the home rank and crashed.
+        items = [_make_conv_request_item(i, "A") for i in range(40)]
+        assign, expected = router.route_requests(states, items, max_num_active_requests=256)
+        final = [states[r].num_active_requests + len(assign[r]) for r in range(8)]
+        assert all(expected >= f for f in final), (expected, final)
+        assert sum(len(v) for v in assign.values()) == 40  # nothing dropped
