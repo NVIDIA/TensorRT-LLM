@@ -652,8 +652,15 @@ def load_hf_tokenizer(model_dir: str,
         raise
 
     try:
-        kwargs_with_local_cache = {'local_files_only': True, **kwargs}
-        tokenizer = TransformersTokenizer.from_pretrained(model_dir, **kwargs_with_local_cache)
+        kwargs['local_files_only'] = True
+        tokenizer = TransformersTokenizer.from_pretrained(
+            model_dir,
+            legacy=False,
+            padding_side='left',
+            truncation_side='left',
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+            **kwargs)
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
         return tokenizer
