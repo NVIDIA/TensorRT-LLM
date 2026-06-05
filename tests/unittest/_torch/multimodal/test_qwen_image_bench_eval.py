@@ -69,6 +69,15 @@ def test_creative_generation_feature_mapping_alias():
     assert dimension_score["level1_score"] == 80.0
 
 
+def test_parse_dimension_output_handles_non_object_json():
+    module = _load_eval_module()
+
+    fixed_scores, dimension_score = module.parse_dimension_output("[]", "Quality")
+
+    assert fixed_scores is None
+    assert dimension_score is None
+
+
 def test_total_score_averages_available_level1_scores():
     module = _load_eval_module()
 

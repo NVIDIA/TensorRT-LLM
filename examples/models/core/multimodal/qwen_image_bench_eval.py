@@ -236,14 +236,18 @@ def extract_json_from_response(response_text: str) -> dict[str, Any] | None:
     text = text.strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
 
     json_match = re.search(r"\{[\s\S]*\}", text)
     if json_match:
         try:
-            return json.loads(json_match.group())
+            parsed = json.loads(json_match.group())
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
@@ -327,6 +331,8 @@ def parse_dimension_output(
     output_text: str, level1_dim: str
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     score_json = extract_json_from_response(output_text)
+    if not score_json:
+        return None, None
     fixed_score_json = fix_score_json(score_json, level1_dim)
     if fixed_score_json is None:
         return None, None
