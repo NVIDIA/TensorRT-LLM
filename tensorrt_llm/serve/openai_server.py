@@ -1404,6 +1404,9 @@ class OpenAIServer(_VideoRoutesMixin):
             texts = ([request.input]
                      if isinstance(request.input, str) else request.input)
 
+            # Workaround: the model class defines its output key name, but the
+            # serving layer cannot discover it automatically yet. This env var
+            # bridges that gap until encode path supports batching/chunked-prefill.
             output_name = os.environ.get("TRTLLM_EMBEDDING_OUTPUT_NAME")
             if output_name is None:
                 return self.create_error_response(
