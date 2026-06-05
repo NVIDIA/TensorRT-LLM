@@ -141,10 +141,7 @@ class _StubQueueItem:
         self.id = _StubQueueItem._next_id
 
 
-def _build_fake_self(queued_items,
-                     model_engine_iter_states,
-                     *,
-                     enable_attention_dp=False):
+def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention_dp=False):
     """Minimal 'self' for ``PyExecutor._update_iter_stats(self, ...)``.
 
     Stubs only the ``self.*`` attributes the method actually reads:
@@ -205,10 +202,7 @@ def _invoke_update_iter_stats(
         When None, defaults to the same partial ``num_ctx_tokens`` payload used
         by older tests.
     """
-    from tensorrt_llm._torch.pyexecutor.py_executor import (
-        PyExecutor,
-        ScheduledBatchStats,
-    )
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, ScheduledBatchStats
 
     model_engine_iter_states = (
         None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
@@ -918,8 +912,7 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
     """
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    fake_self = _build_fake_self(
-        queued_items=[], model_engine_iter_states={"num_ctx_tokens": 0})
+    fake_self = _build_fake_self(queued_items=[], model_engine_iter_states={"num_ctx_tokens": 0})
     # Live counter is several loops ahead of when the batch was built; any
     # accidental re-stamp would surface here.
     fake_self.iter_counter = 999
