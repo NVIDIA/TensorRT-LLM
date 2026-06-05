@@ -467,12 +467,15 @@ class ModelConfig(Generic[TConfig]):
         # Read exclude_modules from HF config if present (HF format module names)
         hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
 
-        # DeepSeek V3 FP8 ckpt
-        if hf_quant_config.get("quant_method") == "fp8" and hf_quant_config.get(
-                "weight_block_size", []):
+        # FP8 ckpt: DeepSeek V3 style (weight_block_size) or
+        # per-tensor static activation scale style (activation_scheme="static",
+        # e.g. Ministral / Pixtral).
+        if hf_quant_config.get("quant_method") == "fp8" and (
+                hf_quant_config.get("weight_block_size")
+                or hf_quant_config.get("activation_scheme") == "static"):
             quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
-            block_size = hf_quant_config.get("weight_block_size", [])
+            block_size = hf_quant_config.get("weight_block_size") or [128, 128]
             assert tuple(block_size) == (
                 128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
             quant_config.group_size = block_size[0]

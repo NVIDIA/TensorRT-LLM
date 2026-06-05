@@ -47,6 +47,7 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
@@ -63,7 +64,13 @@ class MistralAttention(Attention):
         rope_params = RopeParams.from_config(config)
         rope_params_section = getattr(config, "rope_scaling", None) or getattr(
             config, "rope_parameters", None)
-        rope_type = getattr(rope_params_section, "rope_type", None)
+
+        rope_type = getattr(
+            rope_params_section, "rope_type",
+            None) or (rope_params_section.get("rope_type") if isinstance(
+                rope_params_section, dict) else None) or getattr(
+                    config, "rope_type", None)
+
         if rope_type == "yarn":
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.yarn,
@@ -352,46 +359,9 @@ class MistralCommonImageProcessor:
         return processed
 
 
-class Mistral3InputProcessor(BaseMultimodalInputProcessor,
-                             BaseMultimodalDummyInputsBuilder):
-
-    def __init__(
-        self,
-        model_path: str,
-        config: PretrainedConfig,
-        tokenizer: AutoTokenizer | None,
-        trust_remote_code: bool = False,
-        model_type: str = "mistral3",
-        **kwargs,
-    ):
-        super().__init__(model_path=model_path,
-                         config=config,
-                         tokenizer=tokenizer,
-                         trust_remote_code=trust_remote_code,
-                         **kwargs)
-        self._config = config
-        self._dtype = self._config.torch_dtype
-        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
-            model_path,
-            config=config,
-            use_fast=self.use_fast,
-            trust_remote_code=trust_remote_code)
-        self._model_path = model_path
-        auto_processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=self.use_fast,
-            trust_remote_code=trust_remote_code)
-        if model_type == "mistral_large_3":
-            # For mistral large 3, we add chat template in the model forward, and the
-            # MistralCommonImageProcessor is used to process the input when both text and images are provided.
-            # When the input only contains text, we use the text processor to process the input.
-            self._processor = MistralCommonImageProcessor(
-                tokenizer=self._tokenizer, dtype=self.dtype)
-            self.text_processor = auto_processor
-        else:
-            # For other mistral models, we use the AutoProcessor to process the input.
-            self._processor = auto_processor
-            self.text_processor = self._processor
+class MistralInputProcessorBase(BaseMultimodalInputProcessor,
+                                BaseMultimodalDummyInputsBuilder):
+    """Shared logic for HF and native Mistral VLM input processors."""
 
     @property
     def config(self) -> PretrainedConfig:
@@ -413,6 +383,100 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def get_vocab_size(self) -> int:
+        return self.config.text_config.vocab_size
+
+    def get_mm_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            self.processor.image_token_id,
+            self.processor.image_break_token_id,
+            self.processor.image_end_token_id,
+        ])
+
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            self.processor.image_break_token_id,
+            self.processor.image_end_token_id,
+        ])
+
+    @staticmethod
+    def _extract_extra_processed_inputs(
+            processed) -> ExtraProcessedInputs | None:
+        pixel_values = processed.get("pixel_values")
+        if pixel_values is None:
+            return None
+        processed.pop("attention_mask", None)
+        processed["image_sizes"] = processed["image_sizes"].tolist()
+        return {"multimodal_data": {"image": {**processed}}}
+
+
+class MistralHFInputProcessor(BaseMultimodalInputProcessor,
+                              BaseMultimodalDummyInputsBuilder):
+    """Input processor for Mistral VLM checkpoints in HuggingFace format."""
+
+    def __init__(self,
+                 model_path: str,
+                 config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
+        self._config = config
+        self._dtype = self._config.torch_dtype
+        self._model_path = model_path
+        self._tokenizer = (tokenizer if tokenizer is not None else
+                           AutoTokenizer.from_pretrained(
+                               model_path,
+                               config=config,
+                               use_fast=True,
+                               trust_remote_code=True))
+        self._processor = AutoProcessor.from_pretrained(
+            model_path,
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
+        logger.info(f"[mistral] HF processor={type(self._processor).__name__} "
+                    f"tokenizer={type(self._tokenizer).__name__}")
+
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    def get_vocab_size(self) -> int:
+        return self.config.text_config.vocab_size
+
+    def get_mm_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            self.processor.image_token_id,
+            self.processor.image_break_token_id,
+            self.processor.image_end_token_id,
+        ])
+
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            self.processor.image_break_token_id,
+            self.processor.image_end_token_id,
+        ])
+
     @torch.inference_mode()
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -421,38 +485,22 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         do_rescale = getattr(self.processor.image_processor, "do_rescale",
                              False)
         if images is not None and isinstance(images[0], torch.Tensor):
-            # The default multimodal input loader will normalize images to [0, 1] when the requested
-            # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
+            # The default multimodal input loader normalises images to [0, 1]
+            # for "pt" tensors but not for PIL images.
             do_rescale = False
 
-        if images is not None:
-            processed = self.processor(
-                text=inputs["prompt"],
-                images=images,
-                do_rescale=do_rescale,
-            )
-        else:
-            processed = self.text_processor(
-                text=inputs["prompt"],
-                do_rescale=do_rescale,
-            )
+        prompt = inputs["prompt"]
+        processed = self.processor(text=prompt,
+                                   images=images,
+                                   do_rescale=do_rescale)
         input_ids = processed.pop("input_ids").tolist()[0]
-        # Remaining in `processed`:
-        # * "attention_mask": [B, num_input_tokens]
-        # * "pixel_values": [B, C, H, W]
-        # * "image_sizes": [B, 2]
         extra_processed_inputs = None
         pixel_values = processed.get("pixel_values")
         if pixel_values is not None:
-            # We have no use for the `attention_mask`.
             processed.pop("attention_mask")
-            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
-            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
-            # reaching the model forward. Since its values are used to infer the amount of padding
-            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
-            # list here to avoid this.
+            # Keep as list to avoid a D2H copy when the tensor would otherwise
+            # be moved to GPU before the model forward.
             processed["image_sizes"] = processed["image_sizes"].tolist()
-            # NOTE: `processed` is a dict-like object, but not actually a dict.
             extra_processed_inputs = {
                 "multimodal_data": {
                     "image": {
@@ -463,96 +511,81 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
 
         return input_ids, extra_processed_inputs
 
-    def get_vocab_size(self) -> int:
-        """Return the vocab size of the model."""
-        # Unlike some other VLMs, mistral3's vocab size is stored in its `text_config`, not the top-level
-        # config.
-        return self.config.text_config.vocab_size
 
-    def get_mm_token_ids(self) -> torch.Tensor:
-        """Get the IDs of all multimodal tokens (placeholders and special tokens alike)."""
-        return torch.tensor([
-            # This is the `[IMG]` token id inserted into the prompt that should be replaced with image
-            # embeddings.
-            self.processor.image_token_id,
-            # This is the `[IMG_BREAK]` token id at the end of every "row".
-            self.processor.image_break_token_id,
-            # This is the `[IMG_END]` token id to signify the end of an image.
-            self.processor.image_end_token_id,
-        ])
-
-    def get_mm_special_token_ids(self) -> torch.Tensor:
-        """Get the IDs of special multimodal tokens (placeholders not included)."""
-        return torch.tensor([
-            self.processor.image_break_token_id,
-            self.processor.image_end_token_id,
-        ])
-
-
-class MistralCommonInputProcessor(Mistral3InputProcessor):
+class MistralNativeInputProcessor(MistralInputProcessorBase):
+    """Input processor for Mistral VLM checkpoints in mistral-native format."""
 
     def __init__(
         self,
         model_path: str,
         config: PretrainedConfig,
-        tokenizer: AutoTokenizer,
+        tokenizer: AutoTokenizer | None,
         trust_remote_code: bool = False,
         **kwargs,
     ):
-        tokenizer = self.load_tokenizer(model_path,
-                                        config=config,
-                                        tokenizer=tokenizer)
         super().__init__(model_path=model_path,
                          config=config,
                          tokenizer=tokenizer,
                          trust_remote_code=trust_remote_code,
-                         model_type=getattr(config, "input_processor_type",
-                                            "mistral3"),
                          **kwargs)
+        self._config = config
+        self._dtype = self._config.torch_dtype
+        self._model_path = model_path
+        self._tokenizer = MistralTokenizer.from_pretrained(model_path)
+        self._processor = MistralCommonImageProcessor(tokenizer=self._tokenizer,
+                                                      dtype=self.dtype)
+        logger.info(
+            f"[mistral] native processor={type(self._processor).__name__} "
+            f"tokenizer={type(self._tokenizer).__name__}")
 
-    @staticmethod
-    def load_tokenizer(model_path: str,
-                       config: PretrainedConfig,
-                       tokenizer: AutoTokenizer | None = None):
-        if getattr(config, "input_processor_type", None) == "mistral_large_3":
-            try:
-                return MistralTokenizer.from_pretrained(model_path)
+    @torch.inference_mode()
+    def call_with_text_prompt(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], ExtraProcessedInputs | None]:
+        images = inputs.get("multi_modal_data", {}).get("image")
+        # MistralCommonImageProcessor builds the full conversation and applies
+        # the mistral-common chat template internally.
+        processed = self.processor(text=inputs["prompt"], images=images)
+        input_ids = processed.pop("input_ids").tolist()[0]
+        return input_ids, self._extract_extra_processed_inputs(processed)
 
-            except ValueError:
-                logger.info(
-                    f"Could not load mistral-common tokenizer from {model_path}, falling back to HuggingFace"
-                )
 
-        tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
-            model_path, config=config, use_fast=True, trust_remote_code=True)
-        return tokenizer
+# Register the native processor's content-format metadata.  We do this
+# directly rather than via @register_input_processor because that decorator
+# also writes to INPUT_PROCESSOR_REGISTRY (keyed by model class), which would
+# overwrite the MistralHFInputProcessor entry for Mistral3VLM.  The class
+# dispatch for native checkpoints is handled in create_input_processor via
+# input_processor_type, so only the placeholder side-effect is needed here.
+MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+    "mistral3_common",
+    MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "[IMG]"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.PASSTHROUGH,
+    ))
+MistralNativeInputProcessor._registered_model_type = "mistral3_common"
 
 
 @register_auto_model("Mistral3ForConditionalGeneration")
 @register_auto_model("PixtralForConditionalGeneration")
 @register_input_processor(
-    MistralCommonInputProcessor,
-    model_type="mistral_large_3",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            # NOTE: mistral-common uses the tokenizer to set placeholders, this will be ignored
-            "image": "[IMG]",
-        },
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        content_format=ContentFormat.PASSTHROUGH,
-    ))
-@register_input_processor(
-    MistralCommonInputProcessor,
+    MistralHFInputProcessor,
     model_type="mistral3",
     placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            "image": "[IMG]",
-        },
-        # NOTE: for mistral3 multimodal models, it does not strictly have to be before the text.
+        placeholder_map={"image": "[IMG]"},
+        # NOTE: for mistral3 multimodal models, placeholder_placement does not strictly have to be before the text.
         # Ref: https://github.com/mistralai/mistral-common/blob/039465db2bdc0486df36365c9bdb428188482a18/
         #      src/mistral_common/tokens/tokenizers/base.py#L326
         # However, accuracy tests show that the model generates higher quality output when the image
         # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
+    ))
+@register_input_processor(
+    MistralHFInputProcessor,
+    model_type="mistral_large_3",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "[IMG]"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.STRING,
     ))

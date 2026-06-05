@@ -622,6 +622,8 @@ class RopeParams:
         if not isinstance(head_dim, int):
             head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
+        if rope_scaling is None and hf_rope_parameters is not None:
+            rope_scaling = hf_rope_parameters
         rope_params.max_positions = config.max_position_embeddings
         rope_params.theta = get_hf_rope_theta(config, 10000.0)
         rope_percentage = (getattr(config, 'rotary_pct', None)
