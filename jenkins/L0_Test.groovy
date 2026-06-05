@@ -1,7 +1,6 @@
 @Library(['bloom-jenkins-shared-lib@emma/update_nsc_login_node', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
-import java.nio.charset.StandardCharsets
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
@@ -2478,7 +2477,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
             try {
-                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64(), StandardCharsets.UTF_8)
+                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64())
                 def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
                 pipeline.writeFile(file: cbtsInputLocal, text: cbtsInputJson)
                 sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
@@ -3971,9 +3970,6 @@ def launchTestJobs(pipeline, testFilter)
         // "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
         // "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
         // "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
-        "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
-        "A100X-FMHA-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
         // "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
         // "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
         // "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
@@ -4030,6 +4026,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-PyTorch-6": ["auto:dgx-h100-x1", "l0_h100", 6, 6],
         "DGX_H100-PyTorch-Post-Merge-1": ["auto:dgx-h100-x1", "l0_h100", 1, 2],
         "DGX_H100-PyTorch-Post-Merge-2": ["auto:dgx-h100-x1", "l0_h100", 2, 2],
+        "DGX_A100-Triton-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 2],
+        "DGX_A100-Triton-Post-Merge-2": ["auto:dgx-a100-x1", "l0_a100", 2, 2],
+        "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
