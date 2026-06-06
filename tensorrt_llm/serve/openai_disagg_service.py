@@ -388,6 +388,14 @@ class OpenAIDisaggregatedService(OpenAIService):
                     f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
                 )
             choice = ctx_response.choices[0]
+            # When the CTX response is already complete (finish_reason is not
+            # "length"/"not_finished"), no KV transfer to a GEN worker is
+            # required and the response is returned directly to the client
+            # (see _need_gen / _send_disagg_request_ctx_first). In that case
+            # ctx_request_id / disagg_request_id may legitimately be absent,
+            # so skip the strict null checks below.
+            if choice.finish_reason not in ["length", "not_finished"]:
+                return ctx_response
             if choice.disaggregated_params is None:
                 raise ValueError(
                     f"Context server did not return disaggregated params."
