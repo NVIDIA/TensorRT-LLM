@@ -880,13 +880,18 @@ def create_input_processor(
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
         **kwargs: Additional arguments passed to input processor constructors
-            (e.g., video_pruning_rate for multimodal models).
+            (e.g., video_pruning_rate for multimodal models).  A special key
+            ``input_processor`` (str) overrides automatic processor selection with
+            the named registered model_type.
 
     Returns:
         An InputProcessor implementation (model-specific if registered; otherwise DefaultInputProcessor).
     """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import get_model_architecture
+
+    # Pop the override before passing kwargs to constructors.
+    input_processor_override = kwargs.pop("input_processor", None)
 
     config = None
 
@@ -905,7 +910,7 @@ def create_input_processor(
             MistralConfigLoader
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
-        if getattr(config, "input_processor_type", None) == "mistral3_common":
+        if input_processor_override == "mistral3_common":
             from tensorrt_llm._torch.models.modeling_mistral import \
                 MistralNativeInputProcessor
             return MistralNativeInputProcessor(

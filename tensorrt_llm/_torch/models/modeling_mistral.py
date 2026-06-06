@@ -553,9 +553,9 @@ class MistralNativeInputProcessor(MistralInputProcessorBase):
 # Register the native processor's content-format metadata.  We do this
 # directly rather than via @register_input_processor because that decorator
 # also writes to INPUT_PROCESSOR_REGISTRY (keyed by model class), which would
-# overwrite the MistralHFInputProcessor entry for Mistral3VLM.  The class
-# dispatch for native checkpoints is handled in create_input_processor via
-# input_processor_type, so only the placeholder side-effect is needed here.
+# overwrite the MistralHFInputProcessor entry for Mistral3VLM.
+# Mistral is the only supported case where HF preprocessor can be used with
+# non-HF checkpoints, so this hack is preferred to changing the registry itself.
 MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
     "mistral3_common",
     MultimodalPlaceholderMetadata(

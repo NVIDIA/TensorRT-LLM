@@ -329,6 +329,7 @@ def parse_chat_messages_coroutines(
     model_config: AutoConfig,
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
     request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    model_type_override: Optional[str] = None,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
@@ -355,7 +356,8 @@ def parse_chat_messages_coroutines(
     """
     conversation = []
     mm_placeholder_counts = []
-    model_type = resolve_top_level_model_type(model_config)
+    model_type = model_type_override or resolve_top_level_model_type(
+        model_config)
     mm_data_tracker = MultimodalDataTracker(
         model_type,
         multimodal_server_config,
@@ -375,7 +377,7 @@ def parse_chat_messages_coroutines(
     #    `content_parts` - overwriting any STRING-style placeholders inserted here.
     # See also: `_resolve_content_format` (inputs/utils.py) for the full resolution used downstream.
     registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
-        type(model_config).model_type)
+        model_type)
     if registry_format is not None:
         content_format = registry_format
     else:
@@ -404,16 +406,14 @@ def parse_chat_messages_coroutines(
             # prepend/append according to placeholder_placement.
             content_parts = parsed_msg.get("content_parts")
             interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
-                type(model_config).model_type)
+                model_type)
             if content_parts and interleave:
                 parsed_msg["content"] = interleave_mm_placeholders(
-                    type(model_config).model_type, content_parts,
-                    msg_placeholder_counts,
+                    model_type, content_parts, msg_placeholder_counts,
                     mm_data_tracker.placeholder_modalities())
             else:
                 parsed_msg["content"] = add_multimodal_placeholders(
-                    type(model_config).model_type, parsed_msg["content"],
-                    msg_placeholder_counts)
+                    model_type, parsed_msg["content"], msg_placeholder_counts)
         mm_placeholder_counts.append(msg_placeholder_counts)
 
     return conversation, mm_data_tracker.retrieve_all_async(

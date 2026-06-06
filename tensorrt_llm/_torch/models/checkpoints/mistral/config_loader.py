@@ -57,18 +57,6 @@ class _MistralPretrainedConfig(PretrainedConfig):
             self.rope_parameters = self.rope_scaling
 
 
-class _Mistral3VLMPretrainedConfig(_MistralPretrainedConfig):
-    """Pretrained config for mistral-native VLM checkpoints.
-
-    Setting model_type as a class attribute ensures that
-    ``type(config).model_type`` returns ``"mistral3_common"`` so that
-    ``chat_utils.parse_chat_messages_coroutines`` resolves the correct
-    ContentFormat (PASSTHROUGH) without requiring changes to that call-site.
-    """
-
-    model_type = "mistral3_common"
-
-
 def _mistral_pretrained_config_from_dict(config_dict: dict[str, Any]) -> PretrainedConfig:
     return _MistralPretrainedConfig.from_dict(config_dict)
 
@@ -127,10 +115,10 @@ def adapt_config_dict(
     for k, v in defaults.items():
         config_dict.setdefault(k, v)
 
-    if is_vision:
-        config = _Mistral3VLMPretrainedConfig.from_dict(config_dict)
-    else:
-        config = _mistral_pretrained_config_from_dict(config_dict)
+    # if is_vision:
+    #     config = _Mistral3VLMPretrainedConfig.from_dict(config_dict)
+    # else:
+    config = _mistral_pretrained_config_from_dict(config_dict)
 
     return config
 
@@ -406,9 +394,7 @@ class MistralConfigLoader(BaseConfigLoader):
 
         model_config.pretrained_config.gate_cls = Mistral3Gate
         arch = (getattr(pretrained_config, "architectures", None) or [None])[0]
-        if arch == "PixtralForConditionalGeneration":
-            model_config.pretrained_config.input_processor_type = "mistral3_common"
-        else:
-            model_config.pretrained_config.model_type = "mistral3"
+        model_config.pretrained_config.input_processor_type = "mistral3"
+        model_config.pretrained_config.model_type = "mistral3"
         model_config._frozen = True
         return model_config
