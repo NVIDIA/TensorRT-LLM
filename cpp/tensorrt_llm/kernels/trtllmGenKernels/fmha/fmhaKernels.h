@@ -313,6 +313,12 @@ public:
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
 
+        // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
+        if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0)
+        {
+            options.mTileScheduler = TileScheduler::Static;
+        }
+
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
