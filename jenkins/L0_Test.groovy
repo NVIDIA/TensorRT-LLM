@@ -1,7 +1,6 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
-import java.nio.charset.StandardCharsets
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
@@ -98,6 +97,12 @@ TESTER_MEMORY = "96Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
+
+KITMAKER_CREDENTIALS_ID = env.kitmakerCredentialsId ? env.kitmakerCredentialsId : "svc_tensorrt_kitmaker_api_token"
+KITMAKER_DRY_RUN_PIC_EMAIL = env.kitmakerDryRunPicEmail ? env.kitmakerDryRunPicEmail : "kefu@nvidia.com"
+KITMAKER_PUBLISH_TO = env.kitmakerPublishTo ? env.kitmakerPublishTo : "both_devzone_pypi"
+RELEASE_SCRIPT_REPO = env.releaseScriptRepo ? env.releaseScriptRepo.trim() : ""
+RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim() : ""
 
 // GPU types that require open driver
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
@@ -2472,7 +2477,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
             try {
-                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64(), StandardCharsets.UTF_8)
+                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64())
                 def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
                 pipeline.writeFile(file: cbtsInputLocal, text: cbtsInputJson)
                 sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
@@ -3451,7 +3456,94 @@ def checkPipInstall(pipeline, wheel_path, version_local)
 }
 
 
-def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", version_local="", cpver="cp312")
+def pythonVersionFromCpver(cpver)
+{
+    if (cpver == "cp310") {
+        return "3.10"
+    }
+    if (cpver == "cp312") {
+        return "3.12"
+    }
+    error "Unsupported Python ABI for Kitmaker dry run: ${cpver}"
+}
+
+
+def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
+{
+    def wheelUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
+    def releaseScriptsDir = "release-scripts"
+
+    echo "Running Kitmaker wheel dry run for ${wheelUrl} with publish target ${publish_to}"
+    def kitmakerDryRunMetadata = null
+    stage("Kitmaker Publish Dry Run") {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            sh "rm -rf ${releaseScriptsDir}"
+            trtllm_utils.checkoutSource(RELEASE_SCRIPT_REPO, RELEASE_SCRIPT_COMMIT, releaseScriptsDir, false, true)
+            trtllm_utils.llmExecStepWithRetry(
+                pipeline,
+                script: "${python_bin} -m pip install -r ${releaseScriptsDir}/requirements.txt")
+            withCredentials([string(credentialsId: KITMAKER_CREDENTIALS_ID, variable: 'KITMAKER_API_TOKEN')]) {
+                retry(3) {
+                    echo "Publishing Kitmaker wheel dry run for ${wheelUrl}"
+                    def resultData = sh(script: """${python_bin} ${releaseScriptsDir}/kitmaker_wheel.py publish \
+                    --pic-email ${KITMAKER_DRY_RUN_PIC_EMAIL} \
+                    --publish-to ${publish_to} \
+                    --size large \
+                    --wheel-urls ${wheelUrl} \
+                    --no-upload
+                """, returnStdout: true).trim()
+                    echo "${resultData}"
+                    def resultJson = readJSON text: resultData
+                    kitmakerDryRunMetadata = [
+                        releaseUuid: resultJson["release_uuid"],
+                        releaseScriptsDir: releaseScriptsDir,
+                        pythonBin: python_bin,
+                    ]
+                }
+            }
+        }
+    }
+    return kitmakerDryRunMetadata
+}
+
+
+def isKitmakerWheelDryRunEnabled()
+{
+    return RELEASE_SCRIPT_REPO && RELEASE_SCRIPT_COMMIT
+}
+
+
+def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
+{
+    if (!kitmakerDryRunMetadata?.releaseUuid) {
+        echo "Skipping Kitmaker wheel dry run check because publish did not return a release UUID"
+        return
+    }
+    stage("Kitmaker Check Dry Run") {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            retry(3) {
+                echo "Checking Kitmaker wheel dry run ${kitmakerDryRunMetadata.releaseUuid}"
+                withCredentials([string(credentialsId: KITMAKER_CREDENTIALS_ID, variable: 'KITMAKER_API_TOKEN')]) {
+                    sh """${kitmakerDryRunMetadata.pythonBin} ${kitmakerDryRunMetadata.releaseScriptsDir}/kitmaker_wheel.py check \
+                        ${kitmakerDryRunMetadata.releaseUuid} \
+                        --wait \
+                        --ignore-missing-logs-error
+                    """
+                }
+            }
+        }
+    }
+}
+
+
+def runLLMBuild(
+    pipeline,
+    cpu_arch,
+    reinstall_dependencies=false,
+    wheel_path="",
+    version_local="",
+    cpver="cp312",
+    plat_name="")
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -3481,6 +3573,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90-real;100-real;103-real;120-real'"
     }
+    def platNameArg = plat_name ? " --plat-name ${plat_name}" : ""
 
     if (version_local) {
         sh """
@@ -3495,7 +3588,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}${platNameArg}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -3504,6 +3597,16 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
     echo "uploading ${wheelName} to ${cpu_arch}/${wheel_path}"
     trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
+    def uploadedWheelPath = "${cpu_arch}/${wheel_path}${wheelName}"
+    def kitmakerDryRunMetadata = null
+    if (version_local) {
+        echo "Skipping Kitmaker wheel dry run for local version '+${version_local}'"
+    } else if (!isKitmakerWheelDryRunEnabled()) {
+        echo "Skipping Kitmaker wheel dry run because releaseScriptRepo or releaseScriptCommit is not set"
+    } else {
+        def kitmakerPython = "tensorrt_llm/.venv-${pythonVersionFromCpver(cpver)}/bin/python3"
+        kitmakerDryRunMetadata = runKitmakerWheelDryRun(pipeline, uploadedWheelPath, kitmakerPython, KITMAKER_PUBLISH_TO)
+    }
 
     if (reinstall_dependencies) {
         // Test installation in the new environment
@@ -3532,6 +3635,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
             trtllm_utils.uploadArtifacts("${attrDir}/${f}", "${UPLOAD_PATH}/${cpu_arch}/attribution/${wheel_path}${wheelBase}/")
         }
     }
+    checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 
     return wheelName
 }
@@ -3866,9 +3970,6 @@ def launchTestJobs(pipeline, testFilter)
         // "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
         // "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
         // "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
-        "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
-        "A100X-FMHA-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
         // "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
         // "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
         // "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
@@ -3925,6 +4026,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-PyTorch-6": ["auto:dgx-h100-x1", "l0_h100", 6, 6],
         "DGX_H100-PyTorch-Post-Merge-1": ["auto:dgx-h100-x1", "l0_h100", 1, 2],
         "DGX_H100-PyTorch-Post-Merge-2": ["auto:dgx-h100-x1", "l0_h100", 2, 2],
+        "DGX_A100-Triton-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 2],
+        "DGX_A100-Triton-Post-Merge-2": ["auto:dgx-a100-x1", "l0_a100", 2, 2],
+        "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
@@ -3949,6 +4053,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-Triton-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200", 2, 2, 1, 1, true],
+        "DGX_B200-2_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 2, 1, true],
         "DGX_B200-4_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 3, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 3, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 3, 4, 1, true],
@@ -4276,7 +4381,7 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
 
     // Python version and OS for sanity check
-    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall]
+    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall, platName]
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
@@ -4286,6 +4391,7 @@ def launchTestJobs(pipeline, testFilter)
             true,
             DLFW_IMAGE,
             false,
+            'manylinux_2_39_x86_64',
         ],
         "PY310-UB2204": [
             LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
@@ -4295,6 +4401,7 @@ def launchTestJobs(pipeline, testFilter)
             false,
             UBUNTU_22_04_IMAGE,
             true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+            'manylinux_2_28_x86_64',
         ],
         "PY312-UB2404": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
@@ -4304,6 +4411,7 @@ def launchTestJobs(pipeline, testFilter)
             false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
+            'manylinux_2_28_x86_64',
         ],
     ]
 
@@ -4316,6 +4424,7 @@ def launchTestJobs(pipeline, testFilter)
             false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
+            'manylinux_2_39_aarch64',
         ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
@@ -4325,6 +4434,7 @@ def launchTestJobs(pipeline, testFilter)
             true,
             DLFW_IMAGE,
             false,
+            'manylinux_2_39_aarch64',
         ],
     ]
 
@@ -4380,7 +4490,7 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver)
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7])
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.

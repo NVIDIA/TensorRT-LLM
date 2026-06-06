@@ -313,7 +313,7 @@ class WanBlock(nn.Module):
             eps=eps,
             config=model_config,
             layer_idx=_layer_idx,
-            enable_ulysses=False,
+            enable_sequence_parallel=False,
         )
 
         if cross_attn_norm:

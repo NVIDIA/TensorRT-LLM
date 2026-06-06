@@ -63,6 +63,7 @@ _MODEL_MODULES = {
     "modeling_skywork_r1v2": ["SkyworkR1V2ForConditionalGeneration"],
     "modeling_smollm3": ["SmolLM3ForCausalLM"],
     "modeling_starcoder2": ["Starcoder2ForCausalLM"],
+    "modeling_step3p7": ["Step3p7ForCausalLM"],
 }
 
 # AD_USE_IR_MODELS: opt-in flag for staging additional ``_ir.py`` modeling
