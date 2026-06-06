@@ -13,16 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
-
-_UTILS_DIR = Path(__file__).resolve().parents[3] / "_utils_test"
-sys.path.append(str(_UTILS_DIR))
-from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available  # noqa: E402
+from auto_deploy._utils_test._torch_test_utils import (
+    fp4_compatible,
+    fp8_compatible,
+    trtllm_ops_available,
+)
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
 from tensorrt_llm._torch.auto_deploy.utils.fp8_dequant import (  # noqa: E402

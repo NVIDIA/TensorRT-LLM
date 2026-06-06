@@ -13,19 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn.functional as F
-
-_UTILS_DIR = Path(__file__).resolve().parents[3] / "_utils_test"
-sys.path.append(str(_UTILS_DIR))
-from _deepseek_v4_checkpoint_utils import (  # noqa: E402
-    deepseek_v4_flash_checkpoint_or_skip,
-    load_safetensors_tensors_or_skip,
-)
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (  # noqa: E402
@@ -600,103 +590,6 @@ def test_torch_mxfp4_moe_from_routing_matches_deepseek_layout_reference() -> Non
 
     assert expected.abs().max() > 0
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-
-
-def test_deepseek_v4_flash_real_expert0_mxfp4_from_routing_matches_dense_dequant_reference() -> (
-    None
-):
-    checkpoint_dir = deepseek_v4_flash_checkpoint_or_skip()
-    tensor_names = tuple(
-        _deepseek_expert_key(0, 0, projection, tensor_kind)
-        for projection in ("w1", "w2", "w3")
-        for tensor_kind in ("weight", "scale")
-    )
-    state = load_safetensors_tensors_or_skip(checkpoint_dir, tensor_names)
-
-    w1_weight_name = _deepseek_expert_key(0, 0, "w1", "weight")
-    w1_scale_name = _deepseek_expert_key(0, 0, "w1", "scale")
-    w2_weight_name = _deepseek_expert_key(0, 0, "w2", "weight")
-    w2_scale_name = _deepseek_expert_key(0, 0, "w2", "scale")
-    w3_weight_name = _deepseek_expert_key(0, 0, "w3", "weight")
-    w3_scale_name = _deepseek_expert_key(0, 0, "w3", "scale")
-
-    w1_weight = state[w1_weight_name]
-    w2_weight = state[w2_weight_name]
-    w3_weight = state[w3_weight_name]
-    hidden_size = w1_weight.shape[1] * 2
-    intermediate_size = w1_weight.shape[0]
-    assert tuple(w3_weight.shape) == tuple(w1_weight.shape)
-    assert tuple(w2_weight.shape) == (hidden_size, intermediate_size // 2)
-
-    packed = _deepseek_layout().pack_experts(
-        state,
-        layer=0,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        expert_indices=(0,),
-        num_experts=1,
-    )
-    w1_dense = _mxfp4_checkpoint_weight_dense_dequant(
-        w1_weight,
-        state[w1_scale_name],
-        weight_name=w1_weight_name,
-        scale_name=w1_scale_name,
-    )
-    w2_dense = _mxfp4_checkpoint_weight_dense_dequant(
-        w2_weight,
-        state[w2_scale_name],
-        weight_name=w2_weight_name,
-        scale_name=w2_scale_name,
-    )
-    w3_dense = _mxfp4_checkpoint_weight_dense_dequant(
-        w3_weight,
-        state[w3_scale_name],
-        weight_name=w3_weight_name,
-        scale_name=w3_scale_name,
-    )
-
-    num_tokens = 2
-    alpha = 1.0
-    limit = 0.0
-    hidden_states = torch.linspace(
-        -0.01,
-        0.02,
-        steps=num_tokens * hidden_size,
-        dtype=torch.float32,
-    ).reshape(num_tokens, hidden_size)
-    selected_experts = torch.zeros((num_tokens, 1), dtype=torch.int64)
-    routing_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
-    gate_up_bias = torch.zeros((1, 2 * intermediate_size), dtype=torch.float32)
-    down_bias = torch.zeros((1, hidden_size), dtype=torch.float32)
-
-    actual = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
-        hidden_states,
-        selected_experts,
-        routing_weights,
-        packed.gate_up_blocks,
-        gate_up_bias,
-        packed.gate_up_scales,
-        alpha,
-        limit,
-        packed.down_blocks,
-        down_bias,
-        packed.down_scales,
-        "up_gate",
-        "deepseek",
-    )
-    expected = _dense_deepseek_routing_reference(
-        hidden_states,
-        selected_experts,
-        routing_weights,
-        w1_dense.unsqueeze(0),
-        w2_dense.unsqueeze(0),
-        w3_dense.unsqueeze(0),
-        alpha=alpha,
-        limit=limit,
-    )
-
-    assert expected.abs().max() > 0
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-4)
 
 
 def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() -> None:

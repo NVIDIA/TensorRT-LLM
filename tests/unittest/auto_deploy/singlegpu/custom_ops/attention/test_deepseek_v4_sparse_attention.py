@@ -17,17 +17,11 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
+from auto_deploy._utils_test._model_test_utils import assert_rmse_close
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.export import Dim
-
-_UTILS_DIR = Path(__file__).resolve().parents[3] / "_utils_test"
-sys.path.append(str(_UTILS_DIR))
-from _model_test_utils import assert_rmse_close  # noqa: E402
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (  # noqa: E402
