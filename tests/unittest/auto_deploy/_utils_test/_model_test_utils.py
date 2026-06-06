@@ -609,7 +609,9 @@ _SMALL_MODEL_CONFIGS = {
             "head_dim": 64,
             "mamba_num_heads": 4,
             "mamba_head_dim": 64,
-            "n_groups": 2,
+            # n_groups=1 keeps the gated-RMSNorm group_size (= mamba d_inner / n_groups
+            # = 256 / 1 = 256) at the NVFP4 fused_gated_rmsnorm_quant minimum of 256.
+            "n_groups": 1,
             "ssm_state_size": 8,
             "conv_kernel": 4,
             "n_routed_experts": 4,
