@@ -820,11 +820,17 @@ class ConversationAwareADPRouter(ADPRouter):
             if conv_id is not None and conv_id in self._conv_to_rank:
                 target_rank = self._conv_to_rank[conv_id]
                 # Sticky: return the conversation to its target rank while that
-                # rank is under `expected` (the loose fair-share*multiplier cap).
-                # Capping here -- NOT at the hard max_num_active_requests -- is
-                # required: a rank exceeding `expected` breaks the ADP padding
-                # invariant and crashes the executor.
-                if all_ranks_num_active_requests[target_rank] < expected_num_active_requests:
+                # rank is under the HARD cap (max_num_active_requests), NOT the
+                # soft fair-share `expected`. Stickiness intentionally wins over
+                # balance so a conversation's KV prefix stays resident on one
+                # rank -- capping sticky at the soft `expected` (~fair_share)
+                # displaces popular conversations as soon as their rank is
+                # moderately busy, causing rank migration -> prefix-cache miss ->
+                # worse TTFT (measured: cache hit drops below kv-aware). The hard
+                # cap can push a rank above the pre-loop `expected`; the returned
+                # value is re-bumped after the loop to keep the ADP padding
+                # invariant (_pad_attention_dp_dummy_request) satisfied.
+                if all_ranks_num_active_requests[target_rank] < max_num_active_requests:
                     rank = target_rank
                     self._record_target_rank(conv_id, target_rank)  # LRU touch
                 # else: target saturated this batch -> fall through to overflow
@@ -840,6 +846,14 @@ class ConversationAwareADPRouter(ADPRouter):
 
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
+
+        # Sticky returns use the hard cap, so a rank may now exceed the pre-loop
+        # soft `expected`. Re-bump so the returned value covers the actual
+        # per-rank max -- _pad_attention_dp_dummy_request asserts
+        # expected >= len(active_requests) on every rank.
+        expected_num_active_requests = max(
+            expected_num_active_requests, max(all_ranks_num_active_requests)
+        )
 
         logger.debug(
             f"[adp_router][conv] new_reqs_per_rank="

@@ -1106,18 +1106,16 @@ class TestConversationAwareADPRouter:
         assert pos[1] == 2
 
     def test_sticky_overflow_keeps_mapping(self):
-        """When the home rank is saturated (>= the soft fair-share cap), the turn
-        overflows off home but the conversation stays mapped home (returns next
-        batch). Uses fair_share_multiplier=1.0 so the soft cap coincides with the
-        natural saturation point and the overflow path is exercised (with the
-        default mult=2 a lone hot rank's `expected` scales with its own load and
-        never saturates)."""
-        router = ConversationAwareADPRouter(
-            dist=_mock_dist(tp_size=2), fair_share_multiplier=1.0)
+        """When the home rank is saturated at the HARD cap (max_num_active_requests),
+        the turn overflows off home but the conversation stays mapped home (so it
+        returns home next batch once that rank has capacity). Stickiness uses the
+        hard cap -- not the soft fair-share -- so a conversation's KV prefix stays
+        resident on one rank in the common case."""
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2))
         # Seed conv A -> rank 0.
         self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
         home = router._conv_to_rank["A"]
-        # Saturate the home rank, route A again -> must overflow off home...
+        # Fill the home rank to the hard cap, route A again -> must overflow off home...
         states = self._states(2)
         states[home] = RankState(rank=home, num_active_requests=5, num_active_tokens=50)
         pos = self._route(router, states, [_make_conv_request_item(2, "A")], cap=5)
@@ -1161,8 +1159,10 @@ class TestConversationAwareADPRouter:
         rank past expected."""
         router = self._router(tp_size=8)
         states = self._states(8)
-        # 40 requests for the SAME conversation: with the old hard-cap sticky
-        # logic this concentrated > expected on the home rank and crashed.
+        # 40 requests for the SAME conversation: hard-cap stickiness concentrates
+        # all of them on the home rank, pushing it well past the pre-loop soft
+        # `expected`. The post-loop re-bump must lift `expected` to cover the home
+        # rank's actual count, else _pad_attention_dp_dummy_request asserts.
         items = [_make_conv_request_item(i, "A") for i in range(40)]
         assign, expected = router.route_requests(states, items, max_num_active_requests=256)
         final = [states[r].num_active_requests + len(assign[r]) for r in range(8)]
