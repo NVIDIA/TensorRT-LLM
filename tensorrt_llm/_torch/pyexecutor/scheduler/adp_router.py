@@ -23,7 +23,7 @@ import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
 from dataclasses import MISSING, astuple, dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Dict, List, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -104,18 +104,15 @@ class ADPRouter(ABC):
             kv_cache_manager has block reuse enabled; DefaultADPRouter
             otherwise.
         """
-        if attention_dp_config is not None and getattr(
-            attention_dp_config, "kv_cache_routing_conversation_affinity", False
-        ):
+        if (attention_dp_config is not None
+                and attention_dp_config.kv_cache_routing_conversation_affinity):
             # Explicit conversation_id -> rank affinity. Independent of the KV
             # cache manager (works with or without block reuse, though it is
             # most beneficial with reuse on), so it is checked before the
             # KV-cache-aware path and takes precedence when both are enabled.
             return ConversationAwareADPRouter(
                 dist=dist,
-                max_sessions=getattr(
-                    attention_dp_config, "kv_cache_routing_max_sessions", 1 << 16
-                ),
+                max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
             )
 
@@ -171,6 +168,58 @@ class ADPRouter(ABC):
         local_state = self.create_rank_state(active_requests, new_requests or [])
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
+
+    @staticmethod
+    def _assign_explicit_dp_ranks(
+        requests: List["RequestQueueItem"],
+        all_ranks_new_requests: Dict[int, List["RequestQueueItem"]],
+        all_ranks_num_active_requests: List[int],
+        max_num_active_requests: int,
+    ) -> List["RequestQueueItem"]:
+        """Place requests carrying an explicit ``attention_dp_rank`` on that rank
+        (while it is under ``max_num_active_requests``) and return the rest for
+        load-balanced assignment. Mutates the ``all_ranks_*`` accumulators in
+        place. Shared by Default and ConversationAware routers.
+        """
+        remaining: List["RequestQueueItem"] = []
+        for req_item in requests:
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            target_dp_rank = (
+                scheduling_params.attention_dp_rank if scheduling_params is not None else None
+            )
+            if (
+                target_dp_rank is not None
+                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+            ):
+                all_ranks_num_active_requests[target_dp_rank] += 1
+                all_ranks_new_requests[target_dp_rank].append(req_item)
+            else:
+                remaining.append(req_item)
+        return remaining
+
+    @staticmethod
+    def _expected_num_active_requests(
+        all_ranks_num_active_requests: List[int],
+        num_new_requests: int,
+        tp_size: int,
+        *,
+        multiplier: float = 1.0,
+        hard_cap: Optional[int] = None,
+    ) -> int:
+        """Loose per-rank target = ``multiplier * ceil(fair-share)``, floored at the
+        busiest rank's current load and optionally capped at ``hard_cap``
+        (``max_num_active_requests``). It is the soft cap that bounds per-rank
+        assignment so no rank exceeds the returned value -- the ADP padding
+        invariant asserted in py_executor._pad_attention_dp_dummy_request.
+        """
+        fair_share = (
+            sum(all_ranks_num_active_requests) + num_new_requests + tp_size - 1
+        ) // tp_size
+        expected = max(
+            math.ceil(multiplier * fair_share),
+            max(all_ranks_num_active_requests),
+        )
+        return min(expected, hard_cap) if hard_cap is not None else expected
 
     @abstractmethod
     def route_requests(
@@ -247,28 +296,17 @@ class DefaultADPRouter(ADPRouter):
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
-        remaining_unscheduled = []
-        for req_item in sorted_requests:
-            scheduled = False
-            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-            if scheduling_params is not None:
-                target_dp_rank = scheduling_params.attention_dp_rank
-                if (
-                    target_dp_rank is not None
-                    and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
-                ):
-                    all_ranks_num_active_requests[target_dp_rank] += 1
-                    scheduled = True
-                    all_ranks_new_requests[target_dp_rank].append(req_item)
-
-            if not scheduled:
-                remaining_unscheduled.append(req_item)
+        remaining_unscheduled = self._assign_explicit_dp_ranks(
+            sorted_requests, all_ranks_new_requests,
+            all_ranks_num_active_requests, max_num_active_requests,
+        )
 
         num_new_requests_all_ranks = len(remaining_unscheduled)
-        total_num_active_requests = sum(all_ranks_num_active_requests)
-        expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-            max(all_ranks_num_active_requests),
+        # Cap at max_num_active_requests so the per-rank target never
+        # exceeds what the rank can physically schedule.
+        expected_num_active_requests = self._expected_num_active_requests(
+            all_ranks_num_active_requests, num_new_requests_all_ranks, tp_size,
+            hard_cap=max_num_active_requests,
         )
 
         all_ranks_new_requests = self._balance_requests_across_ranks(
@@ -588,13 +626,9 @@ class KVCacheAwareADPRouter(ADPRouter):
         # net against runaway concentration, still loose enough that cache
         # affinity wins in the common case.
         num_new_requests_all_ranks = len(remaining_unscheduled)
-        total_num_active_requests = sum(all_ranks_num_active_requests)
-        fair_share = (
-            total_num_active_requests + num_new_requests_all_ranks + tp_size - 1
-        ) // tp_size
-        expected_num_active_requests = max(
-            math.ceil(self.fair_share_multiplier * fair_share),
-            max(all_ranks_num_active_requests),
+        expected_num_active_requests = self._expected_num_active_requests(
+            all_ranks_num_active_requests, num_new_requests_all_ranks, tp_size,
+            multiplier=self.fair_share_multiplier, hard_cap=max_num_active_requests,
         )
         eligible_ranks = [
             rank
@@ -671,38 +705,11 @@ class KVCacheAwareADPRouter(ADPRouter):
 
 
 class ConversationAwareADPRouter(ADPRouter):
-    """Conversation-affinity request router for attention data parallelism.
-
-    Routes the *first* request of each conversation round-robin across ranks,
-    then pins every later request carrying the same ``conversation_id`` to the
-    rank that served that conversation's first turn. This keeps a multi-turn
-    conversation's growing KV-cache prefix on a single rank (maximizing block
-    reuse, minimizing recompute and cross-rank migration) while still spreading
-    the birth of new conversations evenly.
-
-    Contrast with :class:`KVCacheAwareADPRouter`, which *infers* affinity from
-    probed prefix-match lengths: that affinity is lost as soon as a
-    conversation's blocks are evicted -- the request then re-routes by load and
-    the conversation "migrates" ranks. This router keeps an **explicit**
-    ``conversation_id -> rank`` map, so stickiness is deterministic and survives
-    cache eviction. It is inspired by the serve-level ConversationRouter
-    (``tensorrt_llm/serve/router.py``) and the first-turn-round-robin idea from
-    PR #14744, but applied at the intra-instance ADP-rank level.
-
-    ``conversation_id`` is read from
-    ``req.py_disaggregated_params.conversation_id`` (populated by the serve-side
-    conversation / KV-aware router from the ``X-Session-ID`` header; see
-    PR #14744). When it is absent -- header not sent, non-disaggregated, or the
-    serve-side propagation is not present -- the request falls back to
-    load-balanced round-robin and is *not* recorded, so behaviour degrades
-    gracefully to ``DefaultADPRouter``-style spreading.
-
-    Determinism: :meth:`route_requests` runs locally on every TP rank with no
-    broadcast, so the round-robin cursor and the conversation->rank map MUST
-    evolve identically on every rank. They do, because every rank processes the
-    same ``new_requests`` in the same order. Any divergence would deadlock the
-    distributed allgather protocol -- this is the same invariant the warmup /
-    first-turn-round-robin cursors rely on above.
+    """Pins each conversation to a single attention-DP rank: the first request
+    of a conversation is round-robined, and every later request with the same
+    ``conversation_id`` returns to that rank, keeping the conversation's
+    KV-cache prefix on one rank. Falls back to load-balanced round-robin when no
+    ``conversation_id`` is present.
     """
 
     # Default LRU cap on the conversation->rank map (entries are ~tens of
@@ -712,18 +719,11 @@ class ConversationAwareADPRouter(ADPRouter):
     def __init__(self, dist: "Distributed", max_sessions: int = DEFAULT_MAX_SESSIONS,
                  fair_share_multiplier: float = 2.0):
         super().__init__(dist)
-        # conversation_id -> rank, LRU-ordered (most-recently-routed last).
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
+        # LRU cap on the conversation->rank map; oldest entries evicted beyond this.
         self._max_sessions = max(1, int(max_sessions))
-        # Loose per-rank cap = fair_share_multiplier * ceil fair-share. Sticky
-        # concentration is allowed up to this but NEVER beyond, so the returned
-        # expected_num_active_requests stays >= every rank's active count (the
-        # ADP invariant asserted in py_executor._pad_attention_dp_dummy_request).
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
-        # Round-robin cursor for first-turn / unkeyed requests. Mutated
-        # identically on every rank (route_requests is deterministic), exactly
-        # like KVCacheAwareADPRouter._first_turn_rr_counter; divergence deadlocks.
-        self._rr_counter = 0
+        self._round_robin_cursor = 0
 
     def create_rank_state(
         self,
@@ -742,23 +742,16 @@ class ConversationAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _conversation_id(req_item) -> "str | None":
-        """Return the request's conversation id, or None when unavailable.
-
-        Read from ``py_disaggregated_params.conversation_id`` (serve-side
-        propagated from the X-Session-ID header). Empty strings are treated as
-        absent so they fall through to the load-balanced path.
-        """
-        req = getattr(req_item, "request", None)
+        req = req_item.request
         if req is None:
             return None
-        disagg = getattr(req, "py_disaggregated_params", None)
-        if disagg is None:
+        disagg_params = req.py_disaggregated_params
+        if disagg_params is None:
             return None
-        conv_id = getattr(disagg, "conversation_id", None)
-        return conv_id if conv_id else None
+        return disagg_params.conversation_id or None
 
-    def _record_home(self, conv_id: str, rank: int) -> None:
-        """Bind/refresh a conversation's home rank with LRU eviction."""
+    def _record_target_rank(self, conv_id: str, rank: int) -> None:
+        """Bind/refresh the rank a conversation is pinned to (LRU-touch + evict)."""
         self._conv_to_rank[conv_id] = rank
         self._conv_to_rank.move_to_end(conv_id)
         while len(self._conv_to_rank) > self._max_sessions:
@@ -784,38 +777,19 @@ class ConversationAwareADPRouter(ADPRouter):
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
-        # 1) Honour an explicit attention_dp_rank first (strict placement),
-        #    matching DefaultADPRouter / KVCacheAwareADPRouter.
-        remaining_unscheduled: List[RequestQueueItem] = []
-        for req_item in sorted_requests:
-            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-            target_dp_rank = (
-                scheduling_params.attention_dp_rank if scheduling_params is not None else None
-            )
-            if (
-                target_dp_rank is not None
-                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
-            ):
-                all_ranks_num_active_requests[target_dp_rank] += 1
-                all_ranks_new_requests[target_dp_rank].append(req_item)
-            else:
-                remaining_unscheduled.append(req_item)
+        # 1) Honour an explicit attention_dp_rank first (strict placement).
+        remaining_unscheduled = self._assign_explicit_dp_ranks(
+            sorted_requests, all_ranks_new_requests,
+            all_ranks_num_active_requests, max_num_active_requests,
+        )
 
-        # 2) Loose per-rank cap = fair_share_multiplier * ceil fair-share
-        #    (mirrors KVCacheAwareADPRouter). BOTH new-conversation spreading and
-        #    sticky returns are capped at this, so no rank ever exceeds the
-        #    returned expected_num_active_requests -- exceeding it breaks the ADP
-        #    padding invariant (py_executor._pad_attention_dp_dummy_request) and
-        #    crashes the executor. The multiplier gives sticky concentration
-        #    slack before a conversation overflows off its home rank.
-        num_new_requests_all_ranks = len(remaining_unscheduled)
-        total_num_active_requests = sum(all_ranks_num_active_requests)
-        fair_share = (
-            total_num_active_requests + num_new_requests_all_ranks + tp_size - 1
-        ) // tp_size
-        expected_num_active_requests = max(
-            math.ceil(self._fair_share_multiplier * fair_share),
-            max(all_ranks_num_active_requests),
+        # 2) Loose per-rank cap = fair_share_multiplier * ceil(fair-share). BOTH
+        #    new-conversation spreading and sticky returns are capped at this, so
+        #    no rank exceeds expected_num_active_requests -- exceeding it breaks
+        #    the ADP padding invariant (py_executor._pad_attention_dp_dummy_request).
+        expected_num_active_requests = self._expected_num_active_requests(
+            all_ranks_num_active_requests, len(remaining_unscheduled), tp_size,
+            multiplier=self._fair_share_multiplier,
         )
 
         def _least_loaded(soft_cap: int) -> int:
@@ -828,8 +802,8 @@ class ConversationAwareADPRouter(ADPRouter):
         def _next_rr(soft_cap: int) -> int:
             """Round-robin to the next rank under soft_cap; advance the cursor."""
             for _ in range(tp_size):
-                r = self._rr_counter % tp_size
-                self._rr_counter = (self._rr_counter + 1) % tp_size
+                r = self._round_robin_cursor % tp_size
+                self._round_robin_cursor = (self._round_robin_cursor + 1) % tp_size
                 if all_ranks_num_active_requests[r] < soft_cap:
                     return r
             return _least_loaded(soft_cap)
@@ -839,25 +813,25 @@ class ConversationAwareADPRouter(ADPRouter):
             rank = None
 
             if conv_id is not None and conv_id in self._conv_to_rank:
-                home = self._conv_to_rank[conv_id]
-                # Sticky: return the conversation to its home rank while that
+                target_rank = self._conv_to_rank[conv_id]
+                # Sticky: return the conversation to its target rank while that
                 # rank is under `expected` (the loose fair-share*multiplier cap).
                 # Capping here -- NOT at the hard max_num_active_requests -- is
                 # required: a rank exceeding `expected` breaks the ADP padding
                 # invariant and crashes the executor.
-                if all_ranks_num_active_requests[home] < expected_num_active_requests:
-                    rank = home
-                    self._record_home(conv_id, home)  # LRU touch
-                # else: home saturated this batch -> fall through to overflow
-                # WITHOUT rebinding, so the conversation returns home next batch.
+                if all_ranks_num_active_requests[target_rank] < expected_num_active_requests:
+                    rank = target_rank
+                    self._record_target_rank(conv_id, target_rank)  # LRU touch
+                # else: target saturated this batch -> fall through to overflow
+                # WITHOUT rebinding, so the conversation returns next batch.
 
             if rank is None:
                 # First turn of a new conversation, sticky-overflow, or no
                 # conversation_id -> round-robin spread under the soft cap.
                 rank = _next_rr(expected_num_active_requests)
                 if conv_id is not None and conv_id not in self._conv_to_rank:
-                    # Bind this new conversation's home to its first-turn rank.
-                    self._record_home(conv_id, rank)
+                    # Bind this new conversation to its first-turn rank.
+                    self._record_target_rank(conv_id, rank)
 
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
