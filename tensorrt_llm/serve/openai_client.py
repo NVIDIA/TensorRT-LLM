@@ -181,11 +181,19 @@ class OpenAIHttpClient(OpenAIClient):
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
                     dp.disagg_request_id = self._disagg_id_generator()
-            json_data = request.model_dump(exclude_unset=True, mode="json")
+            # Serialize once on the orchestrator's single event-loop thread:
+            # model_dump_json (pydantic-core) is ~2.3x faster than
+            # model_dump(mode="json") + aiohttp json= (json.dumps). Decodes to
+            # identical JSON (pydantic just emits compact UTF-8 vs spaced ASCII).
+            body = request.model_dump_json(exclude_unset=True)
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
-                async with self._session.post(url, json=json_data) as http_response:
+                async with self._session.post(
+                    url,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                ) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
