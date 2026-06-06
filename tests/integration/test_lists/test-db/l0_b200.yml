@@ -134,6 +134,7 @@ l0_b200:
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
