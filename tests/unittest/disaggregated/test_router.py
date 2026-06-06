@@ -1793,7 +1793,7 @@ def test_tokenize_without_tools_passes_none(router_class):
     assert kwargs["tools"] is None
     assert "thinking" not in kwargs
     # messages and add_generation_prompt must still flow through unchanged.
-    assert kwargs["tokenize"] is True
+    assert kwargs["tokenize"] is False
 
 
 def test_tokenize_preserves_empty_tools_list():
@@ -1855,3 +1855,140 @@ def test_tokenize_skipped_when_prompt_token_ids_already_set():
     assert out == [[10, 20, 30]]
     get_tok.assert_not_called()
     tok.apply_chat_template.assert_not_called()
+
+
+class _PrefixCacheFakeTokenizer:
+
+    _SPECIAL = {"<bos>": 1, "<sys>": 2, "<user>": 3, "<asst>": 4, "<eot>": 5}
+
+    def apply_chat_template(self,
+                            messages,
+                            add_generation_prompt=False,
+                            tokenize=False,
+                            return_dict=False,
+                            tools=None,
+                            **kwargs):
+        tag = {"system": "<sys>", "user": "<user>", "assistant": "<asst>"}
+        parts = ["<bos>"]
+        for m in messages:
+            role = m["role"] if isinstance(m, dict) else m.role
+            content = m["content"] if isinstance(m, dict) else m.content
+            parts.append(tag.get(role, "<user>") + str(content) + "<eot>")
+        if add_generation_prompt:
+            parts.append("<asst>")
+        return "".join(parts)
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        i = 0
+        n = len(text)
+        while i < n:
+            special = None
+            for token, tid in self._SPECIAL.items():
+                if text.startswith(token, i):
+                    special = (token, tid)
+                    break
+            if special is not None:
+                ids.append(special[1])
+                i += len(special[0])
+                continue
+            j = i
+            while j < n and not any(
+                    text.startswith(token, j) for token in self._SPECIAL):
+                j += 1
+            run = text[i:j]
+            ids.append(9000 + len(run))
+            ids.extend(ord(c) for c in run)
+            i = j
+        return ids
+
+
+def _grow_conversation():
+    convo = [{
+        "role": "system",
+        "content": "SYS " * 40
+    }, {
+        "role": "user",
+        "content": "hello " * 20
+    }]
+    yield [dict(m) for m in convo]
+    for turn in range(4):
+        convo.append({"role": "assistant", "content": f"resp{turn} " * 30})
+        convo.append({"role": "user", "content": f"q{turn} " * 12})
+        yield [dict(m) for m in convo]
+
+
+def test_prefix_cache_tokenize_matches_full_encode(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+    tok = _PrefixCacheFakeTokenizer()
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        for convo in _grow_conversation():
+            req = ChatCompletionRequest(model="mock", messages=convo)
+            rendered = tok.apply_chat_template(
+                convo,
+                add_generation_prompt=req.add_generation_prompt,
+                tokenize=False)
+            reference = tok.encode(rendered, add_special_tokens=False)
+            result = router._tokenize(req)[0]
+            assert result == reference
+            assert req.prompt_token_ids == reference
+
+
+def test_prefix_cache_tokenize_encodes_only_delta(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+    tok = _PrefixCacheFakeTokenizer()
+    encoded_lengths = []
+    real_encode = tok.encode
+
+    def _recording_encode(text, add_special_tokens=False):
+        encoded_lengths.append(len(text))
+        return real_encode(text, add_special_tokens=add_special_tokens)
+
+    tok.encode = _recording_encode
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        for index, convo in enumerate(_grow_conversation()):
+            encoded_lengths.clear()
+            req = ChatCompletionRequest(model="mock", messages=convo)
+            rendered = tok.apply_chat_template(
+                convo,
+                add_generation_prompt=req.add_generation_prompt,
+                tokenize=False)
+            router._tokenize(req)
+            assert encoded_lengths
+            if index >= 1:
+                assert min(encoded_lengths) < len(rendered)
+
+
+def test_prefix_cache_tokenize_falls_back_on_divergent_prefix(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+    tok = _PrefixCacheFakeTokenizer()
+    convo_a = [{
+        "role": "system",
+        "content": "A " * 30
+    }, {
+        "role": "user",
+        "content": "alpha"
+    }]
+    convo_b = [{
+        "role": "system",
+        "content": "B " * 30
+    }, {
+        "role": "user",
+        "content": "beta"
+    }]
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        for convo in (convo_a, convo_b, convo_a):
+            req = ChatCompletionRequest(model="mock",
+                                        messages=[dict(m) for m in convo])
+            rendered = tok.apply_chat_template(
+                [dict(m) for m in convo],
+                add_generation_prompt=req.add_generation_prompt,
+                tokenize=False)
+            reference = tok.encode(rendered, add_special_tokens=False)
+            assert router._tokenize(req)[0] == reference

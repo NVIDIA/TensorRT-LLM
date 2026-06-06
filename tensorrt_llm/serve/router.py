@@ -827,40 +827,57 @@ class BlockHashMixin:
                     tokenizer, model, trust_remote_code=True)
         return self._tokenizers[model]
 
+    def _encode_with_prefix_cache(self, rendered: str, key: int,
+                                  tokenizer) -> list[int]:
+        cache = getattr(self, "_tok_prefix_cache", None)
+        if cache is None:
+            cache = self._tok_prefix_cache = OrderedDict()
+        entry = cache.get(key)
+        if entry is not None and len(rendered) > len(entry[0]) and \
+                rendered.startswith(entry[0]):
+            ids = entry[1] + tokenizer.encode(rendered[len(entry[0]):],
+                                              add_special_tokens=False)
+        else:
+            ids = tokenizer.encode(rendered, add_special_tokens=False)
+        cache[key] = (rendered, ids)
+        cache.move_to_end(key)
+        while len(cache) > 1024:
+            cache.popitem(last=False)
+        return ids
+
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
             tokenizer = self._get_tokenizer(request.model)
-            # Forward tools and chat_template_kwargs so custom tokenizers
-            # (e.g. DeepseekV32Tokenizer) render tool schemas and respect
-            # template flags like `thinking=true` when computing the prompt
-            # token ids used for cache-aware routing AND passed downstream
-            # (prompt_token_ids makes the worker skip re-tokenization).
             tool_dicts = (None if getattr(request, "tools", None) is None else [
                 tool.model_dump() if hasattr(tool, "model_dump") else tool
                 for tool in request.tools
             ])
             chat_template_kwargs = (request.chat_template_kwargs if getattr(
                 request, "chat_template_kwargs", None) else {})
-            result = tokenizer.apply_chat_template(
+            rendered = tokenizer.apply_chat_template(
                 [
                     msg if isinstance(msg, dict) else dict(msg)
                     for msg in request.messages
                 ],
                 add_generation_prompt=request.add_generation_prompt,
-                tokenize=True,
+                tokenize=False,
                 return_dict=False,
                 tools=tool_dicts,
                 **chat_template_kwargs,
             )
-            # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
-            # string from apply_chat_template even with tokenize=True.
-            # Encode to token IDs if needed.
-            if isinstance(result, str):
-                result = tokenizer.encode(result, add_special_tokens=False)
-            # Set prompt_token_ids so the worker server skips re-tokenization
+            if isinstance(rendered, str):
+                key = hash("".join(
+                    str(
+                        msg.get("content") if isinstance(msg, dict) else
+                        getattr(msg, "content", ""))
+                    for msg in request.messages[:2]))
+                result = self._encode_with_prefix_cache(rendered, key,
+                                                        tokenizer)
+            else:
+                result = list(rendered)
             request.prompt_token_ids = result
             return [result]
 
@@ -981,7 +998,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  tokens_per_block: int = 32,
                  custom_tokenizer: Optional[str] = None,
                  backfill_block_hashes_on_finish: bool = False,
-                 load_weight: float = 1.0,
+                 load_weight: float = 0.25,
                  load_cap: float = float("inf"),
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
@@ -1105,13 +1122,6 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         token_lists, block_hashes_by_algo = await asyncio.to_thread(
             self._tokenize_and_compute_block_hashes_by_algo, request,
             hash_algo_by_server.values(), cache_salt_id)
-        padded_tokens_by_algo = {
-            hash_algo:
-            max(
-                sum(len(hash_list)
-                    for hash_list in block_hashes) * self._tokens_per_block, 1)
-            for hash_algo, block_hashes in block_hashes_by_algo.items()
-        }
         # select the server by (KV match - load), bounded by load_cap
         workloads = [
             self._server_state[server].num_active_requests()
@@ -1126,12 +1136,11 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server = servers[i]
             hash_algo = hash_algo_by_server[server]
             block_hashes = block_hashes_by_algo[hash_algo]
-            padded_tokens = padded_tokens_by_algo[hash_algo]
             # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
             matches.append(await self._server_state[server].matched_tokens(
                 block_hashes, hash_algo))
-            score = matches[-1] / padded_tokens - self._load_weight * \
-                load_fractions[i]
+            score = matches[-1] / self._tokens_per_block - self._load_weight * \
+                workloads[i]
             scores.append(score)
         # Optional hard cap: drop servers at/over load_cap; fall back to all if
         # none remain. Disabled by default (load_cap=inf) to match the original
