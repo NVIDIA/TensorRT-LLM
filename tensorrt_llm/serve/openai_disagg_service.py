@@ -388,23 +388,33 @@ class OpenAIDisaggregatedService(OpenAIService):
                     f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
                 )
             choice = ctx_response.choices[0]
+            # If the CTX worker already produced a terminal response (e.g. an
+            # early EOS during prefill / MTP draft-token generation), the
+            # disagg KV-cache handoff to GEN will not happen — see
+            # _need_gen() and the ctx-only return path in
+            # _send_disagg_request_ctx_first. In that case ctx_request_id /
+            # disagg_request_id are only meaningful for the (skipped)
+            # handoff, so don't require them. Keep this condition in sync
+            # with _need_gen().
+            ctx_will_hand_off_to_gen = choice.finish_reason in ["length", "not_finished"]
             if choice.disaggregated_params is None:
                 raise ValueError(
                     f"Context server did not return disaggregated params."
                     f" finish_reason={choice.finish_reason!r}"
                 )
-            if choice.disaggregated_params.ctx_request_id is None:
-                raise ValueError(
-                    f"Invalid disaggregated params: ctx_request_id is None."
-                    f" finish_reason={choice.finish_reason!r},"
-                    f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
-                )
-            if choice.disaggregated_params.disagg_request_id is None:
-                raise ValueError(
-                    f"Invalid disaggregated params: disagg_request_id is None."
-                    f" finish_reason={choice.finish_reason!r},"
-                    f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
-                )
+            if ctx_will_hand_off_to_gen:
+                if choice.disaggregated_params.ctx_request_id is None:
+                    raise ValueError(
+                        f"Invalid disaggregated params: ctx_request_id is None."
+                        f" finish_reason={choice.finish_reason!r},"
+                        f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
+                    )
+                if choice.disaggregated_params.disagg_request_id is None:
+                    raise ValueError(
+                        f"Invalid disaggregated params: disagg_request_id is None."
+                        f" finish_reason={choice.finish_reason!r},"
+                        f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
+                    )
             return ctx_response
 
     async def _send_disagg_request_gen_first(
