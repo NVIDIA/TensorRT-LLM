@@ -100,6 +100,15 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
+            "microsoft/Phi-3-mini-4k-instruct",
+            {
+                "transforms": {
+                    "insert_cached_attention": {"backend": "torch"},
+                    "compile_model": {"backend": "torch-simple"},
+                },
+            },
+        ),
+        (
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
             {
                 "transforms": {
@@ -261,7 +270,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
             {
                 "transforms": {
-                    "mlir_elementwise_fusion": {"enabled": True},
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
                     # Use flashinfer attention: trtllm backend does not support FP8 KV cache
                     # with BF16 output currently.
@@ -281,7 +289,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "compile_backend": "torch-cudagraph",
                 "transforms": {
-                    "mlir_elementwise_fusion": {"enabled": True},
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
                     "insert_cached_attention": {"backend": "flashinfer"},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},

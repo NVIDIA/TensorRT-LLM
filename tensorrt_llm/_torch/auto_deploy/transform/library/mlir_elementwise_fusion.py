@@ -110,8 +110,9 @@ class MLIRElementwiseFusion(BaseTransform):
             f"Discovered {len(subgraphs)} fusible subgraphs "
             f"(total ops: {sum(len(sg.ops) for sg in subgraphs)})"
         )
+        num_direct_rewrites = getattr(converter, "num_direct_rewrites", 0)
 
-        if not subgraphs:
+        if not subgraphs and num_direct_rewrites == 0:
             return gm, TransformInfo(
                 skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -157,7 +158,7 @@ class MLIRElementwiseFusion(BaseTransform):
             f"Replaced {num_replaced}/{len(subgraphs)} subgraphs (skipped {num_skipped} low-rank)"
         )
 
-        if num_replaced == 0:
+        if num_replaced == 0 and num_direct_rewrites == 0:
             return gm, TransformInfo(
                 skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -174,7 +175,7 @@ class MLIRElementwiseFusion(BaseTransform):
         # happens later at cache_init).
         return new_gm, TransformInfo(
             skipped=False,
-            num_matches=num_replaced,
+            num_matches=num_replaced + num_direct_rewrites,
             is_clean=False,
             has_valid_shapes=False,
         )

@@ -15,6 +15,8 @@
 
 """Round-trip tests: FX → MLIR → FX."""
 
+import operator
+
 import pytest
 
 xdsl = pytest.importorskip("xdsl")
@@ -22,6 +24,8 @@ xdsl = pytest.importorskip("xdsl")
 import torch  # noqa: E402
 from torch.export import Dim  # noqa: E402
 
+import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant  # noqa: F401, E402
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.l2norm import *  # noqa: F401, F403, E402
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import *  # noqa: F401, F403, E402
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.mlir.fx_to_mlir import FXToMLIRConverter  # noqa: E402
@@ -248,6 +252,299 @@ def test_fx_to_mlir_metadata_stored():
     # Check that val metadata exists for at least some nodes
     has_val = any("val" in meta for meta in converter.metadata.values())
     assert has_val, "Expected 'val' metadata to be stored for tensor nodes"
+
+
+def test_fx_to_mlir_lowers_l2norm_primitives_as_fusible_ops():
+    """FX lowering covers the square -> sum -> div -> cast primitive chain."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    y = graph.placeholder("y")
+    x.meta["val"] = torch.empty((2, 8), device="meta", dtype=torch.float32)
+    y.meta["val"] = torch.empty((2, 8), device="meta", dtype=torch.float32)
+
+    square = graph.call_function(torch.ops.aten.square.default, args=(x,))
+    square.meta["val"] = torch.empty((2, 8), device="meta", dtype=torch.float32)
+    summed = graph.call_function(torch.ops.aten.sum.dim_IntList, args=(square, [1], True))
+    summed.meta["val"] = torch.empty((2, 1), device="meta", dtype=torch.float32)
+    div = graph.call_function(torch.ops.aten.div.Tensor, args=(x, y))
+    div.meta["val"] = torch.empty((2, 8), device="meta", dtype=torch.float32)
+    cast = graph.call_function(torch.ops.aten.to.dtype, args=(div, torch.bfloat16))
+    cast.meta["val"] = torch.empty((2, 8), device="meta", dtype=torch.bfloat16)
+    graph.output((summed, cast))
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    converter = FXToMLIRConverter(gm)
+    mlir_mod = converter.convert()
+
+    op_names = [op.name for op in mlir_mod.body.block.ops]
+    assert "ad.mul" in op_names, f"Expected square to lower to ad.mul in {op_names}"
+    assert "ad.reduce_sum" in op_names, f"Expected ad.reduce_sum in {op_names}"
+    assert "ad.div" in op_names, f"Expected ad.div in {op_names}"
+    assert "ad.to_dtype" in op_names, f"Expected ad.to_dtype in {op_names}"
+    assert "ad.opaque" not in op_names
+
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.subgraph_discovery import (
+        discover_fusible_subgraphs,
+    )
+
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert sorted(len(sg.ops) for sg in subgraphs) == [2, 2]
+
+
+def test_fx_to_mlir_lowers_torch_l2norm_to_fusible_primitives():
+    """Standardized torch_l2norm custom ops lower to primitive MLIR."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty((2, 8), device="meta", dtype=torch.bfloat16)
+
+    l2norm = graph.call_function(torch.ops.auto_deploy.torch_l2norm.default, args=(x, 1e-6))
+    l2norm.meta["val"] = torch.empty((2, 8), device="meta", dtype=torch.bfloat16)
+    graph.output(l2norm)
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    converter = FXToMLIRConverter(gm)
+    mlir_mod = converter.convert()
+
+    op_names = [op.name for op in mlir_mod.body.block.ops]
+    assert op_names.count("ad.to_dtype") == 2
+    assert "ad.reduce_sum" in op_names
+    assert "ad.rsqrt" in op_names
+    assert "ad.opaque" not in op_names
+
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.subgraph_discovery import (
+        discover_fusible_subgraphs,
+    )
+
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert len(subgraphs) == 1
+    assert [op.name for op in subgraphs[0].ops] == [
+        "ad.to_dtype",
+        "ad.mul",
+        "ad.reduce_sum",
+        "ad.splat",
+        "ad.add",
+        "ad.rsqrt",
+        "ad.mul",
+        "ad.to_dtype",
+    ]
+
+
+def test_fx_to_mlir_lowers_narrow_silu_mul_to_single_fusible_subgraph():
+    """Narrow + contiguous + silu + mul lowers to one MLIR fusible subgraph."""
+    hidden = 256
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty((2, hidden * 2), device="meta", dtype=torch.float16)
+
+    gate_narrow = graph.call_function(torch.narrow, args=(x, -1, 0, hidden))
+    gate_narrow.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    up_slice = graph.call_function(
+        torch.ops.aten.slice.Tensor,
+        args=(x, -1, hidden, hidden * 2, 1),
+    )
+    up_slice.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    gate = graph.call_method("contiguous", args=(gate_narrow,))
+    gate.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    up = graph.call_method("contiguous", args=(up_slice,))
+    up.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    silu = graph.call_function(torch.ops.aten.silu.default, args=(gate,))
+    silu.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    mul = graph.call_function(torch.ops.aten.mul.Tensor, args=(silu, up))
+    mul.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    graph.output(mul)
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    converter = FXToMLIRConverter(gm)
+    mlir_mod = converter.convert()
+
+    op_names = [op.name for op in mlir_mod.body.block.ops]
+    assert op_names.count("ad.slice") == 2
+    assert "ad.opaque" not in op_names
+
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.subgraph_discovery import (
+        discover_fusible_subgraphs,
+    )
+
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert len(subgraphs) == 1
+    assert [op.name for op in subgraphs[0].ops] == [
+        "ad.slice",
+        "ad.slice",
+        "ad.silu",
+        "ad.mul",
+    ]
+
+
+def test_fx_to_mlir_lowers_split_getitem_silu_mul_to_single_fusible_subgraph():
+    """Split/getitem + silu + mul lowers to one MLIR fusible subgraph."""
+    hidden = 256
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty((2, hidden * 2), device="meta", dtype=torch.float16)
+
+    split = graph.call_function(
+        torch.ops.aten.split_with_sizes.default,
+        args=(x, [hidden, hidden], -1),
+    )
+    split.meta["val"] = (
+        torch.empty((2, hidden), device="meta", dtype=torch.float16),
+        torch.empty((2, hidden), device="meta", dtype=torch.float16),
+    )
+    gate = graph.call_function(operator.getitem, args=(split, 0))
+    gate.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    up = graph.call_function(operator.getitem, args=(split, 1))
+    up.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    silu = graph.call_function(torch.ops.aten.silu.default, args=(gate,))
+    silu.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    mul = graph.call_function(torch.ops.aten.mul.Tensor, args=(silu, up))
+    mul.meta["val"] = torch.empty((2, hidden), device="meta", dtype=torch.float16)
+    graph.output(mul)
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    converter = FXToMLIRConverter(gm)
+    mlir_mod = converter.convert()
+
+    op_names = [op.name for op in mlir_mod.body.block.ops]
+    assert op_names.count("ad.slice") == 2
+    assert "ad.opaque" not in op_names
+
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.subgraph_discovery import (
+        discover_fusible_subgraphs,
+    )
+
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert len(subgraphs) == 1
+    assert [op.name for op in subgraphs[0].ops] == [
+        "ad.slice",
+        "ad.slice",
+        "ad.silu",
+        "ad.mul",
+    ]
+
+
+def test_fx_to_mlir_lowers_fp8_quant_linear_to_mlir_quant_and_prequant_linear():
+    """FP8 quant-linear consumers lower through ad.quant_fp8."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    input_scale = graph.placeholder("input_scale")
+    weight_scale = graph.placeholder("weight_scale")
+    x.meta["val"] = torch.empty((2, 128), device="meta", dtype=torch.bfloat16)
+    weight.meta["val"] = torch.empty((64, 128), device="meta", dtype=torch.float8_e4m3fn)
+    input_scale.meta["val"] = torch.empty((), device="meta", dtype=torch.float32)
+    weight_scale.meta["val"] = torch.empty((), device="meta", dtype=torch.float32)
+
+    relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+    relu.meta["val"] = torch.empty((2, 128), device="meta", dtype=torch.bfloat16)
+    linear = graph.call_function(
+        torch.ops.auto_deploy.trtllm_quant_fp8_linear.default,
+        args=(relu, weight, None),
+        kwargs={"input_scale": input_scale, "weight_scale": weight_scale},
+    )
+    linear.meta["val"] = torch.empty((2, 64), device="meta", dtype=torch.bfloat16)
+    graph.output(linear)
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    converter = FXToMLIRConverter(gm)
+    mlir_mod = converter.convert()
+
+    op_names = [op.name for op in mlir_mod.body.block.ops]
+    assert "ad.quant_fp8" in op_names
+    assert "ad.opaque" in op_names
+    assert converter.metadata[linear.name]["_original_target"] == (
+        torch.ops.auto_deploy.trtllm_fp8_prequant_linear.default
+    )
+
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.subgraph_discovery import (
+        discover_fusible_subgraphs,
+    )
+
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert len(subgraphs) == 1
+    assert [op.name for op in subgraphs[0].ops] == ["ad.relu", "ad.quant_fp8"]
+
+
+def test_fx_to_mlir_lowers_relu2_nvfp4_quant_linear_to_prequant_linear():
+    """Exclusive ReLU2 -> NVFP4 quant-linear lowers to MLIR-owned prequant path."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    input_scale = graph.placeholder("input_scale")
+    weight_scale = graph.placeholder("weight_scale")
+    alpha = graph.placeholder("alpha")
+    x.meta["val"] = torch.empty((2, 128), device="meta", dtype=torch.float16)
+    weight.meta["val"] = torch.empty((64, 64), device="meta", dtype=torch.uint8)
+    input_scale.meta["val"] = torch.empty((), device="meta", dtype=torch.float32)
+    weight_scale.meta["val"] = torch.empty((512,), device="meta", dtype=torch.uint8)
+    alpha.meta["val"] = torch.empty((), device="meta", dtype=torch.float32)
+
+    relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+    relu.meta["val"] = torch.empty((2, 128), device="meta", dtype=torch.float16)
+    relu2 = graph.call_function(torch.ops.aten.mul.Tensor, args=(relu, relu))
+    relu2.meta["val"] = torch.empty((2, 128), device="meta", dtype=torch.float16)
+    linear = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(relu2, weight, None, input_scale, weight_scale, alpha),
+    )
+    linear.meta["val"] = torch.empty((2, 64), device="meta", dtype=torch.float16)
+    graph.output(linear)
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    converter = FXToMLIRConverter(gm)
+    mlir_mod = converter.convert()
+
+    op_names = [op.name for op in mlir_mod.body.block.ops]
+    assert "ad.relu" not in op_names
+    assert "ad.mul" not in op_names
+    assert op_names.count("ad.opaque") == 2
+    assert converter.num_direct_rewrites == 1
+    assert converter.metadata[linear.name]["_original_target"] == (
+        torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear.default
+    )
+    assert any(
+        meta.get("_original_target") == torch.ops.auto_deploy.trtllm_fused_relu2_quant_nvfp4.default
+        for meta in converter.metadata.values()
+    )
+
+
+def test_fx_to_mlir_leaves_shared_relu2_nvfp4_quant_linear_opaque():
+    """Shared ReLU2 users are not rewritten through the fused NVFP4 path."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    input_scale = graph.placeholder("input_scale")
+    weight_scale = graph.placeholder("weight_scale")
+    alpha = graph.placeholder("alpha")
+    x.meta["val"] = torch.empty((2, 128), device="meta", dtype=torch.float16)
+    weight.meta["val"] = torch.empty((64, 64), device="meta", dtype=torch.uint8)
+    input_scale.meta["val"] = torch.empty((), device="meta", dtype=torch.float32)
+    weight_scale.meta["val"] = torch.empty((512,), device="meta", dtype=torch.uint8)
+    alpha.meta["val"] = torch.empty((), device="meta", dtype=torch.float32)
+
+    relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+    relu.meta["val"] = torch.empty((2, 128), device="meta", dtype=torch.float16)
+    relu2 = graph.call_function(torch.ops.aten.mul.Tensor, args=(relu, relu))
+    relu2.meta["val"] = torch.empty((2, 128), device="meta", dtype=torch.float16)
+    linear = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(relu2, weight, None, input_scale, weight_scale, alpha),
+    )
+    linear.meta["val"] = torch.empty((2, 64), device="meta", dtype=torch.float16)
+    shared = graph.call_function(torch.ops.aten.slice.Tensor, args=(relu2, -1, 0, 64, 1))
+    shared.meta["val"] = torch.empty((2, 64), device="meta", dtype=torch.float16)
+    graph.output((linear, shared))
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    converter = FXToMLIRConverter(gm)
+    mlir_mod = converter.convert()
+
+    op_names = [op.name for op in mlir_mod.body.block.ops]
+    assert "ad.relu" in op_names
+    assert "ad.mul" in op_names
+    assert converter.num_direct_rewrites == 0
+    assert converter.metadata[linear.name]["_original_target"] == (
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default
+    )
 
 
 def test_roundtrip_identity():

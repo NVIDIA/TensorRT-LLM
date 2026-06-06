@@ -33,13 +33,16 @@ from xdsl.ir import Block, Region  # noqa: E402
 
 from tensorrt_llm._torch.auto_deploy.mlir.dialect import (  # noqa: E402
     AdAdd,
+    AdDiv,
     AdGraphInput,
     AdGraphOutput,
     AdMul,
     AdOpaque,
+    AdQuantFP8,
     AdReduceMean,
     AdRMSNorm,
     AdSilu,
+    AdSlice,
     AdSplat,
     Float8E4M3FNType,
     Float8E5M2Type,
@@ -156,6 +159,24 @@ def test_ad_opaque_construction():
     assert op.node_key.data == "relu_0"
 
 
+def test_ad_quant_fp8_construction():
+    """Verify ad.quant_fp8 op can be constructed."""
+    t = TensorType(BFloat16Type(), [2, 128])
+    ts = TensorType(BFloat16Type(), [])
+    tout = TensorType(Float8E4M3FNType(), [2, 128])
+    block = Block()
+    inp = block.insert_arg(t, 0)
+    scale = block.insert_arg(ts, 1)
+
+    op = AdQuantFP8.build(operands=[inp, scale], result_types=[tout])
+    block.add_op(op)
+
+    assert op.name == "ad.quant_fp8"
+    assert op.input is inp
+    assert op.scale is scale
+    assert isinstance(op.output.type.element_type, Float8E4M3FNType)
+
+
 def test_ad_graph_input_output():
     """Verify graph boundary ops."""
     t = TensorType(BFloat16Type(), [2, 128])
@@ -229,6 +250,17 @@ def test_ad_mul_construction():
     assert op.name == "ad.mul"
 
 
+def test_ad_div_construction():
+    """Verify ad.div op can be constructed with proper operands and result."""
+    t = TensorType(BFloat16Type(), [2, 8, 128])
+    block = Block()
+    lhs = block.insert_arg(t, 0)
+    rhs = block.insert_arg(t, 1)
+    op = AdDiv.build(operands=[lhs, rhs], result_types=[t])
+    block.add_op(op)
+    assert op.name == "ad.div"
+
+
 def test_ad_reduce_mean_construction():
     """Verify ad.reduce_mean op with dim and keepdim attributes."""
     from xdsl.dialects.builtin import IntegerAttr  # noqa: E402
@@ -259,6 +291,27 @@ def test_ad_silu_construction():
     assert op.name == "ad.silu"
 
 
+def test_ad_slice_construction():
+    """Verify ad.slice op can be constructed."""
+    from xdsl.dialects.builtin import IntegerAttr  # noqa: E402
+
+    t = TensorType(BFloat16Type(), [2, 512])
+    t_half = TensorType(BFloat16Type(), [2, 256])
+    block = Block()
+    inp = block.insert_arg(t, 0)
+    op = AdSlice.build(
+        operands=[inp],
+        attributes={
+            "dim": IntegerAttr(-1, IntegerType(64)),
+            "start": IntegerAttr(256, IntegerType(64)),
+            "length": IntegerAttr(256, IntegerType(64)),
+        },
+        result_types=[t_half],
+    )
+    block.add_op(op)
+    assert op.name == "ad.slice"
+
+
 def test_ad_splat_construction():
     """Verify ad.splat op with value attribute and no operands."""
     t = TensorType(BFloat16Type(), [1])
@@ -272,7 +325,7 @@ def test_ad_splat_construction():
 
 
 def test_all_primitive_ops_registered():
-    """Verify all 14 primitive ops are registered in the ad dialect."""
+    """Verify all primitive ops are registered in the ad dialect."""
     from xdsl.context import Context as MLContext
 
     ctx = MLContext()
@@ -280,6 +333,7 @@ def test_all_primitive_ops_registered():
     for name in [
         "ad.mul",
         "ad.sub",
+        "ad.div",
         "ad.neg",
         "ad.pow",
         "ad.rsqrt",
@@ -291,6 +345,8 @@ def test_all_primitive_ops_registered():
         "ad.reduce_sum",
         "ad.reduce_mean",
         "ad.cast",
+        "ad.to_dtype",
+        "ad.slice",
         "ad.splat",
     ]:
         assert ctx.get_optional_op(name) is not None, f"{name} not registered"

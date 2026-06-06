@@ -31,6 +31,7 @@ from xdsl.ir import Operation, SSAValue
 from .dialect import (
     AdAdd,
     AdCast,
+    AdDiv,
     AdEq,
     AdExp,
     AdFloorDiv,
@@ -42,6 +43,7 @@ from .dialect import (
     AdNeg,
     AdOpaque,
     AdPow,
+    AdQuantFP8,
     AdReduceMean,
     AdReduceSum,
     AdRelu,
@@ -49,6 +51,7 @@ from .dialect import (
     AdRsqrt,
     AdSigmoid,
     AdSilu,
+    AdSlice,
     AdSoftplus,
     AdSplat,
     AdSqrt,
@@ -145,6 +148,8 @@ class MLIRToFXConverter:
             self._convert_binary_elementwise(mlir_op, graph, metadata, torch.ops.aten.mul.Tensor)
         elif isinstance(mlir_op, AdSub):
             self._convert_binary_elementwise(mlir_op, graph, metadata, torch.ops.aten.sub.Tensor)
+        elif isinstance(mlir_op, AdDiv):
+            self._convert_binary_elementwise(mlir_op, graph, metadata, torch.ops.aten.div.Tensor)
         elif isinstance(mlir_op, AdNeg):
             self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.neg.default)
         elif isinstance(mlir_op, AdSilu):
@@ -167,6 +172,8 @@ class MLIRToFXConverter:
             self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.rsqrt.default)
         elif isinstance(mlir_op, AdSqrt):
             self._convert_unary_elementwise(mlir_op, graph, metadata, torch.ops.aten.sqrt.default)
+        elif isinstance(mlir_op, AdSlice):
+            self._convert_slice(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdReduceMean):
             self._convert_reduce(mlir_op, graph, metadata, torch.ops.aten.mean.dim)
         elif isinstance(mlir_op, AdReduceSum):
@@ -177,6 +184,8 @@ class MLIRToFXConverter:
             self._convert_cast(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdPow):
             self._convert_pow(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdQuantFP8):
+            self._convert_quant_fp8(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdFloorDiv):
             self._convert_floordiv(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdEq):
@@ -252,6 +261,16 @@ class MLIRToFXConverter:
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)
 
+    def _convert_slice(self, op: AdSlice, graph: Graph, metadata: dict) -> None:
+        """Reconstruct ``torch.narrow`` from ``ad.slice``."""
+        input_node = self._resolve(op.input)
+        dim = op.dim.value.data
+        start = op.start.value.data
+        length = op.length.value.data
+        node = graph.call_function(torch.narrow, args=(input_node, dim, start, length))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
     def _convert_cast(self, op, graph: Graph, metadata: dict) -> None:
         """Reconstruct dtype cast from ``ad.cast``."""
         input_node = self._resolve(op.input)
@@ -280,6 +299,29 @@ class MLIRToFXConverter:
         exp_val = exp_attr.value.data if isinstance(exp_attr, FA) else float(str(exp_attr))
         node = graph.call_function(torch.ops.aten.pow.Tensor_Scalar, args=(base_node, exp_val))
         self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_quant_fp8(self, op: AdQuantFP8, graph: Graph, metadata: dict) -> None:
+        """Reconstruct static-scale FP8 quantization from ``ad.quant_fp8``."""
+        del metadata
+        input_node = self._resolve(op.input)
+        scale_node = self._resolve(op.scale)
+        div_node = graph.call_function(torch.ops.aten.div.Tensor, args=(input_node, scale_node))
+        clamp_node = graph.call_function(
+            torch.ops.aten.clamp.default,
+            args=(
+                div_node,
+                float(torch.finfo(torch.float8_e4m3fn).min),
+                float(torch.finfo(torch.float8_e4m3fn).max),
+            ),
+        )
+        node = graph.call_function(
+            torch.ops.aten.to.dtype,
+            args=(clamp_node, torch.float8_e4m3fn),
+        )
+        fake_val = _fake_tensor_from_mlir_type(op.output.type)
+        if fake_val is not None:
+            node.meta["val"] = fake_val
         self._map_value(op.output, node)
 
     def _convert_floordiv(self, op: AdFloorDiv, graph: Graph, metadata: dict) -> None:

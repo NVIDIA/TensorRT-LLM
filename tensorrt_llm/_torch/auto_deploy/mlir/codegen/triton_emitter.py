@@ -48,6 +48,9 @@ from .kernel_cache import KernelCache
 # Module-level kernel cache shared across calls (keyed by subgraph hash)
 _kernel_cache = KernelCache()
 
+_FP8_E4M3FN_MIN = float(torch.finfo(torch.float8_e4m3fn).min)
+_FP8_E4M3FN_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
 # Track temp files so they can be cleaned up at process exit.
 # These files must persist while the process is alive because Triton's @jit
 # calls inspect.getsourcelines() lazily during kernel compilation.
@@ -77,6 +80,7 @@ _EMIT = {
     "ad.add": lambda a, b: f"({a} + {b})",
     "ad.mul": lambda a, b: f"({a} * {b})",
     "ad.sub": lambda a, b: f"({a} - {b})",
+    "ad.div": lambda a, b: f"({a} / {b})",
     "ad.neg": lambda a: f"(-{a})",
     "ad.pow": None,  # handled specially — needs attribute extraction for exponent
     "ad.rsqrt": lambda a: f"(1.0 / tl.sqrt({a}))",
@@ -92,6 +96,7 @@ _EMIT = {
     "ad.reduce_mean": lambda a, ncols: f"(tl.sum({a}, 0) * (1.0 / {ncols}))",
     "ad.splat": None,  # handled specially — just inline the scalar value
     "ad.cast": lambda a, dt: f"{a}.to({dt})",
+    "ad.to_dtype": lambda a, dt: f"{a}.to({dt})",
     "ad.floordiv": None,  # handled specially — scalar divisor from attribute
     "ad.eq": None,  # handled specially — scalar comparand from attribute
 }
@@ -102,6 +107,8 @@ _TRITON_DTYPE_MAP = {
     "f32": "tl.float32",
     "bf16": "tl.bfloat16",
     "f64": "tl.float64",
+    "!ad.f8E4M3FN": "tl.float8e4nv",
+    "!ad.f8E5M2": "tl.float8e5",
     "i1": "tl.int1",
     "i8": "tl.int8",
     "i16": "tl.int16",
@@ -115,6 +122,8 @@ _TORCH_DTYPE_STR_MAP = {
     "f32": "torch.float32",
     "bf16": "torch.bfloat16",
     "f64": "torch.float64",
+    "!ad.f8E4M3FN": "torch.float8_e4m3fn",
+    "!ad.f8E5M2": "torch.float8_e5m2",
     "i1": "torch.bool",
     "i8": "torch.int8",
     "i16": "torch.int16",
@@ -132,12 +141,20 @@ def _is_integer_type(tensor_type: TensorType) -> bool:
 def _mlir_elem_to_triton_str(tensor_type: TensorType) -> str:
     """Return Triton dtype string for a TensorType's element type."""
     elem_str = str(tensor_type.element_type)
+    if "f8E4M3FN" in elem_str:
+        return "tl.float8e4nv"
+    if "f8E5M2" in elem_str:
+        return "tl.float8e5"
     return _TRITON_DTYPE_MAP.get(elem_str, "tl.float32")
 
 
 def _mlir_elem_to_torch_dtype_str(tensor_type: TensorType) -> str:
     """Return torch dtype string for a TensorType's element type (for codegen source)."""
     elem_str = str(tensor_type.element_type)
+    if "f8E4M3FN" in elem_str:
+        return "torch.float8_e4m3fn"
+    if "f8E5M2" in elem_str:
+        return "torch.float8_e5m2"
     return _TORCH_DTYPE_STR_MAP.get(elem_str, "torch.bfloat16")
 
 
@@ -200,6 +217,27 @@ def _get_ncols(inputs: List[SSAValue]) -> int:
     raise ValueError("Cannot determine N_COLS from subgraph inputs")
 
 
+def _get_output_ncols(outputs: List[SSAValue]) -> int:
+    """Return the maximum last-dim size across highest-rank outputs."""
+    max_rank = 0
+    for out in outputs:
+        if isinstance(out.type, TensorType):
+            max_rank = max(max_rank, len(out.type.get_shape()))
+
+    ncols = 0
+    for out in outputs:
+        if isinstance(out.type, TensorType):
+            shape = out.type.get_shape()
+            if len(shape) == max_rank and shape:
+                ncols = max(ncols, shape[-1])
+    return ncols
+
+
+def _has_slice_op(subgraph) -> bool:
+    """Return True if the subgraph contains a static slice op."""
+    return any(op.name == "ad.slice" for op in subgraph.ops)
+
+
 def _detect_group_size(subgraph) -> int:
     """Detect if the subgraph uses grouped reduction.
 
@@ -249,7 +287,10 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
 
     n_inputs = len(subgraph.inputs)
     n_outputs = len(subgraph.outputs)
-    ncols = _get_ncols(subgraph.inputs)
+    slice_mode = _has_slice_op(subgraph)
+    ncols = _get_output_ncols(subgraph.outputs) if slice_mode else 0
+    if ncols <= 0:
+        ncols = _get_ncols(subgraph.inputs)
 
     # Detect grouped reduction mode (e.g. gated RMSNorm with group_size > 0).
     # In grouped mode, the kernel processes one group per program instead of one
@@ -264,8 +305,10 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     val_names: dict[int, str] = {}
 
     # Assign names to subgraph inputs
+    input_indices: dict[int, int] = {}
     for i, inp in enumerate(subgraph.inputs):
         val_names[id(inp)] = f"v{i}"
+        input_indices[id(inp)] = i
 
     # Track which inputs are broadcast (lower rank) or narrow (same rank but
     # last dim < N_COLS, e.g. a gating scalar of shape (-1, 1) in a subgraph
@@ -393,14 +436,52 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             for r in op.results:
                 val_names[id(r)] = result_name
 
-        elif op_name == "ad.cast":
+        elif op_name == "ad.quant_fp8":
+            input_val = op.operands[0]
+            scale_val = op.operands[1]
+            input_name = val_names[id(input_val)]
+            scale_name = val_names[id(scale_val)]
+            result_name = f"t{temp_counter}"
+            scaled_name = f"{result_name}_scaled"
+            body_lines.append(f"    {scaled_name} = {input_name} / {scale_name}")
+            body_lines.append(
+                f"    {result_name} = tl.clamp("
+                f"{scaled_name}, {_FP8_E4M3FN_MIN}, {_FP8_E4M3FN_MAX}).to(tl.float8e4nv)"
+            )
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+
+        elif op_name == "ad.slice":
+            input_val = op.operands[0]
+            input_idx = input_indices.get(id(input_val))
+            if input_idx is None:
+                raise NotImplementedError("ad.slice currently supports external inputs only")
+            dim = op.attributes["dim"].value.data
+            if dim != -1:
+                raise NotImplementedError("ad.slice currently supports only dim=-1")
+            start = op.attributes["start"].value.data
+            length = op.attributes["length"].value.data
+            upcast = "" if int_input_flags[input_idx] else ".to(tl.float32)"
+            other = "0" if int_input_flags[input_idx] else "0.0"
+            result_name = f"t{temp_counter}"
+            body_lines.append(
+                f"    {result_name} = tl.load("
+                f"in{input_idx}_ptr + row_off + {start} + offs, "
+                f"mask=offs < {length}, other={other}){upcast}"
+            )
+            temp_counter += 1
+            for r in op.results:
+                val_names[id(r)] = result_name
+
+        elif op_name in ("ad.cast", "ad.to_dtype"):
             input_val = op.operands[0]
             input_name = val_names[id(input_val)]
             # Get target dtype from the result type
             result_type = op.results[0].type
             triton_dt = _mlir_elem_to_triton_str(result_type)
             result_name = f"t{temp_counter}"
-            expr = _EMIT["ad.cast"](input_name, triton_dt)
+            expr = _EMIT[op_name](input_name, triton_dt)
             body_lines.append(f"    {result_name} = {expr}")
             temp_counter += 1
             for r in op.results:
@@ -558,7 +639,19 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             if isinstance(out.type, TensorType)
             else f"{ref}.dtype"
         )
-        if out_rank < max_rank:
+        if isinstance(out.type, TensorType):
+            shape_parts = []
+            out_shape = out.type.get_shape()
+            for d, s in enumerate(out_shape):
+                if d < len(out_shape) - 1 and d < ref_input_rank:
+                    shape_parts.append(f"{ref}.shape[{d}]")
+                else:
+                    shape_parts.append(f"{ref}.shape[{d}]" if s < 0 else str(s))
+            shape_expr = "(" + ", ".join(shape_parts) + (",)" if len(shape_parts) == 1 else ")")
+            out_alloc_lines.append(
+                f"    out{i} = torch.empty({shape_expr}, device={ref}.device, dtype={out_dtype_str})"
+            )
+        elif out_rank < max_rank:
             out_alloc_lines.append(
                 f"    out{i} = torch.empty("
                 f"{ref}.shape[:-1] + (1,), device={ref}.device, dtype={out_dtype_str})"
@@ -598,14 +691,15 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
         launcher_src = (
             f"def {launcher_name}({', '.join(in_tensor_params)}):\n"
             f"    feat_size = {ref}.size(-1)\n"
+            f"    work_size = {ncols if slice_mode else f'{ref}.size(-1)'}\n"
             f"    seq_len = {ref}.numel() // feat_size\n"
             f"    row_stride = {ref}.stride(-2) if {ref}.dim() >= 2 else feat_size\n"
-            f"    BLOCK_N = triton.next_power_of_2(feat_size)\n" + "\n".join(out_alloc_lines) + "\n"
+            f"    BLOCK_N = triton.next_power_of_2(work_size)\n" + "\n".join(out_alloc_lines) + "\n"
             f"    grid = (seq_len,)\n"
             f"    {kernel_name}[grid](\n"
             f"        {', '.join(launch_args)},\n"
             f"        row_stride=row_stride,\n"
-            f"        N_COLS=feat_size,\n"
+            f"        N_COLS=work_size,\n"
             f"        BLOCK_N=BLOCK_N,\n"
             f"        num_warps=4,\n"
             f"        num_stages=3,\n"
@@ -667,8 +761,11 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     for i, out in enumerate(subgraph.outputs):
         if isinstance(out.type, TensorType):
             shape_parts = []
-            for d, s in enumerate(out.type.get_shape()):
-                if s < 0:
+            out_shape = out.type.get_shape()
+            for d, s in enumerate(out_shape):
+                if d < len(out_shape) - 1 and d < ref_input_rank:
+                    shape_parts.append(f"{ref_input}.shape[{d}]")
+                elif s < 0:
                     shape_parts.append(f"{ref_input}.shape[{d}]")
                 else:
                     shape_parts.append(str(s))

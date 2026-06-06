@@ -26,12 +26,14 @@ Ops:
     - ``ad.to_dtype``: Dtype cast (maps to ``aten.to.dtype``)
     - ``ad.opaque``: Catch-all for unmodeled FX ops
     - ``ad.graph_input`` / ``ad.graph_output``: Graph boundaries
-    - ``ad.mul``, ``ad.sub``, ``ad.neg``: Elementwise arithmetic primitives
+    - ``ad.mul``, ``ad.sub``, ``ad.div``, ``ad.neg``: Elementwise arithmetic primitives
     - ``ad.pow``, ``ad.rsqrt``, ``ad.sqrt``: Power/root primitives
     - ``ad.silu``, ``ad.gelu``, ``ad.relu``, ``ad.tanh``, ``ad.sigmoid``: Activation primitives
     - ``ad.exp``, ``ad.softplus``: Elementwise math primitives
     - ``ad.reduce_sum``, ``ad.reduce_mean``: Reduction primitives (mean supports group_size)
     - ``ad.cast``: Dtype cast primitive
+    - ``ad.quant_fp8``: Static-scale FP8 activation quantization
+    - ``ad.slice``: Static last-dim tensor slice
     - ``ad.splat``: Constant scalar splat
 """
 
@@ -270,6 +272,16 @@ class AdSub(IRDLOperation):
 
 
 @irdl_op_definition
+class AdDiv(IRDLOperation):
+    """Elementwise division — mirrors ``aten.div.Tensor`` / ``aten.div.Scalar``."""
+
+    name = "ad.div"
+    lhs = operand_def(AnyAttr())
+    rhs = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
 class AdNeg(IRDLOperation):
     """Elementwise negation — mirrors ``aten.neg``."""
 
@@ -410,6 +422,28 @@ class AdCast(IRDLOperation):
 
 
 @irdl_op_definition
+class AdQuantFP8(IRDLOperation):
+    """Static-scale FP8 activation quantization."""
+
+    name = "ad.quant_fp8"
+    input = operand_def(AnyAttr())
+    scale = operand_def(AnyAttr())
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdSlice(IRDLOperation):
+    """Static tensor slice — mirrors ``torch.narrow`` for the last dimension."""
+
+    name = "ad.slice"
+    input = operand_def(AnyAttr())
+    dim = attr_def(IntegerAttr)
+    start = attr_def(IntegerAttr)
+    length = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
 class AdFloorDiv(IRDLOperation):
     """Elementwise integer floor division by scalar — mirrors ``operator.floordiv``."""
 
@@ -455,6 +489,7 @@ AD_OPS = [
     AdGraphOutput,
     AdMul,
     AdSub,
+    AdDiv,
     AdNeg,
     AdPow,
     AdRsqrt,
@@ -469,6 +504,8 @@ AD_OPS = [
     AdReduceSum,
     AdReduceMean,
     AdCast,
+    AdQuantFP8,
+    AdSlice,
     AdFloorDiv,
     AdEq,
     AdSplat,

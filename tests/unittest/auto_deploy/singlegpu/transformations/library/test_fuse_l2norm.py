@@ -20,7 +20,6 @@ from torch.export import Dim
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.l2norm import *  # noqa
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
 class L2Norm(torch.nn.Module):
@@ -67,9 +66,15 @@ class TestModel(torch.nn.Module):
         return x
 
 
-def _run_test(model, op, variant):
+def _count_mlir_fused_ops(gm):
+    return sum(
+        1 for n in gm.graph.nodes if n.op == "call_function" and "mlir_fused_" in str(n.target)
+    )
+
+
+def _run_test(model, variant):
     def checker(gm):
-        return any(is_op(n, op) for n in gm.graph.nodes)
+        return _count_mlir_fused_ops(gm) > 0
 
     x = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
     dynamic_shapes = {0: Dim.DYNAMIC}
@@ -103,13 +108,7 @@ def _run_test(model, op, variant):
 
 
 @pytest.mark.parametrize("eps", [1e-2, 1e-6])
-@pytest.mark.parametrize(
-    "variant, op",
-    [
-        ("fla", torch.ops.auto_deploy.fla_l2norm.default),
-        ("torch", torch.ops.auto_deploy.torch_l2norm.default),
-    ],
-)
-def test_l2norm_fusion(eps, variant, op):
+@pytest.mark.parametrize("variant", ["fla", "torch"])
+def test_l2norm_fusion(eps, variant):
     model = TestModel(eps)
-    _run_test(model, op, variant)
+    _run_test(model, variant)

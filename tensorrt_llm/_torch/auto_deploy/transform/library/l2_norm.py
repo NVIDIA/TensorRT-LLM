@@ -12,19 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Graph transform to optimize L2Norm execution using FLA Triton kernels."""
+"""Graph transforms for standardizing L2Norm and routing fusion through MLIR."""
 
 from typing import Literal, Tuple, Type
 
 import torch
 from pydantic import Field
-from torch.fx import GraphModule, Node
+from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 
 # It is important to import ADPatternMatcherPass from pattern_matcher.py, not from torch._inductor.pattern_matcher
-from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -33,11 +32,7 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-_BACKEND_OPS = {
-    "fla": torch.ops.auto_deploy.fla_l2norm.default,
-    "torch": torch.ops.auto_deploy.torch_l2norm.default,
-}
+from ._mlir_elementwise_alias import apply_mlir_elementwise_alias
 
 
 def _l2_norm_pattern(data: torch.Tensor, eps: float) -> torch.Tensor:
@@ -164,18 +159,7 @@ class FuseL2NormConfig(TransformConfig):
 
 @TransformRegistry.register("fuse_l2norm")
 class FuseL2Norm(BaseTransform):
-    """Fuses torch_l2norm ops with the selected backend implementation.
-
-    This transform runs in the post_load_fusion stage and replaces torch_l2norm ops
-    with the specified backend implementation (fla or torch).
-
-    Args:
-        gm: Input graph module to transform.
-        backend: Backend to use for L2Norm computation ("fla" or "torch").
-
-    Returns:
-        Transformed graph module with backend-specific L2Norm operations.
-    """
+    """Compatibility alias for L2Norm fusion through ``mlir_elementwise_fusion``."""
 
     config: FuseL2NormConfig
 
@@ -190,25 +174,4 @@ class FuseL2Norm(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        graph = gm.graph
-        target_op = _BACKEND_OPS[self.config.backend]
-        cnt = 0
-
-        for node in list(graph.nodes):
-            if is_op(node, torch.ops.auto_deploy.torch_l2norm):
-                with graph.inserting_after(node):
-                    new_node: Node = graph.call_function(
-                        target_op,
-                        args=node.args,
-                        kwargs=node.kwargs,
-                    )
-                    new_node.meta = node.meta.copy()
-                    node.replace_all_uses_with(new_node)
-                    graph.erase_node(node)
-                    cnt += 1
-
-        info = TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=cnt == 0
-        )
-
-        return gm, info
+        return apply_mlir_elementwise_alias(self.config, gm, cm, factory, shared_config)

@@ -20,6 +20,7 @@ from _torch_test_utils import fp4_compatible, trtllm_ops_available
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
@@ -137,6 +138,48 @@ def _assert_fused(gm_transformed) -> None:
     assert (
         _count_op(gm_transformed, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear.default) == 1
     )
+
+
+def test_fuse_relu2_quant_nvfp4_legacy_name_routes_to_mlir():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty((2, 64), device="meta", dtype=torch.float16)
+    weight = graph.placeholder("weight")
+    weight.meta["val"] = torch.empty((32, 32), device="meta", dtype=torch.uint8)
+    bias = graph.placeholder("bias")
+    bias.meta["val"] = torch.empty((32,), device="meta", dtype=torch.float16)
+    input_scale = graph.placeholder("input_scale")
+    input_scale.meta["val"] = torch.empty((), device="meta", dtype=torch.float32)
+    weight_scale = graph.placeholder("weight_scale")
+    weight_scale.meta["val"] = torch.empty((32,), device="meta", dtype=torch.uint8)
+    alpha = graph.placeholder("alpha")
+    alpha.meta["val"] = torch.empty((), device="meta", dtype=torch.float32)
+
+    relu = graph.call_function(torch.ops.aten.relu.default, args=(x,))
+    relu.meta["val"] = torch.empty((2, 64), device="meta", dtype=torch.float16)
+    relu2 = graph.call_function(torch.ops.aten.mul.Tensor, args=(relu, relu))
+    relu2.meta["val"] = torch.empty((2, 64), device="meta", dtype=torch.float16)
+    linear = graph.call_function(
+        torch.ops.auto_deploy.torch_quant_nvfp4_linear.default,
+        args=(relu2, weight, bias, input_scale, weight_scale, alpha),
+    )
+    linear.meta["val"] = torch.empty((2, 32), device="meta", dtype=torch.float16)
+    graph.output(linear)
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    config_cls = TransformRegistry.get_config_class("fuse_relu2_quant_nvfp4")
+    transform = TransformRegistry.get("fuse_relu2_quant_nvfp4")(
+        config_cls(stage="post_load_fusion")
+    )
+    gm_transformed, info = transform._apply(
+        gm,
+        cm=None,
+        factory=None,
+        shared_config=SharedConfig(local_rank=0, world_size=1),
+    )
+
+    assert info.num_matches == 1
+    _assert_fused(gm_transformed)
 
 
 @pytest.mark.skipif(_skip_condition, reason=_skip_reason)

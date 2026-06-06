@@ -17,7 +17,6 @@ import operator
 
 import torch
 
-import tensorrt_llm._torch.auto_deploy.custom_ops.linear.silu_mul  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -84,10 +83,7 @@ def _build_getitem_silu_mul_graph():
     x = graph.placeholder("x")
     sizes = [_HALF, _HALF]
 
-    def _split_fn(tensor, _sizes=sizes):
-        return tuple(t.contiguous() for t in torch.split(tensor, _sizes, dim=-1))
-
-    split = graph.call_function(_split_fn, args=(x,))
+    split = graph.call_function(torch.ops.aten.split_with_sizes.default, args=(x, sizes, -1))
     gate = graph.call_function(operator.getitem, args=(split, 0))
     up = graph.call_function(operator.getitem, args=(split, 1))
     silu = graph.call_function(torch.ops.aten.silu.default, args=(gate,))
@@ -111,28 +107,33 @@ def _count_ops(gm, op):
     return sum(1 for n in gm.graph.nodes if is_op(n, op))
 
 
+def _count_mlir_fused_ops(gm):
+    return sum(
+        1 for n in gm.graph.nodes if n.op == "call_function" and "mlir_fused_" in str(n.target)
+    )
+
+
 def test_fuse_silu_mul_narrow_variant():
-    """Variant 1: narrow + silu + mul → flashinfer_silu_and_mul."""
+    """Variant 1: narrow + silu + mul is routed through MLIR fusion."""
     gm, _ = _build_narrow_silu_mul_graph()
     gm, info = _run_fuse_silu_mul(gm)
     assert info.num_matches == 1
-    assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) == 1
+    assert _count_mlir_fused_ops(gm) == 1
     assert _count_ops(gm, torch.ops.aten.silu.default) == 0
     assert _count_ops(gm, torch.ops.aten.mul.Tensor) == 0
 
 
 def test_fuse_silu_mul_narrow_contig_variant():
-    """Variant 1b: narrow + .contiguous() + silu + mul → flashinfer_silu_and_mul.
+    """Variant 1b: narrow + .contiguous() + silu + mul is routed through MLIR fusion.
 
     This shape is what ``fuse_gemms_mixed_children`` and the quantized fusion
-    paths emit (``allow_not_contigous=False``). The fuse_silu_mul transform must
-    walk past the ``call_method('contiguous')`` nodes to recover the pre-narrow
-    fused tensor. Without that, SwiGLU fusion silently no-ops.
+    paths emit (``allow_not_contigous=False``). The MLIR alias must walk past
+    the ``call_method('contiguous')`` nodes to recover the pre-narrow fused tensor.
     """
     gm, _ = _build_narrow_contig_silu_mul_graph()
     gm, info = _run_fuse_silu_mul(gm)
     assert info.num_matches == 1
-    assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) == 1
+    assert _count_mlir_fused_ops(gm) == 1
     assert _count_ops(gm, torch.ops.aten.silu.default) == 0
     assert _count_ops(gm, torch.ops.aten.mul.Tensor) == 0
     # The narrow + contiguous chain must be DCE'd.
@@ -141,11 +142,11 @@ def test_fuse_silu_mul_narrow_contig_variant():
 
 
 def test_fuse_silu_mul_getitem_variant():
-    """Variant 2: split+getitem + silu + mul → flashinfer_silu_and_mul."""
+    """Variant 2: split+getitem + silu + mul is routed through MLIR fusion."""
     gm, _ = _build_getitem_silu_mul_graph()
     gm, info = _run_fuse_silu_mul(gm)
     assert info.num_matches == 1
-    assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) == 1
+    assert _count_mlir_fused_ops(gm) == 1
     assert _count_ops(gm, torch.ops.aten.silu.default) == 0
     assert _count_ops(gm, torch.ops.aten.mul.Tensor) == 0
 
@@ -154,5 +155,5 @@ def test_fuse_silu_mul_skipped_when_disabled():
     gm, _ = _build_narrow_silu_mul_graph()
     gm, info = _run_fuse_silu_mul(gm, enabled=False)
     assert info.skipped
-    assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) == 0
+    assert _count_mlir_fused_ops(gm) == 0
     assert _count_ops(gm, torch.ops.aten.silu.default) == 1

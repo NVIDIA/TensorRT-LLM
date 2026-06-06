@@ -183,7 +183,7 @@ transforms:
     backend: trtllm
   fuse_relu2_quant_nvfp4:
     stage: post_load_fusion
-    enabled: true
+    enabled: false
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
   fuse_finegrained_fp8_swiglu:
@@ -219,15 +219,16 @@ transforms:
     requires_shape_prop: true
   fuse_rmsnorm_quant_nvfp4:
     stage: post_load_fusion
-    enabled: true
+    enabled: false
   fuse_gdn_gating:
     stage: post_load_fusion
   fuse_l2norm:
     stage: post_load_fusion
+    enabled: false
     backend: fla
   fuse_silu_mul:
     stage: post_load_fusion
-    enabled: true
+    enabled: false
     backend: flashinfer
   fuse_swiglu:
     stage: post_load_fusion
@@ -257,7 +258,7 @@ transforms:
     stage: post_load_fusion
   mlir_elementwise_fusion:
     stage: post_load_fusion
-    enabled: false
+    enabled: true
     run_shape_prop: false
     bypass_ops: []
   ############################################################################################

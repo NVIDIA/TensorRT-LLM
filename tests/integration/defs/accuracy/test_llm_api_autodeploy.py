@@ -262,9 +262,6 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                 "compile_model": {
                     "backend": backend_cfg["compile_backend"],
                 },
-                "fuse_silu_mul": {
-                    "enabled": True,
-                },
             },
         }
         if enable_chunked_prefill:
