@@ -134,6 +134,7 @@ l0_b200:
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
@@ -208,6 +209,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
+  - unittest/_torch/visual_gen/test_cosmos3_transformer.py
+  - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - examples/test_visual_gen.py::test_wan_t2v_example
   # - examples/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
