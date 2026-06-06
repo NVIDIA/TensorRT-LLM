@@ -139,9 +139,13 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
-            ctx_server, _ = await self._ctx_router.get_next_server(
+            ctx_server, ctx_info = await self._ctx_router.get_next_server(
                 ctx_req, exclude_server=gen_server
             )
+            # Carry the router's is_first_turn into the ctx request sent to the
+            # worker, for kv_cache_routing_first_turn_round_robin.
+            if ctx_req.disaggregated_params is not None and ctx_info is not None:
+                ctx_req.disaggregated_params.is_first_turn = ctx_info.get("is_first_turn")
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
@@ -552,6 +556,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
+            # Carry is_first_turn into the ctx request (see ctx-first path).
+            if ctx_req.disaggregated_params is not None and ctx_server_info is not None:
+                ctx_req.disaggregated_params.is_first_turn = ctx_server_info.get("is_first_turn")
         gen_req = self._get_gen_request(
             request,
             ctx_response=None,

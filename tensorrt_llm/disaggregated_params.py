@@ -51,6 +51,12 @@ class DisaggregatedParams:
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
+    # Multi-turn conversation id (e.g. from X-Session-ID), carried through to
+    # worker-side consumers such as the ADP router.
+    conversation_id: Optional[str] = None
+    # First-turn flag from the serve router, used by the worker ADP router for
+    # kv_cache_routing_first_turn_round_robin. None when unknown.
+    is_first_turn: Optional[bool] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (

@@ -117,6 +117,7 @@ class ADPRouter(ABC):
                 match_rate_threshold=attention_dp_config.kv_cache_routing_match_rate_threshold,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
                 cold_start_warmup=attention_dp_config.kv_cache_routing_cold_start_warmup,
+                first_turn_round_robin=attention_dp_config.kv_cache_routing_first_turn_round_robin,
                 async_transfer_manager=async_transfer_manager,
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
@@ -367,6 +368,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         match_rate_threshold: float = 0.1,
         fair_share_multiplier: float = 2.0,
         cold_start_warmup: bool = False,
+        first_turn_round_robin: bool = False,
         async_transfer_manager=None,
         account_for_in_transfer: bool = False,
     ):
@@ -375,6 +377,10 @@ class KVCacheAwareADPRouter(ADPRouter):
         self.load_balance_weight = load_balance_weight
         self.match_rate_threshold = match_rate_threshold
         self.fair_share_multiplier = fair_share_multiplier
+        self.first_turn_round_robin = first_turn_round_robin
+        # Round-robin cursor for first-turn spreading. Must advance identically
+        # on every rank (like _pending_warmup_ranks) or the protocol deadlocks.
+        self._first_turn_rr_counter = 0
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
         # Cold-start warmup: ranks not yet targeted through this router.
         # Empty set disables warmup; see ``route_requests``.
@@ -482,6 +488,16 @@ class KVCacheAwareADPRouter(ADPRouter):
         effective = req_tokens - match_len
         normalized_load = rank_active_tokens / load_denom * req_tokens
         return effective + self.load_balance_weight * normalized_load
+
+    def _should_round_robin_first_turn(self, req_item) -> bool:
+        """True iff the feature is enabled and the request carries an
+        is_first_turn flag (set by the serve router via disaggregated_params).
+        """
+        if not self.first_turn_round_robin:
+            return False
+        req = req_item.request
+        disagg_params = req.py_disaggregated_params if req is not None else None
+        return bool(disagg_params and disagg_params.is_first_turn)
 
     @staticmethod
     def _prefix_fingerprint(token_ids, num_tokens: int = 64) -> tuple:
@@ -622,19 +638,26 @@ class KVCacheAwareADPRouter(ADPRouter):
                 max_match_for_req / max(req_tokens, 1)
             ) > self.match_rate_threshold
 
-            for rank in iter_ranks:
-                match_len = match_lens[rank] if cache_affinity_active else 0
-                score = self._score_rank(
-                    req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
-                )
-                # Tie-break on active_tokens to spread traffic when scores
-                # collide; cache-affinity wins are unaffected (lower score).
-                if (score, all_ranks_num_active_tokens[rank]) < (
-                    best_score,
-                    all_ranks_num_active_tokens[best_rank],
-                ):
-                    best_score = score
-                    best_rank = rank
+            # Spread first turns across ranks instead of scoring them, so a
+            # shared prefix can't funnel every new conversation onto one rank.
+            if self._should_round_robin_first_turn(req_item):
+                best_rank = eligible_ranks[self._first_turn_rr_counter % len(eligible_ranks)]
+                # Keep the cursor bounded in [0, tp_size) so it never grows.
+                self._first_turn_rr_counter = (self._first_turn_rr_counter + 1) % tp_size
+            else:
+                for rank in iter_ranks:
+                    match_len = match_lens[rank] if cache_affinity_active else 0
+                    score = self._score_rank(
+                        req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
+                    )
+                    # Tie-break on active_tokens to spread traffic when scores
+                    # collide; cache-affinity wins are unaffected (lower score).
+                    if (score, all_ranks_num_active_tokens[rank]) < (
+                        best_score,
+                        all_ranks_num_active_tokens[best_rank],
+                    ):
+                        best_score = score
+                        best_rank = rank
 
             all_ranks_new_requests[best_rank].append(req_item)
             all_ranks_num_active_requests[best_rank] += 1
