@@ -310,10 +310,9 @@ models:
 # - name: deepseek-ai/DeepSeek-R1
 #   config_id: deepseek_r1
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
-# OOM during AutoDeploy run.
-# - name: deepseek-ai/DeepSeek-R1-0528
-#   config_id: deepseek_r1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
+- name: deepseek-ai/DeepSeek-R1-0528
+  config_id: deepseek_r1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
 #   config_id: deepseek_v2_ep
@@ -374,14 +373,12 @@ models:
 #   config_id: default_ws_4
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Qwen3.5 MoE (Feb 2026) ---
-# tensorrt_llm.executor.utils.RequestError: Ran into a kwarg keyword mismatch.
-# - name: Qwen/Qwen3.5-35B-A3B
-#   config_id: qwen3_5_moe_35b
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
-# OOM during AutoDeploy run.
-# - name: Qwen/Qwen3.5-397B-A17B
-#   config_id: qwen3_5_moe_400b
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
+- name: Qwen/Qwen3.5-35B-A3B
+  config_id: qwen3_5_moe_35b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
+- name: Qwen/Qwen3.5-397B-A17B
+  config_id: qwen3_5_moe_400b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
 # --- GLM-5 (Feb 2026) ---
 - name: zai-org/GLM-5
   config_id: glm_5
@@ -404,6 +401,18 @@ models:
 # - name: XiaomiMiMo/MiMo-V2-Flash
 #   config_id: default_ws_8
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- StepFun Step-3.7-Flash (Feb 2026) ---
+# Text decoder of the Step-3.7-Flash VLM (model_type step3p7 / step3p5). 45 layers,
+# 288 routed experts top-8 + shared expert, mixed full/sliding GQA, head-wise attn gate.
+- name: stepfun-ai/Step-3.7-Flash
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
+- name: stepfun-ai/Step-3.7-Flash-FP8
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
+- name: stepfun-ai/Step-3.7-Flash-NVFP4
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
 # --- Kimi-K2.5 (Jan 2026) ---
 # TypeError: 'NoneType' object is not subscriptable
 # - name: moonshotai/Kimi-K2.5

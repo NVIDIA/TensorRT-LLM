@@ -734,10 +734,9 @@ class KVCacheManager(BaseResourceManager):
                 live_state_slots = self.max_batch_size * pp_size
                 max_snapshots = live_state_slots
                 if kv_cache_config.enable_block_reuse:
-                    max_snapshots = max(
+                    max_snapshots += (
                         kv_cache_config.max_tokens //
-                        linear_attention_metadata.states_snapshot_interval,
-                        live_state_slots)
+                        linear_attention_metadata.states_snapshot_interval)
 
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
@@ -2035,16 +2034,13 @@ class KVCacheManager(BaseResourceManager):
         pp_size = self.mapping.pp_size if self.mapping is not None else 1
         intercept = self.max_batch_size * pp_size * state_bytes_local
 
-        # heuristic: When block reuse is enabled, we assume the mamba snapshots are dominant instead of active states,
-        # otherwise we may run out of kv cache blocks prior to mamba blocks due to the large number of max_batch_size.
-        # So we ignore intercept and only calculate max_tokens based on slope
-        # This can be improved by a more accurate max_batch_size and ISL/OSL estimation in the future.
-        if mamba_slope > 0:
-            max_tokens = max((primary_budget) // slope, 0)
-        else:
-            max_tokens = max((primary_budget - intercept) // slope, 0)
+        max_tokens = max((primary_budget - intercept) // slope, 0)
         if kv_cache_config.max_tokens is not None:
             max_tokens = min(kv_cache_config.max_tokens, max_tokens)
+            if max_tokens < kv_cache_config.max_tokens:
+                logger.warning(
+                    f'The memory budget for Mamba + KV cache cannot fit the user-specified max_tokens of {kv_cache_config.max_tokens}. The calculated max_tokens based on the memory budget is {max_tokens}. Please consider adjusting max_batch_size/max_tokens/mamba_state_cache_interval.'
+                )
 
         kv_blocks_in_primary_pool = int(max_tokens // self.tokens_per_block)
 
@@ -2067,7 +2063,7 @@ class KVCacheManager(BaseResourceManager):
             max_snapshots += self.spec_config.max_draft_len
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
-            max_snapshots = max(max_tokens // interval, max_snapshots)
+            max_snapshots += max_tokens // interval
 
         secondary_snapshots = int(max_snapshots *
                                   (self._secondary_pool_memory_bytes /
@@ -3054,6 +3050,18 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
+
+    def resume_request(self, req: LlmRequest) -> bool:
+        """Resume a previously-suspended KV cache for *req*.
+
+        Returns True if the cache is (or becomes) active on GPU, False if
+        resume was refused (e.g. GPU pressure above max_util_for_resume)
+        or no cache exists for the request.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        return self._resume_and_restore(req.py_request_id, kv_cache)
 
     # ---- prepare_resources ----
 

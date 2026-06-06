@@ -429,14 +429,14 @@ class SlotAllocator:
 
     def finish_shrink(self) -> bool:
         assert NDEBUG or self._check()
-        if (
-            self.shrink_in_progress
-            and self._target_capacity + len(self._overflow_slots) == self._num_active_slots
-        ):
-            assert (
-                len(set(s.slot_id for s in self._overflow_slots)) == len(self._overflow_slots)
-                and len(self._overflow_slots) == self._num_active_slots - self._target_capacity
-            ), "Some slots are still in use."
+        # Overflow-range IDs that were ever issued are exactly
+        # max(0, _num_active_slots - _target_capacity); the underused case
+        # (_num_active_slots <= _target_capacity) collapses to zero.
+        expected_overflow = max(0, self._num_active_slots - self._target_capacity)
+        if self.shrink_in_progress and len(self._overflow_slots) == expected_overflow:
+            assert len(set(s.slot_id for s in self._overflow_slots)) == len(self._overflow_slots), (
+                "Some slots are still in use."
+            )
             for ev in set(s.ready_event for s in self._overflow_slots):
                 ev.synchronize()
             for slot in self._overflow_slots:

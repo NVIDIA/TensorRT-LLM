@@ -52,8 +52,16 @@ COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolut
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
-# TODO: add hf_ids
-@register_pipeline("Cosmos3OmniMoTPipeline")
+@register_pipeline(
+    "Cosmos3OmniMoTPipeline",
+    hf_ids=[
+        "nvidia/Cosmos3-Nano",
+        "nvidia/Cosmos3-Super",
+        "nvidia/Cosmos3-Super-Text2Image",
+        "nvidia/Cosmos3-Super-Image2Video",
+    ],
+    doc="Cosmos3 Omnimodal world models.",
+)
 class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, model_config):
         super().__init__(model_config)
@@ -107,6 +115,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 subfolder=PipelineComponent.SCHEDULER,
             )
 
+        # Re-check the env var in case it was changed after initialization like in unit tests.
+        guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+        global TRTLLM_DISABLE_COSMOS3_GUARDRAILS
+        TRTLLM_DISABLE_COSMOS3_GUARDRAILS = guardrails_disabled
         if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS:
             # lazy import
             try:
