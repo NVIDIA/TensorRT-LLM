@@ -1106,9 +1106,14 @@ class TestConversationAwareADPRouter:
         assert pos[1] == 2
 
     def test_sticky_overflow_keeps_mapping(self):
-        """When the home rank is at the hard cap, the turn overflows but the
-        conversation stays mapped home (returns next batch)."""
-        router = self._router(tp_size=2)
+        """When the home rank is saturated (>= the soft fair-share cap), the turn
+        overflows off home but the conversation stays mapped home (returns next
+        batch). Uses fair_share_multiplier=1.0 so the soft cap coincides with the
+        natural saturation point and the overflow path is exercised (with the
+        default mult=2 a lone hot rank's `expected` scales with its own load and
+        never saturates)."""
+        router = ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=2), fair_share_multiplier=1.0)
         # Seed conv A -> rank 0.
         self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
         home = router._conv_to_rank["A"]
