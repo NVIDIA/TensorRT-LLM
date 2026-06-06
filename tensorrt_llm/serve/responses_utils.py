@@ -256,9 +256,6 @@ class ConversationHistoryStore:
 
                 conversation_id = self.response_to_conversation[prev_resp_id]
                 self.conversations[conversation_id].extend(resp_msgs)
-                while len(self.conversations[conversation_id]
-                          ) > self.conversation_capacity:
-                    self._pop_conversation(resp_id)
             else:
                 conversation_id = _random_uuid()
                 self.conversations[conversation_id] = resp_msgs
@@ -268,6 +265,7 @@ class ConversationHistoryStore:
 
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
+            self._trim_conversation(conversation_id)
             self._update_visited_conversation(conversation_id)
 
     async def pop_response(self, resp_id: Optional[str] = None) -> bool:
@@ -306,12 +304,10 @@ class ConversationHistoryStore:
             _responses_debug_log(
                 f" * storing at conversation: {conversation_id}")
             self.conversations[conversation_id] = msgs
-            if len(self.conversations[conversation_id]
-                   ) > self.conversation_capacity:
-                self._pop_conversation(resp_id)
 
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
+            self._trim_conversation(conversation_id)
             self._update_visited_conversation(conversation_id)
 
     async def get_conversation_history(
@@ -371,6 +367,14 @@ class ConversationHistoryStore:
         if conversation_id is None:
             return
 
+        self._pop_conversation_by_conversation_id(conversation_id)
+
+    def _trim_conversation(self, conversation_id) -> None:
+        while len(self.conversations[conversation_id]
+                  ) > self.conversation_capacity:
+            self._pop_conversation_by_conversation_id(conversation_id)
+
+    def _pop_conversation_by_conversation_id(self, conversation_id) -> None:
         conversation = self.conversations[conversation_id]
         if len(conversation) == 0:
             return
