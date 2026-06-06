@@ -258,6 +258,39 @@ class TestSpeculativeConfigValidation:
         assert args.model_factory == "eagle_one_model"
 
 
+class TestSSMReplayValidation:
+    """The replay SSM kernel (ssm_replay) is only meaningful with speculative decoding.
+
+    Its replay state buffers are read on the speculative extend path and are only bound by
+    the Mamba cache manager when spec is enabled, so enabling replay without spec would leak
+    unmanaged allocations. LlmArgs must reject that combination.
+    """
+
+    def test_ssm_replay_without_spec_raises(self):
+        with pytest.raises(ValueError, match="requires speculative decoding"):
+            LlmArgs(
+                model="test-model",
+                transforms={"insert_cached_ssm_attention": {"ssm_replay": True}},
+            )
+
+    def test_ssm_replay_with_spec_ok(self):
+        from tensorrt_llm.llmapi import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(num_nextn_predict_layers=3, mtp_eagle_one_model=True)
+        # Replay + spec is valid and must not raise.
+        args = LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            transforms={"insert_cached_ssm_attention": {"ssm_replay": True}},
+        )
+        assert args.transforms["insert_cached_ssm_attention"]["ssm_replay"] is True
+
+    def test_no_ssm_replay_without_spec_ok(self):
+        # The default (replay off) with spec off is the common case and must not raise.
+        args = LlmArgs(model="test-model")
+        assert not args.transforms.get("insert_cached_ssm_attention", {}).get("ssm_replay", False)
+
+
 # ================================
 # CUDA Graph Batch Sizes Tests
 # ================================

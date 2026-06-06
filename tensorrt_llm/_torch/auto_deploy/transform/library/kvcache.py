@@ -54,6 +54,8 @@ from ...custom_ops.attention_interface import (
     Constant,
     KVPagedResourceHandler,
     PrepareMetadataCallable,
+    ResourceHandler,
+    SpeculativeOnly,
 )
 from ...custom_ops.semantic_mask_registry import SemanticMaskRegistry
 from ...models.factory import ModelFactory
@@ -329,6 +331,22 @@ class _InsertCachedOperator(BaseTransform):
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
 
+    @staticmethod
+    def _suppress_speculative_when_no_spec(
+        resource_handler: Optional[ResourceHandler], spec_config: Optional[object]
+    ) -> Optional[ResourceHandler]:
+        """Drop a speculative-only resource to the None sentinel when spec decoding is off.
+
+        Handlers carrying the ``SpeculativeOnly`` trait are read only on the speculative extend
+        path and are never bound by the cache manager without ``spec_config``; registering them
+        would leak an unmanaged per-layer allocation. Returns ``None`` for such handlers when
+        ``spec_config`` is None, otherwise returns ``resource_handler`` unchanged (``isinstance``
+        is None-safe, so the existing None sentinel passes through untouched).
+        """
+        if spec_config is None and isinstance(resource_handler, SpeculativeOnly):
+            return None
+        return resource_handler
+
     def _apply(
         self,
         gm: GraphModule,
@@ -385,12 +403,6 @@ class _InsertCachedOperator(BaseTransform):
         # --- Pass 1: register resources and assign per-layer group_idx ---
         # Group identity comes from KVPagedResourceHandler.__eq__ (which
         # includes sliding_window).  A group IS a pool IS a metadata set.
-        from ...custom_ops.attention_interface import (
-            KVPagedResourceHandler,
-            SpecCausalConvResourceHandler,
-            SpecSSMResourceHandler,
-        )
-
         handler_groups: list[KVPagedResourceHandler] = []
         per_layer_group_idx: list[int] = []
         group_idx_by_layer_idx: dict[int, int] = {}
@@ -438,16 +450,14 @@ class _InsertCachedOperator(BaseTransform):
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
-                    # Speculative intermediate state buffers are never bound by the
-                    # cache manager when spec decoding is off (see
-                    # CachedSequenceInterface._create_and_assign_state_views), so allocating
-                    # them would waste a full per-layer state buffer and OOM. Drop them to
-                    # the None sentinel instead of registering an unmanaged resource.
-                    if cm._spec_config is None and isinstance(
-                        resource_handler,
-                        (SpecSSMResourceHandler, SpecCausalConvResourceHandler),
-                    ):
-                        resource_handler = None
+                    # Speculative-only resources (intermediate SSM/conv state and replay
+                    # buffers) are never bound by the cache manager when spec decoding is off
+                    # (see CachedSequenceInterface._create_and_assign_state_views), so
+                    # allocating them would waste a full per-layer state buffer and OOM. Drop
+                    # them to the None sentinel instead of registering an unmanaged resource.
+                    resource_handler = self._suppress_speculative_when_no_spec(
+                        resource_handler, cm._spec_config
+                    )
                     if resource_handler is None:
                         # None sentinel: pass literal None positionally, no resource allocated.
                         cache_in_nodes.append(None)

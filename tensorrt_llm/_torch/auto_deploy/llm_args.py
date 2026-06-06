@@ -183,6 +183,26 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_ssm_replay_requires_spec(self):
+        """Reject the replay SSM kernel when speculative decoding is off.
+
+        ``ssm_replay`` makes the SSM backend register per-layer replay state buffers
+        (``Replay*`` handlers). Those buffers are read only on the speculative extend
+        (draft-verification) path, and the Mamba cache manager only binds them when
+        ``speculative_config`` is set. Enabling replay without speculative decoding would
+        register buffers that are never used and never bound, so fail fast here instead of
+        silently mis-allocating them.
+        """
+        ssm_cfg = self.transforms.get("insert_cached_ssm_attention", {})
+        if ssm_cfg.get("ssm_replay", False) and self.speculative_config is None:
+            raise ValueError(
+                "transforms.insert_cached_ssm_attention.ssm_replay=True requires speculative "
+                "decoding (speculative_config must be set). Replay buffers are only used on the "
+                "speculative extend path."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_parallel_config(self):
         """Setup parallel config according to world_size.
 
