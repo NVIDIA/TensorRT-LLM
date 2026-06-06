@@ -742,13 +742,18 @@ class ConversationAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _conversation_id(req_item) -> "str | None":
-        req = req_item.request
+        # NOTE: req_item.request may be a raw tensorrt_llm.bindings.executor.Request
+        # (e.g. warmup/dummy requests) that lacks the Python-side
+        # py_disaggregated_params attribute -- getattr (not direct access) so those
+        # fall through to the load-balanced path instead of raising AttributeError.
+        req = getattr(req_item, "request", None)
         if req is None:
             return None
-        disagg_params = req.py_disaggregated_params
-        if disagg_params is None:
+        disagg = getattr(req, "py_disaggregated_params", None)
+        if disagg is None:
             return None
-        return disagg_params.conversation_id or None
+        conv_id = getattr(disagg, "conversation_id", None)
+        return conv_id if conv_id else None
 
     def _record_target_rank(self, conv_id: str, rank: int) -> None:
         """Bind/refresh the rank a conversation is pinned to (LRU-touch + evict)."""
