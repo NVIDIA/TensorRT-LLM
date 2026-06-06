@@ -55,6 +55,7 @@ class InferenceOptimizer:
             local_rank=local_rank,
             world_size=world_size,
             dist_config=dist_config,
+            transform_config=self.config,
         )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:

@@ -48,6 +48,31 @@ class MLIRElementwiseFusionConfig(TransformConfig):
         default_factory=list,
         description="Op names to skip during decomposition (reserved for future use).",
     )
+    enabled_rewrites: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional MLIR rewrite families to run. Empty means all rewrites; "
+            "legacy alias transforms pass a single family to avoid widening behavior."
+        ),
+    )
+
+
+def _subgraph_rewrite_families(op_names: set[str]) -> set[str]:
+    families = set()
+    if {"ad.to_dtype", "ad.reduce_sum", "ad.rsqrt"}.issubset(op_names):
+        families.add("l2norm")
+    if {"ad.slice", "ad.silu", "ad.mul"}.issubset(op_names):
+        families.add("silu_mul")
+    if "ad.quant_fp8" in op_names and {"ad.reduce_mean", "ad.rsqrt"}.issubset(op_names):
+        families.add("rmsnorm_quant_fp8")
+    return families
+
+
+def _subgraph_enabled_for_rewrites(sg, enabled_rewrites: set[str] | None) -> bool:
+    if enabled_rewrites is None:
+        return True
+    op_names = {op.name for op in sg.ops}
+    return bool(_subgraph_rewrite_families(op_names) & enabled_rewrites)
 
 
 @TransformRegistry.register("mlir_elementwise_fusion")
@@ -91,7 +116,8 @@ class MLIRElementwiseFusion(BaseTransform):
         from ...mlir.mlir_to_fx import MLIRToFXConverter
 
         # Step 1: FX -> MLIR
-        converter = FXToMLIRConverter(gm)
+        enabled_rewrites = set(self.config.enabled_rewrites) or None
+        converter = FXToMLIRConverter(gm, enabled_rewrites=enabled_rewrites)
         try:
             mlir_module = converter.convert()
         except ValueError as e:
@@ -106,6 +132,10 @@ class MLIRElementwiseFusion(BaseTransform):
 
         # Step 3: Discover fusible subgraphs
         subgraphs = discover_fusible_subgraphs(mlir_module)
+        if enabled_rewrites is not None:
+            subgraphs = [
+                sg for sg in subgraphs if _subgraph_enabled_for_rewrites(sg, enabled_rewrites)
+            ]
         self._log_info(
             f"Discovered {len(subgraphs)} fusible subgraphs "
             f"(total ops: {sum(len(sg.ops) for sg in subgraphs)})"

@@ -48,4 +48,6 @@ class FuseRelu2QuantNVFP4(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        return apply_mlir_elementwise_alias(self.config, gm, cm, factory, shared_config)
+        return apply_mlir_elementwise_alias(
+            "fuse_relu2_quant_nvfp4", self.config, gm, cm, factory, shared_config
+        )

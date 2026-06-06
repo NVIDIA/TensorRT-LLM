@@ -23,9 +23,9 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 _HALF = 256
 
 
-def _run_fuse_silu_mul(gm, enabled=True, backend="flashinfer"):
+def _run_fuse_silu_mul(gm, enabled=True, backend="flashinfer", shared_config=None):
     """Apply just the fuse_silu_mul transform (no other passes)."""
-    shared_config = SharedConfig(local_rank=0, world_size=1)
+    shared_config = shared_config or SharedConfig(local_rank=0, world_size=1)
     config_cls = TransformRegistry.get_config_class("fuse_silu_mul")
     config = config_cls(stage="post_load_fusion", enabled=enabled, backend=backend)
     transform = TransformRegistry.get("fuse_silu_mul")(config)
@@ -103,6 +103,22 @@ def _build_getitem_silu_mul_graph():
     return gm, fused_size
 
 
+def _build_add_mul_graph():
+    """Build a generic elementwise graph that is not a SiLU+Mul alias target."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    y = graph.placeholder("y")
+    z = graph.placeholder("z")
+    add = graph.call_function(torch.ops.aten.add.Tensor, args=(x, y))
+    mul = graph.call_function(torch.ops.aten.mul.Tensor, args=(add, z))
+    graph.output(mul)
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    for node in gm.graph.nodes:
+        if node.op == "placeholder" or node.op == "call_function":
+            node.meta["val"] = torch.empty(2, _HALF, dtype=torch.float16, device="meta")
+    return gm
+
+
 def _count_ops(gm, op):
     return sum(1 for n in gm.graph.nodes if is_op(n, op))
 
@@ -154,6 +170,28 @@ def test_fuse_silu_mul_getitem_variant():
 def test_fuse_silu_mul_skipped_when_disabled():
     gm, _ = _build_narrow_silu_mul_graph()
     gm, info = _run_fuse_silu_mul(gm, enabled=False)
+    assert info.skipped
+    assert _count_mlir_fused_ops(gm) == 0
+    assert _count_ops(gm, torch.ops.aten.silu.default) == 1
+
+
+def test_fuse_silu_mul_does_not_fuse_unrelated_elementwise_graph():
+    gm = _build_add_mul_graph()
+    gm, info = _run_fuse_silu_mul(gm)
+    assert info.num_matches == 0
+    assert _count_mlir_fused_ops(gm) == 0
+    assert _count_ops(gm, torch.ops.aten.add.Tensor) == 1
+    assert _count_ops(gm, torch.ops.aten.mul.Tensor) == 1
+
+
+def test_fuse_silu_mul_skips_when_canonical_mlir_enabled():
+    gm, _ = _build_narrow_silu_mul_graph()
+    shared_config = SharedConfig(
+        local_rank=0,
+        world_size=1,
+        transform_config={"mlir_elementwise_fusion": {"stage": "post_load_fusion"}},
+    )
+    gm, info = _run_fuse_silu_mul(gm, shared_config=shared_config)
     assert info.skipped
     assert _count_mlir_fused_ops(gm) == 0
     assert _count_ops(gm, torch.ops.aten.silu.default) == 1

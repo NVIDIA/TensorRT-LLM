@@ -506,8 +506,9 @@ class FXToMLIRConverter:
     - ``self.metadata``: dict mapping ``node_name → node.meta`` for round-trip
     """
 
-    def __init__(self, gm: GraphModule):
+    def __init__(self, gm: GraphModule, enabled_rewrites: Optional[set[str]] = None):
         self._gm = gm
+        self._enabled_rewrites = enabled_rewrites
         # node name → MLIR SSAValue (for wiring operands)
         self._value_map: Dict[str, SSAValue] = {}
         # node name → node.meta (for round-trip)
@@ -527,10 +528,14 @@ class FXToMLIRConverter:
 
         for node in self._gm.graph.nodes:
             self._convert_node(node, block)
-        self._run_nvfp4_rmsnorm_quant_rewrites(block)
+        if self._rewrite_enabled("rmsnorm_quant_nvfp4"):
+            self._run_nvfp4_rmsnorm_quant_rewrites(block)
 
         self.mlir_module = ModuleOp(region)
         return self.mlir_module
+
+    def _rewrite_enabled(self, rewrite_name: str) -> bool:
+        return self._enabled_rewrites is None or rewrite_name in self._enabled_rewrites
 
     # ------------------------------------------------------------------
     # Per-node conversion
@@ -593,7 +598,10 @@ class FXToMLIRConverter:
         import operator as op_module
 
         if _is_relu_nvfp4_quant_node(node) or _is_relu2_nvfp4_quant_node(node):
-            self._store_meta(node)
+            if self._rewrite_enabled("relu2_quant_nvfp4"):
+                self._store_meta(node)
+            else:
+                self._convert_opaque(node, block)
         elif is_op(node, torch.ops.aten.add.Tensor):
             self._convert_add(node, block)
         elif is_op(node, torch.ops.aten.mul.Tensor):
@@ -642,12 +650,26 @@ class FXToMLIRConverter:
             self._convert_rmsnorm(node, block)
         elif _is_gated_rmsnorm(node):
             self._convert_gated_rmsnorm(node, block)
-        elif _is_l2norm(node):
+        elif _is_l2norm(node) and self._rewrite_enabled("l2norm"):
             self._convert_l2norm(node, block)
-        elif _is_supported_fp8_linear(node):
+        elif _is_l2norm(node):
+            self._convert_opaque(node, block)
+        elif (
+            _is_supported_fp8_linear(node)
+            and self._rewrite_enabled("rmsnorm_quant_fp8")
+            and (self._enabled_rewrites is None or self._is_rmsnorm_quant_fp8_linear(node))
+        ):
             self._convert_fp8_quant_linear(node, block)
-        elif _is_supported_nvfp4_linear(node):
+        elif _is_supported_fp8_linear(node):
+            self._convert_opaque(node, block)
+        elif (
+            _is_supported_nvfp4_linear(node)
+            and self._rewrite_enabled("relu2_quant_nvfp4")
+            and self._has_relu2_nvfp4_source(node)
+        ):
             self._convert_nvfp4_relu2_quant_linear(node, block)
+        elif _is_supported_nvfp4_linear(node):
+            self._convert_opaque(node, block)
         elif is_op(node, torch.ops.aten.to.dtype):
             self._convert_to_dtype(node, block)
         elif node.target is op_module.floordiv:
@@ -981,6 +1003,19 @@ class FXToMLIRConverter:
         self._value_map[node.name] = cast_out.output
         self._store_meta(node)
         self.metadata[node.name]["_fx_node_name"] = node.name
+
+    def _is_rmsnorm_quant_fp8_linear(self, node: Node) -> bool:
+        input_arg, _, _, _, _ = self._extract_fp8_linear_args(node)
+        if not isinstance(input_arg, Node):
+            return False
+        norm_node, post_nodes = _unwrap_post_norm_nodes(input_arg)
+        if _has_unsupported_post_norm_nodes(post_nodes):
+            return False
+        return _is_rmsnorm(norm_node) or _is_gated_rmsnorm(norm_node)
+
+    def _has_relu2_nvfp4_source(self, node: Node) -> bool:
+        input_arg, _, _, _, _, _ = _extract_nvfp4_linear_args(node)
+        return _extract_relu2_source_for_nvfp4_quant(input_arg) is not None
 
     def _convert_fp8_quant_linear(self, node: Node, block: Block) -> None:
         """Lower FP8 quant-linear to MLIR quant + prequant linear."""

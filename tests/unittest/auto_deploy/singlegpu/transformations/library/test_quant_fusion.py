@@ -797,7 +797,7 @@ def test_fuse_allreduce_rmsnorm_quant_nvfp4_keeps_norm_for_mixed_consumers():
         for n in gm.graph.nodes
     )
     assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
-    assert _count_mlir_fused_ops(gm) >= 1
+    assert _count_mlir_fused_ops(gm) == 0
     assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
 
 
@@ -1002,6 +1002,6 @@ def test_fuse_add_rmsnorm_quant_nvfp4_keeps_norm_for_mixed_consumers():
         for n in gm.graph.nodes
     )
     assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
-    assert _count_mlir_fused_ops(gm) >= 1
+    assert _count_mlir_fused_ops(gm) == 0
     assert not any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes)
     assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)

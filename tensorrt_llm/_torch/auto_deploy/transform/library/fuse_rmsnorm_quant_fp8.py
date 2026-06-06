@@ -48,4 +48,6 @@ class FuseRMSNormQuantFP8(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        return apply_mlir_elementwise_alias(self.config, gm, cm, factory, shared_config)
+        return apply_mlir_elementwise_alias(
+            "fuse_rmsnorm_quant_fp8", self.config, gm, cm, factory, shared_config
+        )

@@ -141,6 +141,7 @@ class SharedConfig(BaseModel):
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
     dist_config: Optional[DistConfig] = Field(default=None)
+    transform_config: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TransformConfig(BaseModel):
