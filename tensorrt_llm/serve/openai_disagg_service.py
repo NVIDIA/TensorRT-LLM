@@ -393,7 +393,14 @@ class OpenAIDisaggregatedService(OpenAIService):
                     f"Context server did not return disaggregated params."
                     f" finish_reason={choice.finish_reason!r}"
                 )
-            if choice.disaggregated_params.ctx_request_id is None:
+            # When the context phase already produced an end-of-sequence
+            # token (finish_reason not in {"length", "not_finished"}), no
+            # generation phase will follow (see _need_gen), so the ctx
+            # server legitimately omits ctx_request_id since there is no
+            # kv-cache transfer to schedule. Only enforce the presence of
+            # ctx_request_id when a gen phase is expected.
+            gen_expected = choice.finish_reason in ("length", "not_finished", None)
+            if gen_expected and choice.disaggregated_params.ctx_request_id is None:
                 raise ValueError(
                     f"Invalid disaggregated params: ctx_request_id is None."
                     f" finish_reason={choice.finish_reason!r},"
