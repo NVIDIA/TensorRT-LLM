@@ -51,6 +51,9 @@ truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
 BlockHash = Union[int, str]
 
+# Max number of conversations whose home-server pin is retained (LRU).
+ROUTE_AFFINITY_CACHE_SIZE = 50000
+
 
 def get_request_num_tokens(request: OpenAIRequest) -> int:
     if request.disaggregated_params is None or request.disaggregated_params.request_type == "context_only":
@@ -1095,6 +1098,18 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             # Persist once so per-request reads can skip the lock+await.
             self._server_state[server].set_hash_algo(worker_algo)
 
+    @staticmethod
+    def _content_affinity_key(request: OpenAIRequest) -> Optional[int]:
+        messages = getattr(request, "messages", None)
+        if not messages:
+            return None
+        parts = []
+        for message in messages[:2]:
+            content = (message.get("content") if isinstance(message, dict) else
+                       getattr(message, "content", ""))
+            parts.append(str(content))
+        return hash("".join(parts))
+
     async def get_next_server(
             self,
             request: OpenAIRequest,
@@ -1150,11 +1165,33 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         ]
         if not candidate_idx:
             candidate_idx = list(range(len(servers)))
-        max_score = max(scores[i] for i in candidate_idx)
-        tied = [i for i in candidate_idx if scores[i] == max_score]
-        winner = tied[self._rr_counter % len(tied)]
+        # Conversation affinity: pin all turns of a conversation (keyed by a
+        # content-derived prefix hash, no conversation-id header) to the server
+        # it first landed on, so a worker eviction shrinking the match score
+        # cannot scatter the conversation off its warm home. New conversations
+        # (no pin yet) fall through to the score, which balances them by load.
+        affinity = getattr(self, "_route_affinity", None)
+        if affinity is None:
+            affinity = self._route_affinity = OrderedDict()
+        conv_key = self._content_affinity_key(request)
+        winner = None
+        if conv_key is not None:
+            pinned = affinity.get(conv_key)
+            if pinned in servers:
+                pinned_idx = servers.index(pinned)
+                if pinned_idx in candidate_idx:
+                    winner = pinned_idx
+        if winner is None:
+            max_score = max(scores[i] for i in candidate_idx)
+            tied = [i for i in candidate_idx if scores[i] == max_score]
+            winner = tied[self._rr_counter % len(tied)]
         self._rr_counter += 1
         server = servers[winner]
+        if conv_key is not None:
+            affinity[conv_key] = server
+            affinity.move_to_end(conv_key)
+            while len(affinity) > ROUTE_AFFINITY_CACHE_SIZE:
+                affinity.popitem(last=False)
         hash_algo = hash_algo_by_server[server]
         block_hashes = block_hashes_by_algo[hash_algo]
         async with self._lock:

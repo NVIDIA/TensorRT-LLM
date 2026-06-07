@@ -1992,3 +1992,54 @@ def test_prefix_cache_tokenize_falls_back_on_divergent_prefix(servers):
                 tokenize=False)
             reference = tok.encode(rendered, add_special_tokens=False)
             assert router._tokenize(req)[0] == reference
+
+
+@pytest.mark.asyncio
+async def test_conversation_affinity_pins_across_load(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                load_weight=1.0)
+    tok = mock.MagicMock()
+    tok.apply_chat_template.return_value = [1, 2, 3, 4, 5, 6, 7, 8]
+    convo = [{
+        "role": "system",
+        "content": "S"
+    }, {
+        "role": "user",
+        "content": "u1"
+    }]
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        req1 = ChatCompletionRequest(model="m",
+                                     messages=[dict(m) for m in convo])
+        home, _ = await router.get_next_server(req1)
+        # Saturate the home server so a fresh request would avoid it.
+        for _ in range(64):
+            await router._server_state[home].increment_load(
+                ChatCompletionRequest(model="m",
+                                      messages=[{
+                                          "role": "user",
+                                          "content": "x"
+                                      }]))
+        # Same conversation (same first-2-message content) -> pinned to home
+        # even though the score now favours the idle servers.
+        req2 = ChatCompletionRequest(model="m",
+                                     messages=[dict(m) for m in convo] +
+                                     [{
+                                         "role": "assistant",
+                                         "content": "a1"
+                                     }, {
+                                         "role": "user",
+                                         "content": "u2"
+                                     }])
+        assert (await router.get_next_server(req2))[0] == home
+        # A different conversation is free to avoid the saturated home.
+        req3 = ChatCompletionRequest(model="m",
+                                     messages=[{
+                                         "role": "system",
+                                         "content": "OTHER"
+                                     }, {
+                                         "role": "user",
+                                         "content": "v1"
+                                     }])
+        assert (await router.get_next_server(req3))[0] != home
