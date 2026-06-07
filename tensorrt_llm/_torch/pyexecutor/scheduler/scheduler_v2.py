@@ -772,9 +772,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         return down_block_start - lo
 
     @staticmethod
-    def _needs_cross_context_allocation(req: LlmRequest) -> bool:
+    def _get_optional_encoder_output_len(req: LlmRequest) -> Optional[int]:
+        get_encoder_output_len = getattr(type(req), "try_get_encoder_output_len", None)
+        encoder_output_len = (
+            get_encoder_output_len(req)
+            if get_encoder_output_len is not None
+            else getattr(req, "encoder_output_len", None)
+        )
+        if encoder_output_len is None:
+            return None
+        return int(encoder_output_len)
+
+    @classmethod
+    def _needs_cross_context_allocation(cls, req: LlmRequest) -> bool:
         """Return whether decoder context must reserve cross-KV for *req*."""
-        if getattr(req, "encoder_output_len", None) is None:
+        if cls._get_optional_encoder_output_len(req) is None:
             return False
         skip_projection = getattr(req, "py_skip_cross_kv_projection", False)
         return not (isinstance(skip_projection, bool) and skip_projection)
@@ -792,7 +804,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
             return ScheduleAction.STOP
 
-        req_tokens = int(req.encoder_output_len)
+        req_tokens = self._get_optional_encoder_output_len(req)
+        if req_tokens is None:
+            return ScheduleAction.SCHEDULED
         from ..resource_manager import KVCacheManagerV2
 
         if isinstance(self.cross_kv_cache_manager, KVCacheManagerV2):
