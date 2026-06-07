@@ -65,7 +65,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
     from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
-    from kv_cache_manager_v2._storage._core import CacheLevelStorage
+    from kv_cache_manager_v2._storage._core import CacheLevelStorage, SlotAllocator
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -118,7 +118,10 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import CacheLevelStorage
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
+        CacheLevelStorage,
+        SlotAllocator,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -343,7 +346,9 @@ class TestNoBatching(TestKVCacheManagerV2):
             req_id, self.manager.create_kv_cache(reuse_scope, prompt), prompt, decode_len
         )
 
-    def run_request(self, req: Request, interval: int, refcheck: bool) -> float:
+    def run_request(
+        self, req: Request, interval: int, refcheck: bool, delay_commit: bool = False
+    ) -> float:
         req_id, kv_cache, prompt, decode_len = req
         assert kv_cache.status == _KVCache.Status.ACTIVE
         stream = kv_cache.cuda_stream
@@ -366,7 +371,8 @@ class TestNoBatching(TestKVCacheManagerV2):
         for _ in range(decode_len):
             required_capacity = len(history) + 1
             if required_capacity > capacity:
-                kv_cache.commit(history[kv_cache.history_length :])
+                if not delay_commit:
+                    kv_cache.commit(history[kv_cache.history_length :])
                 # workaround a mypyc bug: exception in property setter is not propagated
                 # kv_cache.capacity = round_up(required_capacity, interval)
                 if not kv_cache.resize(round_up(required_capacity, interval)):
@@ -391,6 +397,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         interval: int = 1,
         refcheck: bool = True,
         use_external_page_index_buf: bool = False,
+        delay_commit: bool = False,
     ) -> float:
         prompt_len = 1
         decode_len = seq_len - prompt_len
@@ -413,7 +420,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             kv_cache = req0.kv_cache
             success = kv_cache.resume(stream)
             assert success
-            time_taken = self.run_request(req0, interval, refcheck)
+            time_taken = self.run_request(req0, interval, refcheck, delay_commit)
 
         s.take_finish_event().synchronize()
         kv_cache.close()
@@ -576,9 +583,14 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertGreater(num_reused(None), 0)
         self.assertGreater(num_reused(default_scope), 0)
 
-    @parameterized.expand(list(itertools.product([False, True], repeat=2)))
+    @parameterized.expand(list(itertools.product([False, True], repeat=3)))
     # @assert_no_ref_cycle
-    def test_naive(self, use_external_page_index_buf: bool, use_block_quant: bool) -> None:
+    def test_naive(
+        self,
+        use_external_page_index_buf: bool,
+        use_block_quant: bool,
+        delay_commit: bool,
+    ) -> None:
         self.prepare(
             256 << 20,
             256 << 20,
@@ -588,7 +600,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             48,
             block_quant_buf_size=(1024 if use_block_quant else None),
         )
-        self.run_naive(512, 1, True, use_external_page_index_buf)
+        self.run_naive(512, 1, True, use_external_page_index_buf, delay_commit=delay_commit)
 
     @parameterized.expand([(2**i, False) for i in range(12)])
     # @parameterized.expand([(32, True)])
@@ -1275,6 +1287,22 @@ class TestResizeQuota(TestKVCacheManagerV2):
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
 
+        def count_active_pages_by_level(kv_cache: _KVCache) -> list[int]:
+            counts = [0] * self.manager._storage.num_cache_levels
+            for ordinal, beam_idx, lc_idx in kv_cache._active_pages():
+                block_page = kv_cache._page(ordinal, beam_idx, lc_idx)
+                assert block_page is not None
+                counts[block_page.page.cache_level] += 1
+            return counts
+
+        def assert_prefetched_pages_are_evictable(kv_cache: _KVCache) -> None:
+            for ordinal, beam_idx, lc_idx in kv_cache._active_pages():
+                block_page = kv_cache._page(ordinal, beam_idx, lc_idx)
+                assert block_page is not None
+                page = block_page.page
+                if page.cache_level == HOST_LEVEL and self.manager._storage.is_evictable(page):
+                    self.assertTrue(page.scheduled_for_eviction)
+
         # First commit some blocks to fill all levels of cache. This helps test the case where shrinking
         # the quota will drop some pages from the last-level cache.
         for _ in range(11):
@@ -1329,6 +1357,19 @@ class TestResizeQuota(TestKVCacheManagerV2):
         assert success
         success = self.manager.resize(HOST_LEVEL, 128 << 20)
         assert success
+        prefetch_target = kv_cache_lst[1]
+        prefetch_counts_before = count_active_pages_by_level(prefetch_target)
+        self.assertGreater(prefetch_counts_before[DISK_LEVEL], 0)
+        success = prefetch_target.prefetch(HOST_LEVEL)
+        self.assertEqual(success, True)
+        prefetch_counts_after = count_active_pages_by_level(prefetch_target)
+        self.assertEqual(prefetch_counts_after[GPU_LEVEL], prefetch_counts_before[GPU_LEVEL])
+        self.assertEqual(prefetch_counts_after[DISK_LEVEL], 0)
+        self.assertEqual(
+            prefetch_counts_after[HOST_LEVEL],
+            prefetch_counts_before[HOST_LEVEL] + prefetch_counts_before[DISK_LEVEL],
+        )
+        assert_prefetched_pages_are_evictable(prefetch_target)
         # Now both requests can resume
         for kv_cache in kv_cache_lst:
             success = kv_cache.resume(stream)
@@ -2476,6 +2517,43 @@ class TestScratchReuse(TestKVCacheManagerV2):
         s.take_finish_event().synchronize()
         kv.close()
         self.manager.clear_reusable_blocks()
+
+
+class TestSlotAllocatorShrink(unittest.TestCase):
+    def test_shrink_underused_pool(self) -> None:
+        # Regression for NVBug 6225866: shrinking a pool whose new size is
+        # still above the slot-ID high-water mark used to assert because
+        # _num_active_slots - _target_capacity went negative.
+        allocator = SlotAllocator(capacity=184064)
+        slots = [allocator.allocate() for _ in range(2048)]
+        for s in slots:
+            allocator.release(s)
+        self.assertEqual(allocator._num_active_slots, 2048)
+
+        allocator.prepare_for_shrink(122624)
+        self.assertEqual(len(allocator._overflow_slots), 0)
+        self.assertTrue(allocator.finish_shrink())
+        self.assertEqual(allocator._capacity, 122624)
+        self.assertEqual(allocator._num_active_slots, 2048)
+        self.assertFalse(allocator.shrink_in_progress)
+
+    def test_shrink_touched_pool(self) -> None:
+        # Sanity-check that the non-trivial migration path still works:
+        # all ids are issued, half released, shrink to half.
+        allocator = SlotAllocator(capacity=16)
+        slots = [allocator.allocate() for _ in range(16)]
+        for s in slots[8:]:
+            allocator.release(s)
+        self.assertEqual(allocator._num_active_slots, 16)
+
+        allocator.prepare_for_shrink(8)
+        self.assertEqual(len(allocator._overflow_slots), 8)
+        self.assertTrue(allocator.finish_shrink())
+        self.assertEqual(allocator._capacity, 8)
+        self.assertEqual(allocator._num_active_slots, 8)
+
+        for s in slots[:8]:
+            allocator.release(s)
 
 
 if __name__ == "__main__":

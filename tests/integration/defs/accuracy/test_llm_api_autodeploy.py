@@ -67,8 +67,9 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
 
 
 def _set_quant_config(llm, model_id: str) -> None:
-    """Set quant_config on *llm* based on *model_id* so the accuracy harness
-    can resolve the correct thresholds.
+    """Set quant_config on *llm* based on *model_id*.
+
+    This lets the accuracy harness resolve the correct thresholds.
     """
     QUANT_ALGO_BY_MODEL_ID = {
         "fp8": {
@@ -148,19 +149,18 @@ def low_memory_overrides(config,
                          max_batch_size=32,
                          free_gpu_memory_fraction=0.4,
                          max_seq_len=8192,
-                         max_num_tokens=8192,
-                         cuda_graph_batch_sizes=None):
+                         max_num_tokens=8192):
     """Update and return config that reduce memory footprint for unquantized (bf16) runs."""
-    if cuda_graph_batch_sizes is None:
-        cuda_graph_batch_sizes = [
-            s for s in [1, 2, 4, 8, 16, 32, 64, 128] if s <= max_batch_size
-        ]
+    cuda_graph_batch_sizes = [
+        s for s in [1, 2, 4, 8, 16, 32, 64, 128] if s <= max_batch_size
+    ]
     config.update({
         "max_batch_size": max_batch_size,
         "max_seq_len": max_seq_len,
         "max_num_tokens": max_num_tokens,
         "cuda_graph_config": {
-            "batch_sizes": cuda_graph_batch_sizes
+            "batch_sizes": cuda_graph_batch_sizes,
+            "max_batch_size": max_batch_size,
         },
     })
     kv_cache_config = config.setdefault("kv_cache_config", {})
@@ -222,7 +222,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_seq_len": 2048,
             "compile_backend": "torch-simple",
         },
-        "triton_paged": {
+        "triton": {
             "max_batch_size": 128,
             "max_seq_len": 8192,
             "compile_backend": "torch-cudagraph",
@@ -294,7 +294,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             # For batch_size=32: 8.25 GiB KV + ~15 GiB weights ~= 23.3 GiB.
             # If batch size is increased, this parameterization must be gated at a higher memory threshold.
             "torch",
-            "triton_paged",
+            "triton",
         ],
     )
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
@@ -498,7 +498,7 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
         task = GSM8K(self.MODEL_NAME)
         task.evaluate(llm)
 
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     def test_auto_dtype(self, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
@@ -769,7 +769,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         low_memory_overrides(
             kwargs,
             max_batch_size=8,
-            cuda_graph_batch_sizes=[1, 2, 4, 8],
         )
         kwargs["attn_backend"] = attn_backend
 
@@ -874,11 +873,11 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for GLM-4.7-Flash variants"""
+    """Accuracy regression tests for GLM-4.7-Flash variants."""
 
     MODEL_NAME = "GLM-4.7-Flash"
-    MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
-    MODEL_PATH_NVFP4 = hf_id_to_local_model_dir("DeepInfra/GLM-4.7-Flash-NVFP4")
+    MODEL_HF_ID_BF16 = "zai-org/GLM-4.7-Flash"
+    MODEL_HF_ID_NVFP4 = "DeepInfra/GLM-4.7-Flash-NVFP4"
 
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
@@ -933,14 +932,15 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     def test_auto_dtype(self, enable_chunked_prefill, attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH_BF16,
-                           tokenizer=self.MODEL_PATH_BF16,
+        model_path = hf_id_to_local_model_dir(self.MODEL_HF_ID_BF16)
+        with AutoDeployLLM(model=model_path, tokenizer=model_path,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -953,8 +953,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
-                           tokenizer=self.MODEL_PATH_NVFP4,
+        model_path = hf_id_to_local_model_dir(self.MODEL_HF_ID_NVFP4)
+        with AutoDeployLLM(model=model_path, tokenizer=model_path,
                            **kwargs) as llm:
             # Manually set quant_config for NVFP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4

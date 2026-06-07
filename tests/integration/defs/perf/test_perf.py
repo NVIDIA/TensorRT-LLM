@@ -64,6 +64,10 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "glm_5_fp8",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_nano_12b_v2",
+    "phi_4_multimodal_instruct",
+    "phi_4_multimodal_instruct_fp4",
+    "phi_4_multimodal_instruct_fp8",
 }
 
 # Models that use random_image dataset in serve mode benchmarks.
@@ -82,6 +86,17 @@ OPENAI_CHAT_BACKEND_MODELS = {
 # Spec-dec models real dataset in serve perf tests.
 SPEC_DEC_REAL_DATASET_MODELS = {
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
+}
+
+# All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
+# benchmark client commands: forcing generation past EOS produces unstable
+# acceptance rates for spec-dec.
+SPEC_DEC_MODELS = {
+    "qwen3_4b_eagle3",
+    "qwen3_235b_a22b_fp4_eagle3",
+    "gpt_oss_120b_eagle3",
+    "gpt_oss_120b_eagle3_throughput",
+    *SPEC_DEC_REAL_DATASET_MODELS,
 }
 
 # Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
@@ -1062,8 +1077,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.model_name in HF_MODEL_PATH.keys():
             tokenizer_dir = HF_MODEL_PATH[self._config.model_name]
         else:
-            tokenizer_dir = os.path.join(llm_models_root(), "llama-models",
-                                         "llama-7b-hf")
+            tokenizer_dir = os.path.join(llm_models_root(), "llama-models-v2",
+                                         "TinyLlama-1.1B-Chat-v1.0")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
 
@@ -1314,7 +1329,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             model_dir,
             trust_remote_code=self._config.model_name
             in TRUST_REMOTE_CODE_MODELS)
-        dataset = load_dataset("cnn_dailymail",
+        dataset = load_dataset(os.path.join(llm_models_root(), "datasets",
+                                            "cnn_dailymail"),
                                "3.0.0",
                                split="validation",
                                streaming=True,
@@ -1389,12 +1405,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             model_dir,
             "--num-prompts",
             str(self._config.num_reqs),
-            "--ignore-eos",
             "--tokenize-on-client",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        # --ignore-eos must be off for spec-decoding models: forcing generation
+        # past EOS produces unstable acceptance rates.
+        if self._config.model_name not in SPEC_DEC_MODELS:
+            client_cmd.append("--ignore-eos")
         if self._config.model_name in OPENAI_CHAT_BACKEND_MODELS:
             client_cmd += ["--backend", "openai-chat"]
         if real_dataset_path:

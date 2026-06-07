@@ -297,7 +297,6 @@ def create_tensors(
     mma_tiler_mn,
     permuted_m=None,
     seq_len=None,
-    b_tensor_l_sizes=None,
 ):
     """Create tensors for contiguous grouped GEMM.
 
@@ -305,7 +304,6 @@ def create_tensors(
                      A matrix, C matrix, and scale factor A will be padded to this size.
                      The kernel exits when tile_idx >= num_non_exiting_tiles.
     :param seq_len: Sequence length (number of output tokens for C tensor)
-    :param b_tensor_l_sizes: Optional tuple of L sizes for multi-B tensor mode.
     :return: Tuple of (a_tensor, b_tensor, out_tensor, sfa_tensor, sfb_tensor,
                       tile_idx_to_expert_idx, num_non_exiting_tiles, alpha,
                       a_torch_cpu, b_torch_cpu, out_torch_cpu, sfa_torch_cpu, sfb_torch_cpu,
@@ -333,11 +331,6 @@ def create_tensors(
     """
     torch.manual_seed(1111)
 
-    multi_b_mode = b_tensor_l_sizes is not None
-    if multi_b_mode:
-        total_l = sum(b_tensor_l_sizes)
-        if total_l != l:
-            raise ValueError(f"Sum of b_tensor_l_sizes ({total_l}) must equal total L ({l}).")
     alpha_torch_cpu = torch.ones((l,), dtype=torch.float32) * 0.1
 
     (
@@ -400,50 +393,6 @@ def create_tensors(
     alpha = from_dlpack(alpha_torch_cpu.cuda()).mark_layout_dynamic()
 
     out_torch_gpu.fill_(0)
-
-    if multi_b_mode:
-        b_torch_cpu_list = []
-        b_tensor_list = []
-        b_torch_gpu_list = []
-        sfb_torch_cpu_list = []
-        sfb_tensor_list = []
-        sfb_torch_gpu_list = []
-        alpha_torch_cpu_list = []
-        alpha_tensor_list = []
-
-        for l_size in b_tensor_l_sizes:
-            alpha_cpu = torch.ones((l_size,), dtype=torch.float32) * 0.1
-            alpha_torch_cpu_list.append(alpha_cpu)
-            alpha_tensor_list.append(from_dlpack(alpha_cpu.cuda()).mark_layout_dynamic())
-
-            b_cpu = cutlass_torch.matrix(l_size, n, k, b_major == "n", cutlass.Float32)
-            b_tensor_i, b_torch_gpu_i = cutlass_torch.cute_tensor_like(
-                b_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
-            )
-            b_tensor_i.mark_compact_shape_dynamic(
-                mode=1 if b_major == "k" else 0,
-                stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-                divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
-            )
-            b_torch_cpu_list.append(b_cpu)
-            b_tensor_list.append(b_tensor_i)
-            b_torch_gpu_list.append(b_torch_gpu_i)
-
-            sfb_cpu, sfb_tensor_i, sfb_torch_gpu_i = create_scale_factor_tensor(
-                l_size, n, k, sf_vec_size, sf_dtype
-            )
-            sfb_torch_cpu_list.append(sfb_cpu)
-            sfb_tensor_list.append(sfb_tensor_i)
-            sfb_torch_gpu_list.append(sfb_torch_gpu_i)
-
-        b_tensor = b_tensor_list
-        b_torch_cpu = b_torch_cpu_list
-        b_torch_gpu = b_torch_gpu_list
-        sfb_tensor = sfb_tensor_list
-        sfb_torch_cpu = sfb_torch_cpu_list
-        sfb_torch_gpu = sfb_torch_gpu_list
-        alpha = alpha_tensor_list
-        alpha_torch_cpu = alpha_torch_cpu_list
 
     return (
         a_tensor,
@@ -560,7 +509,6 @@ def run(
     raster_along_m: bool = False,
     use_blkred: bool = False,
     use_cupti: bool = False,
-    b_tensor_l_sizes=None,
     **kwargs,
 ):
     """Prepare A/B/C tensors, launch GPU kernel, and reference checking.
@@ -618,10 +566,7 @@ def run(
 
     # Unpack parameters
     n, k, l = nkl  # noqa: E741
-    multi_b_mode = b_tensor_l_sizes is not None
-    total_l = sum(b_tensor_l_sizes) if multi_b_mode else l
-    if multi_b_mode and total_l != l:
-        raise ValueError(f"Sum of b_tensor_l_sizes ({total_l}) must equal L ({l}).")
+    total_l = l
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
@@ -686,7 +631,6 @@ def run(
         mma_tiler_mn,  # cta_tile_m
         permuted_m,
         seq_len,  # Pass seq_len as num_tokens for C tensor shape
-        b_tensor_l_sizes=b_tensor_l_sizes,
     )
 
     # Calculate actual tensor_m used (with padding if permuted_m provided)
@@ -713,7 +657,6 @@ def run(
         cluster_shape_mn,
         use_blkred=use_blkred,
         raster_along_m=raster_along_m,
-        b_tensor_l_sizes=b_tensor_l_sizes if multi_b_mode else None,
     )
 
     # Compute max active clusters on current device
@@ -726,27 +669,29 @@ def run(
     current_stream = cutlass_torch.default_stream()
 
     # Compile gemm kernel
-    if multi_b_mode:
-        compiled_gemm = cute.compile(
-            gemm,
-            a_tensor,
-            tuple(b_tensor),
-            out_tensor,
-            sfa_tensor,
-            tuple(sfb_tensor),
-            tile_idx_to_expert_idx,
-            num_non_exiting_tiles,
-            tile_idx_to_mn_limit,
-            tuple(alpha),
-            max_active_clusters,
-            current_stream,
-            permuted_idx_to_expanded_idx,
-            token_final_scales,
-            options="--opt-level 2",
-        )
-    else:
-        compiled_gemm = cute.compile(
-            gemm,
+    compiled_gemm = cute.compile(
+        gemm,
+        a_tensor,
+        b_tensor,
+        out_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        tile_idx_to_expert_idx,
+        num_non_exiting_tiles,
+        tile_idx_to_mn_limit,
+        alpha,
+        max_active_clusters,
+        current_stream,
+        permuted_idx_to_expanded_idx,
+        token_final_scales,
+        options="--opt-level 2",
+    )
+
+    # Compute reference result
+    if not skip_ref_check:
+        print("Verifying results...")
+        # Execution
+        compiled_gemm(
             a_tensor,
             b_tensor,
             out_tensor,
@@ -756,47 +701,10 @@ def run(
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
             alpha,
-            max_active_clusters,
             current_stream,
             permuted_idx_to_expanded_idx,
             token_final_scales,
-            options="--opt-level 2",
         )
-
-    # Compute reference result
-    if not skip_ref_check:
-        print("Verifying results...")
-        # Execution
-        if multi_b_mode:
-            compiled_gemm(
-                a_tensor,
-                tuple(b_tensor),
-                out_tensor,
-                sfa_tensor,
-                tuple(sfb_tensor),
-                tile_idx_to_expert_idx,
-                num_non_exiting_tiles,
-                tile_idx_to_mn_limit,
-                tuple(alpha),
-                current_stream,
-                permuted_idx_to_expanded_idx,
-                token_final_scales,
-            )
-        else:
-            compiled_gemm(
-                a_tensor,
-                b_tensor,
-                out_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                tile_idx_to_expert_idx,
-                num_non_exiting_tiles,
-                tile_idx_to_mn_limit,
-                alpha,
-                current_stream,
-                permuted_idx_to_expanded_idx,
-                token_final_scales,
-            )
 
         torch.cuda.synchronize()
         ref_result = verify_reference_result(
@@ -892,7 +800,6 @@ def run(
             mma_tiler_mn,  # cta_tile_m
             permuted_m,
             seq_len,  # Pass seq_len as num_tokens for C tensor shape
-            b_tensor_l_sizes=b_tensor_l_sizes,
         )
 
         (
@@ -909,21 +816,6 @@ def run(
             final_scale_dtype,
         )
 
-        if multi_b_mode:
-            return cute.testing.JitArguments(
-                a_tensor,
-                tuple(b_tensor),
-                out_tensor,
-                sfa_tensor,
-                tuple(sfb_tensor),
-                tile_idx_to_expert_idx,
-                num_non_exiting_tiles,
-                tile_idx_to_mn_limit,
-                tuple(alpha),
-                current_stream,
-                permuted_idx_to_expanded_idx,
-                token_final_scales,
-            )
         return cute.testing.JitArguments(
             a_tensor,
             b_tensor,
@@ -982,14 +874,6 @@ if __name__ == "__main__":
             return tuple(int(x.strip()) for x in s.split(","))
         except ValueError:
             raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
-
-    def split_groups_to_b_tensors(num_groups: int, num_b_tensors: int) -> Tuple[int, ...]:
-        if num_b_tensors <= 0:
-            raise argparse.ArgumentTypeError("num_b_tensors must be positive.")
-        base = num_groups // num_b_tensors
-        remainder = num_groups % num_b_tensors
-        sizes = [base + (1 if i < remainder else 0) for i in range(num_b_tensors)]
-        return tuple(sizes)
 
     def read_benchmark_file(
         filepath: str,
@@ -1184,19 +1068,6 @@ if __name__ == "__main__":
         help="Use CUPTI to measure execution time",
     )
 
-    parser.add_argument(
-        "--num_b_tensors",
-        type=int,
-        default=1,
-        help="Number of B tensors for multi-B mode (default: 1).",
-    )
-    parser.add_argument(
-        "--b_tensor_l_sizes",
-        type=parse_comma_separated_ints,
-        default=None,
-        help="Comma-separated L sizes for each B tensor (e.g., 8,8,16). Overrides --num_b_tensors.",
-    )
-
     args = parser.parse_args()
 
     # Process arguments to generate nkl and group_m_list
@@ -1213,17 +1084,6 @@ if __name__ == "__main__":
 
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
-
-    _, _, l = nkl  # noqa: E741
-    b_tensor_l_sizes = None
-    if args.b_tensor_l_sizes is not None:
-        b_tensor_l_sizes = args.b_tensor_l_sizes
-        if args.num_b_tensors != 1 and args.num_b_tensors != len(b_tensor_l_sizes):
-            parser.error("--num_b_tensors must match length of --b_tensor_l_sizes")
-        if sum(b_tensor_l_sizes) != l:
-            parser.error("--b_tensor_l_sizes must sum to L")
-    elif args.num_b_tensors > 1:
-        b_tensor_l_sizes = split_groups_to_b_tensors(l, args.num_b_tensors)
 
     exec_time = run(
         nkl,
@@ -1249,7 +1109,6 @@ if __name__ == "__main__":
         args.raster_along_m,
         args.use_blkred,
         args.use_cupti,
-        b_tensor_l_sizes=b_tensor_l_sizes,
     )
     print("exec_time: ", exec_time)
     print("PASS")

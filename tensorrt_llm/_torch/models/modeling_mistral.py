@@ -310,13 +310,19 @@ class MistralCommonImageProcessor:
             Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
 
-    def __call__(self, text, images, **kwargs):
-        mm_items = []
-        if images:
-            mm_items = [{
-                "type": "image",
-                "base64": encode_base64_image(image)
-            } for image in images]
+    def __call__(self, text, images=None, **kwargs):
+        if not images:
+            # Plain-text inputs (e.g. text-only evaluation like MMLU/GSM8K): tokenize
+            # directly without wrapping in a multi-modal chat conversation, which would
+            # otherwise inject chat-template tokens and corrupt continuation prompts.
+            encoded = self.tokenizer.transformers_tokenizer(text,
+                                                            return_tensors='pt')
+            return {"input_ids": encoded["input_ids"]}
+
+        mm_items = [{
+            "type": "image",
+            "base64": encode_base64_image(image)
+        } for image in images]
 
         conversation = [{
             "role": "user",
@@ -371,19 +377,20 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
         self._model_path = model_path
+        auto_processor = AutoProcessor.from_pretrained(
+            model_path,
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
         if model_type == "mistral_large_3":
             # For mistral large 3, we add chat template in the model forward, and the
             # MistralCommonImageProcessor is used to process the input when both text and images are provided.
             # When the input only contains text, we use the text processor to process the input.
             self._processor = MistralCommonImageProcessor(
                 tokenizer=self._tokenizer, dtype=self.dtype)
-            self.text_processor = self._processor
+            self.text_processor = auto_processor
         else:
             # For other mistral models, we use the AutoProcessor to process the input.
-            self._processor = AutoProcessor.from_pretrained(
-                model_path,
-                use_fast=self.use_fast,
-                trust_remote_code=trust_remote_code)
+            self._processor = auto_processor
             self.text_processor = self._processor
 
     @property
@@ -407,7 +414,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         return self._dtype
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], ExtraProcessedInputs | None]:
         images = inputs.get("multi_modal_data", {}).get("image")
