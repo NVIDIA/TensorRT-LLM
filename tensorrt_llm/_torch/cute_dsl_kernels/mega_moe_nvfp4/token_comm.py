@@ -14,9 +14,15 @@ import cutlass.pipeline as pipeline
 from cutlass.cutlass_dsl import (Float32, Int32, Int64, Uint8, Uint32,
                                  extract_mlir_values, new_from_mlir_values)
 
+# Keep these as separate handlers (NOT a tuple `except (A, B)`): CuteDSL's
+# preprocessor import-walker (cutlass-dsl 4.5.0) raises AttributeError on
+# tuple except types, which silently disables AST preprocessing for this
+# module and breaks dynamic `if` control flow in the kernel.
 try:
     from cutlass.cute import iket as _iket  # type: ignore
-except (ImportError, NotImplementedError):  # pragma: no cover
+except ImportError:  # pragma: no cover
+    from .iket_compat import iket as _iket
+except NotImplementedError:  # pragma: no cover
     from .iket_compat import iket as _iket
 
 from cutlass._mlir import ir
