@@ -43,12 +43,11 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
-    bypass_processor_output_validation,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
-from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
+from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, install_qwen_vl_processor_defaults_fix
 from .modeling_utils import (
     ModelConfig,
     QuantConfig,
@@ -83,6 +82,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         self._processor = AutoProcessor.from_pretrained(
             model_path, use_fast=True, trust_remote_code=trust_remote_code
         )
+        install_qwen_vl_processor_defaults_fix(self._processor)
         self.tllm_multimodal_token_id = self.get_vocab_size() + 1
         # temporal patch size for video frames
         self.temporal_patch_size = getattr(self.config.vision_config, "temporal_patch_size", 1)
@@ -304,24 +304,20 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
-        # validates per-modality kwargs against the processor's TypedDict.
-        # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
-        # round-trip into the validator via tokenizer ``init_kwargs`` /
-        # ``model_input_names`` and trip it with ``TypeError:
-        # merged_typed_dict.__init__() got an unexpected keyword argument
-        # 'video_grid_thw'``. Bypass the validator for our known output keys
-        # for the duration of the processor call.
-        with bypass_processor_output_validation():
-            return self.processor(
-                text=[text],
-                images=images,
-                videos=videos,
-                padding=True,
-                do_rescale=do_rescale,
-                return_tensors="pt",
-                **mm_processor_kwargs,
-            )
+        # The TRT-LLM safe-processor subclass installed in __init__ prevents
+        # the upstream class-level _defaults mutation that would otherwise
+        # cause processor *output* keys to leak into per-modality kwargs and
+        # trip ProcessorMixin._merge_kwargs validation. So we can call the
+        # processor directly here.
+        return self.processor(
+            text=[text],
+            images=images,
+            videos=videos,
+            padding=True,
+            do_rescale=do_rescale,
+            return_tensors="pt",
+            **mm_processor_kwargs,
+        )
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         masks = (input_ids == self.config.image_token_id) | (
