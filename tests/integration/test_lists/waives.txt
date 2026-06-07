@@ -17,8 +17,6 @@ accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma4_e2b_it SKIP (http
 accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8 SKIP (https://nvbugs/6158397)
 accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[deepseek-ai_DeepSeek-R1-0528-True] SKIP (https://nvbugs/6278380)
 accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-NVFP4-True] SKIP (https://nvbugs/6245279)
-accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-trtllm] SKIP (https://nvbugs/6185150)
-accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-4-trtllm] SKIP (https://nvbugs/6185150)
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True] SKIP (https://nvbugs/6261164)
 accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_bf16_small[4] SKIP (https://nvbugs/6158397)
 accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_nvfp4[8] SKIP (https://nvbugs/6278380)
