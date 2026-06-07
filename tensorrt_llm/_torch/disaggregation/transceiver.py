@@ -178,6 +178,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 groups.append(np.array([], dtype=np.int64))
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
+            # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
+            # Extra blocks from num_extra_kv_tokens (speculative decoding) have
+            # uninitialized KV data and must not be transferred.
+            prompt_blocks = (req.prompt_len + tpb - 1) // tpb
+            if block_ids.size > prompt_blocks:
+                block_ids = block_ids[:prompt_blocks]
             window_size = lg.sliding_window_size
 
             if window_size is not None:
