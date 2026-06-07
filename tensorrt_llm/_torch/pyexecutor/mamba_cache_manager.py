@@ -1690,7 +1690,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         )
         if requests:
             self.requests.extend(requests)
-        self._setup_state_indices()
+            # Only process the newly added requests, not all of self.requests.
+            # self.requests may contain stale entries from the previous
+            # _prepare_resources call (e.g., disagg transfer-pending requests)
+            # that would exceed max_batch_size and cause out-of-bounds access.
+            self._setup_state_indices(requests)
         return requests
 
     def update_resources(self,
@@ -1913,11 +1917,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self._request_id_to_state_index.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
-    def _setup_state_indices(self) -> None:
+    def _setup_state_indices(self, requests=None) -> None:
         if self.local_num_mamba_layers == 0:
             return
+        if requests is None:
+            requests = self.requests
         block_indices = []
-        for req in self.requests:
+        for req in requests:
             if req.is_context_finished:
                 next_step = self.get_num_tokens(req) - 1
             elif self.kv_cache_config.enable_block_reuse:
@@ -1927,12 +1933,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 next_step = req.prompt_len - 1
             block_indices.append(next_step // self.tokens_per_block)
         self.impl.copy_batch_block_offsets(
-            self.host_block_offsets,
-            [req.py_request_id for req in self.requests], 1, 0)
-
+            self.host_block_offsets, [req.py_request_id for req in requests], 1,
+            0)
         max_blocks = self.blocks_per_window[
             LinearCacheType.RECURRENT_STATES.value][0]
-        n = len(self.requests)
+        n = len(requests)
         self._host_state_indices.zero_()
         if n > 0:
             # Vectorized gather: replace per-element Python loop with a single
@@ -1947,7 +1952,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             invalid_mask = (values < 0) | (values >= max_blocks)
             if invalid_mask.any():
                 bad_i = int(invalid_mask.nonzero(as_tuple=False)[0, 0])
-                req = self.requests[bad_i]
+                req = requests[bad_i]
                 value = int(values[bad_i])
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
@@ -1967,7 +1972,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
-        for i, req in enumerate(self.requests):
+        for i, req in enumerate(requests):
             self._request_id_to_state_index[
                 req.py_request_id] = self._host_state_indices[i].item()
 
