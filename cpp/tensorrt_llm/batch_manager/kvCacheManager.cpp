@@ -3269,19 +3269,26 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             // Use the cached summary if provided; otherwise perform a fresh tree walk.
             auto const summary
                 = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
-            auto const numReusableBlocks = summary.reusableBlocksAllocated;
             auto const promptInputLen = std::min(req.mPromptLen, windowSize + chunkSize);
             // `addSequence()` ignores the last prompt token because its KV cannot be recovered.
             // When the prompt lands exactly on a block boundary, counting reusable full blocks from
             // all unique tokens can over-credit one extra shared block.
             TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
             auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
-            // Only subtract from shared blocks (reusable blocks are always shared)
-            auto const reusableSharedBlocks
-                = std::min({numReusableBlocks, numSharedBlocks, maxRecoverableSharedBlocks});
-            numRequiredBlocks -= reusableSharedBlocks;
-            // Store on request so the micro batch scheduler can use it for token budget
-            req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
+            // Block (capacity) budget: only ALLOCATED reuse reduces free-pool demand (see #11731).
+            // Reusing a free-but-cached block still pulls one block from the free pool, so crediting
+            // it here would double-count (it is already in the eviction policy's free count) and
+            // over-admit requests. Only subtract from shared blocks (reusable blocks are always shared).
+            auto const reusableAllocatedBlocks
+                = std::min({summary.reusableBlocksAllocated, numSharedBlocks, maxRecoverableSharedBlocks});
+            numRequiredBlocks -= reusableAllocatedBlocks;
+            // Token (compute) budget: ALL cached prefix blocks skip recompute, regardless of ref
+            // state — the engine recovers their KV via prepopulatedPromptLen either way. Mirrors the
+            // accounting already used by getRemainingBlocksToCompletion (GUARANTEED_NO_EVICT) so the
+            // micro batch scheduler does not under-credit reuse and serialize context requests.
+            auto const reusableAllBlocks
+                = std::min({summary.reusableBlocksAll, numSharedBlocks, maxRecoverableSharedBlocks});
+            req.setEstimatedReusableTokens(reusableAllBlocks * getTokensPerBlock());
         }
         return numRequiredBlocks;
     }
