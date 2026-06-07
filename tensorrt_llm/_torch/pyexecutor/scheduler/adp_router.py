@@ -720,7 +720,6 @@ class ConversationAwareADPRouter(ADPRouter):
                  fair_share_multiplier: float = 2.0):
         super().__init__(dist)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
-        # LRU cap on the conversation->rank map; oldest entries evicted beyond this.
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._round_robin_cursor = 0
@@ -742,10 +741,6 @@ class ConversationAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _conversation_id(req_item) -> "str | None":
-        # NOTE: req_item.request may be a raw tensorrt_llm.bindings.executor.Request
-        # (e.g. warmup/dummy requests) that lacks the Python-side
-        # py_disaggregated_params attribute -- getattr (not direct access) so those
-        # fall through to the load-balanced path instead of raising AttributeError.
         req = getattr(req_item, "request", None)
         if req is None:
             return None
@@ -788,10 +783,8 @@ class ConversationAwareADPRouter(ADPRouter):
             all_ranks_num_active_requests, max_num_active_requests,
         )
 
-        # 2) Loose per-rank cap = fair_share_multiplier * ceil(fair-share). BOTH
-        #    new-conversation spreading and sticky returns are capped at this, so
-        #    no rank exceeds expected_num_active_requests -- exceeding it breaks
-        #    the ADP padding invariant (py_executor._pad_attention_dp_dummy_request).
+        # 2) Loose soft cap for spreading new conversations across ranks; sticky
+        #    returns may exceed it (hard cap), so it is re-bumped after the loop.
         expected_num_active_requests = self._expected_num_active_requests(
             all_ranks_num_active_requests, len(remaining_unscheduled), tp_size,
             multiplier=self._fair_share_multiplier,
@@ -821,15 +814,9 @@ class ConversationAwareADPRouter(ADPRouter):
                 target_rank = self._conv_to_rank[conv_id]
                 # Sticky: return the conversation to its target rank while that
                 # rank is under the HARD cap (max_num_active_requests), NOT the
-                # soft fair-share `expected`. Stickiness intentionally wins over
-                # balance so a conversation's KV prefix stays resident on one
-                # rank -- capping sticky at the soft `expected` (~fair_share)
-                # displaces popular conversations as soon as their rank is
-                # moderately busy, causing rank migration -> prefix-cache miss ->
-                # worse TTFT (measured: cache hit drops below kv-aware). The hard
-                # cap can push a rank above the pre-loop `expected`; the returned
-                # value is re-bumped after the loop to keep the ADP padding
-                # invariant (_pad_attention_dp_dummy_request) satisfied.
+                # soft fair-share `expected`. Stickiness wins over balance so a
+                # conversation's KV prefix stays resident on one rank instead of
+                # migrating when the rank gets moderately busy.
                 if all_ranks_num_active_requests[target_rank] < max_num_active_requests:
                     rank = target_rank
                     self._record_target_rank(conv_id, target_rank)  # LRU touch
