@@ -1099,9 +1099,7 @@ class TestConversationAwareADPRouter:
 
     def test_explicit_target_dp_rank_respected(self):
         router = self._router(tp_size=4)
-        item = _make_conv_request_item(
-            1, "A", target_dp_rank=2, attention_dp_relax=False
-        )
+        item = _make_conv_request_item(1, "A", target_dp_rank=2, attention_dp_relax=False)
         pos = self._route(router, self._states(4), [item])
         assert pos[1] == 2
 
@@ -1136,9 +1134,7 @@ class TestConversationAwareADPRouter:
         cfg = MagicMock()
         cfg.kv_cache_routing_conversation_affinity = True
         cfg.kv_cache_routing_max_sessions = 8
-        router = ADPRouter.create(
-            dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg
-        )
+        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
         assert isinstance(router, ConversationAwareADPRouter)
         assert router._max_sessions == 8
 
@@ -1146,9 +1142,7 @@ class TestConversationAwareADPRouter:
         cfg = MagicMock()
         cfg.kv_cache_routing_conversation_affinity = False
         cfg.enable_kv_cache_aware_routing = False
-        router = ADPRouter.create(
-            dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg
-        )
+        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
         assert isinstance(router, DefaultADPRouter)
 
     def test_returned_expected_covers_every_rank(self):

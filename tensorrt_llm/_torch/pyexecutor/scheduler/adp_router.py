@@ -22,7 +22,7 @@ import math
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
-from dataclasses import MISSING, astuple, dataclass, field, fields, replace
+from dataclasses import astuple, dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
@@ -104,8 +104,10 @@ class ADPRouter(ABC):
             kv_cache_manager has block reuse enabled; DefaultADPRouter
             otherwise.
         """
-        if (attention_dp_config is not None
-                and attention_dp_config.kv_cache_routing_conversation_affinity):
+        if (
+            attention_dp_config is not None
+            and attention_dp_config.kv_cache_routing_conversation_affinity
+        ):
             # Explicit conversation_id -> rank affinity. Independent of the KV
             # cache manager (works with or without block reuse, though it is
             # most beneficial with reuse on), so it is checked before the
@@ -297,15 +299,19 @@ class DefaultADPRouter(ADPRouter):
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
         remaining_unscheduled = self._assign_explicit_dp_ranks(
-            sorted_requests, all_ranks_new_requests,
-            all_ranks_num_active_requests, max_num_active_requests,
+            sorted_requests,
+            all_ranks_new_requests,
+            all_ranks_num_active_requests,
+            max_num_active_requests,
         )
 
         num_new_requests_all_ranks = len(remaining_unscheduled)
         # Cap at max_num_active_requests so the per-rank target never
         # exceeds what the rank can physically schedule.
         expected_num_active_requests = self._expected_num_active_requests(
-            all_ranks_num_active_requests, num_new_requests_all_ranks, tp_size,
+            all_ranks_num_active_requests,
+            num_new_requests_all_ranks,
+            tp_size,
             hard_cap=max_num_active_requests,
         )
 
@@ -627,8 +633,11 @@ class KVCacheAwareADPRouter(ADPRouter):
         # affinity wins in the common case.
         num_new_requests_all_ranks = len(remaining_unscheduled)
         expected_num_active_requests = self._expected_num_active_requests(
-            all_ranks_num_active_requests, num_new_requests_all_ranks, tp_size,
-            multiplier=self.fair_share_multiplier, hard_cap=max_num_active_requests,
+            all_ranks_num_active_requests,
+            num_new_requests_all_ranks,
+            tp_size,
+            multiplier=self.fair_share_multiplier,
+            hard_cap=max_num_active_requests,
         )
         eligible_ranks = [
             rank
@@ -716,8 +725,12 @@ class ConversationAwareADPRouter(ADPRouter):
     # bytes each). Bounds memory on long-running servers as conversations churn.
     DEFAULT_MAX_SESSIONS = 1 << 16
 
-    def __init__(self, dist: "Distributed", max_sessions: int = DEFAULT_MAX_SESSIONS,
-                 fair_share_multiplier: float = 2.0):
+    def __init__(
+        self,
+        dist: "Distributed",
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
+        fair_share_multiplier: float = 2.0,
+    ):
         super().__init__(dist)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
@@ -779,14 +792,18 @@ class ConversationAwareADPRouter(ADPRouter):
 
         # 1) Honour an explicit attention_dp_rank first (strict placement).
         remaining_unscheduled = self._assign_explicit_dp_ranks(
-            sorted_requests, all_ranks_new_requests,
-            all_ranks_num_active_requests, max_num_active_requests,
+            sorted_requests,
+            all_ranks_new_requests,
+            all_ranks_num_active_requests,
+            max_num_active_requests,
         )
 
         # 2) Loose soft cap for spreading new conversations across ranks; sticky
         #    returns may exceed it (hard cap), so it is re-bumped after the loop.
         expected_num_active_requests = self._expected_num_active_requests(
-            all_ranks_num_active_requests, len(remaining_unscheduled), tp_size,
+            all_ranks_num_active_requests,
+            len(remaining_unscheduled),
+            tp_size,
             multiplier=self._fair_share_multiplier,
         )
 
