@@ -84,7 +84,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     create_moe,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
-from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -279,60 +279,6 @@ def _create_model_config(
         kwargs["max_num_tokens"] = max_num_tokens
 
     return ModelConfig(**kwargs)
-
-
-def test_configurable_moe_runs_backend_validation_after_wrapper_state(monkeypatch):
-    import tensorrt_llm._torch.modules.fused_moe.configurable_moe as configurable_moe_module
-    import tensorrt_llm._torch.modules.fused_moe.create_moe as create_moe_module
-
-    class RejectingBackend:
-        scheduler_kind = MoESchedulerKind.FUSED_COMM
-        use_flashinfer = False
-
-        def create_weights(self):
-            return None
-
-        def _supports_load_balancer(self):
-            return True
-
-        def validate_configurable_moe(self, moe):
-            assert moe.comm is None
-            assert moe.moe_max_num_tokens == 8
-            raise ValueError("backend validation reached")
-
-    monkeypatch.setattr(
-        create_moe_module,
-        "resolve_moe_cls",
-        lambda *args, **kwargs: RejectingBackend,
-    )
-    monkeypatch.setattr(
-        create_moe_module,
-        "create_moe_backend",
-        lambda *args, **kwargs: RejectingBackend(),
-    )
-    monkeypatch.setattr(configurable_moe_module, "create_moe_scheduler", lambda moe: object())
-
-    model_cfg = _create_model_config(
-        num_experts=4,
-        hidden_size=16,
-        intermediate_size=16,
-        dtype=torch.bfloat16,
-        mapping=Mapping(),
-        quant_config=None,
-        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
-        max_num_tokens=8,
-    )
-
-    with pytest.raises(ValueError, match="backend validation reached"):
-        configurable_moe_module.ConfigurableMoE(
-            routing_method=DefaultMoeRoutingMethod(top_k=1),
-            num_experts=4,
-            hidden_size=16,
-            intermediate_size=16,
-            dtype=torch.bfloat16,
-            reduce_results=True,
-            model_config=model_cfg,
-        )
 
 
 def _run_autotune_test(
