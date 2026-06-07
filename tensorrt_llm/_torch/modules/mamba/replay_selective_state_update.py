@@ -58,6 +58,18 @@ MIN_REPLAY_TILE_SIZE = 16
 # - *_window: combined history + step values over the full window dimension.
 
 
+@triton.jit
+def _gdc_wait_with_memory_clobber():
+    tl.inline_asm_elementwise(
+        "griddepcontrol.wait; // dummy $0",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
 # Lazy global allocator for Triton TMA tensor descriptors. Required by any
 # host- or device-built tensor_descriptor; without it Triton raises at first
 # launch.
@@ -380,7 +392,7 @@ def _replay_precompute_impl(
     # --- Wait for upstream kernel (external PDL) before loading B and C ---
     # All dt processing above is independent of conv1d outputs.
     if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_wait()
+        _gdc_wait_with_memory_clobber()
 
     # --- Load C and B once for the group (shared across HEADS_PER_BLOCK heads) ---
     group_idx = first_head // nheads_ngroups_ratio
@@ -718,7 +730,7 @@ def _rectangle_precompute_impl(
 
     # ---- gdc_wait: from here on we depend on conv1d's outputs ----
     if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_wait()
+        _gdc_wait_with_memory_clobber()
 
     # Conv1d outputs: B and C
     C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
@@ -1459,7 +1471,7 @@ def _persistent_main_impl(
         ).to(tl.float32)
 
     if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_wait()
+        _gdc_wait_with_memory_clobber()
 
     C_tile = tl.load(
         C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
@@ -1694,7 +1706,7 @@ def _persistent_rectangle_impl(
     ).to(tl.float32)
 
     if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_wait()
+        _gdc_wait_with_memory_clobber()
 
     C_tile = tl.load(
         C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
@@ -1975,7 +1987,7 @@ def _persistent_main_kernel(
         # A kernel launched with PDL must wait for its upstream dependency
         # before it can finish, even if this launch has no local work and does
         # not launch its own dependents.
-        tl.extra.cuda.gdc_wait()
+        _gdc_wait_with_memory_clobber()
 
     # Persistent loop.  Decompose tile_id into (pid_h, pid_b_local, pid_m)
     # with pid_m varying fastest (M-tile cache locality on state load), then
