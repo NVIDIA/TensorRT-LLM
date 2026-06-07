@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
 #include <numeric>
 #include <set>
 #include <utility>
@@ -38,8 +39,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // CacheLevelManager
 // ---------------------------------------------------------------------------
 
-CacheLevelManager::CacheLevelManager(std::vector<PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
-    CacheTierConfig const& tierConfig, StorageConfig const& storageConfig, std::vector<int> const& slotCountList)
+CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
+    CacheTierConfig const& tierConfig, StorageConfig const& storageConfig,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
@@ -47,18 +49,17 @@ CacheLevelManager::CacheLevelManager(std::vector<PoolGroupIndex> const& lifeCycl
     storage = createCacheLevelStorage(tierConfig, storageConfig, slotCountList);
 }
 
-int CacheLevelManager::cacheTierGranularity(CacheTier tier, size_t quota)
+size_t CacheLevelManager::cacheTierGranularity(CacheTier tier, size_t quota)
 {
     switch (tier)
     {
     case CacheTier::GPU_MEM:
     {
         constexpr size_t kPageSize = 2ULL << 20;
-        return static_cast<int>(
-            kPageSize << std::min(4, std::max(0, static_cast<int>(std::log2(quota / (kPageSize * 512))))));
+        return kPageSize << std::min(4, std::max(0, static_cast<int>(std::log2(quota / (kPageSize * 512)))));
     }
-    case CacheTier::HOST_MEM: return static_cast<int>(HostMem::kAlignment); // 4 KiB
-    case CacheTier::DISK: return 2 << 20; // DiskCacheLevelStorage::POOL_SIZE_GRANULARITY
+    case CacheTier::HOST_MEM: return HostMem::kAlignment; // 4 KiB
+    case CacheTier::DISK: return size_t{2} << 20;         // DiskCacheLevelStorage::POOL_SIZE_GRANULARITY
     default: throw std::invalid_argument("Invalid cache tier");
     }
 }
@@ -73,32 +74,32 @@ namespace
 // Compute the slot-to-page-indices scale factors.
 // For each (lcId, poolIdx), scale = numBuffersInCoalescedSlot.
 // Python: _slot_to_page_indices[lc_id][pool_idx] = numBuffers
-std::vector<std::vector<int>> computeSlotToPageIndices(StorageConfig const& config)
+TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(StorageConfig const& config)
 {
-    int numLc = config.numLifeCycles();
-    std::vector<std::vector<int>> result(static_cast<size_t>(numLc));
+    LifeCycleId numLc = config.numLifeCycles();
+    TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> result(numLc);
 
     auto const& slotDescList = config.slotDescList;
     auto const& grouping = config.lifeCycleGrouping();
 
-    for (int lc = 0; lc < numLc; ++lc)
+    for (LifeCycleId lcId{0}; lcId < result.size(); ++lcId)
     {
-        PoolGroupIndex pgIdx = grouping[lc];
-        SlotDesc const& sd = slotDescList.at(static_cast<size_t>(pgIdx));
+        PoolGroupIndex pgIdx = grouping[lcId];
+        SlotDesc const& sd = slotDescList.at(pgIdx);
         // Find the variant that corresponds to this lifecycle.
         for (auto const& variant : sd.variants)
         {
-            if (variant.lifeCycleId == lc)
+            if (variant.lifeCycleId == lcId)
             {
                 // Each coalesced buffer contributes its numBuffers as the scale.
-                result[static_cast<size_t>(lc)].reserve(variant.coalescedBuffers.size());
+                result[lcId].reserve(variant.coalescedBuffers.size());
                 for (auto const& cb : variant.coalescedBuffers)
-                    result[static_cast<size_t>(lc)].push_back(cb.numBuffers());
+                    result[lcId].push_back(cb.numBuffers());
                 break;
             }
         }
-        if (result[static_cast<size_t>(lc)].empty())
-            result[static_cast<size_t>(lc)].assign(1, 1); // fallback
+        if (result[lcId].empty())
+            result[lcId].push_back(1); // fallback
     }
     return result;
 }
@@ -124,10 +125,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     // Compute layer attributes and slot utilization fractions for scratch support.
     mLayerAttributes = config.layerAttributes();
-    mSlotUtilFracMax.resize(static_cast<size_t>(lifeCycles.size()), Rational{0, 1});
+    mSlotUtilFracMax.resize(lifeCycles.size(), Rational{0, 1});
     for (auto const& [layerId, layerAttr] : mLayerAttributes)
     {
-        auto lcIdx = static_cast<size_t>(layerAttr.lifeCycleId);
+        LifeCycleId const lcIdx = layerAttr.lifeCycleId;
         if (layerAttr.slotUtilFracMax > mSlotUtilFracMax[lcIdx])
         {
             mSlotUtilFracMax[lcIdx] = layerAttr.slotUtilFracMax;
@@ -137,29 +138,29 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     assert(std::all_of(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end(),
         [this](PoolGroupIndex pg) { return pg < numPoolGroups(); }));
     assert(numPoolGroups()
-        == static_cast<int>(std::set<PoolGroupIndex>(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end()).size()));
+        == PoolGroupIndex{
+            static_cast<int>(std::set<PoolGroupIndex>(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end()).size())});
 
     // Build one CacheLevelManager per tier.
     assert(!config.cacheTiers.empty());
-    assert(std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[0]) && "First cache tier must be GPU");
+    assert(std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[kGpuLevel]) && "First cache tier must be GPU");
 
     // Compute slot size lists for all pool groups.
-    std::vector<std::vector<int>> slotSizeLists;
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizeLists;
     slotSizeLists.reserve(mSlotDescList.size());
     for (auto const& sd : mSlotDescList)
     {
-        auto sizeList = sd.slotSizeList();
-        slotSizeLists.emplace_back(sizeList.begin(), sizeList.end());
+        slotSizeLists.push_back(sd.slotSizeList());
     }
 
-    size_t gpuQuota = cacheTierQuota(config.cacheTiers[0]);
-    int gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
+    size_t gpuQuota = cacheTierQuota(config.cacheTiers[kGpuLevel]);
+    size_t gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
     // Compute min_slots from constraints.
     mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse);
 
     // Compute init_ratio from typical_batch, constraints, or fallback.
-    std::vector<float> initRatio;
+    TypedVec<PoolGroupIndex, float> initRatio;
     if (typicalBatch.has_value())
     {
         initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
@@ -178,13 +179,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         initRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
     }
 
-    int numLevels = static_cast<int>(config.cacheTiers.size());
     mLevels.reserve(config.cacheTiers.size());
-    for (int i = 0; i < numLevels; ++i)
+    for (CacheLevel level{0}; level < config.cacheTiers.size(); ++level)
     {
-        auto slotCountList = computeSlotCountForLevel(config.cacheTiers[i], slotSizeLists, initRatio);
-        mLevels.emplace_back(
-            mLifeCycleGrouping, static_cast<CacheLevel>(i), config.cacheTiers[i], config, slotCountList);
+        auto slotCountList = computeSlotCountForLevel(config.cacheTiers[level], slotSizeLists, initRatio);
+        mLevels.emplace_back(mLifeCycleGrouping, level, config.cacheTiers[level], config, slotCountList);
     }
 
     assert(mLevels.empty()
@@ -211,51 +210,63 @@ void StorageManager::destroy()
 // newSlots
 // ---------------------------------------------------------------------------
 
-std::vector<std::vector<Slot>> StorageManager::newSlots(CacheLevel level, std::vector<int> const& numSlotsPerLc)
+TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(
+    CacheLevel level, TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc)
 {
-    assert(static_cast<int>(numSlotsPerLc.size()) == numLifeCycles());
-    auto& storage = *mLevels.at(static_cast<size_t>(level)).storage;
+    assert(numSlotsPerLc.size() == numLifeCycles());
+    auto& storage = *mLevels.at(level).storage;
 
     // Aggregate by pool group.
-    std::vector<int> pgNumSlots(static_cast<size_t>(numPoolGroups()), 0);
-    for (int lc = 0; lc < numLifeCycles(); ++lc)
-        pgNumSlots[static_cast<size_t>(mLifeCycleGrouping[lc])] += numSlotsPerLc[lc];
+    TypedVec<PoolGroupIndex, SlotCount> pgNumSlots(numPoolGroups(), 0);
+    for (LifeCycleId lcId{0}; lcId < numSlotsPerLc.size(); ++lcId)
+    {
+        SlotCount const numSlots = numSlotsPerLc[lcId];
+        if (numSlots < 0)
+        {
+            throw LogicError("StorageManager::newSlots: slot count must be non-negative");
+        }
+        pgNumSlots[mLifeCycleGrouping[lcId]] += numSlots;
+    }
 
     // Prepare free slots if needed.
     bool needMore = false;
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
-        if (pgNumSlots[pg] > storage.numFreeSlots(static_cast<PoolGroupIndex>(pg)))
+    for (PoolGroupIndex pgIdx{0}; pgIdx < pgNumSlots.size(); ++pgIdx)
+    {
+        if (pgNumSlots[pgIdx] > storage.numFreeSlots(pgIdx))
         {
             needMore = true;
             break;
         }
+    }
 
     if (needMore)
+    {
         prepareFreeSlots(level, pgNumSlots);
+    }
 
     // A14: post-condition — free-slot counts satisfy requirements.
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < pgNumSlots.size(); ++pgIdx)
     {
-        assert(pgNumSlots[pg] <= storage.numFreeSlots(static_cast<PoolGroupIndex>(pg))
+        assert(pgNumSlots[pgIdx] <= storage.numFreeSlots(pgIdx)
             && "Free slot count does not satisfy requirement after prepareFreeSlots");
     }
 
     // Allocate.
-    std::vector<std::vector<Slot>> ret(static_cast<size_t>(numLifeCycles()));
+    TypedVec<LifeCycleId, std::vector<Slot>> ret(numLifeCycles());
     try
     {
-        for (int lc = 0; lc < numLifeCycles(); ++lc)
+        for (LifeCycleId lcId{0}; lcId < ret.size(); ++lcId)
         {
-            PoolGroupIndex pg = mLifeCycleGrouping[lc];
-            ret[lc] = storage.allocateMultiple(pg, numSlotsPerLc[lc]);
+            PoolGroupIndex pg = mLifeCycleGrouping[lcId];
+            ret[lcId] = storage.allocateMultiple(pg, numSlotsPerLc[lcId]);
         }
     }
     catch (...)
     {
-        for (int lc = 0; lc < numLifeCycles(); ++lc)
+        for (LifeCycleId lcId{0}; lcId < ret.size(); ++lcId)
         {
-            PoolGroupIndex pg = mLifeCycleGrouping[lc];
-            for (auto& s : ret[lc])
+            PoolGroupIndex pg = mLifeCycleGrouping[lcId];
+            for (auto& s : ret[lcId])
                 storage.release(pg, std::move(s));
         }
         throw;
@@ -263,38 +274,43 @@ std::vector<std::vector<Slot>> StorageManager::newSlots(CacheLevel level, std::v
     return ret;
 }
 
-std::vector<std::vector<Slot>> StorageManager::newGpuSlots(std::vector<int> const& numSlotsPerLc)
+TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newGpuSlots(
+    TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc)
 {
     return newSlots(kGpuLevel, numSlotsPerLc);
 }
 
-std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, int numSlots)
+std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots)
 {
-    auto& storage = *mLevels.at(static_cast<size_t>(level)).storage;
+    if (numSlots < 0)
+    {
+        throw LogicError("StorageManager::newSlotsForPoolGroup: numSlots must be non-negative");
+    }
+    auto& storage = *mLevels.at(level).storage;
     if (numSlots > storage.numFreeSlots(pgIdx))
     {
-        std::vector<int> requirements(static_cast<size_t>(numPoolGroups()), 0);
-        requirements.at(static_cast<size_t>(pgIdx)) = numSlots;
+        TypedVec<PoolGroupIndex, SlotCount> requirements(numPoolGroups(), 0);
+        requirements.at(pgIdx) = numSlots;
         prepareFreeSlots(level, requirements);
     }
     assert(numSlots <= storage.numFreeSlots(pgIdx));
     return storage.allocateMultiple(pgIdx, numSlots);
 }
 
-Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, int poolIdx) const
+Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const
 {
-    return mLevels.at(static_cast<size_t>(level)).storage->slotAddress(pgIdx, slotId).at(static_cast<size_t>(poolIdx));
+    return mLevels.at(level).storage->slotAddress(pgIdx, slotId).at(poolIdx);
 }
 
 CacheTier StorageManager::cacheTier(CacheLevel level) const
 {
-    return mLevels.at(static_cast<size_t>(level)).cacheTier;
+    return mLevels.at(level).cacheTier;
 }
 
 void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 {
-    PoolGroupIndex pg = mLifeCycleGrouping.at(static_cast<size_t>(lc));
-    mLevels.at(static_cast<size_t>(level)).storage->release(pg, std::move(slot));
+    PoolGroupIndex pg = mLifeCycleGrouping.at(lc);
+    mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
 // ---------------------------------------------------------------------------
@@ -305,8 +321,7 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 {
     PageStatus s = page.status();
     CacheLevel lvl = level.value_or(page.cacheLevel);
-    return (s == PageStatus::DROPPABLE && page.isCommitted())
-        || (s == PageStatus::HELD && lvl < static_cast<CacheLevel>(numCacheLevels() - 1));
+    return (s == PageStatus::DROPPABLE && page.isCommitted()) || (s == PageStatus::HELD && lvl < numCacheLevels() - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -316,34 +331,38 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 void StorageManager::scheduleForEviction(Page& page)
 {
     if (isEvictable(page))
-        mLevels.at(static_cast<size_t>(page.cacheLevel)).controller.scheduleForEviction(page);
+        mLevels.at(page.cacheLevel).controller.scheduleForEviction(page);
 }
 
 void StorageManager::excludeFromEviction(Page& page)
 {
     assert(page.nodeRef.has_value());
-    mLevels.at(static_cast<size_t>(page.cacheLevel)).controller.remove(*page.nodeRef);
+    mLevels.at(page.cacheLevel).controller.remove(*page.nodeRef);
 }
 
 // ---------------------------------------------------------------------------
 // prepareFreeSlots
 // ---------------------------------------------------------------------------
 
-void StorageManager::prepareFreeSlots(CacheLevel level, std::vector<int> const& requirements)
+void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements)
 {
-    // goals[level][pgIdx] = how many free slots we need at `level` for `pgIdx`.
-    std::vector<std::vector<int>> goals(
-        static_cast<size_t>(numCacheLevels()), std::vector<int>(static_cast<size_t>(numPoolGroups()), 0));
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
-        goals.at(static_cast<size_t>(level)).at(static_cast<size_t>(pg)) = requirements.at(static_cast<size_t>(pg));
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
+    for (CacheLevel lvl{0}; lvl < goals.size(); ++lvl)
+    {
+        goals[lvl].resize(numPoolGroups(), 0);
+    }
+    for (PoolGroupIndex pgIdx{0}; pgIdx < requirements.size(); ++pgIdx)
+    {
+        goals.at(level).at(pgIdx) = requirements.at(pgIdx);
+    }
 
-    std::vector<std::vector<SharedPtr<Page>>> fallenPages(static_cast<size_t>(numPoolGroups()));
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> fallenPages(numPoolGroups());
     _prepareFreeSlots(goals, level, fallenPages);
 }
 
-void StorageManager::forceEvict(CacheLevel level, std::vector<int> const& minNumPages)
+void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages)
 {
-    auto evicted = mLevels.at(static_cast<size_t>(level)).controller.evict(minNumPages);
+    auto evicted = mLevels.at(level).controller.evict(minNumPages);
 
     if (isLastLevel(level))
     {
@@ -358,15 +377,18 @@ void StorageManager::forceEvict(CacheLevel level, std::vector<int> const& minNum
         return;
     }
 
-    std::vector<std::vector<int>> goals(
-        static_cast<size_t>(numCacheLevels()), std::vector<int>(static_cast<size_t>(numPoolGroups()), 0));
-    CacheLevel nextLvl = static_cast<CacheLevel>(level + 1);
-
-    std::vector<std::vector<SharedPtr<Page>>> fallen(static_cast<size_t>(numPoolGroups()));
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
+    for (CacheLevel lvl{0}; lvl < goals.size(); ++lvl)
     {
-        for (auto& sp : evicted.at(static_cast<size_t>(pg)))
-            fallen.at(static_cast<size_t>(pg)).push_back(sp);
+        goals[lvl].resize(numPoolGroups(), 0);
+    }
+    CacheLevel nextLvl = level + 1;
+
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> fallen(numPoolGroups());
+    for (PoolGroupIndex pgIdx{0}; pgIdx < fallen.size(); ++pgIdx)
+    {
+        for (auto& sp : evicted.at(pgIdx))
+            fallen.at(pgIdx).push_back(sp);
     }
     _prepareFreeSlots(goals, nextLvl, fallen);
 }
@@ -375,16 +397,16 @@ void StorageManager::forceEvict(CacheLevel level, std::vector<int> const& minNum
 // _prepareFreeSlots (recursive)
 // ---------------------------------------------------------------------------
 
-void StorageManager::_prepareFreeSlots(
-    std::vector<std::vector<int>>& goals, CacheLevel lvlId, std::vector<std::vector<SharedPtr<Page>>>& fallenPages)
+void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals,
+    CacheLevel lvlId, TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages)
 {
     // A7: goals dimensions must match [numCacheLevels][numPoolGroups].
     if (!gNdebug)
     {
-        assert(static_cast<int>(goals.size()) == numCacheLevels() && "goals.rows must equal numCacheLevels");
+        assert(goals.size() == numCacheLevels() && "goals.rows must equal numCacheLevels");
         for (auto const& row : goals)
         {
-            assert(static_cast<int>(row.size()) == numPoolGroups() && "goals.cols must equal numPoolGroups");
+            assert(row.size() == numPoolGroups() && "goals.cols must equal numPoolGroups");
         }
     }
 
@@ -400,51 +422,52 @@ void StorageManager::_prepareFreeSlots(
         }
     }
 
-    auto& lvl = mLevels.at(static_cast<size_t>(lvlId));
+    auto& lvl = mLevels.at(lvlId);
     auto& storage = *lvl.storage;
     auto& ctrl = lvl.controller;
     bool isLast = isLastLevel(lvlId);
 
-    std::vector<int> numToEvict(static_cast<size_t>(numPoolGroups()), 0);
-    std::vector<std::vector<SharedPtr<Page>>> heldPages(static_cast<size_t>(numPoolGroups()));
+    TypedVec<PoolGroupIndex, SlotCount> numToEvict(numPoolGroups(), 0);
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> heldPages(numPoolGroups());
 
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numToEvict.size(); ++pgIdx)
     {
-        int goal = goals.at(static_cast<size_t>(lvlId)).at(static_cast<size_t>(pg));
-        int fallen = static_cast<int>(fallenPages.at(static_cast<size_t>(pg)).size());
-        int oldFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
-        int evictable = ctrl.numEvictablePages(static_cast<PoolGroupIndex>(pg));
-        numToEvict.at(static_cast<size_t>(pg)) = std::max(0, std::min(goal + fallen - oldFree, evictable));
+        SlotCount const goal = goals.at(lvlId).at(pgIdx);
+        SlotCount const fallen = slotCountValueFromSize(fallenPages.at(pgIdx).size());
+        SlotCount const oldFree = storage.numFreeSlots(pgIdx);
+        SlotCount const evictableCount = ctrl.numEvictablePages(pgIdx);
+        SlotCount const required = goal + fallen;
+        SlotCount const shortage = required > oldFree ? required - oldFree : 0;
+        numToEvict.at(pgIdx) = std::min(shortage, evictableCount);
 
-        int fallenHeld = 0;
+        SlotCount fallenHeld = 0;
         if (isLast)
         {
             // Separate held pages from fallen_pages (mirrors Python's remove_if).
-            auto& fp = fallenPages.at(static_cast<size_t>(pg));
-            heldPages.at(static_cast<size_t>(pg))
-                = stealIf(fp, [](SharedPtr<Page> const& p) { return p->status() == PageStatus::HELD; });
-            fallenHeld = static_cast<int>(heldPages.at(static_cast<size_t>(pg)).size());
+            auto& fp = fallenPages.at(pgIdx);
+            heldPages.at(pgIdx) = stealIf(fp, [](SharedPtr<Page> const& p) { return p->status() == PageStatus::HELD; });
+            fallenHeld = slotCountValueFromSize(heldPages.at(pgIdx).size());
 
-            if (fallenHeld > oldFree + evictable)
+            if (fallenHeld > oldFree + evictableCount)
                 throw OutOfPagesError(
-                    "Too many held pages falling to last-level cache for group " + std::to_string(pg));
+                    "Too many held pages falling to last-level cache for group " + std::to_string(pgIdx.value()));
         }
 
-        if (oldFree + evictable - fallenHeld < goal)
-            throw OutOfPagesError(
-                "Impossible to meet free-slot goal " + std::to_string(goal) + " for group " + std::to_string(pg));
+        if (oldFree + evictableCount < fallenHeld + goal)
+            throw OutOfPagesError("Impossible to meet free-slot goal " + std::to_string(goal) + " for group "
+                + std::to_string(pgIdx.value()));
     }
 
     auto evicted = ctrl.evict(numToEvict);
-    std::vector<std::vector<SharedPtr<Page>>> acceptedPages(static_cast<size_t>(numPoolGroups()));
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> acceptedPages(numPoolGroups());
 
     if (isLast)
     {
-        for (int pg = 0; pg < numPoolGroups(); ++pg)
+        for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
         {
-            auto& ev = evicted.at(static_cast<size_t>(pg));
-            int oldFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
-            int numEvicted = static_cast<int>(ev.size());
+            auto& ev = evicted.at(pgIdx);
+            SlotCount const oldFree = storage.numFreeSlots(pgIdx);
+            SlotCount const numEvicted = slotCountValueFromSize(ev.size());
             // A9: all evicted pages at last level must be DROPPABLE.
             if (!gNdebug)
             {
@@ -455,26 +478,25 @@ void StorageManager::_prepareFreeSlots(
             }
             // Drop droppable evicted pages (GC).
             ev.clear();
-            int newFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
+            SlotCount const newFree = storage.numFreeSlots(pgIdx);
             assert(newFree >= numEvicted + oldFree);
 
             // A10: held_pages count must not exceed new_free.
-            assert(static_cast<int>(heldPages.at(static_cast<size_t>(pg)).size()) <= newFree
+            assert(slotCountValueFromSize(heldPages.at(pgIdx).size()) <= newFree
                 && "held_pages count exceeds new free slot count");
 
             // Add held pages from upper levels.
-            auto& hp = heldPages.at(static_cast<size_t>(pg));
-            auto& fp = fallenPages.at(static_cast<size_t>(pg));
+            auto& hp = heldPages.at(pgIdx);
+            auto& fp = fallenPages.at(pgIdx);
             fp.insert(fp.end(), hp.begin(), hp.end());
             hp.clear();
 
-            int goal = goals.at(static_cast<size_t>(lvlId)).at(static_cast<size_t>(pg));
-            int numAccepted = std::min(newFree - goal, static_cast<int>(fp.size()));
-            // A11: numAccepted must be non-negative (last-level path).
-            assert(numAccepted >= 0 && "numAccepted must be >= 0");
+            SlotCount const goal = goals.at(lvlId).at(pgIdx);
+            SlotCount const freeAfterGoal = newFree > goal ? newFree - goal : 0;
+            SlotCount const numAccepted = std::min(freeAfterGoal, slotCountValueFromSize(fp.size()));
             if (numAccepted > 0)
             {
-                acceptedPages.at(static_cast<size_t>(pg)).assign(fp.end() - numAccepted, fp.end());
+                acceptedPages.at(pgIdx).assign(fp.end() - static_cast<std::ptrdiff_t>(numAccepted), fp.end());
             }
             fp.clear();
         }
@@ -490,24 +512,23 @@ void StorageManager::_prepareFreeSlots(
             }
         }
 
-        CacheLevel nextLvl = static_cast<CacheLevel>(lvlId + 1);
-        for (int pg = 0; pg < numPoolGroups(); ++pg)
+        CacheLevel nextLvl = lvlId + 1;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
         {
-            auto& ev = evicted.at(static_cast<size_t>(pg));
-            int oldFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
-            int numEvicted = static_cast<int>(ev.size());
-            auto& fp = fallenPages.at(static_cast<size_t>(pg));
+            auto& ev = evicted.at(pgIdx);
+            SlotCount const oldFree = storage.numFreeSlots(pgIdx);
+            SlotCount const numEvicted = slotCountValueFromSize(ev.size());
+            auto& fp = fallenPages.at(pgIdx);
             fp.insert(fp.begin(), ev.begin(), ev.end()); // prepend evicted to fallen (preserving order)
             ev.clear();
 
-            int goal = goals.at(static_cast<size_t>(lvlId)).at(static_cast<size_t>(pg));
-            int numAccepted = std::min(oldFree + numEvicted - goal, static_cast<int>(fp.size()));
-            // A11: numAccepted must be non-negative (non-last-level path).
-            assert(numAccepted >= 0 && "numAccepted must be >= 0");
+            SlotCount const goal = goals.at(lvlId).at(pgIdx);
+            SlotCount const availableAfterGoal = oldFree + numEvicted > goal ? oldFree + numEvicted - goal : 0;
+            SlotCount const numAccepted = std::min(availableAfterGoal, slotCountValueFromSize(fp.size()));
             if (numAccepted > 0)
             {
-                acceptedPages.at(static_cast<size_t>(pg)).assign(fp.end() - numAccepted, fp.end());
-                fp.erase(fp.end() - numAccepted, fp.end());
+                acceptedPages.at(pgIdx).assign(fp.end() - static_cast<std::ptrdiff_t>(numAccepted), fp.end());
+                fp.erase(fp.end() - static_cast<std::ptrdiff_t>(numAccepted), fp.end());
             }
         }
         _prepareFreeSlots(goals, nextLvl, fallenPages);
@@ -523,15 +544,14 @@ void StorageManager::_prepareFreeSlots(
     }
 
     // Migrate accepted pages into lvlId.
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < acceptedPages.size(); ++pgIdx)
     {
         // Group by source level (mirrors Python's partition()).
-        auto bySrcLevel = partition(
-            acceptedPages.at(static_cast<size_t>(pg)), [](SharedPtr<Page> const& p) { return p->cacheLevel; });
+        auto bySrcLevel = partition(acceptedPages.at(pgIdx), [](SharedPtr<Page> const& p) { return p->cacheLevel; });
 
         for (auto& [srcLvl, pages] : bySrcLevel)
         {
-            _batchedMigrate(static_cast<PoolGroupIndex>(pg), lvlId, srcLvl, pages, /*updateSrc=*/true);
+            _batchedMigrate(pgIdx, lvlId, srcLvl, pages, /*updateSrc=*/true);
             for (auto const& p : pages)
             {
                 if (isLast && p->status() == PageStatus::HELD)
@@ -550,7 +570,7 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
     std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, bool defrag)
 {
     assert(defrag || dstLevel != srcLevel);
-    int numSlots = static_cast<int>(srcPages.size());
+    SlotCount const numSlots = slotCountValueFromSize(srcPages.size());
 
     auto& srcPoolGroup = poolGroup(srcLevel, pgIdx);
     auto& dstPoolGroup = poolGroup(dstLevel, pgIdx);
@@ -560,37 +580,37 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
 
     auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
     // A15: allocated slot count must match the request.
-    assert(static_cast<int>(dstSlots.size()) == numSlots && "dst_slots size mismatch");
+    assert(slotCountValueFromSize(dstSlots.size()) == numSlots && "dst_slots size mismatch");
     try
     {
-        CacheTier dstTier = mLevels.at(static_cast<size_t>(dstLevel)).cacheTier;
-        CacheTier srcTier = mLevels.at(static_cast<size_t>(srcLevel)).cacheTier;
+        CacheTier dstTier = mLevels.at(dstLevel).cacheTier;
+        CacheTier srcTier = mLevels.at(srcLevel).cacheTier;
 
-        int numPools = mNumPools(pgIdx);
+        PoolIndex numPools = mNumPools(pgIdx);
 
         // Build copy tasks per pool.
-        std::vector<std::vector<CopyTask>> tasksPerPool(static_cast<size_t>(numPools));
-        for (int i = 0; i < numSlots; ++i)
+        TypedVec<PoolIndex, std::vector<CopyTask>> tasksPerPool(numPools);
+        for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
-            auto const& src = srcPages.at(static_cast<size_t>(i));
-            auto const& dst = dstSlots.at(static_cast<size_t>(i));
+            auto const& src = srcPages.at(i);
+            auto const& dst = dstSlots.at(i);
             // Fix #8: assert non-defrag migrations only accept pages not scheduled for eviction.
             assert(defrag || !src->scheduledForEviction());
-            for (int pi = 0; pi < numPools; ++pi)
+            for (PoolIndex poolIdx{0}; poolIdx < tasksPerPool.size(); ++poolIdx)
             {
-                Address dstAddr = dstPoolGroup.slotAddress(dst.slotId()).at(static_cast<size_t>(pi));
-                Address srcAddr = srcPoolGroup.slotAddress(src->slotId()).at(static_cast<size_t>(pi));
-                tasksPerPool.at(static_cast<size_t>(pi)).push_back({dstAddr, srcAddr});
+                Address dstAddr = dstPoolGroup.slotAddress(dst.slotId()).at(poolIdx);
+                Address srcAddr = srcPoolGroup.slotAddress(src->slotId()).at(poolIdx);
+                tasksPerPool.at(poolIdx).push_back({dstAddr, srcAddr});
             }
         }
 
         // Collect prior events (src + dst ready events) — mirrors Python's prior_events set.
         std::vector<CachedCudaEvent const*> priorEvents;
-        priorEvents.reserve(static_cast<size_t>(2 * numSlots));
-        for (int i = 0; i < numSlots; ++i)
+        priorEvents.reserve(2 * srcPages.size());
+        for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
-            priorEvents.push_back(&srcPages.at(static_cast<size_t>(i))->readyEvent);
-            priorEvents.push_back(&dstSlots.at(static_cast<size_t>(i)).readyEvent);
+            priorEvents.push_back(&srcPages.at(i)->readyEvent);
+            priorEvents.push_back(&dstSlots.at(i).readyEvent);
         }
 
         // Create a temporary CUDA stream that waits for all prior events before copying.
@@ -599,36 +619,35 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
             auto scope = tempStream.enter();
             CUstream stream = tempStream.get();
             auto slotSizes = slotSize(pgIdx);
-            for (int pi = 0; pi < numPools; ++pi)
+            for (PoolIndex poolIdx{0}; poolIdx < numPools; ++poolIdx)
             {
-                batchedCopy(dstTier, srcTier, static_cast<size_t>(slotSizes.at(static_cast<size_t>(pi))),
-                    tasksPerPool.at(static_cast<size_t>(pi)), stream);
+                batchedCopy(dstTier, srcTier, slotSizes.at(poolIdx), tasksPerPool.at(poolIdx), stream);
             }
         } // ~Scope records finish event
 
         CachedCudaEvent finishEvent = tempStream.takeFinishEvent();
-        for (int i = 0; i < numSlots; ++i)
+        for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
-            dstSlots.at(static_cast<size_t>(i)).readyEvent = finishEvent;
+            dstSlots.at(i).readyEvent = finishEvent;
             // Fix #6: set src.ready_event unconditionally — compulsory for the next owner
             // getting this slot from the pool. Mirrors Python: `src.ready_event = finish_event`.
-            srcPages.at(static_cast<size_t>(i))->readyEvent = finishEvent;
+            srcPages.at(i)->readyEvent = finishEvent;
             if (updateSrc)
             {
-                bool wasScheduled = srcPages.at(static_cast<size_t>(i))->scheduledForEviction();
+                bool wasScheduled = srcPages.at(i)->scheduledForEviction();
                 if (wasScheduled)
-                    excludeFromEviction(*srcPages.at(static_cast<size_t>(i)));
+                    excludeFromEviction(*srcPages.at(i));
                 // Extract source slot from the page and release it back to the pool.
                 Slot srcSlot;
-                srcSlot.setSlotId(srcPages.at(static_cast<size_t>(i))->slotId()); // asserts valid
+                srcSlot.setSlotId(srcPages.at(i)->slotId()); // asserts valid
                 srcSlot.readyEvent = finishEvent;
-                srcPages.at(static_cast<size_t>(i))->resetSlot();
+                srcPages.at(i)->resetSlot();
                 srcPoolGroup.release(std::move(srcSlot));
                 // Transfer dst slot ownership to the page.
-                srcPages.at(static_cast<size_t>(i))->setSlot(dstSlots.at(static_cast<size_t>(i)));
-                srcPages.at(static_cast<size_t>(i))->cacheLevel = dstLevel;
+                srcPages.at(i)->setSlot(dstSlots.at(i));
+                srcPages.at(i)->cacheLevel = dstLevel;
                 if (wasScheduled)
-                    scheduleForEviction(*srcPages.at(static_cast<size_t>(i)));
+                    scheduleForEviction(*srcPages.at(i));
             }
         }
     }
@@ -652,16 +671,17 @@ void StorageManager::batchedMigrateToGpu(std::vector<BatchedLockTarget> const& t
     {
         if (t.page->cacheLevel == kGpuLevel)
             continue;
-        PoolGroupIndex pg = mLifeCycleGrouping.at(static_cast<size_t>(t.lifeCycle));
+        PoolGroupIndex pg = mLifeCycleGrouping.at(t.lifeCycle);
         groups[{t.page->cacheLevel, pg}].push_back(t.page);
     }
     for (auto& [key, pages] : groups)
         _batchedMigrate(key.second, kGpuLevel, key.first, pages, /*updateSrc=*/true);
 }
 
-void StorageManager::prefetch(CacheLevel dstLevel, std::vector<std::vector<std::vector<SharedPtr<Page>>>> const& pages)
+void StorageManager::prefetch(
+    CacheLevel dstLevel, TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages)
 {
-    std::vector<int> numSlots(static_cast<size_t>(numPoolGroups()), 0);
+    TypedVec<PoolGroupIndex, SlotCount> numSlotsToMigrate(numPoolGroups(), 0);
     std::vector<SharedPtr<Page>> scheduled;
 
     struct ReschedulePagesGuard
@@ -679,13 +699,13 @@ void StorageManager::prefetch(CacheLevel dstLevel, std::vector<std::vector<std::
         }
     } reschedulePagesGuard{*this, scheduled};
 
-    for (int pgIdx = 0; pgIdx < static_cast<int>(pages.size()); ++pgIdx)
+    for (PoolGroupIndex pgIndex{0}; pgIndex < pages.size(); ++pgIndex)
     {
-        auto const& poolGroupPages = pages.at(static_cast<size_t>(pgIdx));
-        for (int lvl = 0; lvl < static_cast<int>(poolGroupPages.size()); ++lvl)
+        auto const& poolGroupPages = pages.at(pgIndex);
+        for (CacheLevel level{0}; level < poolGroupPages.size(); ++level)
         {
-            auto const& levelPages = poolGroupPages.at(static_cast<size_t>(lvl));
-            assert(lvl >= dstLevel || levelPages.empty());
+            auto const& levelPages = poolGroupPages.at(level);
+            assert(level >= dstLevel || levelPages.empty());
             for (auto const& page : levelPages)
             {
                 if (page->scheduledForEviction())
@@ -697,24 +717,23 @@ void StorageManager::prefetch(CacheLevel dstLevel, std::vector<std::vector<std::
                 {
                     scheduled.push_back(page);
                 }
-                assert(lvl >= dstLevel);
-                if (lvl == dstLevel)
+                assert(level >= dstLevel);
+                if (level == dstLevel)
                 {
                     continue;
                 }
-                numSlots.at(static_cast<size_t>(pgIdx)) += 1;
+                numSlotsToMigrate.at(pgIndex) += 1;
             }
         }
     }
 
-    prepareFreeSlots(dstLevel, numSlots);
-    for (int pgIdx = 0; pgIdx < static_cast<int>(pages.size()); ++pgIdx)
+    prepareFreeSlots(dstLevel, numSlotsToMigrate);
+    for (PoolGroupIndex pgIndex{0}; pgIndex < pages.size(); ++pgIndex)
     {
-        auto const& poolGroupPages = pages.at(static_cast<size_t>(pgIdx));
-        for (int lvl = dstLevel + 1; lvl < numCacheLevels(); ++lvl)
+        auto const& poolGroupPages = pages.at(pgIndex);
+        for (CacheLevel lvl = dstLevel + 1; lvl < numCacheLevels(); ++lvl)
         {
-            _batchedMigrate(static_cast<PoolGroupIndex>(pgIdx), dstLevel, static_cast<CacheLevel>(lvl),
-                poolGroupPages.at(static_cast<size_t>(lvl)), /*updateSrc=*/true);
+            _batchedMigrate(pgIndex, dstLevel, lvl, poolGroupPages.at(lvl), /*updateSrc=*/true);
         }
     }
 }
@@ -728,35 +747,30 @@ LifeCycle const& StorageManager::getLifeCycle(LifeCycleId lc) const
     return mLifeCycles[lc];
 }
 
-int StorageManager::getPoolGroupIndex(LifeCycleId lc) const
+PoolGroupIndex StorageManager::getPoolGroupIndex(LifeCycleId lc) const
 {
-    return mLifeCycleGrouping.at(static_cast<size_t>(lc));
+    return mLifeCycleGrouping.at(lc);
 }
 
-int StorageManager::mNumPools(PoolGroupIndex pgIdx) const
+PoolIndex StorageManager::mNumPools(PoolGroupIndex pgIdx) const
 {
     assert(!mLevels.empty());
     return getUniformAttribute(mLevels, [pgIdx](auto const& lvl) { return lvl.storage->numPools(pgIdx); });
 }
 
-int StorageManager::numPools(PoolGroupIndex pgIdx) const
+PoolIndex StorageManager::numPools(PoolGroupIndex pgIdx) const
 {
     return mNumPools(pgIdx);
 }
 
-std::vector<int> StorageManager::slotSize(PoolGroupIndex pgIdx) const
+TypedVec<PoolIndex, size_t> StorageManager::slotSize(PoolGroupIndex pgIdx) const
 {
-    auto szList = mSlotDescList.at(static_cast<size_t>(pgIdx)).slotSizeList();
-    std::vector<int> result;
-    result.reserve(szList.size());
-    for (auto s : szList)
-        result.push_back(static_cast<int>(s));
-    return result;
+    return mSlotDescList.at(pgIdx).slotSizeList();
 }
 
 PoolGroupBase& StorageManager::poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx)
 {
-    return mLevels.at(static_cast<size_t>(lvl)).storage->poolGroup(pgIdx);
+    return mLevels.at(lvl).storage->poolGroup(pgIdx);
 }
 
 MemAddress StorageManager::getMemPoolBaseAddress(LayerId layerId, DataRole role) const
@@ -765,13 +779,13 @@ MemAddress StorageManager::getMemPoolBaseAddress(LayerId layerId, DataRole role)
     if (it == mBufferAttr.end())
         throw std::out_of_range("Unknown BufferId");
     auto const& attr = it->second;
-    PoolGroupIndex pgIdx = mLifeCycleGrouping.at(static_cast<size_t>(attr.lifeCycleId));
-    return mLevels[0].storage->getBaseAddress(pgIdx, attr.poolIndex, SlotId(0)) + attr.offset;
+    PoolGroupIndex pgIdx = mLifeCycleGrouping.at(attr.lifeCycleId);
+    return mLevels[kGpuLevel].storage->getBaseAddress(pgIdx, attr.poolIndex, SlotId{0}) + attr.offset;
 }
 
 MemAddress StorageManager::getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
 {
-    return mLevels[0].storage->getBaseAddress(pgIdx, poolIdx, SlotId(0));
+    return mLevels[kGpuLevel].storage->getBaseAddress(pgIdx, poolIdx, SlotId{0});
 }
 
 LayerAttr const& StorageManager::getLayerAttr(LayerId layerId) const
@@ -782,28 +796,28 @@ LayerAttr const& StorageManager::getLayerAttr(LayerId layerId) const
     return it->second;
 }
 
-int StorageManager::numSlots(PoolGroupIndex pgIdx, CacheLevel level) const
+SlotCount StorageManager::numSlots(PoolGroupIndex pgIdx, CacheLevel level) const
 {
-    return mLevels.at(static_cast<size_t>(level)).storage->numSlots(pgIdx);
+    return mLevels.at(level).storage->numSlots(pgIdx);
 }
 
 StorageStatistics StorageManager::getStatistics(CacheLevel level, PoolGroupIndex pgIdx) const
 {
-    auto const& lvl = mLevels.at(static_cast<size_t>(level));
-    int freeSlots = lvl.storage->numFreeSlots(pgIdx);
-    int totalSlots = lvl.storage->numSlots(pgIdx);
-    int evictable = lvl.controller.numEvictablePages(pgIdx);
+    auto const& lvl = mLevels.at(level);
+    SlotCount freeSlots = lvl.storage->numFreeSlots(pgIdx);
+    SlotCount totalSlots = lvl.storage->numSlots(pgIdx);
+    SlotCount evictable = lvl.controller.numEvictablePages(pgIdx);
     auto sizes = lvl.storage->slotSize(pgIdx);
     return StorageStatistics{sizes, totalSlots, freeSlots, evictable};
 }
 
-std::vector<float> StorageManager::getUtilization(CacheLevel level) const
+TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(CacheLevel level) const
 {
-    std::vector<float> result;
-    result.reserve(static_cast<size_t>(numPoolGroups()));
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    TypedVec<PoolGroupIndex, float> result;
+    result.reserve(numPoolGroups());
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
     {
-        auto const s = getStatistics(level, static_cast<PoolGroupIndex>(pg));
+        auto const s = getStatistics(level, pgIdx);
         assert(s.total > 0);
         result.push_back(static_cast<float>(s.unavailable()) / static_cast<float>(s.total));
     }
@@ -813,9 +827,9 @@ std::vector<float> StorageManager::getUtilization(CacheLevel level) const
 float StorageManager::getOverallUtilization(CacheLevel level) const
 {
     float num = 0.f, den = 0.f;
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
     {
-        auto s = getStatistics(level, static_cast<PoolGroupIndex>(pg));
+        auto s = getStatistics(level, pgIdx);
         float sz = 0.f;
         for (auto v : s.slotSizes)
             sz += static_cast<float>(v);
@@ -830,7 +844,7 @@ float StorageManager::getOverallUtilization(CacheLevel level) const
 // expandPoolGroup
 // ---------------------------------------------------------------------------
 
-void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, int newNumSlots)
+void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots)
 {
     auto& pg = poolGroup(level, pgIdx);
     assert(newNumSlots > pg.numSlots());
@@ -843,30 +857,29 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, int
 // ---------------------------------------------------------------------------
 
 void StorageManager::shrinkPoolGroup(
-    CacheLevel level, PoolGroupIndex pgIdx, int newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
+    CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
 {
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator();
-    auto& ctrl = mLevels.at(static_cast<size_t>(level)).controller;
+    auto& ctrl = mLevels.at(level).controller;
     assert(newNumSlots < pg.numSlots());
 
     // A16: persistent_pages preconditions.
-    assert(static_cast<int>(persistentPages.size()) <= newNumSlots && "Not enough slots to hold all persistent pages");
+    assert(persistentPages.size() <= slotCountToSizeT(newNumSlots) && "Not enough slots to hold all persistent pages");
     if (!gNdebug)
     {
         for (auto const& p : persistentPages)
         {
             assert(p->cacheLevel == level && "Persistent page cache level mismatch");
-            assert(mLifeCycleGrouping.at(static_cast<size_t>(p->lifeCycle)) == pgIdx
-                && "Persistent page pool group mismatch");
+            assert(mLifeCycleGrouping.at(p->lifeCycle) == pgIdx && "Persistent page pool group mismatch");
         }
     }
 
     // Find overflow pages: scheduled pages with slot_id >= newNumSlots.
     auto gen = ctrl.pageGenerator(pgIdx);
-    std::deque<std::pair<int, SharedPtr<Page>>> overflowSlots;
+    std::deque<std::pair<SlotCount, SharedPtr<Page>>> overflowSlots;
     {
-        int idx = 0;
+        SlotCount idx = 0;
         while (auto const* page = gen())
         {
             if ((*page)->slotId() >= newNumSlots)
@@ -882,7 +895,7 @@ void StorageManager::shrinkPoolGroup(
         if (p->slotId() >= newNumSlots)
             overflowPersistent.push_back(p);
     }
-    int numOverflowPersistent = static_cast<int>(overflowPersistent.size());
+    SlotCount numOverflowPersistent = slotCountValueFromSize(overflowPersistent.size());
 
     // A2: RUNTIME check — persistent overflow pages must fit in the new capacity.
     if (numOverflowPersistent > newNumSlots)
@@ -896,10 +909,10 @@ void StorageManager::shrinkPoolGroup(
     // Calculate minimum number of lowest-priority pages to evict.
     // Need numEvictedOverflowSlots because evicted overflow pages won't become free,
     // because only free non-overflow slots can be used for defragmentation.
-    int minNumEvicted = 0;
-    int numEvictedOverflowSlots = 0;
+    SlotCount minNumEvicted = 0;
+    SlotCount numEvictedOverflowSlots = 0;
     while (!overflowSlots.empty()
-        && static_cast<int>(overflowSlots.size()) + numOverflowPersistent
+        && slotCountValueFromSize(overflowSlots.size()) + numOverflowPersistent
             > std::min(newNumSlots, overflowSlots.front().first + allocator.numFreeSlots() - numEvictedOverflowSlots))
     {
         minNumEvicted = overflowSlots.front().first + 1;
@@ -908,8 +921,8 @@ void StorageManager::shrinkPoolGroup(
     }
 
     // Force-evict the required pages.
-    std::vector<int> evictReqs(static_cast<size_t>(numPoolGroups()), 0);
-    evictReqs[static_cast<size_t>(pgIdx)] = minNumEvicted;
+    TypedVec<PoolGroupIndex, SlotCount> evictReqs(numPoolGroups(), 0);
+    evictReqs[pgIdx] = minNumEvicted;
     forceEvict(level, evictReqs);
 
     // Remaining overflow pages to defragment.
@@ -921,8 +934,8 @@ void StorageManager::shrinkPoolGroup(
         overflowPages.push_back(p);
 
     // Ensure free slots for the overflow pages.
-    std::vector<int> reqs(static_cast<size_t>(numPoolGroups()), 0);
-    reqs[static_cast<size_t>(pgIdx)] = static_cast<int>(overflowPages.size());
+    TypedVec<PoolGroupIndex, SlotCount> reqs(numPoolGroups(), 0);
+    reqs[pgIdx] = slotCountValueFromSize(overflowPages.size());
     prepareFreeSlots(level, reqs);
 
     // A17: all overflow pages must be at the expected cache level.
@@ -951,9 +964,10 @@ void StorageManager::shrinkPoolGroup(
 // ---------------------------------------------------------------------------
 
 void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
-    std::vector<float> const& ratioList, std::vector<std::vector<SharedPtr<Page>>> const* persistentPages)
+    TypedVec<PoolGroupIndex, float> const& ratioList,
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
 {
-    auto& lvlStorage = *mLevels.at(static_cast<size_t>(level)).storage;
+    auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
     size_t quota = newQuota.has_value()
         ? roundUp(newQuota.value(), static_cast<size_t>(lvlStorage.poolSizeGranularity()))
@@ -970,31 +984,32 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         assert(persistentPages == nullptr);
 
     // Shrink first.
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
     {
-        if (newNumSlots[pg] >= oldNumSlots[pg])
+        if (newNumSlots[pgIdx] >= oldNumSlots[pgIdx])
             continue;
         std::vector<SharedPtr<Page>> pages;
         if (persistentPages)
-            pages = (*persistentPages)[pg];
-        shrinkPoolGroup(level, static_cast<PoolGroupIndex>(pg), newNumSlots[pg], pages);
+            pages = (*persistentPages)[pgIdx];
+        shrinkPoolGroup(level, pgIdx, newNumSlots[pgIdx], pages);
     }
     // Then expand.
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
     {
-        if (newNumSlots[pg] <= oldNumSlots[pg])
+        if (newNumSlots[pgIdx] <= oldNumSlots[pgIdx])
             continue;
-        expandPoolGroup(level, static_cast<PoolGroupIndex>(pg), newNumSlots[pg]);
+        expandPoolGroup(level, pgIdx, newNumSlots[pgIdx]);
     }
     lvlStorage.postResize();
 }
 
-std::vector<float> StorageManager::getRatioList(CacheLevel level) const
+TypedVec<PoolGroupIndex, float> StorageManager::getRatioList(CacheLevel level) const
 {
-    return mLevels.at(static_cast<size_t>(level)).storage->ratioList();
+    return mLevels.at(level).storage->ratioList();
 }
 
-std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int historyLength, int capacity) const
+TypedVec<PoolGroupIndex, float> StorageManager::ratioFromLength(
+    int tokensPerBlock, int historyLength, int capacity) const
 {
     if (capacity < historyLength)
     {
@@ -1002,28 +1017,27 @@ std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int histo
         capacity = historyLength;
     }
     int numBlocks = divUp(capacity, tokensPerBlock);
-    std::vector<size_t> numBytes(static_cast<size_t>(numPoolGroups()), 0);
+    TypedVec<PoolGroupIndex, size_t> numBytes(numPoolGroups(), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
     auto const& lifecycles = mLifeCycles.getAll();
-    for (int lcIdx = 0; lcIdx < numLifeCycles(); ++lcIdx)
+    for (LifeCycleId lcId{0}; lcId < lifecycles.size(); ++lcId)
     {
-        PoolGroupIndex pgIdx = mLifeCycleGrouping[lcIdx];
+        PoolGroupIndex pgIdx = mLifeCycleGrouping[lcId];
         auto ss = slotSize(pgIdx);
-        int slotSizeSum = 0;
+        size_t slotSizeSum = 0;
         for (auto s : ss)
             slotSizeSum += s;
         int numRequiredBlocks;
-        if (ssmLcId.has_value() && lcIdx == *ssmLcId)
+        if (ssmLcId.has_value() && lcId == *ssmLcId)
         {
             numRequiredBlocks = 1;
         }
         else
         {
-            auto stale = getStaleRange(lifecycles[lcIdx], historyLength, tokensPerBlock);
+            auto stale = getStaleRange(lifecycles[lcId], historyLength, tokensPerBlock);
             numRequiredBlocks = std::max(numBlocks - stale.length(), 1);
         }
-        numBytes[static_cast<size_t>(pgIdx)]
-            += static_cast<size_t>(numRequiredBlocks) * static_cast<size_t>(slotSizeSum);
+        numBytes[pgIdx] += static_cast<size_t>(numRequiredBlocks) * slotSizeSum;
     }
     return normalizeToRatio(numBytes);
 }
@@ -1032,8 +1046,8 @@ std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int histo
 // ratioFromBatch
 // ---------------------------------------------------------------------------
 
-std::vector<float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
-    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, int granularity) const
+TypedVec<PoolGroupIndex, float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const
 {
     auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
     auto numBytes = slotsToBytes(numSlots, granularity);
@@ -1044,18 +1058,21 @@ std::vector<float> StorageManager::ratioFromBatch(BatchDesc const& batch, int to
 // computeMinSlotsFromConstraints
 // ---------------------------------------------------------------------------
 
-std::vector<int> StorageManager::computeMinSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
-    int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstraints(
+    std::vector<BatchDesc> const& constraints, int tokensPerBlock,
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
     // Default floor: 1 slot per life cycle in each pool group.
-    std::vector<int> maxSlots(static_cast<size_t>(numPoolGroups()), 0);
+    TypedVec<PoolGroupIndex, SlotCount> maxSlots(numPoolGroups(), 0);
     for (auto pgIdx : mLifeCycleGrouping)
-        maxSlots[static_cast<size_t>(pgIdx)] += 1;
+        maxSlots[pgIdx] += 1;
     for (auto const& batch : constraints)
     {
         auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
-        for (int pg = 0; pg < numPoolGroups(); ++pg)
-            maxSlots[pg] = std::max(maxSlots[pg], slots[pg]);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slots.size(); ++pgIdx)
+        {
+            maxSlots[pgIdx] = std::max(maxSlots[pgIdx], slots[pgIdx]);
+        }
     }
     return maxSlots;
 }
@@ -1064,10 +1081,10 @@ std::vector<int> StorageManager::computeMinSlotsFromConstraints(std::vector<Batc
 // computeSlotsForBatch
 // ---------------------------------------------------------------------------
 
-std::vector<int> StorageManager::computeSlotsForBatch(
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotsForBatch(
     BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
-    std::vector<int> numSlots(static_cast<size_t>(numPoolGroups()), 0);
+    TypedVec<PoolGroupIndex, SlotCount> numSlots(numPoolGroups(), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
     int sysBlocks = batch.systemPromptLength / tokensPerBlock;
 
@@ -1077,18 +1094,18 @@ std::vector<int> StorageManager::computeSlotsForBatch(
         if (ssmLcId.has_value() && lcIdx == *ssmLcId)
         {
             // SSM: always 1 dedicated block per request, never shared.
-            numSlots[static_cast<size_t>(pgIdx)] += static_cast<int>(batch.kvCaches.size());
+            numSlots[pgIdx] += slotCountValueFromSize(batch.kvCaches.size());
             continue;
         }
         // Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
-        HalfOpenRange sysRange{0, sysBlocks};
-        HalfOpenRange staleIntersection = sysRange;
+        HalfOpenRange<BlockOrdinal> sysRange{0, sysBlocks};
+        HalfOpenRange<BlockOrdinal> staleIntersection = sysRange;
         for (auto const& kv : batch.kvCaches)
         {
             auto stale = getStaleRange(lc, kv.historyLength, tokensPerBlock);
             staleIntersection = intersect(staleIntersection, stale);
         }
-        numSlots[static_cast<size_t>(pgIdx)] += sysBlocks - staleIntersection.length();
+        numSlots[pgIdx] += sysBlocks - staleIntersection.length();
 
         // Per-request unique blocks (excluding shared sys blocks already counted above).
         for (auto const& kv : batch.kvCaches)
@@ -1104,12 +1121,11 @@ std::vector<int> StorageManager::computeSlotsForBatch(
                     lc, kv.historyLength, kv.capacity, tokensPerBlock, swaScratchReuse->maxRewindLen);
                 int numScratch = scratch.length();
                 // Scratch blocks share coalesced slots: actual slots = ceil(numScratch * fracMax).
-                numSlots[static_cast<size_t>(pgIdx)]
-                    += (uniqueNonStale - numScratch) + mSlotUtilFracMax[static_cast<size_t>(lcIdx)].ceilMul(numScratch);
+                numSlots[pgIdx] += (uniqueNonStale - numScratch) + mSlotUtilFracMax[lcIdx].ceilMul(numScratch);
             }
             else
             {
-                numSlots[static_cast<size_t>(pgIdx)] += uniqueNonStale;
+                numSlots[pgIdx] += uniqueNonStale;
             }
         }
     }
@@ -1120,15 +1136,15 @@ std::vector<int> StorageManager::computeSlotsForBatch(
 // slotsToBytes
 // ---------------------------------------------------------------------------
 
-std::vector<size_t> StorageManager::slotsToBytes(std::vector<int> const& numSlots, int granularity) const
+TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
+    TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const
 {
-    std::vector<size_t> numBytes(static_cast<size_t>(numPoolGroups()), 0);
-    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    TypedVec<PoolGroupIndex, size_t> numBytes(numPoolGroups(), 0);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numSlots.size(); ++pgIdx)
     {
-        for (auto poolSize : slotSize(static_cast<PoolGroupIndex>(pg)))
+        for (auto poolSize : slotSize(pgIdx))
         {
-            numBytes[pg] += roundUp(
-                static_cast<size_t>(numSlots[pg]) * static_cast<size_t>(poolSize), static_cast<size_t>(granularity));
+            numBytes[pgIdx] += roundUp(slotCountToSizeT(numSlots[pgIdx]) * poolSize, granularity);
         }
     }
     return numBytes;
@@ -1138,13 +1154,14 @@ std::vector<size_t> StorageManager::slotsToBytes(std::vector<int> const& numSlot
 // computeSlotCountForLevel
 // ---------------------------------------------------------------------------
 
-std::vector<int> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
-    std::vector<std::vector<int>> const& slotSizeLists, std::vector<float> const& ratio) const
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+    TypedVec<PoolGroupIndex, float> const& ratio) const
 {
     CacheTier tier = cacheTierOf(tierConfig);
     size_t quota = cacheTierQuota(tierConfig);
-    int granularity = CacheLevelManager::cacheTierGranularity(tier, quota);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity), roundUp(quota, static_cast<size_t>(granularity)));
+    size_t granularity = CacheLevelManager::cacheTierGranularity(tier, quota);
+    quota = std::max(minQuotaForLevel(slotSizeLists, granularity), roundUp(quota, granularity));
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, mMinSlots);
 }
 
@@ -1152,15 +1169,15 @@ std::vector<int> StorageManager::computeSlotCountForLevel(CacheTierConfig const&
 // minQuotaForLevel
 // ---------------------------------------------------------------------------
 
-size_t StorageManager::minQuotaForLevel(std::vector<std::vector<int>> const& slotSizeLists, int granularity) const
+size_t StorageManager::minQuotaForLevel(
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity) const
 {
     size_t total = 0;
-    for (size_t pg = 0; pg < slotSizeLists.size(); ++pg)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
-        for (auto slotSize : slotSizeLists[pg])
+        for (auto slotSize : slotSizeLists[pgIdx])
         {
-            total += roundUp(
-                static_cast<size_t>(mMinSlots[pg]) * static_cast<size_t>(slotSize), static_cast<size_t>(granularity));
+            total += roundUp(slotCountToSizeT(mMinSlots[pgIdx]) * slotSize, granularity);
         }
     }
     return total;
@@ -1170,10 +1187,10 @@ size_t StorageManager::minQuotaForLevel(std::vector<std::vector<int>> const& slo
 // constrainRatio
 // ---------------------------------------------------------------------------
 
-std::vector<float> StorageManager::constrainRatio(std::vector<float> const& ratio) const
+TypedVec<PoolGroupIndex, float> StorageManager::constrainRatio(TypedVec<PoolGroupIndex, float> const& ratio) const
 {
-    auto& gpuStorage = *mLevels[0].storage;
-    int granularity = gpuStorage.poolSizeGranularity();
+    auto& gpuStorage = *mLevels[kGpuLevel].storage;
+    size_t granularity = gpuStorage.poolSizeGranularity();
     auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots);
     auto numBytes = slotsToBytes(slotCountList, granularity);
     return normalizeToRatio(numBytes);

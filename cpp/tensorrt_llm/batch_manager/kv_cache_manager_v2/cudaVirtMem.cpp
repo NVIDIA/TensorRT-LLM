@@ -104,7 +104,7 @@ PooledPhysMemAllocator::PooledPhysMem PooledPhysMemAllocator::acquire()
 // VirtMem
 // ---------------------------------------------------------------------------
 
-VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, int initNumPhysMem)
+VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t initNumPhysMem)
     : mVmSize(vmSize)
     , mPhysMemAllocator(physMemAllocator)
 {
@@ -152,12 +152,12 @@ void VirtMem::pop()
     mPhysHandles.pop_back(); // PhysMemHandle destructor returns to pool
 }
 
-void VirtMem::extend(int numToAdd)
+void VirtMem::extend(size_t numToAdd)
 {
-    int old = numPhysMem();
+    size_t old = numPhysMem();
     try
     {
-        for (int i = 0; i < numToAdd; ++i)
+        for (size_t i = 0; i < numToAdd; ++i)
         {
             push(mPhysMemAllocator.acquire());
         }
@@ -173,10 +173,10 @@ void VirtMem::extend(int numToAdd)
     }
 }
 
-void VirtMem::shrink(int numToRemove)
+void VirtMem::shrink(size_t numToRemove)
 {
     cuCheck(cuCtxSynchronize());
-    for (int i = 0; i < numToRemove; ++i)
+    for (size_t i = 0; i < numToRemove; ++i)
     {
         pop();
     }
@@ -185,8 +185,8 @@ void VirtMem::shrink(int numToRemove)
 void VirtMem::realloc(size_t numBytes)
 {
     size_t physSize = mPhysMemAllocator.physMemSize();
-    int required = static_cast<int>(divUp(numBytes, physSize));
-    int current = numPhysMem();
+    size_t required = divUp(numBytes, physSize);
+    size_t current = numPhysMem();
     if (required > current)
     {
         extend(required - current);

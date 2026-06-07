@@ -24,7 +24,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <tuple>
-#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -32,19 +31,11 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class KvCacheIntrospection
 {
 public:
-    using ActivePageStats = std::tuple<std::vector<int>, std::vector<int>>;
+    using ActivePageStats = std::tuple<TypedVec<CacheLevel, int>, TypedVec<CacheLevel, int>>;
 
     static ActivePageStats activePageStats(KvCache const& kvCache);
     static bool allTreePagesDroppable(KvCacheManager& manager);
-    static bool isCommitAllowed(KvCache const& kvCache);
-    static std::vector<float> currentGpuRatio(KvCacheManager& manager);
-    static std::vector<StorageStatistics> storageStatistics(KvCacheManager& manager, CacheLevel level);
-    static std::vector<float> storageUtilization(KvCacheManager& manager, CacheLevel level);
-    static int64_t grainsForSlots(int numSlots, std::vector<int> const& slotSizeList, int granularity);
-    static std::tuple<int, int64_t> grainsToSlots(
-        int64_t pgGrains, std::vector<int> const& slotSizeList, int granularity);
-    static std::vector<int> ratioToSlotCountList(size_t quota, std::vector<std::vector<int>> const& slotSizeLists,
-        std::vector<float> const& ratioList, int granularity, std::vector<int> const& minSlots);
+    static TypedVec<PoolGroupIndex, StorageStatistics> storageStatistics(KvCacheManager& manager, CacheLevel level);
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

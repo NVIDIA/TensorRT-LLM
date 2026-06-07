@@ -152,7 +152,7 @@ struct RootBlock : NodeBase
 
     BlockOrdinal ordinal() const noexcept override
     {
-        return -1;
+        return kBadBlockOrdinal;
     }
 
     int tokensPerBlock() const noexcept override;
@@ -171,10 +171,9 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     // Raw non-owning pointer: while attached, the prev node's `next` map owns us via shared_ptr.
     NodeBase* prev{nullptr};
 
-    // indexed by LifeCycleId; nullptr = no cached page for that lifecycle
-    std::vector<CommittedPage*> storage;
+    TypedVec<LifeCycleId, CommittedPage*> storage;
 
-    Block(BlockKey key, std::vector<TokenIdExt> tokens, NodeBase* prev, int numLifeCycles);
+    Block(BlockKey key, std::vector<TokenIdExt> tokens, NodeBase* prev, LifeCycleId numLifeCycles);
     ~Block() override;
 
     static BlockKey makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_t count);
@@ -191,9 +190,9 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
 
     int tokensPerBlock() const noexcept override;
 
-    int numLifeCycles() const noexcept
+    LifeCycleId numLifeCycles() const noexcept
     {
-        return static_cast<int>(storage.size());
+        return storage.size();
     }
 
     bool isFull() const noexcept
@@ -259,7 +258,7 @@ public:
         return mTokensPerBlock;
     }
 
-    int numLifeCycles() const noexcept;
+    LifeCycleId numLifeCycles() const noexcept;
 
     LifeCycleRegistry const& lifeCycles() const noexcept
     {
@@ -305,7 +304,7 @@ private:
 // If isNew is non-null, *isNew is set to true if a new block was created, false
 // if an existing block was returned.
 SharedPtr<Block> addOrGetExistingBlock(
-    NodeBase* prev, int numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew = nullptr);
+    NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew = nullptr);
 
 // Post-order traversal: remove a subtree rooted at `root` from its parent's
 // next map. ~Block() handles page cleanup. Mirrors Python's remove_subtree().

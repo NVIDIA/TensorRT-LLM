@@ -40,13 +40,13 @@ struct AttnLifeCycle
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
 
-    HalfOpenRange getStaleRange(int historyLength, int tokensPerBlock) const
+    HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
         int numBlocks = divUp(historyLength, tokensPerBlock);
-        int start = std::min(numBlocks, numSinkBlocks);
+        BlockOrdinal start{std::min(numBlocks, numSinkBlocks)};
         if (!windowSize.has_value())
             return {start, start};
-        int windowStart = (historyLength + 1 - *windowSize) / tokensPerBlock;
+        BlockOrdinal windowStart{(historyLength + 1 - *windowSize) / tokensPerBlock};
         return {start, std::max(start, windowStart)};
     }
 
@@ -80,9 +80,9 @@ struct AttnLifeCycle
 // ---------------------------------------------------------------------------
 struct SsmLifeCycle
 {
-    HalfOpenRange getStaleRange(int historyLength, int tokensPerBlock) const
+    HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
-        return {0, historyLength / tokensPerBlock};
+        return {BlockOrdinal{0}, BlockOrdinal{historyLength / tokensPerBlock}};
     }
 
     bool operator==(SsmLifeCycle const&) const noexcept
@@ -102,7 +102,7 @@ struct SsmLifeCycle
 using LifeCycle = std::variant<AttnLifeCycle, SsmLifeCycle>;
 
 // Free function: compute stale range via std::visit.
-inline HalfOpenRange getStaleRange(LifeCycle const& lc, int historyLength, int tokensPerBlock)
+inline HalfOpenRange<BlockOrdinal> getStaleRange(LifeCycle const& lc, int historyLength, int tokensPerBlock)
 {
     return std::visit([&](auto const& v) { return v.getStaleRange(historyLength, tokensPerBlock); }, lc);
 }
@@ -113,17 +113,17 @@ inline HalfOpenRange getStaleRange(LifeCycle const& lc, int historyLength, int t
 //   input_blocks: [divUp(historyLength, tpb), divUp(capacity, tpb)) — new blocks
 //     for the current chunk.
 // Mirrors _life_cycle_registry.py::compute_scratch_range().
-inline HalfOpenRange computeScratchRange(
+inline HalfOpenRange<BlockOrdinal> computeScratchRange(
     LifeCycle const& lc, int historyLength, int capacity, int tokensPerBlock, int maxRewindLen)
 {
     auto const* attn = std::get_if<AttnLifeCycle>(&lc);
     if (!attn || !attn->windowSize.has_value())
     {
-        return {0, 0};
+        return {BlockOrdinal{0}, BlockOrdinal{0}};
     }
     int const nonRewindableCapacity = std::max(0, capacity - maxRewindLen);
     auto capStale = attn->getStaleRange(nonRewindableCapacity, tokensPerBlock);
-    HalfOpenRange inputRange{divUp(historyLength, tokensPerBlock), divUp(capacity, tokensPerBlock)};
+    HalfOpenRange<BlockOrdinal> inputRange{divUp(historyLength, tokensPerBlock), divUp(capacity, tokensPerBlock)};
     return intersect(capStale, inputRange);
 }
 
@@ -131,7 +131,7 @@ inline HalfOpenRange computeScratchRange(
 LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock);
 
 // Integer id assigned to each unique LifeCycle.
-using LifeCycleId = int;
+using LifeCycleId = StrongIndex<int, struct LifeCycleIdTag>;
 
 // Alias for public exposure (same meaning as LifeCycleId).
 using LayerGroupId = LifeCycleId;
@@ -156,7 +156,7 @@ public:
     LifeCycleId size() const noexcept;
 
     // Iteration over LifeCycles in registration order.
-    std::vector<LifeCycle> const& getAll() const noexcept
+    TypedVec<LifeCycleId, LifeCycle> const& getAll() const noexcept
     {
         return mLifeCycleList;
     }
@@ -181,10 +181,10 @@ public:
     std::vector<std::pair<LifeCycleId, AttnLifeCycle const*>> attentionLifeCycles() const
     {
         std::vector<std::pair<LifeCycleId, AttnLifeCycle const*>> result;
-        for (size_t i = 0; i < mLifeCycleList.size(); ++i)
+        for (LifeCycleId lcId{0}; lcId < mLifeCycleList.size(); ++lcId)
         {
-            if (auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycleList[i]))
-                result.emplace_back(static_cast<LifeCycleId>(i), attn);
+            if (auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycleList[lcId]))
+                result.emplace_back(lcId, attn);
         }
         return result;
     }
@@ -199,7 +199,7 @@ public:
     class ItemIterator
     {
     public:
-        ItemIterator(std::vector<LifeCycle> const& list, size_t pos)
+        ItemIterator(TypedVec<LifeCycleId, LifeCycle> const& list, LifeCycleId pos)
             : mList(&list)
             , mPos(pos)
         {
@@ -207,7 +207,7 @@ public:
 
         Item operator*() const
         {
-            return {static_cast<LifeCycleId>(mPos), (*mList)[mPos]};
+            return {mPos, (*mList)[mPos]};
         }
 
         ItemIterator& operator++()
@@ -222,13 +222,13 @@ public:
         }
 
     private:
-        std::vector<LifeCycle> const* mList;
-        size_t mPos;
+        TypedVec<LifeCycleId, LifeCycle> const* mList;
+        LifeCycleId mPos;
     };
 
     ItemIterator begin() const
     {
-        return {mLifeCycleList, 0};
+        return {mLifeCycleList, LifeCycleId{0}};
     }
 
     ItemIterator end() const
@@ -237,7 +237,7 @@ public:
     }
 
 private:
-    std::vector<LifeCycle> mLifeCycleList; // indexed by LifeCycleId
+    TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;
     std::optional<LifeCycleId> mSsmLifeCycleId;
 };

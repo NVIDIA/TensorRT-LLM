@@ -116,7 +116,7 @@ public:
     BeamIndex beamIndex;
     std::vector<TokenIdExt> tokens;
 
-    UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc, CacheLevel level, BeamIndex bi = 0);
+    UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc, CacheLevel level, BeamIndex bi = kDefaultBeamIndex);
 
     ~UncommittedPage() override;
 

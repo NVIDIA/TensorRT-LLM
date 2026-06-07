@@ -33,8 +33,6 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-class KvCacheIntrospection;
-
 // ---------------------------------------------------------------------------
 // Slot — represents ownership of one allocated slot in a pool group.
 // Mirrors _storage/_core.py::Slot.
@@ -49,12 +47,12 @@ struct Slot
     CachedCudaEvent readyEvent = CachedCudaEvent::makeNull();
 
     // Mirrors Python @property slot_id: asserts valid, returns unwrapped value.
-    SlotId slotId() const
+    [[nodiscard]] SlotId slotId() const
     {
         return mSlotId.value();
     }
 
-    bool hasValidSlot() const noexcept
+    [[nodiscard]] bool hasValidSlot() const noexcept
     {
         return mSlotId.has_value();
     }
@@ -97,44 +95,44 @@ private:
 class SlotAllocator
 {
 public:
-    explicit SlotAllocator(int capacity);
+    explicit SlotAllocator(SlotCount capacity);
     ~SlotAllocator();
 
-    int numFreeSlots() const noexcept;
-    int numOccupiedSlots() const noexcept;
+    [[nodiscard]] SlotCount numFreeSlots() const noexcept;
+    [[nodiscard]] SlotCount numOccupiedSlots() const noexcept;
 
-    int numSlots() const noexcept
+    [[nodiscard]] SlotCount numSlots() const noexcept
     {
         return mCapacity;
     }
 
     Slot allocate();
-    std::vector<Slot> allocateMultiple(int numSlots);
+    std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
 
-    void expand(int newNumSlots);
-    void prepareForShrink(int newNumSlots);
+    void expand(SlotCount newNumSlots);
+    void prepareForShrink(SlotCount newNumSlots);
     bool finishShrink();
 
-    bool shrinkInProgress() const noexcept
+    [[nodiscard]] bool shrinkInProgress() const noexcept
     {
         return mTargetCapacity < mCapacity;
     }
 
-    std::vector<SlotId> getSlotsBlockingShrink() const;
+    [[nodiscard]] std::vector<SlotId> getSlotsBlockingShrink() const;
 
     // Read-only accessors for debug assertions (mirrors Python's direct attribute access).
-    int numOverflowSlots() const noexcept
+    [[nodiscard]] SlotCount numOverflowSlots() const noexcept
     {
-        return static_cast<int>(mOverflowSlots.size());
+        return slotCountValueFromSize(mOverflowSlots.size());
     }
 
-    int numActiveSlots() const noexcept
+    [[nodiscard]] SlotCount numActiveSlots() const noexcept
     {
         return mNumActiveSlots;
     }
 
-    int targetCapacity() const noexcept
+    [[nodiscard]] SlotCount targetCapacity() const noexcept
     {
         return mTargetCapacity;
     }
@@ -143,12 +141,12 @@ public:
 
 private:
     void scrubEvents();
-    bool check() const noexcept;
+    [[nodiscard]] bool check() const noexcept;
 
-    int mCapacity;
-    int mTargetCapacity;
-    int mNumActiveSlots;
-    int mNumReadyRecycledSlots;
+    SlotCount mCapacity;
+    SlotCount mTargetCapacity;
+    SlotCount mNumActiveSlots;
+    SlotCount mNumReadyRecycledSlots;
     std::deque<Slot> mRecycledSlots;
     std::vector<Slot> mOverflowSlots;
     DynamicBitset mOccupiedMask;
@@ -173,15 +171,15 @@ public:
         return mSlotSize;
     }
 
-    virtual int numSlots() const noexcept = 0;
+    virtual SlotCount numSlots() const noexcept = 0;
 
     size_t numBytes() const noexcept
     {
-        return mSlotSize * static_cast<size_t>(numSlots());
+        return mSlotSize * slotCountToSizeT(numSlots());
     }
 
     virtual void destroy() = 0;
-    virtual void resize(int newNumSlots) = 0;
+    virtual void resize(SlotCount newNumSlots) = 0;
     virtual Address slotAddress(SlotId slot) const = 0;
 
 protected:
@@ -194,18 +192,18 @@ protected:
 class GpuSlotPool : public SlotPoolBase
 {
 public:
-    GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, int numSlots);
+    GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots);
 
-    int numSlots() const noexcept override;
+    SlotCount numSlots() const noexcept override;
     void destroy() override;
-    void resize(int newNumSlots) override;
+    void resize(SlotCount newNumSlots) override;
     Address slotAddress(SlotId slot) const override;
 
     // Extend by exactly one physical memory chunk; returns new numSlots.
-    int extendByOnePhysMem();
+    SlotCount extendByOnePhysMem();
 
-    static int computeNumPhysMem(size_t slotSize, int numSlots, size_t physMemSize) noexcept;
-    static int computeNumSlots(size_t slotSize, int numPhysMem, size_t physMemSize) noexcept;
+    static size_t computeNumPhysMem(size_t slotSize, SlotCount numSlots, size_t physMemSize) noexcept;
+    static SlotCount computeNumSlots(size_t slotSize, size_t numPhysMem, size_t physMemSize) noexcept;
 
 private:
     VirtMem mVirtMem;
@@ -217,14 +215,14 @@ private:
 class HostSlotPool : public SlotPoolBase
 {
 public:
-    HostSlotPool(size_t slotSize, int numSlots);
+    HostSlotPool(size_t slotSize, SlotCount numSlots);
 
-    int numSlots() const noexcept override;
+    SlotCount numSlots() const noexcept override;
     void destroy() override;
-    void resize(int newNumSlots) override;
+    void resize(SlotCount newNumSlots) override;
     Address slotAddress(SlotId slot) const override;
 
-    size_t alignedSize(int numSlots) const noexcept;
+    size_t alignedSize(SlotCount numSlots) const noexcept;
 
 private:
     HostMem mHostMem;
@@ -237,12 +235,12 @@ class DiskSlotPool : public SlotPoolBase
 {
 public:
     // directory: path under which to create the temp file.
-    DiskSlotPool(std::string const& directory, size_t slotSize, int numSlots);
+    DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots);
     ~DiskSlotPool() override;
 
-    int numSlots() const noexcept override;
+    SlotCount numSlots() const noexcept override;
     void destroy() override;
-    void resize(int newNumSlots) override;
+    void resize(SlotCount newNumSlots) override;
     Address slotAddress(SlotId slot) const override;
 
     int fd() const noexcept
@@ -261,17 +259,17 @@ private:
 class PoolGroupBase
 {
 public:
-    explicit PoolGroupBase(int numSlots);
+    explicit PoolGroupBase(SlotCount numSlots);
     virtual ~PoolGroupBase();
 
-    int numPools() const noexcept
+    PoolIndex numPools() const noexcept
     {
-        return static_cast<int>(mPools.size());
+        return mPools.size();
     }
 
-    int numSlots() const noexcept;
+    SlotCount numSlots() const noexcept;
 
-    int numFreeSlots() const noexcept
+    SlotCount numFreeSlots() const noexcept
     {
         return mSlotAllocator.numFreeSlots();
     }
@@ -287,15 +285,15 @@ public:
     }
 
     Slot allocate();
-    std::vector<Slot> allocateMultiple(int numSlots);
+    std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
     void destroy();
-    void resizePools(std::optional<int> newNumSlots = std::nullopt);
+    void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt);
 
     // Addresses for all pools at a given slot id.
-    std::vector<Address> slotAddress(SlotId slotId) const;
+    TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
     // Sizes per pool.
-    std::vector<size_t> slotSize() const;
+    TypedVec<PoolIndex, size_t> slotSize() const;
 
     // Total bytes across all pools for one slot.
     size_t numBytes() const noexcept
@@ -308,20 +306,20 @@ public:
 
     // Total bytes across all pools, rounding each pool's bytes up to granularity.
     // Mirrors Python total_quota: sum(round_up(p.num_bytes, granularity) for p in pg._pools).
-    size_t roundedNumBytes(int granularity) const noexcept
+    size_t roundedNumBytes(size_t granularity) const noexcept
     {
         size_t total = 0;
         for (auto const& pool : mPools)
-            total += roundUp(pool->numBytes(), static_cast<size_t>(granularity));
+            total += roundUp(pool->numBytes(), granularity);
         return total;
     }
 
 protected:
     // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
-    int getNumSlotsFromPools() const noexcept;
+    SlotCount getNumSlotsFromPools() const noexcept;
 
     SlotAllocator mSlotAllocator;
-    std::vector<std::unique_ptr<SlotPoolBase>> mPools;
+    TypedVec<PoolIndex, std::unique_ptr<SlotPoolBase>> mPools;
     bool mDestroyed = false;
 };
 
@@ -331,19 +329,20 @@ protected:
 class GpuPoolGroup : public PoolGroupBase
 {
 public:
-    GpuPoolGroup(int numSlots, std::vector<size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
+    GpuPoolGroup(
+        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
 };
 
 class HostPoolGroup : public PoolGroupBase
 {
 public:
-    HostPoolGroup(int numSlots, std::vector<size_t> const& slotSizeList);
+    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
 };
 
 class DiskPoolGroup : public PoolGroupBase
 {
 public:
-    DiskPoolGroup(int numSlots, std::vector<size_t> const& slotSizeList, std::string const& directory);
+    DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
 };
 
 // ---------------------------------------------------------------------------
@@ -357,15 +356,15 @@ public:
 
     virtual CacheTier cacheTier() const noexcept = 0;
 
-    int numPoolGroups() const noexcept
+    PoolGroupIndex numPoolGroups() const noexcept
     {
-        return static_cast<int>(mPoolGroups.size());
+        return mPoolGroups.size();
     }
 
-    std::vector<Slot> allocateMultiple(PoolGroupIndex pgIdx, int numSlots);
+    std::vector<Slot> allocateMultiple(PoolGroupIndex pgIdx, SlotCount numSlots);
     void release(PoolGroupIndex pgIdx, Slot slot);
-    int numFreeSlots(PoolGroupIndex pgIdx) const;
-    std::vector<Address> slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const;
+    SlotCount numFreeSlots(PoolGroupIndex pgIdx) const;
+    TypedVec<PoolIndex, Address> slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const;
 
     // Additional accessors used by StorageManager and KvCacheManager.
     virtual void destroy()
@@ -374,36 +373,39 @@ public:
             pg->destroy();
     }
 
-    int numPools(PoolGroupIndex pgIdx) const
+    PoolIndex numPools(PoolGroupIndex pgIdx) const
     {
-        return mPoolGroups.at(static_cast<size_t>(pgIdx))->numPools();
+        return mPoolGroups.at(pgIdx)->numPools();
     }
 
-    int numSlots(PoolGroupIndex pgIdx) const
+    SlotCount numSlots(PoolGroupIndex pgIdx) const
     {
-        return mPoolGroups.at(static_cast<size_t>(pgIdx))->numSlots();
+        return mPoolGroups.at(pgIdx)->numSlots();
     }
 
-    std::vector<int> slotSize(PoolGroupIndex pgIdx) const
+    TypedVec<PoolIndex, size_t> slotSize(PoolGroupIndex pgIdx) const
     {
-        auto szl = mPoolGroups.at(static_cast<size_t>(pgIdx))->slotSize();
-        return std::vector<int>(szl.begin(), szl.end());
+        auto szl = mPoolGroups.at(pgIdx)->slotSize();
+        TypedVec<PoolIndex, size_t> ret;
+        ret.reserve(szl.size());
+        for (auto sz : szl)
+            ret.push_back(sz);
+        return ret;
     }
 
     PoolGroupBase& poolGroup(PoolGroupIndex pgIdx)
     {
-        return *mPoolGroups.at(static_cast<size_t>(pgIdx));
+        return *mPoolGroups.at(pgIdx);
     }
 
     MemAddress getBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotId slotId) const
     {
-        return std::get<MemAddress>(
-            mPoolGroups.at(static_cast<size_t>(pgIdx))->slotAddress(slotId).at(static_cast<size_t>(poolIdx)));
+        return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
     }
 
     size_t totalQuota() const noexcept
     {
-        int granularity = poolSizeGranularity();
+        size_t granularity = poolSizeGranularity();
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
             total += pg->roundedNumBytes(granularity);
@@ -411,38 +413,40 @@ public:
     }
 
     // Returns numSlots() per pool group.
-    std::vector<int> slotCountList() const
+    TypedVec<PoolGroupIndex, SlotCount> slotCountList() const
     {
-        std::vector<int> ret;
+        TypedVec<PoolGroupIndex, SlotCount> ret;
         ret.reserve(mPoolGroups.size());
         for (auto const& pg : mPoolGroups)
             ret.push_back(pg->numSlots());
         return ret;
     }
 
-    // Returns slotSize lists per pool group (vector of vectors).
-    std::vector<std::vector<int>> slotSizeLists() const
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizeLists() const
     {
-        std::vector<std::vector<int>> ret;
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> ret;
         ret.reserve(mPoolGroups.size());
         for (auto const& pg : mPoolGroups)
         {
             auto szl = pg->slotSize();
-            ret.emplace_back(szl.begin(), szl.end());
+            TypedVec<PoolIndex, size_t> sizes;
+            sizes.reserve(szl.size());
+            for (auto sz : szl)
+                sizes.push_back(sz);
+            ret.push_back(std::move(sizes));
         }
         return ret;
     }
 
     // Current ratio list: proportion of bytes per pool group.
-    std::vector<float> ratioList() const
+    TypedVec<PoolGroupIndex, float> ratioList() const
     {
-        int numPg = static_cast<int>(mPoolGroups.size());
-        std::vector<float> ret(static_cast<size_t>(numPg), 0.f);
+        TypedVec<PoolGroupIndex, float> ret(mPoolGroups.size(), 0.f);
         float total = 0.f;
-        for (int i = 0; i < numPg; ++i)
+        for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
         {
-            auto sz = static_cast<float>(mPoolGroups[i]->numBytes());
-            ret[i] = sz;
+            auto sz = static_cast<float>(mPoolGroups[pgIdx]->numBytes());
+            ret[pgIdx] = sz;
             total += sz;
         }
         assert(total > 0.f);
@@ -451,51 +455,52 @@ public:
         return ret;
     }
 
-    virtual int poolSizeGranularity() const noexcept
+    virtual size_t poolSizeGranularity() const noexcept
     {
-        return 2 << 20;
+        return size_t{2} << 20;
     }
 
     // Compute slot counts per pool group for a given ratio, min_slots, and optional quota.
     // Instance convenience method — delegates to the static version below.
-    std::vector<int> computeSlotCountList(std::vector<float> const& ratioList, std::vector<int> const& minSlots,
-        std::optional<size_t> quota = std::nullopt) const;
+    TypedVec<PoolGroupIndex, SlotCount> computeSlotCountList(TypedVec<PoolGroupIndex, float> const& ratioList,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<size_t> quota = std::nullopt) const;
 
     // Static version: compute slot counts from quota, slot size lists, ratio, granularity, and min_slots.
     // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
-    static std::vector<int> ratioToSlotCountList(size_t quota, std::vector<std::vector<int>> const& slotSizeLists,
-        std::vector<float> const& ratioList, int granularity, std::vector<int> const& minSlots);
+    static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+
+    // Distribute grains among pools within a pool group.
+    // Returns {num_slots, grains_consumed}.
+    static std::pair<SlotCount, size_t> grainsToSlots(
+        size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
+
+    // Compute minimum grains needed for numSlots in a pool group.
+    static size_t grainsForSlots(
+        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
 
     virtual void postResize() {}
 
 protected:
-    std::vector<std::unique_ptr<PoolGroupBase>> mPoolGroups;
-
-private:
-    friend class KvCacheIntrospection;
-
-    // Distribute grains among pools within a pool group.
-    // Returns {num_slots, grains_consumed}.
-    static std::pair<int, int64_t> grainsToSlots(
-        int64_t pgGrains, std::vector<int> const& slotSizeList, int granularity);
-
-    // Compute minimum grains needed for numSlots in a pool group.
-    static int64_t grainsForSlots(int numSlots, std::vector<int> const& slotSizeList, int granularity);
+    TypedVec<PoolGroupIndex, std::unique_ptr<PoolGroupBase>> mPoolGroups;
 };
 
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    GpuCacheLevelStorage(StorageConfig const& storageCfg, std::vector<int> const& slotCountList, size_t physMemSize);
+    GpuCacheLevelStorage(
+        StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize);
 
     CacheTier cacheTier() const noexcept override
     {
         return CacheTier::GPU_MEM;
     }
 
-    int poolSizeGranularity() const noexcept override
+    size_t poolSizeGranularity() const noexcept override
     {
-        return static_cast<int>(mPhysMemAllocator->physMemSize());
+        return mPhysMemAllocator->physMemSize();
     }
 
     void postResize() override
@@ -517,24 +522,24 @@ private:
 class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    HostCacheLevelStorage(StorageConfig const& storageCfg, std::vector<int> const& slotCountList);
+    HostCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
 
     CacheTier cacheTier() const noexcept override
     {
         return CacheTier::HOST_MEM;
     }
 
-    int poolSizeGranularity() const noexcept override
+    size_t poolSizeGranularity() const noexcept override
     {
-        return static_cast<int>(HostMem::kAlignment);
+        return HostMem::kAlignment;
     }
 };
 
 class DiskCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    DiskCacheLevelStorage(
-        StorageConfig const& storageCfg, std::vector<int> const& slotCountList, std::string directory);
+    DiskCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
+        std::string directory);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -551,7 +556,7 @@ private:
 };
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
-std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(
-    CacheTierConfig const& tierCfg, StorageConfig const& storageCfg, std::vector<int> const& slotCountList);
+std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
+    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -21,7 +21,12 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <map>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -31,9 +36,35 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // ---------------------------------------------------------------------------
 // Index types (mirrors _storage/_core.py)
 // ---------------------------------------------------------------------------
-using PoolGroupIndex = int; // index of a pool group (= set of pools with mirrored allocation)
-using PoolIndex = int;      // index of a pool within a pool group
-using SlotId = int;         // slot index within a pool
+// Index of a pool group (= set of pools with mirrored allocation).
+using PoolGroupIndex = StrongIndex<int, struct PoolGroupIndexTag>;
+// Index of a pool within a pool group.
+using PoolIndex = StrongIndex<int, struct PoolIndexTag>;
+// Plain count of slots when the value is not itself a slot id.
+using SlotCount = std::int64_t;
+// Slot index within a pool.
+using SlotId = StrongIndex<SlotCount, struct SlotIdTag>;
+
+[[nodiscard]] inline SlotCount slotCountValueFromSize(std::size_t count) noexcept
+{
+    assert(count <= static_cast<std::size_t>(std::numeric_limits<SlotCount>::max()));
+    return static_cast<SlotCount>(count);
+}
+
+[[nodiscard]] inline std::size_t slotCountToSizeT(SlotCount count) noexcept
+{
+    assert(count >= 0 && "Slot count must be non-negative for size_t conversion");
+    return static_cast<std::size_t>(count);
+}
+
+[[nodiscard]] inline int slotIdToPageIndexValue(SlotId slotId)
+{
+    if (slotId.value() < 0 || slotId.value() > std::numeric_limits<int>::max())
+    {
+        throw std::overflow_error("SlotId does not fit in int page-index storage");
+    }
+    return static_cast<int>(slotId.value());
+}
 
 // ---------------------------------------------------------------------------
 // BufferId — (layer_id, role) pair identifying one buffer in a layer.
@@ -94,13 +125,13 @@ struct CoalescedBuffer
 // ---------------------------------------------------------------------------
 struct SlotDescVariant
 {
-    LifeCycleId lifeCycleId = 0;
-    std::vector<CoalescedBuffer> coalescedBuffers; // indexed by PoolIndex, sorted size desc
+    LifeCycleId lifeCycleId{0};
+    TypedVec<PoolIndex, CoalescedBuffer> coalescedBuffers; // sorted size desc
 
     // Slot size for each pool in this group.
-    std::vector<size_t> slotSizeList() const
+    TypedVec<PoolIndex, size_t> slotSizeList() const
     {
-        std::vector<size_t> out;
+        TypedVec<PoolIndex, size_t> out;
         out.reserve(coalescedBuffers.size());
         for (auto const& cb : coalescedBuffers)
             out.push_back(cb.size());
@@ -119,7 +150,7 @@ struct SlotDesc
 {
     std::vector<SlotDescVariant> variants; // different life cycles sharing this pool group
 
-    std::vector<size_t> slotSizeList() const
+    TypedVec<PoolIndex, size_t> slotSizeList() const
     {
         return getUniformAttribute(variants, [](auto const& v) { return v.slotSizeList(); });
     }
@@ -131,8 +162,8 @@ struct SlotDesc
 // ---------------------------------------------------------------------------
 struct BufferAttr
 {
-    LifeCycleId lifeCycleId = 0;
-    PoolIndex poolIndex = 0;
+    LifeCycleId lifeCycleId{0};
+    PoolIndex poolIndex{0};
     size_t offset = 0; // byte offset within the slot
     size_t size = 0;   // expanded size of the buffer (after expansion)
     int expansion = 1; // expansion factor (tokens_per_block / tokens_per_block_override)
@@ -171,11 +202,11 @@ struct Rational
 // ---------------------------------------------------------------------------
 struct LayerAttr
 {
-    LifeCycleId lifeCycleId = 0;
+    LifeCycleId lifeCycleId{0};
 
     // Number of sub-pages within a single coalesced slot that belong to this layer,
     // per pool within the pool group.
-    std::vector<int> slotUtil;
+    TypedVec<PoolIndex, int> slotUtil;
 
     // Fraction of slot_util to total number of buffers in the slot, max over all pools.
     Rational slotUtilFracMax;
@@ -187,14 +218,14 @@ struct LayerAttr
 // ---------------------------------------------------------------------------
 struct StorageConfig
 {
-    std::vector<CacheTierConfig> cacheTiers; // from KVCacheManagerConfig
-    std::vector<SlotDesc> slotDescList;      // indexed by PoolGroupIndex
+    TypedVec<CacheLevel, CacheTierConfig> cacheTiers;
+    TypedVec<PoolGroupIndex, SlotDesc> slotDescList;
 
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;
 
     // Map each LifeCycleId → its PoolGroupIndex.
-    std::vector<PoolGroupIndex> lifeCycleGrouping() const;
+    TypedVec<LifeCycleId, PoolGroupIndex> lifeCycleGrouping() const;
 
     // Attribute map for each buffer.
     std::map<BufferId, BufferAttr> bufferAttributes() const;
@@ -206,7 +237,7 @@ struct StorageConfig
     // Mirrors _storage/_config.py::StorageConfig.layer_attributes().
     std::map<LayerId, LayerAttr> layerAttributes() const;
 
-    int numLifeCycles() const;
+    LifeCycleId numLifeCycles() const;
 };
 
 // ---------------------------------------------------------------------------

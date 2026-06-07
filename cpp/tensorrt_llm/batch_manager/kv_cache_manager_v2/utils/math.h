@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/utils/typedIndex.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
@@ -24,6 +26,7 @@
 #include <map>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -139,18 +142,44 @@ template <typename T>
     return ratio;
 }
 
+template <typename Index, typename T>
+[[nodiscard]] TypedVec<Index, float> normalizeToRatio(TypedVec<Index, T> const& values)
+{
+    auto total = std::accumulate(values.begin(), values.end(), static_cast<T>(0));
+    assert(total > 0);
+    TypedVec<Index, float> ratio(values.size());
+    for (Index index{0}; index < values.size(); ++index)
+    {
+        ratio[index] = static_cast<float>(values[index]) / static_cast<float>(total);
+    }
+    return ratio;
+}
+
 // ---------------------------------------------------------------------------
 // HalfOpenRange — a half-open range [beg, end). Empty when beg >= end.
 // Mirrors _utils.py::HalfOpenRange.
 // ---------------------------------------------------------------------------
+template <typename Index = int>
 struct HalfOpenRange
 {
-    int beg = 0;
-    int end = 0;
+    using IndexType = Index;
+    using DifferenceType = decltype(std::declval<Index>() - std::declval<Index>());
 
-    [[nodiscard]] int length() const noexcept
+    Index beg{0};
+    Index end{0};
+
+    constexpr HalfOpenRange() noexcept = default;
+
+    template <typename Beg, typename End>
+    constexpr HalfOpenRange(Beg b, End e) noexcept
+        : beg(Index{b})
+        , end(Index{e})
     {
-        return beg < end ? end - beg : 0;
+    }
+
+    [[nodiscard]] DifferenceType length() const noexcept
+    {
+        return beg < end ? end - beg : DifferenceType{0};
     }
 
     [[nodiscard]] bool empty() const noexcept
@@ -177,7 +206,7 @@ struct HalfOpenRange
 
     // Membership test: is value in [beg, end)?
     // Mirrors Python's HalfOpenRange.__contains__.
-    [[nodiscard]] bool contains(int value) const noexcept
+    [[nodiscard]] bool contains(Index value) const noexcept
     {
         return beg <= value && value < end;
     }
@@ -185,7 +214,8 @@ struct HalfOpenRange
 
 // Returns the intersection of two half-open ranges.
 // The result may be empty (beg >= end), which is safe to chain.
-[[nodiscard]] inline HalfOpenRange intersect(HalfOpenRange a, HalfOpenRange b) noexcept
+template <typename Index>
+[[nodiscard]] inline HalfOpenRange<Index> intersect(HalfOpenRange<Index> a, HalfOpenRange<Index> b) noexcept
 {
     return {std::max(a.beg, b.beg), std::min(a.end, b.end)};
 }
@@ -197,51 +227,51 @@ struct HalfOpenRange
 class DynamicBitset
 {
 public:
-    explicit DynamicBitset(int capacity)
-        : mWords(static_cast<size_t>(divUp(capacity, 64)), uint64_t{0})
+    explicit DynamicBitset(size_t capacity)
+        : mWords(divUp(capacity, size_t{64}), uint64_t{0})
         , mNumSetBits(0)
     {
     }
 
-    void set(int index)
+    void set(size_t index)
     {
         if (!get(index))
         {
-            mWords[static_cast<size_t>(index / 64)] |= (uint64_t{1} << (index % 64));
+            mWords[index / 64] |= (uint64_t{1} << (index % 64));
             ++mNumSetBits;
         }
     }
 
-    [[nodiscard]] bool get(int index) const noexcept
+    [[nodiscard]] bool get(size_t index) const noexcept
     {
-        return (mWords[static_cast<size_t>(index / 64)] & (uint64_t{1} << (index % 64))) != 0;
+        return (mWords[index / 64] & (uint64_t{1} << (index % 64))) != 0;
     }
 
-    void clear(int index)
+    void clear(size_t index)
     {
         if (get(index))
         {
-            mWords[static_cast<size_t>(index / 64)] &= ~(uint64_t{1} << (index % 64));
+            mWords[index / 64] &= ~(uint64_t{1} << (index % 64));
             --mNumSetBits;
         }
     }
 
-    [[nodiscard]] int numSetBits() const noexcept
+    [[nodiscard]] size_t numSetBits() const noexcept
     {
         return mNumSetBits;
     }
 
-    void resize(int newCapacity)
+    void resize(size_t newCapacity)
     {
-        int oldWords = static_cast<int>(mWords.size());
-        int newWords = divUp(newCapacity, 64);
+        size_t oldWords = mWords.size();
+        size_t newWords = divUp(newCapacity, size_t{64});
         if (newWords > oldWords)
         {
-            mWords.resize(static_cast<size_t>(newWords), uint64_t{0});
+            mWords.resize(newWords, uint64_t{0});
         }
         else if (newWords < oldWords)
         {
-            mWords.resize(static_cast<size_t>(newWords));
+            mWords.resize(newWords);
             // mask the last partial word if needed
             if (newCapacity % 64 != 0)
             {
@@ -251,43 +281,43 @@ public:
     }
 
     // Returns true if any bit in [start, end) is set.
-    [[nodiscard]] bool anySet(int start, int end) const noexcept
+    [[nodiscard]] bool anySet(size_t start, size_t end) const noexcept
     {
         if (start >= end)
         {
             return false;
         }
-        int startWord = start / 64;
-        int endWord = (end - 1) / 64;
+        size_t startWord = start / 64;
+        size_t endWord = (end - 1) / 64;
         uint64_t startMask = ~uint64_t{0} << (start % 64);
         if (startWord == endWord)
         {
-            int bitsInWord = end % 64;
+            size_t bitsInWord = end % 64;
             uint64_t endMask = bitsInWord ? ((uint64_t{1} << bitsInWord) - 1) : ~uint64_t{0};
-            return (mWords[static_cast<size_t>(startWord)] & startMask & endMask) != 0;
+            return (mWords[startWord] & startMask & endMask) != 0;
         }
-        if (mWords[static_cast<size_t>(startWord)] & startMask)
+        if (mWords[startWord] & startMask)
         {
             return true;
         }
-        for (int w = startWord + 1; w < endWord; ++w)
+        for (size_t w = startWord + 1; w < endWord; ++w)
         {
-            if (mWords[static_cast<size_t>(w)])
+            if (mWords[w])
             {
                 return true;
             }
         }
-        int bitsInLastWord = end % 64;
+        size_t bitsInLastWord = end % 64;
         if (bitsInLastWord == 0)
         {
-            return mWords[static_cast<size_t>(endWord)] != 0;
+            return mWords[endWord] != 0;
         }
-        return (mWords[static_cast<size_t>(endWord)] & ((uint64_t{1} << bitsInLastWord) - 1)) != 0;
+        return (mWords[endWord] & ((uint64_t{1} << bitsInLastWord) - 1)) != 0;
     }
 
 private:
     std::vector<uint64_t> mWords;
-    int mNumSetBits;
+    size_t mNumSetBits;
 };
 
 // ---------------------------------------------------------------------------

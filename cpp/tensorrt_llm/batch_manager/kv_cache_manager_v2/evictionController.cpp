@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/page.h"
 
 #include <cassert>
+#include <cstddef>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -108,12 +109,12 @@ SharedPtr<Page> PrioritizedEvictionPolicy::remove(NodeRef node)
     return page;
 }
 
-size_t PrioritizedEvictionPolicy::size() const noexcept
+SlotCount PrioritizedEvictionPolicy::size() const noexcept
 {
-    size_t total = 0;
+    SlotCount total = 0;
     for (auto const& [p, policy] : mPolicies)
     {
-        total += policy.size();
+        total += slotCountValueFromSize(policy.size());
     }
     return total;
 }
@@ -125,12 +126,12 @@ size_t PrioritizedEvictionPolicy::size() const noexcept
 // ---------------------------------------------------------------------------
 
 PerLevelEvictionController::PerLevelEvictionController(
-    std::vector<PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel)
+    TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel)
     : mCacheLevel(cacheLevel)
     , mLifeCycleGrouping(lifeCycleGrouping)
 {
     // Compute number of pool groups = max(grouping) + 1
-    PoolGroupIndex numPoolGroups = 0;
+    PoolGroupIndex numPoolGroups{0};
     for (auto g : mLifeCycleGrouping)
     {
         if (g + 1 > numPoolGroups)
@@ -138,9 +139,9 @@ PerLevelEvictionController::PerLevelEvictionController(
     }
     // Pool group indices must be contiguous 0..N-1.
     assert(numPoolGroups
-        == static_cast<PoolGroupIndex>(
-            std::set<PoolGroupIndex>(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end()).size()));
-    mPolicies.resize(static_cast<size_t>(numPoolGroups));
+        == PoolGroupIndex{
+            static_cast<int>(std::set<PoolGroupIndex>(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end()).size())});
+    mPolicies.resize(numPoolGroups);
 }
 
 PerLevelEvictionController::~PerLevelEvictionController()
@@ -162,8 +163,8 @@ PerLevelEvictionController::~PerLevelEvictionController()
 
 PrioritizedEvictionPolicy& PerLevelEvictionController::getPolicy(LifeCycleId lcId)
 {
-    PoolGroupIndex pgIdx = mLifeCycleGrouping.at(static_cast<size_t>(lcId));
-    return mPolicies.at(static_cast<size_t>(pgIdx));
+    PoolGroupIndex pgIdx = mLifeCycleGrouping.at(lcId);
+    return mPolicies.at(pgIdx);
 }
 
 void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst)
@@ -176,28 +177,33 @@ void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst
     assert(*ref == sharedPage && "stored iterator must dereference to this page");
 }
 
-std::vector<std::vector<SharedPtr<Page>>> PerLevelEvictionController::evict(std::vector<int> const& minNumPages)
+TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> PerLevelEvictionController::evict(
+    TypedVec<PoolGroupIndex, SlotCount> const& minNumPages)
 {
-    assert(static_cast<int>(minNumPages.size()) == numPoolGroups());
+    assert(minNumPages.size() == numPoolGroups());
 
-    std::vector<std::vector<SharedPtr<Page>>> ret(static_cast<size_t>(numPoolGroups()));
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> ret(numPoolGroups());
 
     try
     {
-        for (int pgIdx = 0; pgIdx < numPoolGroups(); ++pgIdx)
+        for (PoolGroupIndex pgIdx{0}; pgIdx < minNumPages.size(); ++pgIdx)
         {
-            auto& policy = mPolicies.at(static_cast<size_t>(pgIdx));
-            int count = minNumPages.at(static_cast<size_t>(pgIdx));
-            int available = static_cast<int>(policy.size()) + static_cast<int>(ret[pgIdx].size());
+            auto& policy = mPolicies.at(pgIdx);
+            SlotCount const count = minNumPages.at(pgIdx);
+            if (count < 0)
+            {
+                throw LogicError("PerLevelEvictionController::evict: page count must be non-negative");
+            }
+            SlotCount const available = policy.size() + slotCountValueFromSize(ret[pgIdx].size());
             if (available < count)
             {
-                throw OutOfPagesError("Not enough pages to evict in group " + std::to_string(pgIdx));
+                throw OutOfPagesError("Not enough pages to evict in group " + std::to_string(pgIdx.value()));
             }
-            while (static_cast<int>(ret[pgIdx].size()) < count)
+            while (slotCountValueFromSize(ret[pgIdx].size()) < count)
             {
                 auto page = policy.pop();
                 page->nodeRef = std::nullopt;
-                ret[static_cast<size_t>(pgIdx)].push_back(page);
+                ret[pgIdx].push_back(page);
                 // @TODO: evict dependencies (like Python _evict_dependencies)
             }
         }
@@ -205,12 +211,15 @@ std::vector<std::vector<SharedPtr<Page>>> PerLevelEvictionController::evict(std:
     catch (...)
     {
         // Re-queue evicted pages in reverse order (push to front so they are evicted first next time)
-        for (int i = static_cast<int>(ret.size()) - 1; i >= 0; --i)
+        for (PoolGroupIndex pgIdx = ret.size(); pgIdx > PoolGroupIndex{0};)
         {
-            auto& group = ret[static_cast<size_t>(i)];
-            for (int j = static_cast<int>(group.size()) - 1; j >= 0; --j)
+            --pgIdx;
+            auto& group = ret[pgIdx];
+            while (!group.empty())
             {
-                scheduleForEviction(*group[static_cast<size_t>(j)], /*evictFirst=*/true);
+                auto page = std::move(group.back());
+                group.pop_back();
+                scheduleForEviction(*page, /*evictFirst=*/true);
             }
         }
         throw;
@@ -239,9 +248,9 @@ void PerLevelEvictionController::remove(NodeRef node)
     page->nodeRef = std::nullopt;
 }
 
-int PerLevelEvictionController::numEvictablePages(PoolGroupIndex pgIdx) const
+SlotCount PerLevelEvictionController::numEvictablePages(PoolGroupIndex pgIdx) const
 {
-    return static_cast<int>(mPolicies.at(static_cast<size_t>(pgIdx)).size());
+    return mPolicies.at(pgIdx).size();
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

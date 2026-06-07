@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/utils/typedIndex.h"
+
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -67,12 +69,11 @@ enum class PageIndexMode : int
 
 // ---------------------------------------------------------------------------
 // Strongly-typed integer aliases (mirroring Python NewType wrappers).
-// These are plain integer typedefs — use them for type-checked indices.
 // ---------------------------------------------------------------------------
 
 // Index of a cache level (0 = GPU, 1 = host, 2 = disk, ...).
-using CacheLevel = int;
-inline constexpr CacheLevel kGpuLevel = 0;
+using CacheLevel = StrongIndex<int, struct CacheLevelTag, 0>;
+inline constexpr CacheLevel kGpuLevel{0};
 
 // Vocabulary token identifier (normal tokens only).
 using TokenId = int64_t;
@@ -159,8 +160,8 @@ private:
 using TokenIdExt = std::variant<TokenId, DigestToken>;
 
 // Ordinal index of a KV cache block (sequence of tokens).
-using BlockOrdinal = int;
-inline constexpr BlockOrdinal kBadBlockOrdinal = -1;
+using BlockOrdinal = StrongIndex<int, struct BlockOrdinalTag, -1>;
+inline constexpr BlockOrdinal kBadBlockOrdinal{-1};
 
 // Identifier of an attention layer.
 using LayerId = int;
@@ -169,8 +170,8 @@ using LayerId = int;
 using CudaStream = uintptr_t;
 
 // Index of a beam in beam-search.
-using BeamIndex = int;
-inline constexpr BeamIndex kDefaultBeamIndex = 0;
+using BeamIndex = StrongIndex<int, struct BeamIndexTag, 0>;
+inline constexpr BeamIndex kDefaultBeamIndex{0};
 
 // User-defined request/session identifier.
 using UserId = int64_t;
@@ -183,8 +184,8 @@ using FileDescriptor = int;
 inline constexpr FileDescriptor kBadFileDescriptor = -1;
 
 // Index into a page table.
-using PageIndex = int;
-inline constexpr PageIndex kBadPageIndex = -1;
+using PageIndex = StrongIndex<int, struct PageIndexTag, -1>;
+inline constexpr PageIndex kBadPageIndex{-1};
 
 // Eviction priority (0 = highest priority to evict, 100 = lowest).
 using Priority = int;

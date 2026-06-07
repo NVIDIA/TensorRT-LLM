@@ -107,17 +107,17 @@ public:
     //         Must be a multiple of physMemSize.
     // physMemAllocator: shared allocator for physical chunks.
     // initNumPhysMem: number of physical chunks to map immediately.
-    VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, int initNumPhysMem = 0);
+    VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t initNumPhysMem = 0);
     ~VirtMem() noexcept;
 
     VirtMem(VirtMem const&) = delete;
     VirtMem& operator=(VirtMem const&) = delete;
 
     // Map numPhysMem additional chunks at the top of the address range.
-    void extend(int numPhysMem);
+    void extend(size_t numPhysMem);
 
     // Unmap numPhysMem chunks from the top (synchronizes CUDA first).
-    void shrink(int numPhysMem);
+    void shrink(size_t numPhysMem);
 
     // Adjust mapped bytes to exactly numBytes (extend or shrink).
     void realloc(size_t numBytes);
@@ -136,7 +136,7 @@ public:
 
     [[nodiscard]] size_t mappedBytes() const noexcept
     {
-        return mPhysMemAllocator.physMemSize() * static_cast<size_t>(numPhysMem());
+        return mPhysMemAllocator.physMemSize() * numPhysMem();
     }
 
     [[nodiscard]] size_t virtualBytes() const noexcept
@@ -144,9 +144,9 @@ public:
         return mVmSize;
     }
 
-    [[nodiscard]] int numPhysMem() const noexcept
+    [[nodiscard]] size_t numPhysMem() const noexcept
     {
-        return static_cast<int>(mPhysHandles.size());
+        return mPhysHandles.size();
     }
 
 private:

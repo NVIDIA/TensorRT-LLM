@@ -32,9 +32,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // StorageConfig methods
 // ---------------------------------------------------------------------------
 
-int StorageConfig::numLifeCycles() const
+LifeCycleId StorageConfig::numLifeCycles() const
 {
-    int count = 0;
+    LifeCycleId count{0};
     for (auto const& sd : slotDescList)
     {
         count += static_cast<int>(sd.variants.size());
@@ -42,15 +42,15 @@ int StorageConfig::numLifeCycles() const
     return count;
 }
 
-std::vector<PoolGroupIndex> StorageConfig::lifeCycleGrouping() const
+TypedVec<LifeCycleId, PoolGroupIndex> StorageConfig::lifeCycleGrouping() const
 {
-    int n = numLifeCycles();
-    std::vector<PoolGroupIndex> ret(static_cast<size_t>(n), -1);
-    for (int pgIdx = 0; pgIdx < static_cast<int>(slotDescList.size()); ++pgIdx)
+    LifeCycleId n = numLifeCycles();
+    TypedVec<LifeCycleId, PoolGroupIndex> ret(n, PoolGroupIndex{-1});
+    for (PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < slotDescList.size(); ++poolGroupIndex)
     {
-        for (auto const& variant : slotDescList[pgIdx].variants)
+        for (auto const& variant : slotDescList[poolGroupIndex].variants)
         {
-            ret[static_cast<size_t>(variant.lifeCycleId)] = pgIdx;
+            ret[variant.lifeCycleId] = poolGroupIndex;
         }
     }
     return ret;
@@ -64,9 +64,9 @@ std::map<BufferId, BufferAttr> StorageConfig::bufferAttributes() const
         for (auto const& variant : sd.variants)
         {
             LifeCycleId lcId = variant.lifeCycleId;
-            for (int poolIdx = 0; poolIdx < static_cast<int>(variant.coalescedBuffers.size()); ++poolIdx)
+            for (PoolIndex poolIndex{0}; poolIndex < variant.coalescedBuffers.size(); ++poolIndex)
             {
-                auto const& cb = variant.coalescedBuffers[poolIdx];
+                auto const& cb = variant.coalescedBuffers[poolIndex];
                 size_t offset = 0;
                 for (auto const& bufId : cb.bufferIds)
                 {
@@ -75,7 +75,7 @@ std::map<BufferId, BufferAttr> StorageConfig::bufferAttributes() const
                     if (it != expansion.end())
                         exp = it->second;
 
-                    ret[bufId] = BufferAttr{lcId, poolIdx, offset, cb.singleBufferSize, exp};
+                    ret[bufId] = BufferAttr{lcId, poolIndex, offset, cb.singleBufferSize, exp};
                     offset += cb.singleBufferSize;
                 }
             }
@@ -106,11 +106,9 @@ std::map<LayerId, LayerAttr> StorageConfig::layerAttributes() const
         for (auto const& variant : pg.variants)
         {
             LifeCycleId lcId = variant.lifeCycleId;
-            int numPools = static_cast<int>(variant.coalescedBuffers.size());
-
-            for (int poolIdx = 0; poolIdx < numPools; ++poolIdx)
+            for (PoolIndex poolIndex{0}; poolIndex < variant.coalescedBuffers.size(); ++poolIndex)
             {
-                auto const& cb = variant.coalescedBuffers[static_cast<size_t>(poolIdx)];
+                auto const& cb = variant.coalescedBuffers[poolIndex];
                 // Count how many buffers per layer in this coalesced buffer.
                 std::unordered_map<LayerId, int> slotUtilPerLayer;
                 for (auto const& bufId : cb.bufferIds)
@@ -126,13 +124,13 @@ std::map<LayerId, LayerAttr> StorageConfig::layerAttributes() const
                     {
                         LayerAttr attr;
                         attr.lifeCycleId = lcId;
-                        attr.slotUtil.resize(static_cast<size_t>(numPools), 0);
+                        attr.slotUtil.resize(variant.coalescedBuffers.size(), 0);
                         attr.slotUtilFracMax = Rational{0, 1};
                         it = ret.emplace(layerId, std::move(attr)).first;
                     }
                     auto& attr = it->second;
                     assert(attr.lifeCycleId == lcId);
-                    attr.slotUtil[static_cast<size_t>(poolIdx)] = count;
+                    attr.slotUtil[poolIndex] = count;
                     Rational frac{count, buffersPerSlot};
                     if (frac > attr.slotUtilFracMax)
                     {
@@ -211,11 +209,12 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     std::map<std::vector<size_t>, std::vector<SlotDescVariant>> poolGroupsBySizes;
     for (auto& sg : slotGroups)
     {
-        poolGroupsBySizes[sg.slotSizeList()].push_back(std::move(sg));
+        auto sizes = sg.slotSizeList();
+        poolGroupsBySizes[sizes.raw()].push_back(std::move(sg));
     }
 
     StorageConfig out;
-    out.cacheTiers = config.cacheTiers;
+    out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.expansion = expansionMap;
 
     for (auto& [sizes, variants] : poolGroupsBySizes)

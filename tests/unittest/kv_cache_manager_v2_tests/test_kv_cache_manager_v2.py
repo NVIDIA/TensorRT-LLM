@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
-from typing import TYPE_CHECKING, Iterator, NamedTuple, cast
+from typing import TYPE_CHECKING, Iterator, NamedTuple, cast, get_type_hints
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
@@ -65,7 +65,8 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
-    from kv_cache_manager_v2._storage._core import SlotAllocator
+    from kv_cache_manager_v2._storage._core import CacheLevelStorage, PoolGroupBase, SlotAllocator
+    from kv_cache_manager_v2._storage_manager import StorageManager
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -116,7 +117,12 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import SlotAllocator
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
+        CacheLevelStorage,
+        PoolGroupBase,
+        SlotAllocator,
+    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageManager
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -210,6 +216,28 @@ def assert_no_ref_cycle(func):
         return result
 
     return wrapper
+
+
+class TestTypedSlotIds(unittest.TestCase):
+    def test_num_slots_accessors_return_int(self) -> None:
+        self.assertIs(get_type_hints(SlotAllocator.num_slots.fget)["return"], int)
+        self.assertIs(get_type_hints(SlotAllocator.num_free_slots.fget)["return"], int)
+        self.assertIs(get_type_hints(SlotAllocator.num_occupied_slots.fget)["return"], int)
+        self.assertIs(get_type_hints(PoolGroupBase.num_slots.fget)["return"], int)
+        self.assertIs(get_type_hints(PoolGroupBase.num_free_slots.fget)["return"], int)
+        self.assertIs(get_type_hints(CacheLevelStorage.num_slots)["return"], int)
+        self.assertIs(get_type_hints(CacheLevelStorage.get_num_free_slots)["return"], int)
+        self.assertIs(get_type_hints(StorageManager.num_slots)["return"], int)
+
+        self.assertIs(get_type_hints(SlotAllocator.allocate_multiple)["num_slots"], int)
+        self.assertIs(get_type_hints(PoolGroupBase.allocate_multiple)["num_slots"], int)
+        self.assertIs(get_type_hints(CacheLevelStorage.allocate_multiple)["num_slots"], int)
+        self.assertIs(get_type_hints(StorageManager.new_slots_for_pool_group)["num_slots"], int)
+
+        allocator = SlotAllocator(3)
+        self.assertEqual(allocator.num_slots, 3)
+        self.assertEqual(allocator.num_free_slots, 3)
+        self.assertEqual(allocator.num_occupied_slots, 0)
 
 
 class TestCacheLevelStorage(unittest.TestCase):

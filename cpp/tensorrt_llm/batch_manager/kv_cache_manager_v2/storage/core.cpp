@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -37,12 +38,12 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // SlotAllocator
 // ---------------------------------------------------------------------------
 
-SlotAllocator::SlotAllocator(int capacity)
+SlotAllocator::SlotAllocator(SlotCount capacity)
     : mCapacity(capacity)
     , mTargetCapacity(capacity)
     , mNumActiveSlots(0)
     , mNumReadyRecycledSlots(0)
-    , mOccupiedMask(capacity)
+    , mOccupiedMask(slotCountToSizeT(capacity))
 {
 }
 
@@ -51,24 +52,25 @@ SlotAllocator::~SlotAllocator()
     // Mirrors Python SlotAllocator.__del__ (assert_critical checks).
     if (!gNdebug)
     {
-        assert(mNumReadyRecycledSlots == static_cast<int>(mRecycledSlots.size())
+        assert(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size()
             && "SlotAllocator destroyed with unfinished events — did you call synchronize()?");
         assert(mTargetCapacity == mCapacity && mOverflowSlots.empty()
             && "SlotAllocator destroyed while resize is in progress");
         assert(mOccupiedMask.numSetBits() == 0 && "SlotAllocator destroyed with occupied slots still in use");
-        assert(static_cast<int>(mRecycledSlots.size()) == mNumActiveSlots
+        assert(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots)
             && "SlotAllocator destroyed with some slots not recycled");
     }
 }
 
-int SlotAllocator::numFreeSlots() const noexcept
+SlotCount SlotAllocator::numFreeSlots() const noexcept
 {
-    return static_cast<int>(mRecycledSlots.size()) + std::max(mTargetCapacity - mNumActiveSlots, 0);
+    SlotCount const inactiveSlots = mTargetCapacity > mNumActiveSlots ? mTargetCapacity - mNumActiveSlots : 0;
+    return slotCountValueFromSize(mRecycledSlots.size()) + inactiveSlots;
 }
 
-int SlotAllocator::numOccupiedSlots() const noexcept
+SlotCount SlotAllocator::numOccupiedSlots() const noexcept
 {
-    return mOccupiedMask.numSetBits();
+    return slotCountValueFromSize(mOccupiedMask.numSetBits());
 }
 
 Slot SlotAllocator::allocate()
@@ -91,7 +93,7 @@ Slot SlotAllocator::allocate()
     }
     else if (mNumActiveSlots < std::min(mCapacity, mTargetCapacity))
     {
-        slot.setSlotId(mNumActiveSlots++);
+        slot.setSlotId(SlotId{mNumActiveSlots++});
     }
     else
     {
@@ -99,19 +101,23 @@ Slot SlotAllocator::allocate()
         mRecycledSlots.pop_front();
         assert(slot.hasValidSlot() && "non-ready recycled slot has no valid id");
     }
-    mOccupiedMask.set(slot.slotId());
+    mOccupiedMask.set(toSizeT(slot.slotId()));
     return slot;
 }
 
-std::vector<Slot> SlotAllocator::allocateMultiple(int numSlots)
+std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
 {
+    if (numSlots < 0)
+    {
+        throw LogicError("SlotAllocator::allocateMultiple: slot count must be non-negative");
+    }
     if (numFreeSlots() < numSlots)
     {
         throw OutOfPagesError("SlotAllocator: not enough free slots");
     }
     std::vector<Slot> result;
-    result.reserve(static_cast<size_t>(numSlots));
-    for (int i = 0; i < numSlots; ++i)
+    result.reserve(slotCountToSizeT(numSlots));
+    for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
     {
         result.push_back(allocate());
     }
@@ -124,12 +130,13 @@ void SlotAllocator::release(Slot slot)
     {
         throw LogicError("SlotAllocator::release: slot has no valid id");
     }
-    if (slot.slotId() >= mCapacity || !mOccupiedMask.get(slot.slotId()))
+    SlotId const slotId = slot.slotId();
+    if (slotId >= numSlots() || !mOccupiedMask.get(toSizeT(slotId)))
     {
         throw LogicError("SlotAllocator::release: slot is not occupied");
     }
-    mOccupiedMask.clear(slot.slotId());
-    if (slot.slotId() < mTargetCapacity)
+    mOccupiedMask.clear(toSizeT(slotId));
+    if (slotId < mTargetCapacity)
     {
         mRecycledSlots.push_back(std::move(slot));
     }
@@ -141,27 +148,26 @@ void SlotAllocator::release(Slot slot)
     assert(check());
 }
 
-void SlotAllocator::expand(int newNumSlots)
+void SlotAllocator::expand(SlotCount newNumSlots)
 {
     assert(gNdebug || check());
     assert(mTargetCapacity == mCapacity);
     assert(newNumSlots > mCapacity);
-    mOccupiedMask.resize(newNumSlots);
+    mOccupiedMask.resize(slotCountToSizeT(newNumSlots));
     mCapacity = newNumSlots;
     mTargetCapacity = newNumSlots;
     assert(gNdebug || check());
 }
 
-void SlotAllocator::prepareForShrink(int newNumSlots)
+void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
 {
     assert(gNdebug || check());
     assert(mTargetCapacity == mCapacity);
     assert(newNumSlots < mCapacity);
     std::deque<Slot> newRecycled;
-    std::vector<Slot> newRecycledList;
-    int newNumReady = 0;
-    int oldNumReady = mNumReadyRecycledSlots;
-    int idx = 0;
+    SlotCount newNumReady = 0;
+    SlotCount const oldNumReady = mNumReadyRecycledSlots;
+    SlotCount idx = 0;
     for (auto& s : mRecycledSlots)
     {
         if (s.slotId() < newNumSlots)
@@ -185,10 +191,10 @@ void SlotAllocator::prepareForShrink(int newNumSlots)
 bool SlotAllocator::finishShrink()
 {
     assert(gNdebug || check());
-    if (shrinkInProgress() && mTargetCapacity + static_cast<int>(mOverflowSlots.size()) == mNumActiveSlots)
+    if (shrinkInProgress() && mTargetCapacity + slotCountValueFromSize(mOverflowSlots.size()) == mNumActiveSlots)
     {
         // Mirrors Python assertions: validate overflow slots before shrinking.
-        assert(static_cast<int>(mOverflowSlots.size()) == mNumActiveSlots - mTargetCapacity
+        assert(slotCountValueFromSize(mOverflowSlots.size()) == mNumActiveSlots - mTargetCapacity
             && "Overflow slot count mismatch");
         // Validate uniqueness of slot IDs in overflow (debug only).
         if (!gNdebug)
@@ -199,8 +205,7 @@ bool SlotAllocator::finishShrink()
                 assert(s.hasValidSlot());
                 ids.insert(s.slotId());
             }
-            assert(static_cast<int>(ids.size()) == static_cast<int>(mOverflowSlots.size())
-                && "Duplicate slot IDs in overflow slots");
+            assert(ids.size() == mOverflowSlots.size() && "Duplicate slot IDs in overflow slots");
         }
         // Synchronize overflow events (deduplicated — slots often share events).
         {
@@ -225,17 +230,17 @@ bool SlotAllocator::finishShrink()
 std::vector<SlotId> SlotAllocator::getSlotsBlockingShrink() const
 {
     std::vector<SlotId> result;
-    for (int id = mTargetCapacity; id < mCapacity; ++id)
+    for (SlotCount id = mTargetCapacity; id < mCapacity; ++id)
     {
-        if (mOccupiedMask.get(id))
-            result.push_back(id);
+        if (mOccupiedMask.get(slotCountToSizeT(id)))
+            result.push_back(SlotId{id});
     }
     return result;
 }
 
 void SlotAllocator::synchronize()
 {
-    while (mNumReadyRecycledSlots != static_cast<int>(mRecycledSlots.size()))
+    while (slotCountToSizeT(mNumReadyRecycledSlots) != mRecycledSlots.size())
     {
         scrubEvents();
     }
@@ -254,22 +259,22 @@ bool SlotAllocator::check() const noexcept
     {
         if (!slot.hasValidSlot())
             return false;
-        SlotId id = slot.slotId();
+        SlotCount id = slot.slotId().value();
         if (id < mTargetCapacity || id >= mCapacity)
             return false;
     }
-    if (static_cast<int>(mRecycledSlots.size()) + static_cast<int>(mOverflowSlots.size()) + numOccupiedSlots()
-        != mNumActiveSlots)
+    SlotCount const accountedSlots = slotCountValueFromSize(mRecycledSlots.size())
+        + slotCountValueFromSize(mOverflowSlots.size()) + numOccupiedSlots();
+    if (accountedSlots != mNumActiveSlots)
         return false;
     return true;
 }
 
 void SlotAllocator::scrubEvents()
 {
-    int num = mNumReadyRecycledSlots;
-    for (int i = num; i < static_cast<int>(mRecycledSlots.size()); ++i)
+    for (size_t i = slotCountToSizeT(mNumReadyRecycledSlots); i < mRecycledSlots.size(); ++i)
     {
-        if (mRecycledSlots[static_cast<size_t>(i)].queryReady())
+        if (mRecycledSlots[i].queryReady())
         {
             ++mNumReadyRecycledSlots;
         }
@@ -284,7 +289,7 @@ void SlotAllocator::scrubEvents()
 // GpuSlotPool
 // ---------------------------------------------------------------------------
 
-GpuSlotPool::GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, int numSlots)
+GpuSlotPool::GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator& physMemAllocator, SlotCount numSlots)
     : SlotPoolBase(slotSize)
     , mVirtMem(vmSize, physMemAllocator)
 {
@@ -292,17 +297,17 @@ GpuSlotPool::GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator&
     resize(numSlots);
 }
 
-int GpuSlotPool::computeNumPhysMem(size_t slotSize, int numSlots, size_t physMemSize) noexcept
+size_t GpuSlotPool::computeNumPhysMem(size_t slotSize, SlotCount numSlots, size_t physMemSize) noexcept
 {
-    return static_cast<int>(divUp(static_cast<size_t>(numSlots) * slotSize, physMemSize));
+    return divUp(slotCountToSizeT(numSlots) * slotSize, physMemSize);
 }
 
-int GpuSlotPool::computeNumSlots(size_t slotSize, int numPhysMem, size_t physMemSize) noexcept
+SlotCount GpuSlotPool::computeNumSlots(size_t slotSize, size_t numPhysMem, size_t physMemSize) noexcept
 {
-    return static_cast<int>(static_cast<size_t>(numPhysMem) * physMemSize / slotSize);
+    return slotCountValueFromSize(numPhysMem * physMemSize / slotSize);
 }
 
-int GpuSlotPool::numSlots() const noexcept
+SlotCount GpuSlotPool::numSlots() const noexcept
 {
     return computeNumSlots(mSlotSize, mVirtMem.numPhysMem(), mVirtMem.physMemSize());
 }
@@ -312,14 +317,14 @@ void GpuSlotPool::destroy()
     mVirtMem.destroy();
 }
 
-void GpuSlotPool::resize(int newNumSlots)
+void GpuSlotPool::resize(SlotCount newNumSlots)
 {
     size_t physSize = mVirtMem.physMemSize();
-    int newPhysMem = computeNumPhysMem(mSlotSize, newNumSlots, physSize);
-    mVirtMem.realloc(physSize * static_cast<size_t>(newPhysMem));
+    size_t newPhysMem = computeNumPhysMem(mSlotSize, newNumSlots, physSize);
+    mVirtMem.realloc(physSize * newPhysMem);
 }
 
-int GpuSlotPool::extendByOnePhysMem()
+SlotCount GpuSlotPool::extendByOnePhysMem()
 {
     mVirtMem.extend(1);
     return numSlots();
@@ -327,27 +332,28 @@ int GpuSlotPool::extendByOnePhysMem()
 
 Address GpuSlotPool::slotAddress(SlotId slot) const
 {
-    return MemAddress(mVirtMem.address() + mSlotSize * static_cast<size_t>(slot));
+    assert(slot < numSlots() && "GpuSlotPool::slotAddress: slot index out of bounds");
+    return MemAddress(mVirtMem.address() + mSlotSize * toSizeT(slot));
 }
 
 // ---------------------------------------------------------------------------
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
-HostSlotPool::HostSlotPool(size_t slotSize, int numSlots)
+HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots)
     : SlotPoolBase(slotSize)
     , mHostMem(alignedSize(numSlots))
 {
 }
 
-size_t HostSlotPool::alignedSize(int numSlots) const noexcept
+size_t HostSlotPool::alignedSize(SlotCount numSlots) const noexcept
 {
-    return roundUp(static_cast<size_t>(numSlots) * mSlotSize, HostMem::kAlignment);
+    return roundUp(slotCountToSizeT(numSlots) * mSlotSize, HostMem::kAlignment);
 }
 
-int HostSlotPool::numSlots() const noexcept
+SlotCount HostSlotPool::numSlots() const noexcept
 {
-    return static_cast<int>(mHostMem.size() / mSlotSize);
+    return slotCountValueFromSize(mHostMem.size() / mSlotSize);
 }
 
 void HostSlotPool::destroy()
@@ -355,21 +361,22 @@ void HostSlotPool::destroy()
     mHostMem.destroy();
 }
 
-void HostSlotPool::resize(int newNumSlots)
+void HostSlotPool::resize(SlotCount newNumSlots)
 {
     mHostMem.resize(alignedSize(newNumSlots));
 }
 
 Address HostSlotPool::slotAddress(SlotId slot) const
 {
-    return MemAddress(mHostMem.address() + mSlotSize * static_cast<size_t>(slot));
+    assert(slot < numSlots() && "HostSlotPool::slotAddress: slot index out of bounds");
+    return MemAddress(mHostMem.address() + mSlotSize * toSizeT(slot));
 }
 
 // ---------------------------------------------------------------------------
 // DiskSlotPool
 // ---------------------------------------------------------------------------
 
-DiskSlotPool::DiskSlotPool(std::string const& directory, size_t slotSize, int numSlots)
+DiskSlotPool::DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots)
     : SlotPoolBase(slotSize)
 {
     // Try O_TMPFILE first, fall back to mkstemp.
@@ -400,11 +407,11 @@ DiskSlotPool::~DiskSlotPool()
     destroy();
 }
 
-int DiskSlotPool::numSlots() const noexcept
+SlotCount DiskSlotPool::numSlots() const noexcept
 {
     assert(mFd != kBadFileDescriptor);
     off_t sz = ::lseek(mFd, 0, SEEK_END);
-    return (sz < 0 || mSlotSize == 0) ? 0 : static_cast<int>(sz / static_cast<off_t>(mSlotSize));
+    return (sz < 0 || mSlotSize == 0) ? 0 : slotCountValueFromSize(static_cast<size_t>(sz) / mSlotSize);
 }
 
 void DiskSlotPool::destroy()
@@ -416,33 +423,38 @@ void DiskSlotPool::destroy()
     }
 }
 
-void DiskSlotPool::resize(int newNumSlots)
+void DiskSlotPool::resize(SlotCount newNumSlots)
 {
-    resizeFile(mFd, static_cast<size_t>(newNumSlots) * mSlotSize);
+    resizeFile(mFd, slotCountToSizeT(newNumSlots) * mSlotSize);
 }
 
 Address DiskSlotPool::slotAddress(SlotId slot) const
 {
     assert(slot < numSlots() && "DiskSlotPool::slotAddress: slot index out of bounds");
-    return DiskAddress{mFd, static_cast<ssize_t>(static_cast<size_t>(slot) * mSlotSize)};
+    size_t const byteOffset = toSizeT(slot) * mSlotSize;
+    assert(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max())
+        && "DiskSlotPool::slotAddress: byte offset out of range");
+    return DiskAddress{mFd, static_cast<ssize_t>(byteOffset)};
 }
 
 // ---------------------------------------------------------------------------
 // PoolGroupBase
 // ---------------------------------------------------------------------------
 
-PoolGroupBase::PoolGroupBase(int numSlots)
+PoolGroupBase::PoolGroupBase(SlotCount numSlots)
     : mSlotAllocator(numSlots)
 {
 }
 
-int PoolGroupBase::getNumSlotsFromPools() const noexcept
+SlotCount PoolGroupBase::getNumSlotsFromPools() const noexcept
 {
     if (mPools.empty())
         return 0;
-    int minSlots = mPools.front()->numSlots();
-    for (size_t i = 1; i < mPools.size(); ++i)
-        minSlots = std::min(minSlots, mPools[i]->numSlots());
+    SlotCount minSlots = mPools.front()->numSlots();
+    for (PoolIndex poolIdx{1}; poolIdx < mPools.size(); ++poolIdx)
+    {
+        minSlots = std::min(minSlots, mPools[poolIdx]->numSlots());
+    }
     return minSlots;
 }
 
@@ -451,13 +463,13 @@ PoolGroupBase::~PoolGroupBase()
     destroy();
 }
 
-int PoolGroupBase::numSlots() const noexcept
+SlotCount PoolGroupBase::numSlots() const noexcept
 {
-    int n = mSlotAllocator.numSlots();
+    SlotCount n = mSlotAllocator.numSlots();
     if (!gNdebug)
     {
         // Mirrors Python PoolGroupBase.num_slots: assert num_slots <= self._get_num_slots_from_pools()
-        [[maybe_unused]] int poolSlots = getNumSlotsFromPools();
+        [[maybe_unused]] SlotCount poolSlots = getNumSlotsFromPools();
         assert(n <= poolSlots && "SlotAllocator capacity exceeds pool capacity");
     }
     return n;
@@ -468,7 +480,7 @@ Slot PoolGroupBase::allocate()
     return mSlotAllocator.allocate();
 }
 
-std::vector<Slot> PoolGroupBase::allocateMultiple(int numSlots)
+std::vector<Slot> PoolGroupBase::allocateMultiple(SlotCount numSlots)
 {
     return mSlotAllocator.allocateMultiple(numSlots);
 }
@@ -493,9 +505,9 @@ void PoolGroupBase::destroy()
     mDestroyed = true;
 }
 
-void PoolGroupBase::resizePools(std::optional<int> newNumSlots)
+void PoolGroupBase::resizePools(std::optional<SlotCount> newNumSlots)
 {
-    int n = newNumSlots.value_or(mSlotAllocator.numSlots());
+    SlotCount n = newNumSlots.value_or(mSlotAllocator.numSlots());
     for (auto& p : mPools)
         p->resize(n);
     // Mirrors Python PoolGroupBase.resize_pools: assert NDEBUG or self._check(True)
@@ -505,18 +517,18 @@ void PoolGroupBase::resizePools(std::optional<int> newNumSlots)
             && "After resizePools: allocator capacity exceeds pool capacity"));
 }
 
-std::vector<Address> PoolGroupBase::slotAddress(SlotId slotId) const
+TypedVec<PoolIndex, Address> PoolGroupBase::slotAddress(SlotId slotId) const
 {
-    std::vector<Address> addrs;
+    TypedVec<PoolIndex, Address> addrs;
     addrs.reserve(mPools.size());
     for (auto const& p : mPools)
         addrs.push_back(p->slotAddress(slotId));
     return addrs;
 }
 
-std::vector<size_t> PoolGroupBase::slotSize() const
+TypedVec<PoolIndex, size_t> PoolGroupBase::slotSize() const
 {
-    std::vector<size_t> sizes;
+    TypedVec<PoolIndex, size_t> sizes;
     sizes.reserve(mPools.size());
     for (auto const& p : mPools)
         sizes.push_back(p->slotSize());
@@ -528,7 +540,7 @@ std::vector<size_t> PoolGroupBase::slotSize() const
 // ---------------------------------------------------------------------------
 
 GpuPoolGroup::GpuPoolGroup(
-    int numSlots, std::vector<size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator)
+    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator)
     : PoolGroupBase(numSlots)
 {
     size_t physMemSize = physMemAllocator.physMemSize();
@@ -547,7 +559,7 @@ GpuPoolGroup::GpuPoolGroup(
         // Compute ratio as double first to avoid size_t overflow.
         double sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
         size_t vmSize = roundDown(static_cast<size_t>(static_cast<double>(totalGpuMem) * sizeRatio), physMemSize);
-        vmSize = std::max(vmSize, roundUp(static_cast<size_t>(numSlots) * sz, physMemSize));
+        vmSize = std::max(vmSize, roundUp(slotCountToSizeT(numSlots) * sz, physMemSize));
         mPools.push_back(std::make_unique<GpuSlotPool>(sz, vmSize, physMemAllocator, numSlots));
     }
 }
@@ -556,7 +568,7 @@ GpuPoolGroup::GpuPoolGroup(
 // HostPoolGroup
 // ---------------------------------------------------------------------------
 
-HostPoolGroup::HostPoolGroup(int numSlots, std::vector<size_t> const& slotSizeList)
+HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList)
     : PoolGroupBase(numSlots)
 {
     for (size_t sz : slotSizeList)
@@ -569,7 +581,8 @@ HostPoolGroup::HostPoolGroup(int numSlots, std::vector<size_t> const& slotSizeLi
 // DiskPoolGroup
 // ---------------------------------------------------------------------------
 
-DiskPoolGroup::DiskPoolGroup(int numSlots, std::vector<size_t> const& slotSizeList, std::string const& directory)
+DiskPoolGroup::DiskPoolGroup(
+    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory)
     : PoolGroupBase(numSlots)
 {
     for (size_t sz : slotSizeList)
@@ -582,24 +595,24 @@ DiskPoolGroup::DiskPoolGroup(int numSlots, std::vector<size_t> const& slotSizeLi
 // CacheLevelStorage
 // ---------------------------------------------------------------------------
 
-std::vector<Slot> CacheLevelStorage::allocateMultiple(PoolGroupIndex pgIdx, int numSlots)
+std::vector<Slot> CacheLevelStorage::allocateMultiple(PoolGroupIndex pgIdx, SlotCount numSlots)
 {
-    return mPoolGroups.at(static_cast<size_t>(pgIdx))->allocateMultiple(numSlots);
+    return mPoolGroups.at(pgIdx)->allocateMultiple(numSlots);
 }
 
 void CacheLevelStorage::release(PoolGroupIndex pgIdx, Slot slot)
 {
-    mPoolGroups.at(static_cast<size_t>(pgIdx))->release(std::move(slot));
+    mPoolGroups.at(pgIdx)->release(std::move(slot));
 }
 
-int CacheLevelStorage::numFreeSlots(PoolGroupIndex pgIdx) const
+SlotCount CacheLevelStorage::numFreeSlots(PoolGroupIndex pgIdx) const
 {
-    return mPoolGroups.at(static_cast<size_t>(pgIdx))->numFreeSlots();
+    return mPoolGroups.at(pgIdx)->numFreeSlots();
 }
 
-std::vector<Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const
+TypedVec<PoolIndex, Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const
 {
-    return mPoolGroups.at(static_cast<size_t>(pgIdx))->slotAddress(slotId);
+    return mPoolGroups.at(pgIdx)->slotAddress(slotId);
 }
 
 // ---------------------------------------------------------------------------
@@ -607,28 +620,33 @@ std::vector<Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx, SlotId
 // ---------------------------------------------------------------------------
 
 GpuCacheLevelStorage::GpuCacheLevelStorage(
-    StorageConfig const& storageCfg, std::vector<int> const& slotCountList, size_t physMemSize)
+    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize)
 {
     assert(slotCountList.size() == storageCfg.slotDescList.size()
         && "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     mPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(physMemSize);
 
-    for (size_t i = 0; i < storageCfg.slotDescList.size(); ++i)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
+    {
         mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
-            slotCountList[i], storageCfg.slotDescList[i].slotSizeList(), *mPhysMemAllocator));
+            slotCountList[pgIdx], storageCfg.slotDescList[pgIdx].slotSizeList(), *mPhysMemAllocator));
+    }
 }
 
 // ---------------------------------------------------------------------------
 // HostCacheLevelStorage
 // ---------------------------------------------------------------------------
 
-HostCacheLevelStorage::HostCacheLevelStorage(StorageConfig const& storageCfg, std::vector<int> const& slotCountList)
+HostCacheLevelStorage::HostCacheLevelStorage(
+    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
 {
     assert(slotCountList.size() == storageCfg.slotDescList.size()
         && "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
-    for (size_t i = 0; i < storageCfg.slotDescList.size(); ++i)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
+    {
         mPoolGroups.push_back(
-            std::make_unique<HostPoolGroup>(slotCountList[i], storageCfg.slotDescList[i].slotSizeList()));
+            std::make_unique<HostPoolGroup>(slotCountList[pgIdx], storageCfg.slotDescList[pgIdx].slotSizeList()));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,22 +654,24 @@ HostCacheLevelStorage::HostCacheLevelStorage(StorageConfig const& storageCfg, st
 // ---------------------------------------------------------------------------
 
 DiskCacheLevelStorage::DiskCacheLevelStorage(
-    StorageConfig const& storageCfg, std::vector<int> const& slotCountList, std::string directory)
+    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
     : mDirectory(std::move(directory))
 {
     assert(slotCountList.size() == storageCfg.slotDescList.size()
         && "DiskCacheLevelStorage: slotCountList and slotDescList must have the same length");
-    for (size_t i = 0; i < storageCfg.slotDescList.size(); ++i)
-        mPoolGroups.push_back(
-            std::make_unique<DiskPoolGroup>(slotCountList[i], storageCfg.slotDescList[i].slotSizeList(), mDirectory));
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
+    {
+        mPoolGroups.push_back(std::make_unique<DiskPoolGroup>(
+            slotCountList[pgIdx], storageCfg.slotDescList[pgIdx].slotSizeList(), mDirectory));
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
-std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(
-    CacheTierConfig const& tierCfg, StorageConfig const& storageCfg, std::vector<int> const& slotCountList)
+std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
+    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
 {
     return std::visit(
         [&](auto const& cfg) -> std::unique_ptr<CacheLevelStorage>
@@ -684,48 +704,58 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(
 // Mirrors Python CacheLevelStorage._grains_to_slots.
 // ---------------------------------------------------------------------------
 
-std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
-    int64_t pgGrains, std::vector<int> const& slotSizeList, int granularity)
+std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(
+    size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity)
 {
-    int numPools = static_cast<int>(slotSizeList.size());
-    std::vector<int64_t> minPoolGrains(static_cast<size_t>(numPools));
-    for (int p = 0; p < numPools; ++p)
-        minPoolGrains[p] = divUp(slotSizeList[p], granularity);
+    TypedVec<PoolIndex, size_t> minPoolGrains(slotSizeList.size());
+    for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
+    {
+        minPoolGrains[poolIdx] = divUp(slotSizeList[poolIdx], granularity);
+    }
 
-    int64_t minTotal = 0;
+    size_t minTotal = 0;
     for (auto g : minPoolGrains)
+    {
         minTotal += g;
+    }
     if (pgGrains < minTotal)
         return {0, 0};
 
-    int numSlots = INT_MAX;
-    int64_t remainingPgGrains = pgGrains;
+    SlotCount numSlots{std::numeric_limits<SlotCount>::max()};
+    size_t remainingPgGrains = pgGrains;
 
     // Sort pools by slot size ascending.
-    std::vector<int> poolOrder(static_cast<size_t>(numPools));
-    std::iota(poolOrder.begin(), poolOrder.end(), 0);
-    std::sort(poolOrder.begin(), poolOrder.end(), [&](int a, int b) { return slotSizeList[a] < slotSizeList[b]; });
+    std::vector<PoolIndex> poolOrder;
+    poolOrder.reserve(slotSizeList.stdSize());
+    for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
+    {
+        poolOrder.push_back(poolIdx);
+    }
+    std::sort(poolOrder.begin(), poolOrder.end(),
+        [&](PoolIndex a, PoolIndex b) { return slotSizeList[a] < slotSizeList[b]; });
 
     for (size_t j = 0; j < poolOrder.size(); ++j)
     {
-        int pool = poolOrder[j];
-        int slotSz = slotSizeList[pool];
-        int poolSzSum = 0;
+        PoolIndex const poolIdx = poolOrder[j];
+        size_t slotSz = slotSizeList[poolIdx];
+        size_t poolSzSum = 0;
         for (size_t k = j; k < poolOrder.size(); ++k)
             poolSzSum += slotSizeList[poolOrder[k]];
         double poolFrac = (poolSzSum > 0) ? static_cast<double>(slotSz) / static_cast<double>(poolSzSum) : 1.0;
-        int64_t poolGrains = std::max(minPoolGrains[pool],
-            static_cast<int64_t>(std::nearbyint(static_cast<double>(remainingPgGrains) * poolFrac)));
-        numSlots = std::min(numSlots, static_cast<int>(poolGrains * granularity / slotSz));
+        size_t roundedGrains = static_cast<size_t>(std::nearbyint(static_cast<double>(remainingPgGrains) * poolFrac));
+        size_t poolGrains = std::max(minPoolGrains[poolIdx], roundedGrains);
+        SlotCount const poolSlots = slotCountValueFromSize(poolGrains * granularity / slotSz);
+        numSlots = std::min(numSlots, poolSlots);
+        assert(poolGrains <= remainingPgGrains);
         remainingPgGrains -= poolGrains;
     }
     assert(remainingPgGrains == 0);
     assert(numSlots > 0);
 
-    auto slotsToGrains = [&](int slots) { return grainsForSlots(slots, slotSizeList, granularity); };
-    int lo = numSlots;
-    int step = 1;
-    int hi = lo + step;
+    auto slotsToGrains = [&](SlotCount slots) { return grainsForSlots(slots, slotSizeList, granularity); };
+    SlotCount lo = numSlots;
+    SlotCount step = 1;
+    SlotCount hi = lo + step;
     while (slotsToGrains(hi) <= pgGrains)
     {
         lo = hi;
@@ -734,7 +764,7 @@ std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
     }
     while (lo + 1 < hi)
     {
-        int const mid = (lo + hi) / 2;
+        SlotCount const mid = lo + ((hi - lo) / 2);
         if (slotsToGrains(mid) <= pgGrains)
         {
             lo = mid;
@@ -744,7 +774,7 @@ std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
             hi = mid;
         }
     }
-    int64_t const used = slotsToGrains(lo);
+    size_t const used = slotsToGrains(lo);
     assert(used <= pgGrains);
     assert(slotsToGrains(lo + 1) > pgGrains);
     return {lo, used};
@@ -756,11 +786,12 @@ std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
 // Mirrors Python CacheLevelStorage._grains_for_slots.
 // ---------------------------------------------------------------------------
 
-int64_t CacheLevelStorage::grainsForSlots(int numSlots, std::vector<int> const& slotSizeList, int granularity)
+size_t CacheLevelStorage::grainsForSlots(
+    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity)
 {
-    int64_t total = 0;
+    size_t total = 0;
     for (auto s : slotSizeList)
-        total += divUp(static_cast<int64_t>(numSlots) * s, static_cast<int64_t>(granularity));
+        total += divUp(slotCountToSizeT(numSlots) * s, granularity);
     return total;
 }
 
@@ -769,11 +800,13 @@ int64_t CacheLevelStorage::grainsForSlots(int numSlots, std::vector<int> const& 
 // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
 // ---------------------------------------------------------------------------
 
-std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vector<std::vector<int>> const& sizeLists,
-    std::vector<float> const& ratioList, int granularity, std::vector<int> const& minSlots)
+TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size_t quota,
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& sizeLists,
+    TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
 {
-    int numPg = static_cast<int>(sizeLists.size());
-    assert(static_cast<int>(ratioList.size()) == numPg);
+    PoolGroupIndex numPg = sizeLists.size();
+    assert(ratioList.size() == numPg);
     if (!gNdebug)
     {
         for ([[maybe_unused]] auto x : ratioList)
@@ -781,23 +814,21 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
             assert(x > 0 && "ratioToSlotCountList: all ratios must be positive");
         }
     }
-    assert(quota % static_cast<size_t>(granularity) == 0);
-    int64_t totalGrains = static_cast<int64_t>(quota) / granularity;
+    assert(quota % granularity == 0);
+    size_t totalGrains = quota / granularity;
     if (!gNdebug)
     {
-        [[maybe_unused]] int64_t minGrains = 0;
+        [[maybe_unused]] size_t minGrains = 0;
         for (auto const& sizes : sizeLists)
-            minGrains += static_cast<int64_t>(sizes.size());
+            minGrains += toSizeT(sizes.size());
         assert(totalGrains >= minGrains
             && "ratioToSlotCountList: insufficient total grains for at least 1 slot per pool group");
     }
 
-    int g = granularity;
-
-    std::vector<int> slotCntList(static_cast<size_t>(numPg), 0);
-    int64_t remainingGrains = totalGrains;
-    std::vector<int> activePgs(static_cast<size_t>(numPg));
-    std::iota(activePgs.begin(), activePgs.end(), 0);
+    TypedVec<PoolGroupIndex, SlotCount> slotCntList(numPg, 0);
+    size_t remainingGrains = totalGrains;
+    std::vector<PoolGroupIndex> activePgs(toSizeT(numPg));
+    std::iota(activePgs.begin(), activePgs.end(), PoolGroupIndex{0});
 
     // Iteratively peel off constrained PGs until all active PGs are
     // unconstrained:
@@ -814,9 +845,9 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
         for (size_t i = 0; i < nActive; ++i)
             activeRatio[i] = ratioList[activePgs[i]];
 
-        std::vector<int> slotsForActive(nActive, 0);
-        std::vector<int64_t> grainsForActive(nActive, 0);
-        int64_t budget = remainingGrains;
+        std::vector<SlotCount> slotsForActive(nActive, 0);
+        std::vector<size_t> grainsForActive(nActive, 0);
+        size_t budget = remainingGrains;
 
         // Sort indices by ratio ascending.
         std::vector<size_t> idxLst(nActive);
@@ -830,21 +861,22 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
             for (size_t j = i; j < idxLst.size(); ++j)
                 ratioSum += static_cast<double>(activeRatio[idxLst[j]]);
             double pct = (ratioSum > 0.0) ? static_cast<double>(activeRatio[idx]) / ratioSum : 1.0;
-            auto [slots, used] = grainsToSlots(
-                static_cast<int64_t>(std::nearbyint(static_cast<double>(budget) * pct)), sizeLists[activePgs[idx]], g);
+            auto [slots, used] = grainsToSlots(static_cast<size_t>(std::nearbyint(static_cast<double>(budget) * pct)),
+                sizeLists[activePgs[idx]], granularity);
             slotsForActive[idx] = slots;
             grainsForActive[idx] = used;
+            assert(used <= budget);
             budget -= used;
         }
-        assert(budget >= 0);
 
         // Identify constrained PGs (slots <= min_slots).
         std::vector<size_t> constrained;
         std::vector<size_t> unconstrained;
         for (size_t idx = 0; idx < nActive; ++idx)
         {
-            int pg = activePgs[idx];
-            if (slotsForActive[idx] <= minSlots[pg])
+            PoolGroupIndex pgIdx = activePgs[idx];
+            SlotCount const minSlotCount = minSlots[pgIdx];
+            if (slotsForActive[idx] <= minSlotCount)
                 constrained.push_back(idx);
             else
                 unconstrained.push_back(idx);
@@ -861,10 +893,12 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
         // Pin constrained PGs to min_slots and subtract from budget.
         for (size_t idx : constrained)
         {
-            int pg = activePgs[idx];
-            int64_t minGrains = grainsForSlots(minSlots[pg], sizeLists[pg], g);
-            auto [slots, used] = grainsToSlots(minGrains, sizeLists[pg], g);
-            slotCntList[pg] = slots;
+            PoolGroupIndex pgIdx = activePgs[idx];
+            SlotCount const minSlotCount = minSlots[pgIdx];
+            size_t minGrains = grainsForSlots(minSlotCount, sizeLists[pgIdx], granularity);
+            auto [slots, used] = grainsToSlots(minGrains, sizeLists[pgIdx], granularity);
+            slotCntList[pgIdx] = slots;
+            assert(used <= remainingGrains);
             remainingGrains -= used;
         }
 
@@ -874,11 +908,11 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
             break;
         }
 
-        if (remainingGrains <= 0)
+        if (remainingGrains == 0)
             throw std::runtime_error("Insufficient quota to satisfy min_slots constraints");
 
         // Continue with unconstrained PGs only.
-        std::vector<int> newActivePgs;
+        std::vector<PoolGroupIndex> newActivePgs;
         newActivePgs.reserve(unconstrained.size());
         for (size_t idx : unconstrained)
             newActivePgs.push_back(activePgs[idx]);
@@ -888,22 +922,23 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
     // _g2s may under-count slots due to imperfect grain distribution
     // across pools. Try bumping each PG's slot count while it still fits
     // within the same grain budget.
-    for (int pg = 0; pg < numPg; ++pg)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < sizeLists.size(); ++pgIdx)
     {
-        int64_t grainsNow = grainsForSlots(slotCntList[pg], sizeLists[pg], g);
-        while (grainsForSlots(slotCntList[pg] + 1, sizeLists[pg], g) <= grainsNow)
-            slotCntList[pg] += 1;
+        size_t grainsNow = grainsForSlots(slotCntList[pgIdx], sizeLists[pgIdx], granularity);
+        while (grainsForSlots(slotCntList[pgIdx] + 1, sizeLists[pgIdx], granularity) <= grainsNow)
+            slotCntList[pgIdx] += 1;
     }
 
     return slotCntList;
 }
 
 // Instance convenience wrapper.
-std::vector<int> CacheLevelStorage::computeSlotCountList(
-    std::vector<float> const& ratioList, std::vector<int> const& minSlots, std::optional<size_t> quota) const
+TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::computeSlotCountList(
+    TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    std::optional<size_t> quota) const
 {
     size_t q = quota.value_or(totalQuota());
-    assert(static_cast<int>(ratioList.size()) == static_cast<int>(mPoolGroups.size()));
+    assert(ratioList.size() == mPoolGroups.size());
     return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
 }
 

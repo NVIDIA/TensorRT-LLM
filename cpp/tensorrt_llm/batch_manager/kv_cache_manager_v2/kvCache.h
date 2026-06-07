@@ -71,10 +71,12 @@ inline SharedPtr<Page> const& blockPageGetPage(BlockPage const& bp) noexcept
 // pages[beamIdx][lcId] tracks who holds/locks each page.
 // treeBlock: non-null only for committed blocks (strong ref in rare cases).
 // ---------------------------------------------------------------------------
+using LifeCycleBlockPages = TypedVec<LifeCycleId, BlockPage>;
+using BeamBlockPages = TypedVec<BeamIndex, LifeCycleBlockPages>;
+
 struct SeqBlock
 {
-    // [beamIdx][lcId]
-    std::vector<std::vector<BlockPage>> pages;
+    BeamBlockPages pages;
     SharedPtr<Block> treeBlock; // non-null iff committed
 
     bool isCommitted() const noexcept
@@ -85,7 +87,7 @@ struct SeqBlock
             // When committed: must have 1 beam, all non-null pages must be CommittedPage.
             if (ret)
             {
-                assert(pages.size() == 1);
+                assert(pages.size() == BeamIndex{1});
                 for (auto const& beamBlock : pages)
                     for (auto const& bp : beamBlock)
                         if (!blockPageIsNull(bp))
@@ -222,12 +224,13 @@ public:
 
     // Get base page indices (slot_id) for beamIdx × layerGroupId.
     // Returns a non-owning Span into the internal page-index buffer.
-    Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = 0) const;
+    Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // Get aggregated (slot-level) page indices for one layer group + beam.
     // Returns one entry per block; bad blocks yield kBadPageIndex.
     // If valid_only=true, bad-index blocks are skipped entirely.
-    std::vector<int> getAggregatedPageIndices(LayerGroupId lgId, BeamIndex beamIdx = 0, bool validOnly = false) const;
+    std::vector<int> getAggregatedPageIndices(
+        LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex, bool validOnly = false) const;
 
     // Zero-copy page index buffer: copy current base indices into [buf, buf+len)
     // and arrange that future updateBasePageIndex calls write there too.
@@ -256,12 +259,12 @@ public:
         return mStatus == Status::CLOSED;
     }
 
-    int numBlocks() const noexcept
+    BlockOrdinal numBlocks() const noexcept
     {
-        return static_cast<int>(mBlocks.size());
+        return mBlocks.size();
     }
 
-    std::vector<SeqBlock> const& blocks() const noexcept
+    TypedVec<BlockOrdinal, SeqBlock> const& blocks() const noexcept
     {
         return mBlocks;
     }
@@ -301,7 +304,7 @@ public:
         return mTokensPerBlock;
     }
 
-    int beamWidth() const noexcept
+    BeamIndex beamWidth() const noexcept
     {
         return mBeamWidth;
     }
@@ -360,7 +363,7 @@ public:
 
     // Return the slot ID for the SSM block at the given layer group / beam.
     // Returns kBadPageIndex if no SSM blocks are allocated.
-    int getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx = 0) const;
+    int getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // ---- SWA scratch slot management ------------------------------------------
 
@@ -398,7 +401,7 @@ private:
     // Snapshot live SSM state to a new page and attach to radix tree block.
     void _snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx);
     // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle.
-    HalfOpenRange _getStaleRange(int historyLength, LifeCycle const& lc) const;
+    HalfOpenRange<BlockOrdinal> _getStaleRange(int historyLength, LifeCycle const& lc) const;
 
     // Backup entry for rollback after _unlockStaleBlocks.
     struct StaleBackup
@@ -429,8 +432,8 @@ private:
 
     bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);
-    void _increaseCapacity(int newNumBlocks, int newHistoryLength);
-    void _decreaseCapacity(int newNumBlocks);
+    void _increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength);
+    void _decreaseCapacity(BlockOrdinal newNumBlocks);
 
     void _evictOutOfWindowBlocks(int historyLength)
     {
@@ -456,7 +459,7 @@ private:
 
     // Extract uncommitted pages from a SeqBlock, resetting block page entries.
     // Returns one TakenPage per lifecycle. Mirrors Python's _take_uncommitted_page().
-    std::vector<TakenPage> _takeUncommittedPage(
+    TypedVec<LifeCycleId, TakenPage> _takeUncommittedPage(
         SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc = std::nullopt);
 
     // Get and validate the tree block at a committed ordinal.
@@ -470,22 +473,22 @@ private:
     // ---- SWA scratch private helpers ------------------------------------------
 
     // Compute the scratch block range for a lifecycle.
-    HalfOpenRange _getScratchRange(LifeCycle const& lc, std::optional<int> hlOverride = std::nullopt,
+    HalfOpenRange<BlockOrdinal> _getScratchRange(LifeCycle const& lc, std::optional<int> hlOverride = std::nullopt,
         std::optional<int> capOverride = std::nullopt) const;
 
     // Result of _takeExcessScratchSlots: excess locks, per-lc delta counts, and scratch ranges.
     struct DeltaScratchSlots
     {
-        std::vector<std::vector<ScratchSlotLock>> excess;
-        std::vector<int> deltaCnt;
-        std::vector<HalfOpenRange> scratchRanges;
+        TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> excess;
+        TypedVec<LifeCycleId, int> deltaCnt;
+        TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> scratchRanges;
     };
 
     // Compute and remove excess scratch slots for a new capacity/historyLength.
     DeltaScratchSlots _takeExcessScratchSlots(int capacity, int historyLength);
 
     // Recover previously taken excess scratch slots back into mScratchSlots.
-    void _recoverExcessScratchSlots(std::vector<std::vector<ScratchSlotLock>>& excess);
+    void _recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<ScratchSlotLock>>& excess);
 
     // Release all scratch slots back to storage.
     void _freeScratchSlots();
@@ -496,8 +499,8 @@ private:
 
     // Page index table management.
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
-    void _checkPageIndexBufferCapacity(int newNumBlocks) const;
-    void _resizePageIndexBuffers(int newNumBlocks);
+    void _checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const;
+    void _resizePageIndexBuffers(BlockOrdinal newNumBlocks);
 
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
@@ -512,9 +515,11 @@ private:
     // Page index tables: [beamIdx][lcId] → either an internal vector or an external span.
     // Mirrors Python's IndexSeq = array.array | memoryview.
     using PageIndexBuf = std::variant<std::vector<int>, Span<int>>;
-    std::vector<std::vector<PageIndexBuf>> mBasePageIndices; // [beamIdx][lcId]
+    using LifeCyclePageIndexBuffers = TypedVec<LifeCycleId, PageIndexBuf>;
+    using BeamPageIndexBuffers = TypedVec<BeamIndex, LifeCyclePageIndexBuffers>;
+    BeamPageIndexBuffers mBasePageIndices;
 
-    std::vector<SeqBlock> mBlocks;
+    TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
     int mNumCommittedBlocks;
@@ -524,12 +529,12 @@ private:
     Average mAvgCapacity;
 
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
-    std::vector<std::vector<BlockPage>> mSsmBlocks;
+    BeamBlockPages mSsmBlocks;
     bool mNeverResumed = true;
 
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
-    std::vector<std::vector<ScratchSlotLock>> mScratchSlots; // [LifeCycleId][]
+    TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

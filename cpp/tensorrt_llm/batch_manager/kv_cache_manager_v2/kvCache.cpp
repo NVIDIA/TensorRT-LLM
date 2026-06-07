@@ -42,8 +42,7 @@ void copySlotData(StorageManager& storageMgr, CacheLevel dstLevel, CacheLevel sr
     auto slotSizes = storageMgr.slotSize(pgIdx);
     CacheTier dstTier = storageMgr.cacheTier(dstLevel);
     CacheTier srcTier = storageMgr.cacheTier(srcLevel);
-    int nPools = static_cast<int>(slotSizes.size());
-    for (int poolIdx = 0; poolIdx < nPools; ++poolIdx)
+    for (PoolIndex poolIdx{0}; poolIdx < slotSizes.size(); ++poolIdx)
     {
         Address dst = storageMgr.slotAddress(dstLevel, pgIdx, dstSlotId, poolIdx);
         Address src = storageMgr.slotAddress(srcLevel, pgIdx, srcSlotId, poolIdx);
@@ -65,25 +64,30 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::vector<Tok
     , mPriorityCb(priorityCb ? std::move(priorityCb) : [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; })
     , mStatus(Status::SUSPENDED)
     , mCommitState(CommitState::ALLOWED)
-    , mBeamWidth(1)
+    , mBeamWidth(BeamIndex{1})
     , mCapacity(0)
     , mHistoryLength(0)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())
 {
-    int numLc = manager.storage().numLifeCycles();
+    LifeCycleId numLc = manager.storage().numLifeCycles();
 
     // Initialise page index buffers: [beamIdx][lcId] = empty vector
-    mBasePageIndices.assign(
-        static_cast<size_t>(mBeamWidth), std::vector<PageIndexBuf>(static_cast<size_t>(numLc), std::vector<int>{}));
+    mBasePageIndices.resize(mBeamWidth);
+    for (auto& beamIndices : mBasePageIndices)
+    {
+        beamIndices.resize(numLc, PageIndexBuf{std::vector<int>{}});
+    }
 
     // Always initialise mSsmBlocks (matching Python: no longer optional).
-    mSsmBlocks.resize(static_cast<size_t>(mBeamWidth));
+    mSsmBlocks.resize(mBeamWidth);
     for (auto& beam : mSsmBlocks)
-        beam.resize(static_cast<size_t>(numLc)); // default-constructs to monostate
+    {
+        beam.resize(numLc); // default-constructs to monostate
+    }
 
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
-    mScratchSlots.resize(static_cast<size_t>(manager.storage().numLifeCycles()));
+    mScratchSlots.resize(manager.storage().numLifeCycles());
 
     if (!inputTokens.empty())
         _setupForReuse(inputTokens);
@@ -138,18 +142,17 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
     std::vector<ActivePage> result;
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     auto const& lcs = mManager->lifeCycles();
-    int numLc = mManager->storage().numLifeCycles();
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
 
-    for (int lcIdx = 0; lcIdx < numLc; ++lcIdx)
+    for (LifeCycleId lcId{0}; lcId < numLc; ++lcId)
     {
-        LifeCycleId lcId = static_cast<LifeCycleId>(lcIdx);
         // SSM lifecycle → yield from mSsmBlocks (check individual entries).
-        if (ssmLcId.has_value() && lcIdx == *ssmLcId)
+        if (ssmLcId.has_value() && lcId == *ssmLcId)
         {
-            for (int bi = 0; bi < mBeamWidth; ++bi)
+            for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
             {
-                if (!blockPageIsNull(mSsmBlocks[bi][static_cast<size_t>(*ssmLcId)]))
-                    result.push_back({kBadBlockOrdinal, static_cast<BeamIndex>(bi), lcId});
+                if (!blockPageIsNull(mSsmBlocks[bi][*ssmLcId]))
+                    result.push_back({kBadBlockOrdinal, bi, lcId});
             }
             continue;
         }
@@ -157,25 +160,25 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
         // Attention lifecycle: yield non-stale blocks (sink + window).
         LifeCycle const& lc = lcs.getLifeCycle(lcId);
         auto staleRange = _getStaleRange(mHistoryLength, lc);
-        int staleBeg = staleRange.beg;
-        int staleEnd = staleRange.end;
+        BlockOrdinal staleBeg = staleRange.beg;
+        BlockOrdinal staleEnd = staleRange.end;
         auto scratchRange = _getScratchRange(lc);
 
         // Sink blocks: [0, staleBeg)
-        for (int ord = 0; ord < staleBeg; ++ord)
-            for (int bi = 0; bi < mBeamWidth; ++bi)
-                result.push_back({static_cast<BlockOrdinal>(ord), static_cast<BeamIndex>(bi), lcId});
+        for (BlockOrdinal ord{0}; ord < staleBeg; ++ord)
+            for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
+                result.push_back({ord, bi, lcId});
 
         // Window blocks: [staleEnd, numBlocks) — skip scratch blocks.
-        for (int ord = staleEnd; ord < static_cast<int>(mBlocks.size()); ++ord)
+        for (BlockOrdinal ord{staleEnd}; ord < mBlocks.size(); ++ord)
         {
-            auto& block = mBlocks[static_cast<size_t>(ord)];
-            for (int bi = 0; bi < mBeamWidth; ++bi)
+            auto& block = mBlocks[ord];
+            for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
             {
                 bool isScratch = scratchRange.contains(ord);
-                assert(isScratch == blockPageIsNull(block.pages[bi][static_cast<size_t>(lcIdx)]));
+                assert(isScratch == blockPageIsNull(block.pages[bi][lcId]));
                 if (!isScratch)
-                    result.push_back({static_cast<BlockOrdinal>(ord), static_cast<BeamIndex>(bi), lcId});
+                    result.push_back({ord, bi, lcId});
             }
         }
     }
@@ -187,9 +190,7 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
     bool const isSsm = ordinal == kBadBlockOrdinal;
     auto const ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     assert((ssmLcId.has_value() && lcId == *ssmLcId) == isSsm);
-    auto const& blockPage = isSsm
-        ? mSsmBlocks.at(static_cast<size_t>(beamIdx)).at(static_cast<size_t>(lcId))
-        : mBlocks.at(static_cast<size_t>(ordinal)).pages.at(static_cast<size_t>(beamIdx)).at(static_cast<size_t>(lcId));
+    auto const& blockPage = isSsm ? mSsmBlocks.at(beamIdx).at(lcId) : mBlocks.at(ordinal).pages.at(beamIdx).at(lcId);
     return blockPageGetPage(blockPage);
 }
 
@@ -210,11 +211,11 @@ void KvCache::activate()
         BlockPage* bp = nullptr;
         if (ap.ordinal == kBadBlockOrdinal)
         {
-            bp = &mSsmBlocks[ap.beamIdx][static_cast<size_t>(ap.lcId)];
+            bp = &mSsmBlocks[ap.beamIdx][ap.lcId];
         }
         else
         {
-            bp = &mBlocks[static_cast<size_t>(ap.ordinal)].pages[ap.beamIdx][static_cast<size_t>(ap.lcId)];
+            bp = &mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId];
         }
         auto& holder = std::get<SharedPtr<PageHolder>>(*bp);
         assert(holder);
@@ -227,8 +228,8 @@ void KvCache::activate()
         for (auto& t : targets)
         {
             assert(gNdebug || t.page == locks[idx].page());
-            int bi = static_cast<int>(t.beamIndex);
-            int lc = static_cast<int>(t.lifeCycle);
+            BeamIndex bi = t.beamIndex;
+            LifeCycleId lc = t.lifeCycle;
             if (t.ordinal == kBadBlockOrdinal)
                 mSsmBlocks[bi][lc] = std::move(locks[idx++]);
             else
@@ -259,25 +260,25 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
     auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
-    int numLc = storageMgr.numLifeCycles();
+    LifeCycleId numLc = storageMgr.numLifeCycles();
 
     // Pre-allocate GPU slots for deferred copies (partial blocks + SSM) and scratch slots
     // before locking, so we never end up in a state where pages are locked but we can't allocate.
-    std::vector<std::optional<Slot>> deferredSlots(static_cast<size_t>(numLc));
+    TypedVec<LifeCycleId, std::optional<Slot>> deferredSlots(numLc);
 
     // Compute scratch slot deltas UNCONDITIONALLY (mirrors Python: _take_excess_scratch_slots
     // is called outside _never_resumed).
     auto [excessScratch, scratchDeltaCounts, scratchRanges] = _takeExcessScratchSlots(mCapacity, mHistoryLength);
-    assert(static_cast<int>(excessScratch.size()) == numLc
+    assert(excessScratch.size() == numLc
         && std::all_of(excessScratch.begin(), excessScratch.end(), [](auto const& s) { return s.empty(); }));
 
-    std::vector<int> numSlotsNeeded(static_cast<size_t>(numLc), 0);
+    TypedVec<LifeCycleId, SlotCount> numSlotsNeeded(numLc, 0);
     bool hasPartial = false;
     if (mNeverResumed)
     {
-        assert(mBeamWidth == 1);
+        assert(mBeamWidth == BeamIndex{1});
         hasPartial = numCommittedTokens() % mTokensPerBlock != 0;
-        for (int lc = 0; lc < numLc; ++lc)
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             bool isSsm = ssmLcId.has_value() && lc == *ssmLcId;
             if (isSsm || hasPartial)
@@ -286,14 +287,14 @@ bool KvCache::resume(std::optional<CUstream> stream)
     }
 
     // Add scratch slot needs UNCONDITIONALLY (mirrors Python: delta loop is outside _never_resumed).
-    for (int lc = 0; lc < numLc; ++lc)
-        numSlotsNeeded[lc] += std::max(0, scratchDeltaCounts[static_cast<size_t>(lc)]);
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+        numSlotsNeeded[lc] += std::max(0, scratchDeltaCounts[lc]);
 
     // Only allocate if any slots are needed.
-    bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](int n) { return n > 0; });
+    bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
     if (anyNeeded)
     {
-        std::vector<std::vector<Slot>> tmpSlots;
+        TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots;
         try
         {
             tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded);
@@ -305,21 +306,24 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
         // Separate deferred vs scratch slots, and collect scratch ready events.
         std::vector<CachedCudaEvent const*> scratchReadyEvents;
-        for (int lc = 0; lc < numLc; ++lc)
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (!tmpSlots[lc].empty())
             {
                 // Mirrors Python: `if self._never_resumed and (... SsmLifeCycle or has_partial):`
                 bool needsDeferred = mNeverResumed && ((ssmLcId.has_value() && lc == *ssmLcId) || hasPartial);
                 if (needsDeferred)
-                    deferredSlots[lc] = std::move(tmpSlots[lc][0]);
-                // Remaining slots are scratch slots.
-                int scratchStart = needsDeferred ? 1 : 0;
-                for (size_t si = static_cast<size_t>(scratchStart); si < tmpSlots[lc].size(); ++si)
                 {
-                    mScratchSlots[static_cast<size_t>(lc)].emplace_back(
-                        std::move(tmpSlots[lc][si]), *this, static_cast<LifeCycleId>(lc), /*skipWait=*/true);
-                    scratchReadyEvents.push_back(&mScratchSlots[static_cast<size_t>(lc)].back().slot().readyEvent);
+                    // Python uses pop() here: reserve one slot for deferred copy, then treat the rest as scratch.
+                    deferredSlots[lc] = std::move(tmpSlots[lc].back());
+                    tmpSlots[lc].pop_back();
+                }
+                // Remaining slots are scratch slots.
+                for (auto& slot : tmpSlots[lc])
+                {
+                    mScratchSlots[lc].emplace_back(std::move(slot), *this, lc,
+                        /*skipWait=*/true);
+                    scratchReadyEvents.push_back(&mScratchSlots[lc].back().slot().readyEvent);
                 }
             }
         }
@@ -337,10 +341,10 @@ bool KvCache::resume(std::optional<CUstream> stream)
     catch (OutOfPagesError const&)
     {
         // Release pre-allocated deferred slots on failure.
-        for (int lc = 0; lc < numLc; ++lc)
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (deferredSlots[lc].has_value())
-                storageMgr.releaseSlot(static_cast<LifeCycleId>(lc), kGpuLevel, std::move(*deferredSlots[lc]));
+                storageMgr.releaseSlot(lc, kGpuLevel, std::move(*deferredSlots[lc]));
         }
         // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
         // a recordEventScope, matching Python behavior.
@@ -351,8 +355,8 @@ bool KvCache::resume(std::optional<CUstream> stream)
     // to pre-allocated GPU slots, then unlock sources and replace with new pages.
     if (mNeverResumed)
     {
-        BeamIndex beamIdx = 0;
-        int lastOrdinal = mBlocks.empty() ? 0 : (numCommittedTokens() - 1) / mTokensPerBlock;
+        BeamIndex beamIdx = kDefaultBeamIndex;
+        auto const lastOrdinal = BlockOrdinal{mBlocks.empty() ? 0 : (numCommittedTokens() - 1) / mTokensPerBlock};
         CUstream cudaStr = cudaStream();
 
         // Wait for all new slots to be ready (deduplicated).
@@ -368,7 +372,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
         // Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
         std::vector<SharedPageLock*> srcLocks;
-        for (int lcIdx = 0; lcIdx < numLc; ++lcIdx)
+        for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
         {
             if (!deferredSlots[lcIdx].has_value())
                 continue;
@@ -379,17 +383,16 @@ bool KvCache::resume(std::optional<CUstream> stream)
             {
                 if (numCommittedTokens() == 0)
                     continue; // fresh SSM — no source to copy from
-                lock = std::get_if<SharedPageLock>(&mSsmBlocks[beamIdx][static_cast<size_t>(lcIdx)]);
+                lock = std::get_if<SharedPageLock>(&mSsmBlocks[beamIdx][lcIdx]);
             }
             else
             {
-                lock = std::get_if<SharedPageLock>(&mBlocks[lastOrdinal].pages[beamIdx][static_cast<size_t>(lcIdx)]);
+                lock = std::get_if<SharedPageLock>(&mBlocks[lastOrdinal].pages[beamIdx][lcIdx]);
             }
             assert(lock && lock->isValid());
             srcLocks.push_back(lock);
 
-            PoolGroupIndex pgIdx
-                = static_cast<PoolGroupIndex>(storageMgr.getPoolGroupIndex(static_cast<LifeCycleId>(lcIdx)));
+            PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
             copySlotData(storageMgr, kGpuLevel, kGpuLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
         }
 
@@ -403,7 +406,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
         }
 
         // Phase 2: Replace with new UncommittedPages (both copied and fresh SSM).
-        for (int lcIdx = 0; lcIdx < numLc; ++lcIdx)
+        for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
         {
             if (!deferredSlots[lcIdx].has_value())
                 continue;
@@ -413,26 +416,24 @@ bool KvCache::resume(std::optional<CUstream> stream)
             BlockOrdinal blockOrdinal;
             if (ssmLcId.has_value() && lcIdx == *ssmLcId)
             {
-                targetBp = &mSsmBlocks[beamIdx][static_cast<size_t>(lcIdx)];
+                targetBp = &mSsmBlocks[beamIdx][lcIdx];
                 blockOrdinal = kBadBlockOrdinal;
             }
             else
             {
-                targetBp = &mBlocks[lastOrdinal].pages[beamIdx][static_cast<size_t>(lcIdx)];
-                blockOrdinal = static_cast<BlockOrdinal>(lastOrdinal);
+                targetBp = &mBlocks[lastOrdinal].pages[beamIdx][lcIdx];
+                blockOrdinal = lastOrdinal;
             }
 
-            auto newPage
-                = makeShared<UncommittedPage>(*this, blockOrdinal, static_cast<LifeCycleId>(lcIdx), kGpuLevel, beamIdx);
+            auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kGpuLevel, beamIdx);
             newPage->setSlot(newSlot);
-            auto newLock
-                = newPage->lock(*this, beamIdx, blockOrdinal, static_cast<LifeCycleId>(lcIdx), /*skipWait=*/true);
+            auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
         }
 
         // Clear treeBlock for partial last block (mirrors Python: partial block is uncommitted).
         if (numCommittedTokens() % mTokensPerBlock != 0)
-            mBlocks[static_cast<size_t>(lastOrdinal)].treeBlock = nullptr;
+            mBlocks[lastOrdinal].treeBlock = nullptr;
     }
 
     mNeverResumed = false;
@@ -444,12 +445,12 @@ bool KvCache::prefetch(CacheLevel target)
 {
     assert(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
-    int const numTiers = storageMgr.numCacheLevels();
+    CacheLevel const numTiers = storageMgr.numCacheLevels();
     assert(kGpuLevel <= target && target < numTiers);
 
-    int const numPoolGroups = storageMgr.numPoolGroups();
-    std::vector<std::vector<std::vector<SharedPtr<Page>>>> allPages(
-        static_cast<size_t>(numPoolGroups), std::vector<std::vector<SharedPtr<Page>>>(static_cast<size_t>(numTiers)));
+    PoolGroupIndex const numPoolGroups = storageMgr.numPoolGroups();
+    TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
+        numPoolGroups, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
 
     for (auto const& activePage : _activePages())
     {
@@ -463,8 +464,8 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
-        auto const pgIdx = static_cast<PoolGroupIndex>(storageMgr.getPoolGroupIndex(activePage.lcId));
-        allPages.at(static_cast<size_t>(pgIdx)).at(static_cast<size_t>(level)).push_back(std::move(page));
+        auto const pgIdx = storageMgr.getPoolGroupIndex(activePage.lcId);
+        allPages.at(pgIdx).at(level).push_back(std::move(page));
     }
 
     try
@@ -485,10 +486,10 @@ void KvCache::suspend()
     assert(!mFinishEvent.has_value());
 
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
-    for (int bi = 0; bi < mBeamWidth; ++bi)
-        for (int lc = 0; lc < static_cast<int>(mBasePageIndices[bi].size()); ++lc)
-            if (std::holds_alternative<Span<int>>(mBasePageIndices[bi][lc]))
-                setBasePageIndexBuf(static_cast<BeamIndex>(bi), static_cast<LayerGroupId>(lc), nullptr, 0);
+    for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
+        for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
+            if (std::holds_alternative<Span<int>>(mBasePageIndices[bi][lcId]))
+                setBasePageIndexBuf(bi, lcId, nullptr, 0);
 
     // Record event scope — mirrors Python's `with self._record_event()`.
     // SharedPageLock destructors inside the scope use finishEvent() to synchronize.
@@ -500,9 +501,8 @@ void KvCache::suspend()
         // Mirrors Python: for ordinal, beam_idx, lc_idx in self._active_pages()
         for (auto const& ap : _activePages())
         {
-            auto& bp = (ap.lcId != ssmLcId)
-                ? mBlocks[static_cast<size_t>(ap.ordinal)].pages[ap.beamIdx][static_cast<size_t>(ap.lcId)]
-                : mSsmBlocks[static_cast<size_t>(ap.beamIdx)][static_cast<size_t>(ap.lcId)];
+            auto& bp = (ap.lcId != ssmLcId) ? mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId]
+                                            : mSsmBlocks[ap.beamIdx][ap.lcId];
             // expect_type(_SharedPageLock, beam_block[lc_idx]) → std::get raises on wrong type
             auto& lock = std::get<SharedPageLock>(bp);
             auto holder = lock.page()->hold();
@@ -558,7 +558,7 @@ void KvCache::_clearBlocks()
     if (ssmLcId.has_value())
     {
         for (auto& beamBlock : mSsmBlocks)
-            beamBlock[static_cast<size_t>(*ssmLcId)] = std::monostate{};
+            beamBlock[*ssmLcId] = std::monostate{};
     }
 }
 
@@ -570,14 +570,13 @@ void KvCache::_clearBlocks()
 void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx)
 {
     auto& storageMgr = mManager->storage();
-    auto* ssmLock = std::get_if<SharedPageLock>(&mSsmBlocks[beamIdx][static_cast<size_t>(ssmLcId)]);
+    auto* ssmLock = std::get_if<SharedPageLock>(&mSsmBlocks[beamIdx][ssmLcId]);
     assert(ssmLock && ssmLock->isValid());
     auto srcPage = ssmLock->page();
-    PoolGroupIndex pgIdx = static_cast<PoolGroupIndex>(storageMgr.getPoolGroupIndex(ssmLcId));
+    PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(ssmLcId);
 
-    for (int lvlInt = static_cast<int>(srcPage->cacheLevel); lvlInt < storageMgr.numCacheLevels(); ++lvlInt)
+    for (CacheLevel lvl = srcPage->cacheLevel; lvl < storageMgr.numCacheLevels(); ++lvl)
     {
-        CacheLevel lvl = static_cast<CacheLevel>(lvlInt);
 
         Slot newSlot;
         try
@@ -595,7 +594,7 @@ void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCyc
         copySlotData(storageMgr, lvl, srcPage->cacheLevel, pgIdx, newSlot.slotId(), srcPage->slotId(), stream);
 
         CachedCudaEvent readyEv(reinterpret_cast<CudaStream>(stream));
-        assert(mTokensPerBlock * (treeBlock->ordinal() + 1) == static_cast<int>(mCommittedTokens.size()));
+        assert(mTokensPerBlock * (treeBlock->ordinal() + 1).value() == static_cast<int>(mCommittedTokens.size()));
 
         auto tempPage = makeShared<UncommittedPage>(*this, treeBlock->ordinal(), ssmLcId, lvl, beamIdx);
         tempPage->setSlot(newSlot);
@@ -616,7 +615,7 @@ void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCyc
 bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLength)
 {
     assert(mStatus == Status::ACTIVE);
-    assert(divUp(mCapacity, mTokensPerBlock) == static_cast<int>(mBlocks.size()));
+    assert(mBlocks.size() == BlockOrdinal{divUp(mCapacity, mTokensPerBlock)});
 
     int newCap = capacity.value_or(mCapacity);
     int newHist = historyLength.value_or(mHistoryLength);
@@ -646,9 +645,9 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     if (!enableScratch && _shortcutSetCapacity(newCap) && _shortcutSetHistoryLength(newHist))
         return true;
 
-    int oldNumBlocks = divUp(mCapacity, mTokensPerBlock);
-    int newNumBlocks = divUp(newCap, mTokensPerBlock);
-    int numLc = mManager->storage().numLifeCycles();
+    BlockOrdinal oldNumBlocks{divUp(mCapacity, mTokensPerBlock)};
+    BlockOrdinal newNumBlocks{divUp(newCap, mTokensPerBlock)};
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
     auto const& lcs = mManager->lifeCycles();
 
     _checkPageIndexBufferCapacity(newNumBlocks);
@@ -669,25 +668,24 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     if (newNumBlocks >= oldNumBlocks)
     {
         // Compute new normal slots needed per lifecycle.
-        std::vector<int> numNewSlots(static_cast<size_t>(numLc), 0);
-        std::vector<HalfOpenRange> staleRanges(static_cast<size_t>(numLc));
-        for (int lc = 0; lc < numLc; ++lc)
+        TypedVec<LifeCycleId, SlotCount> numNewSlots(numLc, 0);
+        TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> staleRanges(numLc);
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (ssmLcId.has_value() && lc == *ssmLcId)
                 continue;
-            staleRanges[static_cast<size_t>(lc)] = _getStaleRange(newHist, lcs.getLifeCycle(lc));
+            staleRanges[lc] = _getStaleRange(newHist, lcs.getLifeCycle(lc));
 
             if (enableScratch)
             {
-                HalfOpenRange const newBlockRange{oldNumBlocks, newNumBlocks};
-                int const numNewBlocksUsingScratch
-                    = intersect(scratchRanges[static_cast<size_t>(lc)], newBlockRange).length();
+                HalfOpenRange<BlockOrdinal> const newBlockRange{oldNumBlocks, newNumBlocks};
+                int const numNewBlocksUsingScratch = intersect(scratchRanges[lc], newBlockRange).length();
                 int const numNewNormalBlocks = newBlockRange.length() - numNewBlocksUsingScratch;
-                numNewSlots[static_cast<size_t>(lc)] = numNewNormalBlocks * mBeamWidth;
+                numNewSlots[lc] = static_cast<SlotCount>(numNewNormalBlocks) * mBeamWidth.value();
             }
             else
             {
-                auto [staleBeg, staleEnd] = staleRanges[static_cast<size_t>(lc)];
+                auto [staleBeg, staleEnd] = staleRanges[lc];
                 int numNewBlocksToAdd;
                 if (oldNumBlocks < staleBeg)
                 {
@@ -698,24 +696,23 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 {
                     numNewBlocksToAdd = newNumBlocks - std::max(staleEnd, oldNumBlocks);
                 }
-                numNewSlots[static_cast<size_t>(lc)] = numNewBlocksToAdd * mBeamWidth;
+                numNewSlots[lc] = static_cast<SlotCount>(numNewBlocksToAdd) * mBeamWidth.value();
             }
         }
 
         // Compute net allocation counts (normal + scratch delta).
-        std::vector<int> netAllocCounts(static_cast<size_t>(numLc), 0);
-        for (int lc = 0; lc < numLc; ++lc)
-            netAllocCounts[static_cast<size_t>(lc)]
-                = numNewSlots[static_cast<size_t>(lc)] + deltaScratchSlots[static_cast<size_t>(lc)];
+        TypedVec<LifeCycleId, SlotCount> netAllocCounts(numLc, 0);
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+            netAllocCounts[lc] = numNewSlots[lc] + static_cast<SlotCount>(deltaScratchSlots[lc]);
 
         // Allocate new slots.
-        std::vector<std::vector<Slot>> newSlots;
-        bool anyPositive = std::any_of(netAllocCounts.begin(), netAllocCounts.end(), [](int c) { return c > 0; });
+        TypedVec<LifeCycleId, std::vector<Slot>> newSlots;
+        bool anyPositive = std::any_of(netAllocCounts.begin(), netAllocCounts.end(), [](SlotCount c) { return c > 0; });
         if (anyPositive)
         {
-            std::vector<int> allocCounts(static_cast<size_t>(numLc));
-            for (int lc = 0; lc < numLc; ++lc)
-                allocCounts[static_cast<size_t>(lc)] = std::max(0, netAllocCounts[static_cast<size_t>(lc)]);
+            TypedVec<LifeCycleId, SlotCount> allocCounts(numLc);
+            for (LifeCycleId lc{0}; lc < numLc; ++lc)
+                allocCounts[lc] = std::max(SlotCount{0}, netAllocCounts[lc]);
             try
             {
                 newSlots = mManager->storage().newGpuSlots(allocCounts);
@@ -729,7 +726,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         }
         else
         {
-            newSlots.resize(static_cast<size_t>(numLc));
+            newSlots.resize(numLc);
         }
 
         // Wait on newly allocated slots.
@@ -743,28 +740,28 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         }
 
         // Combine: new slots + excess scratch detached slots.
-        std::vector<std::vector<Slot>> slots(static_cast<size_t>(numLc));
-        for (int lc = 0; lc < numLc; ++lc)
+        TypedVec<LifeCycleId, std::vector<Slot>> slots(numLc);
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
-            auto& combined = slots[static_cast<size_t>(lc)];
-            combined = std::move(newSlots[static_cast<size_t>(lc)]);
-            for (auto& lock : excessScratchSlots[static_cast<size_t>(lc)])
+            auto& combined = slots[lc];
+            combined = std::move(newSlots[lc]);
+            for (auto& lock : excessScratchSlots[lc])
                 combined.push_back(lock.detachSlot());
-            excessScratchSlots[static_cast<size_t>(lc)].clear();
+            excessScratchSlots[lc].clear();
         }
 
         // Release excess if net is negative.
-        if (std::any_of(netAllocCounts.begin(), netAllocCounts.end(), [](int c) { return c < 0; }))
+        if (std::any_of(netAllocCounts.begin(), netAllocCounts.end(), [](SlotCount c) { return c < 0; }))
         {
             auto scope = recordEventScope();
-            for (int lc = 0; lc < numLc; ++lc)
+            for (LifeCycleId lc{0}; lc < numLc; ++lc)
             {
-                for (int i = 0; i < -netAllocCounts[static_cast<size_t>(lc)]; ++i)
+                for (SlotCount i = 0; i < -netAllocCounts[lc]; ++i)
                 {
-                    auto slot = std::move(slots[static_cast<size_t>(lc)].back());
-                    slots[static_cast<size_t>(lc)].pop_back();
+                    auto slot = std::move(slots[lc].back());
+                    slots[lc].pop_back();
                     slot.readyEvent = finishEvent();
-                    mManager->storage().releaseSlot(static_cast<LifeCycleId>(lc), kGpuLevel, std::move(slot));
+                    mManager->storage().releaseSlot(lc, kGpuLevel, std::move(slot));
                 }
             }
         }
@@ -772,23 +769,22 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         // Assert correct combined slot count.
         if (!gNdebug)
         {
-            for (int lc = 0; lc < numLc; ++lc)
+            for (LifeCycleId lc{0}; lc < numLc; ++lc)
             {
-                int expected
-                    = numNewSlots[static_cast<size_t>(lc)] + std::max(0, deltaScratchSlots[static_cast<size_t>(lc)]);
-                assert(static_cast<int>(slots[static_cast<size_t>(lc)].size()) == expected);
+                [[maybe_unused]] SlotCount const expected
+                    = numNewSlots[lc] + std::max(SlotCount{0}, static_cast<SlotCount>(deltaScratchSlots[lc]));
+                assert(static_cast<SlotCount>(slots[lc].size()) == expected);
             }
         }
 
         // Fulfill additional scratch slots (pop from end of combined slots).
-        for (int lc = 0; lc < numLc; ++lc)
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
-            for (int i = 0; i < deltaScratchSlots[static_cast<size_t>(lc)]; ++i)
+            for (int i = 0; i < deltaScratchSlots[lc]; ++i)
             {
-                auto slot = std::move(slots[static_cast<size_t>(lc)].back());
-                slots[static_cast<size_t>(lc)].pop_back();
-                mScratchSlots[static_cast<size_t>(lc)].emplace_back(
-                    std::move(slot), *this, static_cast<LifeCycleId>(lc), /*skipWait=*/true);
+                auto slot = std::move(slots[lc].back());
+                slots[lc].pop_back();
+                mScratchSlots[lc].emplace_back(std::move(slot), *this, lc, /*skipWait=*/true);
             }
         }
 
@@ -798,49 +794,47 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             for (auto const& beamIndices : mBasePageIndices)
                 for (auto const& buf : beamIndices)
                     if (auto const* vec = std::get_if<std::vector<int>>(&buf))
-                        assert(static_cast<int>(vec->size()) == oldNumBlocks);
+                        assert(vec->size() == toSizeT(oldNumBlocks));
         }
 
         // Create SeqBlocks for new ordinals (pop slots from end, matching Python).
         _resizePageIndexBuffers(newNumBlocks);
-        for (int ord = oldNumBlocks; ord < newNumBlocks; ++ord)
+        for (BlockOrdinal ord = oldNumBlocks; ord < newNumBlocks; ++ord)
         {
             SeqBlock sb;
-            sb.pages.resize(static_cast<size_t>(mBeamWidth));
+            sb.pages.resize(mBeamWidth);
             for (auto& row : sb.pages)
-                row.resize(static_cast<size_t>(numLc));
-            for (int bi = 0; bi < mBeamWidth; ++bi)
+                row.resize(numLc);
+            for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
             {
-                for (int lc = 0; lc < numLc; ++lc)
+                for (LifeCycleId lc{0}; lc < numLc; ++lc)
                 {
                     if (ssmLcId.has_value() && lc == *ssmLcId)
                         continue; // SSM pages live in mSsmBlocks, not in mBlocks
                     if (enableScratch)
                     {
-                        if (scratchRanges[static_cast<size_t>(lc)].contains(ord))
+                        if (scratchRanges[lc].contains(ord))
                             continue; // Scratch block — no per-block page allocation.
                     }
                     else
                     {
-                        auto [staleBeg, staleEnd] = staleRanges[static_cast<size_t>(lc)];
+                        auto [staleBeg, staleEnd] = staleRanges[lc];
                         if (staleBeg <= ord && ord < staleEnd)
                             continue;
                     }
-                    auto slot = std::move(slots[static_cast<size_t>(lc)].back());
-                    slots[static_cast<size_t>(lc)].pop_back();
-                    auto page = makeShared<UncommittedPage>(
-                        *this, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc), kGpuLevel, bi);
+                    auto slot = std::move(slots[lc].back());
+                    slots[lc].pop_back();
+                    auto page = makeShared<UncommittedPage>(*this, ord, lc, kGpuLevel, bi);
                     page->setSlot(slot);
-                    sb.pages[bi][static_cast<size_t>(lc)]
-                        = page->lock(*this, bi, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc));
+                    sb.pages[bi][lc] = page->lock(*this, bi, ord, lc);
                 }
             }
             mBlocks.push_back(std::move(sb));
         }
         if (!gNdebug)
         {
-            for (int lc = 0; lc < numLc; ++lc)
-                assert(slots[static_cast<size_t>(lc)].empty());
+            for (auto const& vec : slots)
+                assert(vec.empty());
         }
     }
 
@@ -918,23 +912,23 @@ bool KvCache::_shortcutSetHistoryLength(int newHist)
 // Capacity management
 // ---------------------------------------------------------------------------
 
-void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
+void KvCache::_increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength)
 {
-    int curNumBlocks = static_cast<int>(mBlocks.size());
-    int numLc = mManager->storage().numLifeCycles();
+    BlockOrdinal curNumBlocks = mBlocks.size();
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
     auto const& lcs = mManager->lifeCycles();
     auto ssmLcId = lcs.ssmLifeCycleId();
 
     // Compute stale ranges using new history length so stale SWA blocks get no pages.
-    std::vector<HalfOpenRange> staleRanges(static_cast<size_t>(numLc));
-    std::vector<int> numSlotsPerLc(static_cast<size_t>(numLc), 0);
-    for (int lc = 0; lc < numLc; ++lc)
+    TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> staleRanges(numLc);
+    TypedVec<LifeCycleId, SlotCount> numSlotsPerLc(numLc, 0);
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
         // SSM slots are handled separately below — don't allocate block-level slots for SSM.
         if (ssmLcId.has_value() && lc == *ssmLcId)
             continue;
-        staleRanges[static_cast<size_t>(lc)] = _getStaleRange(newHistoryLength, lcs.getLifeCycle(lc));
-        auto [staleBeg, staleEnd] = staleRanges[static_cast<size_t>(lc)];
+        staleRanges[lc] = _getStaleRange(newHistoryLength, lcs.getLifeCycle(lc));
+        auto [staleBeg, staleEnd] = staleRanges[lc];
         int numNewBlocks;
         if (curNumBlocks < staleBeg)
         {
@@ -945,7 +939,7 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
         {
             numNewBlocks = newNumBlocks - std::max(staleEnd, curNumBlocks);
         }
-        numSlotsPerLc[static_cast<size_t>(lc)] = numNewBlocks * mBeamWidth;
+        numSlotsPerLc[lc] = static_cast<SlotCount>(numNewBlocks) * mBeamWidth.value();
     }
 
     // SSM slots are now allocated lazily in resume() via deferred copy, not here.
@@ -960,51 +954,49 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
             for (auto const& buf : beamIndices)
             {
                 if (auto const* vec = std::get_if<std::vector<int>>(&buf))
-                    assert(static_cast<int>(vec->size()) == curNumBlocks);
+                    assert(vec->size() == toSizeT(curNumBlocks));
             }
         }
     }
 
     // Create SeqBlocks for the new ordinals.
-    std::vector<size_t> slotCounters(static_cast<size_t>(numLc), 0);
+    TypedVec<LifeCycleId, size_t> slotCounters(numLc, 0);
     _resizePageIndexBuffers(newNumBlocks);
-    for (int ord = curNumBlocks; ord < newNumBlocks; ++ord)
+    for (BlockOrdinal ord = curNumBlocks; ord < newNumBlocks; ++ord)
     {
         SeqBlock sb;
-        sb.pages.resize(static_cast<size_t>(mBeamWidth));
+        sb.pages.resize(mBeamWidth);
         for (auto& row : sb.pages)
-            row.resize(static_cast<size_t>(numLc)); // default-constructs to monostate
-        for (int lc = 0; lc < numLc; ++lc)
+            row.resize(numLc); // default-constructs to monostate
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             // SSM pages live in mSsmBlocks, not in _blocks.
             if (ssmLcId.has_value() && lc == *ssmLcId)
                 continue;
 
-            auto [staleBeg, staleEnd] = staleRanges[static_cast<size_t>(lc)];
+            auto [staleBeg, staleEnd] = staleRanges[lc];
             if (staleBeg <= ord && ord < staleEnd)
                 continue; // stale block for this lc — no page allocated
 
-            size_t si = slotCounters[static_cast<size_t>(lc)]++;
-            auto& slot = allSlots[static_cast<size_t>(lc)][si];
-            auto page = makeShared<UncommittedPage>(
-                *this, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc), kGpuLevel, /*bi=*/0);
+            size_t si = slotCounters[lc]++;
+            auto& slot = allSlots[lc][si];
+            auto page = makeShared<UncommittedPage>(*this, ord, lc, kGpuLevel, kDefaultBeamIndex);
             page->setSlot(slot);
-            sb.pages[0][static_cast<size_t>(lc)]
-                = page->lock(*this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc));
+            sb.pages[kDefaultBeamIndex][lc] = page->lock(*this, kDefaultBeamIndex, ord, lc);
         }
         mBlocks.push_back(std::move(sb));
     }
     // Assert all allocated slots were consumed (mirrors Python line ~488).
     if (!gNdebug)
     {
-        for (int lc = 0; lc < numLc; ++lc)
-            assert(slotCounters[static_cast<size_t>(lc)] == allSlots[static_cast<size_t>(lc)].size());
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+            assert(slotCounters[lc] == allSlots[lc].size());
     }
 }
 
-void KvCache::_decreaseCapacity(int newNumBlocks)
+void KvCache::_decreaseCapacity(BlockOrdinal newNumBlocks)
 {
-    while (static_cast<int>(mBlocks.size()) > newNumBlocks)
+    while (mBlocks.size() > newNumBlocks)
     {
         auto& sb = mBlocks.back();
         for (auto& beamPages : sb.pages)
@@ -1016,7 +1008,7 @@ void KvCache::_decreaseCapacity(int newNumBlocks)
     _resizePageIndexBuffers(newNumBlocks);
 }
 
-HalfOpenRange KvCache::_getStaleRange(int historyLength, LifeCycle const& lc) const
+HalfOpenRange<BlockOrdinal> KvCache::_getStaleRange(int historyLength, LifeCycle const& lc) const
 {
     return kv_cache_manager_v2::getStaleRange(lc, historyLength, mTokensPerBlock);
 }
@@ -1029,11 +1021,11 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
 
     auto scope = recordEventScope();
     auto const& lcs = mManager->lifeCycles();
-    int numLc = mManager->storage().numLifeCycles();
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
 
-    for (int lcIdx = 0; lcIdx < numLc; ++lcIdx)
+    for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
     {
-        LifeCycle const& lc = lcs.getLifeCycle(static_cast<LifeCycleId>(lcIdx));
+        LifeCycle const& lc = lcs.getLifeCycle(lcIdx);
         // SSM pages live in mSsmBlocks, not _blocks — skip.
         if (std::holds_alternative<SsmLifeCycle>(lc))
             continue;
@@ -1043,23 +1035,20 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
             continue;
 
         auto oldRange = _getStaleRange(mHistoryLength, lc);
-        int oldStaleEnd = oldRange.end;
         auto newRange = _getStaleRange(newHistoryLength, lc);
-        int newStaleBeg = newRange.beg;
-        int newStaleEnd = newRange.end;
 
-        int unlockStart = std::max(oldStaleEnd, newStaleBeg);
-        int unlockEnd = std::min(static_cast<int>(mBlocks.size()), newStaleEnd);
+        BlockOrdinal unlockStart = std::max(oldRange.end, newRange.beg);
+        BlockOrdinal unlockEnd = std::min(mBlocks.size(), newRange.end);
 
-        for (int ord = unlockStart; ord < unlockEnd; ++ord)
+        for (BlockOrdinal ord = unlockStart; ord < unlockEnd; ++ord)
         {
-            auto& sb = mBlocks[static_cast<size_t>(ord)];
+            auto& sb = mBlocks[ord];
             bool isCommitted = sb.isCommitted();
             bool holdForCommit = !isCommitted && (mCommitState == CommitState::ALLOWED);
 
-            for (int bi = 0; bi < static_cast<int>(sb.pages.size()); ++bi)
+            for (BeamIndex bi{0}; bi < sb.pages.size(); ++bi)
             {
-                auto& bp = sb.pages[bi][static_cast<size_t>(lcIdx)];
+                auto& bp = sb.pages[bi][lcIdx];
                 if (blockPageIsNull(bp))
                 {
                     assert(mEnableSwaScratchReuse);
@@ -1067,8 +1056,7 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
                 }
                 assert(std::holds_alternative<SharedPageLock>(bp));
                 auto holder = blockPageGetPage(bp)->hold();
-                ret.push_back({static_cast<BlockOrdinal>(ord), static_cast<BeamIndex>(bi),
-                    static_cast<LifeCycleId>(lcIdx), holder});
+                ret.push_back({ord, bi, lcIdx, holder});
                 bp = holdForCommit ? BlockPage{std::move(holder)} : BlockPage{std::monostate{}};
             }
         }
@@ -1087,7 +1075,7 @@ void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
     for (size_t i = 0; i < locks.size(); ++i)
     {
         auto const& t = backup[i];
-        mBlocks[static_cast<size_t>(t.ordinal)].pages[t.beamIdx][static_cast<size_t>(t.lcId)] = std::move(locks[i]);
+        mBlocks[t.ordinal].pages[t.beamIdx][t.lcId] = std::move(locks[i]);
     }
 }
 
@@ -1096,12 +1084,12 @@ void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
 // Mirrors Python's _take_uncommitted_page().
 // ---------------------------------------------------------------------------
 
-std::vector<KvCache::TakenPage> KvCache::_takeUncommittedPage(
+TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(
     SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc)
 {
-    int numLc = mManager->storage().numLifeCycles();
-    std::vector<TakenPage> result(static_cast<size_t>(numLc), {nullptr, false});
-    for (int lc = 0; lc < numLc; ++lc)
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
+    TypedVec<LifeCycleId, TakenPage> result(numLc, TakenPage{nullptr, false});
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
         if (skipLc.has_value() && lc == *skipLc)
             continue;
@@ -1137,8 +1125,8 @@ void KvCache::_commitBlock(int ord, bool isLast)
     assert(mCommitState == CommitState::ALLOWED);
     assert(ord == mNumCommittedBlocks);
 
-    auto& sb = mBlocks.at(static_cast<size_t>(ord));
-    assert(sb.pages.size() == 1 && "Must have 1 beam only");
+    auto& sb = mBlocks.at(BlockOrdinal{ord});
+    assert(sb.pages.size() == BeamIndex{1} && "Must have 1 beam only");
 
     // Build token block — always slice up to tokens_per_block; is_full tells us
     // whether we got a full block's worth.  Mirrors Python's:
@@ -1154,13 +1142,13 @@ void KvCache::_commitBlock(int ord, bool isLast)
 
     // Prev node lookup (root or previous committed block).
     RootBlock& root = mManager->radixTree().addOrGetExisting(mReuseScope);
-    int numLc = mManager->storage().numLifeCycles();
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
 
     NodeBase* prevNode = &root;
     if (ord > 0)
     {
-        assert(mBlocks[ord - 1].treeBlock && "prev block must be committed");
-        prevNode = mBlocks[ord - 1].treeBlock.get();
+        assert(mBlocks[BlockOrdinal{ord - 1}].treeBlock && "prev block must be committed");
+        prevNode = mBlocks[BlockOrdinal{ord - 1}].treeBlock.get();
     }
 
     // Try to find or create a block in the radix tree.
@@ -1188,19 +1176,19 @@ void KvCache::_commitBlock(int ord, bool isLast)
     {
         // New block: take uncommitted pages, convert to committed.
         // Mirrors Python's _take_uncommitted_page + convert path.
-        auto taken = _takeUncommittedPage(sb, 0, ssmLcId);
+        auto taken = _takeUncommittedPage(sb, kDefaultBeamIndex, ssmLcId);
         sb.treeBlock = newBlock;
-        for (int lc = 0; lc < numLc; ++lc)
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             auto& [up, locked] = taken[lc];
             if (!up)
                 continue;
             auto committed = up->convertToCommitted(newBlock, finishEvent());
             if (locked)
-                sb.pages[0][lc]
-                    = committed->lock(*this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc));
+                sb.pages[kDefaultBeamIndex][lc]
+                    = committed->lock(*this, kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc);
             else
-                sb.pages[0][lc] = committed->hold();
+                sb.pages[kDefaultBeamIndex][lc] = committed->hold();
         }
         // SSM snapshot: copy live SSM state at interval boundaries.
         if (ssmLcId.has_value())
@@ -1209,11 +1197,11 @@ void KvCache::_commitBlock(int ord, bool isLast)
             int blockEnd = (ord + 1) * mTokensPerBlock;
             if (blockEnd == numCommitted && numCommitted > 0 && numCommitted % mManager->ssmReuseInterval() == 0)
             {
-                _snapshotSsmToTreeBlock(newBlock, *ssmLcId, 0);
+                _snapshotSsmToTreeBlock(newBlock, *ssmLcId, kDefaultBeamIndex);
             }
             else
             {
-                newBlock->storage[static_cast<size_t>(*ssmLcId)] = nullptr;
+                newBlock->storage[*ssmLcId] = nullptr;
             }
         }
         assert(gNdebug || _getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
@@ -1224,14 +1212,14 @@ void KvCache::_commitBlock(int ord, bool isLast)
         // Existing block: rebase — reuse existing block's committed pages.
         // Mirrors Python's `elif tree_block.is_full and allow_seq_rebasing and is_full` path.
         std::vector<BatchedLockTarget> reuseTasks;
-        for (int lc = 0; lc < numLc; ++lc)
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (ssmLcId.has_value() && lc == *ssmLcId)
                 continue;
-            auto& bp = sb.pages[0][lc];
+            auto& bp = sb.pages[kDefaultBeamIndex][lc];
             if (blockPageIsNull(bp))
                 continue;
-            auto* existingPage = newBlock->storage.at(static_cast<size_t>(lc));
+            auto* existingPage = newBlock->storage.at(lc);
             bool isLocked = std::holds_alternative<SharedPageLock>(bp);
             if (existingPage == nullptr)
             {
@@ -1243,9 +1231,9 @@ void KvCache::_commitBlock(int ord, bool isLast)
                     {
                         bp = std::monostate{};
                         auto committed = up->convertToCommitted(newBlock, finishEvent());
-                        bp = isLocked ? BlockPage{committed->lock(
-                                 *this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc))}
-                                      : BlockPage{committed->hold()};
+                        bp = isLocked
+                            ? BlockPage{committed->lock(*this, kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc)}
+                            : BlockPage{committed->hold()};
                     }
                 }
                 else if (auto* holder = std::get_if<SharedPtr<PageHolder>>(&bp))
@@ -1270,8 +1258,8 @@ void KvCache::_commitBlock(int ord, bool isLast)
                     auto holder = blockPageGetPage(bp)->hold();
                     bp = std::move(holder);
                 }
-                reuseTasks.push_back({existingPage->sharedFromThis(), static_cast<BeamIndex>(0),
-                    static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc)});
+                reuseTasks.push_back(
+                    {existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc});
             }
         }
         if (!reuseTasks.empty())
@@ -1279,8 +1267,8 @@ void KvCache::_commitBlock(int ord, bool isLast)
             auto locks = batchedLockToGpu(*this, reuseTasks);
             for (size_t ri = 0; ri < reuseTasks.size(); ++ri)
             {
-                int lc = static_cast<int>(reuseTasks[ri].lifeCycle);
-                sb.pages[0][lc] = std::move(locks[ri]);
+                LifeCycleId lc = reuseTasks[ri].lifeCycle;
+                sb.pages[kDefaultBeamIndex][lc] = std::move(locks[ri]);
             }
         }
         // Don't clear SSM storage on rebase — the existing block may have a valid snapshot.
@@ -1297,23 +1285,23 @@ void KvCache::_commitBlock(int ord, bool isLast)
     if (sb.isCommitted())
     {
         auto const& lifeCycles = mManager->lifeCycles();
-        for (int lcIdx = 0; lcIdx < numLc; ++lcIdx)
+        for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
         {
             if (ssmLcId.has_value() && lcIdx == *ssmLcId)
             {
                 continue;
             }
-            LifeCycle const& lc = lifeCycles.getLifeCycle(static_cast<LifeCycleId>(lcIdx));
+            LifeCycle const& lc = lifeCycles.getLifeCycle(lcIdx);
             if (!std::holds_alternative<AttnLifeCycle>(lc))
             {
                 continue;
             }
             auto const staleRange = _getStaleRange(mHistoryLength, lc);
-            if (staleRange.contains(ord))
+            if (staleRange.contains(BlockOrdinal{ord}))
             {
                 for (auto& beamBlock : sb.pages)
                 {
-                    beamBlock[static_cast<size_t>(lcIdx)] = std::monostate{};
+                    beamBlock[lcIdx] = std::monostate{};
                 }
             }
         }
@@ -1337,7 +1325,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
 void KvCache::commit(std::vector<TokenIdExt> const& tokens)
 {
     assert(mStatus == Status::ACTIVE);
-    if (mBeamWidth != 1)
+    if (mBeamWidth != BeamIndex{1})
         throw LogicError("Not implemented yet for beam search");
     if (tokens.empty())
         return;
@@ -1395,7 +1383,7 @@ void KvCache::stopCommitting()
     int tokensLeft = static_cast<int>(mCommittedTokens.size()) - mNumCommittedBlocks * mTokensPerBlock;
     if (tokensLeft > 0)
     {
-        assert(mNumCommittedBlocks < static_cast<int>(mBlocks.size()));
+        assert(BlockOrdinal{mNumCommittedBlocks} < mBlocks.size());
         auto scope = recordEventScope();
         // isLast=true: _commitBlock handles USER_STOP + _onStopCommitting() internally.
         _commitBlock(mNumCommittedBlocks, /*isLast=*/true);
@@ -1424,17 +1412,17 @@ void KvCache::_onStopCommitting()
             continue; // SSM pages live in _ssm_blocks, not in _blocks
 
         auto staleRange = _getStaleRange(mHistoryLength, lc);
-        int start = std::max(staleRange.beg, mNumCommittedBlocks);
-        int end = staleRange.end;
+        BlockOrdinal start = std::max(staleRange.beg, BlockOrdinal{mNumCommittedBlocks});
+        BlockOrdinal end = staleRange.end;
 
-        assert(end <= static_cast<int>(mBlocks.size()));
-        for (int ord = start; ord < end; ++ord)
+        assert(end <= mBlocks.size());
+        for (BlockOrdinal ord = start; ord < end; ++ord)
         {
-            auto& sb = mBlocks[static_cast<size_t>(ord)];
+            auto& sb = mBlocks[ord];
             assert(!sb.isCommitted());
             for (auto& beamPages : sb.pages)
             {
-                auto& bp = beamPages[static_cast<size_t>(lcIdx)];
+                auto& bp = beamPages[lcIdx];
                 if (blockPageIsNull(bp))
                 {
                     assert(mEnableSwaScratchReuse);
@@ -1460,48 +1448,49 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 
     auto& lifeCycles = mManager->lifeCycles();
     auto const& allLc = lifeCycles.getAll();
-    int numLc = lifeCycles.size();
+    LifeCycleId numLc = lifeCycles.size();
     auto ssmLcId = lifeCycles.ssmLifeCycleId();
 
     // --- Build blocks with stale range handling ---
 
-    _resizePageIndexBuffers(static_cast<int>(matched.size()));
+    BlockOrdinal const numMatchedBlocks{static_cast<int>(matched.size())};
+    _resizePageIndexBuffers(numMatchedBlocks);
 
     for (size_t i = 0; i < matched.size(); ++i)
     {
         SeqBlock sb;
         sb.treeBlock = matched[i]->sharedFromThis();
-        sb.pages.resize(1);
-        sb.pages[0].resize(static_cast<size_t>(numLc));
+        sb.pages.resize(BeamIndex{1});
+        sb.pages[kDefaultBeamIndex].resize(numLc);
         mBlocks.push_back(std::move(sb));
     }
 
-    BeamIndex beamIdx = 0;
+    BeamIndex beamIdx = kDefaultBeamIndex;
 
-    for (int lcId = 0; lcId < numLc; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < numLc; ++lcId)
     {
         // SSM is handled separately below.
         if (ssmLcId.has_value() && lcId == *ssmLcId)
             continue;
 
         auto staleRange = getStaleRange(allLc[lcId], numTokens, mTokensPerBlock);
-        int staleStart = staleRange.beg;
-        int staleEnd = staleRange.end;
+        BlockOrdinal staleStart = staleRange.beg;
+        BlockOrdinal staleEnd = staleRange.end;
 
         // Process a non-stale ordinal: hold the page.
         // For partial blocks (last block, not full), defer the copy to first resume().
-        auto processOrdinal = [&](int ordinal)
+        auto processOrdinal = [&](BlockOrdinal ordinal)
         {
-            auto& blk = *matched[ordinal];
-            auto* page = blk.storage.at(static_cast<size_t>(lcId));
+            auto& blk = *matched[toSizeT(ordinal)];
+            auto* page = blk.storage.at(lcId);
             assert(page && "Expected page in non-stale block");
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
         };
 
-        for (int ord = 0; ord < staleStart; ++ord)
+        for (BlockOrdinal ord{0}; ord < staleStart; ++ord)
             processOrdinal(ord);
-        for (int ord = staleEnd; ord < static_cast<int>(matched.size()); ++ord)
+        for (BlockOrdinal ord = staleEnd; ord < numMatchedBlocks; ++ord)
             processOrdinal(ord);
     }
 
@@ -1509,9 +1498,9 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
     if (ssmLcId.has_value() && !matched.empty())
     {
         auto& snapshotBlock = *matched.back();
-        auto* snapshotPage = snapshotBlock.storage[static_cast<size_t>(*ssmLcId)];
+        auto* snapshotPage = snapshotBlock.storage[*ssmLcId];
         assert(snapshotPage && "Last matched block must have SSM snapshot after truncation");
-        mSsmBlocks[0][static_cast<size_t>(*ssmLcId)] = snapshotPage->hold();
+        mSsmBlocks[kDefaultBeamIndex][*ssmLcId] = snapshotPage->hold();
     }
 
     // Append matched tokens.
@@ -1529,22 +1518,22 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 
 SharedPtr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
 {
-    assert(mBlocks[static_cast<size_t>(ordinal)].isCommitted());
-    auto const& ret = mBlocks[static_cast<size_t>(ordinal)].treeBlock;
+    assert(mBlocks[ordinal].isCommitted());
+    auto const& ret = mBlocks[ordinal].treeBlock;
     assert(ret);
     if (!gNdebug)
     {
         auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
-        auto const& beamBlock = mBlocks[static_cast<size_t>(ordinal)].pages[0];
-        for (int lc = 0; lc < static_cast<int>(beamBlock.size()); ++lc)
+        auto const& beamBlock = mBlocks[ordinal].pages[kDefaultBeamIndex];
+        for (LifeCycleId lcId{0}; lcId < beamBlock.size(); ++lcId)
         {
-            if (ssmLcId.has_value() && lc == *ssmLcId)
+            if (ssmLcId.has_value() && lcId == *ssmLcId)
             {
-                assert(blockPageIsNull(beamBlock[lc]) && "SSM pages live in mSsmBlocks");
+                assert(blockPageIsNull(beamBlock[lcId]) && "SSM pages live in mSsmBlocks");
             }
-            else if (!blockPageIsNull(beamBlock[lc]))
+            else if (!blockPageIsNull(beamBlock[lcId]))
             {
-                auto page = blockPageGetPage(beamBlock[lc]);
+                auto page = blockPageGetPage(beamBlock[lcId]);
                 auto committed = dynamicPointerCast<CommittedPage>(page);
                 assert(committed && committed->block == ret.get());
             }
@@ -1561,35 +1550,35 @@ SharedPtr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
 bool KvCache::_checkSanity() const
 {
     if (mStatus == Status::CLOSED)
-        return numBlocks() == 0;
+        return numBlocks() == BlockOrdinal{0};
 
     assert(numCommittedTokens() <= mHistoryLength && mHistoryLength <= mCapacity);
-    assert(numBlocks() == divUp(mCapacity, mTokensPerBlock));
+    assert(numBlocks() == BlockOrdinal{divUp(mCapacity, mTokensPerBlock)});
 
     auto const& lcs = mManager->lifeCycles();
-    int numLc = mManager->storage().numLifeCycles();
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
     auto ssmLcId = lcs.ssmLifeCycleId();
 
     // Precompute stale and scratch ranges for each lifecycle.
-    std::vector<HalfOpenRange> staleRanges(static_cast<size_t>(numLc));
-    std::vector<HalfOpenRange> scratchRangesVec(static_cast<size_t>(numLc));
-    for (int lc = 0; lc < numLc; ++lc)
+    TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> staleRanges(numLc);
+    TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> scratchRangesVec(numLc);
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
-        auto const& lifecycle = lcs.getLifeCycle(static_cast<LifeCycleId>(lc));
+        auto const& lifecycle = lcs.getLifeCycle(lc);
         staleRanges[lc] = _getStaleRange(mHistoryLength, lifecycle);
         scratchRangesVec[lc] = _getScratchRange(lifecycle);
     }
 
-    for (int ordinal = 0; ordinal < numBlocks(); ++ordinal)
+    for (BlockOrdinal ordinal{0}; ordinal < numBlocks(); ++ordinal)
     {
-        auto const& block = mBlocks[static_cast<size_t>(ordinal)];
-        bool isCommitted = mNeverResumed || ordinal < mNumCommittedBlocks;
+        auto const& block = mBlocks[ordinal];
+        bool isCommitted = mNeverResumed || ordinal < BlockOrdinal{mNumCommittedBlocks};
         assert(isCommitted == block.isCommitted());
 
         for (auto const& beamBlock : block.pages)
         {
-            assert(static_cast<int>(beamBlock.size()) == numLc);
-            for (int lc = 0; lc < numLc; ++lc)
+            assert(beamBlock.size() == numLc);
+            for (LifeCycleId lc{0}; lc < numLc; ++lc)
             {
                 auto const& bp = beamBlock[lc];
                 if (ssmLcId.has_value() && lc == *ssmLcId)
@@ -1643,9 +1632,9 @@ bool KvCache::_checkSanity() const
     // Check SSM blocks (mirrors Python lines 1342-1353).
     if (ssmLcId.has_value())
     {
-        for (int bi = 0; bi < mBeamWidth; ++bi)
+        for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
         {
-            auto const& bp = mSsmBlocks[static_cast<size_t>(bi)][static_cast<size_t>(*ssmLcId)];
+            auto const& bp = mSsmBlocks[bi][*ssmLcId];
             if (!blockPageIsNull(bp))
             {
                 if (mNeverResumed)
@@ -1672,7 +1661,7 @@ bool KvCache::_checkSanity() const
 // Page index tables
 // ---------------------------------------------------------------------------
 
-void KvCache::_checkPageIndexBufferCapacity(int newNumBlocks) const
+void KvCache::_checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const
 {
     for (auto const& beamIndices : mBasePageIndices)
     {
@@ -1680,7 +1669,7 @@ void KvCache::_checkPageIndexBufferCapacity(int newNumBlocks) const
         {
             if (auto const* ext = std::get_if<Span<int>>(&buf))
             {
-                if (ext->len < newNumBlocks)
+                if (ext->len < newNumBlocks.value())
                 {
                     throw std::invalid_argument("User-provided base page indices is too short");
                 }
@@ -1689,23 +1678,24 @@ void KvCache::_checkPageIndexBufferCapacity(int newNumBlocks) const
     }
 }
 
-void KvCache::_resizePageIndexBuffers(int newNumBlocks)
+void KvCache::_resizePageIndexBuffers(BlockOrdinal newNumBlocks)
 {
-    for (int bi = 0; bi < mBeamWidth; ++bi)
+    for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
     {
-        for (int lc = 0; lc < static_cast<int>(mBasePageIndices[bi].size()); ++lc)
+        for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
         {
-            auto& buf = mBasePageIndices[bi][lc];
+            auto& buf = mBasePageIndices[bi][lcId];
             if (auto* vec = std::get_if<std::vector<int>>(&buf))
             {
                 // When shrinking, assert tail entries are already BAD (mirrors Python line ~432).
-                if (!gNdebug && newNumBlocks < static_cast<int>(vec->size()))
+                auto const newSize = toSizeT(newNumBlocks);
+                if (!gNdebug && newSize < vec->size())
                 {
-                    for (int i = newNumBlocks; i < static_cast<int>(vec->size()); ++i)
-                        assert((*vec)[i] == kBadPageIndex);
+                    for (size_t i = newSize; i < vec->size(); ++i)
+                        assert((*vec)[i] == kBadPageIndex.value());
                 }
                 // Growing fills new entries with kBadPageIndex; shrinking truncates.
-                vec->resize(static_cast<size_t>(newNumBlocks), kBadPageIndex);
+                vec->resize(newSize, kBadPageIndex.value());
             }
             else
             {
@@ -1713,12 +1703,13 @@ void KvCache::_resizePageIndexBuffers(int newNumBlocks)
                 // and tail beyond active blocks must already be BAD
                 // (lock destructors set indices via updateBasePageIndex).
                 auto& ext = std::get<Span<int>>(buf);
-                if (ext.len < newNumBlocks)
+                int const newLen = newNumBlocks.value();
+                if (ext.len < newLen)
                 {
                     throw std::invalid_argument("User-provided base page indices is too short");
                 }
-                for (int i = newNumBlocks; i < ext.len; ++i)
-                    assert(ext[i] == kBadPageIndex);
+                for (int i = newLen; i < ext.len; ++i)
+                    assert(ext[i] == kBadPageIndex.value());
             }
         }
     }
@@ -1727,7 +1718,7 @@ void KvCache::_resizePageIndexBuffers(int newNumBlocks)
 int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value)
 {
     if (ord == kBadBlockOrdinal)
-        return kBadPageIndex; // SSM pages use BAD_BLOCK_ORDINAL
+        return kBadPageIndex.value(); // SSM pages use BAD_BLOCK_ORDINAL
     auto& buf = mBasePageIndices[bi][lc];
     return std::visit(
         [&](auto& b) -> int
@@ -1735,22 +1726,25 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
             using T = std::decay_t<decltype(b)>;
             if constexpr (std::is_same_v<T, std::vector<int>>)
             {
-                assert(static_cast<int>(b.size()) > ord);
+                assert(b.size() > toSizeT(ord));
+                int old = b[toSizeT(ord)];
+                b[toSizeT(ord)] = value;
+                return old;
             }
             else
             {
                 assert(ord < b.len);
+                int old = b[ord.value()];
+                b[ord.value()] = value;
+                return old;
             }
-            int old = b[ord];
-            b[ord] = value;
-            return old;
         },
         buf);
 }
 
 Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx) const
 {
-    auto const& buf = mBasePageIndices.at(static_cast<size_t>(beamIdx)).at(static_cast<size_t>(lgId));
+    auto const& buf = mBasePageIndices.at(beamIdx).at(lgId);
     auto result = std::visit(
         [](auto const& b) -> Span<int const> {
             return {b.data(), static_cast<int32_t>(b.size())};
@@ -1770,18 +1764,18 @@ Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx
 std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex beamIdx, bool validOnly) const
 {
     std::vector<int> result;
-    result.reserve(mBlocks.size());
+    result.reserve(mBlocks.stdSize());
     for (auto const& sb : mBlocks)
     {
-        auto const& pg = blockPageGetPage(sb.pages[static_cast<size_t>(beamIdx)][static_cast<size_t>(lgId)]);
+        auto const& pg = blockPageGetPage(sb.pages[beamIdx][lgId]);
         if (!pg)
         {
             if (!validOnly)
-                result.push_back(kBadPageIndex);
+                result.push_back(kBadPageIndex.value());
         }
         else
         {
-            result.push_back(static_cast<int>(pg->slotId()));
+            result.push_back(slotIdToPageIndexValue(pg->slotId()));
         }
     }
     return result;
@@ -1789,8 +1783,8 @@ std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex 
 
 void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len)
 {
-    auto& slot = mBasePageIndices[static_cast<size_t>(beamIdx)][static_cast<size_t>(lgId)];
-    int numBlocks = static_cast<int>(mBlocks.size());
+    auto& slot = mBasePageIndices[beamIdx][lgId];
+    BlockOrdinal const numBlocks = mBlocks.size();
 
     if (!buf || len == 0)
     {
@@ -1798,7 +1792,7 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
         auto const& old = slot;
         if (auto const* ext = std::get_if<Span<int>>(&old))
         {
-            int n = std::min(numBlocks, ext->len);
+            auto const n = std::min(toSizeT(numBlocks), static_cast<size_t>(ext->len));
             std::vector<int> vec(ext->ptr, ext->ptr + n);
             slot = std::move(vec);
         }
@@ -1806,7 +1800,7 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
         return;
     }
 
-    if (len < numBlocks)
+    if (len < numBlocks.value())
     {
         throw std::invalid_argument("setBasePageIndexBuf: buffer length must be >= num_blocks");
     }
@@ -1825,21 +1819,21 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
         oldData = span.data();
         oldLen = span.len;
     }
-    int copyLen = std::min(oldLen, numBlocks);
+    auto const copyLen = std::min(static_cast<size_t>(oldLen), toSizeT(numBlocks));
     std::copy(oldData, oldData + copyLen, buf);
-    std::fill(buf + copyLen, buf + len, kBadPageIndex);
+    std::fill(buf + copyLen, buf + len, kBadPageIndex.value());
     slot = Span<int>{buf, len};
 }
 
 int KvCache::getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx) const
 {
-    auto const& bp = mSsmBlocks.at(static_cast<size_t>(beamIdx)).at(static_cast<size_t>(lgId));
+    auto const& bp = mSsmBlocks.at(beamIdx).at(lgId);
     if (blockPageIsNull(bp))
-        return kBadPageIndex;
+        return kBadPageIndex.value();
     assert(std::holds_alternative<SharedPageLock>(bp));
     auto const& pg = blockPageGetPage(bp);
     assert(pg && "SSM block must have a valid page");
-    return static_cast<int>(pg->slotId()); // asserts valid slot
+    return slotIdToPageIndexValue(pg->slotId()); // asserts valid slot
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,7 +1860,7 @@ bool KvCache::supportsIndexMode(PageIndexMode mode) const
     return false;
 }
 
-HalfOpenRange KvCache::_getScratchRange(
+HalfOpenRange<BlockOrdinal> KvCache::_getScratchRange(
     LifeCycle const& lc, std::optional<int> hlOverride, std::optional<int> capOverride) const
 {
     if (!mEnableSwaScratchReuse)
@@ -1901,9 +1895,9 @@ std::optional<ScratchDesc> KvCache::getScratchDesc(LayerGroupId lgId) const
     if (!sr)
         return std::nullopt;
     std::vector<int> slotIds;
-    slotIds.reserve(mScratchSlots[static_cast<size_t>(lgId)].size());
-    for (auto const& lock : mScratchSlots[static_cast<size_t>(lgId)])
-        slotIds.push_back(lock.slot().slotId());
+    slotIds.reserve(mScratchSlots[lgId].size());
+    for (auto const& lock : mScratchSlots[lgId])
+        slotIds.push_back(slotIdToPageIndexValue(lock.slot().slotId()));
     return ScratchDesc{sr, std::move(slotIds)};
 }
 
@@ -1930,44 +1924,44 @@ void KvCache::setEnableSwaScratchReuse(bool enable)
 
 KvCache::DeltaScratchSlots KvCache::_takeExcessScratchSlots(int capacity, int historyLength)
 {
-    int numLc = mManager->storage().numLifeCycles();
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
     DeltaScratchSlots result;
-    result.excess.resize(static_cast<size_t>(numLc));
-    result.deltaCnt.resize(static_cast<size_t>(numLc), 0);
-    result.scratchRanges.resize(static_cast<size_t>(numLc));
+    result.excess.resize(numLc);
+    result.deltaCnt.resize(numLc, 0);
+    result.scratchRanges.resize(numLc);
 
     for (auto const& [lcIdx, lc] : mManager->lifeCycles())
     {
         auto scratchRange = _getScratchRange(lc, historyLength, capacity);
-        result.scratchRanges[static_cast<size_t>(lcIdx)] = scratchRange;
+        result.scratchRanges[lcIdx] = scratchRange;
         int numScratchBlocks = scratchRange.length();
         auto const& fracMax = mManager->storage().slotUtilFracMax(lcIdx);
         int neededSlots = fracMax.ceilMul(numScratchBlocks);
-        int existingSlots = static_cast<int>(mScratchSlots[static_cast<size_t>(lcIdx)].size());
+        int existingSlots = static_cast<int>(mScratchSlots[lcIdx].size());
         int delta = neededSlots - existingSlots;
-        result.deltaCnt[static_cast<size_t>(lcIdx)] = delta;
+        result.deltaCnt[lcIdx] = delta;
 
         if (delta < 0)
         {
             for (int i = 0; i < -delta; ++i)
             {
-                result.excess[static_cast<size_t>(lcIdx)].push_back(
-                    std::move(mScratchSlots[static_cast<size_t>(lcIdx)].back()));
-                mScratchSlots[static_cast<size_t>(lcIdx)].pop_back();
+                result.excess[lcIdx].push_back(std::move(mScratchSlots[lcIdx].back()));
+                mScratchSlots[lcIdx].pop_back();
             }
         }
     }
     return result;
 }
 
-void KvCache::_recoverExcessScratchSlots(std::vector<std::vector<ScratchSlotLock>>& excess)
+void KvCache::_recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<ScratchSlotLock>>& excess)
 {
-    int numLc = static_cast<int>(excess.size());
-    for (int lc = 0; lc < numLc; ++lc)
+    for (LifeCycleId lcId{0}; lcId < excess.size(); ++lcId)
     {
-        for (auto& lock : excess[static_cast<size_t>(lc)])
-            mScratchSlots[static_cast<size_t>(lc)].push_back(std::move(lock));
-        excess[static_cast<size_t>(lc)].clear();
+        for (auto& lock : excess[lcId])
+        {
+            mScratchSlots[lcId].push_back(std::move(lock));
+        }
+        excess[lcId].clear();
     }
 }
 

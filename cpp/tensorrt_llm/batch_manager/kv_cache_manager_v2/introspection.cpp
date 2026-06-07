@@ -21,7 +21,6 @@
 
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
-#include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/storageManager.h"
 
 #include <utility>
@@ -57,9 +56,9 @@ bool allBlockPagesDroppable(Block const& block)
 KvCacheIntrospection::ActivePageStats KvCacheIntrospection::activePageStats(KvCache const& kvCache)
 {
     auto& storageMgr = kvCache.manager().storage();
-    int const numTiers = storageMgr.numCacheLevels();
-    std::vector<int> counts(static_cast<size_t>(numTiers), 0);
-    std::vector<int> unscheduledEvictable(static_cast<size_t>(numTiers), 0);
+    CacheLevel const numTiers = storageMgr.numCacheLevels();
+    TypedVec<CacheLevel, int> counts(numTiers, 0);
+    TypedVec<CacheLevel, int> unscheduledEvictable(numTiers, 0);
 
     for (auto const& activePage : kvCache._activePages())
     {
@@ -70,61 +69,27 @@ KvCacheIntrospection::ActivePageStats KvCacheIntrospection::activePageStats(KvCa
         }
 
         CacheLevel const level = page->cacheLevel;
-        auto const levelIdx = static_cast<size_t>(level);
-        counts.at(levelIdx) += 1;
+        counts.at(level) += 1;
         if (storageMgr.isEvictable(*page) && !page->scheduledForEviction())
         {
-            unscheduledEvictable.at(levelIdx) += 1;
+            unscheduledEvictable.at(level) += 1;
         }
     }
 
     return {std::move(counts), std::move(unscheduledEvictable)};
 }
 
-bool KvCacheIntrospection::isCommitAllowed(KvCache const& kvCache)
+TypedVec<PoolGroupIndex, StorageStatistics> KvCacheIntrospection::storageStatistics(
+    KvCacheManager& manager, CacheLevel level)
 {
-    return kvCache.commitState() == KvCache::CommitState::ALLOWED;
-}
-
-std::vector<float> KvCacheIntrospection::currentGpuRatio(KvCacheManager& manager)
-{
-    return manager.storage().getRatioList(kGpuLevel);
-}
-
-std::vector<StorageStatistics> KvCacheIntrospection::storageStatistics(KvCacheManager& manager, CacheLevel level)
-{
-    std::vector<StorageStatistics> result;
-    int const numPoolGroups = manager.storage().numPoolGroups();
-    result.reserve(static_cast<size_t>(numPoolGroups));
-    for (int pg = 0; pg < numPoolGroups; ++pg)
+    TypedVec<PoolGroupIndex, StorageStatistics> result;
+    PoolGroupIndex const numPoolGroups = manager.storage().numPoolGroups();
+    result.reserve(numPoolGroups);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups; ++pgIdx)
     {
-        result.push_back(manager.storage().getStatistics(level, static_cast<PoolGroupIndex>(pg)));
+        result.push_back(manager.storage().getStatistics(level, pgIdx));
     }
     return result;
-}
-
-std::vector<float> KvCacheIntrospection::storageUtilization(KvCacheManager& manager, CacheLevel level)
-{
-    return manager.storage().getUtilization(level);
-}
-
-int64_t KvCacheIntrospection::grainsForSlots(int numSlots, std::vector<int> const& slotSizeList, int granularity)
-{
-    return CacheLevelStorage::grainsForSlots(numSlots, slotSizeList, granularity);
-}
-
-std::tuple<int, int64_t> KvCacheIntrospection::grainsToSlots(
-    int64_t pgGrains, std::vector<int> const& slotSizeList, int granularity)
-{
-    auto [slots, used] = CacheLevelStorage::grainsToSlots(pgGrains, slotSizeList, granularity);
-    return {slots, used};
-}
-
-std::vector<int> KvCacheIntrospection::ratioToSlotCountList(size_t quota,
-    std::vector<std::vector<int>> const& slotSizeLists, std::vector<float> const& ratioList, int granularity,
-    std::vector<int> const& minSlots)
-{
-    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratioList, granularity, minSlots);
 }
 
 bool KvCacheIntrospection::allTreePagesDroppable(KvCacheManager& manager)

@@ -26,6 +26,7 @@
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/storage/core.h"
 
 #include <cassert>
 #include <cstring>
@@ -40,6 +41,7 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -75,6 +77,36 @@ static std::vector<kv::TokenIdExt> castTokenIterable(nb::handle tokens)
     return vec;
 }
 
+static kv::TypedVec<kv::PoolIndex, size_t> typedPoolSizeList(std::vector<size_t> const& slotSizeList)
+{
+    return kv::TypedVec<kv::PoolIndex, size_t>{slotSizeList};
+}
+
+static kv::TypedVec<kv::PoolGroupIndex, kv::TypedVec<kv::PoolIndex, size_t>> typedSlotSizeLists(
+    std::vector<std::vector<size_t>> const& slotSizeLists)
+{
+    kv::TypedVec<kv::PoolGroupIndex, kv::TypedVec<kv::PoolIndex, size_t>> result;
+    for (auto const& slotSizeList : slotSizeLists)
+    {
+        result.push_back(typedPoolSizeList(slotSizeList));
+    }
+    return result;
+}
+
+static kv::TypedVec<kv::PoolGroupIndex, kv::SlotCount> typedSlotCounts(std::vector<kv::SlotCount> const& slotCounts)
+{
+    kv::TypedVec<kv::PoolGroupIndex, kv::SlotCount> result;
+    for (kv::SlotCount slotCount : slotCounts)
+    {
+        if (slotCount < 0)
+        {
+            throw std::invalid_argument("slot counts must be non-negative");
+        }
+        result.push_back(slotCount);
+    }
+    return result;
+}
+
 static nb::object castLifeCycle(kv::LifeCycle const& lifeCycle)
 {
     return std::visit([](auto const& concreteLifeCycle) { return nb::cast(concreteLifeCycle); }, lifeCycle);
@@ -95,7 +127,7 @@ static kv::KvCache::PriorityCb castPriorityCallback(kv::KvCacheManager const& ma
     return [callback = std::move(callback), lifeCycles](kv::BlockOrdinal ordinal, kv::LifeCycleId lifeCycleId)
     {
         nb::gil_scoped_acquire acquire;
-        return nb::cast<kv::Priority>(callback(ordinal, castLifeCycle(lifeCycles->getLifeCycle(lifeCycleId))));
+        return nb::cast<kv::Priority>(callback(ordinal.value(), castLifeCycle(lifeCycles->getLifeCycle(lifeCycleId))));
     };
 }
 
@@ -207,14 +239,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                              .value("CLOSED", kv::KvCache::Status::CLOSED);
 
     // ---- Life cycle helpers ------------------------------------------------
-    nb::class_<kv::HalfOpenRange>(m, "HalfOpenRange")
+    using BlockRange = kv::HalfOpenRange<kv::BlockOrdinal>;
+    nb::class_<BlockRange>(m, "HalfOpenRange")
         .def(nb::init<int, int>(), nb::arg("beg"), nb::arg("end"))
-        .def_ro("beg", &kv::HalfOpenRange::beg)
-        .def_ro("end", &kv::HalfOpenRange::end)
-        .def("__bool__", [](kv::HalfOpenRange const& self) { return static_cast<bool>(self); })
-        .def("__len__", &kv::HalfOpenRange::length)
-        .def("__eq__", &kv::HalfOpenRange::operator==)
-        .def("__contains__", &kv::HalfOpenRange::contains, nb::arg("item"));
+        .def_prop_ro("beg", [](BlockRange const& self) { return self.beg.value(); })
+        .def_prop_ro("end", [](BlockRange const& self) { return self.end.value(); })
+        .def("__bool__", [](BlockRange const& self) { return static_cast<bool>(self); })
+        .def("__len__", &BlockRange::length)
+        .def("__eq__", [](BlockRange const& self, BlockRange const& other) { return self == other; })
+        .def(
+            "__contains__", [](BlockRange const& self, int item) { return self.contains(kv::BlockOrdinal{item}); },
+            nb::arg("item"));
 
     nb::enum_<kv::PageIndexMode>(m, "PageIndexMode")
         .value("SHARED", kv::PageIndexMode::SHARED)
@@ -368,8 +403,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_buffers", &kv::CoalescedBuffer::numBuffers);
 
     nb::class_<kv::SlotDescVariant>(m, "SlotDescVariant")
-        .def_prop_ro("layer_group_id", [](kv::SlotDescVariant const& self) { return self.lifeCycleId; })
-        .def_ro("coalesced_buffers", &kv::SlotDescVariant::coalescedBuffers)
+        .def_prop_ro("layer_group_id", [](kv::SlotDescVariant const& self) { return self.lifeCycleId.value(); })
+        .def_prop_ro("coalesced_buffers", [](kv::SlotDescVariant const& self) { return self.coalescedBuffers.raw(); })
         .def_prop_ro("slot_size_list",
             [](kv::SlotDescVariant const& self)
             {
@@ -387,15 +422,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             });
 
     nb::class_<kv::PoolDesc>(m, "PoolDesc")
-        .def_ro("pool_index", &kv::PoolDesc::poolIndex)
+        .def_prop_ro("pool_index", [](kv::PoolDesc const& self) { return self.poolIndex.value(); })
         .def_ro("base_address", &kv::PoolDesc::baseAddress)
         .def_ro("slot_bytes", &kv::PoolDesc::slotBytes);
 
     nb::class_<kv::PoolGroupDesc>(m, "PoolGroupDesc")
-        .def_ro("pool_group_index", &kv::PoolGroupDesc::poolGroupIndex)
+        .def_prop_ro("pool_group_index", [](kv::PoolGroupDesc const& self) { return self.poolGroupIndex.value(); })
         .def_ro("num_slots", &kv::PoolGroupDesc::numSlots)
         .def_ro("slot_desc", &kv::PoolGroupDesc::slotDesc)
-        .def_ro("pools", &kv::PoolGroupDesc::pools);
+        .def_prop_ro("pools", [](kv::PoolGroupDesc const& self) { return self.pools.raw(); });
 
     nb::class_<kv::ExpandedBuffer>(m, "ExpandedBuffer")
         .def_ro("id", &kv::ExpandedBuffer::id)
@@ -408,7 +443,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("base", &kv::AggregatedPageDesc::base)
         .def_ro("size", &kv::AggregatedPageDesc::size)
         .def_ro("stride", &kv::AggregatedPageDesc::stride)
-        .def_ro("layer_group_id", &kv::AggregatedPageDesc::layerGroupId)
+        .def_prop_ro("layer_group_id", [](kv::AggregatedPageDesc const& self) { return self.layerGroupId.value(); })
         .def_ro("buffers", &kv::AggregatedPageDesc::buffers);
 
     // ---- Config structs ----------------------------------------------------
@@ -585,7 +620,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("cuda_stream") = nb::none())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
-        .def("prefetch", &kv::KvCache::prefetch, nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
+            nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",
@@ -614,12 +651,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
-            [](kv::KvCache const& self, kv::LayerGroupId lgId, kv::BeamIndex beamIdx)
+            [](kv::KvCache const& self, int layerGroupId, int beamIdx)
             {
                 kv::Span<int const> span;
                 {
                     nb::gil_scoped_release release;
-                    span = self.getBasePageIndices(lgId, beamIdx);
+                    span = self.getBasePageIndices(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIdx});
                 }
                 // Zero-copy: return a read-only numpy ndarray referencing the internal buffer.
                 // nb::handle() = no owner; the returned array does not own the data.
@@ -632,10 +669,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     span.ptr, {static_cast<size_t>(span.len)}, nb::handle());
             },
             nb::arg("layer_group_id"), nb::arg("beam_idx") = 0)
-        .def("get_ssm_block_base_index", &kv::KvCache::getSsmBlockBaseIndex, nb::arg("layer_group_id"),
-            nb::arg("beam_id") = 0, nb::call_guard<nb::gil_scoped_release>())
-        .def("get_scratch_desc", &kv::KvCache::getScratchDesc, nb::arg("layer_group_id"),
-            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_ssm_block_base_index",
+            [](kv::KvCache const& self, int layerGroupId, int beamId)
+            { return self.getSsmBlockBaseIndex(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamId}); },
+            nb::arg("layer_group_id"), nb::arg("beam_id") = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_scratch_desc",
+            [](kv::KvCache const& self, int layerGroupId)
+            { return self.getScratchDesc(kv::LayerGroupId{layerGroupId}); },
+            nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
         .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
             [](kv::KvCache& self, bool enable) { self.setEnableSwaScratchReuse(enable); })
@@ -656,14 +699,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     throw nb::python_error();
                 }
             })
-        .def_prop_ro("num_blocks", &kv::KvCache::numBlocks)
+        .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
             [](kv::KvCache& self, int hist) { self.setHistoryLength(hist); })
         .def_prop_rw("capacity", &kv::KvCache::capacity, [](kv::KvCache& self, int cap) { self.setCapacity(cap); })
         .def_prop_ro("tokens_per_block", &kv::KvCache::tokensPerBlock)
-        .def_prop_ro("beam_width", &kv::KvCache::beamWidth)
+        .def_prop_ro("beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); })
         .def_prop_rw(
             "cuda_stream",
             [](kv::KvCache const& self) -> intptr_t { return reinterpret_cast<intptr_t>(self.cudaStream()); },
@@ -676,16 +719,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
         .def(
             "get_aggregated_page_indices",
-            [](kv::KvCache const& self, kv::LayerGroupId lgId, kv::BeamIndex beamIdx, bool validOnly)
-            { return self.getAggregatedPageIndices(lgId, beamIdx, validOnly); },
+            [](kv::KvCache const& self, int layerGroupId, int beamIdx, bool validOnly) {
+                return self.getAggregatedPageIndices(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIdx}, validOnly);
+            },
             nb::arg("layer_group_id"), nb::arg("beam_idx") = 0, nb::arg("valid_only") = false)
         .def(
             "set_base_page_index_buf",
-            [](kv::KvCache& self, kv::BeamIndex beamIdx, kv::LayerGroupId lgId, nb::object bufObj)
+            [](kv::KvCache& self, int beamIdx, int layerGroupId, nb::object bufObj)
             {
+                kv::BeamIndex const typedBeamIdx{beamIdx};
+                kv::LayerGroupId const typedLayerGroupId{layerGroupId};
                 if (bufObj.is_none())
                 {
-                    self.setBasePageIndexBuf(beamIdx, lgId, nullptr, 0);
+                    self.setBasePageIndexBuf(typedBeamIdx, typedLayerGroupId, nullptr, 0);
                     return;
                 }
                 // Accept any object exporting a 1-D writable int32 ('i') buffer.
@@ -704,8 +750,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 } cleanup{&view};
                 if (std::string(view.format) != "i" || view.ndim != 1)
                     throw std::invalid_argument("set_base_page_index_buf: buffer must be 1-D int32 ('i')");
-                self.setBasePageIndexBuf(
-                    beamIdx, lgId, static_cast<int32_t*>(view.buf), static_cast<int>(view.len / sizeof(int32_t)));
+                self.setBasePageIndexBuf(typedBeamIdx, typedLayerGroupId, static_cast<int32_t*>(view.buf),
+                    static_cast<int>(view.len / sizeof(int32_t)));
             },
             nb::arg("beam_idx"), nb::arg("layer_group_id"), nb::arg("buf"));
 
@@ -715,31 +761,89 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // ---- Introspection -------------------------------------------------------
     auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
     nb::class_<kv::StorageStatistics>(mIntrospection, "StorageStatistics")
-        .def_ro("slot_sizes", &kv::StorageStatistics::slotSizes)
+        .def_prop_ro("slot_sizes", [](kv::StorageStatistics const& self) { return self.slotSizes.raw(); })
         .def_ro("total", &kv::StorageStatistics::total)
         .def_ro("free", &kv::StorageStatistics::free)
         .def_ro("evictable", &kv::StorageStatistics::evictable)
         .def_prop_ro("available", &kv::StorageStatistics::available)
         .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
-    mIntrospection.def("active_page_stats", &kv::KvCacheIntrospection::activePageStats, nb::arg("kv_cache"),
-        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "active_page_stats",
+        [](kv::KvCache const& kvCache)
+        {
+            auto [counts, unscheduledEvictable] = kv::KvCacheIntrospection::activePageStats(kvCache);
+            return std::make_tuple(std::move(counts.raw()), std::move(unscheduledEvictable.raw()));
+        },
+        nb::arg("kv_cache"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
         nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def("is_commit_allowed", &kv::KvCacheIntrospection::isCommitAllowed, nb::arg("kv_cache"),
+    mIntrospection.def(
+        "is_commit_allowed",
+        [](kv::KvCache const& kvCache) { return kvCache.commitState() == kv::KvCache::CommitState::ALLOWED; },
+        nb::arg("kv_cache"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "current_gpu_ratio",
+        [](kv::KvCacheManager& manager)
+        {
+            auto ratio = manager.storage().getRatioList(kv::kGpuLevel);
+            return std::move(ratio.raw());
+        },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "storage_statistics",
+        [](kv::KvCacheManager& manager, int cacheLevel)
+        {
+            auto stats = kv::KvCacheIntrospection::storageStatistics(manager, kv::CacheLevel{cacheLevel});
+            return std::move(stats.raw());
+        },
+        nb::arg("manager"), nb::arg("cache_level") = kv::kGpuLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "storage_utilization",
+        [](kv::KvCacheManager& manager, int cacheLevel)
+        {
+            auto utilization = manager.storage().getUtilization(kv::CacheLevel{cacheLevel});
+            return std::move(utilization.raw());
+        },
+        nb::arg("manager"), nb::arg("cache_level") = kv::kGpuLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "grains_for_slots",
+        [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity)
+        {
+            if (numSlots < 0)
+            {
+                throw std::invalid_argument("num_slots must be non-negative");
+            }
+            return kv::CacheLevelStorage::grainsForSlots(numSlots, typedPoolSizeList(slotSizeList), granularity);
+        },
+        nb::arg("num_slots"), nb::arg("slot_size_list"), nb::arg("granularity"),
         nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def("current_gpu_ratio", &kv::KvCacheIntrospection::currentGpuRatio, nb::arg("manager"),
+    mIntrospection.def(
+        "grains_to_slots",
+        [](size_t pgGrains, std::vector<size_t> const& slotSizeList, size_t granularity)
+        {
+            auto [slots, used]
+                = kv::CacheLevelStorage::grainsToSlots(pgGrains, typedPoolSizeList(slotSizeList), granularity);
+            return std::make_tuple(slots, used);
+        },
+        nb::arg("pg_grains"), nb::arg("slot_size_list"), nb::arg("granularity"),
         nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def("storage_statistics", &kv::KvCacheIntrospection::storageStatistics, nb::arg("manager"),
-        nb::arg("cache_level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def("storage_utilization", &kv::KvCacheIntrospection::storageUtilization, nb::arg("manager"),
-        nb::arg("cache_level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def("grains_for_slots", &kv::KvCacheIntrospection::grainsForSlots, nb::arg("num_slots"),
-        nb::arg("slot_size_list"), nb::arg("granularity"), nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def("grains_to_slots", &kv::KvCacheIntrospection::grainsToSlots, nb::arg("pg_grains"),
-        nb::arg("slot_size_list"), nb::arg("granularity"), nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def("ratio_to_slot_count_list", &kv::KvCacheIntrospection::ratioToSlotCountList, nb::arg("quota"),
-        nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"), nb::arg("min_slots"),
-        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "ratio_to_slot_count_list",
+        [](size_t quota, std::vector<std::vector<size_t>> const& slotSizeLists, std::vector<float> const& ratioList,
+            size_t granularity, std::vector<kv::SlotCount> const& minSlots)
+        {
+            auto slotCountList = kv::CacheLevelStorage::ratioToSlotCountList(quota, typedSlotSizeLists(slotSizeLists),
+                kv::TypedVec<kv::PoolGroupIndex, float>{ratioList}, granularity, typedSlotCounts(minSlots));
+            std::vector<kv::SlotCount> result;
+            result.reserve(slotCountList.stdSize());
+            for (kv::SlotCount slotCount : slotCountList)
+            {
+                result.push_back(slotCount);
+            }
+            return result;
+        },
+        nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
+        nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
 
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
@@ -784,14 +888,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"))
-        .def("resize", &kv::KvCacheManager::resize, nb::arg("cache_level"), nb::arg("quota"),
-            nb::arg("best_efforts") = false, nb::call_guard<nb::gil_scoped_release>())
-        .def("get_quota", &kv::KvCacheManager::getQuota, nb::arg("cache_level"))
+        .def(
+            "resize",
+            [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)
+            { return self.resize(kv::CacheLevel{cacheLevel}, quota, bestEfforts); },
+            nb::arg("cache_level"), nb::arg("quota"), nb::arg("best_efforts") = false,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_quota",
+            [](kv::KvCacheManager const& self, int cacheLevel) { return self.getQuota(kv::CacheLevel{cacheLevel}); },
+            nb::arg("cache_level"))
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
-        .def_prop_ro("cache_tier_list", &kv::KvCacheManager::cacheTierList)
+        .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
-        .def_prop_ro("pool_group_descs", &kv::KvCacheManager::poolGroupDescs)
+        .def_prop_ro("pool_group_descs", [](kv::KvCacheManager const& self) { return self.poolGroupDescs().raw(); })
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
@@ -810,8 +921,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("ssm_reuse_interval", &kv::KvCacheManager::ssmReuseInterval)
         .def_prop_ro("num_layers", &kv::KvCacheManager::numLayers)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
-        .def_prop_ro("layer_grouping", &kv::KvCacheManager::layerGrouping)
-        .def("get_layer_group_id", &kv::KvCacheManager::getLayerGroupId, nb::arg("layer_id"))
+        .def_prop_ro("layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); })
+        .def(
+            "get_layer_group_id",
+            [](kv::KvCacheManager const& self, kv::LayerId layerId) { return self.getLayerGroupId(layerId).value(); },
+            nb::arg("layer_id"))
         .def("get_page_index_converter", &kv::KvCacheManager::getPageIndexConverter, nb::arg("layer_id"),
             nb::arg("data_role"))
         .def(

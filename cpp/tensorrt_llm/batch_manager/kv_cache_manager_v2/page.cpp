@@ -144,12 +144,11 @@ UncommittedPage::~UncommittedPage()
         bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
         if (!isSsm)
         {
-            [[maybe_unused]] bool blockRemoved = static_cast<int>(kvCache->blocks().size()) <= ordinal;
+            [[maybe_unused]] bool blockRemoved = kvCache->blocks().size() <= ordinal;
             [[maybe_unused]] bool pageOk = true;
             if (!blockRemoved)
             {
-                auto const& bp = kvCache->blocks()[static_cast<size_t>(ordinal)]
-                                     .pages[static_cast<size_t>(beamIndex)][static_cast<size_t>(lifeCycle)];
+                auto const& bp = kvCache->blocks()[ordinal].pages[beamIndex][lifeCycle];
                 auto page = blockPageGetPage(bp);
                 pageOk
                     = blockPageIsNull(bp) || page.get() == this || dynamicPointerCast<CommittedPage>(page) != nullptr;
@@ -164,8 +163,7 @@ UncommittedPage::~UncommittedPage()
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(SharedPtr<Block> blk, CachedCudaEvent readyEv)
 {
     assert(!scheduledForEviction());
-    assert(blk->storage.at(static_cast<size_t>(lifeCycle)) == nullptr
-        && "Block slot for this lifecycle already has a committed page");
+    assert(blk->storage.at(lifeCycle) == nullptr && "Block slot for this lifecycle already has a committed page");
     assert(status() == PageStatus::DROPPABLE && "Release holder/lock before converting");
 
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
@@ -182,7 +180,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(SharedPtr<Block> bl
     assert(committed->hasValidSlot() && "committed page must have a valid slot after transfer");
 
     // Register in block storage.
-    blk->storage.at(static_cast<size_t>(lifeCycle)) = committed.get();
+    blk->storage.at(lifeCycle) = committed.get();
 
     return committed;
 }
@@ -370,17 +368,19 @@ void SharedPageLock::acquirePageIndex()
 {
     auto* kvc = mUser.kvCache;
     auto& pg = *page();
-    int old = kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, pg.slotId());
+    int old = kvc->updateBasePageIndex(
+        mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, slotIdToPageIndexValue(pg.slotId()));
     // Mirrors Python assertion: old base index must be BAD (prevents double-locking same slot).
-    assert(old == kBadPageIndex && "Double-lock: page index already acquired for this (beam, ordinal, lc)");
+    assert(old == kBadPageIndex.value() && "Double-lock: page index already acquired for this (beam, ordinal, lc)");
     (void) old;
 }
 
 void SharedPageLock::releasePageIndex()
 {
-    int oldBaseIndex = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, /*BAD=*/-1);
+    int oldBaseIndex
+        = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, kBadPageIndex.value());
     // Mirrors Python assertion: old base index must match this page's slot ID.
-    assert(oldBaseIndex == page()->slotId());
+    assert(oldBaseIndex == slotIdToPageIndexValue(page()->slotId()));
     (void) oldBaseIndex;
 }
 
@@ -397,7 +397,7 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
         || std::all_of(targets.begin(), targets.end(), [&](auto const& t) { return t.page->manager == storeMgr; }));
 
     // Determine how many GPU slots are needed per pool group.
-    std::vector<int> requirements(static_cast<size_t>(storeMgr->numPoolGroups()), 0);
+    TypedVec<PoolGroupIndex, SlotCount> requirements(storeMgr->numPoolGroups(), 0);
     std::vector<bool> wasScheduled(targets.size(), false);
 
     for (size_t i = 0; i < targets.size(); ++i)
@@ -408,8 +408,8 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
             storeMgr->excludeFromEviction(*t.page);
         if (t.page->cacheLevel != kGpuLevel)
         {
-            int pgIdx = storeMgr->getPoolGroupIndex(t.lifeCycle);
-            requirements[static_cast<size_t>(pgIdx)] += 1;
+            PoolGroupIndex pgIdx = storeMgr->getPoolGroupIndex(t.lifeCycle);
+            requirements[pgIdx] += 1;
         }
     }
 

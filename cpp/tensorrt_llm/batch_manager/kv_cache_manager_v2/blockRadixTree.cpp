@@ -305,11 +305,11 @@ BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_
     return h.digest();
 }
 
-Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode, int nlc)
+Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode, LifeCycleId numLifeCycles)
     : NodeBase(k)
     , tokens(std::move(toks))
     , prev(prevNode)
-    , storage(static_cast<size_t>(nlc), nullptr)
+    , storage(numLifeCycles, nullptr)
     , mOrdinal(prevNode->ordinal() + 1)
 {
 }
@@ -329,13 +329,13 @@ Block::~Block()
     // DROPPABLE and scheduled for eviction, exclude from eviction.
     // Also null out the page's back-pointer so that CommittedPage::~CommittedPage()
     // doesn't attempt cleanup through this dead Block.
-    for (size_t i = 0; i < storage.size(); ++i)
+    for (LifeCycleId lcIdx{0}; lcIdx < storage.size(); ++lcIdx)
     {
-        auto const page = storage[i];
+        auto const page = storage[lcIdx];
         if (page != nullptr)
         {
             assert(page->block == this);
-            unlinkPage(static_cast<LifeCycleId>(i));
+            unlinkPage(lcIdx);
             if (page->status() == PageStatus::DROPPABLE && page->scheduledForEviction())
             {
                 page->manager->excludeFromEviction(*page);
@@ -364,7 +364,7 @@ int Block::partialMatchThisNode(TokenIdExt const* otherTokens, size_t otherCount
 
 CommittedPage* Block::unlinkPage(LifeCycleId lcIdx)
 {
-    auto& slot = storage.at(static_cast<size_t>(lcIdx));
+    auto& slot = storage.at(lcIdx);
     CommittedPage* page = slot;
     if (page != nullptr)
     {
@@ -378,7 +378,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     Block& block, LifeCycleId lcIdx, LifeCycle const& lc)
 {
     std::vector<SharedPtr<Block>> detachedBlocks;
-    assert(block.storage.at(static_cast<size_t>(lcIdx)) == nullptr);
+    assert(block.storage.at(lcIdx) == nullptr);
     if (block.isOrphan())
     {
         return detachedBlocks;
@@ -391,7 +391,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 
     // If this is a full-attention block or a sink block: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && (!alc->windowSize.has_value() || block.ordinal() < alc->numSinkBlocks))
+    if (alc && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
         detachedBlocks.push_back(removeSubtree(block));
@@ -402,7 +402,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     // curr when its last shared_ptr is dropped.
     Block* curr
         = pruneStart && pruneStart->type() == NodeBase::Type::kBLOCK ? static_cast<Block*>(pruneStart) : nullptr;
-    while (curr && curr->next.empty() && curr->storage.at(static_cast<size_t>(lcIdx)) == nullptr)
+    while (curr && curr->next.empty() && curr->storage.at(lcIdx) == nullptr)
     {
         NodeBase* prevNode = curr->prev;
         BlockKey const currKey = curr->key;
@@ -423,7 +423,8 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 // addOrGetExistingBlock
 // ---------------------------------------------------------------------------
 
-SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, int numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew)
+SharedPtr<Block> addOrGetExistingBlock(
+    NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew)
 {
     assert(prev && "prev must not be null");
 
@@ -545,9 +546,9 @@ BlockRadixTree::~BlockRadixTree()
     mRoots.clear();
 }
 
-int BlockRadixTree::numLifeCycles() const noexcept
+LifeCycleId BlockRadixTree::numLifeCycles() const noexcept
 {
-    return static_cast<int>(mLifeCycles.size());
+    return mLifeCycles.size();
 }
 
 void BlockRadixTree::drainPendingRootErases() const
@@ -624,7 +625,7 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 
 bool hasPage(Block const& block, LifeCycleId lcId)
 {
-    return block.storage.at(static_cast<size_t>(lcId)) != nullptr;
+    return block.storage.at(lcId) != nullptr;
 }
 
 } // anonymous namespace
@@ -650,7 +651,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     RootBlock const& root = *rootIt->second;
     std::unordered_map<BlockKey, SharedPtr<Block>> const* currentNext = &root.next;
     // ordinal tracks which block we're on (0-based, after root).
-    int ordinal = 0;
+    BlockOrdinal ordinal{0};
     bool missed = false;
 
     while (auto key = gen())
@@ -661,7 +662,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
             missed = true;
             break;
         }
-        size_t beg = static_cast<size_t>(ordinal) * static_cast<size_t>(mTokensPerBlock);
+        size_t beg = toSizeT(ordinal) * static_cast<size_t>(mTokensPerBlock);
         int numTokens = static_cast<int>(std::min(static_cast<size_t>(mTokensPerBlock), tokens.size() - beg));
         Block* block = blockIt->second.get();
         results.push_back({block, numTokens});
@@ -672,7 +673,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     // Partial match in children of current node.
     if (missed && enablePartialMatch)
     {
-        size_t beg = static_cast<size_t>(ordinal) * static_cast<size_t>(mTokensPerBlock);
+        size_t beg = toSizeT(ordinal) * static_cast<size_t>(mTokensPerBlock);
         size_t missedCount = std::min(static_cast<size_t>(mTokensPerBlock), tokens.size() - beg);
         auto [best, bestMatch] = findBestPartialMatchInNextNodes(*currentNext, tokens.data() + beg, missedCount);
         if (best)
@@ -772,13 +773,13 @@ BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> m
             }
 
             auto staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
-            int const staleEnd = staleRange.end;
-            if (staleEnd < static_cast<int>(matched.size()))
+            BlockOrdinal const staleEnd = staleRange.end;
+            if (staleEnd < BlockOrdinal{static_cast<int>(matched.size())})
             {
-                auto tailBegin = matched.begin() + staleEnd;
+                auto tailBegin = matched.begin() + static_cast<ptrdiff_t>(toSizeT(staleEnd));
                 int nMissing = findIndex(matched.rbegin(), std::make_reverse_iterator(tailBegin),
                     [&](auto const& match) { return !hasPage(*match.block, lcId); });
-                if (static_cast<int>(matched.size()) - nMissing > staleEnd)
+                if (BlockOrdinal{static_cast<int>(matched.size()) - nMissing} > staleEnd)
                 {
                     matched.resize(matched.size() - static_cast<size_t>(nMissing) - 1);
                     trimmed = true;

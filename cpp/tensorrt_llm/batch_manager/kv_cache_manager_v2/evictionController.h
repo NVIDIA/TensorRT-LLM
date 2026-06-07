@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
+#include <cstddef>
 #include <list>
 #include <map>
 #include <optional>
@@ -102,7 +103,7 @@ public:
     SharedPtr<Page> pop();
     SharedPtr<Page> remove(NodeRef node);
 
-    size_t size() const noexcept;
+    SlotCount size() const noexcept;
 
     bool empty() const noexcept
     {
@@ -158,7 +159,7 @@ class PerLevelEvictionController
 public:
     // lifeCycleGrouping: maps LifeCycleId → PoolGroupIndex.
     // cacheLevel: the level this controller manages.
-    PerLevelEvictionController(std::vector<PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel);
+    PerLevelEvictionController(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel);
 
     ~PerLevelEvictionController();
 
@@ -167,30 +168,31 @@ public:
     // Evict at least minNumPages[pgIdx] pages per pool group.
     // Returns evicted pages per pool group.
     // On failure, re-queues any already-evicted pages and throws OutOfPagesError.
-    std::vector<std::vector<SharedPtr<Page>>> evict(std::vector<int> const& minNumPages);
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> evict(
+        TypedVec<PoolGroupIndex, SlotCount> const& minNumPages);
 
     // Remove a page from the queue by its NodeRef.
     void remove(NodeRef node);
 
-    [[nodiscard]] int numEvictablePages(PoolGroupIndex pgIdx) const;
+    [[nodiscard]] SlotCount numEvictablePages(PoolGroupIndex pgIdx) const;
 
-    [[nodiscard]] int numPoolGroups() const noexcept
+    [[nodiscard]] PoolGroupIndex numPoolGroups() const noexcept
     {
-        return static_cast<int>(mPolicies.size());
+        return mPolicies.size();
     }
 
     // All pages in eviction order for a pool group.
     [[nodiscard]] auto pageGenerator(PoolGroupIndex pgIdx) const
     {
-        return mPolicies.at(static_cast<size_t>(pgIdx)).pageGenerator();
+        return mPolicies.at(pgIdx).pageGenerator();
     }
 
 private:
     PrioritizedEvictionPolicy& getPolicy(LifeCycleId lcId);
 
     CacheLevel mCacheLevel;
-    std::vector<PoolGroupIndex> mLifeCycleGrouping;
-    std::vector<PrioritizedEvictionPolicy> mPolicies; // one per pool group
+    TypedVec<LifeCycleId, PoolGroupIndex> mLifeCycleGrouping;
+    TypedVec<PoolGroupIndex, PrioritizedEvictionPolicy> mPolicies; // one per pool group
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

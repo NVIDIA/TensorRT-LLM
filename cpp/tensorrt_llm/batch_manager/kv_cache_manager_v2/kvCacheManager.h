@@ -39,17 +39,17 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // ---------------------------------------------------------------------------
 struct PoolDesc
 {
-    PoolIndex poolIndex = 0;
+    PoolIndex poolIndex{0};
     MemAddress baseAddress = 0;
-    int slotBytes = 0;
+    size_t slotBytes = 0;
 };
 
 struct PoolGroupDesc
 {
-    PoolGroupIndex poolGroupIndex = 0;
-    int numSlots = 0;
+    PoolGroupIndex poolGroupIndex{0};
+    SlotCount numSlots = 0;
     SlotDesc slotDesc;
-    std::vector<PoolDesc> pools; // indexed by PoolIndex
+    TypedVec<PoolIndex, PoolDesc> pools;
 };
 
 // ---------------------------------------------------------------------------
@@ -64,8 +64,8 @@ struct ExpandedBuffer
 struct AggregatedPageDesc
 {
     MemAddress base;                     // pool base address + buffer offset
-    int size;                            // byte span of this aggregated buffer group
-    int stride;                          // slot size (bytes per slot in the pool group)
+    size_t size;                         // byte span of this aggregated buffer group
+    size_t stride;                       // slot size (bytes per slot in the pool group)
     LifeCycleId layerGroupId;            // pool group / life-cycle id
     std::vector<ExpandedBuffer> buffers; // constituent buffers in offset order
 };
@@ -77,8 +77,8 @@ struct AggregatedPageDesc
 // ---------------------------------------------------------------------------
 struct ScratchDesc
 {
-    HalfOpenRange range;      // block ordinal range [beg, end)
-    std::vector<int> slotIds; // scratch slot IDs, length = ceil(numScratchBlocks / scale)
+    HalfOpenRange<BlockOrdinal> range; // block ordinal range [beg, end)
+    std::vector<int> slotIds;          // scratch slot IDs, length = ceil(numScratchBlocks / scale)
 
     explicit operator bool() const noexcept
     {
@@ -147,7 +147,7 @@ public:
         LayerId layerId, DataRole role, std::optional<PageIndexMode> indexMode = std::nullopt) const;
 
     int getPageStride(LayerId layerId, DataRole role) const;
-    int getPageIndexUpperBound(LayerId layerId, DataRole role) const;
+    size_t getPageIndexUpperBound(LayerId layerId, DataRole role) const;
 
     // Scale factor: base_page_index * scale → kernel page index.
     int getPageIndexScale(LayerId layerId, DataRole role) const;
@@ -159,7 +159,7 @@ public:
     // Mirrors Python's KVCacheManager.get_aggregated_pages().
     std::vector<AggregatedPageDesc> getAggregatedPages(std::vector<BufferId> const& buffers) const;
 
-    std::vector<PoolGroupDesc> poolGroupDescs() const;
+    TypedVec<PoolGroupIndex, PoolGroupDesc> poolGroupDescs() const;
 
     // ---- Query / info ------------------------------------------------------
 
@@ -191,13 +191,13 @@ public:
     LayerGroupId getLayerGroupId(LayerId layerId) const;
 
     // Layer grouping: layers with the same lifecycle share pool allocation.
-    std::vector<std::vector<LayerId>> layerGrouping() const;
+    TypedVec<LayerGroupId, std::vector<LayerId>> layerGrouping() const;
 
     // Iterator over all buffer identifiers. Mirrors Python's all_buffer_ids property.
     std::vector<BufferId> allBufferIds() const;
 
     // Sorted by CacheLevel from warm to cold. Mirrors Python's cache_tier_list property.
-    std::vector<CacheTier> cacheTierList() const;
+    TypedVec<CacheLevel, CacheTier> cacheTierList() const;
 
     // Get the max possible sequence length limited by GPU memory pools.
     // Mirrors Python's clamp_max_seq_len_for_mem().
@@ -266,12 +266,12 @@ public:
 private:
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
-    std::vector<float> const& _getTargetRatioList(CacheLevel level) const;
-    std::vector<std::vector<SharedPtr<Page>>> _gatherPersistentPages() const;
+    TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherPersistentPages() const;
 
     // Current per-pool-group GPU utilization ratios.
-    std::vector<float> _currentGpuRatio() const;
-    std::vector<float> _currentOtherRatios() const;
+    TypedVec<PoolGroupIndex, float> _currentGpuRatio() const;
+    TypedVec<PoolGroupIndex, float> _currentOtherRatios() const;
 
     KVCacheManagerConfig mConfig;
     LifeCycleRegistry mLifeCycles;
@@ -286,8 +286,8 @@ private:
     MovingAverage mAvgSqrCapacity;
     MovingAverage mAvgSqrHistoryLength;
 
-    std::vector<float> mTargetRatioListGpu;
-    std::vector<float> mTargetRatioListOther;
+    TypedVec<PoolGroupIndex, float> mTargetRatioListGpu;
+    TypedVec<PoolGroupIndex, float> mTargetRatioListOther;
 
     int mNumCreatedKvCaches{0};
     int mNumSampledKvCaches{0};
