@@ -28,6 +28,7 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -942,7 +943,21 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         FlashInfer backend is required for hybrid attention (per-layer
         head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
         bidirectional attention masks for multimodal tokens.
+
+        The trtllm-gen FMHA runner that this path dispatches to only
+        supports the SM100 family (Blackwell). On other architectures
+        (e.g. SM89 / NVIDIA L4) it fails deep inside the kernel with an
+        opaque ``Unsupported architecture`` error during warmup, so we
+        fail early here with an actionable message instead.
         """
+        sm_version = get_sm_version()
+        if not is_sm_100f(sm_version):
+            raise RuntimeError(
+                f"{cls.__name__} requires the FlashInfer trtllm-gen FMHA "
+                f"backend, which is only supported on SM100-family GPUs "
+                f"(compute capability 10.0/10.3, e.g. Blackwell). The current "
+                f"GPU reports SM{sm_version}, which is not supported. Gemma4 "
+                f"cannot be served on this architecture.")
         return {
             "attn_backend": "FLASHINFER",
         }
