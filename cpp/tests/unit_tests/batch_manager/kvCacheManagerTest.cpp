@@ -6511,6 +6511,91 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     EXPECT_EQ(remainingAfterContextAlloc, maxNewTokens / tokensPerBlock);
 }
 
+// Validates the two independent budgets getNeededBlocksOneStep drives for a first-chunk context request.
+// The block/capacity budget (numRequiredBlocks) credits only allocated reuse, since a free-but-cached
+// block still costs a free-pool block when reused. The compute/token budget (estimatedReusableTokens)
+// credits all cached prefix blocks, since the engine skips recomputing them via prepopulatedPromptLen
+// regardless of ref state.
+//
+// In steady state a shared prefix is free-but-cached (no active refs), so reusableBlocksAllocated is 0
+// while reusableBlocksAll stays large. Crediting only allocated reuse to the token budget would charge
+// the full prompt as compute and starve the FCFS micro-batch scheduler, serializing context requests.
+TEST(KVCacheManagerReuseAccountingTest, NeededBlocksOneStepCreditsFreeCachedReuseInTokenBudget)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr promptLength = 64; // 4 full context blocks
+    auto constexpr maxNewTokens = 32;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxAttentionWindow = 512;
+    auto constexpr maxNumTokens = 1024;
+
+    auto kvCacheManager = createKvCacheManager(
+        KvCacheManagerInstantiationParameters{
+            /* numLayers */ 1,
+            /* numHeads */ 1,
+            /* sizePerHead */ 1,
+            /* tokensPerBlock */ tokensPerBlock,
+            /* blocksPerWindow */ blocksAndWindow(/* numPrimaryBlocks */ 256, /* windowSize */ maxAttentionWindow),
+            /* sinkTokenLength */ 0,
+            /* maxAttentionWindow */ maxAttentionWindow,
+            /* maxBeamWidth */ maxBeamWidth,
+            /* maxNumTokens */ maxNumTokens,
+            /* kvCacheBlockReuse */ true,
+        },
+        stream);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+    auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+
+    auto const baseTokens = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(promptLength), 7);
+
+    // req0 populates the radix tree, then is removed so its prefix blocks are FREE-but-cached
+    // (present in the reuse tree, but with no active references).
+    auto req0 = LlmRequest{0, maxNewTokens, baseTokens, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+    kvCacheManager->addSequenceBatch({{{req0.mRequestId, req0.getPromptLen(), maxBeamWidth}}}, {std::ref(req0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(req0);
+    kvCacheManager->storeContextBlocks(req0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(req0);
+    kvCacheManager->removeSequence(req0.mRequestId, req0);
+
+    // req1 shares the whole prefix. Because req0 was removed, the matching blocks have no refs.
+    auto req1 = LlmRequest{1, maxNewTokens, baseTokens, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+
+    // storeContextBlocks only commits (promptLength - 1) tokens worth of blocks -> 3 full blocks.
+    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 3
+    auto const summary = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    // Every reusable block is free-but-cached, so all of them count in All and none in Allocated.
+    ASSERT_EQ(summary.reusableBlocksAll, expectedReusableBlocks);
+    ASSERT_EQ(summary.reusableBlocksAllocated, 0);
+
+    auto const numContextBlocks = promptLength / tokensPerBlock; // 4
+
+    // Block/capacity budget: free-cached reuse is not subtracted, since it still costs free blocks.
+    auto const neededOneStep
+        = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
+    EXPECT_EQ(neededOneStep, numContextBlocks);
+
+    // Token/compute budget: the MAX_UTILIZATION path credits all cached blocks, so the whole prefix is
+    // free for compute.
+    auto const estimatedReusableTokens = req1.getEstimatedReusableTokens();
+    EXPECT_EQ(estimatedReusableTokens, expectedReusableBlocks * tokensPerBlock); // 48
+
+    // Model the FCFS micro-batch scheduler's compute-aware admission for a fixed per-iteration token
+    // budget: each first-chunk context request costs (promptLength - reusableTokens) compute tokens.
+    // Crediting all cached reuse admits more requests than crediting only allocated reuse.
+    auto const ctxTokenBudget = promptLength;                                                  // 64
+    auto const allocatedOnlyReusableTokens = summary.reusableBlocksAllocated * tokensPerBlock; // 0
+    auto const computeCostAllCached = std::max(1, promptLength - estimatedReusableTokens);
+    auto const computeCostAllocatedOnly = std::max(1, promptLength - allocatedOnlyReusableTokens);
+
+    auto const admittedAllocatedOnly = ctxTokenBudget / computeCostAllocatedOnly;
+    auto const admittedAllCached = ctxTokenBudget / computeCostAllCached;
+
+    EXPECT_EQ(admittedAllocatedOnly, 1); // full-prompt compute: only one request fits
+    EXPECT_EQ(admittedAllCached, 4);     // cached prefix is free: four requests fit
+    EXPECT_GT(admittedAllCached, admittedAllocatedOnly);
+}
+
 TEST(KVCacheManagerReuseAccountingTest, NeededBlocksOneStepCapsAllocatedReuseAtExactBlockBoundary)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
