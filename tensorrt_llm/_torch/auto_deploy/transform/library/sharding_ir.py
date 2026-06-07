@@ -148,6 +148,8 @@ class ShardableNode(ABC):
 
         def decorator(subcls):
             for target in op_targets:
+                if target is None:
+                    continue
                 if isinstance(target, OpOverloadPacket):
                     for overload_name in target.overloads():
                         cls._REGISTRY[getattr(target, overload_name)] = subcls

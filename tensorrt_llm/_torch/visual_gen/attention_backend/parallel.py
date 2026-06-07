@@ -20,9 +20,14 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+from typing import TYPE_CHECKING, Optional
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from ..mapping import VisualGenMapping
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
@@ -458,6 +463,8 @@ class RingAttention(AttentionBackend):
         inner_backend: AttentionBackend,
         process_group: dist.ProcessGroup,
     ):
+        # Invariant: only instantiated when ring_size > 1 (see attention.py),
+        # so distributed must be initialized and the group must be non-trivial.
         if not type(inner_backend).support_lse():
             raise ValueError(
                 f"RingAttention requires an LSE-capable inner backend (FA4); "
@@ -608,3 +615,40 @@ class RingAttention(AttentionBackend):
     @classmethod
     def support_lse(cls) -> bool:
         return False
+
+
+def wrap_parallel_attention(
+    attn: AttentionBackend,
+    *,
+    visual_gen_mapping: Optional["VisualGenMapping"] = None,
+    enable_sequence_parallel: bool = True,
+) -> AttentionBackend:
+    """Wrap a compute backend with the configured parallelism strategy.
+
+    Nesting order (inner → outer):
+    - Attention2D + Ulysses: Attention2DAttention → UlyssesAttention
+    - Ring + Ulysses: RingAttention → UlyssesAttention
+
+    When ``enable_sequence_parallel`` is False, no wrappers are applied (callers
+    use this for cross-attention paths that cannot use Ulysses/Ring/Attention2D).
+    """
+    if not enable_sequence_parallel or visual_gen_mapping is None:
+        return attn
+
+    vgm = visual_gen_mapping
+    ring_size = vgm.ring_size
+    ulysses_size = vgm.ulysses_size
+    attn2d_size = vgm.attn2d_row_size * vgm.attn2d_col_size
+
+    if attn2d_size > 1:
+        attn = Attention2DAttention(
+            inner_backend=attn,
+            row_process_group=vgm.attn2d_row_group,
+            col_process_group=vgm.attn2d_col_group,
+        )
+    elif ring_size > 1:
+        attn = RingAttention(attn, process_group=vgm.ring_group)
+
+    if ulysses_size > 1:
+        attn = UlyssesAttention(attn, process_group=vgm.ulysses_group)
+    return attn

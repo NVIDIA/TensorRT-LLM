@@ -402,7 +402,7 @@ class BatchInfo:
     Args:
         batch_info_host: The batch info tensor on the host.
 
-    The information is stored in a 12-element batch_info_host tensor as follows:
+    The information is stored in a 14-element batch_info_host tensor as follows:
 
     Slots 0-5 (batch composition):
     - [0] num_prefill: number of prefill requests
@@ -425,10 +425,13 @@ class BatchInfo:
     Slot 12 (spec-decoding info, set once at runtime init):
     - [12] max_draft_len: maximum draft length per request (0 when not spec dec)
 
+    Slot 13 (replay mode flag, set once at runtime init):
+    - [13] use_replay: 1 if SSM replay state-update path is active, 0 otherwise
+
     All fields can be accessed and updated with the convenience functions below.
     """
 
-    _NUM_ELEMENTS = 13
+    _NUM_ELEMENTS = 14
 
     def __init__(self, batch_info_host: Optional[torch.Tensor] = None):
         if batch_info_host is None:
@@ -550,6 +553,16 @@ class BatchInfo:
 
     def get_max_draft_len(self) -> int:
         return int(self._batch_info[12])
+
+    # --- replay mode flag (slot 13) writer ---
+
+    def update_use_replay(self, use_replay: bool) -> None:
+        self._batch_info[13] = int(use_replay)
+
+    # --- replay mode flag (slot 13) reader ---
+
+    def is_use_replay(self) -> bool:
+        return bool(self._batch_info[13])
 
 
 class SequenceInfo:
@@ -2096,6 +2109,149 @@ class SpecSSMResourceHandler(StateResourceHandler):
         return cls(
             num_heads=base.num_heads, head_dim=base.head_dim, d_state=base.d_state, dtype=base.dtype
         )
+
+
+class ReplayOldXHandler(StateResourceHandler):
+    """Per-layer old_x cache for the replay SSM kernel (single-buffered, bf16).
+
+    Shape: (max_batch, T, num_heads, head_dim) — T is determined by the manager's
+    spec_config (max_draft_len + 1), not by this handler.  Acts as a type marker.
+    Routes to MambaHybridCacheManager via get_replay_old_x(layer_idx).
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, dtype: torch.dtype) -> None:
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int]:
+        return (self.num_heads, self.head_dim)
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayOldXHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, ReplayOldXHandler)
+            and self.num_heads == other.num_heads
+            and self.head_dim == other.head_dim
+            and self.dtype == other.dtype
+        )
+
+
+class ReplayOldBHandler(StateResourceHandler):
+    """Per-layer old_B cache for the replay SSM kernel (double-buffered, bf16).
+
+    Shape: (max_batch, 2, T, n_groups, d_state) — T from manager.
+    Routes to MambaHybridCacheManager via get_replay_old_B(layer_idx).
+    """
+
+    def __init__(self, n_groups: int, d_state: int, dtype: torch.dtype) -> None:
+        self.n_groups = n_groups
+        self.d_state = d_state
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int]:
+        return (self.n_groups, self.d_state)
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayOldBHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, ReplayOldBHandler)
+            and self.n_groups == other.n_groups
+            and self.d_state == other.d_state
+            and self.dtype == other.dtype
+        )
+
+
+class ReplayOldDtHandler(StateResourceHandler):
+    """Per-layer old_dt cache for the replay SSM kernel (double-buffered, fp32).
+
+    Shape: (max_batch, 2, num_heads, T) — T from manager.
+    Routes to MambaHybridCacheManager via get_replay_old_dt(layer_idx).
+    """
+
+    def __init__(self, num_heads: int) -> None:
+        self.num_heads = num_heads
+        super().__init__(dtype=torch.float32)
+
+    @property
+    def state_shape(self) -> Tuple[int]:
+        return (self.num_heads,)
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayOldDtHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayOldDtHandler) and self.num_heads == other.num_heads
+
+
+class ReplayOldDAcumsumHandler(StateResourceHandler):
+    """Per-layer old_dA_cumsum cache for the replay SSM kernel (double-buffered, fp32).
+
+    Shape: (max_batch, 2, num_heads, T) — T from manager.
+    Routes to MambaHybridCacheManager via get_replay_old_dA_cumsum(layer_idx).
+    """
+
+    def __init__(self, num_heads: int) -> None:
+        self.num_heads = num_heads
+        super().__init__(dtype=torch.float32)
+
+    @property
+    def state_shape(self) -> Tuple[int]:
+        return (self.num_heads,)
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayOldDAcumsumHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayOldDAcumsumHandler) and self.num_heads == other.num_heads
+
+
+class ReplayCacheBufIdxHandler(StateResourceHandler):
+    """Global cache_buf_idx tensor for the replay SSM kernel (shared across all layers, int32).
+
+    Shape: (max_batch,).  Routes to MambaHybridCacheManager.get_replay_cache_buf_idx().
+    The same tensor is returned for every SSM layer — the FX graph has one constant-address
+    input per layer, all pointing to the same buffer.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(dtype=torch.int32)
+
+    @property
+    def state_shape(self) -> Tuple[()]:
+        return ()
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayCacheBufIdxHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayCacheBufIdxHandler)
+
+
+class ReplayPrevNumAcceptedHandler(StateResourceHandler):
+    """Global prev_num_accepted_tokens tensor for the replay SSM kernel (int32, shared).
+
+    Shape: (max_batch,).  Routes to MambaHybridCacheManager.get_replay_prev_num_accepted_tokens().
+    """
+
+    def __init__(self) -> None:
+        super().__init__(dtype=torch.int32)
+
+    @property
+    def state_shape(self) -> Tuple[()]:
+        return ()
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayPrevNumAcceptedHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayPrevNumAcceptedHandler)
 
 
 class SpecCausalConvResourceHandler(StateResourceHandler):

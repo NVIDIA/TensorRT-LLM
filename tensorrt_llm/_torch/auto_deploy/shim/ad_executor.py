@@ -58,12 +58,13 @@ from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
-# Non-tensor multimodal metadata consumed by _store_prefill_multimodal_metadata.
+# Non-model multimodal metadata consumed before the exported graph or ignored by AD.
 # These keys must NOT leak into the generic extra_args dict — entries there
-# are expected to be tensors, and these are lists or nested dicts.
+# are expected to be tensors, and these may be scalars, lists, or nested dicts.
 _RESERVED_MM_DATA_KEYS = frozenset(
     {
         "layout_metadata",
+        "mm_bidirectional_blocks",
         "special_token_offsets",
         "multimodal_embed_mask_cumsum",
     }
@@ -393,11 +394,6 @@ class ADEngine(ModelEngine):
         self.llm_args.print_iter_log = reporting_info.print_log
         self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
-        self.llm_args.stream_interval = 1
-        self.llm_args.attention_dp_config = None
-        self.llm_args.batch_wait_timeout_ms = 0
-        self.llm_args.batch_wait_timeout_iters = 0
-        self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
@@ -407,12 +403,22 @@ class ADEngine(ModelEngine):
         self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
 
         if ad_config is not None:
+            self.llm_args.stream_interval = ad_config.stream_interval
+            self.llm_args.attention_dp_config = ad_config.attention_dp_config
+            self.llm_args.batch_wait_timeout_ms = ad_config.batch_wait_timeout_ms
+            self.llm_args.batch_wait_timeout_iters = ad_config.batch_wait_timeout_iters
+            self.llm_args.batch_wait_max_tokens_ratio = ad_config.batch_wait_max_tokens_ratio
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
             self.llm_args.max_stats_len = ad_config.max_stats_len
             self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
+            self.llm_args.stream_interval = 1
+            self.llm_args.attention_dp_config = None
+            self.llm_args.batch_wait_timeout_ms = 0
+            self.llm_args.batch_wait_timeout_iters = 0
+            self.llm_args.batch_wait_max_tokens_ratio = 0.0
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False

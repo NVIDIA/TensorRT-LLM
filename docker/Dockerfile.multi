@@ -55,10 +55,11 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     # WAR: uninstall dependencies that has vulnerability or need upgrading.
+    apt remove python3-wheel \
     pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
-    pip3 install --ignore-installed -r /tmp/constraints.txt && \
+    pip3 install -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
