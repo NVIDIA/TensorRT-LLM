@@ -211,7 +211,7 @@ def test_vswa_each_layer_routes_to_its_groups_extra_metadata():
 
 @pytest.mark.parametrize(
     "backend, expected_cyclic",
-    [("triton_paged", False), ("trtllm", True)],
+    [("triton", False), ("trtllm", True)],
 )
 def test_vswa_sets_kernel_handles_cyclic_swa(backend, expected_cyclic):
     """The transform records the backend's cyclic-SWA capability on the interface.
