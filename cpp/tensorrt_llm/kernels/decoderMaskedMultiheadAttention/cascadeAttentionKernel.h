@@ -60,7 +60,7 @@ namespace cascade
 //                         rotation and RotaryScalingType::kNONE (covers Qwen,
 //                         Llama3, Mistral default configs).
 //   - T_cache            = T (no INT8 / FP8 KV cache yet)
-//   - Dh                 in { 64, 128 }
+//   - Dh                 = 128
 //   - T                  in { half, __nv_bfloat16 }
 //
 // Activation is gated by the env var `TRTLLM_ENABLE_CASCADE_MMHA` (default off).

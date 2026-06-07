@@ -55,14 +55,14 @@ namespace cascade
 //   - TOKEN_TILE     = 16 = MMA K dimension for P·V and N dimension for Q·K^T
 //
 // Phase 2 (suffix decode) still uses THDS_PER_BLOCK threads-per-block with the
-// per-channel block_sum reduction.  Supported Dh values are 64 and 128.
+// per-channel block_sum reduction.  Supported Dh value is 128.
 template <int Dh_>
 struct CascadeConfig
 {
     static constexpr int THDS_PER_BLOCK = 128;
     static constexpr int BEAM_TILE = 16;
     static constexpr int TOKEN_TILE = 16;
-    static_assert(Dh_ == 64 || Dh_ == 128, "cascade kernel only supports Dh \\in {64, 128}");
+    static_assert(Dh_ == 128, "cascade kernel only supports Dh = 128");
 };
 
 // Tag selecting which side of the KV cache to read from.
@@ -269,7 +269,7 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
     constexpr int BEAM_TILE = Cfg::BEAM_TILE;    // 16
     constexpr int TOKEN_TILE = Cfg::TOKEN_TILE;  // 16
     constexpr int WARPS = THDS / 32;             // 4
-    constexpr int DH_PER_WARP = Dh / WARPS;      // 32 (Dh=128) / 16 (Dh=64)
+    constexpr int DH_PER_WARP = Dh / WARPS;      // 32 (Dh=128)
     constexpr int PV_N_BLOCKS = DH_PER_WARP / 8; // m16n8 output tiles per warp
     static_assert(BEAM_TILE == 16 && TOKEN_TILE == 16, "MMA tiles are fixed at 16");
     static_assert(Dh % 16 == 0, "Dh must be divisible by MMA k-dim 16");
@@ -455,7 +455,7 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
         // ============ Q · K^T  (warp 0) ============
         // C[M=beam, N=tok] = A[M, K=dh] * B[K=dh, N=tok] col-major.
         // B col-major source layout: B[k, n] == K_cur[n][k].
-        // 2 n-blocks (N=0..7, 8..15), 8 k-slices for Dh=128 (or 4 for Dh=64).
+        // 2 n-blocks (N=0..7, 8..15), 8 k-slices for Dh=128.
         if (warp_id == 0)
         {
             float qk_acc[2][4];
@@ -722,7 +722,7 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     // Read prefix_len from device memory (Graph-safe: no host copy needed).
     int const prefix_len = __ldg(&d_input_lengths[req_idx * beam_width]);
 
-    if (params.hidden_size_per_head != Dh || tid >= Dh)
+    if (params.hidden_size_per_head != Dh)
     {
         return;
     }
@@ -742,10 +742,7 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     // NOTE: Must use params.stride (packed QKV per-sample stride) not num_heads*Dh.
     uint32_t const q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
     int const q_offset = seq * q_stride + head_idx * Dh + tid;
-    if (tid < Dh)
-    {
-        q_smem[tid] = common::cuda_cast<float>(params.q[q_offset]);
-    }
+    q_smem[tid] = common::cuda_cast<float>(params.q[q_offset]);
     __syncthreads();
 
     // Apply RoPE to Q if enabled.  Cached K is already post-RoPE.
@@ -779,7 +776,7 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
         __syncthreads();
     }
 
-    float const q_val = (tid < Dh) ? q_smem[tid] : 0.f;
+    float const q_val = q_smem[tid];
 
     // =====================================================================
     // Fused Phase 0: compute the current step's K/V (bias + RoPE) and have
@@ -1046,7 +1043,7 @@ bool cascade_eligible(KernelParamsType const& params)
         return false;
     }
     int const dh = params.hidden_size_per_head;
-    if (dh != 64 && dh != 128)
+    if (dh != 128)
     {
         return false;
     }
@@ -1092,7 +1089,6 @@ bool launch_cascade_attention(
     Multihead_attention_params<T, false> const& params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t stream)
 {
     static_assert(std::is_same_v<T, T_cache>, "cascade kernel requires T_cache == T");
-
 
     // IMPORTANT: In TRT-LLM MMHA, params.batch_size = total_sequences =
     // num_requests × beam_width.  Our cascade design separates the "shared
@@ -1184,15 +1180,11 @@ bool launch_cascade_attention(
     template bool launch_cascade_attention<T, T, KVB, DH>(                                                             \
         Multihead_attention_params<T, false> const&, KVB const&, cudaStream_t);
 
-INSTANTIATE_CASCADE(half, KVLinearBuffer, 64)
 INSTANTIATE_CASCADE(half, KVLinearBuffer, 128)
-INSTANTIATE_CASCADE(half, KVBlockArray, 64)
 INSTANTIATE_CASCADE(half, KVBlockArray, 128)
 
 #ifdef ENABLE_BF16
-INSTANTIATE_CASCADE(__nv_bfloat16, KVLinearBuffer, 64)
 INSTANTIATE_CASCADE(__nv_bfloat16, KVLinearBuffer, 128)
-INSTANTIATE_CASCADE(__nv_bfloat16, KVBlockArray, 64)
 INSTANTIATE_CASCADE(__nv_bfloat16, KVBlockArray, 128)
 #endif
 
