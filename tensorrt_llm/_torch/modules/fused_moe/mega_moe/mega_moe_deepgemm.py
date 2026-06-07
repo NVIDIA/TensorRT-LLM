@@ -282,7 +282,16 @@ class MegaMoEDeepGemm(MoE):
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
         self.swiglu_limit_scalar = swiglu_limit_scalar
-        self.fast_math = fast_math
+        # fast-math is non-associative (token-layout-dependent rounding); under sparse attention the
+        # MTP draft/verify passes then diverge via the sparse top-k, so drafts are always rejected.
+        # Force fast-math off when sparse attention is active; the dense path keeps it.
+        self.fast_math = fast_math and (model_config.sparse_attention_config is None)
+        if fast_math and model_config.sparse_attention_config is not None:
+            logger.warning_once(
+                "MegaMoE: forcing DeepGEMM fast_math=False because sparse attention is active "
+                "(fast-math's layout-dependent rounding breaks MTP draft acceptance).",
+                key="megamoe_fast_math_off_sparse",
+            )
 
         # Buffer sizing. MoE layers execute serially per forward; a single
         # process-level pool sized to worst-case per-rank tokens serves all.
