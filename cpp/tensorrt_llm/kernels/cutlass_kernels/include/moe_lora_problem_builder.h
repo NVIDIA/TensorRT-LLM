@@ -97,9 +97,11 @@ struct MoeLoraGemmGroupArrays
 //
 // Scalars:
 //   in_hidden_size:  K for the in-GEMM, also lda_in[i] and ldb_in[i].
-//   out_hidden_size: N for the out-GEMM, also ldb_out[i] and ldd_out[i].
+//   out_hidden_size: N for the out-GEMM, also ldd_out[i].
 //   max_lora_rank:   ldd_in[i], the workspace stride, fixed regardless of the
 //                    per-token rank so the GEMM lands at a known offset.
+//                    The out-GEMM's ldb_out[i] is the per-token rank (adapter B
+//                    is stored [out_hidden_size, rank]), not out_hidden_size.
 //   dtype_bytes:     scalar size in bytes (2 for bf16/fp16, 4 for fp32).
 //   splitk_slices:   split-K factor for the in-GEMM; drives the per-problem
 //                    split-K scratch stride.

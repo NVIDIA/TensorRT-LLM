@@ -163,9 +163,12 @@ protected:
         return p;
     }
 
+    // When with_splitk is false, out.splitk_offsets is left null to exercise the
+    // kernel's null-offset branch (and the launch_count path that drops the +1
+    // sentinel thread); the splitk_offsets comparison is then skipped.
     void runAndCompare(std::vector<int32_t> const& ranks, std::vector<int64_t> const& ptrs, int64_t input_base,
         int64_t lowrank_workspace, int64_t output_base, int64_t in_hidden_size, int64_t out_hidden_size,
-        int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices)
+        int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, bool with_splitk = true)
     {
         auto const P = static_cast<int64_t>(ranks.size());
         RefOutputs ref = cpuReference(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size,
@@ -189,7 +192,7 @@ protected:
         out.ldd_in = allocZero<int64_t>(P);
         out.ldb_out = allocZero<int64_t>(P);
         out.ldd_out = allocZero<int64_t>(P);
-        out.splitk_offsets = allocZero<int64_t>(P + 1);
+        out.splitk_offsets = with_splitk ? allocZero<int64_t>(P + 1) : nullptr;
 
         launchMoeLoraProblemBuilder(ranks_dev, ptrs_dev, reinterpret_cast<void const*>(input_base),
             reinterpret_cast<void*>(lowrank_workspace), reinterpret_cast<void*>(output_base), P, in_hidden_size,
@@ -234,7 +237,10 @@ protected:
         check_int64("ldd_in", out.ldd_in, ref.ldd_in);
         check_int64("ldb_out", out.ldb_out, ref.ldb_out);
         check_int64("ldd_out", out.ldd_out, ref.ldd_out);
-        check_int64("splitk_offsets", out.splitk_offsets, ref.splitk_offsets);
+        if (with_splitk)
+        {
+            check_int64("splitk_offsets", out.splitk_offsets, ref.splitk_offsets);
+        }
     }
 
     cudaStream_t mStream{};
@@ -326,6 +332,33 @@ TEST_F(MoeLoraProblemBuilderTest, BoundaryCases)
         runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
             max_lora_rank, dtype_bytes, splitk_slices);
     }
+}
+
+// splitk_offsets == nullptr: the caller does not need the split-K scratch
+// offsets, so the kernel must skip the sentinel write and the per-row offset
+// store while still producing all other arrays correctly.
+TEST_F(MoeLoraProblemBuilderTest, NullSplitkOffsets)
+{
+    int64_t const in_hidden_size = 16;
+    int64_t const out_hidden_size = 32;
+    int64_t const max_lora_rank = 8;
+    int64_t const dtype_bytes = 2;
+    int64_t const splitk_slices = 4;
+
+    int64_t const input_base = static_cast<int64_t>(0xA'0000'0000ull);
+    int64_t const lowrank_workspace = static_cast<int64_t>(0xB'0000'0000ull);
+    int64_t const output_base = static_cast<int64_t>(0xC'0000'0000ull);
+
+    std::vector<int32_t> ranks = {2, 0, 4, 1, 8};
+    std::vector<int64_t> ptrs;
+    for (int32_t i = 0; i < static_cast<int32_t>(ranks.size()); ++i)
+    {
+        ptrs.push_back(fakeAdapter(/*tag=*/4, i, /*side=*/0));
+        ptrs.push_back(fakeAdapter(/*tag=*/4, i, /*side=*/1));
+    }
+
+    runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
+        max_lora_rank, dtype_bytes, splitk_slices, /*with_splitk=*/false);
 }
 
 } // namespace

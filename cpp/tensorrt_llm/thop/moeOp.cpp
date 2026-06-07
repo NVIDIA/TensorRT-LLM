@@ -590,7 +590,11 @@ public:
             /*num_tokens=*/num_rows, hidden_size, inter_size, mActivationDtype, lora_max_low_rank, is_gated_act, stream,
             static_cast<int>(experts_per_token));
         size_t lora_workspace_size = 0;
-        if (lora_params_opt.has_value())
+        // The device path uses persistent device scratch and never touches the
+        // legacy cuBLAS lora_workspace, so skip computing/allocating it there to
+        // avoid duplicating LoRA scratch per stream (and the resulting OOM risk
+        // at large top_k/rank).
+        if (lora_params_opt.has_value() && !lora_params_opt->device_path.enabled)
         {
             auto const lora_dtype = loraTypeFromActDtype(mActivationDtype);
             lora_workspace_size = computeLoraWorkspaceSize(lora_params_opt->fc1_lora_impl,
@@ -629,7 +633,7 @@ public:
         // LoraParams is either the populated one we just built or a default-constructed empty one (use_lora=false).
         ::tensorrt_llm::kernels::LoraParams lora_params
             = lora_params_opt.value_or(::tensorrt_llm::kernels::LoraParams{});
-        if (lora_active)
+        if (lora_active && !lora_params.device_path.enabled)
         {
             lora_params.workspace = workspace_info.lora_workspace;
         }
@@ -1022,6 +1026,12 @@ private:
     // buildMoeLoraParams; resizing reallocates and changes the buffer addresses.
     int64_t mLoraHostBufCapacity = 0;
 
+    // Set once a CUDA-graph capture has been observed on the LoRA path. After
+    // that, growing the persistent scratch is forbidden even outside capture,
+    // since a captured graph keeps replaying against the freed addresses.
+    // Mutable so the const capture-safety check can record it.
+    mutable bool mLoraCaptureObserved = false;
+
     // Persistent device-resident scratch backing the capture-safe MoE LoRA
     // path. One LoraDevicePathBuffers per module (fc1, fc2, gated). All
     // at::Tensor members are allocated by ensureLoraDeviceScratch and reused
@@ -1287,15 +1297,27 @@ private:
             // ptr_data[req_id * 3 + 2] is the optional DoRA magnitude vector pointer; ignored here
             // (MoE+DoRA is rejected at load time, see tensorrt_llm/lora_manager.py).
 
-            auto const req_type = static_cast<MoeLoraRequestType>(req_types[req_id]);
+            // Validate the raw request type before trusting it. An unexpected
+            // value would otherwise fall into the CONTEXT branch and read an
+            // arbitrary context length, producing a negative/garbage repeat.
+            int32_t const req_type_raw = req_types[req_id];
+            TORCH_CHECK(req_type_raw == static_cast<int32_t>(MoeLoraRequestType::kCONTEXT)
+                    || req_type_raw == static_cast<int32_t>(MoeLoraRequestType::kGENERATION),
+                "MoE LoRA host_request_types[", req_id, "] must be 0 (context) or 1 (generation); got ", req_type_raw);
+            auto const req_type = static_cast<MoeLoraRequestType>(req_type_raw);
+            if (req_type == MoeLoraRequestType::kCONTEXT)
+            {
+                TORCH_CHECK(ctx_lens[req_id] >= 0, "MoE LoRA host_context_lengths[", req_id,
+                    "] must be non-negative; got ", ctx_lens[req_id]);
+            }
             int64_t const repeat
                 = (req_type == MoeLoraRequestType::kGENERATION) ? int64_t{1} : static_cast<int64_t>(ctx_lens[req_id]);
             // Guard the destination writes BEFORE producing them. expand_*_data
             // point at fixed-capacity pinned buffers sized for num_tokens, so a
             // malformed host_context_lengths (summing past num_tokens) must be a
             // clean error rather than an out-of-bounds write into pinned memory.
-            TORCH_CHECK(produced + repeat <= num_tokens, "MoE LoRA per-request expansion overran the ", num_tokens,
-                "-token buffer at request ", req_id, " (produced ", produced, " + ", repeat,
+            TORCH_CHECK(repeat >= 0 && produced + repeat <= num_tokens, "MoE LoRA per-request expansion overran the ",
+                num_tokens, "-token buffer at request ", req_id, " (produced ", produced, " + ", repeat,
                 "). Check host_request_types / host_context_lengths against the op's token count.");
             for (int64_t i = 0; i < repeat; ++i)
             {
@@ -1310,22 +1332,26 @@ private:
             " tokens but op input has ", num_tokens, " tokens.");
     }
 
-    // Guard against reallocating MoE-LoRA scratch while a CUDA graph is being
-    // captured on `stream`. Reallocation would hand out fresh device/pinned
-    // addresses, silently invalidating the copies and kernels already recorded
-    // into earlier captured graphs (which keep replaying against the old
-    // addresses). Convert that silent corruption into a loud, actionable error.
-    // No-op when not capturing or when stream is null (warmup pre-sizing).
+    // Reallocating MoE-LoRA scratch hands out fresh addresses, which silently
+    // invalidates any CUDA graph that baked in the old ones. Reject reallocation
+    // both while capturing and after any capture has been observed, since an
+    // earlier graph keeps replaying. Callers invoke this only when reallocation
+    // is imminent. No-op before the first capture (e.g. warmup pre-sizing).
     void checkLoraReallocSafeDuringCapture(cudaStream_t stream, int64_t requested, int64_t current) const
     {
-        if (stream == nullptr || !tensorrt_llm::common::isCapturing(stream))
+        bool const capturing = (stream != nullptr && tensorrt_llm::common::isCapturing(stream));
+        if (capturing)
+        {
+            mLoraCaptureObserved = true;
+        }
+        if (!capturing && !mLoraCaptureObserved)
         {
             return;
         }
         TORCH_CHECK(false, "MoE LoRA scratch (current capacity ", current, ") is too small for ", requested,
-            " entries during CUDA graph capture. Growing it would invalidate addresses baked into "
-            "already-captured graphs. Run the device LoRA path eagerly through the worst-case shape before "
-            "capture so the scratch is pre-sized.");
+            capturing ? " entries during CUDA graph capture." : " entries after a CUDA graph capture was observed.",
+            " Growing it would invalidate addresses baked into already-captured graphs. Run the device LoRA path "
+            "eagerly through the worst-case shape before capture so the scratch is pre-sized.");
     }
 
     // Internal helper: (re)allocate the six pinned-host + six device tensor
@@ -1536,6 +1562,27 @@ private:
 
         int64_t const num_seqs = fc1_lora_ranks->size(0);
         bool const has_gated = is_gated_activation && gated_lora_ranks.has_value();
+
+        // Every per-request rank must fit within lora_max_low_rank, which sizes
+        // both the lowrank workspace and the max-problem hints. A larger rank
+        // would make the device path build GEMM problems wider than the
+        // allocated scratch and write out of bounds, so reject it up front.
+        auto validate_rank_tensor = [&](char const* name, torch::Tensor const& ranks_tensor)
+        {
+            CHECK_CPU_INPUT(ranks_tensor, at::ScalarType::Int)
+            auto const* rank_data = ranks_tensor.data_ptr<int32_t>();
+            for (int64_t i = 0; i < ranks_tensor.size(0); ++i)
+            {
+                TORCH_CHECK(rank_data[i] >= 0 && rank_data[i] <= lora_max_low_rank, name, "[", i, "]=", rank_data[i],
+                    " is outside [0, ", lora_max_low_rank, "].");
+            }
+        };
+        validate_rank_tensor("fc1_lora_ranks", *fc1_lora_ranks);
+        validate_rank_tensor("fc2_lora_ranks", *fc2_lora_ranks);
+        if (has_gated)
+        {
+            validate_rank_tensor("gated_lora_ranks", *gated_lora_ranks);
+        }
 
         // Ensure pinned/device buffers can hold num_tokens entries.
         // Idempotent at-or-below current capacity.

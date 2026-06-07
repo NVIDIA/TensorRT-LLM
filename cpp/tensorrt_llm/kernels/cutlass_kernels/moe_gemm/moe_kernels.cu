@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -3888,6 +3888,14 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         auto const& dp = lora_params.device_path;
         nvinfer1::DataType const data_type = moeLoraNvInferType<ScaleBiasType>();
 
+        // The device-path GEMM skips rank-0 rows, but the bias/reorder paths
+        // read lora_fc1_result_ for every valid row. Zero the buffer first so
+        // skipped rows are a deterministic no-op. It is contiguous and holds
+        // both the gated and fc1 halves when gated, so one memset covers both.
+        size_t const fc1_result_bytes = static_cast<size_t>(expanded_num_rows) * static_cast<size_t>(inter_size)
+            * (is_gated_activation ? 2u : 1u) * sizeof(ScaleBiasType);
+        TLLM_CUDA_CHECK(cudaMemsetAsync(lora_fc1_result_, 0, fc1_result_bytes, stream));
+
         runMoeLoraDeviceModule(dp.fc1, expanded_num_rows, /*in_hidden_size=*/hidden_size, dp.max_lora_rank,
             dp.dtype_bytes, dp.splitk_slices, /*input_base=*/static_cast<void const*>(input),
             /*output_base=*/static_cast<void*>(lora_fc1_result), dp.run, data_type, stream);
@@ -3972,6 +3980,13 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     {
         auto const& dp = lora_params.device_path;
         nvinfer1::DataType const data_type = moeLoraNvInferType<ScaleBiasType>();
+
+        // As in loraFC1, zero the output so rank-0 rows the GEMM skips do not
+        // feed stale data into the downstream add.
+        size_t const fc2_result_bytes
+            = static_cast<size_t>(num_tokens) * static_cast<size_t>(hidden_size) * sizeof(ScaleBiasType);
+        TLLM_CUDA_CHECK(cudaMemsetAsync(lora_fc2_result_, 0, fc2_result_bytes, stream));
+
         runMoeLoraDeviceModule(dp.fc2, num_tokens, /*in_hidden_size=*/inter_size, dp.max_lora_rank, dp.dtype_bytes,
             dp.splitk_slices, /*input_base=*/static_cast<void const*>(input),
             /*output_base=*/static_cast<void*>(lora_fc2_result_), dp.run, data_type, stream);
@@ -4216,7 +4231,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
         bool is_gated_activation = isGatedActivation(fc1_activation_type);
 
-        if (use_lora)
+        // The device path builds every consumer's input on-device via
+        // launchMoeLoraPointerExpand, so skip the host staging D2H copies and the
+        // gating event. Keeping them would add a host dependency that breaks
+        // CUDA-graph capture.
+        if (use_lora && !lora_params.device_path.enabled)
         {
             std::vector<int>& host_permuted_rows = host_lora_workspace_.host_permuted_rows;
             std::vector<int64_t>& host_expert_first_token_offset = host_lora_workspace_.host_expert_first_token_offset;

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
+#include <cassert>
 #include <cstdint>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -57,6 +58,10 @@ __global__ void moeLoraProblemBuilderKernel(int32_t const* __restrict__ ranks, i
     }
 
     int32_t const rank = ranks[i];
+    // The workspace row and ldd_in[i] use max_lora_rank, so a larger rank makes
+    // the in-GEMM write past its slice. Callers validate ranks host-side (see
+    // moeOp.cpp); this assert is a debug-build backstop.
+    assert(rank <= max_lora_rank);
     int64_t const a_ptr_bits = ptrs[2 * i + 0];
     int64_t const b_ptr_bits = ptrs[2 * i + 1];
 

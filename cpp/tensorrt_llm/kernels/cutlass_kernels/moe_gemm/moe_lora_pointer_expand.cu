@@ -60,6 +60,16 @@ __device__ inline void expandOneModule(
     mod.ranks_out[i] = rank;
 }
 
+// Reset one module's output slot to a rank-0 no-op. The device-path scratch is
+// persistent and reused, so ghost rows must be explicitly zeroed; otherwise
+// stale ranks or pointers survive into the next grouped GEMM.
+__device__ inline void zeroOneModule(MoeLoraExpandModule const& mod, int64_t i)
+{
+    mod.ranks_out[i] = 0;
+    mod.ptrs_out[2 * i + 0] = 0;
+    mod.ptrs_out[2 * i + 1] = 0;
+}
+
 // One thread per permuted row: find its expert via search over
 // expert_first_token_offset (staged in shared memory), compute
 // source_index = permuted_rows[i] % num_rows, and expand fc1, fc2, and
@@ -105,9 +115,16 @@ __global__ void moeLoraPointerExpandKernel(int32_t const* __restrict__ permuted_
     }
     // Tokens past the last valid offset (padding "ghost" rows) get
     // expert_idx == num_experts_per_node; drop them so weight_index cannot run
-    // off the expert table.
+    // off the expert table. Zero their output slots first so reused scratch
+    // becomes a deterministic rank-0 no-op.
     if (expert_idx >= num_experts_per_node)
     {
+        zeroOneModule(fc1, i);
+        zeroOneModule(fc2, i);
+        if (has_gated)
+        {
+            zeroOneModule(gated, i);
+        }
         return;
     }
 

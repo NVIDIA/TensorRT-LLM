@@ -103,6 +103,19 @@ T* deviceAllocZero(size_t count)
     return dev;
 }
 
+// Like deviceAllocZero but pre-fills with a non-zero byte pattern. Simulates
+// reused scratch holding stale values, so tests can verify the kernel actively
+// zeroes ghost rows.
+template <typename T>
+T* deviceAllocFilled(size_t count, int byte_pattern)
+{
+    T* dev = nullptr;
+    auto const bytes = count * sizeof(T);
+    TLLM_CUDA_CHECK(cudaMalloc(&dev, bytes));
+    TLLM_CUDA_CHECK(cudaMemset(dev, byte_pattern, bytes));
+    return dev;
+}
+
 template <typename T>
 void deviceDownload(T* dev, std::vector<T>& host)
 {
@@ -149,10 +162,22 @@ protected:
         return p;
     }
 
-    // Run the kernel against ref and assert the device outputs match.
+    template <typename T>
+    T* allocFilled(size_t count, int byte_pattern)
+    {
+        T* p = deviceAllocFilled<T>(count, byte_pattern);
+        mAllocations.push_back(p);
+        return p;
+    }
+
+    // Run the kernel against ref and assert the device outputs match. When
+    // prefill_garbage is true the output buffers start with a non-zero pattern,
+    // forcing the kernel to explicitly zero ghost rows for the comparison to
+    // pass.
     void runAndCompare(std::vector<int32_t> const& permuted_rows, std::vector<int64_t> const& expert_first_token_offset,
         int32_t num_experts_per_node, int32_t start_expert, int64_t num_rows, int64_t expanded_num_rows,
-        int64_t lora_dtype_bytes, RefModule& fc1_ref, RefModule& fc2_ref, RefModule* gated_ref)
+        int64_t lora_dtype_bytes, RefModule& fc1_ref, RefModule& fc2_ref, RefModule* gated_ref,
+        bool prefill_garbage = false)
     {
         cpuExpand(permuted_rows, expert_first_token_offset, num_experts_per_node, start_expert, num_rows,
             expanded_num_rows, lora_dtype_bytes, fc1_ref, fc2_ref, gated_ref);
@@ -167,8 +192,10 @@ protected:
             m.ptrs_src = upload(r.ptrs_src);
             m.dim_a = r.dim_a;
             m.dim_b = r.dim_b;
-            m.ranks_out = allocZero<int32_t>(expanded_num_rows);
-            m.ptrs_out = allocZero<int64_t>(expanded_num_rows * 2);
+            m.ranks_out = prefill_garbage ? allocFilled<int32_t>(expanded_num_rows, 0x7F)
+                                          : allocZero<int32_t>(expanded_num_rows);
+            m.ptrs_out = prefill_garbage ? allocFilled<int64_t>(expanded_num_rows * 2, 0x7F)
+                                         : allocZero<int64_t>(expanded_num_rows * 2);
             return m;
         };
 
@@ -320,6 +347,74 @@ TEST_F(MoeLoraPointerExpandTest, Fp32StrideBytes)
 
     runAndCompare(permuted_rows, expert_first_token_offset, num_experts_per_node, start_expert, num_rows,
         expanded_num_rows, /*lora_dtype_bytes=*/4, fc1, fc2, /*gated=*/nullptr);
+}
+
+// Ghost rows: expanded_num_rows exceeds the last valid expert offset, so the
+// trailing rows have expert_idx == num_experts_per_node and must be zeroed by
+// the kernel. Buffers are pre-filled with garbage to verify the kernel actively
+// resets them.
+TEST_F(MoeLoraPointerExpandTest, GhostRowsRemainZero)
+{
+    int32_t const num_experts_per_node = 3;
+    int32_t const start_expert = 0;
+    int64_t const num_rows = 4;
+    // expert_first_token_offset.back() == 6, but we run two extra ghost rows.
+    int64_t const expanded_num_rows = 8;
+
+    std::vector<int32_t> permuted_rows = {0, 4, 1, 5, 2, 6, 0, 0};
+    std::vector<int64_t> expert_first_token_offset = {0, 2, 4, 6};
+
+    RefModule fc1{};
+    fc1.dim_a = 16;
+    fc1.dim_b = 32;
+    fc1.ranks_src = {2, 0, 4, 1};
+    fc1.ptrs_src.resize(num_rows * 2);
+    for (int32_t s = 0; s < num_rows; ++s)
+    {
+        fc1.ptrs_src[2 * s + 0] = fakePtr(/*tag=*/1, s, /*side=*/0);
+        fc1.ptrs_src[2 * s + 1] = fakePtr(/*tag=*/1, s, /*side=*/1);
+    }
+
+    RefModule fc2 = fc1;
+    fc2.dim_a = 32;
+    fc2.dim_b = 16;
+
+    runAndCompare(permuted_rows, expert_first_token_offset, num_experts_per_node, start_expert, num_rows,
+        expanded_num_rows, /*lora_dtype_bytes=*/2, fc1, fc2, /*gated=*/nullptr, /*prefill_garbage=*/true);
+}
+
+// num_experts_per_node above kMaxExpertsInSmem (1024) forces the kernel to take
+// the global-memory expert-offset scan instead of the shared-memory path.
+TEST_F(MoeLoraPointerExpandTest, ForceGlobalScanNumExperts1025)
+{
+    int32_t const num_experts_per_node = 1025;
+    int32_t const start_expert = 0;
+    int64_t const num_rows = 4;
+    int64_t const expanded_num_rows = 4; // top_k=1
+
+    std::vector<int32_t> permuted_rows = {0, 1, 2, 3};
+    // All tokens land in expert 0; every other expert is empty. Offset array has
+    // num_experts_per_node + 1 == 1026 entries.
+    std::vector<int64_t> expert_first_token_offset(num_experts_per_node + 1, expanded_num_rows);
+    expert_first_token_offset[0] = 0;
+
+    RefModule fc1{};
+    fc1.dim_a = 8;
+    fc1.dim_b = 16;
+    fc1.ranks_src = {1, 2, 3, 4};
+    fc1.ptrs_src.resize(num_rows * 2);
+    for (int32_t s = 0; s < num_rows; ++s)
+    {
+        fc1.ptrs_src[2 * s + 0] = fakePtr(/*tag=*/1, s, /*side=*/0);
+        fc1.ptrs_src[2 * s + 1] = fakePtr(/*tag=*/1, s, /*side=*/1);
+    }
+
+    RefModule fc2 = fc1;
+    fc2.dim_a = 16;
+    fc2.dim_b = 8;
+
+    runAndCompare(permuted_rows, expert_first_token_offset, num_experts_per_node, start_expert, num_rows,
+        expanded_num_rows, /*lora_dtype_bytes=*/2, fc1, fc2, /*gated=*/nullptr);
 }
 
 } // namespace
