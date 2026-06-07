@@ -13,9 +13,15 @@ from cutlass.cutlass_dsl import (Boolean, Int32, Integer, const_expr,
                                  dsl_user_op, extract_mlir_values,
                                  new_from_mlir_values)
 
+# Keep these as separate handlers (NOT a tuple `except (A, B)`): CuteDSL's
+# preprocessor import-walker (cutlass-dsl 4.5.0) raises AttributeError on
+# tuple except types, which silently disables AST preprocessing for this
+# module and breaks dynamic `if` control flow in the kernel.
 try:
     from cutlass.cute import iket  # type: ignore
-except (ImportError, NotImplementedError):  # pragma: no cover
+except ImportError:  # pragma: no cover
+    from .iket_compat import iket
+except NotImplementedError:  # pragma: no cover
     from .iket_compat import iket
 
 from .moe_persistent_scheduler import (_DEFAULT_SCHED_EXT, MoESchedulerBase,

@@ -9,9 +9,15 @@ from typing import List, Literal, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 
+# Keep these as separate handlers (NOT a tuple `except (A, B)`): CuteDSL's
+# preprocessor import-walker (cutlass-dsl 4.5.0) raises AttributeError on
+# tuple except types, which silently disables AST preprocessing for this
+# module and breaks dynamic `if` control flow in the kernel.
 try:
     from cutlass.cute import iket  # type: ignore
-except (ImportError, NotImplementedError):  # pragma: no cover
+except ImportError:  # pragma: no cover
+    from .iket_compat import iket
+except NotImplementedError:  # pragma: no cover
     from .iket_compat import iket
 
 import cutlass.pipeline as pipeline
