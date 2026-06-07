@@ -63,6 +63,8 @@ class MockPyExecutor:
     max_input_len: int
     max_batch_size: int
     max_beam_width: int
+    max_draft_len: int
+    max_total_draft_tokens: int
     guided_decoder: Any
     kv_cache_transceiver: Any = None
     resource_governor_queue: Any = None
