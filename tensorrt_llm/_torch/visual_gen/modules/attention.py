@@ -98,8 +98,16 @@ class Attention(nn.Module):
         ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
-        # TRTLLM doesn't support cross-attention (different Q/KV seq lengths); fall back to VANILLA
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and base_backend == "TRTLLM":
+        quant_attention_config = getattr(config.attention, "quant_attention_config", None)
+
+        # TRTLLM's standard VisualGen path expects fused QKV for separate-QKV
+        # modules. Quantized attention recipes (SageAttention) are the
+        # exception: they consume separate Q/K/V.
+        if (
+            self.qkv_mode == QKVMode.SEPARATE_QKV
+            and base_backend == "TRTLLM"
+            and quant_attention_config is None
+        ):
             backend_name = "VANILLA"
         else:
             backend_name = base_backend
@@ -220,6 +228,15 @@ class Attention(nn.Module):
             )
         self.sparse_params = sparse_params
 
+        if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
+            ring_size = vgm.ring_size
+            attn2d_size = vgm.attn2d_row_size * vgm.attn2d_col_size
+            if ring_size > 1 or attn2d_size > 1:
+                raise ValueError(
+                    "SEPARATE_QKV cross-attention does not support Ring or Attention2D "
+                    "sequence parallelism; use enable_sequence_parallel=False or Ulysses."
+                )
+
         # Create compute backend
         self.attn = create_attention(
             backend=backend_name,
@@ -233,14 +250,6 @@ class Attention(nn.Module):
             attention_metadata_state=attention_metadata_state,
             sparse_params=sparse_params,
         )
-
-        if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
-            ring_size = vgm.ring_size
-            if ring_size > 1:
-                raise ValueError(
-                    "SEPARATE_QKV cross-attention does not support Ring sequence "
-                    "parallelism; use enable_sequence_parallel=False or Ulysses/Attention2D."
-                )
 
         self.attn = wrap_parallel_attention(
             self.attn,
@@ -483,6 +492,15 @@ class Attention(nn.Module):
         batch_size = q.shape[0]
         seq_len = q.shape[1]
         seq_len_kv = k.shape[1] if k is not None else seq_len
+        if (
+            self.attn_backend == "TRTLLM"
+            and getattr(self.attn, "quant_attention_config", None) is not None
+            and seq_len_kv != seq_len
+        ):
+            raise ValueError(
+                "TRTLLM SageAttention currently supports self-attention only; "
+                f"got seq_len={seq_len}, seq_len_kv={seq_len_kv}."
+            )
 
         # Reshape inputs: [B, S, H*D] -> backend's preferred 4D layout
         if backend_layout == AttentionTensorLayout.HND:

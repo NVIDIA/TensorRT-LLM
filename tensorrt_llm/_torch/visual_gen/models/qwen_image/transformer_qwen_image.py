@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
@@ -515,9 +516,9 @@ class QwenJointAttention(Attention):
     per-stream QK-norms, and the two output projections (to_out.0 for
     image, to_add_out for text) as direct submodules so the HF state_dict
     loads with the checkpoint remapping in ``load_weights``. The common
-    unmasked path uses the VisualGen attention backend; the masked path
-    falls back to torch SDPA because VisualGen's backend mask contract is
-    currently limited to predefined masks.
+    unmasked path uses the VisualGen attention backend. For masked Qwen
+    text padding, TRTLLM attention compacts valid text tokens per batch
+    item because the backend mask contract is limited to predefined masks.
     """
 
     def __init__(
@@ -547,6 +548,9 @@ class QwenJointAttention(Attention):
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
+            # Qwen uses joint separate-QKV attention; keep it on the local
+            # backend instead of wrapping it with sequence-parallel adapters.
+            enable_sequence_parallel=False,
         )
         self.heads = num_attention_heads
         self.head_dim = attention_head_dim
@@ -605,6 +609,53 @@ class QwenJointAttention(Attention):
     @staticmethod
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
         return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
+
+    def _trtllm_masked_attention(
+        self,
+        txt_q: torch.Tensor,
+        txt_k: torch.Tensor,
+        txt_v: torch.Tensor,
+        img_q: torch.Tensor,
+        img_k: torch.Tensor,
+        img_v: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_txt = txt_q.shape[1]
+        seq_img = img_q.shape[1]
+        mask_bool = attention_mask.to(torch.bool)
+        expected_mask_len = seq_txt + seq_img
+        if mask_bool.shape[1] != expected_mask_len:
+            raise ValueError(
+                "QwenJointAttention attention_mask length mismatch: "
+                f"expected {expected_mask_len}, got {mask_bool.shape[1]}."
+            )
+        if not torch.all(mask_bool[:, seq_txt:]):
+            raise ValueError("QwenJointAttention requires all image tokens to be unmasked.")
+
+        outputs = []
+        for batch_idx in range(mask_bool.shape[0]):
+            txt_indices = torch.nonzero(mask_bool[batch_idx, :seq_txt], as_tuple=False).flatten()
+            batch_slice = slice(batch_idx, batch_idx + 1)
+            compact_q = torch.cat([txt_q[batch_slice, txt_indices], img_q[batch_slice]], dim=1)
+            compact_k = torch.cat([txt_k[batch_slice, txt_indices], img_k[batch_slice]], dim=1)
+            compact_v = torch.cat([txt_v[batch_slice, txt_indices], img_v[batch_slice]], dim=1)
+            compact_out = self._attn_impl(
+                compact_q.flatten(2),
+                compact_k.flatten(2),
+                compact_v.flatten(2),
+            )
+
+            valid_txt = txt_indices.numel()
+            output = torch.zeros(
+                (1, expected_mask_len, compact_out.shape[-1]),
+                device=compact_out.device,
+                dtype=compact_out.dtype,
+            )
+            output[:, txt_indices] = compact_out[:, :valid_txt]
+            output[:, seq_txt:] = compact_out[:, valid_txt:]
+            outputs.append(output)
+
+        return torch.cat(outputs, dim=0)
 
     def forward(
         self,
@@ -670,6 +721,10 @@ class QwenJointAttention(Attention):
                 joint_k.transpose(1, 2).flatten(2),
                 joint_v.transpose(1, 2).flatten(2),
                 timestep=timestep,
+            )
+        elif self.attn_backend == "TRTLLM":
+            out = self._trtllm_masked_attention(
+                txt_q, txt_k, txt_v, img_q, img_k, img_v, attention_mask
             )
         else:
             out = F.scaled_dot_product_attention(
@@ -874,13 +929,24 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             dtype=self.model_config.torch_dtype,
             has_weights=True,
         )
+        quant_config = self.model_config.get_quant_config()
+        img_in_quant_config = quant_config
+        if in_channels < 128 and quant_config is not None and quant_config.quant_algo is not None:
+            # Qwen image-patch projection uses small K dimensions that are not
+            # supported by the FP8 Linear path. Keep only KV-cache quant fields.
+            img_in_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         linear_kwargs = {
             "dtype": self.model_config.torch_dtype,
-            "quant_config": self.model_config.get_quant_config(),
+            "quant_config": quant_config,
             "skip_create_weights_in_init": self.model_config.skip_create_weights_in_init,
             "force_dynamic_quantization": self.model_config.force_dynamic_quantization,
         }
-        self.img_in = Linear(in_channels, self.inner_dim, bias=True, **linear_kwargs)
+        self.img_in = Linear(
+            in_channels,
+            self.inner_dim,
+            bias=True,
+            **{**linear_kwargs, "quant_config": img_in_quant_config},
+        )
         self.txt_in = Linear(joint_attention_dim, self.inner_dim, bias=True, **linear_kwargs)
 
         self.transformer_blocks = nn.ModuleList(
@@ -929,6 +995,19 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             return torch.device("cuda", torch.cuda.current_device())
         return torch.device("cpu")
 
+    def apply_quant_config_exclude_modules(self) -> None:
+        quant_config = self.model_config.get_quant_config()
+        if quant_config is None or quant_config.exclude_modules is None:
+            return
+
+        no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+
+        for name, module in self.named_modules():
+            if not isinstance(module, Linear) or getattr(module, "quant_config", None) is None:
+                continue
+            if quant_config.is_module_excluded_from_quantization(name):
+                module.quant_config = no_quant_config
+
     @classmethod
     def from_config_dict(cls, cfg: Dict[str, Any], **kwargs) -> "QwenImageTransformer2DModel":
         """Build from a transformer/config.json dict."""
@@ -973,6 +1052,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         weights = _remap_checkpoint_keys(weights)
 
         device = self._weight_loading_device()
+        self.apply_quant_config_exclude_modules()
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
@@ -980,11 +1060,26 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        missing = sorted(expected - provided)
+
+        def _is_dynamic_quant_aux(name: str) -> bool:
+            if not getattr(self.model_config, "dynamic_weight_quant", False):
+                return False
+            return name.rsplit(".", 1)[-1] in {
+                "alpha",
+                "input_scale",
+                "inv_input_scale",
+                "inv_kv_scales",
+                "kv_scales",
+                "pre_quant_scale",
+                "weight_scale",
+                "weight_scale_2",
+            }
+
+        missing = sorted(name for name in expected - provided if not _is_dynamic_quant_aux(name))
         unexpected = sorted(provided - expected)
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.
-        if missing and not self.model_config.dynamic_weight_quant:
+        if missing:
             raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
         if unexpected:
             raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
