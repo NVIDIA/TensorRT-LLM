@@ -2430,6 +2430,7 @@ class Qwen3_5MoeModel(nn.Module):
             "mm_item_types",
             "mm_token_positions",
             "mm_token_lengths",
+            "mm_token_type_ids",
             "mm_special_offsets_cu_seqlen",
             "mm_special_offsets",
             "mrope_delta_cache",
@@ -2865,15 +2866,8 @@ class Qwen3_5MoeADInputProcessor:
         return num_video_tokens[0]
 
     def get_vocab_size(self) -> Optional[int]:
-        """Return the tokenizer vocabulary size for Qwen multimodal hashing helpers."""
-        if self.tokenizer is not None and hasattr(self.tokenizer, "vocab_size"):
-            return int(self.tokenizer.vocab_size)
-        wrapped_tokenizer = getattr(self.tokenizer, "tokenizer", None)
-        if wrapped_tokenizer is not None and hasattr(wrapped_tokenizer, "vocab_size"):
-            return int(wrapped_tokenizer.vocab_size)
-        processor_tokenizer = getattr(self.processor, "tokenizer", None)
-        if processor_tokenizer is not None and hasattr(processor_tokenizer, "vocab_size"):
-            return int(processor_tokenizer.vocab_size)
+        # Qwen multimodal masks are identified by explicit image/video token ids.
+        # Avoid probing tokenizer.vocab_size; it is only needed when mm_token_ids is unavailable.
         return None
 
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
@@ -3046,6 +3040,10 @@ class Qwen3_5MoeADInputProcessor:
             extra_processed_inputs = {}
         extra_processed_inputs["multimodal_input"] = multimodal_input
         multimodal_data = extra_processed_inputs.get("multimodal_data", {})
+        # Dense token-type masks have prompt-length dimensions; the AD wrapper
+        # rebuilds Qwen mRoPE state from compact span metadata instead.
+        multimodal_data.pop("token_type_ids", None)
+        multimodal_data.pop("mm_token_type_ids", None)
         multimodal_data["layout_metadata"] = {
             "special_token_offsets": torch.tensor(special_offsets, dtype=torch.int32),
             "item_types": torch.tensor(item_types, dtype=torch.int32),

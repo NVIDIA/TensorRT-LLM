@@ -54,8 +54,13 @@ def test_custom_values():
 
 
 def test_requires_uniform_kv_caches_follows_attention_backend():
-    """TRTLLM requires stricter KV cache compatibility than FlashInfer."""
-    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is True
+    """No attention backend currently requires uniform KV caches.
+
+    The trtllm backend used to force a single KV pool, but it now supports
+    multiple KV cache memory pools for non-uniform sliding-window models, so the
+    flag defaults to False for all backends.
+    """
+    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is False
     assert (
         LlmArgs(model="test-model", attn_backend="flashinfer").requires_uniform_kv_caches is False
     )
@@ -158,6 +163,23 @@ def test_config_flow(
     else:
         # For LLM with _autodeploy backend, executor should not be called directly
         pass
+
+
+def test_build_model_replaces_parent_model_specific_input_processor():
+    """Parent model build can create a registered multimodal input processor."""
+    llm = object.__new__(LLM)
+    llm.input_processor = object()
+    llm._tokenizer = None
+    replacement_processor = object()
+
+    with (
+        patch.object(LLM, "_prefetch_model"),
+        patch("tensorrt_llm._torch.auto_deploy.llm._TorchLLM._build_model"),
+        patch.object(LLM, "_create_input_processor", return_value=replacement_processor),
+    ):
+        LLM._build_model(llm)
+
+    assert llm.input_processor is replacement_processor
 
 
 @pytest.mark.parametrize(

@@ -350,7 +350,8 @@ public:
         torch::Tensor workspace, torch::Tensor output, torch::optional<torch::Tensor> output_sf, torch::Tensor qkv_or_q,
         torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v, torch::Tensor sequence_length,
         torch::Tensor host_past_key_value_lengths, int32_t const total_kv_len, torch::Tensor context_lengths,
-        torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
+        torch::Tensor host_context_lengths, std::optional<int64_t> max_context_q_len_override,
+        torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
         torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -374,8 +375,8 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt) const
+        std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
+        std::optional<int64_t> compressed_kv_cache_pool_ptr) const
         = 0;
 };
 
@@ -417,7 +418,8 @@ public:
         torch::Tensor workspace, torch::Tensor output, torch::optional<torch::Tensor> output_sf, torch::Tensor qkv_or_q,
         torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v, torch::Tensor sequence_length,
         torch::Tensor host_past_key_value_lengths, int32_t const total_kv_len, torch::Tensor context_lengths,
-        torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
+        torch::Tensor host_context_lengths, std::optional<int64_t> max_context_q_len_override,
+        torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
         torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -441,7 +443,7 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits,
+        std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
@@ -575,13 +577,33 @@ public:
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
         int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();
         // Note we still need context length during generation for MMHA optimization.
-        int32_t max_context_q_len = 0;
-        int32_t max_past_kv_length = 0;
+        // For encoder CUDA graphs compatibility, allow the caller to override the
+        // max context Q length so FMHA kernel launch params (mMaxSeqLenQ-driven grid
+        // and cluster dims) are stable across graph replays even when actual per-batch
+        // sequence lengths vary.
+        int32_t const max_context_q_len_computed
+            = host_context_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+        int32_t const max_past_kv_length_computed
+            = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+
+        if (max_context_q_len_override.has_value())
         {
-            max_context_q_len = host_context_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
-            max_past_kv_length
-                = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+            int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
+            TORCH_CHECK(override_value >= max_context_q_len_computed,
+                "max_context_q_len_override (%d) must be >= computed max context q length (%d).", override_value,
+                max_context_q_len_computed);
+            TORCH_CHECK(override_value >= max_past_kv_length_computed,
+                "max_context_q_len_override (%d) must be >= computed max past kv length (%d).", override_value,
+                max_past_kv_length_computed);
         }
+
+        int32_t const max_context_q_len = max_context_q_len_override.has_value()
+            ? static_cast<int32_t>(max_context_q_len_override.value())
+            : max_context_q_len_computed;
+        // Override the max_past_kv_length as well for encoder CUDA graph compatibility
+        int32_t const max_past_kv_length = max_context_q_len_override.has_value()
+            ? static_cast<int32_t>(max_context_q_len_override.value())
+            : max_past_kv_length_computed;
 
         // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
         // unless each layer has different attention window sizes.
@@ -724,6 +746,7 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+        common_enqueue_params.trtllm_gen_jit_warmup = trtllm_gen_jit_warmup;
         if (softmax_stats_tensor.has_value())
         {
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().scalar_type() == at::ScalarType::Float,
@@ -902,19 +925,19 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> output_sf, std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length,
     torch::Tensor host_past_key_value_lengths, torch::Tensor host_total_kv_lens, torch::Tensor context_lengths,
     torch::Tensor host_context_lengths, torch::Tensor host_request_types,
-    std::optional<torch::Tensor> kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_pool_pointers,
-    std::optional<torch::Tensor> host_kv_cache_pool_mapping, std::optional<torch::Tensor> cache_indirection,
-    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
-    std::optional<torch::Tensor> out_scale, std::optional<torch::Tensor> rotary_inv_freq,
-    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
-    std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
-    std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const local_layer_idx, int64_t const num_heads,
-    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
-    int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode, double const q_scaling,
-    int64_t const position_embedding_type, int64_t const rope_dim, double const rope_base,
-    int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
+    std::optional<int64_t> max_context_q_len_override, std::optional<torch::Tensor> kv_cache_block_offsets,
+    std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
+    std::optional<torch::Tensor> cache_indirection, std::optional<torch::Tensor> kv_scale_orig_quant,
+    std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> out_scale,
+    std::optional<torch::Tensor> rotary_inv_freq, std::optional<torch::Tensor> rotary_cos_sin,
+    std::optional<torch::Tensor> latent_cache, std::optional<torch::Tensor> q_pe,
+    std::optional<torch::Tensor> block_ids_per_seq, std::optional<torch::Tensor> attention_sinks,
+    bool const is_fused_qkv, bool const update_kv_cache, int64_t const predicted_tokens_per_seq,
+    int64_t const local_layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
+    int64_t const max_seq_len, int64_t const attention_window_size, int64_t const beam_width, int64_t const mask_type,
+    int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type, int64_t const rope_dim,
+    double const rope_base, int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
     double const rope_long_m_scale, int64_t const rope_max_positions, int64_t const rope_original_max_positions,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
@@ -941,7 +964,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
-    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
+    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
     std::optional<int64_t> compressed_kv_cache_pool_ptr)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
@@ -1038,6 +1061,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mFP8GenerationMLA = false;
     op->mFuseFp4Quant = is_fp4_out;
     op->mMaxContextLength = max_context_length;
+    op->mMaxSeqLen = max_seq_len;
+    op->mMaxNumRequests = max_num_requests;
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
         = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));
@@ -1208,16 +1233,16 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             /*num_seqs=*/num_contexts, token_offset,
             /*num_tokens=*/num_ctx_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv_or_q, k, v,
             sequence_length, host_past_key_value_lengths, ctx_total_kv_len, context_lengths, host_context_lengths,
-            kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
+            max_context_q_len_override, kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+            cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
+            latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
             helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
             spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            compressed_kv_cache_pool_ptr);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1230,16 +1255,16 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             /*num_seqs=*/num_generations, token_offset,
             /*num_tokens=*/num_gen_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv_or_q, k, v,
             sequence_length, host_past_key_value_lengths, gen_total_kv_len, context_lengths, host_context_lengths,
-            kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
+            max_context_q_len_override, kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+            cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
+            latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
             helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
             spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            compressed_kv_cache_pool_ptr);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

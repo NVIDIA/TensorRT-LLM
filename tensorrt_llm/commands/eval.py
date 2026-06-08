@@ -27,6 +27,17 @@ from ..llmapi import BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
 from ..usage import config as _telemetry_config
+from .utils import collect_explicit_cli_keys
+
+# Map Click parameter names to the LlmArgs field name (or merge-function CLI
+# scalar name) used by `update_llm_args_with_extra_options`.
+_CLICK_TO_LLM_ARG = {
+    "tp_size": "tensor_parallel_size",
+    "pp_size": "pipeline_parallel_size",
+    "ep_size": "moe_expert_parallel_size",
+    "kv_cache_free_gpu_memory_fraction": "free_gpu_memory_fraction",
+    "disable_kv_cache_reuse": "enable_block_reuse",
+}
 
 
 @click.group()
@@ -112,8 +123,9 @@ from ..usage import config as _telemetry_config
               "extra_llm_api_options",
               type=str,
               default=None,
-              help="Path to a YAML file that overwrites the parameters. "
-              "Can be specified as either --config or --extra_llm_api_options.")
+              help="Path to a YAML configuration file. Explicit CLI flags "
+              "take precedence over values in this file. Can be specified "
+              "as either --config or --extra_llm_api_options.")
 @click.option("--disable_kv_cache_reuse",
               is_flag=True,
               default=False,
@@ -131,6 +143,10 @@ def main(ctx, model: str, tokenizer: Optional[str],
          extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool,
          telemetry: bool):
     logger.set_level(log_level)
+
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_llm_api_options", "config"),
+        translate=_CLICK_TO_LLM_ARG)
 
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
@@ -182,13 +198,10 @@ def main(ctx, model: str, tokenizer: Optional[str],
             param_hint="backend")
 
     if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(llm_args,
-                                                      extra_llm_api_options)
-
-    # CLI --no-telemetry always wins over YAML config
-    if not telemetry:
-        llm_args["telemetry_config"] = llm_args["telemetry_config"].model_copy(
-            update={"disabled": True})
+        llm_args = update_llm_args_with_extra_options(
+            llm_args,
+            extra_llm_api_options,
+            explicit_cli_keys=explicit_cli_keys)
 
     profiler.start("trtllm init")
     llm = llm_cls(**llm_args)

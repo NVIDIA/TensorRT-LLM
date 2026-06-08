@@ -147,6 +147,12 @@ class CachedSequenceInterface:
         # same order as the C++ manager's internal pool ordering (i.e. the
         # insertion order of the per-window shape map keys).
         self._kv_group_windows: List[int] = []
+        # Whether the attention backend's kernel applies the sliding-window mask
+        # itself via cyclic KV indexing (trtllm). When True the executor passes
+        # the full per-window block table and global KV lengths instead of
+        # host-slicing to the live window. Set by the kvcache transform from the
+        # attention descriptor's ``kernel_handles_cyclic_swa()``.
+        self._kernel_handles_cyclic_swa: bool = False
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
@@ -589,6 +595,9 @@ class CachedSequenceInterface:
             ]
         else:
             kv_cache_config.max_attention_window = None
+        has_swa_window = kv_cache_config.max_attention_window is not None and any(
+            window < self.info.max_seq_len for window in kv_cache_config.max_attention_window
+        )
 
         # Update kv_cache_config based on max_tokens if provided
         if max_tokens is not None:
@@ -597,7 +606,11 @@ class CachedSequenceInterface:
                 max_tokens_gathered = [None] * get_world_size()
                 all_gather_object(max_tokens_gathered, max_tokens)
                 max_tokens = min(max_tokens_gathered)
-            kv_cache_config.free_gpu_memory_fraction = None
+            # VSWA uses a memory-fraction/byte pool split across window groups.
+            # Keep the fraction even when AD passes a synthetic token estimate,
+            # because VSWA ignores max_tokens during final block allocation.
+            if not has_swa_window:
+                kv_cache_config.free_gpu_memory_fraction = None
             kv_cache_config.max_tokens = min(kv_cache_config.max_tokens or max_tokens, max_tokens)
 
         # Check if we should disable block reuse
@@ -1299,6 +1312,21 @@ class CachedSequenceInterface:
         insertion order of the per-window keys).
         """
         self._kv_group_windows = list(group_windows)
+
+    @property
+    def kernel_handles_cyclic_swa(self) -> bool:
+        """Whether the attention kernel applies the sliding-window mask itself.
+
+        When True (trtllm), the executor passes the full per-window block table
+        and global KV lengths; when False (triton/flashinfer), it host-slices to
+        the live sliding window.
+        """
+        return self._kernel_handles_cyclic_swa
+
+    def set_kernel_handles_cyclic_swa(self, value: bool) -> None:
+        """Record the attention backend's cyclic-SWA capability (called by the
+        kvcache transform from ``AttentionDescriptor.kernel_handles_cyclic_swa``)."""
+        self._kernel_handles_cyclic_swa = bool(value)
 
     @property
     def kv_cache_manager(self) -> Optional[KVCacheManager]:

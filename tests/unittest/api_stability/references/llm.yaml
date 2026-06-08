@@ -80,7 +80,7 @@ methods:
         default: pytorch
         status: deprecated
       cuda_graph_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
       attention_dp_config:
@@ -352,10 +352,13 @@ methods:
       add_special_tokens:
         annotation: bool
         default: True
+      return_raw_logits:
+        annotation: bool
+        default: False
       model_kwargs:
         annotation: Any
         default: inspect._empty
-    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]
     status: prototype
   preprocess:
     parameters:

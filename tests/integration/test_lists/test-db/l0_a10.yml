@@ -26,11 +26,13 @@ l0_a10:
   - unittest/_torch/modeling/test_nemotron_nano_preprocessing.py
   - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/modeling/test_modeling_radio.py
+  - unittest/_torch/modeling/test_modeling_step3p7.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
   - unittest/_torch/executor/test_kv_cache_estimation.py
   - unittest/_torch/executor/test_kv_cache_budget_split.py
+  - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
   - unittest/_torch/modules/dwdp/test_dwdp_manager.py
