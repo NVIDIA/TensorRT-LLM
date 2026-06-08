@@ -88,7 +88,7 @@ void invokeVerifyDynamicTreeGreedyPacked(int32_t* acceptIndex, int32_t* acceptTo
 //! \param acceptIndex    output [batchSize, numSpecStep] int64 — tree positions of accepted tokens.
 //! \param acceptTokenNum output [batchSize] int64 — # accepted draft tokens (excl. root).
 //! \param acceptToken    output [batchSize, numSpecStep] int64 — accepted/correction token ids.
-//! \param candidates     [batchSize, numDraftTokens] int64; col 0 = root (target sample).
+//! \param draftTokens    [batchSize, numDraftTokens-1] int64; draft token ids (excluding root).
 //! \param targetProbs    [batchSize, numDraftTokens, vocabSize] float32; index 0 = root.
 //! \param retrieveNextToken   [batchSize, numDraftTokens] int32 first-child pointer, -1=none.
 //! \param retrieveNextSibling [batchSize, numDraftTokens] int32 next-sibling pointer, -1=none.
@@ -101,7 +101,7 @@ void invokeVerifyDynamicTreeGreedyPacked(int32_t* acceptIndex, int32_t* acceptTo
 //! \param offset         [1] int64 on GPU. Philox RNG offset.
 //! \param stream         cudaStream_t.
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
-    int64_t const* candidates, float const* targetProbs, int32_t const* retrieveNextToken,
+    int64_t const* draftTokens, float const* targetProbs, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, bool const* treeValid, runtime::SizeType32 batchSize,
     runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep, runtime::SizeType32 vocabSize,
     int64_t const* seed, int64_t const* offset, cudaStream_t stream);

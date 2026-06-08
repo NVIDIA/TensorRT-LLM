@@ -1248,7 +1248,7 @@ def _register_fake():
         return logits.new_empty(list(logits.shape), dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::verify_dynamic_tree_rejection_out_op")
-    def _(candidates: torch.Tensor, targetProbs: torch.Tensor,
+    def _(draftTokens: torch.Tensor, targetProbs: torch.Tensor,
           retrieveNextToken: torch.Tensor, retrieveNextSibling: torch.Tensor,
           treeValid: torch.Tensor, acceptIndex: torch.Tensor,
           acceptTokenNum: torch.Tensor, acceptToken: torch.Tensor,
