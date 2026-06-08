@@ -3496,39 +3496,9 @@ class PyExecutor:
             ))
 
     @staticmethod
-    def _is_delay_batch_context_only_request(req) -> bool:
-        if isinstance(req, RequestQueueItem):
-            request_type = getattr(req.request, "request_type", None)
-            if request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
-                return True
-            if request_type in (
-                    RequestType.REQUEST_TYPE_GENERATION_ONLY,
-                    RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION):
-                return False
-
-        request_type = getattr(req, "py_llm_request_type", None)
-        if request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
-            return True
-        if request_type in (
-                LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-                LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION):
-            return False
-
-        request_type = getattr(req, "llm_request_type", None)
-        if request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
-            return True
-        if request_type in (
-                LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-                LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION):
-            return False
-
-        try:
-            is_context_only = getattr(req, "is_context_only_request", False)
-            if callable(is_context_only):
-                is_context_only = is_context_only()
-        except Exception:
-            is_context_only = False
-        return bool(is_context_only)
+    def _is_delay_batch_context_only_request(req: RequestQueueItem) -> bool:
+        return (req.request is not None and req.request.request_type
+                == RequestType.REQUEST_TYPE_CONTEXT_ONLY)
 
     def _sync_delay_batch_fetched_all_ctx(self, fetched_all_ctx: bool,
                                           real_request_count: int):
