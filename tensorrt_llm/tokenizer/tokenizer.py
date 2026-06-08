@@ -43,7 +43,7 @@ TOKENIZER_ALIASES = {
     "deepseek_v32":
     "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
     "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
-    "mistral":
+    "mistral_common":
     "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer.MistralTokenizer",
 }
 

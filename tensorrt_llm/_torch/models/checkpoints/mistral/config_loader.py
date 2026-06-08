@@ -390,7 +390,6 @@ class MistralConfigLoader(BaseConfigLoader):
         from tensorrt_llm._torch.models.modeling_mistral_large3 import Mistral3Gate
 
         model_config.pretrained_config.gate_cls = Mistral3Gate
-        arch = (getattr(pretrained_config, "architectures", None) or [None])[0]
         model_config.pretrained_config.input_processor_type = "mistral3"
         model_config.pretrained_config.model_type = "mistral3"
         model_config._frozen = True
