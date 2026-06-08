@@ -16,7 +16,7 @@
 import math
 import os
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import PIL.Image
 import torch
@@ -32,7 +32,7 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
-from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS
+from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS, COSMOS3_T2I_PARAMS
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import Cosmos3VFMTransformer
@@ -41,8 +41,12 @@ COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate videos from a given prompt."
 )
+COSMOS3_T2I_SYSTEM_PROMPT = (
+    "You are a helpful assistant who will generate images from a given prompt."
+)
 COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
+COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 
 # Inverse templates are appended to the negative prompt so the unconditional
 # branch is steered away from the requested duration/resolution.
@@ -50,6 +54,7 @@ COSMOS3_INVERSE_DURATION_TEMPLATE = (
     "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
 )
 COSMOS3_INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
+COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{width} resolution."
 
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
@@ -142,6 +147,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 checkpoint_dir,
                 subfolder=PipelineComponent.SCHEDULER,
             )
+            # Snapshot the checkpoint scheduler config so the scheduler can be
+            # rebuilt at request time when a mode-specific ``flow_shift`` is
+            # needed (T2I uses shift=3.0; T2V/I2V keep the checkpoint default).
+            self._base_scheduler_config = self.scheduler.config
+            self._engine_init_flow_shift = float(
+                getattr(self.scheduler.config, "flow_shift", 1.0) or 1.0
+            )
+            self._current_flow_shift = self._engine_init_flow_shift
             if self.audio_gen:
                 # Separate instance so video and audio scheduler states don't collide
                 # (UniPC mutates internal correction buffers on every .step() call).
@@ -176,6 +189,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
+    def _set_flow_shift(self, target_shift: float) -> None:
+        """Rebuild the UniPC scheduler with ``flow_shift=target_shift`` if needed.
+
+        T2I uses ``flow_shift=3.0`` while T2V/I2V use the checkpoint default.
+        ``self._current_flow_shift`` is tracked explicitly so a prior T2I rebuild
+        does not leak into a subsequent video request.
+        """
+        if not hasattr(self, "_base_scheduler_config"):
+            return
+        target = float(target_shift)
+        if target == float(self._current_flow_shift):
+            return
+        self.scheduler = UniPCMultistepScheduler.from_config(
+            self._base_scheduler_config, flow_shift=target
+        )
+        self._current_flow_shift = target
+
     @property
     def default_warmup_resolutions(self):
         return [(720, 1280)]
@@ -209,24 +239,62 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 enable_audio=False,
             )
 
+    @staticmethod
+    def _resolve_t2i_default(merged_value, video_default, t2i_default):
+        """Pick the T2I default when the field still carries the merged video default.
+
+        The executor merges a single ``default_generation_params`` dict (the
+        video params) into the request before ``infer()``, so an unspecified
+        field arrives equal to its video default.  For T2I we substitute the
+        T2I default in that case while honoring any explicit user override.
+        """
+        return t2i_default if merged_value == video_default else merged_value
+
     def infer(self, req):
+        extra_params = req.params.extra_params or {}
+        output_type = extra_params.get("output_type", "video")
+        is_t2i = str(output_type).lower() == "image"
+
+        height = req.params.height
+        width = req.params.width
+        num_inference_steps = req.params.num_inference_steps
+        guidance_scale = req.params.guidance_scale
+        if is_t2i:
+            height = self._resolve_t2i_default(
+                height, COSMOS3_720P_PARAMS["height"], COSMOS3_T2I_PARAMS["height"]
+            )
+            width = self._resolve_t2i_default(
+                width, COSMOS3_720P_PARAMS["width"], COSMOS3_T2I_PARAMS["width"]
+            )
+            num_inference_steps = self._resolve_t2i_default(
+                num_inference_steps,
+                COSMOS3_720P_PARAMS["num_inference_steps"],
+                COSMOS3_T2I_PARAMS["num_inference_steps"],
+            )
+            guidance_scale = self._resolve_t2i_default(
+                guidance_scale,
+                COSMOS3_720P_PARAMS["guidance_scale"],
+                COSMOS3_T2I_PARAMS["guidance_scale"],
+            )
+
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
             image=req.params.image,
-            height=req.params.height,
-            width=req.params.width,
+            height=height,
+            width=width,
             num_frames=req.params.num_frames,
-            num_inference_steps=req.params.num_inference_steps,
-            guidance_scale=req.params.guidance_scale,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             frame_rate=req.params.frame_rate,
-            use_duration_template=req.params.extra_params.get("use_duration_template", False),
-            use_resolution_template=req.params.extra_params.get("use_resolution_template", False),
-            use_system_prompt=req.params.extra_params.get("use_system_prompt", False),
-            use_guardrails=req.params.extra_params.get("use_guardrails", True),
-            enable_audio=req.params.extra_params.get("enable_audio", False),
+            use_duration_template=extra_params.get("use_duration_template", False),
+            use_resolution_template=extra_params.get("use_resolution_template", False),
+            use_system_prompt=extra_params.get("use_system_prompt", False),
+            use_guardrails=extra_params.get("use_guardrails", True),
+            enable_audio=extra_params.get("enable_audio", False),
+            output_type=output_type,
         )
 
     def _apply_metadata_templates(
@@ -278,14 +346,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @nvtx_range("_tokenize_prompt", color="blue")
     def _tokenize_prompt(
-        self, text: str, max_sequence_length: int, use_system_prompt: bool = False
+        self,
+        text: str,
+        max_sequence_length: int,
+        use_system_prompt: bool = False,
+        system_prompt: Optional[str] = None,
     ):
         """Tokenize a prompt using the Qwen2 chat template.
 
         Returns (input_ids, attention_mask) as [1, S] tensors on device.
         """
         conversations = (
-            [{"role": "system", "content": COSMOS3_DEFAULT_SYSTEM_PROMPT}]
+            [{"role": "system", "content": system_prompt or COSMOS3_DEFAULT_SYSTEM_PROMPT}]
             if use_system_prompt
             else []
         )
@@ -490,6 +562,67 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         """
         return self.audio_tokenizer.decode(latent)  # [B, audio_channels, N_samples]
 
+    @nvtx_range("Cosmos3OmniMoTPipeline._denoise_t2i", color="blue")
+    def _denoise_t2i(
+        self,
+        latents: torch.Tensor,
+        cond_ids: torch.Tensor,
+        cond_mask: torch.Tensor,
+        uncond_ids: torch.Tensor,
+        uncond_mask: torch.Tensor,
+        guidance_scale: float,
+        video_shape: Tuple[int, int, int],
+        frame_rate: float,
+        guidance_interval: Optional[Tuple[float, float]],
+    ) -> torch.Tensor:
+        """Denoise loop for text-to-image.
+
+        The only T2I-specific behavior is the guidance interval — CFG is applied
+        only when the scheduler timestep falls inside ``guidance_interval``;
+        outside it the conditional prediction is used directly.
+        """
+        do_cfg = guidance_scale > 1.0
+        if guidance_interval is not None:
+            interval_lo, interval_hi = guidance_interval
+        else:
+            interval_lo, interval_hi = float("-inf"), float("inf")
+
+        if do_cfg:
+            vgm = self.model_config.visual_gen_mapping
+            if vgm is not None and getattr(vgm, "cfg_size", 1) >= 2 and self.rank == 0:
+                raise RuntimeError("Cosmos3 T2I does not use CFG-parallel. Use cfg_size=1.")
+            text_ids = torch.cat([uncond_ids, cond_ids], dim=0)
+            text_mask = torch.cat([uncond_mask, cond_mask], dim=0)
+        else:
+            text_ids = cond_ids
+            text_mask = cond_mask
+
+        for t in self.scheduler.timesteps:
+            latent_input = torch.cat([latents] * 2) if do_cfg else latents
+            timestep = t.expand(latent_input.shape[0])
+
+            noise_pred = self.transformer(
+                hidden_states=latent_input,
+                timestep=timestep,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=frame_rate,
+                noisy_frame_mask=None,
+            ).video
+
+            if do_cfg:
+                noise_uncond, noise_cond = noise_pred.chunk(2)
+                t_val = t.item() if t.dim() == 0 else t[0].item()
+                if interval_lo <= t_val <= interval_hi:
+                    noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+                else:
+                    noise_pred = noise_cond
+
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        return latents
+
     # =========================================================================
     # Forward (main generation entry point)
     # =========================================================================
@@ -514,12 +647,32 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
         enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
+        output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
 
         use_guardrails = use_guardrails and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
+
+        # Text-to-image mode: same checkpoint/forward path as T2V, but a single
+        # latent frame, image-flavored prompt templates, flow_shift=3.0, a CFG
+        # guidance interval, and an image (rather than video) output.
+        is_t2i = str(output_type).lower() == "image"
+        guidance_interval = None
+        if is_t2i:
+            if image is not None:
+                raise ValueError(
+                    "Cosmos3 text-to-image (output_type='image') does not accept an image input."
+                )
+            num_frames = 1
+            enable_audio = False
+            guidance_interval = COSMOS3_T2I_PARAMS["guidance_interval"]
+            self._set_flow_shift(COSMOS3_T2I_PARAMS["flow_shift"])
+        else:
+            # Restore the checkpoint flow_shift in case a prior T2I request
+            # rebuilt the scheduler with shift=3.0.
+            self._set_flow_shift(getattr(self, "_engine_init_flow_shift", 1.0))
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -563,15 +716,30 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if negative_prompt is None:
             negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
 
-        # Positive prompt: forward duration/resolution templates.
+        # Positive prompt: forward duration/resolution templates.  T2I has no
+        # duration concept (single image) and uses the image-flavored
+        # resolution template.
+        use_duration_template = use_duration_template and not is_t2i
         dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
-        res_tmpl = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE if use_resolution_template else None
+        if use_resolution_template:
+            res_tmpl = (
+                COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_DEFAULT_RESOLUTION_TEMPLATE
+            )
+        else:
+            res_tmpl = None
 
         # Negative prompt: inverse templates, gated on the same flags as the
         # positive templates, with the duration clause forced on so it is present
         # even for single-frame requests.
         inv_dur_tmpl = COSMOS3_INVERSE_DURATION_TEMPLATE if use_duration_template else None
-        inv_res_tmpl = COSMOS3_INVERSE_RESOLUTION_TEMPLATE if use_resolution_template else None
+        if use_resolution_template:
+            inv_res_tmpl = (
+                COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
+                if is_t2i
+                else COSMOS3_INVERSE_RESOLUTION_TEMPLATE
+            )
+        else:
+            inv_res_tmpl = None
 
         negative_prompt = self._apply_metadata_templates(
             negative_prompt,
@@ -602,9 +770,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 1. Tokenize prompts (no separate text encoder — transformer embeds internally)
         logger.info("Tokenizing prompts...")
-        cond_ids, cond_mask = self._tokenize_prompt(prompt, max_sequence_length, use_system_prompt)
+        system_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_DEFAULT_SYSTEM_PROMPT
+        cond_ids, cond_mask = self._tokenize_prompt(
+            prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
+        )
         uncond_ids, uncond_mask = self._tokenize_prompt(
-            negative_prompt, max_sequence_length, use_system_prompt
+            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
 
         # 2. Prepare latents
@@ -705,24 +876,42 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 6. Denoise
         timer.mark_denoise_start()
-        extra_streams = {"audio": (audio_latents, self.audio_scheduler)} if do_audio else None
-        denoise_result = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
-            neg_prompt_embeds=uncond_ids,
-            guidance_scale=guidance_scale,
-            forward_fn=forward_fn,
-            extra_cfg_tensors=extra_cfg_tensors,
-            extra_streams=extra_streams,
-        )
-
-        if extra_streams is not None:
-            latents, extra_latents = denoise_result
-            audio_latents = extra_latents.get("audio")
-        else:
-            latents = denoise_result
+        if is_t2i:
+            # T2I uses a dedicated loop with sequential CFG (separate cond/uncond
+            # K/V caches) and a CFG guidance interval. The shared BasePipeline
+            # denoise() batches [uncond, cond] and applies CFG at every step,
+            # which cannot express the guidance interval.
+            latents = self._denoise_t2i(
+                latents=latents,
+                cond_ids=cond_ids,
+                cond_mask=cond_mask,
+                uncond_ids=uncond_ids,
+                uncond_mask=uncond_mask,
+                guidance_scale=guidance_scale,
+                video_shape=video_shape,
+                frame_rate=frame_rate,
+                guidance_interval=guidance_interval,
+            )
             audio_latents = None
+        else:
+            extra_streams = {"audio": (audio_latents, self.audio_scheduler)} if do_audio else None
+            denoise_result = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
+                neg_prompt_embeds=uncond_ids,
+                guidance_scale=guidance_scale,
+                forward_fn=forward_fn,
+                extra_cfg_tensors=extra_cfg_tensors,
+                extra_streams=extra_streams,
+            )
+
+            if extra_streams is not None:
+                latents, extra_latents = denoise_result
+                audio_latents = extra_latents.get("audio")
+            else:
+                latents = denoise_result
+                audio_latents = None
 
         timer.mark_post_start()
 
@@ -751,6 +940,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video = check_video_safety(video, self.safety_checker)
 
         timer.mark_end()
+
+        if is_t2i:
+            # Collapse the single decoded frame [B, T=1, H, W, C] -> [B, H, W, C].
+            image = video[:, 0] if video is not None else None
+            return timer.fill(PipelineOutput(image=image))
+
         return timer.fill(
             PipelineOutput(
                 video=video,
