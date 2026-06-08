@@ -412,18 +412,16 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def disable_cudagraph_for_speculative_flashinfer(self):
+    def reject_cudagraph_for_speculative_flashinfer(self):
         if (
             self.speculative_config is not None
             and self.attn_backend == "flashinfer"
             and self.is_cuda_graph_enabled()
         ):
-            ad_logger.warning(
+            raise ValueError(
                 "Speculative decoding with FlashInfer attention does not currently support CUDA "
-                "graph replay in AutoDeploy; falling back to compile_backend='torch-simple'."
+                "graph replay in AutoDeploy. Use compile_backend='torch-simple' instead."
             )
-            self.compile_backend = "torch-simple"
-            self.update_transforms_with_shortcuts()
         return self
 
     ### UTILITY METHODS ############################################################################
