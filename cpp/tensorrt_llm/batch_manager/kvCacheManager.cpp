@@ -2711,11 +2711,11 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 [[nodiscard]] SizeType32 WindowBlockManager::getNumFreeBlocks() const
 {
     auto const numFree = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
-    TLLM_CHECK_WITH_INFO(numFree <= getMaxNumBlocks(),
-        "%s::getNumFreeBlocks - primary free block count (%d) exceeds total block count (%d). "
+    TLLM_CHECK_WITH_INFO(numFree <= getNumPrimaryBlocks(),
+        "%s::getNumFreeBlocks - primary free block count (%d) exceeds primary block count (%d). "
         "This indicates a block accounting inconsistency, likely caused by block pool swaps "
         "during offload/onboard operations. numPrimaryBlocks=%d, numSecondaryBlocks=%d",
-        mLogPrefix.c_str(), numFree, getMaxNumBlocks(), mNumPrimaryBlocks, mNumSecondaryBlocks);
+        mLogPrefix.c_str(), numFree, getNumPrimaryBlocks(), mNumPrimaryBlocks, mNumSecondaryBlocks);
     return numFree;
 }
 
