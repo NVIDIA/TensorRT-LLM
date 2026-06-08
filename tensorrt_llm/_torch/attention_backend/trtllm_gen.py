@@ -615,6 +615,11 @@ class FlashInferTrtllmGenAttention:
             return False, "trtllm-gen does not support sparse attention."
         if has_skip_softmax:
             return False, "trtllm-gen does not support skip-softmax attention."
+        if meta.use_spec_decoding and meta.is_spec_dec_tree:
+            return (
+                False,
+                "FlashInfer trtllm-gen does not support spec-dec tree/custom masks.",
+            )
         if is_mla_enable and fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "trtllm-gen MLA supports generation-only attention."
 
