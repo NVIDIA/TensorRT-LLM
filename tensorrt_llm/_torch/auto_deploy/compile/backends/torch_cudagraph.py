@@ -285,8 +285,14 @@ class CapturedGraph(nn.Module):
         # set the args hash --> this is used to compare the static inputs during graph replay
         self._args_hash = self._get_hash(args_static)
 
-        # store the input buffers for the largest batch size
-        self._input_buffers = [a.clone() for a in args_batched]
+        # store the input buffers for the largest batch size.
+        # B0: alias the live (persistent) input views instead of cloning. The AD engine stages
+        # decode inputs into persistent device buffers (SequenceInfo._device_buffer), so the
+        # captured graph can read directly from them and the per-step device->device copy in
+        # capture()/forward() degenerates to a self-copy that we skip (PT-style: the graph's
+        # input tensor IS the engine's input buffer). Falls back transparently for any input
+        # whose runtime storage differs (the data_ptr guard in the copy loops below).
+        self._input_buffers = [a.detach() for a in args_batched]
 
         # create new args, kwargs with the input buffers and static args
         args, kwargs = self._in_spec.unflatten(self._input_buffers + args_static)
@@ -320,9 +326,10 @@ class CapturedGraph(nn.Module):
                 dim_i = self.dynamic_dims[i]
                 size_i = input_tensor.shape[dim_i]
                 input_sizes.append(size_i)
-                self._input_buffers[i].narrow(dim_i, 0, size_i).copy_(
-                    input_tensor, non_blocking=True
-                )
+                dst = self._input_buffers[i].narrow(dim_i, 0, size_i)
+                # B0: skip when the input already aliases the graph buffer (self-copy).
+                if dst.data_ptr() != input_tensor.data_ptr():
+                    dst.copy_(input_tensor, non_blocking=True)
 
             # truncate input buffers along their respective dynamic dims
             inputs_truncated = [
@@ -396,7 +403,11 @@ class CapturedGraph(nn.Module):
         for i, input_tensor in enumerate(args_batched):
             dim_i = self.dynamic_dims[i]
             size_i = input_tensor.shape[dim_i]
-            self._input_buffers[i].narrow(dim_i, 0, size_i).copy_(input_tensor, non_blocking=True)
+            dst = self._input_buffers[i].narrow(dim_i, 0, size_i)
+            # B0: skip the device->device copy when the runtime input already aliases the
+            # graph's input buffer (the AD engine staged its H2D directly into this storage).
+            if dst.data_ptr() != input_tensor.data_ptr():
+                dst.copy_(input_tensor, non_blocking=True)
 
         # run forward pass via graph
         self.cudagraphs[combined_shape].replay()
