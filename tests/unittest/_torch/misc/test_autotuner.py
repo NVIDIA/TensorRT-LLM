@@ -1004,77 +1004,46 @@ class TestFindNearestProfileBounds:
     def setup_method(self):
         AutoTuner._find_nearest_profile.cache_clear()
 
-    def test_dynamic_spec_input_idx_out_of_range(self):
-        shapes = _make_shapes([4, 8])
-        spec = DynamicTensorSpec(input_idx=5,
-                                 dim_idx=0,
-                                 gen_tuning_buckets=(1, ))
-        result = AutoTuner._find_nearest_profile(shapes,
-                                                 dynamic_tensor_specs=(spec, ),
-                                                 constraint_specs=())
-        assert result == ((4, 8), )
-
-    def test_dynamic_spec_dim_idx_out_of_range(self):
-        shapes = _make_shapes([4, 8])
-        spec = DynamicTensorSpec(input_idx=0,
-                                 dim_idx=10,
-                                 gen_tuning_buckets=(1, ))
-        result = AutoTuner._find_nearest_profile(shapes,
-                                                 dynamic_tensor_specs=(spec, ),
-                                                 constraint_specs=())
-        assert result == ((4, 8), )
-
-    def test_constraint_spec_input_idx_out_of_range(self):
+    @pytest.mark.parametrize(
+        "spec_class,input_idx,dim_idx",
+        [
+            pytest.param("dynamic", 5, 0, id="dynamic_input_idx_out_of_range"),
+            pytest.param("dynamic", 0, 10, id="dynamic_dim_idx_out_of_range"),
+            pytest.param("dynamic", -1, 0, id="dynamic_negative_input_idx"),
+            pytest.param("dynamic", 0, -1, id="dynamic_negative_dim_idx"),
+            pytest.param("constraint",
+                         3,
+                         0,
+                         id="constraint_input_idx_out_of_range"),
+            pytest.param("constraint",
+                         0,
+                         7,
+                         id="constraint_dim_idx_out_of_range"),
+            pytest.param("constraint",
+                         -1,
+                         0,
+                         id="constraint_negative_input_idx"),
+        ],
+    )
+    def test_oob_spec_skipped(self, spec_class, input_idx, dim_idx):
         from tensorrt_llm._torch.autotuner import ConstraintSpec
         shapes = _make_shapes([4, 8])
-        spec = ConstraintSpec(input_idx=3,
-                              dim_idx=0,
-                              infer_shape=lambda shapes: 1)
-        result = AutoTuner._find_nearest_profile(shapes,
-                                                 dynamic_tensor_specs=(),
-                                                 constraint_specs=(spec, ))
-        assert result == ((4, 8), )
-
-    def test_constraint_spec_dim_idx_out_of_range(self):
-        from tensorrt_llm._torch.autotuner import ConstraintSpec
-        shapes = _make_shapes([4, 8])
-        spec = ConstraintSpec(input_idx=0,
-                              dim_idx=7,
-                              infer_shape=lambda shapes: 1)
-        result = AutoTuner._find_nearest_profile(shapes,
-                                                 dynamic_tensor_specs=(),
-                                                 constraint_specs=(spec, ))
-        assert result == ((4, 8), )
-
-    def test_dynamic_spec_negative_input_idx(self):
-        shapes = _make_shapes([4, 8])
-        spec = DynamicTensorSpec(input_idx=-1,
-                                 dim_idx=0,
-                                 gen_tuning_buckets=(1, ))
-        result = AutoTuner._find_nearest_profile(shapes,
-                                                 dynamic_tensor_specs=(spec, ),
-                                                 constraint_specs=())
-        assert result == ((4, 8), )
-
-    def test_dynamic_spec_negative_dim_idx(self):
-        shapes = _make_shapes([4, 8])
-        spec = DynamicTensorSpec(input_idx=0,
-                                 dim_idx=-1,
-                                 gen_tuning_buckets=(1, ))
-        result = AutoTuner._find_nearest_profile(shapes,
-                                                 dynamic_tensor_specs=(spec, ),
-                                                 constraint_specs=())
-        assert result == ((4, 8), )
-
-    def test_constraint_spec_negative_input_idx(self):
-        from tensorrt_llm._torch.autotuner import ConstraintSpec
-        shapes = _make_shapes([4, 8])
-        spec = ConstraintSpec(input_idx=-1,
-                              dim_idx=0,
-                              infer_shape=lambda shapes: 1)
-        result = AutoTuner._find_nearest_profile(shapes,
-                                                 dynamic_tensor_specs=(),
-                                                 constraint_specs=(spec, ))
+        if spec_class == "dynamic":
+            spec = DynamicTensorSpec(input_idx=input_idx,
+                                     dim_idx=dim_idx,
+                                     gen_tuning_buckets=(1, ))
+            result = AutoTuner._find_nearest_profile(
+                shapes,
+                dynamic_tensor_specs=(spec, ),
+                constraint_specs=())
+        else:
+            spec = ConstraintSpec(input_idx=input_idx,
+                                  dim_idx=dim_idx,
+                                  infer_shape=lambda shapes: 1)
+            result = AutoTuner._find_nearest_profile(
+                shapes,
+                dynamic_tensor_specs=(),
+                constraint_specs=(spec, ))
         assert result == ((4, 8), )
 
     def test_valid_specs_unaffected(self):
