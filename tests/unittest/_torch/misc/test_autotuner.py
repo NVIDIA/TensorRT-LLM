@@ -1023,6 +1023,10 @@ class TestFindNearestProfileBounds:
                          -1,
                          0,
                          id="constraint_negative_input_idx"),
+            pytest.param("constraint",
+                         0,
+                         -1,
+                         id="constraint_negative_dim_idx"),
         ],
     )
     def test_oob_spec_skipped(self, spec_class, input_idx, dim_idx):
