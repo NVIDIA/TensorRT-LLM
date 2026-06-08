@@ -263,7 +263,8 @@ class GuidedDecoder:
                     # the new_tokens buffer always holds the static max, but only
                     # `max_num_draft_tokens` slots are reserved this iteration.
                     for i, tid in enumerate(
-                            req.draft_tokens[:requests.max_num_draft_tokens], 1):
+                            req.draft_tokens[:requests.max_num_draft_tokens],
+                            1):
                         accepted = matcher.accept_token(tid)
                         if not accepted:
                             break
