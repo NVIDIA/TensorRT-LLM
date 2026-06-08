@@ -332,7 +332,7 @@ class _InsertCachedOperator(BaseTransform):
         gm.graph.erase_node(attn_node)
 
     @staticmethod
-    def _suppress_speculative_when_no_spec(
+    def _suppress_spec_handlers_maybe(
         resource_handler: Optional[ResourceHandler], spec_config: Optional[object]
     ) -> Optional[ResourceHandler]:
         """Drop a speculative-only resource to the None sentinel when spec decoding is off.
@@ -455,7 +455,7 @@ class _InsertCachedOperator(BaseTransform):
                     # (see CachedSequenceInterface._create_and_assign_state_views), so
                     # allocating them would waste a full per-layer state buffer and OOM. Drop
                     # them to the None sentinel instead of registering an unmanaged resource.
-                    resource_handler = self._suppress_speculative_when_no_spec(
+                    resource_handler = self._suppress_spec_handlers_maybe(
                         resource_handler, cm._spec_config
                     )
                     if resource_handler is None:

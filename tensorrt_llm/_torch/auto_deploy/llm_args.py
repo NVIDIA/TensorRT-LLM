@@ -186,12 +186,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     def validate_ssm_replay_requires_spec(self):
         """Reject the replay SSM kernel when speculative decoding is off.
 
-        ``ssm_replay`` makes the SSM backend register per-layer replay state buffers
-        (``Replay*`` handlers). Those buffers are read only on the speculative extend
-        (draft-verification) path, and the Mamba cache manager only binds them when
-        ``speculative_config`` is set. Enabling replay without speculative decoding would
-        register buffers that are never used and never bound, so fail fast here instead of
-        silently mis-allocating them.
+        ``ssm_replay`` makes the SSM backend emit per-layer replay state buffers (``Replay*``
+        handlers), which are read only on the speculative extend (draft-verification) path.
+        Those handlers carry the ``SpeculativeOnly`` trait, so without ``speculative_config``
+        the kvcache insert transform drops them entirely and the ``ssm_replay`` flag becomes a
+        no-op. Reject the contradictory config here rather than silently ignoring the flag.
         """
         ssm_cfg = self.transforms.get("insert_cached_ssm_attention", {})
         if ssm_cfg.get("ssm_replay", False) and self.speculative_config is None:

@@ -2040,26 +2040,7 @@ class StateResourceHandler(ResourceHandler):
 
 
 class SpeculativeOnly:
-    """Trait mixin marking a resource that only exists on the speculative extend path.
-
-    Intermediate SSM/conv state buffers and the replay-kernel buffers are read solely on the
-    speculative-decoding extend (draft-verification) path. When speculative decoding is off
-    they are never bound by the cache manager, so registering them would leak an unmanaged
-    per-layer allocation. The kvcache insert transform drops any handler carrying this trait
-    to the None sentinel when ``spec_config`` is None, so it is never registered or allocated.
-
-    This trait is the single source of truth for "spec-only": a new spec-only handler simply
-    mixes it in, with no change to the transform. It is mixed in as a *sibling* of the concrete
-    base (e.g. ``StateResourceHandler``) so it does not perturb ``isinstance`` checks against
-    ``SSMResourceHandler`` / ``CausalConvResourceHandler``, and carries no ``__init__`` so the
-    concrete base's initializer is used unchanged.
-
-    NOTE: the trait governs the spec-OFF direction only. With spec decoding ON, carrying this
-    trait does not imply the resource is bound by the cache manager: e.g. when the Mamba
-    n_groups constraint fails, an intermediate conv handler legitimately falls through to local
-    (unmanaged) allocation. The spec-aware binding guards in ``CachedSequenceInterface`` must
-    therefore NOT be turned into "a spec-only handler must be manager-bound" assertions.
-    """
+    """Trait mixin marking a resource that is only needed when speculative decoding is enabled."""
 
 
 class SSMResourceHandler(StateResourceHandler):
@@ -2138,8 +2119,7 @@ class IntermediateSSMStateHandler(SpeculativeOnly, StateResourceHandler):
 
     Inherits from StateResourceHandler (not SSMResourceHandler) so that
     isinstance(h, SSMResourceHandler) returns False for intermediate handlers, eliminating
-    the need for exclusion guards throughout the codebase. Mixes in SpeculativeOnly so the
-    kvcache transform drops it to None when spec decoding is off.
+    the need for exclusion guards throughout the codebase. Mixes in SpeculativeOnly.
     """
 
     def __init__(
@@ -2322,7 +2302,7 @@ class IntermediateConvStateHandler(SpeculativeOnly, StateResourceHandler):
 
     Inherits from StateResourceHandler (not CausalConvResourceHandler) so that
     isinstance(h, CausalConvResourceHandler) returns False for intermediate handlers. Mixes in
-    SpeculativeOnly so the kvcache transform drops it to None when spec decoding is off.
+    SpeculativeOnly.
     """
 
     def __init__(

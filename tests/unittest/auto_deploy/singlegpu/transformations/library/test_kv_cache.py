@@ -1262,24 +1262,24 @@ def test_gate_when_spec_off():
     """Spec decoding off: speculative-only handlers are dropped to None; base handlers are kept."""
     # Dropped: every speculative-only handler becomes the None sentinel (never registered).
     for handler in _speculative_only_handlers():
-        result = _InsertCachedOperator._suppress_speculative_when_no_spec(handler, None)
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, None)
         assert result is None, f"{type(handler).__name__} should be dropped when spec is off"
 
     # Kept: base (non-speculative) handlers pass through unchanged.
     for handler in _non_speculative_handlers():
-        result = _InsertCachedOperator._suppress_speculative_when_no_spec(handler, None)
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, None)
         assert result is handler, f"{type(handler).__name__} should be kept when spec is off"
 
     # An existing None sentinel passes through unchanged.
-    assert _InsertCachedOperator._suppress_speculative_when_no_spec(None, None) is None
+    assert _InsertCachedOperator._suppress_spec_handlers_maybe(None, None) is None
 
 
 def test_gate_when_spec_on():
     """Spec decoding on: nothing is dropped — speculative-only AND base handlers are all kept."""
     spec_config = object()  # any non-None spec config
     for handler in _speculative_only_handlers() + _non_speculative_handlers():
-        result = _InsertCachedOperator._suppress_speculative_when_no_spec(handler, spec_config)
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, spec_config)
         assert result is handler, f"{type(handler).__name__} should be kept when spec is on"
 
     # The None sentinel passes through unchanged regardless of spec state.
-    assert _InsertCachedOperator._suppress_speculative_when_no_spec(None, spec_config) is None
+    assert _InsertCachedOperator._suppress_spec_handlers_maybe(None, spec_config) is None
