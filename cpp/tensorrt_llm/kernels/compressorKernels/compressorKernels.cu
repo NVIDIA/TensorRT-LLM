@@ -831,7 +831,7 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     constexpr int NTHRD_INNER = NTHRD_BASE / HEAD_BLOCKS;
     constexpr int ELEM_PER_BLOCK = NTHRD_INNER * VEC;
 
-    int const tid = (HEAD_BLOCKS == 1 && NUM_RED_WARPS == 1) ? threadIdx.x : (threadIdx.x % NTHRD_INNER);
+    int const tid = threadIdx.x % NTHRD_INNER;
     int const red_warp = (NUM_RED_WARPS == 1) ? 0 : (threadIdx.x / NTHRD_INNER);
     int const batch_idx = blockIdx.x;
     int const local_output_idx = blockIdx.y;
