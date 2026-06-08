@@ -618,7 +618,14 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
 
 
 class TestTelemetryConfigPrecedence:
-    """Test that telemetry config follows: default < YAML < CLI precedence."""
+    """Telemetry-config precedence in the merge helper.
+
+    Two modes are exercised:
+    - `explicit_cli_keys is None` (legacy / programmatic): YAML wins on
+      conflicts; `usage_context` carve-out still applies.
+    - `explicit_cli_keys` provided (CLI mode): explicit keys win on
+      conflicts; see `TestExplicitCliKeysPrecedence` for that path.
+    """
 
     def test_default_telemetry_config_preserved_when_no_yaml(self):
         """Default telemetry_config survives YAML merge when YAML has none."""
@@ -679,8 +686,15 @@ class TestTelemetryConfigPrecedence:
         assert tc.usage_context == UsageContext.CLI_SERVE
         assert tc.disabled is True
 
-    def test_cli_disabled_overrides_yaml_enabled(self):
-        """CLI --telemetry-disabled wins over YAML disabled=false."""
+    def test_cli_disabled_overrides_yaml_enabled_legacy_fixup(self):
+        """Legacy post-merge fixup pattern (preserved for back-compat).
+
+        This exercises the pre-`explicit_cli_keys` flow where the CLI entry
+        point overrode `disabled` after the merge by hand. The CLI tools no
+        longer use this pattern (they pass `explicit_cli_keys={"telemetry"}`
+        instead — see `TestExplicitCliKeysPrecedence`), but third-party
+        callers may still build the merge this way.
+        """
         from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
         base = {
             "model":
@@ -691,7 +705,6 @@ class TestTelemetryConfigPrecedence:
         }
         yaml_dict = {"telemetry_config": {"disabled": False}}
         merged = update_llm_args_with_extra_dict(base, yaml_dict)
-        # Simulate CLI --no-telemetry (as done in eval.py / serve.py)
         telemetry = False
         if not telemetry:
             merged["telemetry_config"] = merged["telemetry_config"].model_copy(
@@ -701,7 +714,7 @@ class TestTelemetryConfigPrecedence:
         assert tc.usage_context == UsageContext.CLI_EVAL
 
     def test_yaml_disabled_respected_when_cli_not_set(self):
-        """When CLI doesn't set --no-telemetry, YAML disabled=true is kept."""
+        """YAML disabled=true is honored when explicit_cli_keys is None."""
         from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
         base = {
             "model":
@@ -712,11 +725,6 @@ class TestTelemetryConfigPrecedence:
         }
         yaml_dict = {"telemetry_config": {"disabled": True}}
         merged = update_llm_args_with_extra_dict(base, yaml_dict)
-        # CLI flag not set (--telemetry is default True) — no override
-        telemetry = True
-        if not telemetry:
-            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
-                update={"disabled": True})
         tc = merged["telemetry_config"]
         assert tc.disabled is True
         assert tc.usage_context == UsageContext.CLI_SERVE
@@ -738,6 +746,270 @@ class TestTelemetryConfigPrecedence:
         assert isinstance(tc, TelemetryConfig)
         assert tc.usage_context == UsageContext.CLI_SERVE
         assert tc.disabled is False
+
+
+class TestExplicitCliKeysPrecedence:
+    """`explicit_cli_keys` makes the CLI side win over YAML on conflicts."""
+
+    def test_explicit_cli_key_wins_over_yaml_scalar(self):
+        base = {"model": "dummy", "tensor_parallel_size": 4}
+        yaml_dict = {"tensor_parallel_size": 8}
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"tensor_parallel_size"})
+        assert merged["tensor_parallel_size"] == 4
+
+    def test_non_explicit_value_loses_to_yaml_scalar(self):
+        # Backward-compat: when explicit_cli_keys is None, today's "YAML wins"
+        # behavior is preserved.
+        base = {"model": "dummy", "tensor_parallel_size": 4}
+        yaml_dict = {"tensor_parallel_size": 8}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        assert merged["tensor_parallel_size"] == 8
+
+    def test_kv_cache_config_explicit_field_wins_yaml_siblings_preserved(self):
+        # CLI builds a KvCacheConfig from --free_gpu_memory_fraction; YAML
+        # provides a partial kv_cache_config with sibling fields that should
+        # survive the merge.
+        base = {
+            "model": "dummy",
+            "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.85),
+        }
+        yaml_dict = {
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+            }
+        }
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"free_gpu_memory_fraction"})
+        kv = merged["kv_cache_config"]
+        assert kv.free_gpu_memory_fraction == 0.85
+        assert kv.enable_block_reuse is False
+
+    def test_build_config_tier_cli_wins(self):
+        # Tier 1: explicit CLI scalar wins over both top-level YAML and nested.
+        base = {
+            "model": "dummy",
+            "max_batch_size": 64,
+            "build_config": BuildConfig(max_batch_size=64),
+        }
+        yaml_dict = {
+            "max_batch_size": 256,
+            "build_config": {
+                "max_batch_size": 300
+            },
+        }
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"max_batch_size"})
+        assert merged["max_batch_size"] == 64
+        assert merged["build_config"].max_batch_size == 64
+
+    def test_build_config_tier_yaml_top_level_wins(self):
+        # Tier 2: no explicit CLI, but YAML top-level scalar -> propagate to
+        # build_config (legacy behavior).
+        base = {
+            "model": "dummy",
+            "build_config": BuildConfig(max_batch_size=8),
+        }
+        yaml_dict = {"max_batch_size": 256}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        assert merged["max_batch_size"] == 256
+        assert merged["build_config"].max_batch_size == 256
+
+    def test_build_config_tier_yaml_nested_only_leaves_alone(self):
+        # Tier 3: no explicit CLI, no top-level YAML scalar; nested YAML
+        # build_config is imported by the outer merge.
+        base = {
+            "model": "dummy",
+            "build_config": BuildConfig(max_batch_size=8),
+        }
+        yaml_dict = {"build_config": {"max_batch_size": 256}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        assert merged["build_config"].max_batch_size == 256
+
+    def test_telemetry_explicit_disabled_wins_over_yaml(self):
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=True,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": False}}
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"telemetry"})
+        assert merged["telemetry_config"].disabled is True
+
+    def test_kv_cache_dtype_explicit_wins_over_yaml(self):
+        # Mirrors the kv_cache_config tier-2 path for the second mapped CLI
+        # scalar (`--kv_cache_dtype` -> `kv_cache_config.dtype`).
+        base = {
+            "model": "dummy",
+            "kv_cache_config": KvCacheConfig(dtype="fp8"),
+        }
+        yaml_dict = {"kv_cache_config": {"dtype": "auto"}}
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"kv_cache_dtype"})
+        assert merged["kv_cache_config"].dtype == "fp8"
+
+    def test_enable_block_reuse_explicit_wins_over_yaml(self):
+        # Mirrors the kv_cache_config tier-2 path for `--disable_kv_cache_reuse`,
+        # which translates to `enable_block_reuse` in explicit_cli_keys.
+        base = {
+            "model": "dummy",
+            "kv_cache_config": KvCacheConfig(enable_block_reuse=False),
+        }
+        yaml_dict = {"kv_cache_config": {"enable_block_reuse": True}}
+        merged = update_llm_args_with_extra_dict(
+            base, yaml_dict, explicit_cli_keys={"enable_block_reuse"})
+        assert merged["kv_cache_config"].enable_block_reuse is False
+
+
+class TestEvalTranslationMap:
+    """eval's _CLICK_TO_LLM_ARG via the shared helper."""
+
+    def _collect(self, click_param_names):
+        """Simulate a Click ctx with the given params explicitly set."""
+        import click as _click
+
+        from tensorrt_llm.commands import eval as eval_mod
+        from tensorrt_llm.commands.utils import collect_explicit_cli_keys
+
+        class _FakeCtx:
+            params = {name: object() for name in click_param_names}
+
+            @staticmethod
+            def get_parameter_source(name):
+                from click.core import ParameterSource
+                return ParameterSource.COMMANDLINE
+
+        original = _click.get_current_context
+        _click.get_current_context = lambda: _FakeCtx
+        try:
+            return collect_explicit_cli_keys(
+                exclude=("extra_llm_api_options", "config"),
+                translate=eval_mod._CLICK_TO_LLM_ARG)
+        finally:
+            _click.get_current_context = original
+
+    @pytest.mark.parametrize(
+        "click_name,expected",
+        [
+            ("tp_size", "tensor_parallel_size"),
+            ("pp_size", "pipeline_parallel_size"),
+            ("ep_size", "moe_expert_parallel_size"),
+            ("kv_cache_free_gpu_memory_fraction", "free_gpu_memory_fraction"),
+            ("disable_kv_cache_reuse", "enable_block_reuse"),
+            ("max_batch_size", "max_batch_size"),  # unmapped: identity
+        ])
+    def test_translation(self, click_name, expected):
+        assert expected in self._collect({click_name})
+
+    def test_meta_flags_excluded(self):
+        assert self._collect({"extra_llm_api_options", "config"}) == set()
+
+
+class TestBenchTranslationMap:
+    """`collect_explicit_cli_keys` in bench.benchmark rewrites Click param names."""
+
+    def _collect(self, click_param_names):
+        import click as _click
+
+        from tensorrt_llm.bench import benchmark as bench_mod
+
+        class _FakeCtx:
+            params = {name: object() for name in click_param_names}
+
+            @staticmethod
+            def get_parameter_source(name):
+                from click.core import ParameterSource
+                return ParameterSource.COMMANDLINE
+
+        # `bench_mod.collect_explicit_cli_keys()` calls `click.get_current_context()`.
+        original = _click.get_current_context
+        _click.get_current_context = lambda: _FakeCtx
+        try:
+            return bench_mod.collect_explicit_cli_keys()
+        finally:
+            _click.get_current_context = original
+
+    @pytest.mark.parametrize(
+        "click_name,expected",
+        [
+            ("tp", "tensor_parallel_size"),
+            ("pp", "pipeline_parallel_size"),
+            ("ep", "moe_expert_parallel_size"),
+            ("cluster_size", "moe_cluster_parallel_size"),
+            ("kv_cache_free_gpu_mem_fraction", "free_gpu_memory_fraction"),
+            ("enable_chunked_context", "enable_chunked_prefill"),
+            ("max_batch_size", "max_batch_size"),  # unmapped: identity
+        ])
+    def test_translation(self, click_name, expected):
+        assert expected in self._collect({click_name})
+
+    def test_beam_width_does_not_participate(self):
+        # `--beam_width` is a SamplingParams flag, not an llm_args field, so
+        # it must be left out of the translation map. Otherwise an explicit
+        # `--beam_width N` would silently drop YAML's `max_beam_width`
+        # without anything in llm_args to replace it.
+        explicit = self._collect({"beam_width"})
+        assert "max_beam_width" not in explicit
+        assert "beam_width" in explicit
+
+    def test_meta_flags_excluded(self):
+        assert self._collect({"extra_llm_api_options", "config"}) == set()
+
+
+class TestDisaggLauncherKwargsPreservation:
+    """Regression tests for `_build_llm_args_from_disagg_server_cfg`.
+
+    The disagg launcher takes a single `server_cfg.other_args` dict and
+    must produce an llm_args dict that contains every user-set field —
+    including kwargs that fell through `get_llm_args`'s named signature
+    into its `**llm_args_extra_dict` catch-all (e.g. `quant_config`,
+    `lora_config`, `pytorch_backend_config`).
+    """
+
+    def test_extra_kwargs_survive(self):
+        from tensorrt_llm.commands.serve import \
+            _build_llm_args_from_disagg_server_cfg
+
+        other_args = {
+            "model": llama_model_path,
+            "backend": "pytorch",
+            "tensor_parallel_size": 1,
+            "gpus_per_node": 1,
+            # These do not match get_llm_args's named params; they go into
+            # **llm_args_extra_dict and must reach the LLM constructor.
+            "quant_config": {
+                "quant_algo": "FP8"
+            },
+            "lora_config": {
+                "lora_dir": ["/tmp/lora-test"]
+            },
+        }
+
+        final = _build_llm_args_from_disagg_server_cfg(other_args)
+
+        assert "quant_config" in final
+        assert "lora_config" in final
+        assert isinstance(final["quant_config"], QuantConfig)
+        assert isinstance(final["lora_config"], LoraConfig)
+
+    def test_default_valued_named_params_survive(self):
+        """A disagg-YAML field equal to its LlmArgs class default survives."""
+        from tensorrt_llm.commands.serve import \
+            _build_llm_args_from_disagg_server_cfg
+
+        other_args = {
+            "model": llama_model_path,
+            "backend": "pytorch",
+            "tensor_parallel_size": 1,  # equals LlmArgs class default
+            "gpus_per_node": 1,
+        }
+        final = _build_llm_args_from_disagg_server_cfg(other_args)
+        assert final.get("tensor_parallel_size") == 1
 
 
 class TestTorchLlmArgsCudaGraphSettings:
@@ -1485,89 +1757,121 @@ class TestStrictBaseModelArbitraryArgs:
 class TestServeDefaults:
 
     def test_serve_get_llm_args_preserves_model_defaults(self):
-        # Get llm_args with default values (simulating serve.py behavior)
+        # No explicit CLI flags: only required params and serve-side defaults
+        # reach the constructor; everything else is left for YAML / model
+        # defaults to provide.
         llm_args, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
-            # Don't pass parameters to test default behavior
         )
 
-        # Verify that required params are present
         assert "model" in llm_args
         assert "backend" in llm_args
         assert "postprocess_tokenizer_dir" in llm_args
 
-        # For PyTorch backend, build_config and scheduler_config should NOT be included
+        # PyTorch backend: build_config / scheduler_config stay None and are
+        # filtered out.
         assert "build_config" not in llm_args
         assert "scheduler_config" not in llm_args
 
-        # Test that when we DO pass values, they're included appropriately
+        # Explicit CLI flags survive the filter.
         llm_args_with_values, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
-            max_batch_size=128,  # Non-default value
-            tensor_parallel_size=4,  # Non-default value
+            max_batch_size=128,
+            tensor_parallel_size=4,
+            explicit_cli_keys={"max_batch_size", "tensor_parallel_size"},
         )
         assert llm_args_with_values.get("max_batch_size") == 128
         assert llm_args_with_values.get("tensor_parallel_size") == 4
 
     def test_serve_filters_default_values(self):
-        # Test with all defaults for PyTorch backend
+        # All defaults, no explicit CLI flags.
         llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
 
-        # Should only include required params
         assert "model" in llm_args
         assert "backend" in llm_args
         assert "postprocess_tokenizer_dir" in llm_args
 
-        # Should NOT include build_config or scheduler_config for PyTorch
         assert "build_config" not in llm_args
         assert "scheduler_config" not in llm_args
 
-        # Test with custom values
+        # Custom values survive only when listed in explicit_cli_keys.
         llm_args, _ = get_llm_args(
             model=llama_model_path,
             backend="pytorch",
-            max_batch_size=128,  # Non-default value
-            tensor_parallel_size=4,  # Non-default value
+            max_batch_size=128,
+            tensor_parallel_size=4,
+            explicit_cli_keys={"max_batch_size", "tensor_parallel_size"},
         )
 
-        # Custom values should be included
         assert llm_args.get("max_batch_size") == 128
         assert llm_args.get("tensor_parallel_size") == 4
 
     def test_serve_backend_specific_configs(self):
-        # Test PyTorch backend
+        # PyTorch backend: build_config / scheduler_config stay None and are
+        # filtered out.
         llm_args_pytorch, _ = get_llm_args(model=llama_model_path,
                                            backend="pytorch")
         assert "build_config" not in llm_args_pytorch
         assert "scheduler_config" not in llm_args_pytorch
 
-        # Test TensorRT backend
+        # TensorRT backend: both are non-None and differ from the LlmArgs
+        # class default, so the value-based filter keeps them.
         llm_args_trt, _ = get_llm_args(model=llama_model_path,
                                        backend="tensorrt")
         assert "build_config" in llm_args_trt
         assert "scheduler_config" in llm_args_trt
 
+    def test_serve_explicit_cli_default_value_wins_over_yaml(self):
+        """Typing --tensor_parallel_size 1 (the default) must beat YAML."""
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            tensor_parallel_size=1,
+            explicit_cli_keys={"tensor_parallel_size"},
+        )
+        # The CLI value lands in llm_args because it is explicit.
+        assert llm_args["tensor_parallel_size"] == 1
+        merged = update_llm_args_with_extra_dict(
+            llm_args,
+            {"tensor_parallel_size": 8},
+            explicit_cli_keys={"tensor_parallel_size"},
+        )
+        assert merged["tensor_parallel_size"] == 1
+
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
-        assert is_non_default_or_required("model", "test-model", "pytorch")
-        assert is_non_default_or_required("backend", "pytorch", "pytorch")
+        assert is_non_default_or_required("model", "test-model", "pytorch",
+                                          set())
+        assert is_non_default_or_required("backend", "pytorch", "pytorch",
+                                          set())
         assert is_non_default_or_required("tokenizer", "test-tokenizer",
-                                          "pytorch")
+                                          "pytorch", set())
 
         # Test None values
-        assert not is_non_default_or_required("max_batch_size", None, "pytorch")
+        assert not is_non_default_or_required("max_batch_size", None, "pytorch",
+                                              set())
 
         # Test default values (should return False)
         assert not is_non_default_or_required("tensor_parallel_size", 1,
-                                              "pytorch")
+                                              "pytorch", set())
         assert not is_non_default_or_required("pipeline_parallel_size", 1,
-                                              "pytorch")
+                                              "pytorch", set())
 
         # Test non-default values (should return True)
-        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch")
-        assert is_non_default_or_required("max_batch_size", 128, "pytorch")
+        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch",
+                                          set())
+        assert is_non_default_or_required("max_batch_size", 128, "pytorch",
+                                          set())
+
+        # Test explicit CLI source overrides the default-equals-value check
+        assert is_non_default_or_required("tensor_parallel_size", 1, "pytorch",
+                                          {"tensor_parallel_size"})
+        # Test CLI-derived field (--free_gpu_memory_fraction -> kv_cache_config)
+        assert is_non_default_or_required("kv_cache_config", KvCacheConfig(),
+                                          "pytorch",
+                                          {"free_gpu_memory_fraction"})
 
 
 class TestPyTorchBackendModelDefaults:

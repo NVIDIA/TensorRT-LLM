@@ -54,6 +54,7 @@ from tensorrt_llm.mapping import Mapping
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
+from ..utils.cuda_graph import BypassCapturedGraphs
 from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
@@ -127,6 +128,15 @@ def maybe_pad_for_cuda_graph(func):
         def _call_func():
             return func(self, scheduled_requests, resource_manager, *args, **kwargs)
 
+        def _call_func_eager():
+            # When this wrapper has decided that all ranks must run eager, also force
+            # the inner cudagraph backend to bypass captured graphs. Otherwise, ranks
+            # whose shapes happen to match a captured graph would still replay and
+            # use stale capture-time scalar kernel args (e.g. runtime_max_tokens_per_rank
+            # baked from local total at capture, vs cross-rank max read fresh in eager).
+            with BypassCapturedGraphs():
+                return _call_func()
+
         # check conditions for current rank
         can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
@@ -158,7 +168,7 @@ def maybe_pad_for_cuda_graph(func):
         can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
 
         if not can_run_cuda_graph_all:
-            return _call_func()
+            return _call_func_eager()
 
         # get closest cudagraph batch size based on max_batch_size across ALL ranks
         # NOTE: we assume uniform cudagraph batch sizes across all ranks ensuring all ranks get the
@@ -167,14 +177,14 @@ def maybe_pad_for_cuda_graph(func):
         cg_batch_size = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
 
         if cg_batch_size is None:
-            return _call_func()
+            return _call_func_eager()
 
         # let's check if all ranks can pad the batch if they need to
         can_pad_all = all(r_info[1] or (r_info[2] == cg_batch_size) for r_info in all_rank_info)
 
         # fall back if we cannot run cudagraph due to padding issues
         if not can_pad_all:
-            return _call_func()
+            return _call_func_eager()
 
         # check actual amount of padding needed
         num_padding = cg_batch_size - batch_size
@@ -394,11 +404,6 @@ class ADEngine(ModelEngine):
         self.llm_args.print_iter_log = reporting_info.print_log
         self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
-        self.llm_args.stream_interval = 1
-        self.llm_args.attention_dp_config = None
-        self.llm_args.batch_wait_timeout_ms = 0
-        self.llm_args.batch_wait_timeout_iters = 0
-        self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
@@ -408,12 +413,22 @@ class ADEngine(ModelEngine):
         self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
 
         if ad_config is not None:
+            self.llm_args.stream_interval = ad_config.stream_interval
+            self.llm_args.attention_dp_config = ad_config.attention_dp_config
+            self.llm_args.batch_wait_timeout_ms = ad_config.batch_wait_timeout_ms
+            self.llm_args.batch_wait_timeout_iters = ad_config.batch_wait_timeout_iters
+            self.llm_args.batch_wait_max_tokens_ratio = ad_config.batch_wait_max_tokens_ratio
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
             self.llm_args.max_stats_len = ad_config.max_stats_len
             self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
+            self.llm_args.stream_interval = 1
+            self.llm_args.attention_dp_config = None
+            self.llm_args.batch_wait_timeout_ms = 0
+            self.llm_args.batch_wait_timeout_iters = 0
+            self.llm_args.batch_wait_max_tokens_ratio = 0.0
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
@@ -942,6 +957,20 @@ class ADEngine(ModelEngine):
             scheduled_requests, resource_manager, new_tokens, new_tokens_lens, gather_context_logits
         )
         self.iter_counter += 1
+
+        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 14
+        # (``max_dp_num_tokens``). Mirrors base TRT-LLM's pattern in
+        # ``model_engine._get_all_rank_num_tokens``: MoE all-to-all needs the
+        # cross-rank max to size dispatch padding without over-padding to the
+        # static config ``max_num_tokens``. ``nest_sequences`` already
+        # initialized slot 14 to the local ``total_num_tokens``; this overrides
+        # with the cross-rank max only when attention-DP requires it.
+        if self.enable_attention_dp and self.dist_config.tp_size > 1:
+            assert self.dist is not None, "Distributed object is required for attention DP mode"
+            info = self.cache_seq_interface.info
+            local_total_num_tokens = info.batch_info.get_total_num_tokens()
+            all_rank_num_tokens = list(self.dist.tp_allgather(local_total_num_tokens))
+            info.batch_info.update_max_dp_num_tokens(max(all_rank_num_tokens))
 
         # compute outputs
         outputs = self._run_forward()

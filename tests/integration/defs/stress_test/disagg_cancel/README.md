@@ -19,14 +19,15 @@ land incrementally:
 | Thread | Status |
 |--------|--------|
 | `log_scanner_thread` | Implemented — hard-zero log fail-fast |
-| `metrics_thread` | Stub (Step 2) |
+| `metrics_thread` | Implemented — `trtllm_kv_cache_utilization` scraper |
 | `injector_thread` | Implemented — SIGSTOP/SIGCONT/SIGKILL + respawn |
-| `canary_thread` | Stub |
+| `canary_thread` | Implemented — greedy canaries + token-equivalence |
 | `load_thread` | Stub |
 
-Component-level coverage: `test_log_scanner.py`, `test_injector.py`.
-The parametrized marathon pytest still runs a lifecycle smoke until
-`setup()` launches a real cluster and the remaining threads are wired.
+Component-level coverage: `test_log_scanner.py`, `test_metrics_thread.py`,
+`test_injector.py`, `test_canary.py`. The parametrized marathon pytest
+still runs a lifecycle smoke until `setup()` launches a real cluster
+and the remaining thread (`load`) is wired.
 
 ## File layout
 
@@ -37,7 +38,9 @@ tests/integration/defs/stress_test/disagg_cancel/
 ├── harness.py                      (DisaggCancellationStressHarness)
 ├── test_disagg_cancel_stress.py    (pytest entry point)
 ├── test_log_scanner.py             (log_scanner unit tests)
+├── test_metrics_thread.py          (metrics_thread unit tests)
 ├── test_injector.py                (injector unit tests)
+├── test_canary.py                  (canary_thread unit tests)
 └── configs/
     ├── README.md                   (YAML schema + how to add a config)
     ├── marathon_cpp_v1_deepseek.yaml
@@ -74,15 +77,21 @@ cd /path/to/TensorRT-LLM
 
 export PYTHONPATH=tests/integration/defs:tests/integration/defs/disaggregated
 
+# Step 4 — canary thread (greedy canaries + token-equivalence)
+python3 -m pytest -c /dev/null -o addopts= \
+  --confcutdir=tests/integration/defs/stress_test \
+  tests/integration/defs/stress_test/disagg_cancel/test_canary.py -v
+
 # Step 3 — injector thread (SIGSTOP / SIGCONT / SIGKILL + respawn)
 python3 -m pytest -c /dev/null -o addopts= \
   --confcutdir=tests/integration/defs/stress_test \
   tests/integration/defs/stress_test/disagg_cancel/test_injector.py -v
 
-# Step 1 — log scanner (optional sanity alongside injector PR)
+# Steps 1-2 — log scanner + metrics (optional sanity)
 python3 -m pytest -c /dev/null -o addopts= \
   --confcutdir=tests/integration/defs/stress_test \
-  tests/integration/defs/stress_test/disagg_cancel/test_log_scanner.py -v
+  tests/integration/defs/stress_test/disagg_cancel/test_log_scanner.py \
+  tests/integration/defs/stress_test/disagg_cancel/test_metrics_thread.py -v
 
 # Marathon YAML parse/validate (includes stress_config.injections schedule)
 python3 -m pytest -c /dev/null -o addopts= \
@@ -95,9 +104,7 @@ All three together:
 ```bash
 python3 -m pytest -c /dev/null -o addopts= \
   --confcutdir=tests/integration/defs/stress_test \
-  tests/integration/defs/stress_test/disagg_cancel/test_injector.py \
-  tests/integration/defs/stress_test/disagg_cancel/test_log_scanner.py \
-  tests/integration/defs/stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_all_marathon_yamls_parse_and_validate -q
+  tests/integration/defs/stress_test/disagg_cancel/ -q
 ```
 
 In a full TRT-LLM dev container/venv (with `transformers` installed),
