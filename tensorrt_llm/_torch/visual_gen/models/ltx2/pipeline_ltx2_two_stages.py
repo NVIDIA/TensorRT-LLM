@@ -7,12 +7,13 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import safetensors.torch
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise, quantize_nvfp4
@@ -39,6 +40,7 @@ from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
 from .pipeline_ltx2 import (
     LTX2Pipeline,
+    _LTX2CUDAGraphRunner,
     _assert_resolution,
     _find_safetensors_files,
     _prefetch_ltx2_safetensors_files,
@@ -872,6 +874,24 @@ class _PersistentLoRAWeightCache:
         return counts
 
 
+class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
+    """CUDA graph runner keyed by LTX-2 two-stage LoRA weight state."""
+
+    def __init__(
+        self,
+        config: CUDAGraphRunnerConfig,
+        lora_state_getter: Callable[[], str],
+    ) -> None:
+        super().__init__(config)
+        self._lora_state_getter = lora_state_getter
+
+    def get_graph_key(self, *args, **kwargs):
+        return (
+            *super().get_graph_key(*args, **kwargs),
+            ("ltx2_two_stage_lora_state", self._lora_state_getter()),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -895,6 +915,26 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     @property
     def common_warmup_shapes(self) -> list:
         return [(512, 768, 121)]
+
+    def _current_lora_cuda_graph_state(self) -> str:
+        return getattr(self, "_lora_cuda_graph_state", "original")
+
+    def _setup_cuda_graphs(self):
+        """Wrap transformer.forward with a LoRA-state-aware CUDA graph key."""
+        if not self.model_config.cuda_graph.enable:
+            return
+
+        runner = _LTX2TwoStageCUDAGraphRunner(
+            CUDAGraphRunnerConfig(use_cuda_graph=True),
+            self._current_lora_cuda_graph_state,
+        )
+        compile_note = " (with torch.compile)" if self.model_config.torch_compile.enable else ""
+        logger.info(
+            "CUDA graph runner: wrapping LTX-2 two-stage transformer.forward "
+            f"with LoRA state key{compile_note}"
+        )
+        self.transformer.forward = runner.wrap(self.transformer.forward)
+        self._cuda_graph_runners["transformer"] = runner
 
     # ------------------------------------------------------------------
     # Component loading
@@ -1057,6 +1097,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                  → decode.
         """
         # Optional prompt enhancement (applied once and reused for both stages).
+        self._lora_cuda_graph_state = "original"
         if enhance_prompt:
             logger.info("Enhancing prompt with Gemma3 (two-stage)...")
             prompt_text = prompt if isinstance(prompt, str) else prompt[0]
@@ -1138,10 +1179,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         saved_lora_state: Dict[str, Any] = {}
         snapshot_required = 0
         n = 0
+        dense_lora_merge_completed = False
         stage2_start = time.time()
         try:
             if using_persistent_lora:
                 lora_cache.bind_merged()
+                self._lora_cuda_graph_state = "merged"
                 n = lora_cache.applied_count
                 logger.info(f"Bound persistent distilled LoRA ({n} params) for stage 2")
             else:
@@ -1157,6 +1200,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     sign=1.0,
                     save_bf16_weights=save_bf16_weights,
                 )
+                dense_lora_merge_completed = True
+                self._lora_cuda_graph_state = "merged"
                 logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
 
             # Disable Ulysses for Stage 2: only rank 0 is active, so
@@ -1181,8 +1226,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             self.transformer.set_ulysses_enabled(True)
             if using_persistent_lora:
                 lora_cache.bind_original()
+                self._lora_cuda_graph_state = "original"
                 logger.info("Re-bound persistent distilled LoRA original weights after stage 2")
-            else:
+            elif dense_lora_merge_completed:
                 if snapshot_required and not saved_lora_state:
                     raise RuntimeError(
                         "LoRA state was not saved; cannot safely restore stage 2 weights."
@@ -1207,7 +1253,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     raise RuntimeError(
                         f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
                     )
+                self._lora_cuda_graph_state = "original"
                 logger.info("Un-merged distilled LoRA after stage 2")
+            else:
+                self._lora_cuda_graph_state = "original"
 
         # ================================================================
         # Decode

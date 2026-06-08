@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Integration tests for LTX2 pipelines.
 
 Tests cover:
@@ -1155,6 +1158,22 @@ class TestLTX2TwoStageLoRAHelpers:
         )
         assert queried_devices == ["cuda:1"]
 
+    def test_two_stage_cuda_graph_key_includes_lora_state(self):
+        """Original and merged LoRA bindings must not share CUDA graph keys."""
+        lora_state = {"value": "original"}
+        runner = ltx2_two_stages._LTX2TwoStageCUDAGraphRunner(
+            ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
+            lambda: lora_state["value"],
+        )
+
+        original_key = runner.get_graph_key(torch.empty(1, 2))
+        lora_state["value"] = "merged"
+        merged_key = runner.get_graph_key(torch.empty(1, 2))
+
+        assert original_key != merged_key
+        assert original_key[-1] == ("ltx2_two_stage_lora_state", "original")
+        assert merged_key[-1] == ("ltx2_two_stage_lora_state", "merged")
+
     def test_persistent_bf16_cache_reuses_weight_storage(self):
         """Persistent BF16 cache swaps between the same original and merged tensors."""
 
@@ -1221,6 +1240,10 @@ class TestLTX2TwoStageLoRAHelpers:
         module = TinyModule()
         original_weight = module.proj.weight.detach().clone()
         original_scale = module.proj.weight_scale.detach().clone()
+        original_bf16 = ltx2_two_stages._dequantize_fp8_weight(
+            original_weight,
+            original_scale,
+        )
         delta = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
 
         cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
@@ -1238,6 +1261,16 @@ class TestLTX2TwoStageLoRAHelpers:
         assert merged_weight_ptr != original_weight_ptr
         assert merged_scale_ptr != original_scale_ptr
         assert module.proj.weight.dtype == torch.float8_e4m3fn
+        merged_bf16 = ltx2_two_stages._dequantize_fp8_weight(
+            module.proj.weight,
+            module.proj.weight_scale,
+        )
+        assert torch.allclose(
+            merged_bf16,
+            original_bf16 + delta,
+            atol=1e-1,
+            rtol=1e-1,
+        )
 
         cache.bind_original()
         assert module.proj.weight.data_ptr() == original_weight_ptr
@@ -1350,7 +1383,7 @@ class TestLTX2TwoStageLoRAHelpers:
             "bad": torch.ones((2, 2), dtype=torch.bfloat16),
         }
 
-        with pytest.raises(RuntimeError, match="missing bad.weight_scale"):
+        with pytest.raises(RuntimeError, match=r"missing bad\.weight_scale"):
             ltx2_two_stages._apply_lora_deltas(
                 module,
                 deltas,
