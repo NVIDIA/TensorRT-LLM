@@ -344,6 +344,7 @@ class Cosmos3CrossAttention(Attention):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        real_text_lens: Optional[list[int]],
     ) -> torch.Tensor:
         """
         Args:
@@ -367,15 +368,31 @@ class Cosmos3CrossAttention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        k_all = torch.cat([k_und, k], dim=1).contiguous()
-        v_all = torch.cat([v_und, v], dim=1).contiguous()
+        if real_text_lens is not None and batch_size > 1:
+            outs = []
+            for b in range(batch_size):
+                Lb = int(real_text_lens[b])
+                k_all_b = torch.cat([k_und[b : b + 1, :Lb], k[b : b + 1]], dim=1)
+                v_all_b = torch.cat([v_und[b : b + 1, :Lb], v[b : b + 1]], dim=1)
+                outs.append(
+                    self._attn_impl(
+                        q[b : b + 1],
+                        k_all_b,
+                        v_all_b,
+                        attention_mask=PredefinedAttentionMask.FULL,
+                    )
+                )
+            out = torch.cat(outs, dim=0)
+        else:
+            k_all = torch.cat([k_und, k], dim=1).contiguous()
+            v_all = torch.cat([v_und, v], dim=1).contiguous()
 
-        out = self._attn_impl(
-            q,
-            k_all,
-            v_all,
-            attention_mask=PredefinedAttentionMask.FULL,
-        )
+            out = self._attn_impl(
+                q,
+                k_all,
+                v_all,
+                attention_mask=PredefinedAttentionMask.FULL,
+            )
 
         return self.to_out[0](out)
 
@@ -486,6 +503,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         k_und: torch.Tensor,
         v_und: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
+        real_text_lens: Optional[list[int]] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -497,6 +515,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             v_und=v_und,
             freqs_cos=cos,
             freqs_sin=sin,
+            real_text_lens=real_text_lens,
         )
         hidden_states = residual + hidden_states
 
@@ -969,6 +988,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()
+        real_text_lens = text_mask.sum(dim=1).tolist()
 
         hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
 
@@ -1060,7 +1080,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             if not self.sharder.is_active:
                 k_und = k_und[:, :max_real_len]
                 v_und = v_und[:, :max_real_len]
-            hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
+                hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen, real_text_lens)
+            else:
+                hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
