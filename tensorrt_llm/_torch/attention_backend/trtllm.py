@@ -1417,10 +1417,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if backends is None:
             backends = {}
             self._fmha_backends = backends
-        backend = backends.get(fmha_cls.capabilities.name)
+        backend = backends.get(fmha_cls)
         if backend is None:
             backend = fmha_cls(attention_layer=self)
-            backends[fmha_cls.capabilities.name] = backend
+            backends[fmha_cls] = backend
         return backend
 
     def _run(

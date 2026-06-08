@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention_backend.fmha import (
     FallbackFmha,
     FmhaFeature,
     FmhaSupportContext,
+    MlaRopeLayout,
 )
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
 from tensorrt_llm._torch.attention_backend.trtllm import iter_enabled_fmha_libs
@@ -53,7 +54,12 @@ def _context(**overrides) -> FmhaSupportContext:
         use_paged_kv_cache=True,
         is_mla_enable=False,
         kv_lora_rank=None,
+        qk_nope_head_dim=None,
         qk_rope_head_dim=None,
+        v_head_dim=None,
+        mla_rope_layout=None,
+        is_fused_qkv=True,
+        update_kv_cache=True,
         has_context_phase=True,
         has_generation_phase=False,
         is_cross_attention=False,
@@ -71,15 +77,15 @@ def _context(**overrides) -> FmhaSupportContext:
 
 def test_default_fmha_order(monkeypatch):
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
-    assert [fmha.capabilities.name for fmha in iter_enabled_fmha_libs()] == [
-        "flashinfer_trtllm_gen",
-        "fallback",
+    assert [fmha.__name__ for fmha in iter_enabled_fmha_libs()] == [
+        "FlashInferTrtllmGenFmha",
+        "FallbackFmha",
     ]
 
 
 def test_fmha_env_delta_disables_flashinfer_but_keeps_fallback(monkeypatch):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "-flashinfer_trtllm_gen,-fallback")
-    assert [fmha.capabilities.name for fmha in iter_enabled_fmha_libs()] == ["fallback"]
+    assert [fmha.__name__ for fmha in iter_enabled_fmha_libs()] == ["FallbackFmha"]
 
 
 def test_fmha_env_delta_raises_unknown_name(monkeypatch):
@@ -90,17 +96,23 @@ def test_fmha_env_delta_raises_unknown_name(monkeypatch):
 
 def test_flashinfer_fmha_uses_declarative_capabilities():
     assert FlashInferTrtllmGenFmha.capabilities is FLASHINFER_TRTLLM_GEN_CAPABILITIES
-    assert FLASHINFER_TRTLLM_GEN_CAPABILITIES.context.head_sizes.values
-    assert FLASHINFER_TRTLLM_GEN_CAPABILITIES.mla.generation_cases
-    assert (576, 512, 32) not in {
-        (case.head_dim_qk, case.head_dim_v, case.tokens_per_block)
-        for case in FLASHINFER_TRTLLM_GEN_CAPABILITIES.mla.generation_cases
+    assert FLASHINFER_TRTLLM_GEN_CAPABILITIES.context.standard.head_size.values
+    assert FLASHINFER_TRTLLM_GEN_CAPABILITIES.generation.mla.generation_cases
+    assert (576, 512, "values=[16, 64]") in {
+        case.describe()
+        for case in FLASHINFER_TRTLLM_GEN_CAPABILITIES.generation.mla.generation_cases
     }
 
 
 def test_fallback_fmha_has_declarative_capabilities():
-    assert FallbackFmha.capabilities.runtime_features == frozenset(FmhaFeature)
-    assert FallbackFmha.capabilities.generation_head_ratios.min_value == 1
+    assert FmhaFeature.cross_attention not in FallbackFmha.capabilities.runtime_features.values
+    assert FallbackFmha.capabilities.context.standard.head_size.values == frozenset(
+        {32, 48, 64, 72, 80, 96, 104, 112, 128, 144, 160, 192, 224, 256}
+    )
+    assert PositionEmbeddingType.deferred not in (
+        FallbackFmha.capabilities.context.standard.position_embedding_type.values
+    )
+    assert FallbackFmha.capabilities.num_heads_per_kv_head.min_value == 1
     assert FallbackFmha.is_supported(
         _context(
             sm=90,
@@ -109,6 +121,83 @@ def test_fallback_fmha_has_declarative_capabilities():
             tokens_per_block=None,
             has_kv_cache_manager=False,
             use_paged_kv_cache=False,
+        )
+    )
+
+
+def test_fallback_capabilities_do_not_accept_standard_head_size_outside_thop_precheck():
+    assert not FallbackFmha.is_supported(_context(head_size=16))
+
+
+def test_fallback_capabilities_do_not_accept_deferred_position_embedding():
+    assert not FallbackFmha.is_supported(
+        _context(position_embedding_type=PositionEmbeddingType.deferred)
+    )
+
+
+def test_fallback_capabilities_do_not_accept_separate_qkv_without_sage_attention():
+    assert not FallbackFmha.is_supported(_context(is_fused_qkv=False))
+
+
+def test_fallback_capabilities_accept_separate_qkv_with_sage_attention():
+    assert FallbackFmha.is_supported(_context(is_fused_qkv=False, use_sage_attention=True))
+
+
+def test_fallback_capabilities_do_not_accept_undeclared_mla_context_dims():
+    assert not FallbackFmha.is_supported(
+        _context(
+            is_mla_enable=True,
+            kv_lora_rank=256,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+            mla_rope_layout=MlaRopeLayout.appended,
+        )
+    )
+
+
+def test_fallback_capabilities_accept_declared_mla_context_dims():
+    assert FallbackFmha.is_supported(
+        _context(
+            is_mla_enable=True,
+            is_fused_qkv=False,
+            head_size=576,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+            mla_rope_layout=MlaRopeLayout.appended,
+        )
+    )
+
+
+def test_fallback_capabilities_do_not_accept_dense_mla_context_fused_qkv():
+    assert not FallbackFmha.is_supported(
+        _context(
+            is_mla_enable=True,
+            is_fused_qkv=True,
+            head_size=576,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+            mla_rope_layout=MlaRopeLayout.appended,
+        )
+    )
+
+
+def test_fallback_capabilities_accept_sparse_mla_context_fused_qkv():
+    assert FallbackFmha.is_supported(
+        _context(
+            is_mla_enable=True,
+            is_fused_qkv=True,
+            has_sparse_attention=True,
+            head_size=576,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+            mla_rope_layout=MlaRopeLayout.appended,
         )
     )
 
@@ -169,6 +258,8 @@ def test_flashinfer_capabilities_accept_declared_mla_generation_case():
         head_size=576,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
         tokens_per_block=64,
     )
     assert StaticFlashInferTrtllmGenFmha.is_supported(context)
@@ -183,6 +274,8 @@ def test_flashinfer_capabilities_do_not_accept_undeclared_mla_generation_case():
         head_size=576,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
         tokens_per_block=32,
     )
     assert not StaticFlashInferTrtllmGenFmha.is_supported(context)

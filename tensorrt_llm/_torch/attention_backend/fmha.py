@@ -15,7 +15,7 @@
 import weakref
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar, Generic, Optional, TypeVar
 
 import torch
 
@@ -29,6 +29,8 @@ from .interface import AttentionForwardArgs, AttentionInputType
 
 if TYPE_CHECKING:
     from .trtllm import TrtllmAttention, TrtllmAttentionMetadata
+
+T = TypeVar("T")
 
 
 # ``AttentionForwardArgs`` fields that the fallback ``thop.attention`` call
@@ -53,13 +55,8 @@ _THOP_LITERALS: dict = {
 @dataclass(frozen=True, slots=True)
 class DTypeCombination:
     q: torch.dtype
-    kv_cache: DataType
+    kv_cache: Optional[DataType]
     output: torch.dtype
-
-
-class FmhaPhase(Enum):
-    context = "context"
-    generation = "generation"
 
 
 class FmhaFeature(Enum):
@@ -73,6 +70,53 @@ class FmhaFeature(Enum):
     skip_softmax_attention = "skip_softmax_attention"
     padded_input = "padded_input"
     position_shift = "position_shift"
+
+
+class FmhaQkvMode(Enum):
+    fused_qkv = "fused_qkv"
+    separate_qkv = "separate_qkv"
+    separate_qkv_sage = "separate_qkv_sage"
+
+
+class FmhaKvCacheUpdateMode(Enum):
+    update = "update"
+    no_update = "no_update"
+
+
+class MlaRopeLayout(Enum):
+    appended = "appended"
+    separate = "separate"
+
+
+def _accepted_value_name(value: object) -> str:
+    if isinstance(value, Enum):
+        return value.name
+    return str(value)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedValues(Generic[T]):
+    values: frozenset[T] = field(default_factory=frozenset)
+
+    def accepts(self, value: T) -> bool:
+        return value in self.values
+
+    def describe(self) -> str:
+        return f"values={sorted(_accepted_value_name(value) for value in self.values)}"
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedFeatureSet:
+    values: frozenset[FmhaFeature] = field(default_factory=frozenset)
+
+    def accepts(self, features: frozenset[FmhaFeature]) -> bool:
+        return features <= self.values
+
+    def rejected(self, features: frozenset[FmhaFeature]) -> frozenset[FmhaFeature]:
+        return features - self.values
+
+    def describe(self) -> str:
+        return f"values={sorted(feature.value for feature in self.values)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,65 +149,137 @@ class AcceptedIntegerValues:
 class MlaGenerationCase:
     head_dim_qk: int
     head_dim_v: int
-    tokens_per_block: int
+    tokens_per_block: AcceptedIntegerValues
+
+    def accepts(self, head_dim_qk: int, head_dim_v: int, tokens_per_block: int) -> bool:
+        return (
+            self.head_dim_qk == head_dim_qk
+            and self.head_dim_v == head_dim_v
+            and self.tokens_per_block.accepts(tokens_per_block)
+        )
+
+    def describe(self) -> tuple[int, int, str]:
+        return (self.head_dim_qk, self.head_dim_v, self.tokens_per_block.describe())
 
 
-def _all_attention_input_types() -> frozenset[AttentionInputType]:
-    return frozenset(AttentionInputType)
+@dataclass(frozen=True, slots=True)
+class MlaContextCase:
+    kv_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    v_head_dim: int
+    mla_rope_layout: MlaRopeLayout
+    qkv_mode: FmhaQkvMode
+    runtime_features: AcceptedFeatureSet
+    required_runtime_features: frozenset[FmhaFeature] = field(default_factory=frozenset)
+
+    def accepts(self, context: "FmhaSupportContext") -> bool:
+        return (
+            self.kv_lora_rank == context.kv_lora_rank
+            and self.qk_nope_head_dim == context.qk_nope_head_dim
+            and self.qk_rope_head_dim == context.qk_rope_head_dim
+            and self.v_head_dim == context.v_head_dim
+            and self.mla_rope_layout == context.mla_rope_layout
+            and self.qkv_mode == context.qkv_mode
+            and self.runtime_features.accepts(context.runtime_features)
+            and self.required_runtime_features <= context.runtime_features
+        )
+
+    def describe(self) -> tuple[int, int, int, int, str, str, str, list[str]]:
+        return (
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+            self.mla_rope_layout.value,
+            self.qkv_mode.value,
+            self.runtime_features.describe(),
+            sorted(feature.value for feature in self.required_runtime_features),
+        )
 
 
-def _all_attention_mask_types() -> frozenset[AttentionMaskType]:
-    return frozenset(AttentionMaskType)
+def _accepted_attention_input_type() -> AcceptedValues[AttentionInputType]:
+    return AcceptedValues(values=frozenset(AttentionInputType))
 
 
-def _all_position_embedding_types() -> frozenset[PositionEmbeddingType]:
-    return frozenset(PositionEmbeddingType)
+def _accepted_mask_type() -> AcceptedValues[AttentionMaskType]:
+    return AcceptedValues(values=frozenset(AttentionMaskType))
 
 
-def _all_fmha_phases() -> frozenset[FmhaPhase]:
-    return frozenset(FmhaPhase)
+def _accepted_position_embedding_type() -> AcceptedValues[PositionEmbeddingType]:
+    return AcceptedValues(values=frozenset(PositionEmbeddingType))
 
 
-def _all_fmha_features() -> frozenset[FmhaFeature]:
-    return frozenset(FmhaFeature)
+def _accepted_runtime_features() -> AcceptedFeatureSet:
+    return AcceptedFeatureSet(values=frozenset(FmhaFeature))
 
 
 def _positive_integers() -> AcceptedIntegerValues:
     return AcceptedIntegerValues(min_value=1)
 
 
+def _accepted_qkv_mode() -> AcceptedValues[FmhaQkvMode]:
+    return AcceptedValues(values=frozenset(FmhaQkvMode))
+
+
+def _accepted_kv_cache_update_mode() -> AcceptedValues[FmhaKvCacheUpdateMode]:
+    return AcceptedValues(values=frozenset(FmhaKvCacheUpdateMode))
+
+
+@dataclass(frozen=True, slots=True)
+class StandardPhaseCapabilities:
+    dtype_combinations: frozenset[DTypeCombination] = field(default_factory=frozenset)
+    head_size: AcceptedIntegerValues = field(default_factory=_positive_integers)
+    qkv_mode: AcceptedValues[FmhaQkvMode] = field(default_factory=_accepted_qkv_mode)
+    kv_cache_update_mode: AcceptedValues[FmhaKvCacheUpdateMode] = field(
+        default_factory=_accepted_kv_cache_update_mode
+    )
+    mask_type: AcceptedValues[AttentionMaskType] = field(default_factory=_accepted_mask_type)
+    position_embedding_type: AcceptedValues[PositionEmbeddingType] = field(
+        default_factory=_accepted_position_embedding_type
+    )
+    runtime_features: AcceptedFeatureSet = field(default_factory=_accepted_runtime_features)
+    phase_features: AcceptedFeatureSet = field(default_factory=_accepted_runtime_features)
+    required_runtime_features: frozenset[FmhaFeature] = field(default_factory=frozenset)
+
+
+@dataclass(frozen=True, slots=True)
+class MlaPhaseCapabilities:
+    dtype_combinations: frozenset[DTypeCombination] = field(default_factory=frozenset)
+    context_cases: frozenset[MlaContextCase] = field(default_factory=frozenset)
+    generation_cases: frozenset[MlaGenerationCase] = field(default_factory=frozenset)
+    qkv_mode: AcceptedValues[FmhaQkvMode] = field(default_factory=_accepted_qkv_mode)
+    kv_cache_update_mode: AcceptedValues[FmhaKvCacheUpdateMode] = field(
+        default_factory=_accepted_kv_cache_update_mode
+    )
+    mask_type: AcceptedValues[AttentionMaskType] = field(default_factory=_accepted_mask_type)
+    position_embedding_type: AcceptedValues[PositionEmbeddingType] = field(
+        default_factory=_accepted_position_embedding_type
+    )
+    runtime_features: AcceptedFeatureSet = field(default_factory=_accepted_runtime_features)
+    phase_features: AcceptedFeatureSet = field(default_factory=_accepted_runtime_features)
+    required_runtime_features: frozenset[FmhaFeature] = field(default_factory=frozenset)
+
+
 @dataclass(frozen=True, slots=True)
 class PhaseCapabilities:
-    dtype_combinations: frozenset[DTypeCombination] = field(default_factory=frozenset)
-    head_sizes: AcceptedIntegerValues = field(default_factory=_positive_integers)
-    mask_types: frozenset[AttentionMaskType] = field(default_factory=_all_attention_mask_types)
-    position_embedding_types: frozenset[PositionEmbeddingType] = field(
-        default_factory=_all_position_embedding_types
-    )
-    features: frozenset[FmhaFeature] = field(default_factory=_all_fmha_features)
-
-
-@dataclass(frozen=True, slots=True)
-class MlaCapabilities:
-    phases: frozenset[FmhaPhase] = field(default_factory=_all_fmha_phases)
-    generation_cases: frozenset[MlaGenerationCase] = field(default_factory=frozenset)
+    standard: Optional[StandardPhaseCapabilities] = None
+    mla: Optional[MlaPhaseCapabilities] = None
 
 
 @dataclass(frozen=True, slots=True)
 class FmhaCapabilities:
-    name: str
-    sm_versions: AcceptedIntegerValues = field(default_factory=AcceptedIntegerValues)
-    attention_input_types: frozenset[AttentionInputType] = field(
-        default_factory=_all_attention_input_types
+    sm: AcceptedIntegerValues = field(default_factory=AcceptedIntegerValues)
+    attention_input_type: AcceptedValues[AttentionInputType] = field(
+        default_factory=_accepted_attention_input_type
     )
-    runtime_features: frozenset[FmhaFeature] = field(default_factory=_all_fmha_features)
+    runtime_features: AcceptedFeatureSet = field(default_factory=_accepted_runtime_features)
     required_runtime_features: frozenset[FmhaFeature] = field(default_factory=frozenset)
     tokens_per_block: AcceptedIntegerValues = field(default_factory=_positive_integers)
-    generation_beam_widths: AcceptedIntegerValues = field(default_factory=_positive_integers)
-    generation_head_ratios: AcceptedIntegerValues = field(default_factory=_positive_integers)
+    beam_width: AcceptedIntegerValues = field(default_factory=_positive_integers)
+    num_heads_per_kv_head: AcceptedIntegerValues = field(default_factory=_positive_integers)
     context: PhaseCapabilities = field(default_factory=PhaseCapabilities)
     generation: PhaseCapabilities = field(default_factory=PhaseCapabilities)
-    mla: MlaCapabilities = field(default_factory=MlaCapabilities)
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +300,12 @@ class FmhaSupportContext:
     use_paged_kv_cache: bool
     is_mla_enable: bool
     kv_lora_rank: Optional[int]
+    qk_nope_head_dim: Optional[int]
     qk_rope_head_dim: Optional[int]
+    v_head_dim: Optional[int]
+    mla_rope_layout: Optional[MlaRopeLayout]
+    is_fused_qkv: bool
+    update_kv_cache: bool
     has_context_phase: bool
     has_generation_phase: bool
     is_cross_attention: bool
@@ -218,6 +339,39 @@ class FmhaSupportContext:
         return frozenset(features)
 
     @property
+    def qkv_mode(self) -> FmhaQkvMode:
+        if self.is_fused_qkv:
+            return FmhaQkvMode.fused_qkv
+        if self.use_sage_attention:
+            return FmhaQkvMode.separate_qkv_sage
+        return FmhaQkvMode.separate_qkv
+
+    @property
+    def kv_cache_update_mode(self) -> FmhaKvCacheUpdateMode:
+        if self.update_kv_cache:
+            return FmhaKvCacheUpdateMode.update
+        return FmhaKvCacheUpdateMode.no_update
+
+    @property
+    def dtype_combination(self) -> DTypeCombination:
+        output_dtype = self.output_dtype if self.output_dtype is not None else self.q_dtype
+        return DTypeCombination(self.q_dtype, self.kv_cache_dtype, output_dtype)
+
+    @property
+    def num_heads_per_kv_head(self) -> int:
+        return self.num_heads // self.num_kv_heads
+
+    @property
+    def head_dim_qk(self) -> Optional[int]:
+        if self.kv_lora_rank is None or self.qk_rope_head_dim is None:
+            return None
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
+    @property
+    def head_dim_v(self) -> Optional[int]:
+        return self.kv_lora_rank
+
+    @property
     def phase_features(self) -> frozenset[FmhaFeature]:
         features: set[FmhaFeature] = set()
         if self.is_padded:
@@ -236,7 +390,6 @@ class FmhaSupportContext:
     ) -> "FmhaSupportContext":
         kv_cache_manager = metadata.kv_cache_manager
         kv_cache_dtype = kv_cache_manager.dtype if kv_cache_manager is not None else None
-        q_dtype = torch.float8_e4m3fn if kv_cache_dtype == DataType.NVFP4 else q.dtype
         output_dtype = forward_args.output.dtype if forward_args.output is not None else None
 
         attention_input_type = forward_args.attention_input_type
@@ -259,7 +412,7 @@ class FmhaSupportContext:
 
         return cls(
             sm=get_sm_version(),
-            q_dtype=q_dtype,
+            q_dtype=q.dtype,
             kv_cache_dtype=kv_cache_dtype,
             output_dtype=output_dtype,
             num_heads=attn.num_heads,
@@ -274,7 +427,18 @@ class FmhaSupportContext:
             use_paged_kv_cache=metadata.kv_cache_block_offsets is not None,
             is_mla_enable=attn.is_mla_enable,
             kv_lora_rank=attn.kv_lora_rank,
+            qk_nope_head_dim=attn.qk_nope_head_dim,
             qk_rope_head_dim=attn.qk_rope_head_dim,
+            v_head_dim=attn.v_head_dim,
+            mla_rope_layout=(
+                None
+                if attn.rope_append is None
+                else MlaRopeLayout.appended
+                if attn.rope_append
+                else MlaRopeLayout.separate
+            ),
+            is_fused_qkv=forward_args.is_fused_qkv,
+            update_kv_cache=forward_args.update_kv_cache,
             has_context_phase=has_context_phase,
             has_generation_phase=has_generation_phase,
             is_cross_attention=metadata.is_cross,
@@ -296,7 +460,7 @@ class BaseFmha:
 
     @property
     def name(self) -> str:
-        return self.capabilities.name
+        return type(self).__name__
 
     def _get_attention_layer(self) -> "TrtllmAttention":
         attention_layer = self._attention_layer_ref()
@@ -306,7 +470,7 @@ class BaseFmha:
 
     @classmethod
     def _not_supported(cls, reason: str) -> bool:
-        logger.debug("FMHA %s unsupported: %s", cls.capabilities.name, reason)
+        logger.debug("FMHA %s unsupported: %s", cls.__name__, reason)
         return False
 
     @classmethod
@@ -328,21 +492,183 @@ class BaseFmha:
 def _dtype_combo_supported(
     fmha_cls: type[BaseFmha],
     phase_name: str,
-    phase: PhaseCapabilities,
+    phase: StandardPhaseCapabilities | MlaPhaseCapabilities,
     context: FmhaSupportContext,
 ) -> bool:
     if not phase.dtype_combinations:
         return True
-    if context.kv_cache_dtype is None:
-        return fmha_cls._not_supported(f"[{phase_name}] missing KV cache dtype.")
-    output_dtype = context.output_dtype if context.output_dtype is not None else context.q_dtype
-    combo = DTypeCombination(context.q_dtype, context.kv_cache_dtype, output_dtype)
+    combo = context.dtype_combination
     if combo not in phase.dtype_combinations:
         return fmha_cls._not_supported(
             f"[{phase_name}] unsupported dtype combination: "
-            f"Q={context.q_dtype}, KV={context.kv_cache_dtype}, O={output_dtype}.",
+            f"Q={combo.q}, KV={combo.kv_cache}, O={combo.output}.",
         )
     return True
+
+
+def _common_phase_properties_supported(
+    fmha_cls: type[BaseFmha],
+    phase_name: str,
+    phase: StandardPhaseCapabilities | MlaPhaseCapabilities,
+    context: FmhaSupportContext,
+) -> bool:
+    if not phase.mask_type.accepts(context.mask_type):
+        return fmha_cls._not_supported(
+            f"[{phase_name}] mask type {context.mask_type.name} is not accepted. "
+            f"Accepted: {phase.mask_type.describe()}."
+        )
+    if not phase.position_embedding_type.accepts(context.position_embedding_type):
+        return fmha_cls._not_supported(
+            f"[{phase_name}] position embedding type {context.position_embedding_type.name} is not accepted. "
+            f"Accepted: {phase.position_embedding_type.describe()}."
+        )
+    unavailable_features = phase.phase_features.rejected(context.phase_features)
+    if unavailable_features:
+        return fmha_cls._not_supported(
+            f"[{phase_name}] feature(s) not accepted: "
+            f"{', '.join(sorted(feature.value for feature in unavailable_features))}."
+        )
+    unavailable_runtime_features = phase.runtime_features.rejected(context.runtime_features)
+    if unavailable_runtime_features:
+        return fmha_cls._not_supported(
+            f"[{phase_name}] runtime feature(s) are not accepted: "
+            f"{', '.join(sorted(feature.value for feature in unavailable_runtime_features))}."
+        )
+    missing_required_features = phase.required_runtime_features - context.runtime_features
+    if missing_required_features:
+        return fmha_cls._not_supported(
+            f"[{phase_name}] required runtime feature(s) are absent: "
+            f"{', '.join(sorted(feature.value for feature in missing_required_features))}."
+        )
+    return _dtype_combo_supported(fmha_cls, phase_name, phase, context)
+
+
+def _standard_phase_supported(
+    fmha_cls: type[BaseFmha],
+    phase_name: str,
+    phase: StandardPhaseCapabilities,
+    context: FmhaSupportContext,
+) -> bool:
+    if not phase.head_size.accepts(context.head_size):
+        return fmha_cls._not_supported(
+            f"[{phase_name}] head size {context.head_size} is not accepted. "
+            f"Accepted: {phase.head_size.describe()}."
+        )
+    if not phase.qkv_mode.accepts(context.qkv_mode):
+        return fmha_cls._not_supported(
+            f"[{phase_name}] QKV mode {context.qkv_mode.value} is not accepted. "
+            f"Accepted: {phase.qkv_mode.describe()}."
+        )
+    if not phase.kv_cache_update_mode.accepts(context.kv_cache_update_mode):
+        return fmha_cls._not_supported(
+            f"[{phase_name}] KV cache update mode {context.kv_cache_update_mode.value} is not accepted. "
+            f"Accepted: {phase.kv_cache_update_mode.describe()}."
+        )
+    return _common_phase_properties_supported(fmha_cls, phase_name, phase, context)
+
+
+def _mla_context_supported(
+    fmha_cls: type[BaseFmha],
+    phase_name: str,
+    phase: MlaPhaseCapabilities,
+    context: FmhaSupportContext,
+) -> bool:
+    missing_params = [
+        name
+        for name, value in (
+            ("kv_lora_rank", context.kv_lora_rank),
+            ("qk_nope_head_dim", context.qk_nope_head_dim),
+            ("qk_rope_head_dim", context.qk_rope_head_dim),
+            ("v_head_dim", context.v_head_dim),
+            ("mla_rope_layout", context.mla_rope_layout),
+        )
+        if value is None or (isinstance(value, int) and value <= 0)
+    ]
+    if missing_params:
+        return fmha_cls._not_supported(
+            f"[{phase_name}][MLA] missing required MLA parameter(s): {', '.join(missing_params)}.",
+        )
+
+    if not any(case.accepts(context) for case in phase.context_cases):
+        requested_case = (
+            context.kv_lora_rank,
+            context.qk_nope_head_dim,
+            context.qk_rope_head_dim,
+            context.v_head_dim,
+            context.mla_rope_layout.value,
+            context.qkv_mode.value,
+            sorted(feature.value for feature in context.runtime_features),
+        )
+        accepted_cases = sorted(case.describe() for case in phase.context_cases)
+        return fmha_cls._not_supported(
+            f"[{phase_name}][MLA] case {requested_case} is not accepted. Accepted: {accepted_cases}.",
+        )
+    return True
+
+
+def _mla_generation_supported(
+    fmha_cls: type[BaseFmha],
+    phase_name: str,
+    phase: MlaPhaseCapabilities,
+    context: FmhaSupportContext,
+) -> bool:
+    missing_params = [
+        name
+        for name, value in (
+            ("kv_lora_rank", context.kv_lora_rank),
+            ("qk_nope_head_dim", context.qk_nope_head_dim),
+            ("qk_rope_head_dim", context.qk_rope_head_dim),
+            ("v_head_dim", context.v_head_dim),
+        )
+        if value is None or value <= 0
+    ]
+    if missing_params:
+        return fmha_cls._not_supported(
+            f"[{phase_name}][MLA] missing required MLA parameter(s): {', '.join(missing_params)}.",
+        )
+    head_dim_qk = int(context.head_dim_qk)
+    head_dim_v = int(context.head_dim_v)
+    if context.head_size != head_dim_qk:
+        return fmha_cls._not_supported(
+            f"[{phase_name}][MLA] head_size ({context.head_size}) must match "
+            f"kv_lora_rank + qk_rope_head_dim ({head_dim_qk}).",
+        )
+
+    tokens_per_block = context.tokens_per_block or 0
+    if not any(
+        case.accepts(head_dim_qk, head_dim_v, tokens_per_block) for case in phase.generation_cases
+    ):
+        accepted_cases = sorted(case.describe() for case in phase.generation_cases)
+        return fmha_cls._not_supported(
+            f"[{phase_name}][MLA] case "
+            f"(head_dim_qk={head_dim_qk}, head_dim_v={head_dim_v}, tokens_per_block={tokens_per_block}) "
+            "is not accepted. "
+            f"Accepted: {accepted_cases}.",
+        )
+    return True
+
+
+def _mla_phase_supported(
+    fmha_cls: type[BaseFmha],
+    phase_name: str,
+    phase: MlaPhaseCapabilities,
+    context: FmhaSupportContext,
+) -> bool:
+    if not phase.qkv_mode.accepts(context.qkv_mode):
+        return fmha_cls._not_supported(
+            f"[{phase_name}][MLA] QKV mode {context.qkv_mode.value} "
+            f"is not accepted. Accepted: {phase.qkv_mode.describe()}."
+        )
+    if not phase.kv_cache_update_mode.accepts(context.kv_cache_update_mode):
+        return fmha_cls._not_supported(
+            f"[{phase_name}][MLA] KV cache update mode {context.kv_cache_update_mode.value} "
+            f"is not accepted. Accepted: {phase.kv_cache_update_mode.describe()}."
+        )
+    if not _common_phase_properties_supported(fmha_cls, f"{phase_name}][MLA", phase, context):
+        return False
+    if phase_name == "Context":
+        return _mla_context_supported(fmha_cls, phase_name, phase, context)
+    return _mla_generation_supported(fmha_cls, phase_name, phase, context)
 
 
 def _phase_supported(
@@ -351,86 +677,26 @@ def _phase_supported(
     phase: PhaseCapabilities,
     context: FmhaSupportContext,
 ) -> bool:
-    if not phase.head_sizes.accepts(context.head_size):
-        return fmha_cls._not_supported(
-            f"[{phase_name}] head size {context.head_size} is not accepted. "
-            f"Accepted: {phase.head_sizes.describe()}."
-        )
-    if context.mask_type not in phase.mask_types:
-        return fmha_cls._not_supported(
-            f"[{phase_name}] mask type {context.mask_type.name} is not accepted. "
-            f"Accepted: {[mask.name for mask in sorted(phase.mask_types, key=int)]}."
-        )
-    if context.position_embedding_type not in phase.position_embedding_types:
-        return fmha_cls._not_supported(
-            f"[{phase_name}] position embedding type {context.position_embedding_type.name} is not accepted. "
-            "Accepted: "
-            f"{[position.name for position in sorted(phase.position_embedding_types, key=int)]}."
-        )
-    unavailable_features = context.phase_features - phase.features
-    if unavailable_features:
-        return fmha_cls._not_supported(
-            f"[{phase_name}] feature(s) not accepted: "
-            f"{', '.join(sorted(feature.value for feature in unavailable_features))}."
-        )
-    return _dtype_combo_supported(fmha_cls, phase_name, phase, context)
-
-
-def _mla_generation_supported(fmha_cls: type[BaseFmha], context: FmhaSupportContext) -> bool:
-    mla = fmha_cls.capabilities.mla
-    missing_params = [
-        name
-        for name, value in (
-            ("kv_lora_rank", context.kv_lora_rank),
-            ("qk_rope_head_dim", context.qk_rope_head_dim),
-        )
-        if value is None or value <= 0
-    ]
-    if missing_params:
-        return fmha_cls._not_supported(
-            f"[Generation][MLA] missing required MLA parameter(s): {', '.join(missing_params)}.",
-        )
-
-    kv_rank = int(context.kv_lora_rank)
-    qk_rope_dim = int(context.qk_rope_head_dim)
-    head_dim_qk = kv_rank + qk_rope_dim
-    head_dim_v = kv_rank
-    if context.head_size != head_dim_qk:
-        return fmha_cls._not_supported(
-            f"[Generation][MLA] head_size ({context.head_size}) must match "
-            f"kv_lora_rank + qk_rope_head_dim ({head_dim_qk}).",
-        )
-
-    tokens_per_block = context.tokens_per_block or 0
-    generation_case = MlaGenerationCase(head_dim_qk, head_dim_v, tokens_per_block)
-    if mla.generation_cases and generation_case not in mla.generation_cases:
-        accepted_cases = sorted(
-            (
-                case.head_dim_qk,
-                case.head_dim_v,
-                case.tokens_per_block,
-            )
-            for case in mla.generation_cases
-        )
-        return fmha_cls._not_supported(
-            f"[Generation][MLA] case {generation_case} is not accepted. "
-            f"Accepted: {accepted_cases}.",
-        )
-    return True
+    if context.is_mla_enable:
+        if phase.mla is None:
+            return fmha_cls._not_supported(f"[{phase_name}][MLA] MLA is not supported.")
+        return _mla_phase_supported(fmha_cls, phase_name, phase.mla, context)
+    if phase.standard is None:
+        return fmha_cls._not_supported(f"[{phase_name}] standard attention is not supported.")
+    return _standard_phase_supported(fmha_cls, phase_name, phase.standard, context)
 
 
 def _fmha_supported_by_capabilities(fmha_cls: type[BaseFmha], context: FmhaSupportContext) -> bool:
     capabilities = fmha_cls.capabilities
 
-    if not capabilities.sm_versions.accepts(context.sm):
+    if not capabilities.sm.accepts(context.sm):
         return fmha_cls._not_supported(
-            f"SM{context.sm} is not accepted. Accepted: {capabilities.sm_versions.describe()}."
+            f"SM{context.sm} is not accepted. Accepted: {capabilities.sm.describe()}."
         )
-    if context.attention_input_type not in capabilities.attention_input_types:
+    if not capabilities.attention_input_type.accepts(context.attention_input_type):
         return fmha_cls._not_supported(
             f"attention input type {context.attention_input_type.name} is not accepted. "
-            "Accepted: "
-            f"{[input_type.name for input_type in sorted(capabilities.attention_input_types, key=int)]}."
+            f"Accepted: {capabilities.attention_input_type.describe()}."
         )
 
     runtime_features = context.runtime_features
@@ -440,7 +706,7 @@ def _fmha_supported_by_capabilities(fmha_cls: type[BaseFmha], context: FmhaSuppo
             "required runtime feature(s) are absent: "
             f"{', '.join(sorted(feature.value for feature in missing_required_features))}."
         )
-    unavailable_features = runtime_features - capabilities.runtime_features
+    unavailable_features = capabilities.runtime_features.rejected(runtime_features)
     if unavailable_features:
         return fmha_cls._not_supported(
             "runtime feature(s) are not accepted: "
@@ -457,35 +723,23 @@ def _fmha_supported_by_capabilities(fmha_cls: type[BaseFmha], context: FmhaSuppo
         )
 
     if context.has_context_phase:
-        if context.is_mla_enable and FmhaPhase.context not in capabilities.mla.phases:
-            return fmha_cls._not_supported(
-                "MLA context and mixed phases are not supported.",
-            )
-        if not context.is_mla_enable and not _phase_supported(
-            fmha_cls, "Context", capabilities.context, context
-        ):
+        if not _phase_supported(fmha_cls, "Context", capabilities.context, context):
             return False
 
     if context.has_generation_phase:
         if not _phase_supported(fmha_cls, "Generation", capabilities.generation, context):
             return False
-        if not capabilities.generation_beam_widths.accepts(context.beam_width):
+        if not capabilities.beam_width.accepts(context.beam_width):
             return fmha_cls._not_supported(
                 f"[Generation] beam width {context.beam_width} is not accepted. "
-                f"Accepted: {capabilities.generation_beam_widths.describe()}."
+                f"Accepted: {capabilities.beam_width.describe()}."
             )
         if not context.is_mla_enable:
-            heads_ratio = context.num_heads // context.num_kv_heads
-            if not capabilities.generation_head_ratios.accepts(heads_ratio):
+            if not capabilities.num_heads_per_kv_head.accepts(context.num_heads_per_kv_head):
                 return fmha_cls._not_supported(
-                    f"[Generation] heads ratio {heads_ratio} is not accepted. "
-                    f"Accepted: {capabilities.generation_head_ratios.describe()}."
+                    f"[Generation] num_heads_per_kv_head {context.num_heads_per_kv_head} is not accepted. "
+                    f"Accepted: {capabilities.num_heads_per_kv_head.describe()}."
                 )
-        if context.is_mla_enable:
-            if FmhaPhase.generation not in capabilities.mla.phases:
-                return fmha_cls._not_supported("[Generation][MLA] MLA generation is not supported.")
-            if not _mla_generation_supported(fmha_cls, context):
-                return False
 
     if context.use_paged_kv_cache:
         tokens_per_block = context.tokens_per_block or 0
@@ -497,7 +751,7 @@ def _fmha_supported_by_capabilities(fmha_cls: type[BaseFmha], context: FmhaSuppo
                 f"Accepted: {capabilities.tokens_per_block.describe()}."
             )
 
-    logger.debug("FMHA %s supported.", capabilities.name)
+    logger.debug("FMHA %s supported.", fmha_cls.__name__)
     return True
 
 
@@ -623,30 +877,421 @@ def call_thop_attention(
 
 
 class FallbackFmha(BaseFmha):
+    # Mirrors static thop / AttentionOp prechecks; tensor presence and env-sensitive
+    # checks stay in the backend call path.
     capabilities: ClassVar[FmhaCapabilities] = FmhaCapabilities(
-        name="fallback",
-        sm_versions=AcceptedIntegerValues(min_value=0),
-        attention_input_types=frozenset(AttentionInputType),
-        runtime_features=frozenset(FmhaFeature),
+        sm=AcceptedIntegerValues(min_value=0),
+        attention_input_type=AcceptedValues(
+            values=frozenset(
+                {
+                    AttentionInputType.mixed,
+                    AttentionInputType.context_only,
+                    AttentionInputType.generation_only,
+                }
+            )
+        ),
+        runtime_features=AcceptedFeatureSet(
+            values=frozenset(
+                {
+                    FmhaFeature.kv_cache_manager,
+                    FmhaFeature.paged_kv_cache,
+                    FmhaFeature.output_buffer,
+                    FmhaFeature.helix,
+                    FmhaFeature.sage_attention,
+                    FmhaFeature.sparse_attention,
+                    FmhaFeature.skip_softmax_attention,
+                }
+            )
+        ),
         required_runtime_features=frozenset(),
         tokens_per_block=AcceptedIntegerValues(min_value=1),
-        generation_beam_widths=AcceptedIntegerValues(min_value=1),
-        generation_head_ratios=AcceptedIntegerValues(min_value=1),
+        beam_width=AcceptedIntegerValues(min_value=1),
+        num_heads_per_kv_head=AcceptedIntegerValues(min_value=1),
         context=PhaseCapabilities(
-            head_sizes=AcceptedIntegerValues(min_value=1),
-            mask_types=frozenset(AttentionMaskType),
-            position_embedding_types=frozenset(PositionEmbeddingType),
-            features=frozenset(FmhaFeature),
+            standard=StandardPhaseCapabilities(
+                dtype_combinations=frozenset(
+                    {
+                        DTypeCombination(q_dtype, kv_cache_dtype, output_dtype)
+                        for kv_cache_dtype in (
+                            None,
+                            DataType.HALF,
+                            DataType.BF16,
+                            DataType.FLOAT,
+                            DataType.FP8,
+                            DataType.INT8,
+                        )
+                        for q_dtype, output_dtype in (
+                            (torch.float16, torch.float16),
+                            (torch.float16, torch.float8_e4m3fn),
+                            (torch.float16, torch.uint8),
+                            (torch.bfloat16, torch.bfloat16),
+                            (torch.bfloat16, torch.float8_e4m3fn),
+                            (torch.bfloat16, torch.uint8),
+                            (torch.float32, torch.float32),
+                        )
+                    }
+                    | {
+                        DTypeCombination(q_dtype, DataType.NVFP4, output_dtype)
+                        for q_dtype, output_dtype in (
+                            (torch.float16, torch.float16),
+                            (torch.float16, torch.float8_e4m3fn),
+                            (torch.float16, torch.uint8),
+                            (torch.bfloat16, torch.bfloat16),
+                            (torch.bfloat16, torch.float8_e4m3fn),
+                            (torch.bfloat16, torch.uint8),
+                        )
+                    }
+                ),
+                head_size=AcceptedIntegerValues(
+                    values=frozenset(
+                        {32, 48, 64, 72, 80, 96, 104, 112, 128, 144, 160, 192, 224, 256}
+                    )
+                ),
+                qkv_mode=AcceptedValues(
+                    values=frozenset({FmhaQkvMode.fused_qkv, FmhaQkvMode.separate_qkv_sage})
+                ),
+                kv_cache_update_mode=AcceptedValues(
+                    values=frozenset({FmhaKvCacheUpdateMode.update})
+                ),
+                mask_type=AcceptedValues(
+                    values=frozenset(
+                        {
+                            AttentionMaskType.padding,
+                            AttentionMaskType.causal,
+                            AttentionMaskType.sliding_window_causal,
+                            AttentionMaskType.bidirectional,
+                            AttentionMaskType.bidirectionalglm,
+                            AttentionMaskType.blocksparse,
+                            AttentionMaskType.custom_mask,
+                        }
+                    )
+                ),
+                position_embedding_type=AcceptedValues(
+                    values=frozenset(
+                        {
+                            PositionEmbeddingType.learned_absolute,
+                            PositionEmbeddingType.rope_gptj,
+                            PositionEmbeddingType.rope_gpt_neox,
+                            PositionEmbeddingType.long_rope,
+                            PositionEmbeddingType.alibi,
+                            PositionEmbeddingType.alibi_with_scale,
+                            PositionEmbeddingType.relative,
+                            PositionEmbeddingType.chatglm,
+                            PositionEmbeddingType.yarn,
+                            PositionEmbeddingType.mrope,
+                        }
+                    )
+                ),
+                runtime_features=AcceptedFeatureSet(
+                    values=frozenset(
+                        {
+                            FmhaFeature.kv_cache_manager,
+                            FmhaFeature.paged_kv_cache,
+                            FmhaFeature.output_buffer,
+                            FmhaFeature.helix,
+                            FmhaFeature.sage_attention,
+                            FmhaFeature.sparse_attention,
+                            FmhaFeature.skip_softmax_attention,
+                        }
+                    )
+                ),
+                phase_features=AcceptedFeatureSet(
+                    values=frozenset({FmhaFeature.padded_input, FmhaFeature.position_shift})
+                ),
+            ),
+            mla=MlaPhaseCapabilities(
+                dtype_combinations=frozenset(
+                    DTypeCombination(q_dtype, kv_cache_dtype, output_dtype)
+                    for kv_cache_dtype in (DataType.HALF, DataType.BF16, DataType.FP8)
+                    for q_dtype, output_dtype in (
+                        (torch.float16, torch.float16),
+                        (torch.float16, torch.float8_e4m3fn),
+                        (torch.bfloat16, torch.bfloat16),
+                        (torch.bfloat16, torch.float8_e4m3fn),
+                    )
+                ),
+                context_cases=frozenset(
+                    {
+                        MlaContextCase(
+                            512,
+                            128,
+                            64,
+                            128,
+                            MlaRopeLayout.appended,
+                            FmhaQkvMode.separate_qkv,
+                            AcceptedFeatureSet(
+                                values=frozenset(
+                                    {
+                                        FmhaFeature.kv_cache_manager,
+                                        FmhaFeature.paged_kv_cache,
+                                        FmhaFeature.output_buffer,
+                                    }
+                                )
+                            ),
+                        ),
+                        MlaContextCase(
+                            512,
+                            128,
+                            64,
+                            128,
+                            MlaRopeLayout.appended,
+                            FmhaQkvMode.fused_qkv,
+                            AcceptedFeatureSet(
+                                values=frozenset(
+                                    {
+                                        FmhaFeature.kv_cache_manager,
+                                        FmhaFeature.paged_kv_cache,
+                                        FmhaFeature.output_buffer,
+                                        FmhaFeature.sparse_attention,
+                                    }
+                                )
+                            ),
+                            frozenset({FmhaFeature.sparse_attention}),
+                        ),
+                        MlaContextCase(
+                            448,
+                            128,
+                            64,
+                            128,
+                            MlaRopeLayout.separate,
+                            FmhaQkvMode.separate_qkv,
+                            AcceptedFeatureSet(
+                                values=frozenset(
+                                    {
+                                        FmhaFeature.kv_cache_manager,
+                                        FmhaFeature.paged_kv_cache,
+                                        FmhaFeature.output_buffer,
+                                    }
+                                )
+                            ),
+                        ),
+                        MlaContextCase(
+                            448,
+                            128,
+                            64,
+                            128,
+                            MlaRopeLayout.separate,
+                            FmhaQkvMode.fused_qkv,
+                            AcceptedFeatureSet(
+                                values=frozenset(
+                                    {
+                                        FmhaFeature.kv_cache_manager,
+                                        FmhaFeature.paged_kv_cache,
+                                        FmhaFeature.output_buffer,
+                                        FmhaFeature.sparse_attention,
+                                    }
+                                )
+                            ),
+                            frozenset({FmhaFeature.sparse_attention}),
+                        ),
+                    }
+                ),
+                qkv_mode=AcceptedValues(
+                    values=frozenset({FmhaQkvMode.fused_qkv, FmhaQkvMode.separate_qkv})
+                ),
+                kv_cache_update_mode=AcceptedValues(
+                    values=frozenset({FmhaKvCacheUpdateMode.update})
+                ),
+                mask_type=AcceptedValues(
+                    values=frozenset(
+                        {
+                            AttentionMaskType.padding,
+                            AttentionMaskType.causal,
+                            AttentionMaskType.sliding_window_causal,
+                            AttentionMaskType.bidirectional,
+                            AttentionMaskType.bidirectionalglm,
+                            AttentionMaskType.blocksparse,
+                        }
+                    )
+                ),
+                position_embedding_type=AcceptedValues(
+                    values=frozenset(
+                        {
+                            PositionEmbeddingType.learned_absolute,
+                            PositionEmbeddingType.rope_gptj,
+                            PositionEmbeddingType.rope_gpt_neox,
+                            PositionEmbeddingType.long_rope,
+                            PositionEmbeddingType.alibi,
+                            PositionEmbeddingType.alibi_with_scale,
+                            PositionEmbeddingType.relative,
+                            PositionEmbeddingType.chatglm,
+                            PositionEmbeddingType.yarn,
+                            PositionEmbeddingType.mrope,
+                        }
+                    )
+                ),
+                runtime_features=AcceptedFeatureSet(
+                    values=frozenset(
+                        {
+                            FmhaFeature.kv_cache_manager,
+                            FmhaFeature.paged_kv_cache,
+                            FmhaFeature.output_buffer,
+                            FmhaFeature.sparse_attention,
+                        }
+                    )
+                ),
+                phase_features=AcceptedFeatureSet(values=frozenset()),
+                required_runtime_features=frozenset(
+                    {FmhaFeature.kv_cache_manager, FmhaFeature.paged_kv_cache}
+                ),
+            ),
         ),
         generation=PhaseCapabilities(
-            head_sizes=AcceptedIntegerValues(min_value=1),
-            mask_types=frozenset(AttentionMaskType),
-            position_embedding_types=frozenset(PositionEmbeddingType),
-            features=frozenset(FmhaFeature),
-        ),
-        mla=MlaCapabilities(
-            phases=frozenset(FmhaPhase),
-            generation_cases=frozenset(),
+            standard=StandardPhaseCapabilities(
+                dtype_combinations=frozenset(
+                    {
+                        DTypeCombination(q_dtype, kv_cache_dtype, output_dtype)
+                        for kv_cache_dtype in (
+                            None,
+                            DataType.HALF,
+                            DataType.BF16,
+                            DataType.FLOAT,
+                            DataType.FP8,
+                            DataType.INT8,
+                        )
+                        for q_dtype, output_dtype in (
+                            (torch.float16, torch.float16),
+                            (torch.float16, torch.float8_e4m3fn),
+                            (torch.float16, torch.uint8),
+                            (torch.bfloat16, torch.bfloat16),
+                            (torch.bfloat16, torch.float8_e4m3fn),
+                            (torch.bfloat16, torch.uint8),
+                            (torch.float32, torch.float32),
+                        )
+                    }
+                    | {
+                        DTypeCombination(q_dtype, DataType.NVFP4, output_dtype)
+                        for q_dtype, output_dtype in (
+                            (torch.float16, torch.float16),
+                            (torch.float16, torch.float8_e4m3fn),
+                            (torch.float16, torch.uint8),
+                            (torch.bfloat16, torch.bfloat16),
+                            (torch.bfloat16, torch.float8_e4m3fn),
+                            (torch.bfloat16, torch.uint8),
+                        )
+                    }
+                ),
+                head_size=AcceptedIntegerValues(
+                    values=frozenset(
+                        {32, 48, 64, 72, 80, 96, 104, 112, 128, 144, 160, 192, 224, 256}
+                    )
+                ),
+                qkv_mode=AcceptedValues(
+                    values=frozenset({FmhaQkvMode.fused_qkv, FmhaQkvMode.separate_qkv_sage})
+                ),
+                kv_cache_update_mode=AcceptedValues(
+                    values=frozenset({FmhaKvCacheUpdateMode.update})
+                ),
+                mask_type=AcceptedValues(
+                    values=frozenset(
+                        {
+                            AttentionMaskType.padding,
+                            AttentionMaskType.causal,
+                            AttentionMaskType.sliding_window_causal,
+                            AttentionMaskType.bidirectional,
+                            AttentionMaskType.bidirectionalglm,
+                            AttentionMaskType.blocksparse,
+                            AttentionMaskType.custom_mask,
+                        }
+                    )
+                ),
+                position_embedding_type=AcceptedValues(
+                    values=frozenset(
+                        {
+                            PositionEmbeddingType.learned_absolute,
+                            PositionEmbeddingType.rope_gptj,
+                            PositionEmbeddingType.rope_gpt_neox,
+                            PositionEmbeddingType.long_rope,
+                            PositionEmbeddingType.alibi,
+                            PositionEmbeddingType.alibi_with_scale,
+                            PositionEmbeddingType.relative,
+                            PositionEmbeddingType.chatglm,
+                            PositionEmbeddingType.yarn,
+                            PositionEmbeddingType.mrope,
+                        }
+                    )
+                ),
+                runtime_features=AcceptedFeatureSet(
+                    values=frozenset(
+                        {
+                            FmhaFeature.kv_cache_manager,
+                            FmhaFeature.paged_kv_cache,
+                            FmhaFeature.output_buffer,
+                            FmhaFeature.helix,
+                            FmhaFeature.sage_attention,
+                            FmhaFeature.sparse_attention,
+                            FmhaFeature.skip_softmax_attention,
+                        }
+                    )
+                ),
+                phase_features=AcceptedFeatureSet(
+                    values=frozenset({FmhaFeature.padded_input, FmhaFeature.position_shift})
+                ),
+            ),
+            mla=MlaPhaseCapabilities(
+                dtype_combinations=frozenset(
+                    DTypeCombination(q_dtype, kv_cache_dtype, output_dtype)
+                    for kv_cache_dtype in (DataType.HALF, DataType.BF16, DataType.FP8)
+                    for q_dtype, output_dtype in (
+                        (torch.float16, torch.float16),
+                        (torch.float16, torch.float8_e4m3fn),
+                        (torch.bfloat16, torch.bfloat16),
+                        (torch.bfloat16, torch.float8_e4m3fn),
+                    )
+                ),
+                generation_cases=frozenset(
+                    {
+                        MlaGenerationCase(576, 512, AcceptedIntegerValues(min_value=1)),
+                        MlaGenerationCase(512, 448, AcceptedIntegerValues(min_value=1)),
+                    }
+                ),
+                qkv_mode=AcceptedValues(values=frozenset({FmhaQkvMode.fused_qkv})),
+                kv_cache_update_mode=AcceptedValues(
+                    values=frozenset({FmhaKvCacheUpdateMode.update})
+                ),
+                mask_type=AcceptedValues(
+                    values=frozenset(
+                        {
+                            AttentionMaskType.padding,
+                            AttentionMaskType.causal,
+                            AttentionMaskType.sliding_window_causal,
+                            AttentionMaskType.bidirectional,
+                            AttentionMaskType.bidirectionalglm,
+                            AttentionMaskType.blocksparse,
+                        }
+                    )
+                ),
+                position_embedding_type=AcceptedValues(
+                    values=frozenset(
+                        {
+                            PositionEmbeddingType.learned_absolute,
+                            PositionEmbeddingType.rope_gptj,
+                            PositionEmbeddingType.rope_gpt_neox,
+                            PositionEmbeddingType.long_rope,
+                            PositionEmbeddingType.alibi,
+                            PositionEmbeddingType.alibi_with_scale,
+                            PositionEmbeddingType.relative,
+                            PositionEmbeddingType.chatglm,
+                            PositionEmbeddingType.yarn,
+                            PositionEmbeddingType.mrope,
+                        }
+                    )
+                ),
+                runtime_features=AcceptedFeatureSet(
+                    values=frozenset(
+                        {
+                            FmhaFeature.kv_cache_manager,
+                            FmhaFeature.paged_kv_cache,
+                            FmhaFeature.output_buffer,
+                            FmhaFeature.sparse_attention,
+                        }
+                    )
+                ),
+                phase_features=AcceptedFeatureSet(values=frozenset()),
+                required_runtime_features=frozenset(
+                    {FmhaFeature.kv_cache_manager, FmhaFeature.paged_kv_cache}
+                ),
+            ),
         ),
     )
 

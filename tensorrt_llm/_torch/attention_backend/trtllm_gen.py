@@ -30,16 +30,20 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 from tensorrt_llm._torch.attention_backend.fmha import (
+    AcceptedFeatureSet,
     AcceptedIntegerValues,
+    AcceptedValues,
     BaseFmha,
     DTypeCombination,
     FmhaCapabilities,
     FmhaFeature,
-    FmhaPhase,
+    FmhaKvCacheUpdateMode,
+    FmhaQkvMode,
     FmhaSupportContext,
-    MlaCapabilities,
     MlaGenerationCase,
+    MlaPhaseCapabilities,
     PhaseCapabilities,
+    StandardPhaseCapabilities,
 )
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
 from tensorrt_llm.bindings import DataType
@@ -64,105 +68,235 @@ _TRTLLM_GEN_REQUIRED_THOP_OPS = (
     "build_trtllm_gen_kv_cache_metadata",
 )
 
-_TRTLLM_GEN_CONTEXT_DTYPE_COMBINATIONS = frozenset(
-    {
-        DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
-        DTypeCombination(torch.float16, DataType.HALF, torch.float16),
-        DTypeCombination(torch.bfloat16, DataType.BF16, torch.bfloat16),
-        DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float16),
-        DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
-        DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
-        DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
-        DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
-    }
-)
-
-_TRTLLM_GEN_GENERATION_DTYPE_COMBINATIONS = frozenset(
-    {
-        DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
-        DTypeCombination(torch.float16, DataType.HALF, torch.float16),
-        DTypeCombination(torch.bfloat16, DataType.BF16, torch.bfloat16),
-        DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float16),
-        DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
-        DTypeCombination(torch.bfloat16, DataType.FP8, torch.bfloat16),
-        DTypeCombination(torch.float16, DataType.FP8, torch.float16),
-        DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
-        DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
-        DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
-    }
-)
-
-_TRTLLM_GEN_RUNTIME_FEATURES = frozenset(
-    {
-        FmhaFeature.kv_cache_manager,
-        FmhaFeature.paged_kv_cache,
-        FmhaFeature.output_buffer,
-    }
-)
-
-_TRTLLM_GEN_CONTEXT_HEAD_SIZES = frozenset(
-    {
-        # TRTLLM-GEN context kernels currently cover common power-of-two LLM head
-        # sizes. HeadDim=80 has a padded SMEM layout in the C++ export path but is
-        # not accepted here until the flashinfer package ships the matching context
-        # kernels for this path.
-        16,
-        32,
-        64,
-        128,
-        256,
-        512,
-    }
-)
-
-_TRTLLM_GEN_POSITION_EMBEDDING_TYPES = frozenset(
-    {
-        position_embedding_type
-        for position_embedding_type in PositionEmbeddingType
-        if not position_embedding_type.is_alibi()
-    }
-)
-
-_TRTLLM_GEN_CONTEXT_MASK_TYPES = frozenset(
-    {mask_type for mask_type in AttentionMaskType if mask_type != AttentionMaskType.custom_mask}
-)
-
-_TRTLLM_GEN_MLA_GENERATION_CASES = frozenset(
-    {
-        MlaGenerationCase(320, 256, 16),
-        MlaGenerationCase(320, 256, 32),
-        MlaGenerationCase(320, 256, 64),
-        MlaGenerationCase(576, 512, 16),
-        MlaGenerationCase(576, 512, 64),
-    }
-)
-
 FLASHINFER_TRTLLM_GEN_CAPABILITIES = FmhaCapabilities(
-    name="flashinfer_trtllm_gen",
-    sm_versions=AcceptedIntegerValues(values=frozenset({100, 103})),
-    attention_input_types=frozenset(AttentionInputType),
-    runtime_features=_TRTLLM_GEN_RUNTIME_FEATURES,
-    required_runtime_features=_TRTLLM_GEN_RUNTIME_FEATURES,
+    sm=AcceptedIntegerValues(values=frozenset({100, 103})),
+    attention_input_type=AcceptedValues(
+        values=frozenset(
+            {
+                AttentionInputType.mixed,
+                AttentionInputType.context_only,
+                AttentionInputType.generation_only,
+            }
+        )
+    ),
+    runtime_features=AcceptedFeatureSet(
+        values=frozenset(
+            {
+                FmhaFeature.kv_cache_manager,
+                FmhaFeature.paged_kv_cache,
+                FmhaFeature.output_buffer,
+            }
+        )
+    ),
+    required_runtime_features=frozenset(
+        {
+            FmhaFeature.kv_cache_manager,
+            FmhaFeature.paged_kv_cache,
+            FmhaFeature.output_buffer,
+        }
+    ),
     tokens_per_block=AcceptedIntegerValues(values=frozenset({16, 32, 64})),
-    generation_beam_widths=AcceptedIntegerValues(values=frozenset({1})),
-    generation_head_ratios=AcceptedIntegerValues(min_value=1, max_value=32),
+    beam_width=AcceptedIntegerValues(values=frozenset({1})),
+    num_heads_per_kv_head=AcceptedIntegerValues(min_value=1, max_value=32),
     context=PhaseCapabilities(
-        dtype_combinations=_TRTLLM_GEN_CONTEXT_DTYPE_COMBINATIONS,
-        head_sizes=AcceptedIntegerValues(values=_TRTLLM_GEN_CONTEXT_HEAD_SIZES),
-        mask_types=_TRTLLM_GEN_CONTEXT_MASK_TYPES,
-        position_embedding_types=_TRTLLM_GEN_POSITION_EMBEDDING_TYPES,
-        features=frozenset(),
+        standard=StandardPhaseCapabilities(
+            dtype_combinations=frozenset(
+                {
+                    DTypeCombination(torch.float16, DataType.HALF, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.BF16, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.uint8),
+                }
+            ),
+            head_size=AcceptedIntegerValues(values=frozenset({16, 32, 64, 128, 256, 512})),
+            qkv_mode=AcceptedValues(values=frozenset({FmhaQkvMode.fused_qkv})),
+            kv_cache_update_mode=AcceptedValues(values=frozenset({FmhaKvCacheUpdateMode.update})),
+            mask_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        AttentionMaskType.padding,
+                        AttentionMaskType.causal,
+                        AttentionMaskType.sliding_window_causal,
+                        AttentionMaskType.bidirectional,
+                        AttentionMaskType.bidirectionalglm,
+                        AttentionMaskType.blocksparse,
+                    }
+                )
+            ),
+            position_embedding_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        PositionEmbeddingType.learned_absolute,
+                        PositionEmbeddingType.rope_gptj,
+                        PositionEmbeddingType.rope_gpt_neox,
+                        PositionEmbeddingType.long_rope,
+                        PositionEmbeddingType.relative,
+                        PositionEmbeddingType.chatglm,
+                        PositionEmbeddingType.yarn,
+                        PositionEmbeddingType.mrope,
+                        PositionEmbeddingType.deferred,
+                    }
+                )
+            ),
+            runtime_features=AcceptedFeatureSet(
+                values=frozenset(
+                    {
+                        FmhaFeature.kv_cache_manager,
+                        FmhaFeature.paged_kv_cache,
+                        FmhaFeature.output_buffer,
+                    }
+                )
+            ),
+            phase_features=AcceptedFeatureSet(values=frozenset()),
+        ),
     ),
     generation=PhaseCapabilities(
-        dtype_combinations=_TRTLLM_GEN_GENERATION_DTYPE_COMBINATIONS,
-        head_sizes=AcceptedIntegerValues(min_value=1),
-        mask_types=frozenset(AttentionMaskType),
-        position_embedding_types=_TRTLLM_GEN_POSITION_EMBEDDING_TYPES,
-        features=frozenset(),
-    ),
-    mla=MlaCapabilities(
-        phases=frozenset({FmhaPhase.generation}),
-        generation_cases=_TRTLLM_GEN_MLA_GENERATION_CASES,
+        standard=StandardPhaseCapabilities(
+            dtype_combinations=frozenset(
+                {
+                    DTypeCombination(torch.float16, DataType.HALF, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.BF16, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.uint8),
+                }
+            ),
+            head_size=AcceptedIntegerValues(min_value=1),
+            qkv_mode=AcceptedValues(values=frozenset({FmhaQkvMode.fused_qkv})),
+            kv_cache_update_mode=AcceptedValues(values=frozenset({FmhaKvCacheUpdateMode.update})),
+            mask_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        AttentionMaskType.padding,
+                        AttentionMaskType.causal,
+                        AttentionMaskType.sliding_window_causal,
+                        AttentionMaskType.bidirectional,
+                        AttentionMaskType.bidirectionalglm,
+                        AttentionMaskType.blocksparse,
+                        AttentionMaskType.custom_mask,
+                    }
+                )
+            ),
+            position_embedding_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        PositionEmbeddingType.learned_absolute,
+                        PositionEmbeddingType.rope_gptj,
+                        PositionEmbeddingType.rope_gpt_neox,
+                        PositionEmbeddingType.long_rope,
+                        PositionEmbeddingType.relative,
+                        PositionEmbeddingType.chatglm,
+                        PositionEmbeddingType.yarn,
+                        PositionEmbeddingType.mrope,
+                        PositionEmbeddingType.deferred,
+                    }
+                )
+            ),
+            runtime_features=AcceptedFeatureSet(
+                values=frozenset(
+                    {
+                        FmhaFeature.kv_cache_manager,
+                        FmhaFeature.paged_kv_cache,
+                        FmhaFeature.output_buffer,
+                    }
+                )
+            ),
+            phase_features=AcceptedFeatureSet(values=frozenset()),
+        ),
+        mla=MlaPhaseCapabilities(
+            dtype_combinations=frozenset(
+                {
+                    DTypeCombination(torch.float16, DataType.HALF, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.BF16, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.uint8),
+                }
+            ),
+            generation_cases=frozenset(
+                {
+                    MlaGenerationCase(
+                        320, 256, AcceptedIntegerValues(values=frozenset({16, 32, 64}))
+                    ),
+                    MlaGenerationCase(576, 512, AcceptedIntegerValues(values=frozenset({16, 64}))),
+                }
+            ),
+            qkv_mode=AcceptedValues(values=frozenset({FmhaQkvMode.fused_qkv})),
+            kv_cache_update_mode=AcceptedValues(values=frozenset({FmhaKvCacheUpdateMode.update})),
+            mask_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        AttentionMaskType.padding,
+                        AttentionMaskType.causal,
+                        AttentionMaskType.sliding_window_causal,
+                        AttentionMaskType.bidirectional,
+                        AttentionMaskType.bidirectionalglm,
+                        AttentionMaskType.blocksparse,
+                        AttentionMaskType.custom_mask,
+                    }
+                )
+            ),
+            position_embedding_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        PositionEmbeddingType.learned_absolute,
+                        PositionEmbeddingType.rope_gptj,
+                        PositionEmbeddingType.rope_gpt_neox,
+                        PositionEmbeddingType.long_rope,
+                        PositionEmbeddingType.relative,
+                        PositionEmbeddingType.chatglm,
+                        PositionEmbeddingType.yarn,
+                        PositionEmbeddingType.mrope,
+                        PositionEmbeddingType.deferred,
+                    }
+                )
+            ),
+            runtime_features=AcceptedFeatureSet(
+                values=frozenset(
+                    {
+                        FmhaFeature.kv_cache_manager,
+                        FmhaFeature.paged_kv_cache,
+                        FmhaFeature.output_buffer,
+                    }
+                )
+            ),
+            phase_features=AcceptedFeatureSet(values=frozenset()),
+        ),
     ),
 )
 
