@@ -1329,6 +1329,7 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
+        conversation_id=tllm_disagg_params.conversation_id,
     )
 
 
@@ -1353,6 +1354,7 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
+        conversation_id=disaggregated_params.conversation_id,
     )
 
 
