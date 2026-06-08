@@ -369,7 +369,6 @@ unittest/auto_deploy/singlegpu/smoke/test_disagg.py::test_autodeploy_disaggregat
 unittest/auto_deploy/singlegpu/smoke/test_disagg.py::test_autodeploy_disaggregated_smoke[llama-flashinfer-simple] SKIP (https://nvbugs/6307525)
 unittest/auto_deploy/singlegpu/smoke/test_disagg.py::test_autodeploy_disaggregated_smoke[llama-trtllm-cudagraph] SKIP (https://nvbugs/6307525)
 unittest/auto_deploy/singlegpu/smoke/test_disagg.py::test_autodeploy_disaggregated_smoke[llama-trtllm-simple] SKIP (https://nvbugs/6307525)
-unittest/bindings/test_transfer_agent_bindings.py::TestNixlFunctionalTransfer::test_nixl_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6260897)
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)

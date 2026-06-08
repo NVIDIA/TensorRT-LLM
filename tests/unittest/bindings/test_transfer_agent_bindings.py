@@ -585,8 +585,11 @@ class TestNixlFunctionalTransfer:
         status = agent_a.submit_transfer_requests(request)
 
         # With timeout_ms=0, wait checks status once and returns immediately.
+        # Either IN_PROGRESS (transfer still running) or SUCCESS (transfer
+        # already completed by the progress thread on a fast loopback path)
+        # is a valid non-blocking observation; FAILURE would indicate a bug.
         result = status.wait(timeout_ms=0)
-        assert result == tab.TransferState.IN_PROGRESS
+        assert result in (tab.TransferState.IN_PROGRESS, tab.TransferState.SUCCESS)
 
         # Wait for the transfer to actually finish before cleanup
         final_result = status.wait(timeout_ms=5000)
