@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-adjust_gb200_x4_platform_load_balancing', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-adjust_gb200_x4_platform_load_balancing', 'trtllm-jenkins-shared-lib@user/yuanjingx/support_getting_estimate_from_per_cluster_duraiton_files']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1038,7 +1038,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // line is "Mako options:", maybe we can make it more generic, which
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
-                def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson)
+                String clusterNameForDurations = useClusterDurations ? partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_') : null
+                def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson, clusterNameForDurations)
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
@@ -1693,9 +1694,9 @@ class GlobalState {
     static final int MAX_PORT = 32000            // Maximum port number to avoid system ports
 }
 
-def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount)
+def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount, String clusterName=null)
 {
-    def estimate = trtllm_utils.estimateRenderedStageAttemptMillis(pipeline, llmSrc, testListPath, stageName, renderedTestCount)
+    def estimate = trtllm_utils.estimateRenderedStageAttemptMillis(pipeline, llmSrc, testListPath, stageName, renderedTestCount, clusterName)
     if (estimate.error) {
         echo "[CI-BUDGET] ${stageName}: failed to read .test_durations; using count-based estimate. Error: ${estimate.error}"
     }
@@ -2462,7 +2463,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     return makoArgs
 }
 
-def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
+def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null) {
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
@@ -2528,7 +2529,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
-    recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount)
+    recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount, clusterName)
 
     return testList
 }
@@ -3188,15 +3189,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
-        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName)
-
-        // Download and Merge waives.txt
-        mergeWaivesTxt(pipeline, llmSrc, stageName)
-
-        // Add passed test list from previous pipeline run to the waives.txt
-        if (testFilter[(REUSE_TEST)] != false) {
-            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt", postTag)
-        }
 
         // When useClusterDurations is set, use a per-cluster durations file keyed on
         // partition.clusterName (e.g. "aws-dfw", "dlcluster").  This lets each cluster
@@ -3204,11 +3196,23 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // on different hardware.  Falls back to the shared .test_durations when unset.
         def clusterDurationsArgs = []
         def clusterDurationsPath = ""
+        String clusterNameForDurations = null
         if (useClusterDurations) {
             def partition = SlurmConfig.resolvePlatform(platform)
             def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+            clusterNameForDurations = clusterKey
             clusterDurationsPath = "${llmSrc}/tests/integration/defs/.test_durations_${clusterKey}"
             clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
+        }
+
+        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
+
+        // Download and Merge waives.txt
+        mergeWaivesTxt(pipeline, llmSrc, stageName)
+
+        // Add passed test list from previous pipeline run to the waives.txt
+        if (testFilter[(REUSE_TEST)] != false) {
+            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt", postTag)
         }
 
         // Process shard test list and create separate files for regular and isolate tests
