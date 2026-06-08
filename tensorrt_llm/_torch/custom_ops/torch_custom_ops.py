@@ -57,26 +57,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
 
-def _init_deep_gemm_pdl() -> None:
-    try:
-        cuda_available = torch.cuda.is_available()
-    except RuntimeError as err:
-        logger.warning(
-            f"Failed to query CUDA availability for DeepGEMM PDL: {err}")
-        return
-
-    if not cuda_available:
-        return
-
-    try:
-        deep_gemm.set_pdl(get_env_enable_pdl())
-    except RuntimeError as err:
-        logger.warning(f"Failed to initialize DeepGEMM PDL: {err}")
-
-
-_init_deep_gemm_pdl()
-
-
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
 def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
