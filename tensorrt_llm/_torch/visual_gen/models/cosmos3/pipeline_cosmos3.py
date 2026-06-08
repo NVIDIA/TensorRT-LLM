@@ -57,8 +57,8 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
     hf_ids=[
         "nvidia/Cosmos3-Nano",
         "nvidia/Cosmos3-Super",
-        "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Image2Video",
+        "nvidia/Cosmos3-Super-Text2Image",
     ],
     doc="Cosmos3 Omnimodal world models.",
 )
