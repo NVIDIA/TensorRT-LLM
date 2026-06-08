@@ -778,6 +778,28 @@ class AttentionDpConfig(StrictBaseModel):
         "and causes empty fetch cycles. Default False preserves the prior "
         "behaviour (fetch blocks when truly idle). "
         "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_conversation_affinity: bool = Field(
+        default=False,
+        description=
+        "Enable explicit conversation-affinity routing for attention DP. When "
+        "True, the first request of each conversation is round-robined across "
+        "ranks and every subsequent request carrying the same conversation_id "
+        "(read from disaggregated_params, populated from the X-Session-ID "
+        "header) is pinned to that conversation's first-turn rank. This keeps a "
+        "multi-turn conversation's KV-cache prefix on one rank (maximizing "
+        "block reuse, minimizing cross-rank migration). Unlike "
+        "enable_kv_cache_aware_routing (affinity inferred from prefix-match "
+        "length, which is lost when blocks are evicted), the conversation->rank "
+        "map is explicit and survives eviction. Falls back to load-balanced "
+        "round-robin when no conversation_id is available. Takes precedence "
+        "over enable_kv_cache_aware_routing when both are set.")
+    kv_cache_routing_max_sessions: int = Field(
+        default=65536,
+        description=
+        "LRU cap on the conversation->rank map used by conversation-affinity "
+        "routing. The oldest conversations are evicted once more than this many "
+        "are tracked, bounding memory on long-running servers. Only used when "
+        "kv_cache_routing_conversation_affinity is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
