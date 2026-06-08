@@ -1041,6 +1041,8 @@ class PyExecutor:
         it = -1
         enabled = False
         start_time = None
+        last_profile_start_iter = None
+        last_profile_stop_iter = None
 
         # These events are used to record the time of the previous batch.
         # We need two set of the start-end events to record the time through
@@ -1091,9 +1093,13 @@ class PyExecutor:
         calibrator = get_calibrator()
 
         def profile_step():
-            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
+            nonlocal it, enabled, start_time
+            nonlocal start_event_1, end_event_1, start_event_2, end_event_2
+            nonlocal prev_device_step_time
+            nonlocal last_profile_start_iter, last_profile_stop_iter
             calibrator.post_step(it)
             if (self.iter_counter in self.profile_stop_iters
+                    and last_profile_stop_iter != self.iter_counter
                     and not self.is_warmup):
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
@@ -1105,6 +1111,7 @@ class PyExecutor:
                 torch.cuda.cudart().cudaProfilerStop()
                 calibrator.stop()
                 enabled = False
+                last_profile_stop_iter = self.iter_counter
 
             if start_time is not None and self.print_log and (
                     log_all_ranks or self.dist.rank in log_ranks):
@@ -1148,6 +1155,7 @@ class PyExecutor:
             it += 1
 
             if (self.iter_counter in self.profile_start_iters
+                    and last_profile_start_iter != self.iter_counter
                     and not self.is_warmup):
                 assert not enabled, "Inconsistent CUDA profiling state"
                 calibrator.start()
@@ -1157,6 +1165,7 @@ class PyExecutor:
                 logger.info(
                     f"Profiling started at iteration {self.iter_counter}.")
                 enabled = True
+                last_profile_start_iter = self.iter_counter
             calibrator.pre_step(it)
             start_time = time.time()
             if it % 2 == 0:
@@ -2510,7 +2519,8 @@ class PyExecutor:
                     break
 
                 if self._skip_current_iteration:
-                    self.iter_counter += 1
+                    # Delay-batch waiting is not a model iteration; keep the
+                    # public iteration counter stable until a batch runs.
                     continue
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
