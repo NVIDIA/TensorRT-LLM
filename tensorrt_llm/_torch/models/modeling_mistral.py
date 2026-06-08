@@ -263,6 +263,18 @@ class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
+    def load_weights(self, weights: Dict, weight_mapper=None, *args, **kwargs):
+        if weight_mapper and type(weight_mapper) is MistralWeightMapper:
+            weight_mapper.permute_qk(weights=weights, config=self.config)
+            super().load_weights(weights,
+                                 weight_mapper=weight_mapper,
+                                 params_map=weight_mapper.mistral_llm_mapping)
+        else:
+            super().load_weights(weights,
+                                 weight_mapper=weight_mapper,
+                                 *args,
+                                 **kwargs)
+
 
 class MistralCommonImageProcessor:
 
@@ -657,11 +669,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         llm_weights = filter_weights(weights=weights, prefix="language_model")
         logger.debug(f"Loading weights for {type(self.llm)}")
         if weight_mapper and type(weight_mapper) is MistralWeightMapper:
-            weight_mapper.permute_qk(weights=llm_weights,
-                                     config=self.llm.config)
-            self.llm.load_weights(llm_weights,
-                                  weight_mapper=weight_mapper,
-                                  params_map=weight_mapper.mistral_llm_mapping)
+            self.llm.load_weights(llm_weights, weight_mapper=weight_mapper)
         else:
             self.llm.load_weights(llm_weights)
         logger.debug(f"Successfully loaded weights for {type(self.llm)}")
