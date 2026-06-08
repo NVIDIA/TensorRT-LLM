@@ -37,19 +37,20 @@ from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
-COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
-    "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
-    "over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, "
-    "underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, "
-    "low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, "
-    "unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of "
-    "poor quality."
-)
+COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate videos from a given prompt."
 )
 COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
+
+# Inverse templates are appended to the negative prompt so the unconditional
+# branch is steered away from the requested duration/resolution.
+COSMOS3_INVERSE_DURATION_TEMPLATE = (
+    "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
+)
+COSMOS3_INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
+
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
@@ -221,14 +222,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             frame_rate=req.params.frame_rate,
-            use_duration_template=req.params.extra_params.get("use_duration_template", True),
-            use_resolution_template=req.params.extra_params.get("use_resolution_template", True),
+            use_duration_template=req.params.extra_params.get("use_duration_template", False),
+            use_resolution_template=req.params.extra_params.get("use_resolution_template", False),
             use_system_prompt=req.params.extra_params.get("use_system_prompt", False),
             use_guardrails=req.params.extra_params.get("use_guardrails", True),
             enable_audio=req.params.extra_params.get("enable_audio", False),
         )
 
-    def _format_prompt_with_template(
+    def _apply_metadata_templates(
         self,
         prompt: str,
         *,
@@ -236,22 +237,29 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         width: int,
         num_frames: int,
         frame_rate: float,
-        use_duration_template: bool = True,
-        use_resolution_template: bool = True,
+        duration_template: Optional[str] = COSMOS3_DURATION_TEMPLATE,
+        resolution_template: Optional[str] = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+        force_duration_template: bool = False,
     ) -> str:
-        prompt = prompt.strip()
+        """Append duration and resolution metadata to a prompt.
 
-        if use_duration_template and num_frames > 1:
+        ``duration_template`` / ``resolution_template`` of ``None`` disables that
+        template.  The positive prompt uses the forward templates; the negative
+        prompt uses the inverse templates with ``force_duration_template=True``
+        so the duration clause is appended even for single-frame requests.
+        """
+        parts: List[str] = []
+        head = prompt.rstrip(".").strip()
+        if head:
+            parts.append(head)
+        if duration_template is not None and (num_frames > 1 or force_duration_template):
             duration = num_frames / frame_rate
-            dur_text = COSMOS3_DURATION_TEMPLATE.format(duration=duration, fps=frame_rate)
-            prompt = prompt.rstrip(".") + ". " + dur_text
-
-        prompt = prompt.strip()
-        if use_resolution_template:
-            res_text = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE.format(height=height, width=width)
-            prompt = prompt.rstrip(".") + ". " + res_text
-
-        return prompt
+            parts.append(duration_template.format(duration=duration, fps=frame_rate).rstrip("."))
+        if resolution_template is not None:
+            parts.append(resolution_template.format(height=height, width=width).rstrip("."))
+        if not parts:
+            return ""
+        return ". ".join(parts) + "."
 
     def _resize_and_center_crop_image(
         self, image: PIL.Image.Image, height: int, width: int
@@ -530,7 +538,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
         # Text guardrail — check both positive and user-supplied negative prompts.
-        # None negative_prompt means the hardcoded default will be used (safe); skip it.
+        # None negative_prompt means the empty default will be used (safe); skip it.
         text_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
         if self.rank == 0 and use_guardrails and self.safety_checker is not None:
             prompts_to_check = list(prompt)
@@ -555,25 +563,36 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if negative_prompt is None:
             negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
 
-        negative_prompt = self._format_prompt_with_template(
+        # Positive prompt: forward duration/resolution templates.
+        dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
+        res_tmpl = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE if use_resolution_template else None
+
+        # Negative prompt: inverse templates, gated on the same flags as the
+        # positive templates, with the duration clause forced on so it is present
+        # even for single-frame requests.
+        inv_dur_tmpl = COSMOS3_INVERSE_DURATION_TEMPLATE if use_duration_template else None
+        inv_res_tmpl = COSMOS3_INVERSE_RESOLUTION_TEMPLATE if use_resolution_template else None
+
+        negative_prompt = self._apply_metadata_templates(
             negative_prompt,
             height=height,
             width=width,
             num_frames=num_frames,
             frame_rate=frame_rate,
-            use_duration_template=use_duration_template,
-            use_resolution_template=use_resolution_template,
+            duration_template=inv_dur_tmpl,
+            resolution_template=inv_res_tmpl,
+            force_duration_template=True,
         )
 
         prompt = [
-            self._format_prompt_with_template(
+            self._apply_metadata_templates(
                 p,
                 height=height,
                 width=width,
                 num_frames=num_frames,
                 frame_rate=frame_rate,
-                use_duration_template=use_duration_template,
-                use_resolution_template=use_resolution_template,
+                duration_template=dur_tmpl,
+                resolution_template=res_tmpl,
             )
             for p in prompt
         ]

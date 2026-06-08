@@ -38,12 +38,12 @@ COSMOS3_720P_PARAMS = {
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "use_duration_template": ExtraParamSchema(
         type="bool",
-        default=True,
+        default=False,
         description="Whether to use the duration template.",
     ),
     "use_resolution_template": ExtraParamSchema(
         type="bool",
-        default=True,
+        default=False,
         description="Whether to use the resolution template.",
     ),
     "use_system_prompt": ExtraParamSchema(
