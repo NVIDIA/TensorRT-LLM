@@ -1020,6 +1020,44 @@ async def test_kv_cache_aware_router_prepare_server_keeps_when_worker_omits_tpb(
 
 
 @pytest.mark.asyncio
+async def test_kv_cache_aware_router_prepare_server_adopts_worker_tpb_when_unset(
+):
+    router = KvCacheAwareRouter(server_role=None, servers=["server-a"])
+    assert router._tpb_auto is True
+    assert router._tokens_per_block == 32
+
+    async def fake_fetch(server, timeout):
+        return {"tokens_per_block": 128, "kv_cache_hash_algo": "v1_block_key"}
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        await router._prepare_server("server-a")
+
+    assert "server-a" in router._prepared_ready_servers
+    assert router._tokens_per_block == 128
+    assert router._tpb_auto is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_tpb", [32, 64, 128])
+async def test_kv_cache_aware_router_auto_tpb_equals_worker(worker_tpb):
+    router = KvCacheAwareRouter(server_role=None, servers=["server-a"])
+
+    async def fake_fetch(server, timeout):
+        return {
+            "tokens_per_block": worker_tpb,
+            "kv_cache_hash_algo": "v1_block_key"
+        }
+
+    with mock.patch.object(router, "_fetch_server_info",
+                           side_effect=fake_fetch):
+        await router._prepare_server("server-a")
+
+    assert router._tokens_per_block == worker_tpb
+    assert "server-a" in router._prepared_ready_servers
+
+
+@pytest.mark.asyncio
 async def test_kv_cache_aware_router_prepare_server_warns_on_missing_algo():
     router = KvCacheAwareRouter(server_role=None,
                                 servers=["server-a"],

@@ -803,16 +803,19 @@ class BlockHashMixin:
     """
 
     def _init_block_hashing(self,
-                            tokens_per_block: int = 32,
+                            tokens_per_block: Optional[int] = None,
                             custom_tokenizer: Optional[str] = None):
         env_tokens_per_block = os.environ.get(
             "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
             tokens_per_block = int(env_tokens_per_block)
-        self._tokens_per_block = tokens_per_block
+        self._tpb_auto = tokens_per_block is None
+        self._tokens_per_block = 32 if tokens_per_block is None \
+            else tokens_per_block
         self._tokenizers: dict = {}
         self._custom_tokenizer = custom_tokenizer
         logger.info(f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
+                    f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
                     f", custom_tokenizer={self._custom_tokenizer}")
 
     def _get_tokenizer(self, model: str):
@@ -1001,7 +1004,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
                  max_batch_size: int = 64,
-                 tokens_per_block: int = 32,
+                 tokens_per_block: Optional[int] = None,
                  custom_tokenizer: Optional[str] = None,
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
@@ -1066,7 +1069,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             return
         info = self._server_info.get(server, {})
         worker_tpb = info.get("tokens_per_block")
-        if worker_tpb is not None and worker_tpb != self._tokens_per_block:
+        if worker_tpb is not None and getattr(self, "_tpb_auto", False):
+            if worker_tpb != self._tokens_per_block:
+                logger.info(
+                    "router tokens_per_block unset: adopting worker's %d on %s",
+                    worker_tpb, server)
+                self._tokens_per_block = worker_tpb
+            self._tpb_auto = False
+        elif worker_tpb is not None and worker_tpb != self._tokens_per_block:
             larger = max(worker_tpb, self._tokens_per_block)
             smaller = min(worker_tpb, self._tokens_per_block)
             if larger % smaller != 0:
