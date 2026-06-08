@@ -22,13 +22,13 @@ h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
 tensorrt~=10.16.1
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-04.html#rel-26-04 uses 2.12.0a0.
-torch>=2.11.0,<=2.12.0a0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.12.0a0.
+torch>=2.11.0,<=2.13.0a0
 torchvision
 nvidia-modelopt[torch]~=0.37.0
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-04.html#rel-26-04 uses 2.29.7
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.30.4
 # torch 2.11.0+cu130 depends on nvidia-nccl-cu13==2.28.9
-nvidia-nccl-cu13>=2.28.9,<=2.29.7
+nvidia-nccl-cu13>=2.28.9,<=2.30.4
 nvidia-cuda-nvrtc
 transformers==5.5.4
 prometheus_client
