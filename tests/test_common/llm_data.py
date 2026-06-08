@@ -69,7 +69,8 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "Qwen/Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
     "nvidia/Cosmos3-Nano": "nvidia/Cosmos3-Nano",
     "nvidia/Cosmos3-Super": "nvidia/Cosmos3-Super",
-    "nvidia/Nemotron-Ultra-V3-NVFP4": "nemotron-ultra-sample-ckpt-old-format-sft_nvfp4_aggressive_03_04_26_nvfp4",
+    "MiniMaxAI/MiniMax-M2": "MiniMax-M2",
+    "nvidia/Nemotron-Ultra-V3-NVFP4": "NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
 }
 
 
