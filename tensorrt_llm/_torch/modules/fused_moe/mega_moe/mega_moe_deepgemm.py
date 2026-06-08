@@ -248,23 +248,24 @@ class MegaMoEDeepGemm(MoE):
                 f"divisible by ep_size ({self.ep_size})."
             )
 
-        # ADP semantics: DG's fp8_fp4_mega_moe subsumes cross-rank token
-        # dispatch into its internal symm_mem exchange. When EP spans
-        # *all* ranks that may carry tokens (i.e. ``ep_size ==
-        # parallel_size``), no outer allgather / reducescatter is needed:
-        # every token's origin rank is inside the EP group and DG returns
-        # results to that origin. If EP is a strict subset of
-        # parallel_size (e.g. attention-DP > moe_ep_size), some tokens
-        # live on ranks that the DG kernel cannot reach — that topology
-        # is not yet supported.
+        # DG's fp8_fp4_mega_moe assumes the MoE input is partitioned across
+        # ranks (each rank's SymmBuffer holds a unique slice). Supported:
+        # single rank, or DEP with ep_size == parallel_size. Reject both
+        # DEP > EP (some tokens unreachable) and TEP (input TP-replicated
+        # so dispatch sees parallel_size duplicate copies — math correct,
+        # wall ~parallel_size× slower).
         if self.use_dp and self.parallel_size > 1:
             assert self.ep_size == self.parallel_size, (
                 f"MegaMoEDeepGemm with enable_attention_dp=True requires "
                 f"ep_size == parallel_size (got ep_size={self.ep_size}, "
-                f"parallel_size={self.parallel_size}). Configurations "
-                f"with ADP > EP are not yet supported; add the standard "
-                f"allgather(pre) + reducescatter(post) wrapper before "
-                f"calling fp8_fp4_mega_moe to support them."
+                f"parallel_size={self.parallel_size})."
+            )
+        elif (not self.use_dp) and self.parallel_size > 1:
+            raise NotImplementedError(
+                f"MegaMoEDeepGemm does not support TEP "
+                f"(enable_attention_dp=False, parallel_size="
+                f"{self.parallel_size}>1). Use moe_config.backend=TRTLLM "
+                f"or enable attention-DP with ep_size == parallel_size."
             )
 
         # apply_router_weight_on_input pre-multiplies routing weights
