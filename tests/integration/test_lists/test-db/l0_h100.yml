@@ -94,6 +94,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_disable_overlap_scheduler
+  - accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[no_overlap]
+  - accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[overlap]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=TRTLLM] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=TRTLLM] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dummy_load_format
@@ -493,7 +495,7 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma3n_e2b_it
   - accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma4_e2b_it
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton-False-1]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[trtllm-torch-cudagraph]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[flashinfer-torch-simple]
@@ -525,4 +527,4 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-1-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-1-attn_dp_off-trtllm]
