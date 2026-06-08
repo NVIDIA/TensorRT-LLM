@@ -11,22 +11,13 @@ Architecture:
     - Attention: flashinfer trtllm-gen FMHA kernels, reading KV cache through
       the KV cache manager carried by attention metadata.
 
-Entry points:
-    FlashInferTrtllmGenAttention.is_supported()  - Check if trtllm-gen can handle the given config.
-    FlashInferTrtllmGenAttention.attention()      - Main attention method (called from TrtllmAttention.run).
-
-Example:
-    backend = FlashInferTrtllmGenAttention(attention_layer=...)
-    supported, reason = backend.is_supported(
-        q, metadata=..., forward_args=..., ...)
-    if supported:
-        backend.attention(q, metadata=..., forward_args=..., ...)
-    else:
-        Fallback to thop.attention()
+Entry point:
+    FlashInferTrtllmGenFmha.forward() - Main attention method selected by
+    TrtllmAttention's unified FMHA capability evaluator.
 """
 
 import math
-import weakref
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -38,13 +29,27 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_en
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
+from tensorrt_llm._torch.attention_backend.fmha import (
+    AcceptedFeatureSet,
+    AcceptedIntegerValues,
+    AcceptedValues,
+    BaseFmha,
+    DTypeCombination,
+    FmhaCapabilities,
+    FmhaFeature,
+    FmhaKvCacheUpdateMode,
+    FmhaQkvMode,
+    FmhaSupportContext,
+    MlaGenerationCase,
+    MlaPhaseCapabilities,
+    PhaseCapabilities,
+    StandardPhaseCapabilities,
+)
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantMode
 
 if TYPE_CHECKING:
@@ -54,283 +59,246 @@ if TYPE_CHECKING:
     )
 
 
-class TrtllmGenSupportChecker:
-    """
-    Validates if a configuration is supported by trtllm-gen backend.
+_TRTLLM_GEN_REQUIRED_THOP_OPS = (
+    "get_trtllm_gen_context_workspace_layout",
+    "get_trtllm_gen_generation_workspace_layout",
+    "trtllm_gen_context_preprocess",
+    "trtllm_gen_context_postprocess",
+    "trtllm_gen_generation_preprocess",
+    "build_trtllm_gen_kv_cache_metadata",
+)
 
-    Implements all checks from the original C++ AttentionOp to determine
-    if trtllm-gen kernel can handle the attention computation.
-    """
-
-    # Supported data types
-    SUPPORTED_INPUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
-    SUPPORTED_KV_CACHE_DTYPES = {
-        DataType.HALF,
-        DataType.BF16,
-        DataType.FP8,
-        DataType.NVFP4,
-    }
-    SUPPORTED_OUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
-
-    # Supported Q:KV:O dtype combinations for trtllm-gen kernels
-    # Format: (q_dtype: torch.dtype, kv_dtype: DataType, o_dtype: torch.dtype)
-    # Context phase supported combinations
-    SUPPORTED_DTYPE_COMBOS_CONTEXT = {
-        # e4m3:e4m3:e4m3
-        (torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
-        # fp16:fp16:fp16
-        (torch.float16, DataType.HALF, torch.float16),
-        # bf16:bf16:bf16
-        (torch.bfloat16, DataType.BF16, torch.bfloat16),
-        # e4m3:e4m3:fp16
-        (torch.float8_e4m3fn, DataType.FP8, torch.float16),
-        # e4m3:e4m3:bf16
-        (torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
-        # e4m3:nvfp4:*
-        (torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
-        (torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
-        (torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
-    }
-
-    # Generation phase supported combinations (includes context + additional)
-    SUPPORTED_DTYPE_COMBOS_GENERATION = {
-        # All context combinations
-        (torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
-        (torch.float16, DataType.HALF, torch.float16),
-        (torch.bfloat16, DataType.BF16, torch.bfloat16),
-        (torch.float8_e4m3fn, DataType.FP8, torch.float16),
-        (torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
-        # Additional generation-only combinations
-        # bf16:e4m3:bf16
-        (torch.bfloat16, DataType.FP8, torch.bfloat16),
-        # fp16:e4m3:fp16
-        (torch.float16, DataType.FP8, torch.float16),
-        # e4m3:nvfp4:*
-        (torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
-        (torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
-        (torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
-    }
-
-    # Unsupported head sizes for context FMHA.
-    # 96 is excluded because trtllm-gen kernel library does not ship
-    # context kernels for headDim=96 (affects Phi-3 family models).
-    UNSUPPORTED_HEAD_SIZES_CONTEXT = {72, 80, 96}
-
-    # Maximum heads ratio for generation.
-    MAX_HEADS_RATIO_GENERATION = 32
-
-    # Minimum tokens per block, tokens_per_block < 8 is not supported by TRTLLM-GEN kernels.
-    MIN_TOKENS_PER_BLOCK = 8
-
-    # Supported tokens_per_block values for trtllm-gen kernels
-    SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
-
-    # MLA shapes accepted by FlashInfer's trtllm-gen wrapper/launcher. The decode API
-    # uses kv_lora_rank as headDimV and kv_lora_rank + qk_rope_head_dim as headDimQk.
-    SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
-        (320, 256),
-        (576, 512),
-    }
-
-    # Known FlashInfer package gap: this shape can pass the coarse checks but then fail
-    # in the TRTLLM-GEN launcher with "Missing TRTLLM-GEN kernel".
-    MISSING_MLA_GENERATION_KERNELS = {
-        (576, 512, 32),
-    }
-
-    @classmethod
-    def _check_mla_generation_support(
-        cls,
-        head_size: int,
-        tokens_per_block: int,
-        kv_lora_rank: Optional[int],
-        qk_rope_head_dim: Optional[int],
-    ) -> Tuple[bool, str]:
-        missing_params = [
-            name
-            for name, value in (
-                ("kv_lora_rank", kv_lora_rank),
-                ("qk_rope_head_dim", qk_rope_head_dim),
-            )
-            if value is None or value <= 0
-        ]
-        if missing_params:
-            return (
-                False,
-                f"[Generation][MLA] Missing required MLA parameter(s): {', '.join(missing_params)}.",
-            )
-
-        kv_rank = int(kv_lora_rank)
-        qk_rope_dim = int(qk_rope_head_dim)
-        head_dim_qk = kv_rank + qk_rope_dim
-        head_dim_v = kv_rank
-        if head_size != head_dim_qk:
-            return (
-                False,
-                f"[Generation][MLA] head_size ({head_size}) must match "
-                f"kv_lora_rank + qk_rope_head_dim ({head_dim_qk}).",
-            )
-
-        if (head_dim_qk, head_dim_v) not in cls.SUPPORTED_MLA_GENERATION_HEAD_DIMS:
-            supported = sorted(cls.SUPPORTED_MLA_GENERATION_HEAD_DIMS)
-            return (
-                False,
-                f"[Generation][MLA] Unsupported head dimensions: "
-                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
-            )
-
-        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.MISSING_MLA_GENERATION_KERNELS:
-            return (
-                False,
-                f"[Generation][MLA] Missing TRTLLM-GEN decode kernel for "
-                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
-                f"tokens_per_block={tokens_per_block}.",
-            )
-
-        return True, ""
-
-    @classmethod
-    def is_supported(
-        cls,
-        q_dtype: torch.dtype,
-        kv_cache_dtype: DataType,
-        num_heads: int,
-        num_kv_heads: int,
-        head_size: int,
-        attention_input_type: Optional[int] = None,
-        out_dtype: Optional[torch.dtype] = None,
-        mask_type: int = 1,
-        beam_width: int = 1,
-        tokens_per_block: Optional[int] = 64,
-        use_paged_kv_cache: bool = True,
-        is_mla_enable: bool = False,
-        kv_lora_rank: Optional[int] = None,
-        qk_rope_head_dim: Optional[int] = None,
-        cross_attention: bool = False,
-        is_spec_decoding: bool = False,
-        has_alibi: bool = False,
-        is_padded: bool = False,
-        position_shift_enabled: bool = False,
-        quant_config: Optional[QuantConfig] = None,
-        has_sparse_attention: bool = False,
-        has_skip_softmax_attention: bool = False,
-    ) -> Tuple[bool, str]:
-        if tokens_per_block is None:
-            tokens_per_block = 0
-        has_context_phase = True
-        has_generation_phase = True
-        if attention_input_type is not None:
-            attn_input_type = AttentionInputType(attention_input_type)
-            has_context_phase = attn_input_type != AttentionInputType.generation_only
-            has_generation_phase = attn_input_type != AttentionInputType.context_only
-
-        sm = get_sm_version()
-        if not is_sm_100f(sm):
-            return (False, f"trtllm-gen requires SM100 or SM103 (Blackwell). Current: SM{sm}.")
-
-        if has_skip_softmax_attention:
-            return (
-                False,
-                "Skip-softmax attention is not supported by trtllm-gen backend.",
-            )
-
-        if has_sparse_attention:
-            return False, "Sparse attention is not supported by trtllm-gen backend."
-        if is_mla_enable and has_context_phase:
-            return False, (
-                "MLA context and mixed phases fall back to thop.attention until "
-                "FlashInfer context support is ready."
-            )
-        if cross_attention:
-            return False, "Cross attention is not supported by trtllm-gen backend."
-
-        if q_dtype not in cls.SUPPORTED_INPUT_DTYPES:
-            return False, f"Input dtype {q_dtype} not supported. Supported: FP16, BF16, FP8 (E4M3)."
-        if kv_cache_dtype not in cls.SUPPORTED_KV_CACHE_DTYPES:
-            return (
-                False,
-                f"KV cache dtype {kv_cache_dtype} not supported. Supported: FP16, BF16, FP8, NVFP4.",
-            )
-        if out_dtype is not None and out_dtype not in cls.SUPPORTED_OUT_DTYPES:
-            return False, f"Output dtype {out_dtype} not supported. Supported: FP16, BF16, FP8."
-
-        assert num_heads > 0, "num_heads must be positive."
-        assert num_kv_heads > 0, "num_kv_heads must be positive."
-        if num_heads % num_kv_heads != 0:
-            return (
-                False,
-                f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads}).",
-            )
-
-        o_dtype = out_dtype if out_dtype is not None else q_dtype
-
-        check_context_phase = has_context_phase and not is_mla_enable
-        if check_context_phase:
-            if head_size in cls.UNSUPPORTED_HEAD_SIZES_CONTEXT:
-                return False, f"[Context] Head size {head_size} is not supported."
-            try:
-                if AttentionMaskType(mask_type) == AttentionMaskType.custom_mask:
-                    return False, "[Context] Custom mask is not supported."
-            except ValueError:
-                return False, f"[Context] Invalid mask_type: {mask_type}."
-            if has_alibi:
-                return False, "[Context] ALiBi is not supported."
-            if is_padded:
-                return False, "[Context] Padded input is not supported."
-            if (q_dtype, kv_cache_dtype, o_dtype) not in cls.SUPPORTED_DTYPE_COMBOS_CONTEXT:
-                return False, (
-                    f"[Context] Unsupported dtype combination: Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
+FLASHINFER_TRTLLM_GEN_CAPABILITIES = FmhaCapabilities(
+    sm=AcceptedIntegerValues(values=frozenset({100, 103})),
+    attention_input_type=AcceptedValues(
+        values=frozenset(
+            {
+                AttentionInputType.mixed,
+                AttentionInputType.context_only,
+                AttentionInputType.generation_only,
+            }
+        )
+    ),
+    runtime_features=AcceptedFeatureSet(
+        values=frozenset(
+            {
+                FmhaFeature.kv_cache_manager,
+                FmhaFeature.paged_kv_cache,
+                FmhaFeature.output_buffer,
+            }
+        )
+    ),
+    required_runtime_features=frozenset(
+        {
+            FmhaFeature.kv_cache_manager,
+            FmhaFeature.paged_kv_cache,
+            FmhaFeature.output_buffer,
+        }
+    ),
+    tokens_per_block=AcceptedIntegerValues(values=frozenset({16, 32, 64})),
+    beam_width=AcceptedIntegerValues(values=frozenset({1})),
+    num_heads_per_kv_head=AcceptedIntegerValues(min_value=1, max_value=32),
+    context=PhaseCapabilities(
+        standard=StandardPhaseCapabilities(
+            dtype_combinations=frozenset(
+                {
+                    DTypeCombination(torch.float16, DataType.HALF, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.BF16, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.uint8),
+                }
+            ),
+            head_size=AcceptedIntegerValues(values=frozenset({16, 32, 64, 128, 256, 512})),
+            qkv_mode=AcceptedValues(values=frozenset({FmhaQkvMode.fused_qkv})),
+            kv_cache_update_mode=AcceptedValues(values=frozenset({FmhaKvCacheUpdateMode.update})),
+            mask_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        AttentionMaskType.padding,
+                        AttentionMaskType.causal,
+                        AttentionMaskType.sliding_window_causal,
+                        AttentionMaskType.bidirectional,
+                        AttentionMaskType.bidirectionalglm,
+                        AttentionMaskType.blocksparse,
+                    }
                 )
-
-        if has_generation_phase:
-            if beam_width != 1:
-                return (
-                    False,
-                    f"[Generation] Beam search (beam_width={beam_width}) is not supported. Must be 1.",
+            ),
+            position_embedding_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        PositionEmbeddingType.learned_absolute,
+                        PositionEmbeddingType.rope_gptj,
+                        PositionEmbeddingType.rope_gpt_neox,
+                        PositionEmbeddingType.long_rope,
+                        PositionEmbeddingType.relative,
+                        PositionEmbeddingType.chatglm,
+                        PositionEmbeddingType.yarn,
+                        PositionEmbeddingType.mrope,
+                        PositionEmbeddingType.deferred,
+                    }
                 )
-            if position_shift_enabled:
-                return False, "[Generation] Position shift is not supported."
-            if tokens_per_block < cls.MIN_TOKENS_PER_BLOCK:
-                return (
-                    False,
-                    f"[Generation] tokens_per_block ({tokens_per_block}) must be >= {cls.MIN_TOKENS_PER_BLOCK}.",
+            ),
+            runtime_features=AcceptedFeatureSet(
+                values=frozenset(
+                    {
+                        FmhaFeature.kv_cache_manager,
+                        FmhaFeature.paged_kv_cache,
+                        FmhaFeature.output_buffer,
+                    }
                 )
-            heads_ratio = num_heads // num_kv_heads
-            if not is_mla_enable and heads_ratio > cls.MAX_HEADS_RATIO_GENERATION:
-                return (
-                    False,
-                    f"[Generation] heads ratio ({heads_ratio}) exceeds maximum ({cls.MAX_HEADS_RATIO_GENERATION}).",
+            ),
+            phase_features=AcceptedFeatureSet(values=frozenset()),
+        ),
+    ),
+    generation=PhaseCapabilities(
+        standard=StandardPhaseCapabilities(
+            dtype_combinations=frozenset(
+                {
+                    DTypeCombination(torch.float16, DataType.HALF, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.BF16, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.uint8),
+                }
+            ),
+            head_size=AcceptedIntegerValues(min_value=1),
+            qkv_mode=AcceptedValues(values=frozenset({FmhaQkvMode.fused_qkv})),
+            kv_cache_update_mode=AcceptedValues(values=frozenset({FmhaKvCacheUpdateMode.update})),
+            mask_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        AttentionMaskType.padding,
+                        AttentionMaskType.causal,
+                        AttentionMaskType.sliding_window_causal,
+                        AttentionMaskType.bidirectional,
+                        AttentionMaskType.bidirectionalglm,
+                        AttentionMaskType.blocksparse,
+                        AttentionMaskType.custom_mask,
+                    }
                 )
-            if has_alibi:
-                return False, "[Generation] ALiBi is not supported."
-            if (q_dtype, kv_cache_dtype, o_dtype) not in cls.SUPPORTED_DTYPE_COMBOS_GENERATION:
-                return False, (
-                    f"[Generation] Unsupported dtype combination: Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
+            ),
+            position_embedding_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        PositionEmbeddingType.learned_absolute,
+                        PositionEmbeddingType.rope_gptj,
+                        PositionEmbeddingType.rope_gpt_neox,
+                        PositionEmbeddingType.long_rope,
+                        PositionEmbeddingType.relative,
+                        PositionEmbeddingType.chatglm,
+                        PositionEmbeddingType.yarn,
+                        PositionEmbeddingType.mrope,
+                        PositionEmbeddingType.deferred,
+                    }
                 )
-            if is_mla_enable:
-                supported, reason = cls._check_mla_generation_support(
-                    head_size=head_size,
-                    tokens_per_block=tokens_per_block,
-                    kv_lora_rank=kv_lora_rank,
-                    qk_rope_head_dim=qk_rope_head_dim,
+            ),
+            runtime_features=AcceptedFeatureSet(
+                values=frozenset(
+                    {
+                        FmhaFeature.kv_cache_manager,
+                        FmhaFeature.paged_kv_cache,
+                        FmhaFeature.output_buffer,
+                    }
                 )
-                if not supported:
-                    return False, reason
-
-        if use_paged_kv_cache:
-            if tokens_per_block <= 0:
-                return False, "tokens_per_block must be positive."
-            if tokens_per_block & (tokens_per_block - 1) != 0:
-                return False, f"tokens_per_block ({tokens_per_block}) must be power of 2."
-            if tokens_per_block not in cls.SUPPORTED_TOKENS_PER_BLOCK:
-                supported = sorted(cls.SUPPORTED_TOKENS_PER_BLOCK)
-                return (
-                    False,
-                    f"tokens_per_block ({tokens_per_block}) is not supported "
-                    f"by trtllm-gen kernels. Supported: {supported}.",
+            ),
+            phase_features=AcceptedFeatureSet(values=frozenset()),
+        ),
+        mla=MlaPhaseCapabilities(
+            dtype_combinations=frozenset(
+                {
+                    DTypeCombination(torch.float16, DataType.HALF, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.BF16, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.bfloat16, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.bfloat16, DataType.NVFP4, torch.uint8),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
+                    DTypeCombination(torch.float8_e4m3fn, DataType.NVFP4, torch.uint8),
+                }
+            ),
+            generation_cases=frozenset(
+                {
+                    MlaGenerationCase(
+                        320, 256, AcceptedIntegerValues(values=frozenset({16, 32, 64}))
+                    ),
+                    MlaGenerationCase(576, 512, AcceptedIntegerValues(values=frozenset({16, 64}))),
+                }
+            ),
+            qkv_mode=AcceptedValues(values=frozenset({FmhaQkvMode.fused_qkv})),
+            kv_cache_update_mode=AcceptedValues(values=frozenset({FmhaKvCacheUpdateMode.update})),
+            mask_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        AttentionMaskType.padding,
+                        AttentionMaskType.causal,
+                        AttentionMaskType.sliding_window_causal,
+                        AttentionMaskType.bidirectional,
+                        AttentionMaskType.bidirectionalglm,
+                        AttentionMaskType.blocksparse,
+                        AttentionMaskType.custom_mask,
+                    }
                 )
-
-        return True, ""
+            ),
+            position_embedding_type=AcceptedValues(
+                values=frozenset(
+                    {
+                        PositionEmbeddingType.learned_absolute,
+                        PositionEmbeddingType.rope_gptj,
+                        PositionEmbeddingType.rope_gpt_neox,
+                        PositionEmbeddingType.long_rope,
+                        PositionEmbeddingType.relative,
+                        PositionEmbeddingType.chatglm,
+                        PositionEmbeddingType.yarn,
+                        PositionEmbeddingType.mrope,
+                        PositionEmbeddingType.deferred,
+                    }
+                )
+            ),
+            runtime_features=AcceptedFeatureSet(
+                values=frozenset(
+                    {
+                        FmhaFeature.kv_cache_manager,
+                        FmhaFeature.paged_kv_cache,
+                        FmhaFeature.output_buffer,
+                    }
+                )
+            ),
+            phase_features=AcceptedFeatureSet(values=frozenset()),
+        ),
+    ),
+)
 
 
 @lru_cache(maxsize=128)
@@ -464,7 +432,7 @@ class EnqueueParams:
     """Per-call dynamic parameters for trtllm-gen attention.
 
     Layer-static properties (num_heads, head_size, rotary params, etc.) are
-    read directly from ``FlashInferTrtllmGenAttention`` cached attributes
+    read directly from ``FlashInferTrtllmGenFmha`` cached attributes
     to avoid redundant copies on every forward call.
     """
 
@@ -503,10 +471,12 @@ class EnqueueParams:
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
 
 
-class FlashInferTrtllmGenAttention:
+class FlashInferTrtllmGenFmha(BaseFmha):
     """
-    An attention backend using pure trtllm-gen kernels from flashinfer.
+    An FMHA implementation using pure trtllm-gen kernels from flashinfer.
     """
+
+    capabilities = FLASHINFER_TRTLLM_GEN_CAPABILITIES
 
     # Default KV layout for flashinfer
     # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
@@ -515,12 +485,24 @@ class FlashInferTrtllmGenAttention:
     # block-table layout used by the fused preprocessing path.
     USE_SHARED_PAGED_KV_IDX = False
 
+    @classmethod
+    def is_supported(cls, context: FmhaSupportContext) -> bool:
+        if not super().is_supported(context):
+            return False
+        if os.environ.get("TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") != "1":
+            return cls._not_supported("disabled by TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION.")
+        if not IS_FLASHINFER_AVAILABLE:
+            return cls._not_supported("flashinfer package is not installed.")
+        missing_ops = cls._missing_fused_nanobind_ops()
+        if missing_ops:
+            return cls._not_supported(f"missing fused nanobind ops: {', '.join(missing_ops)}.")
+        return True
+
     def __init__(
         self,
         attention_layer: "TrtllmAttention",
     ):
-        self._attention_layer_ref = weakref.ref(attention_layer)
-        self._checker = TrtllmGenSupportChecker()
+        super().__init__(attention_layer)
         self._layout = self.DEFAULT_KV_LAYOUT
         # Read once so the hot path is not sensitive to later environment changes.
         self._enable_pdl = get_env_enable_pdl()
@@ -574,9 +556,6 @@ class FlashInferTrtllmGenAttention:
             attention_chunk_size=self._attention_chunk_size,
         )
 
-        # Cached is_supported() result.  None means not yet checked;
-        # a positive result is stable (model-static) and cached permanently.
-        self._support_result: Optional[Tuple[bool, str]] = None
         # Lazily set on the first attention() call from the query device.
         self._multi_processor_count: Optional[int] = None
 
@@ -584,12 +563,6 @@ class FlashInferTrtllmGenAttention:
     def layout(self) -> str:
         """KV cache layout."""
         return self._layout
-
-    def _get_attention_layer(self) -> "TrtllmAttention":
-        attention_layer = self._attention_layer_ref()
-        if attention_layer is None:
-            raise RuntimeError("trtllm-gen attention layer has been destroyed.")
-        return attention_layer
 
     def _get_kv_scale_params(
         self,
@@ -616,77 +589,6 @@ class FlashInferTrtllmGenAttention:
 
         return kv_scale_orig_quant, kv_scale_quant_orig
 
-    def is_supported(
-        self,
-        q: torch.Tensor,
-        *,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        mask_type: int,
-        active_helix: bool,
-        use_sage_attn: bool,
-    ) -> Tuple[bool, str]:
-        if use_sage_attn:
-            return False, "trtllm-gen does not support sage attention."
-        if active_helix:
-            return False, "trtllm-gen does not support helix parallelism."
-        # Return cached positive result after the first supported call.
-        if self._support_result is not None:
-            return self._support_result
-
-        if not IS_FLASHINFER_AVAILABLE:
-            return False, "flashinfer package is not installed."
-        kv_cache_manager = metadata.kv_cache_manager
-        if kv_cache_manager is None:
-            return False, "trtllm-gen requires a KVCacheManager."
-        use_paged_kv_cache = metadata.kv_cache_block_offsets is not None
-        if not use_paged_kv_cache:
-            return False, "trtllm-gen requires paged KV cache."
-
-        output = forward_args.output
-        if output is None:
-            return False, "trtllm-gen requires forward_args.output."
-
-        attention_layer = self._get_attention_layer()
-        sparse_attention_config = attention_layer.sparse_attention_config
-        has_skip_softmax_attention = (
-            getattr(sparse_attention_config, "algorithm", None) == "skip_softmax"
-        )
-        has_sparse_attention = (
-            sparse_attention_config is not None and not has_skip_softmax_attention
-        )
-        q_dtype = q.dtype
-        if kv_cache_manager.dtype == DataType.NVFP4:
-            q_dtype = torch.float8_e4m3fn
-
-        result = self._checker.is_supported(
-            q_dtype=q_dtype,
-            kv_cache_dtype=kv_cache_manager.dtype,
-            num_heads=self._num_heads,
-            num_kv_heads=self._num_kv_heads,
-            head_size=self._head_dim,
-            attention_input_type=int(forward_args.attention_input_type),
-            out_dtype=output.dtype,
-            mask_type=mask_type,
-            beam_width=metadata.beam_width,
-            tokens_per_block=metadata.tokens_per_block,
-            use_paged_kv_cache=use_paged_kv_cache,
-            is_mla_enable=self._is_mla_enable,
-            kv_lora_rank=self._kv_lora_rank,
-            qk_rope_head_dim=self._qk_rope_head_dim,
-            cross_attention=False,
-            is_spec_decoding=metadata.is_spec_decoding_enabled,
-            has_alibi=self._position_embedding_type in (4, 5),
-            is_padded=False,
-            position_shift_enabled=False,
-            quant_config=attention_layer.quant_config,
-            has_sparse_attention=has_sparse_attention,
-            has_skip_softmax_attention=has_skip_softmax_attention,
-        )
-        if result[0]:
-            self._support_result = result
-        return result
-
     @staticmethod
     @lru_cache(maxsize=None)
     def _get_multi_processor_count_for_device(device_index: int) -> int:
@@ -700,6 +602,23 @@ class FlashInferTrtllmGenAttention:
         if device_index is None:
             device_index = torch.cuda.current_device()
         return self._get_multi_processor_count_for_device(device_index)
+
+    def forward(
+        self,
+        attn: "TrtllmAttention",
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> None:
+        self.attention(
+            q,
+            metadata=metadata,
+            forward_args=forward_args,
+            mask_type=int(forward_args.mask_type),
+            use_paged_context_fmha=metadata.use_paged_context_fmha,
+        )
 
     def attention(
         self,
@@ -935,15 +854,7 @@ class FlashInferTrtllmGenAttention:
 
     @staticmethod
     def _missing_fused_nanobind_ops() -> List[str]:
-        required_ops = (
-            "get_trtllm_gen_context_workspace_layout",
-            "get_trtllm_gen_generation_workspace_layout",
-            "trtllm_gen_context_preprocess",
-            "trtllm_gen_context_postprocess",
-            "trtllm_gen_generation_preprocess",
-            "build_trtllm_gen_kv_cache_metadata",
-        )
-        return [op for op in required_ops if not hasattr(thop, op)]
+        return [op for op in _TRTLLM_GEN_REQUIRED_THOP_OPS if not hasattr(thop, op)]
 
     def _get_kv_cache_metadata(
         self,
@@ -1264,3 +1175,6 @@ class FlashInferTrtllmGenAttention:
             enable_pdl=self._enable_pdl,
             backend="trtllm-gen",
         )
+
+
+FlashInferTrtllmGenAttention = FlashInferTrtllmGenFmha

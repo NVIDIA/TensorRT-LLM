@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Static sync test for the inline ``thop.attention(...)`` call in
-``TrtllmAttention._run``.
+"""Static sync test for the ``thop.attention(...)`` call in
+``call_thop_attention``.
 
 That call is the single explicit-kwarg call site for the C++ ``thop.attention``
 binding. This test parses both the call site (Python AST) and the C++
@@ -20,7 +20,7 @@ function declaration in ``attentionOp.h`` (text/regex), and enforces:
 
 1. Every C++ parameter name appears at the call site (and nothing extra).
 2. Every call-site kwarg sourced as ``root.attr[.attr...]`` resolves on
-   exactly one of ``self`` / ``metadata`` / ``forward_args``, and its
+   exactly one of ``attn`` / ``metadata`` / ``forward_args``, and its
    declared C++ type matches the source attribute's Python type at a
    coarse-category level (tensor / int / bool / float / list-of-X).
 3. Every dataclass field reachable from ``AttentionForwardArgs`` (including
@@ -42,18 +42,18 @@ import textwrap
 import typing
 from dataclasses import fields
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.trtllm import (
+from tensorrt_llm._torch.attention_backend.fmha import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
+    call_thop_attention,
 )
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 # Roots used as the LHS of attribute chains at the call site. Match the
-# parameter names inside ``TrtllmAttention._run``.
+# parameter names inside ``call_thop_attention``.
 _SOURCE_CLASSES = {
-    "self": TrtllmAttention,
+    "attn": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
 }
@@ -183,8 +183,8 @@ def _binding_types() -> dict[str, str]:
 
 
 def _parse_thop_attention_call() -> ast.Call:
-    """Locate the single ``thop.attention(...)`` call inside ``_run``."""
-    src = textwrap.dedent(inspect.getsource(TrtllmAttention._run))
+    """Locate the single ``thop.attention(...)`` call in ``call_thop_attention``."""
+    src = textwrap.dedent(inspect.getsource(call_thop_attention))
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if (
@@ -195,7 +195,7 @@ def _parse_thop_attention_call() -> ast.Call:
             and node.func.value.id == "thop"
         ):
             return node
-    raise AssertionError("Could not find thop.attention(...) call in TrtllmAttention._run")
+    raise AssertionError("Could not find thop.attention(...) call in call_thop_attention")
 
 
 def _attribute_path(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
@@ -444,8 +444,8 @@ def _self_attrs_in_property(prop: property) -> set[str]:
 
 
 def _collect_chains(root: str) -> set[tuple[str, ...]]:
-    """All attribute paths in ``_run`` that start with ``Name(root).``."""
-    src = textwrap.dedent(inspect.getsource(TrtllmAttention._run))
+    """All attribute paths in ``call_thop_attention`` that start with ``Name(root).``."""
+    src = textwrap.dedent(inspect.getsource(call_thop_attention))
     chains: set[tuple[str, ...]] = set()
     for node in ast.walk(ast.parse(src)):
         if not isinstance(node, ast.Attribute):
