@@ -38,6 +38,23 @@ class RpcExecutorMixin:
         self.main_loop = None
         self.main_loop_thread = None
 
+        # --- batched submit (opt-in) ---
+        # rank 0 is the sole RPC ingress for the whole instance, so each request
+        # otherwise costs one pickle/HMAC + ZMQ round-trip + run_in_executor
+        # dispatch + GIL acquisition on rank 0, all competing with the
+        # co-located executor loop. That per-request overhead scales with
+        # concurrency and starves the loop at high load. When enabled, requests
+        # are coalesced into a single ``submit_batch`` RPC, collapsing those
+        # fixed per-request costs by ~the batch size. Disabled by default
+        # (TLLM_RPC_SUBMIT_BATCH_MAX=1) so behavior is unchanged unless opted in.
+        self._submit_batch_max = max(
+            1, int(os.getenv("TLLM_RPC_SUBMIT_BATCH_MAX", "1")))
+        self._submit_batch_delay_s = float(
+            os.getenv("TLLM_RPC_SUBMIT_BATCH_DELAY_MS", "0.5")) / 1e3
+        self._submit_batch_enabled = self._submit_batch_max > 1
+        self._submit_pending: List[GenerationRequest] = []
+        self._submit_pending_lock = threading.Lock()
+
     def setup_mainloop(
         self, tasks: Optional[List[Callable]] = None, thread_name: str = "rpc_proxy_main_loop"
     ):
@@ -83,10 +100,8 @@ class RpcExecutorMixin:
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
+        # Register the result *before* sending so a response can never arrive
+        # for a client_id that is not yet tracked (see handle_responses()).
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
@@ -96,7 +111,59 @@ class RpcExecutorMixin:
         )
         self._results[request.id] = result
 
+        if self._submit_batch_enabled:
+            batch = None
+            with self._submit_pending_lock:
+                self._submit_pending.append(request)
+                if len(self._submit_pending) >= self._submit_batch_max:
+                    batch, self._submit_pending = self._submit_pending, []
+            # Size-triggered flush (steady state under load); stragglers are
+            # flushed by _submit_flush_loop_async().
+            if batch is not None:
+                self._send_submit_batch(batch)
+        else:
+            # submit is a fire-and-forget operation, don't need to wait for response
+            with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
+                self.rpc_client.submit(request).remote(need_response=False)
+
         return result
+
+    def _send_submit_batch(self, batch: "List[GenerationRequest]") -> None:
+        """Send a coalesced batch of requests to the worker via a single RPC.
+
+        Uses ``remote_future`` (non-blocking) so it is safe to call both from
+        request threads (size-triggered flush) and from the main loop
+        (time-triggered flush) without blocking either; the actual pickle/send
+        happens once on the RPC client's own loop/thread.
+        """
+        if not batch:
+            return
+        with nvtx_range_debug(f"RPCExecutor.submit_batch[{len(batch)}]",
+                              color="green",
+                              category="Proxy"):
+            self.rpc_client.submit_batch(batch).remote_future(
+                need_response=False)
+
+    async def _submit_flush_loop_async(self):
+        """Flush partially-filled submit batches after a short delay so low
+        concurrency / tail traffic is not held back by the size trigger."""
+        try:
+            while not self._shutdown_event.is_set():
+                await asyncio.sleep(self._submit_batch_delay_s)
+                batch = None
+                with self._submit_pending_lock:
+                    if self._submit_pending:
+                        batch, self._submit_pending = self._submit_pending, []
+                if batch is not None:
+                    self._send_submit_batch(batch)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Best-effort drain of anything still pending at shutdown.
+            with self._submit_pending_lock:
+                batch, self._submit_pending = self._submit_pending, []
+            if batch:
+                self._send_submit_batch(batch)
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
         async_queues = []
