@@ -910,6 +910,8 @@ def create_input_processor(
             MistralConfigLoader
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
+        # The only case where a model class may use two processors.
+        # Will need a more generic approach if more such models appear.
         if input_processor_override == "mistral3_common":
             from tensorrt_llm._torch.models.modeling_mistral import \
                 MistralNativeInputProcessor

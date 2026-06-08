@@ -115,9 +115,6 @@ def adapt_config_dict(
     for k, v in defaults.items():
         config_dict.setdefault(k, v)
 
-    # if is_vision:
-    #     config = _Mistral3VLMPretrainedConfig.from_dict(config_dict)
-    # else:
     config = _mistral_pretrained_config_from_dict(config_dict)
 
     return config
