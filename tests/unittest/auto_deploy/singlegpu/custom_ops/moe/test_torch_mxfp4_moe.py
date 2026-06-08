@@ -652,6 +652,51 @@ def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() ->
     torch.testing.assert_close(partial_sum, full, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CUDA graph capture")
+def test_torch_mxfp4_moe_from_routing_ep_allows_cuda_graph_capture() -> None:
+    num_experts = 2
+    hidden_size = 32
+    intermediate_size = 32
+    alpha = 1.0
+    limit = 1.0
+    x = torch.linspace(
+        -0.4, 0.4, steps=2 * hidden_size, dtype=torch.float32, device="cuda"
+    ).reshape(2, hidden_size)
+    selected_experts = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64, device="cuda")
+    routing_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6]], dtype=torch.float32, device="cuda")
+    packed, _, _, _ = _deepseek_packed_params_from_layout(num_experts)
+    gate_up_bias = torch.zeros(
+        (num_experts, 2 * intermediate_size), dtype=torch.float32, device="cuda"
+    )
+    down_bias = torch.zeros((num_experts, hidden_size), dtype=torch.float32, device="cuda")
+
+    op_args = (
+        x,
+        selected_experts,
+        routing_weights,
+        packed.gate_up_blocks.cuda(),
+        gate_up_bias,
+        packed.gate_up_scales.cuda(),
+        alpha,
+        limit,
+        packed.down_blocks.cuda(),
+        down_bias,
+        packed.down_scales.cuda(),
+        "up_gate",
+        "deepseek",
+    )
+
+    expected = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep(*op_args, expert_start=0)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep(*op_args, expert_start=0)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 def test_mxfp4_transform_backend_selector_prefers_torch_for_checkpoint_layout() -> None:
     config = MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER)
     transform = InsertMXFP4MLP(config)

@@ -44,6 +44,9 @@ _E2M1_VALUES = (
     -4.0,
     -6.0,
 )
+_E2M1_PACKED_VALUES = tuple(
+    (_E2M1_VALUES[byte & 0x0F], _E2M1_VALUES[(byte >> 4) & 0x0F]) for byte in range(256)
+)
 _E8M0_EXPONENT_BIAS = 127
 _MXFP4_BLOCK_SIZE = 32
 
@@ -67,6 +70,7 @@ WeightCacheKey = tuple[object, ...]
 _MXFP4_WEIGHT_CACHE: OrderedDict[WeightCacheKey, tuple[PreparedWeights, list[weakref.finalize]]] = (
     OrderedDict()
 )
+_E2M1_PACKED_TABLE_CACHE: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
 
 # copied from transformers.integrations.mxfp4::swizzle_mxfp4 with minor modification
@@ -185,6 +189,20 @@ def _decode_e8m0_scales(scales: torch.Tensor) -> torch.Tensor:
     return torch.ldexp(torch.ones_like(exponents, dtype=torch.float32), exponents)
 
 
+def _get_e2m1_packed_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (str(device), dtype)
+    table = _E2M1_PACKED_TABLE_CACHE.get(key)
+    if table is not None:
+        return table
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MXFP4 E2M1 decode table should be initialized before CUDA graph capture."
+        )
+    table = torch.tensor(_E2M1_PACKED_VALUES, device=device, dtype=dtype)
+    _E2M1_PACKED_TABLE_CACHE[key] = table
+    return table
+
+
 def _decode_mxfp4_blocks(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     blocks_u8 = _as_uint8(blocks, "blocks")
     if blocks_u8.dim() < 2:
@@ -200,12 +218,8 @@ def _decode_mxfp4_blocks(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Te
             f"{tuple(blocks_u8.shape[:-1])} without the packed-byte dimension."
         )
 
-    packed = blocks_u8.to(torch.int64)
-    low = packed & 0x0F
-    high = (packed >> 4) & 0x0F
-    codes = torch.stack((low, high), dim=-1).reshape(*blocks_u8.shape[:-1], _MXFP4_BLOCK_SIZE)
-    table = torch.tensor(_E2M1_VALUES, device=blocks.device, dtype=torch.float32)
-    values = table[codes]
+    table = _get_e2m1_packed_table(blocks.device, torch.float32)
+    values = table[blocks_u8.to(torch.int64)].reshape(*blocks_u8.shape[:-1], _MXFP4_BLOCK_SIZE)
     decoded = values * _decode_e8m0_scales(scales).unsqueeze(-1)
     return decoded.reshape(*blocks_u8.shape[:-2], blocks_u8.shape[-2] * _MXFP4_BLOCK_SIZE)
 
@@ -248,6 +262,10 @@ def _apply_swiglu(
     raise ValueError(f"Unsupported swiglu_mode: {swiglu_mode}.")
 
 
+def _is_cuda_graph_capture_active(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
 def _router_topk(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -275,6 +293,50 @@ def _split_range_last_remainder(num_experts: int, world_size: int, rank: int) ->
     lo = base * rank
     hi = num_experts if rank == world_size - 1 else base * (rank + 1)
     return lo, hi
+
+
+def _run_torch_mxfp4_from_routing_capture_safe(
+    x: torch.Tensor,
+    leading_shape: torch.Size,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_bias: torch.Tensor,
+    alpha: float,
+    limit: float,
+    expert_start: int,
+    gate_up_order: str,
+    swiglu_mode: str,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    hidden_size = x.shape[-1]
+    output = torch.zeros((x.shape[0], hidden_size), device=x.device, dtype=torch.float32)
+    local_experts = gate_up_weight.shape[0]
+    if local_experts <= 0:
+        raise ValueError("MXFP4 MoE capture path requires at least one local expert.")
+
+    local_expert_idx = selected_experts - int(expert_start)
+    valid_route = (local_expert_idx >= 0) & (local_expert_idx < local_experts)
+    local_expert_idx = local_expert_idx.clamp(0, local_experts - 1).to(torch.int64)
+
+    x_for_bmm = x.unsqueeze(-1)
+    for route_idx in range(local_expert_idx.shape[1]):
+        expert_idx = local_expert_idx[:, route_idx]
+        gate_up = torch.bmm(gate_up_weight.index_select(0, expert_idx), x_for_bmm).squeeze(-1)
+        gate_up = gate_up + gate_up_bias.index_select(0, expert_idx).to(torch.float32)
+        inter = _apply_swiglu(gate_up, alpha, limit, gate_up_order, swiglu_mode)
+        expert_output = torch.bmm(
+            down_weight.index_select(0, expert_idx), inter.unsqueeze(-1)
+        ).squeeze(-1)
+        expert_output = expert_output + down_bias.index_select(0, expert_idx).to(torch.float32)
+        route_scale = routing_weights[:, route_idx, None] * valid_route[:, route_idx, None].to(
+            torch.float32
+        )
+        output = output + expert_output * route_scale
+
+    return output.reshape(*leading_shape, hidden_size).to(output_dtype)
 
 
 def _run_torch_mxfp4_mlp_core(
@@ -350,6 +412,24 @@ def _run_torch_mxfp4_from_routing_core(
         raise ValueError(
             f"Decoded down MXFP4 weight output dimension {down_weight.shape[-2]} "
             f"does not match hidden states dimension {hidden_size}."
+        )
+
+    if _is_cuda_graph_capture_active(x):
+        return _run_torch_mxfp4_from_routing_capture_safe(
+            x,
+            leading_shape,
+            selected_experts,
+            routing_weights,
+            gate_up_weight,
+            gate_up_bias,
+            down_weight,
+            down_bias,
+            alpha,
+            limit,
+            expert_start,
+            gate_up_order,
+            swiglu_mode,
+            hidden_states.dtype,
         )
 
     output = torch.zeros((x.shape[0], hidden_size), device=x.device, dtype=torch.float32)

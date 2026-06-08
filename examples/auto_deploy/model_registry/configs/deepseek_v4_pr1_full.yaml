@@ -13,16 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# DeepSeek V4 Flash PR1 full-layer config for generation quality validation.
+# DeepSeek V4 Flash PR1 full-layer config for generation quality validation with monolithic decode CUDA graph.
 attn_backend: deepseek_v4_sparse
-compile_backend: torch-simple
+compile_backend: torch-cudagraph
 model_factory: DeepseekV4AutoModelForCausalLM
 skip_loading_weights: false
-max_batch_size: 1
+max_batch_size: 2
 max_seq_len: 512
 max_num_tokens: 512
 enable_chunked_prefill: true
-cuda_graph_config: null
+cuda_graph_config:
+  max_batch_size: 2
+  batch_sizes: [1, 2]
 model_kwargs:
   skip_mtp: true
   ad_rope_cache_len: 512
@@ -56,7 +58,7 @@ transforms:
   quantize_mxfp4_moe:
     enabled: true
   compile_model:
-    backend: torch-simple
+    backend: torch-cudagraph
     piecewise_enabled: false
   multi_stream_moe:
     enabled: false

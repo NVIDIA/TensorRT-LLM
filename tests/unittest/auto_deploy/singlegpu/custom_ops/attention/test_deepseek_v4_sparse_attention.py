@@ -98,6 +98,19 @@ def _multi_decode_meta(input_positions: list[int]):
     )
 
 
+def _cuda_decode_meta(input_pos: int, slot_idx: int = 0):
+    batch_info_host, seq_len, input_pos_tensor, slot_idx_tensor, cu_seqlen = _decode_meta(input_pos)
+    input_pos_tensor.fill_(input_pos)
+    slot_idx_tensor.fill_(slot_idx)
+    return (
+        batch_info_host,
+        seq_len.cuda(),
+        input_pos_tensor.cuda(),
+        slot_idx_tensor.cuda(),
+        cu_seqlen.cuda(),
+    )
+
+
 def _sparse_attention_reference(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -170,6 +183,7 @@ def _run_cached_sparse_attention(
     softmax_scale: float = 1.0,
     window_size: int | None = None,
     compress_ratio: int = 0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     mhc_cache = swa_cache.new_empty(swa_cache.shape)
     compressor_kv_cache = q.new_empty(swa_cache.shape[0], swa_cache.shape[1], 0)
@@ -195,6 +209,7 @@ def _run_cached_sparse_attention(
         None,
         1e-6,
         None,
+        out=out,
     )
 
 
@@ -502,6 +517,20 @@ def test_negative_indices_are_masked_before_softmax() -> None:
     assert output.abs().max() < 1.0
 
 
+def test_out_of_range_indices_are_masked_before_softmax() -> None:
+    q = torch.tensor([[[[1.0, 0.0]]]])
+    kv = torch.tensor([[[1000.0, 1000.0], [1.0, 0.0]]])
+    attn_sink = torch.tensor([0.0])
+    topk_idxs = torch.tensor([[[1, 99]]], dtype=torch.int64)
+    masked_topk_idxs = torch.tensor([[[1, -1]]], dtype=torch.int64)
+
+    output = _run_sparse_attention(q, kv, attn_sink, topk_idxs)
+    expected = _sparse_attention_reference(q, kv, attn_sink, masked_topk_idxs, softmax_scale=1.0)
+
+    assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="high top-k mask: ")
+    assert output.abs().max() < 1.0
+
+
 def test_source_ratio0_matches_reference_for_mixed_patterns() -> None:
     torch.manual_seed(11)
     q = torch.randn(2, 4, 3, 6)
@@ -661,6 +690,74 @@ def test_cached_ratio0_topk_decode_without_window_uses_cache_positions() -> None
     assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="cached top-k decode: ")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
+def test_cached_ratio0_decode_cuda_graph_replay_uses_runtime_slot_and_input_pos() -> None:
+    q = torch.zeros(1, 1, 1, 2, device="cuda")
+    kv = torch.tensor([[[2.0, 0.0]]], device="cuda")
+    attn_sink = torch.tensor([-20.0], device="cuda")
+    topk_idxs = torch.tensor([[[1]]], dtype=torch.int64, device="cuda")
+    metadata = _cuda_decode_meta(input_pos=1, slot_idx=0)
+    swa_cache = torch.full((2, 6, 2), -99.0, device="cuda")
+    mhc_cache = torch.empty_like(swa_cache)
+    compressor_kv_cache = q.new_empty(2, 6, 0)
+    compressor_gate_cache = q.new_empty(2, 6, 0)
+    indexer_compressor_kv_cache = q.new_empty(2, 6, 0)
+    indexer_compressor_gate_cache = q.new_empty(2, 6, 0)
+    out = torch.empty_like(q)
+    empty_sparse_args = _empty_sparse_attention_tensors(q, kv)
+
+    def run_op() -> None:
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            *empty_sparse_args,
+            *metadata,
+            swa_cache,
+            mhc_cache,
+            compressor_kv_cache,
+            compressor_gate_cache,
+            indexer_compressor_kv_cache,
+            indexer_compressor_gate_cache,
+            1.0,
+            None,
+            0,
+            None,
+            1e-6,
+            None,
+            out=out,
+        )
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        run_op()
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_op()
+
+    kv.copy_(torch.tensor([[[7.0, 3.0]]], device="cuda"))
+    topk_idxs.copy_(torch.tensor([[[3]]], dtype=torch.int64, device="cuda"))
+    metadata[2].copy_(torch.tensor([3], dtype=torch.int32, device="cuda"))
+    metadata[3].copy_(torch.tensor([1], dtype=torch.int64, device="cuda"))
+    swa_cache[1, 3].fill_(-11.0)
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = _sparse_attention_reference(
+        q,
+        kv,
+        attn_sink,
+        torch.zeros_like(topk_idxs),
+        softmax_scale=1.0,
+    )
+    torch.testing.assert_close(swa_cache[1, 3], kv[0, 0])
+    torch.testing.assert_close(out, expected)
+
+
 def test_cached_ratio0_sink_only_negative_topk_yields_zero_output() -> None:
     q = torch.tensor([[[[1.0, 0.0]]]])
     kv = torch.tensor([[[5.0, 5.0]]])
@@ -679,6 +776,39 @@ def test_cached_ratio0_sink_only_negative_topk_yields_zero_output() -> None:
 
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output, torch.zeros_like(q), rtol=0, atol=0)
+
+
+def test_cached_ratio0_out_buffer_returns_dummy_and_fills_output() -> None:
+    q = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]], [[7.0, 7.0]]]])
+    kv = torch.tensor([[[2.0, 0.0], [0.0, 2.0], [100.0, 100.0]]])
+    attn_sink = torch.tensor([-20.0])
+    topk_idxs = torch.tensor([[[0], [1], [2]]], dtype=torch.int64)
+
+    expected = _run_cached_sparse_attention(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        _context_meta(seq_len=2),
+        torch.empty(1, 8, 2),
+        window_size=2,
+    )
+
+    out = torch.full_like(q, 123.0)
+    result = _run_cached_sparse_attention(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        _context_meta(seq_len=2),
+        torch.empty(1, 8, 2),
+        window_size=2,
+        out=out,
+    )
+
+    assert result.numel() == 0
+    torch.testing.assert_close(out, expected)
+    torch.testing.assert_close(out[:, 2:], torch.zeros_like(out[:, 2:]), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("compress_ratio", [4, 128])
@@ -1405,7 +1535,7 @@ def test_cached_ratio4_indexer_runtime_all_reduce_flips_selected_row(
         assert group is None
         assert not async_op
         all_reduce_inputs.append(tensor.clone())
-        tensor.copy_(torch.tensor([0.0, 100.0], dtype=tensor.dtype, device=tensor.device))
+        tensor.copy_(torch.tensor([[0.0, 100.0, 1000.0]], dtype=tensor.dtype, device=tensor.device))
 
     monkeypatch.setattr(dsv4_sparse.dist_common, "is_initialized", lambda: True)
     monkeypatch.setattr(dsv4_sparse.dist_common, "get_world_size", lambda: 2)
@@ -1440,7 +1570,7 @@ def test_cached_ratio4_indexer_runtime_all_reduce_flips_selected_row(
     )
 
     assert len(all_reduce_inputs) == 1
-    assert all_reduce_inputs[0][0] > all_reduce_inputs[0][1]
+    assert all_reduce_inputs[0][0, 0] > all_reduce_inputs[0][0, 1]
     expected_topk = torch.arange(window_size + 1, dtype=torch.int64).view(1, 1, -1)
     local_window = swa_cache[:, input_pos - window_size + 1 : input_pos + 1]
     expected = _run_sparse_attention(
@@ -1565,6 +1695,144 @@ def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
     torch.testing.assert_close(mhc_cache[0, 0], compressed_kv[0, 0])
     torch.testing.assert_close(mhc_cache[0, 1], torch.full_like(mhc_cache[0, 1], 777.0))
     assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="cached ratio-128 boundary: ")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
+@pytest.mark.parametrize(
+    ("compress_ratio", "capture_pos", "replay_pos", "state_dim", "topk_width"),
+    [
+        (4, 3, 7, 16, 5),
+        (128, 127, 255, 8, 6),
+    ],
+)
+def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_row(
+    compress_ratio: int,
+    capture_pos: int,
+    replay_pos: int,
+    state_dim: int,
+    topk_width: int,
+) -> None:
+    torch.manual_seed(1900 + compress_ratio)
+    max_seq_len = replay_pos + 1
+    max_compressed_len = 2
+    head_dim = 8
+    window_size = 4
+    q = torch.zeros(1, 1, 1, head_dim, device="cuda")
+    kv = torch.zeros(1, 1, head_dim, device="cuda")
+    attn_sink = torch.tensor([-20.0], device="cuda")
+    topk_idxs = torch.zeros(1, 1, topk_width, dtype=torch.int64, device="cuda")
+    metadata = _cuda_decode_meta(input_pos=capture_pos, slot_idx=0)
+
+    compressor_kv_values = torch.randn(2, max_seq_len, state_dim, device="cuda")
+    compressor_gate_values = torch.randn(2, max_seq_len, state_dim, device="cuda")
+    compressor_kv = compressor_kv_values[0:1, capture_pos : capture_pos + 1].clone()
+    compressor_gate = compressor_gate_values[0:1, capture_pos : capture_pos + 1].clone()
+    compressor_ape = torch.zeros(compress_ratio, state_dim, device="cuda")
+    compressor_norm_weight = torch.ones(head_dim, device="cuda")
+    cos_table = torch.empty(max_seq_len, 0, device="cuda")
+    sin_table = torch.empty(max_seq_len, 0, device="cuda")
+    position_ids = torch.tensor([[capture_pos]], dtype=torch.int64, device="cuda")
+
+    swa_cache = torch.zeros(2, max_seq_len, head_dim, device="cuda")
+    mhc_cache = torch.full((2, max_compressed_len, head_dim), -77.0, device="cuda")
+    compressor_kv_cache = torch.zeros(2, max_seq_len, state_dim, device="cuda")
+    compressor_gate_cache = torch.zeros_like(compressor_kv_cache)
+    compressor_kv_cache[0, :capture_pos] = compressor_kv_values[0, :capture_pos]
+    compressor_gate_cache[0, :capture_pos] = compressor_gate_values[0, :capture_pos]
+    compressor_kv_cache[1, :replay_pos] = compressor_kv_values[1, :replay_pos]
+    compressor_gate_cache[1, :replay_pos] = compressor_gate_values[1, :replay_pos]
+
+    if compress_ratio == 4:
+        indexer_q = torch.ones(1, 1, 1, 2, device="cuda")
+        indexer_weights = torch.ones(1, 1, 1, device="cuda")
+        indexer_compressor_kv = torch.randn(1, 1, 4, device="cuda")
+        indexer_compressor_gate = torch.randn(1, 1, 4, device="cuda")
+        indexer_compressor_ape = torch.zeros(compress_ratio, 4, device="cuda")
+        indexer_compressor_norm_weight = torch.ones(2, device="cuda")
+        indexer_compressor_kv_cache = torch.zeros(2, max_seq_len, 4, device="cuda")
+        indexer_compressor_gate_cache = torch.zeros_like(indexer_compressor_kv_cache)
+    else:
+        indexer_q = q.new_empty(1, 1, 0, 0)
+        indexer_weights = q.new_empty(1, 1, 0)
+        indexer_compressor_kv = q.new_empty(1, 1, 0)
+        indexer_compressor_gate = q.new_empty(1, 1, 0)
+        indexer_compressor_ape = q.new_empty(0, 0)
+        indexer_compressor_norm_weight = q.new_empty(0)
+        indexer_compressor_kv_cache = q.new_empty(2, max_seq_len, 0)
+        indexer_compressor_gate_cache = q.new_empty(2, max_seq_len, 0)
+
+    out = torch.empty_like(q)
+
+    def run_op() -> None:
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_with_cache(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            compressor_kv,
+            compressor_gate,
+            compressor_ape,
+            compressor_norm_weight,
+            cos_table,
+            sin_table,
+            position_ids,
+            indexer_q,
+            indexer_weights,
+            indexer_compressor_kv,
+            indexer_compressor_gate,
+            indexer_compressor_ape,
+            indexer_compressor_norm_weight,
+            *metadata,
+            swa_cache,
+            mhc_cache,
+            compressor_kv_cache,
+            compressor_gate_cache,
+            indexer_compressor_kv_cache,
+            indexer_compressor_gate_cache,
+            1.0,
+            window_size,
+            compress_ratio,
+            max_compressed_len,
+            1e-6,
+            0,
+            out=out,
+        )
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        run_op()
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_op()
+
+    compressor_kv.copy_(compressor_kv_values[1:2, replay_pos : replay_pos + 1])
+    compressor_gate.copy_(compressor_gate_values[1:2, replay_pos : replay_pos + 1])
+    metadata[2].copy_(torch.tensor([replay_pos], dtype=torch.int32, device="cuda"))
+    metadata[3].copy_(torch.tensor([1], dtype=torch.int64, device="cuda"))
+    mhc_cache[1, 1].fill_(-33.0)
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected_row = dsv4_sparse._compressed_row_from_unpaged_state(
+        compressor_kv_cache,
+        compressor_gate_cache,
+        1,
+        1,
+        compressor_ape,
+        compressor_norm_weight,
+        cos_table,
+        sin_table,
+        1e-6,
+        0,
+        compress_ratio,
+        head_dim,
+        state_dim,
+        compressor_kv.dtype,
+    )
+    torch.testing.assert_close(mhc_cache[1, 1], expected_row, rtol=1e-5, atol=1e-5)
 
 
 def test_cached_sparse_attention_rejects_unsupported_compress_ratio() -> None:

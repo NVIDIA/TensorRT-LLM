@@ -99,6 +99,8 @@ _DYNAMIC_OP_POLICIES: Dict[str, DynamicOpPolicy] = {
     "auto_deploy::flashinfer_trtllm_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
     "auto_deploy::torch_cached_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
     "auto_deploy::trtllm_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    # Sparse attention variants.
+    "auto_deploy::torch_deepseek_v4_sparse_attention_with_cache": DynamicOpPolicy.OUT_BUFFER,
     "auto_deploy::triton_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
     "auto_deploy::torch_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
     "auto_deploy::flashinfer_cached_ssm": DynamicOpPolicy.OUT_BUFFER,

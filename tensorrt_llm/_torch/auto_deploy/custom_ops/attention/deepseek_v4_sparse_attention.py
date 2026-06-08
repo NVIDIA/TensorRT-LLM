@@ -256,7 +256,11 @@ def _gather_selected_kv(
     topk_idxs: torch.Tensor,
     batch_idxs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    gather_topk_idxs = topk_idxs.to(torch.long).clamp(min=0)
+    kv_rows = kv.shape[1]
+    if kv_rows == 0:
+        return kv.new_zeros(*topk_idxs.shape, kv.shape[-1])
+
+    gather_topk_idxs = topk_idxs.to(torch.long).clamp(min=0, max=kv_rows - 1)
     if batch_idxs is not None:
         return kv[batch_idxs.to(torch.long).unsqueeze(1), gather_topk_idxs]
 
@@ -786,6 +790,507 @@ def _cached_topk_attention(
     return torch.stack(outputs, dim=0)
 
 
+def _flatten_decode_tokens(tensor: torch.Tensor, num_decode: int) -> torch.Tensor:
+    if tensor.numel() == 0:
+        return tensor.new_empty(num_decode, *tensor.shape[2:])
+    return tensor.reshape(-1, *tensor.shape[2:])[:num_decode]
+
+
+def _write_decode_cache_rows(
+    cache: torch.Tensor,
+    values: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+) -> None:
+    if values.numel() == 0:
+        return
+    cache[slot_idx, input_pos] = values.to(cache.dtype)
+
+
+def _decode_cache_rows_from_positions(
+    cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    positions: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    safe_positions = positions.to(torch.long).clamp(min=0, max=cache.shape[1] - 1)
+    return cache[slot_idx.unsqueeze(1), safe_positions].to(dtype)
+
+
+def _decode_attention_from_rows(
+    q_decode: torch.Tensor,
+    selected_kv: torch.Tensor,
+    valid_rows: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    rel_topk = torch.arange(selected_kv.shape[1], dtype=torch.int64, device=q_decode.device)
+    rel_topk = rel_topk.view(1, -1).expand(q_decode.shape[0], -1)
+    rel_topk = torch.where(valid_rows, rel_topk, torch.full_like(rel_topk, -1))
+    output = _deepseek_v4_sparse_attention(
+        q_decode.unsqueeze(1),
+        selected_kv,
+        attn_sink,
+        rel_topk.unsqueeze(1),
+        softmax_scale,
+    )
+    return output.squeeze(1)
+
+
+def _decode_local_cache_rows(
+    swa_cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    window_size: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    offsets = torch.arange(window_size, dtype=torch.long, device=input_pos.device)
+    positions = input_pos.unsqueeze(1) - window_size + 1 + offsets.view(1, -1)
+    valid = (positions >= 0) & (positions <= input_pos.unsqueeze(1))
+    valid = valid & (positions < swa_cache.shape[1])
+    rows = _decode_cache_rows_from_positions(swa_cache, slot_idx, positions, dtype)
+    return rows, valid
+
+
+def _decode_topk_cache_attention(
+    q_decode: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_decode: torch.Tensor,
+    swa_cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    softmax_scale: float,
+    window_size: Optional[int],
+) -> torch.Tensor:
+    if window_size is not None:
+        selected_kv, valid_rows = _decode_local_cache_rows(
+            swa_cache,
+            slot_idx,
+            input_pos,
+            window_size,
+            q_decode.dtype,
+        )
+        return _decode_attention_from_rows(
+            q_decode,
+            selected_kv,
+            valid_rows,
+            attn_sink,
+            softmax_scale,
+        )
+
+    positions = topk_decode.to(torch.long)
+    valid_rows = (positions >= 0) & (positions < swa_cache.shape[1])
+    selected_kv = _decode_cache_rows_from_positions(swa_cache, slot_idx, positions, q_decode.dtype)
+    return _decode_attention_from_rows(
+        q_decode,
+        selected_kv,
+        valid_rows,
+        attn_sink,
+        softmax_scale,
+    )
+
+
+def _batched_compressed_rows_from_unpaged_state(
+    compressor_kv_cache: torch.Tensor,
+    compressor_gate_cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    row_idx: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int,
+    compress_ratio: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    rotate: bool = False,
+) -> torch.Tensor:
+    offsets = torch.arange(compress_ratio, dtype=torch.long, device=row_idx.device)
+    anchor = row_idx.to(torch.long) * compress_ratio
+    max_pos = compressor_kv_cache.shape[1] - 1
+
+    if compress_ratio == 4:
+        previous_positions = anchor.unsqueeze(1) - compress_ratio + offsets.view(1, -1)
+        current_positions = anchor.unsqueeze(1) + offsets.view(1, -1)
+        previous_valid = previous_positions >= 0
+
+        safe_previous = previous_positions.clamp(min=0, max=max_pos)
+        safe_current = current_positions.clamp(min=0, max=max_pos)
+        previous_kv_state = compressor_kv_cache[slot_idx.unsqueeze(1), safe_previous].to(dtype)
+        previous_gate_state = compressor_gate_cache[slot_idx.unsqueeze(1), safe_previous].to(dtype)
+        current_kv_state = compressor_kv_cache[slot_idx.unsqueeze(1), safe_current].to(dtype)
+        current_gate_state = compressor_gate_cache[slot_idx.unsqueeze(1), safe_current].to(dtype)
+
+        previous_kv = previous_kv_state[..., :head_dim]
+        previous_gate = previous_gate_state[..., :head_dim]
+        previous_gate = previous_gate + compressor_ape[:, :head_dim].to(
+            device=previous_gate.device, dtype=dtype
+        )
+        previous_kv = torch.where(
+            previous_valid.unsqueeze(-1), previous_kv, previous_kv.new_zeros(())
+        )
+        previous_gate = torch.where(
+            previous_valid.unsqueeze(-1),
+            previous_gate,
+            previous_gate.new_full((), -1.0e20),
+        )
+
+        current_kv = current_kv_state[..., head_dim : 2 * head_dim]
+        current_gate = current_gate_state[..., head_dim : 2 * head_dim]
+        current_gate = current_gate + compressor_ape[:, head_dim : 2 * head_dim].to(
+            device=current_gate.device, dtype=dtype
+        )
+        kv = torch.cat((previous_kv, current_kv), dim=1)
+        gate = torch.cat((previous_gate, current_gate), dim=1)
+    else:
+        positions = anchor.unsqueeze(1) + offsets.view(1, -1)
+        safe_positions = positions.clamp(min=0, max=max_pos)
+        kv_state = compressor_kv_cache[slot_idx.unsqueeze(1), safe_positions].to(dtype)
+        gate_state = compressor_gate_cache[slot_idx.unsqueeze(1), safe_positions].to(dtype)
+        kv = kv_state[..., :head_dim]
+        gate = gate_state[..., :head_dim]
+        gate = gate + compressor_ape[:, :head_dim].to(device=gate.device, dtype=dtype)
+
+    pooled = (kv * gate.softmax(dim=1)).sum(dim=1)
+    pooled = _rms_norm_ref(pooled, compressor_norm_weight, rms_norm_eps)
+    cos = cos_table[anchor.clamp(min=0, max=cos_table.shape[0] - 1)]
+    sin = sin_table[anchor.clamp(min=0, max=sin_table.shape[0] - 1)]
+    return _apply_compressed_rope_and_quantize(
+        pooled,
+        cos,
+        sin,
+        rope_dim,
+        rotate=rotate,
+    )
+
+
+def _update_decode_compressed_caches(
+    compressor_kv_decode: torch.Tensor,
+    compressor_gate_decode: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    mhc_cache: torch.Tensor,
+    compressor_kv_cache: torch.Tensor,
+    compressor_gate_cache: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int,
+    compress_ratio: int,
+    max_compressed_len: int,
+) -> None:
+    if compress_ratio == 0 or compressor_kv_decode.numel() == 0:
+        return
+
+    state_dim = int(compressor_kv_decode.shape[-1])
+    head_dim = state_dim // (2 if compress_ratio == 4 else 1)
+    _write_decode_cache_rows(compressor_kv_cache, compressor_kv_decode, slot_idx, input_pos)
+    _write_decode_cache_rows(compressor_gate_cache, compressor_gate_decode, slot_idx, input_pos)
+
+    old_completed = input_pos // compress_ratio
+    new_completed = (input_pos + 1) // compress_ratio
+    row_valid = (new_completed > old_completed) & (old_completed < max_compressed_len)
+    row_idx = old_completed.clamp(min=0, max=max_compressed_len - 1)
+    compressed_rows = _batched_compressed_rows_from_unpaged_state(
+        compressor_kv_cache,
+        compressor_gate_cache,
+        slot_idx,
+        row_idx,
+        compressor_ape,
+        compressor_norm_weight,
+        cos_table,
+        sin_table,
+        rms_norm_eps,
+        rope_dim,
+        compress_ratio,
+        head_dim,
+        compressor_kv_decode.dtype,
+    )
+    previous_rows = mhc_cache[slot_idx, row_idx]
+    rows_to_write = torch.where(
+        row_valid.unsqueeze(-1),
+        compressed_rows.to(mhc_cache.dtype),
+        previous_rows,
+    )
+    mhc_cache[slot_idx, row_idx] = rows_to_write
+
+
+def _select_decode_ratio4_indexer_rows(
+    q_index: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_compressor_kv_cache: torch.Tensor,
+    indexer_compressor_gate_cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    index_topk: int,
+    indexer_compressor_ape: torch.Tensor,
+    indexer_compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int,
+    max_compressed_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if index_topk <= 0:
+        empty_rows = torch.empty(q_index.shape[0], 0, dtype=torch.int64, device=q_index.device)
+        empty_valid = torch.empty(q_index.shape[0], 0, dtype=torch.bool, device=q_index.device)
+        return empty_rows, empty_valid
+
+    candidate_rows = torch.arange(max_compressed_len, dtype=torch.long, device=q_index.device)
+    candidate_rows = candidate_rows.view(1, -1).expand(q_index.shape[0], -1)
+    flat_slot_idx = slot_idx.unsqueeze(1).expand_as(candidate_rows).reshape(-1)
+    flat_rows = candidate_rows.reshape(-1)
+    index_head_dim = int(q_index.shape[-1])
+    index_k = _batched_compressed_rows_from_unpaged_state(
+        indexer_compressor_kv_cache,
+        indexer_compressor_gate_cache,
+        flat_slot_idx,
+        flat_rows,
+        indexer_compressor_ape,
+        indexer_compressor_norm_weight,
+        cos_table,
+        sin_table,
+        rms_norm_eps,
+        rope_dim,
+        4,
+        index_head_dim,
+        q_index.dtype,
+        rotate=True,
+    )
+    index_k = index_k.view(q_index.shape[0], max_compressed_len, index_head_dim)
+    index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
+    index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=1)
+    if dist_common.is_initialized() and dist_common.get_world_size() > 1:
+        dist_common.all_reduce(index_score, op=dist_common.ReduceOp.SUM)
+
+    visible_len = ((input_pos + 1) // 4).clamp(max=max_compressed_len)
+    visible = candidate_rows < visible_len.unsqueeze(1)
+    index_score = index_score.masked_fill(~visible, float("-inf"))
+    topk_count = min(index_topk, max_compressed_len)
+    topk_values, topk_rows = index_score.topk(topk_count, dim=-1)
+    topk_valid = torch.isfinite(topk_values)
+    topk_rows = torch.where(topk_valid, topk_rows.to(torch.int64), torch.full_like(topk_rows, -1))
+    if topk_count < index_topk:
+        pad_shape = (q_index.shape[0], index_topk - topk_count)
+        row_pad = torch.full(pad_shape, -1, dtype=torch.int64, device=q_index.device)
+        valid_pad = torch.zeros(pad_shape, dtype=torch.bool, device=q_index.device)
+        topk_rows = torch.cat((topk_rows, row_pad), dim=-1)
+        topk_valid = torch.cat((topk_valid, valid_pad), dim=-1)
+    return topk_rows, topk_valid
+
+
+def _decode_compressed_cache_attention(
+    q_decode: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_decode: torch.Tensor,
+    indexer_q_decode: torch.Tensor,
+    indexer_weights_decode: torch.Tensor,
+    swa_cache: torch.Tensor,
+    mhc_cache: torch.Tensor,
+    indexer_compressor_kv_cache: torch.Tensor,
+    indexer_compressor_gate_cache: torch.Tensor,
+    indexer_compressor_ape: torch.Tensor,
+    indexer_compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    max_compressed_len: int,
+    softmax_scale: float,
+    rms_norm_eps: float,
+    rope_dim: int,
+) -> torch.Tensor:
+    local_kv, local_valid = _decode_local_cache_rows(
+        swa_cache,
+        slot_idx,
+        input_pos,
+        window_size,
+        q_decode.dtype,
+    )
+    if compress_ratio == 4:
+        index_topk = max(int(topk_decode.shape[-1]) - int(window_size), 0)
+        selected_rows, compressed_valid = _select_decode_ratio4_indexer_rows(
+            indexer_q_decode,
+            indexer_weights_decode,
+            indexer_compressor_kv_cache,
+            indexer_compressor_gate_cache,
+            slot_idx,
+            input_pos,
+            index_topk,
+            indexer_compressor_ape,
+            indexer_compressor_norm_weight,
+            cos_table,
+            sin_table,
+            rms_norm_eps,
+            rope_dim,
+            max_compressed_len,
+        )
+        compressed_kv = _decode_cache_rows_from_positions(
+            mhc_cache,
+            slot_idx,
+            selected_rows.clamp(min=0),
+            q_decode.dtype,
+        )
+    else:
+        candidate_rows = torch.arange(
+            max_compressed_len,
+            dtype=torch.long,
+            device=q_decode.device,
+        )
+        selected_rows = candidate_rows.view(1, -1).expand(q_decode.shape[0], -1)
+        compressed_len = ((input_pos + 1) // compress_ratio).clamp(max=max_compressed_len)
+        compressed_valid = selected_rows < compressed_len.unsqueeze(1)
+        compressed_kv = _decode_cache_rows_from_positions(
+            mhc_cache,
+            slot_idx,
+            selected_rows,
+            q_decode.dtype,
+        )
+
+    selected_kv = torch.cat((local_kv, compressed_kv), dim=1)
+    valid_rows = torch.cat((local_valid, compressed_valid), dim=1)
+    return _decode_attention_from_rows(
+        q_decode,
+        selected_kv,
+        valid_rows,
+        attn_sink,
+        softmax_scale,
+    )
+
+
+def _deepseek_v4_sparse_attention_decode_with_cache(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    compressor_kv: torch.Tensor,
+    compressor_gate: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_compressor_kv: torch.Tensor,
+    indexer_compressor_gate: torch.Tensor,
+    indexer_compressor_ape: torch.Tensor,
+    indexer_compressor_norm_weight: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    input_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    swa_cache: torch.Tensor,
+    mhc_cache: torch.Tensor,
+    compressor_kv_cache: torch.Tensor,
+    compressor_gate_cache: torch.Tensor,
+    indexer_compressor_kv_cache: torch.Tensor,
+    indexer_compressor_gate_cache: torch.Tensor,
+    num_decode: int,
+    softmax_scale: float,
+    window_size: Optional[int],
+    compress_ratio: int,
+    max_compressed_len: Optional[int],
+    rms_norm_eps: float,
+    rope_dim: Optional[int],
+    out: Optional[torch.Tensor],
+) -> torch.Tensor:
+    q_flat = q.reshape(-1, *q.shape[2:])
+    q_decode = q_flat[:num_decode]
+    kv_decode = _flatten_decode_tokens(kv, num_decode)
+    topk_decode = _flatten_decode_tokens(topk_idxs, num_decode)
+    slot_idx_decode = slot_idx.reshape(-1)[:num_decode].to(torch.long)
+    input_pos_decode = input_pos.reshape(-1)[:num_decode].to(torch.long)
+
+    _write_decode_cache_rows(swa_cache, kv_decode, slot_idx_decode, input_pos_decode)
+    if compress_ratio:
+        assert window_size is not None
+        assert max_compressed_len is not None
+        assert rope_dim is not None
+        compressor_kv_decode = _flatten_decode_tokens(compressor_kv, num_decode)
+        compressor_gate_decode = _flatten_decode_tokens(compressor_gate, num_decode)
+        _update_decode_compressed_caches(
+            compressor_kv_decode,
+            compressor_gate_decode,
+            compressor_ape,
+            compressor_norm_weight,
+            cos_table,
+            sin_table,
+            slot_idx_decode,
+            input_pos_decode,
+            mhc_cache,
+            compressor_kv_cache,
+            compressor_gate_cache,
+            rms_norm_eps,
+            rope_dim,
+            compress_ratio,
+            max_compressed_len,
+        )
+        if compress_ratio == 4:
+            indexer_compressor_kv_decode = _flatten_decode_tokens(indexer_compressor_kv, num_decode)
+            indexer_compressor_gate_decode = _flatten_decode_tokens(
+                indexer_compressor_gate, num_decode
+            )
+            _write_decode_cache_rows(
+                indexer_compressor_kv_cache,
+                indexer_compressor_kv_decode,
+                slot_idx_decode,
+                input_pos_decode,
+            )
+            _write_decode_cache_rows(
+                indexer_compressor_gate_cache,
+                indexer_compressor_gate_decode,
+                slot_idx_decode,
+                input_pos_decode,
+            )
+        indexer_q_decode = _flatten_decode_tokens(indexer_q, num_decode)
+        indexer_weights_decode = _flatten_decode_tokens(indexer_weights, num_decode)
+        decode_output = _decode_compressed_cache_attention(
+            q_decode,
+            attn_sink,
+            topk_decode,
+            indexer_q_decode,
+            indexer_weights_decode,
+            swa_cache,
+            mhc_cache,
+            indexer_compressor_kv_cache,
+            indexer_compressor_gate_cache,
+            indexer_compressor_ape,
+            indexer_compressor_norm_weight,
+            cos_table,
+            sin_table,
+            slot_idx_decode,
+            input_pos_decode,
+            window_size,
+            compress_ratio,
+            max_compressed_len,
+            softmax_scale,
+            rms_norm_eps,
+            rope_dim,
+        )
+    else:
+        decode_output = _decode_topk_cache_attention(
+            q_decode,
+            attn_sink,
+            topk_decode,
+            swa_cache,
+            slot_idx_decode,
+            input_pos_decode,
+            softmax_scale,
+            window_size,
+        )
+
+    output_flat = torch.zeros_like(q_flat)
+    output_flat[:num_decode].copy_(decode_output)
+    output = output_flat.view_as(q)
+    if out is not None:
+        out.copy_(output)
+        return out.new_empty(0)
+    return output
+
+
 def _cached_decode_topk_positions(
     topk_seq: torch.Tensor,
     input_pos: int,
@@ -881,6 +1386,7 @@ def _deepseek_v4_sparse_attention(
     for start in range(0, num_tokens, chunk_size):
         end = min(start + chunk_size, num_tokens)
         topk_chunk = topk_flat[start:end]
+        valid_topk = (topk_chunk >= 0) & (topk_chunk < kv.shape[1])
         selected_kv_compute = _gather_selected_kv(kv, topk_chunk, batch_idxs[start:end]).to(
             compute_dtype
         )
@@ -888,7 +1394,7 @@ def _deepseek_v4_sparse_attention(
 
         logits = torch.matmul(q_compute, selected_kv_compute.transpose(-1, -2))
         logits = logits * softmax_scale
-        logits = logits.masked_fill((topk_chunk < 0).unsqueeze(1), float("-inf"))
+        logits = logits.masked_fill((~valid_topk).unsqueeze(1), float("-inf"))
         chunk_sink_logits = sink_logits.expand(end - start, num_heads, 1)
         logits_with_sink = torch.cat([logits, chunk_sink_logits], dim=-1)
 
@@ -1077,6 +1583,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     max_compressed_len: Optional[int] = None,
     rms_norm_eps: float = 1e-6,
     rope_dim: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Reference unpaged cached DeepSeek V4 sparse attention with compressor state."""
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
@@ -1114,6 +1621,41 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     if active_tokens > q_flat.shape[0]:
         raise ValueError(
             f"active token count {active_tokens} exceeds flattened q tokens {q_flat.shape[0]}"
+        )
+    if num_prefill == 0 and num_decode > 0:
+        return _deepseek_v4_sparse_attention_decode_with_cache(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            compressor_kv,
+            compressor_gate,
+            compressor_ape,
+            compressor_norm_weight,
+            indexer_q,
+            indexer_weights,
+            indexer_compressor_kv,
+            indexer_compressor_gate,
+            indexer_compressor_ape,
+            indexer_compressor_norm_weight,
+            cos_table,
+            sin_table,
+            input_pos,
+            slot_idx,
+            swa_cache,
+            mhc_cache,
+            compressor_kv_cache,
+            compressor_gate_cache,
+            indexer_compressor_kv_cache,
+            indexer_compressor_gate_cache,
+            num_decode,
+            softmax_scale,
+            window_size,
+            compress_ratio,
+            max_compressed_len,
+            rms_norm_eps,
+            rope_dim,
+            out,
         )
 
     seq_len_host = _to_host_long("seq_len", seq_len, num_seq)
@@ -1283,7 +1825,11 @@ def torch_deepseek_v4_sparse_attention_with_cache(
 
     if active_tokens < q_flat.shape[0]:
         output_flat[active_tokens:].zero_()
-    return output_flat.view_as(q)
+    output = output_flat.view_as(q)
+    if out is not None:
+        out.copy_(output)
+        return out.new_empty(0)
+    return output
 
 
 @torch_deepseek_v4_sparse_attention_with_cache.register_fake
@@ -1322,7 +1868,10 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
     max_compressed_len: Optional[int] = None,
     rms_norm_eps: float = 1e-6,
     rope_dim: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out.new_empty(0)
     _validate_compress_ratio(compress_ratio)
     _validate_rank("q", q, 4)
     _validate_rank("kv", kv, 3)
@@ -1381,6 +1930,7 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
         max_compressed_len,
         rms_norm_eps,
         rope_dim,
+        out,
     )
     return q.new_empty(q.shape).contiguous()
 

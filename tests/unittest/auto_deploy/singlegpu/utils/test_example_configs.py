@@ -159,11 +159,13 @@ def test_deepseek_v4_pr1_registry_dry_run() -> None:
     assert args.model == _DEEPSEEK_V4_MODEL
     assert args.model_factory == "DeepseekV4AutoModelForCausalLM"
     assert args.attn_backend == "deepseek_v4_sparse"
-    assert args.compile_backend == "torch-simple"
-    assert not args.is_cuda_graph_enabled()
-    assert args.max_batch_size == 1
+    assert args.compile_backend == "torch-cudagraph"
+    assert args.is_cuda_graph_enabled()
+    assert args.max_batch_size == 2
     assert args.max_seq_len == 512
     assert args.max_num_tokens == 512
+    assert args.cuda_graph_config is not None
+    assert args.cuda_graph_config.batch_sizes == [1, 2]
     assert args.model_kwargs["num_hidden_layers"] == 5
     assert args.model_kwargs["skip_mtp"] is True
     assert args.model_kwargs["ad_rope_cache_len"] == 512
@@ -175,7 +177,11 @@ def test_deepseek_v4_pr1_registry_dry_run() -> None:
     assert load_weights.get("disable_preload", False) is False
     assert transforms["quantize_finegrained_fp8_linear_from_config"]["enabled"] is True
     assert transforms["quantize_mxfp4_moe"]["enabled"] is True
-    assert transforms["compile_model"]["backend"] == "torch-simple"
+    assert transforms["compile_model"]["backend"] == "torch-cudagraph"
+    assert transforms["compile_model"]["piecewise_enabled"] is False
+    assert "piecewise_use_monolithic_decode" not in transforms["compile_model"]
+    assert transforms["compile_model"]["piecewise_num_tokens"] is None
+    assert transforms["compile_model"]["cuda_graph_batch_sizes"] == [1, 2]
 
     sharding = transforms["apply_sharding_hints"]
     assert sharding["enabled"] is True
