@@ -652,6 +652,7 @@ class QwenImageLayeredPipeline(QwenImagePipeline):
         self.scheduler.set_timesteps(sigmas=sigmas_np, device=device, mu=mu)
         timesteps = self.scheduler.timesteps
         self.scheduler.set_begin_index(0)
+        self._refresh_cache_acceleration(len(timesteps))
 
         additional_t_cond = torch.zeros(batch_size, device=device, dtype=torch.long)
         timer.mark_denoise_start()

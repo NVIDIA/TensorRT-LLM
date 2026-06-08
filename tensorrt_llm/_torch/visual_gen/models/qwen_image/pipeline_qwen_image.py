@@ -234,6 +234,17 @@ class QwenImagePipeline(BasePipeline):
             self.transformer.to_inference_dtype().eval()
         self._target_dtype = self.pipeline_config.torch_dtype
 
+    def post_load_weights(self) -> None:
+        """Post-load setup: transformer hooks and optional Cache-DiT."""
+        super().post_load_weights()
+        if self.transformer is not None and self.model_config.cache_backend == "cache_dit":
+            self._setup_cache_acceleration(self.transformer, coefficients=None)
+
+    def _refresh_cache_acceleration(self, num_inference_steps: int) -> None:
+        cache_accelerator = getattr(self, "cache_accelerator", None)
+        if cache_accelerator is not None and cache_accelerator.is_enabled():
+            cache_accelerator.refresh(num_inference_steps)
+
     # ------------------------------------------------------------------
     # Prompt encoding (Qwen2.5-VL chat template).
     # ------------------------------------------------------------------
@@ -482,6 +493,7 @@ class QwenImagePipeline(BasePipeline):
         self.scheduler.set_timesteps(sigmas=sigmas_np, device=device, mu=mu)
         timesteps = self.scheduler.timesteps
         self.scheduler.set_begin_index(0)
+        self._refresh_cache_acceleration(len(timesteps))
 
         # Denoise loop.
         timer.mark_denoise_start()
