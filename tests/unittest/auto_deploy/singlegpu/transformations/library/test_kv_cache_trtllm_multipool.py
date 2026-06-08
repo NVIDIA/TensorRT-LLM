@@ -30,7 +30,7 @@ each pool's kernel receives its own attention window.
 import pytest
 import torch
 import torch.nn as nn
-from _torch_test_utils import all_close
+from _torch_test_utils import all_close, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
@@ -38,7 +38,10 @@ from tensorrt_llm._torch.auto_deploy.models.factory import FullModelExportInfo, 
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or not trtllm_ops_available(),
+    reason="Requires CUDA and TRT-LLM attention backend",
+)
 
 
 class _DummyFactory(ModelFactory):
