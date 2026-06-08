@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the capture-safe *device path* of routed-expert MoE LoRA in
-`torch.ops.trtllm.fused_moe`.
+"""Tests for the capture-safe grouped-GEMM LoRA core of routed-expert MoE LoRA
+in `torch.ops.trtllm.fused_moe`.
 
-The device path (selected by the slot-indexed input schema, or by
-`TLLM_MOE_LORA_USE_DEVICE_PATH=1` for the per-request schema) performs the
-per-token pointer expansion, problem building, and grouped GEMMs entirely on
-the CUDA stream, so it is safe to record into a CUDA graph. These tests cover
-the surface the eager-only tests in `test_moe_lora_op.py` cannot reach:
+The MoE op always runs the grouped-GEMM core: per-token pointer expansion,
+problem building, and grouped GEMMs run entirely on the CUDA stream, so it is
+safe to record into a CUDA graph. Two input schemas feed the core: the eager
+per-request schema and the CUDA-graph slot-indexed schema. These tests cover the
+surface the eager-only tests in `test_moe_lora_op.py` cannot reach:
 
-  1. Device-path eager correctness vs. the legacy host path and an fp32
-     PyTorch reference (exercises the new on-device kernels).
-  2. CUDA-graph capture + replay of the device path (slot-indexed schema),
-     verified against the eager result.
+  1. Eager per-request correctness vs. an fp32 PyTorch reference (exercises the
+     on-device pointer-expand / problem-builder / grouped-GEMM kernels).
+  2. CUDA-graph capture + replay of the slot-indexed schema, verified against
+     the eager result.
   3. Multi-adapter routing within a single capture (token_to_slot mixing two
      adapter slots).
   4. Slot reassignment under replay: the slot -> per-token expansion runs
@@ -41,8 +41,8 @@ def _isolate_moe_runner_cache():
     """Give every test a fresh cached FusedMoeRunner and release captured graphs
     / device scratch afterward.
 
-    The MoE LoRA device path keeps persistent per-runner scratch (slot tables,
-    pointer arrays, low-rank workspace) on the module-level MoERunner cache, and
+    The MoE LoRA grouped-GEMM core keeps persistent per-runner scratch (slot
+    tables, pointer arrays, low-rank workspace) on the module-level MoERunner cache, and
     these tests leak the CUDA graphs they capture. Without isolation, a test that
     grows the cached runner's slot tables (e.g. max_lora_size 1 -> 2) while an
     earlier test's captured graph still references the old device scratch
@@ -193,13 +193,11 @@ def _reference_multi_slot(x, w3_w1, w2, topk_ids, topk_scores, adapter_sets, tok
 
 
 @requires_cuda_and_op
-def test_device_path_eager_matches_host_and_reference(monkeypatch):
-    """Per-request schema on the device path (env-var opt-in) must match both
-    the legacy host path and the fp32 PyTorch reference. Exercises the on-device
-    pointer-expand / problem-builder / grouped-GEMM kernels in eager mode.
+def test_eager_per_request_matches_reference():
+    """The eager (per-request) input schema feeds the grouped-GEMM LoRA core and
+    must match the fp32 PyTorch reference. Exercises the on-device pointer-expand
+    / problem-builder / grouped-GEMM kernels in eager mode.
     """
-    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, hidden_size, inter_size = 16, 128, 256
@@ -213,29 +211,11 @@ def test_device_path_eager_matches_host_and_reference(monkeypatch):
     )
     lora_kwargs = _per_request_kwargs(num_tokens, adapters, rank)
 
-    # Host path (device path env explicitly disabled), fresh runner.
-    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "0")
-    MoERunner.runner_dict.clear()
-    try:
-        out_host = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, dict(lora_kwargs))
-    finally:
-        MoERunner.runner_dict.clear()
-
-    # Device path (env opt-in), fresh runner.
-    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
-    MoERunner.runner_dict.clear()
-    try:
-        out_device = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, dict(lora_kwargs))
-    finally:
-        MoERunner.runner_dict.clear()
-
+    out = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, dict(lora_kwargs))
     out_ref = _reference(x, w3_w1, w2, topk_ids, topk_scores, adapters)
 
-    assert torch.isfinite(out_device).all()
-    torch.testing.assert_close(out_device, out_ref, rtol=_RTOL, atol=_ATOL)
-    # Host vs device path are different reduction orders but should agree
-    # within the same bf16 tolerance.
-    torch.testing.assert_close(out_device, out_host, rtol=_RTOL, atol=_ATOL)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, out_ref, rtol=_RTOL, atol=_ATOL)
 
 
 def _warmup_and_capture(call_fn, warmup_iters=3):
@@ -252,9 +232,9 @@ def _warmup_and_capture(call_fn, warmup_iters=3):
 
 
 @requires_cuda_and_op
-def test_device_path_cuda_graph_replay_matches_eager():
-    """Slot-indexed schema auto-selects the device path; capturing the op into a
-    CUDA graph and replaying must reproduce the eager device-path output.
+def test_cuda_graph_replay_matches_eager():
+    """Capturing the slot-indexed op into a CUDA graph and replaying must
+    reproduce the eager output.
     """
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -282,16 +262,16 @@ def test_device_path_cuda_graph_replay_matches_eager():
 
     out_ref = _reference(x, w3_w1, w2, topk_ids, topk_scores, adapters)
     assert torch.isfinite(out_replay).all()
-    # Replay reproduces the captured device-path computation bit-for-bit.
+    # Replay reproduces the captured computation bit-for-bit.
     torch.testing.assert_close(out_replay, out_eager, rtol=0, atol=0)
     torch.testing.assert_close(out_replay, out_ref, rtol=_RTOL, atol=_ATOL)
 
 
 @requires_cuda_and_op
-def test_device_path_cuda_graph_multi_adapter():
+def test_cuda_graph_multi_adapter():
     """Two adapter slots routed per-token via token_to_slot, captured + replayed.
-    Validates the device path threads each token's slot through the on-device
-    pointer expansion correctly.
+    Validates the slot-indexed path threads each token's slot through the
+    on-device pointer expansion correctly.
     """
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -327,7 +307,7 @@ def test_device_path_cuda_graph_multi_adapter():
 
 
 @requires_cuda_and_op
-def test_device_path_reserve_prevents_growth_across_captures():
+def test_reserve_prevents_growth_across_captures():
     """Production-mirroring positive test: pre-reserve worst-case LoRA scratch on
     the cached runner, then capture two graphs on the SAME runner at growing slot
     counts (1 then 2). Because reserve pre-sized to the worst case
@@ -440,7 +420,7 @@ def _set_slot_ptrs_inplace(slot_kwargs, adapters, slot_index=0):
 
 
 @requires_cuda_and_op
-def test_device_path_slot_reassignment_reflected_on_replay():
+def test_slot_reassignment_reflected_on_replay():
     """In-place slot reassignment must be reflected on replay WITHOUT recapture.
 
     The slot -> per-token expansion runs on-device (launchMoeLoraSlotExpand)
@@ -477,15 +457,14 @@ def test_device_path_slot_reassignment_reflected_on_replay():
     # Sanity: the two adapters produce meaningfully different outputs.
     assert (out_ref_a.float() - out_ref_b.float()).abs().mean().item() > 1e-2
 
-    # Correctness of the device-path numerics is covered by
-    # test_device_path_cuda_graph_replay_matches_eager and
-    # test_device_path_eager_matches_host_and_reference. This test targets the
+    # Correctness of the grouped-GEMM numerics is covered by
+    # test_cuda_graph_replay_matches_eager and
+    # test_eager_per_request_matches_reference. This test targets the
     # *reassignment* invariant, and uses a precision-robust discriminative check
     # rather than a tight element-wise match: these randomly-drawn adapters push
     # the SwiGLU + FC2 intermediates large enough that a few percent of output
-    # lanes fall into bf16 catastrophic cancellation (the device path is
-    # bit-identical to the host path there; both diverge from the fp32 reference
-    # only on those lanes), so an element-wise reference match is not meaningful.
+    # lanes fall into bf16 catastrophic cancellation and diverge from the fp32
+    # reference on those lanes, so an element-wise reference match is not meaningful.
     # Instead assert that the replayed output tracks whichever adapter is
     # currently assigned (closer in mean to its own reference than to the other)
     # and flips when the slot is reassigned in place, all without recapture.
