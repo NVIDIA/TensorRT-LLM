@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,6 +84,16 @@ namespace
         }
     }
     return fixedExecutorConfig;
+}
+
+[[nodiscard]] bool statsBufferIsEnabled(SizeType32 maxIterations)
+{
+    return maxIterations != 0;
+}
+
+[[nodiscard]] bool statsBufferIsBounded(SizeType32 maxIterations)
+{
+    return maxIterations > 0;
 }
 
 SizeType32 getNumChildRequests(Request const& request)
@@ -1908,9 +1918,13 @@ RequestStatsPerIteration Executor::Impl::getCurrentRequestStats(
 void Executor::Impl::appendCurrentIterStats(IterationStats&& currentIterStats)
 {
     std::scoped_lock<std::mutex> lck(mIterStatsMtx);
-    if (mIterationStats.size() >= mIterStatsMaxIterations)
+    if (statsBufferIsBounded(mIterStatsMaxIterations))
     {
-        mIterationStats.pop_front();
+        auto const maxIterStats = static_cast<std::size_t>(mIterStatsMaxIterations);
+        if (mIterationStats.size() >= maxIterStats)
+        {
+            mIterationStats.pop_front();
+        }
     }
     mIterationStats.emplace_back(std::move(currentIterStats));
 }
@@ -1918,12 +1932,16 @@ void Executor::Impl::appendCurrentIterStats(IterationStats&& currentIterStats)
 void Executor::Impl::appendMultipleIterStats(std::vector<IterationStats>&& currentIterStatsVec)
 {
     std::scoped_lock<std::mutex> lck(mIterStatsMtx);
-    if (mIterationStats.size() + currentIterStatsVec.size() > mIterStatsMaxIterations)
+    if (statsBufferIsBounded(mIterStatsMaxIterations))
     {
-        size_t removeCount = mIterationStats.size() + currentIterStatsVec.size() - mIterStatsMaxIterations;
-        for (size_t i = 0; i < removeCount; i++)
+        auto const maxIterStats = static_cast<std::size_t>(mIterStatsMaxIterations);
+        if (mIterationStats.size() + currentIterStatsVec.size() > maxIterStats)
         {
-            mIterationStats.pop_front();
+            size_t const removeCount = mIterationStats.size() + currentIterStatsVec.size() - maxIterStats;
+            for (size_t i = 0; i < removeCount; i++)
+            {
+                mIterationStats.pop_front();
+            }
         }
     }
     mIterationStats.insert(mIterationStats.end(), std::make_move_iterator(currentIterStatsVec.begin()),
@@ -1935,7 +1953,7 @@ void Executor::Impl::updateIterationStats(RequestList const& activeRequests, dou
     bool flushToOrchestrator)
 {
     NVTX3_SCOPED_RANGE(updateIterationStats);
-    if (mIterStatsMaxIterations > 0 && mIsLeader)
+    if (statsBufferIsEnabled(mIterStatsMaxIterations) && mIsLeader)
     {
         auto currentIterStats = getCurrentIterationStats(
             activeRequests, iterLatencyMS, numNewActiveRequests, newActiveRequestsQueueLatencyMS, numCompletedRequests);
@@ -1972,9 +1990,13 @@ void Executor::Impl::updateIterationStats(RequestList const& activeRequests, dou
 void Executor::Impl::appendCurrentRequestStats(RequestStatsPerIteration&& currentRequestStats)
 {
     std::scoped_lock<std::mutex> lck(mRequestStatsMtx);
-    if (mRequestStats.size() >= mRequestStatsMaxIterations)
+    if (statsBufferIsBounded(mRequestStatsMaxIterations))
     {
-        mRequestStats.pop_front();
+        auto const maxRequestStats = static_cast<std::size_t>(mRequestStatsMaxIterations);
+        if (mRequestStats.size() >= maxRequestStats)
+        {
+            mRequestStats.pop_front();
+        }
     }
     mRequestStats.emplace_back(std::move(currentRequestStats));
 }
@@ -1982,12 +2004,16 @@ void Executor::Impl::appendCurrentRequestStats(RequestStatsPerIteration&& curren
 void Executor::Impl::appendMultipleRequestStats(std::vector<RequestStatsPerIteration>&& currentRequestStatsVec)
 {
     std::scoped_lock<std::mutex> lck(mRequestStatsMtx);
-    if (mRequestStats.size() + currentRequestStatsVec.size() > mRequestStatsMaxIterations)
+    if (statsBufferIsBounded(mRequestStatsMaxIterations))
     {
-        size_t removeCount = mRequestStats.size() + currentRequestStatsVec.size() - mRequestStatsMaxIterations;
-        for (size_t i = 0; i < removeCount; i++)
+        auto const maxRequestStats = static_cast<std::size_t>(mRequestStatsMaxIterations);
+        if (mRequestStats.size() + currentRequestStatsVec.size() > maxRequestStats)
         {
-            mRequestStats.pop_front();
+            size_t const removeCount = mRequestStats.size() + currentRequestStatsVec.size() - maxRequestStats;
+            for (size_t i = 0; i < removeCount; i++)
+            {
+                mRequestStats.pop_front();
+            }
         }
     }
     mRequestStats.insert(mRequestStats.end(), std::make_move_iterator(currentRequestStatsVec.begin()),
@@ -1998,7 +2024,7 @@ void Executor::Impl::updateRequestStats(
     RequestList const& activeRequests, RequestList const& finishedRequests, bool flushToOrchestrator)
 {
     NVTX3_SCOPED_RANGE(updateRequestStats);
-    if (mRequestStatsMaxIterations > 0 && mIsLeader)
+    if (statsBufferIsEnabled(mRequestStatsMaxIterations) && mIsLeader)
     {
         // Add current iteration request stats
         auto currentRequestStats = getCurrentRequestStats(activeRequests, finishedRequests);

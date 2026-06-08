@@ -154,7 +154,9 @@ def test_deepseek_v4_model_defaults_keep_tokens_per_block():
 
     defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
 
-    assert defaults == {"kv_cache_config": {"tokens_per_block": 128}}
+    assert defaults == {
+        "kv_cache_config": {"tokens_per_block": 128, "use_kv_cache_manager_v2": True}
+    }
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
