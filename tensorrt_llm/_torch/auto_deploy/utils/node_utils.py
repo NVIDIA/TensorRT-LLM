@@ -808,23 +808,36 @@ def all_gather_ops() -> frozenset:
 
     Strategy (AUTO/SYMM_MEM) and workspace_id (for symm-mem ProcessGroup
     selection) flow through as op arguments, not as separate op identities.
+
+    The TRT-LLM-backed ops are silently skipped if their custom_ops module
+    failed to register (e.g. in the standalone ``llmc`` package, where
+    ``trtllm_dist`` is not importable).
     """
     return frozenset(
-        {
-            torch.ops.auto_deploy.trtllm_dist_all_gather,
-            torch.ops.auto_deploy.torch_dist_all_gather,
-        }
+        op
+        for op in (
+            _auto_deploy_op("trtllm_dist_all_gather"),
+            _auto_deploy_op("torch_dist_all_gather"),
+        )
+        if op is not None
     )
 
 
 @functools.cache
 def all_reduce_ops() -> frozenset:
-    """All AllReduce custom op packets recognized by AutoDeploy."""
+    """All AllReduce custom op packets recognized by AutoDeploy.
+
+    The TRT-LLM-backed op is silently skipped if its custom_ops module
+    failed to register (e.g. in the standalone ``llmc`` package, where
+    ``trtllm_dist`` is not importable).
+    """
     return frozenset(
-        {
-            torch.ops.auto_deploy.trtllm_dist_all_reduce,
-            torch.ops.auto_deploy.torch_dist_all_reduce,
-        }
+        op
+        for op in (
+            _auto_deploy_op("trtllm_dist_all_reduce"),
+            _auto_deploy_op("torch_dist_all_reduce"),
+        )
+        if op is not None
     )
 
 
