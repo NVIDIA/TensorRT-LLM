@@ -241,16 +241,22 @@ class InputBuffer:
         if fill_value is not None:
             host_view.fill_(fill_value)
 
-        # convert to tensor via numpy (numpy is ~2-3x faster than torch.tensor for large lists)
-        if not isinstance(data, torch.Tensor):
-            data = _list_to_tensor(data, dtype)
-
-        length = data.numel()
-        assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
-        # Use numpy for the memcpy into pinned memory — avoids torch dispatcher overhead
-        dst = host_view[:length].numpy()
-        src = (data if data.dtype == dtype else data.to(dtype)).numpy()
-        np.copyto(dst, src)
+        if isinstance(data, torch.Tensor):
+            length = data.numel()
+            assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
+            # Use numpy for the memcpy into pinned memory — avoids torch dispatcher overhead
+            dst = host_view[:length].numpy()
+            src = (data if data.dtype == dtype else data.to(dtype)).numpy()
+            np.copyto(dst, src)
+        else:
+            # Fast path for Python lists/sequences: assign directly into the pinned host
+            # numpy view. numpy casts the sequence to the buffer dtype in a single pass,
+            # skipping the np.array -> torch.from_numpy (_list_to_tensor) -> two .numpy()
+            # round-trip that dominated tiny per-arg decode staging (input_ids, cu_seqlen,
+            # input_pos arrive as small lists every step at low concurrency).
+            length = len(data)
+            assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
+            host_view[:length].numpy()[:] = data
 
         self._current_lengths[name] = length
         return length
