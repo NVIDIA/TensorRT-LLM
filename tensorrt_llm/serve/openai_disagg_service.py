@@ -388,6 +388,18 @@ class OpenAIDisaggregatedService(OpenAIService):
                     f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
                 )
             choice = ctx_response.choices[0]
+            # If CTX already terminated the request (e.g. EOS emitted during
+            # prefill / MTP draft), there is no KV handoff to verify — the
+            # response is complete and _need_gen() will short-circuit GEN.
+            # Only finish_reason in {"length", "not_finished"} implies a
+            # pending handoff to the gen server.
+            if choice.finish_reason not in ["length", "not_finished"]:
+                logger.debug(
+                    f"CTX response terminated early without KV handoff,"
+                    f" skipping disaggregated params verification."
+                    f" finish_reason={choice.finish_reason!r}"
+                )
+                return ctx_response
             if choice.disaggregated_params is None:
                 raise ValueError(
                     f"Context server did not return disaggregated params."
