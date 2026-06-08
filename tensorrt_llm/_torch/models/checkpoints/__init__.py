@@ -2,6 +2,7 @@ from .base_checkpoint_loader import BaseCheckpointLoader
 from .hf.afmoe_weight_mapper import AfmoeHfWeightMapper
 from .hf.checkpoint_loader import HfCheckpointLoader
 from .hf.config_loader import HfConfigLoader
+from .hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from .hf.gemma3_weight_mapper import Gemma3HfWeightMapper
 from .hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from .hf.llama4_weight_mapper import Llama4HfWeightMapper
@@ -14,7 +15,6 @@ from .hf.qwen2vl_weight_mapper import Qwen2VLHfWeightMapper
 from .hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from .hf.qwen3_next_weight_mapper import Qwen3NextHfWeightMapper
-from .hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from .hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .hf.weight_loader import HfWeightLoader
 from .hf.weight_mapper import HfWeightMapper

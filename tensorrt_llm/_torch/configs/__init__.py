@@ -27,9 +27,7 @@ def _register_custom_configs_with_transformers() -> None:
     # Cosmos3OmniConfig resolves vision sub-configs via ``qwen3_vl_vision``; that
     # alias is only present in newer transformers releases.
     if "qwen3_vl_vision" not in CONFIG_MAPPING:
-        CONFIG_MAPPING.register("qwen3_vl_vision",
-                                Qwen3VLVisionConfig,
-                                exist_ok=True)
+        CONFIG_MAPPING.register("qwen3_vl_vision", Qwen3VLVisionConfig, exist_ok=True)
     for model_type, config_class in custom_configs.items():
         if model_type in CONFIG_MAPPING:
             continue

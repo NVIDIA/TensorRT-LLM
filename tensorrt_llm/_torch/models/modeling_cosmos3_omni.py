@@ -21,16 +21,15 @@ from ..model_config import ModelConfig
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from .modeling_qwen3vl import (
-    Qwen3VLInputProcessorBase,
     Qwen3VisionModel,
     Qwen3VisionModelBase,
+    Qwen3VLInputProcessorBase,
     Qwen3VLModel,
 )
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 
-def _get_cosmos3_model_paths(
-        config: PretrainedConfig) -> Tuple[str, str, str]:
+def _get_cosmos3_model_paths(config: PretrainedConfig) -> Tuple[str, str, str]:
     """Resolve unified Cosmos3 checkpoint paths from the omni config.
 
     Unified Cosmos3 checkpoints use `transformer/` for LLM weights and
@@ -49,16 +48,14 @@ def _get_cosmos3_model_paths(
             root_path = snapshot_download(root_path)
 
     if root_path is None:
-        raise ValueError(
-            "Cannot resolve Cosmos3 checkpoint root from config._name_or_path.")
+        raise ValueError("Cannot resolve Cosmos3 checkpoint root from config._name_or_path.")
 
     root_path = os.fspath(root_path)
     llm_path = os.path.join(root_path, "transformer")
     vision_path = os.path.join(root_path, "vision_encoder")
 
     if not os.path.isdir(llm_path):
-        raise FileNotFoundError(
-            f"Cosmos3 transformer weights not found under {llm_path}.")
+        raise FileNotFoundError(f"Cosmos3 transformer weights not found under {llm_path}.")
 
     return root_path, llm_path, vision_path
 
@@ -70,23 +67,22 @@ def _get_cosmos3_model_paths(
     Qwen3VLInputProcessorBase,
     model_type="cosmos3_omni",
     placeholder_metadata=MultimodalPlaceholderMetadata(
-    placeholder_map={
-        "image": "<|vision_start|><|image_pad|><|vision_end|>",
-        "video": "<|vision_start|><|video_pad|><|vision_end|>",
-    },
-    placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-    placeholders_separator="",
-    content_format=ContentFormat.STRING
-    )
+        placeholder_map={
+            "image": "<|vision_start|><|image_pad|><|vision_end|>",
+            "video": "<|vision_start|><|video_pad|><|vision_end|>",
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        placeholders_separator="",
+        content_format=ContentFormat.STRING,
+    ),
 )
 class Cosmos3OmniModel(Qwen3VLModel):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
-                 **kwargs):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         omni_config = model_config.pretrained_config
         if omni_config is not None:
-            (self._checkpoint_root, self.llm_path,
-             self._vision_encoder_path) = _get_cosmos3_model_paths(omni_config)
+            (self._checkpoint_root, self.llm_path, self._vision_encoder_path) = (
+                _get_cosmos3_model_paths(omni_config)
+            )
 
         super().__init__(model_config, *args, **kwargs)
 
@@ -95,10 +91,8 @@ class Cosmos3OmniModel(Qwen3VLModel):
         """Return the directory of the LLM checkpoint (``transformer/`` subdir)."""
         return self.llm_path
 
-    def load_weights(self, weights: Dict[str, torch.Tensor],
-                     weight_mapper: BaseWeightMapper):
-        vision_weights_file = os.path.join(self._vision_encoder_path,
-                                           "model.safetensors")
+    def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
+        vision_weights_file = os.path.join(self._vision_encoder_path, "model.safetensors")
         if os.path.isfile(vision_weights_file):
             weights.update(safetensors.torch.load_file(vision_weights_file))
 

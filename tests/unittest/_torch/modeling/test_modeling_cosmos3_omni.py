@@ -6,49 +6,43 @@ import os
 
 import pytest
 import torch
-from test_modeling_qwen3vl import (
-    QWEN3_VL_8B_CONFIG,
-    TestQwen3VL,
-    TestQwen3VLScenario,
-)
-
-# Imported for inheritance only; pytest would otherwise collect TestQwen3VL
-# again from this module and run the Qwen3-VL scenarios a second time.
-TestQwen3VL.__test__ = False
+from test_modeling_qwen3vl import QWEN3_VL_8B_CONFIG, TestQwen3VL, TestQwen3VLScenario
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.configs import Cosmos3OmniConfig
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.checkpoints.hf.cosmos3_weight_mapper import (
-    Cosmos3HfWeightMapper,
-)
+from tensorrt_llm._torch.models.checkpoints.hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_cosmos3_omni import Cosmos3OmniModel
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+# Imported for inheritance only; pytest would otherwise collect TestQwen3VL
+# again from this module and run the Qwen3-VL scenarios a second time.
+TestQwen3VL.__test__ = False
+
 COSMOS3_NANO_PATH = os.path.join(llm_models_root(), "nvidia", "Cosmos3-Nano")
 
 COSMOS3_OMNI_TEST_CONFIG = copy.deepcopy(QWEN3_VL_8B_CONFIG)
-COSMOS3_OMNI_TEST_CONFIG.update({
-    "architectures": ["Cosmos3ForConditionalGeneration"],
-    "model_type": "cosmos3_omni",
-    "_name_or_path": COSMOS3_NANO_PATH,
-})
+COSMOS3_OMNI_TEST_CONFIG.update(
+    {
+        "architectures": ["Cosmos3ForConditionalGeneration"],
+        "model_type": "cosmos3_omni",
+        "_name_or_path": COSMOS3_NANO_PATH,
+    }
+)
 
 
 class TestCosmos3Omni(TestQwen3VL):
     __test__ = True
+
     def setUp(self):
         if not os.path.isdir(os.path.join(COSMOS3_NANO_PATH, "transformer")):
-            self.skipTest(
-                f"Cosmos3-Nano checkpoint not found at {COSMOS3_NANO_PATH}")
+            self.skipTest(f"Cosmos3-Nano checkpoint not found at {COSMOS3_NANO_PATH}")
         super().setUp()
         self._load_trtllm_checkpoint_weights(self.trtllm_model)
 
     def _load_trtllm_checkpoint_weights(self, model: Cosmos3OmniModel) -> None:
-        from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import (
-            HfWeightLoader,
-        )
+        from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 
         weight_mapper = Cosmos3HfWeightMapper()
         weight_mapper.init_model_and_config(model, self.hf_config)
@@ -59,7 +53,8 @@ class TestCosmos3Omni(TestQwen3VL):
         model.load_weights(weights, weight_mapper)
         for module in model.modules():
             if hasattr(module, "post_load_weights") and not getattr(
-                    module, "_weights_removed", False):
+                module, "_weights_removed", False
+            ):
                 module.post_load_weights()
 
     def setup_scenario(self, scenario: TestQwen3VLScenario):
@@ -81,8 +76,7 @@ class TestCosmos3Omni(TestQwen3VL):
         )
 
     def run_trtllm_forward(self, trtllm_inputs, use_cuda_graph: bool = False):
-        logits = super().run_trtllm_forward(
-            trtllm_inputs, use_cuda_graph=use_cuda_graph)
+        logits = super().run_trtllm_forward(trtllm_inputs, use_cuda_graph=use_cuda_graph)
         self.assert_outputs_finite(logits)
         return logits
 

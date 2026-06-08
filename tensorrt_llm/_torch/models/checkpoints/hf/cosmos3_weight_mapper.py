@@ -3,9 +3,7 @@
 
 import re
 
-from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import (
-    Qwen3VLHfWeightMapper,
-)
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
 
@@ -20,7 +18,7 @@ class Cosmos3HfWeightMapper(Qwen3VLHfWeightMapper):
     """
 
     KEYS_TO_DROP = (
-        # Generator (image / video diffusion) MoT expert + cross-modal projections
+        # Generator (image / video diffusion) MoT expert + cross-modal projections  # codespell:ignore
         r"\.add_q_proj\.",
         r"\.add_k_proj\.",
         r"\.add_v_proj\.",
@@ -46,8 +44,7 @@ class Cosmos3HfWeightMapper(Qwen3VLHfWeightMapper):
 
         self.prefix_params_map = {
             r"^(layers\.|embed_tokens\.|norm\.)": r"model.language_model.\1",
-            r"^(blocks\.|merger\.|patch_embed\.|pos_embed\.|deepstack_merger_list\.)":
-            r"model.visual.\1",
+            r"^(blocks\.|merger\.|patch_embed\.|pos_embed\.|deepstack_merger_list\.)": r"model.visual.\1",
         }
         self.attn_params_map = {
             r"(.*)\.self_attn\.to_q\.(.*)": r"\1.self_attn.q_proj.\2",
@@ -64,9 +61,7 @@ class Cosmos3HfWeightMapper(Qwen3VLHfWeightMapper):
 
     def preprocess_weights(self, weights: dict) -> dict:
         weights = {
-            key: value
-            for key, value in weights.items()
-            if not self.should_drop_checkpoint_key(key)
+            key: value for key, value in weights.items() if not self.should_drop_checkpoint_key(key)
         }
         weights = self.rename_by_params_map(self.prefix_params_map, weights)
         return self.rename_by_params_map(self.attn_params_map, weights)

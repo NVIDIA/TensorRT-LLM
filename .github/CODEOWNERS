@@ -160,9 +160,11 @@
 /tensorrt_llm/_torch/models/modeling_nemotron_nano.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_qwen3vl.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_qwen3vl_moe.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_cosmos3_omni.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_qwen3_5.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_hunyuan_dense.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/qwen3vl_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/checkpoints/hf/cosmos3_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/qwen3vl_moe_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/qwen3_5_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/llava_next_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs

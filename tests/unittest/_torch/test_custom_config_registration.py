@@ -91,7 +91,8 @@ def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
     ],
 )
 def test_autoconfig_from_pretrained_resolves_to_local_config(
-        tmp_path, model_type, config_cls, config_dict):
+    tmp_path, model_type, config_cls, config_dict
+):
     # Mirrors what the benchmark_serving subprocess does under the hood:
     # AutoTokenizer.from_pretrained -> AutoConfig.from_pretrained. Without
     # the registration this fails through to a bare PreTrainedConfig that

@@ -21,7 +21,6 @@
 import os
 
 from huggingface_hub.dataclasses import strict
-
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING, AutoConfig
 
@@ -67,18 +66,17 @@ class Cosmos3OmniConfig(PreTrainedConfig):
         # does not pass it separately on ModelConfig, so set it when callers provide
         # one via kwargs.
         name_or_path = kwargs.get("_name_or_path") or kwargs.get("name_or_path")
-        if name_or_path and (not getattr(config, "_name_or_path", None)
-                             or len(str(config._name_or_path)) < 2):
+        if name_or_path and (
+            not getattr(config, "_name_or_path", None) or len(str(config._name_or_path)) < 2
+        ):
             config._name_or_path = os.fspath(name_or_path)
         return config
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        config = super().from_pretrained(pretrained_model_name_or_path,
-                                         **kwargs)
+        config = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
         # Same as from_dict above: copy the resolved checkpoint identifier onto the
         # config so Cosmos3OmniModel can find the unified checkpoint root.
-        if not getattr(config, "_name_or_path", None) or len(
-                str(config._name_or_path)) < 2:
+        if not getattr(config, "_name_or_path", None) or len(str(config._name_or_path)) < 2:
             config._name_or_path = os.fspath(pretrained_model_name_or_path)
         return config
