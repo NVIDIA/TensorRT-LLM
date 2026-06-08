@@ -314,6 +314,7 @@ public:
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
 
         // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
+        // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
         if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0)
         {
             options.mTileScheduler = TileScheduler::Static;
