@@ -908,7 +908,6 @@ def test_vision_attention_matches_reference():
         ref_output,
         rtol=1e-4,
         atol=1e-4,
-        msg="VisionAttention forward should match HF reference eager attention",
     )
 
 
@@ -938,7 +937,6 @@ def test_vision_block_matches_reference():
         ref_output,
         rtol=1e-4,
         atol=1e-4,
-        msg="VisionBlock forward should match HF reference",
     )
 
 
@@ -1850,7 +1848,6 @@ def test_vlm_wrapper_delta_is_request_scoped_no_cross_call_leakage():
         ref_logits_with_delta,
         rtol=1e-4,
         atol=1e-4,
-        msg="Call with mrope_position_deltas should apply the request delta",
     )
     torch.testing.assert_close(
         output_without_delta.logits,
