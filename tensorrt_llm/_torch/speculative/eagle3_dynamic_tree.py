@@ -15,7 +15,7 @@
 """Eagle3 one-model dynamic tree speculative decoding."""
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import triton
@@ -319,25 +319,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         sm = get_sm_version()
         self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
-        # Rejection sampling buffers
-        # Unique draft logits per request, one row per distinct parent context.
-        # Shape: [max_batch_size, 1 + (max_draft_len - 1) * K, vocab_size]
-        #   row 0                      -> p(.|root)
-        #   rows [1 : 1 + K]          -> p(.|depth-0 parent_k)
-        #   rows [1 + K : 1 + 2K]     -> p(.|depth-1 parent_k)
-        # This avoids materializing repeated per-tree-position logits such as
-        # [p(.|E), p(.|E), p(.|E), p(.|F1), p(.|F1), p(.|F2)].
-        self._draft_depth_logits_cat: Optional[torch.Tensor] = None
-        # topk_score_indices from resampling_final_draft_tokens for path tracing.
-        # Shape: [max_batch_size, max_total_draft_tokens]
-        self._topk_score_indices_buf = torch.zeros(
-            max_batch_size, self.max_total_draft_tokens, dtype=torch.int64, device="cuda"
-        )
-        # Tree position -> unique draft-prob row mapping for rejection sampling.
-        # Shape: [max_batch_size, max_total_draft_tokens + 1], root row is unused and kept at 0.
-        self._draft_prob_indices_buf = torch.zeros(
-            max_batch_size, self.max_total_draft_tokens + 1, dtype=torch.int32, device="cuda"
-        )
+        # No draft-side buffers needed: target-only rejection sampling does not
+        # require unique draft logits, topk score indices, or draft prob indices.
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
         """XQA indexes mask flat via cuQSeqLens with per-request stride
@@ -650,11 +633,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
             )
 
-            # Capture unique draft logits for the root parent context.
-            if spec_metadata.use_rejection_sampling and num_gens > 0:
-                self._lazy_alloc_draft_logits_buf(logits.shape[-1], logits.dtype, logits.device)
-                self._draft_depth_logits_cat[:num_gens, 0].copy_(logits[num_contexts:])
-
             new_draft_tokens, new_draft_scores = self.sample(
                 logits, self.K, draft_model=draft_model
             )
@@ -717,13 +695,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     selected_hs, draft_model.lm_head, attn_metadata, True
                 )
 
-                # Capture unique draft logits for the K parent contexts at this depth.
-                if spec_metadata.use_rejection_sampling and num_gens > 0:
-                    row_start = 1 + (layer_idx - 1) * self.K
-                    self._draft_depth_logits_cat[:num_gens, row_start : row_start + self.K].copy_(
-                        logits[num_contexts * self.K :].reshape(num_gens, self.K, -1)
-                    )
-
                 new_draft_tokens, new_draft_scores = self.sample(
                     logits, self.K, draft_model=draft_model
                 )
@@ -752,15 +723,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Resample final tokens and build tree
         real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
-
-        # Save topk_score_indices for rejection sampling path tracing.
-        # Rejection sampling needs to map each final draft token back to its history
-        # buffer index to retrieve the corresponding draft logits. Greedy verification
-        # doesn't need this mapping since it only compares token IDs.
-        # Only save the gen rows (skip context rows) so that
-        # _build_draft_prob_indices can read them back at [:num_gens].
-        if spec_metadata.use_rejection_sampling:
-            self._topk_score_indices_buf[:num_gens].copy_(topk_score_indices[num_contexts:])
 
         if spec_tree_manager is not None:
             # Build into contiguous work buffers indexed by bid (0..num_gens-1).
@@ -839,17 +801,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 num_ctx_tokens = logits.shape[0] - num_gens * N
                 device = logits.device
 
-                draft_logits_tree = self._get_unique_draft_logits(num_gens)
-                draft_prob_indices = self._build_draft_prob_indices(num_gens)
                 target_logits_tree = logits[num_ctx_tokens:].reshape(-1, vocab_size)
                 gen_slice = slice(num_contexts, num_contexts + num_gens)
                 skip_top_k = getattr(spec_metadata, "skip_top_k", False)
                 skip_top_p = getattr(spec_metadata, "skip_top_p", False)
-                skip_temperature = getattr(spec_metadata, "skip_temperature", False)
 
                 if spec_metadata.request_temperatures is None:
                     temps = torch.ones(num_gens, dtype=torch.float32, device=device)
-                    skip_temperature = True
                 else:
                     temps = spec_metadata.request_temperatures[gen_slice]
 
@@ -860,13 +818,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 top_ps = None
                 if not skip_top_p and spec_metadata.request_top_ps is not None:
                     top_ps = spec_metadata.request_top_ps[gen_slice]
-
-                skip_all_sampling_params = (
-                    skip_temperature
-                    and skip_top_k
-                    and skip_top_p
-                    and not getattr(spec_metadata, "has_greedy_requests", False)
-                )
 
                 # Lazily initialize seed/offset tensors on correct device
                 if self.seed is None:
@@ -885,34 +836,20 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     gen_slot_ids, num_gens
                 )
 
-                _, accept_index, accept_token_num, accept_token = (
-                    self.tree_ops_converter.verify_dynamic_tree_rejection_from_logits_out(
+                accept_index, accept_token_num, accept_token = (
+                    self.tree_ops_converter.verify_dynamic_tree_rejection_out(
                         rejection_candidates,
-                        draft_logits_tree,
                         target_logits_tree,
-                        draft_prob_indices,
                         retrieve_next_token,
                         retrieve_next_sibling,
                         tree_valid,
                         temps,
                         top_ks,
                         top_ps,
-                        skip_temperature,
                         num_gens,
                         self._max_path_len,
                         seed=self.seed,
                         offset=self.offset,
-                        d2t=self._d2t,
-                        skip_all_sampling_params=skip_all_sampling_params,
-                        # During CUDA graph capture bake top_k_max=0 so the
-                        # full-sort (always-correct) path is captured. Outside
-                        # capture, pass the pre-computed value for the fast
-                        # topk(kMax) path.
-                        top_k_max=(
-                            0
-                            if torch.cuda.is_current_stream_capturing()
-                            else getattr(spec_metadata, "top_k_max", None)
-                        ),
                     )
                 )
 
@@ -964,29 +901,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     def _can_use_rejection_sampling(self, spec_metadata) -> bool:
         """Check if rejection sampling can be used for dynamic tree verification.
 
-        Dynamic tree uses its own compact unique-logit buffer
-        (_draft_depth_logits_cat) instead of spec_metadata.draft_logits, so we
-        check that buffer's allocation status rather than draft_logits_valid.
-        The buffer is lazily allocated and populated during the first forward
-        pass with generation requests.
+        Target-only rejection sampling only requires target logits, which are
+        always available during verification. We skip it only when the whole
+        batch is greedy (argmax is equivalent and avoids the rejection kernel cost).
 
         Args:
             spec_metadata: Speculative decoding metadata
 
         Returns:
-            True if rejection sampling is enabled and the draft logit buffer is allocated
+            True if rejection sampling is enabled for this batch
         """
-        # Skip rejection sampling when the whole batch is greedy: argmax is
-        # equivalent and avoids the rejection kernel cost.
-        # Also skip during CUDA graph capture/replay: the rejection ops use
-        # dynamic memory allocation (full-sort fallback) which is incompatible
-        # with stream capture.
-        return (
-            spec_metadata.use_rejection_sampling
-            and self._draft_depth_logits_cat is not None
-            and not spec_metadata.is_all_greedy_sample
-            and not spec_metadata.is_cuda_graph
-        )
+        return spec_metadata.use_rejection_sampling and not spec_metadata.is_all_greedy_sample
 
     def _finalize_dynamic_tree_verify_outputs(
         self,
@@ -1009,52 +934,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._accepted_draft_indices_tensor[num_contexts:batch_size] = (
             accept_index[:num_gens, 1:max_path_len] - 1
         ).to(torch.int32)
-
-    def _lazy_alloc_draft_logits_buf(self, vocab_size: int, dtype, device):
-        """Lazily allocate unique draft-logit capture buffer."""
-        if self._draft_depth_logits_cat is None:
-            rows = 1 + (self.max_draft_len - 1) * self.K
-            self._draft_depth_logits_cat = torch.empty(
-                self._max_batch_size, rows, vocab_size, dtype=dtype, device=device
-            )
-
-    def _get_unique_draft_logits(
-        self,
-        num_gens: int,
-    ) -> torch.Tensor:
-        """Return compact unique draft logits for rejection sampling.
-
-        The returned rows are unique per parent context, not duplicated per
-        final tree position.
-
-        Args:
-            num_gens: Number of generation requests.
-
-        Returns:
-            draft_logits: [num_gens * (1 + (max_draft_len - 1) * K), draft_vocab_size]
-        """
-        return self._draft_depth_logits_cat[:num_gens].reshape(
-            -1, self._draft_depth_logits_cat.shape[-1]
-        )
-
-    def _build_draft_prob_indices(
-        self,
-        num_gens: int,
-    ) -> torch.Tensor:
-        """Build tree-position -> unique draft-prob row mapping.
-
-        For a final tree position:
-          - depth 0 children map to row 0, which stores p(.|root)
-          - deeper nodes map to row 1 + depth_bucket * K + parent_k
-        """
-        draft_prob_indices = self._draft_prob_indices_buf[:num_gens]
-        torch.ops.trtllm.build_draft_prob_indices_out_op(
-            self._topk_score_indices_buf[:num_gens],
-            draft_prob_indices,
-            self.K,
-            self.max_total_draft_tokens,
-        )
-        return draft_prob_indices
 
     @nvtx_range("eagle3_dyn.sample")
     def sample(
