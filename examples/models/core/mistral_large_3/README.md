@@ -9,7 +9,7 @@ export mistral_large_3_eagle_model_path=<mistral_large_3_eagle_model_path>
 
 ## Multimodal run
 
-Native Mistral checkpoints are using HF tokenizer and multimodal processor by default. Pass `--input_processor mistral3_common` to select the native processor explicitly.
+Native Mistral checkpoints are using HF tokenizer and multimodal processor by default. Pass `--input_processor mistral_common` to select the native processor explicitly.
 
 * Run the Mistral Large V3 by `quickstart_multimodal.py`
 
@@ -23,12 +23,12 @@ mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickst
     --model_type mistral_large_3 \
     --moe_backend TRTLLM \
     --image_format pil \
-    --input_processor mistral3_common # optional
+    --input_processor mistral_common # optional
 ```
 
 ## LLM-only run
 
-To use the mistral-common tokenizer instead of the HuggingFace tokenizer, pass `--custom_tokenizer mistral`. This is optional; the HuggingFace tokenizer is used by default.
+To use the mistral-common tokenizer instead of the HuggingFace tokenizer, pass `--custom_tokenizer mistral_common`. This is optional; the HuggingFace tokenizer is used by default.
 
 * Run the Mistral Large V3 by `quickstart_advanced.py`
 
@@ -40,7 +40,7 @@ mpirun -n 1 --allow-run-as-root --oversubscribe python3 examples/llm-api/quickst
     --max_tokens 100 \
     --checkpoint_format mistral \
     --moe_backend TRTLLM \
-    --custom_tokenizer mistral # optional
+    --custom_tokenizer mistral_common # optional
 ```
 
 ```bash
@@ -68,7 +68,7 @@ tensor_parallel_size: 4
 moe_expert_parallel_size: 4
 checkpoint_format: mistral
 # Optional fields to use native preprocessing
-input_processor: mistral3_common 
+input_processor: mistral_common 
 custom_tokenizer: mistral
 " > serve.yml
 mpirun -n 1 --allow-run-as-root --oversubscribe python3 -m tensorrt_llm.commands.serve serve \

@@ -27,7 +27,7 @@ except ImportError:
 TOKENIZER_ALIASES = {
     "deepseek_v32":
     "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
-    "mistral":
+    "mistral_common":
     "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer.MistralTokenizer",
 }
 
