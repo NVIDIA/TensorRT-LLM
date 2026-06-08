@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -507,7 +507,6 @@ def run(
     topK: int = 8,
     seq_len: int = 4096,
     raster_along_m: bool = False,
-    use_blkred: bool = False,
     use_cupti: bool = False,
     **kwargs,
 ):
@@ -536,7 +535,6 @@ def run(
     :param seq_len: Sequence length for MoE, used by fused finalize,
             need to know the sequence length to do finalize correctly.
     :param raster_along_m: If True, raster along M dimension for tile scheduler.
-    :param use_blkred: If True, enable block reduction.
     :param use_cupti (bool, optional): If True, uses CUPTI to measure execution time.
             Defaults to False.
     """
@@ -561,7 +559,6 @@ def run(
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use TMA prefetch: {'True'}")
     print(f"Raster along M: {raster_along_m}")
-    print(f"Use blkred: {use_blkred}")
     print(f"Use CUPTI: {'True' if use_cupti else 'False'}")
 
     # Unpack parameters
@@ -655,7 +652,6 @@ def run(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
-        use_blkred=use_blkred,
         raster_along_m=raster_along_m,
     )
 
@@ -1055,13 +1051,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--use_blkred",
-        action="store_true",
-        default=False,
-        help="Enable block reduction (default: False)",
-    )
-
-    parser.add_argument(
         "--use_cupti",
         action="store_true",
         default=False,
@@ -1107,7 +1096,6 @@ if __name__ == "__main__":
         args.topk,
         args.seq_len,
         args.raster_along_m,
-        args.use_blkred,
         args.use_cupti,
     )
     print("exec_time: ", exec_time)

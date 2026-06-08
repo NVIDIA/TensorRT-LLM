@@ -39,15 +39,12 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .utils import (
     TRTLLM_ENABLE_PDL,
-    atomic_add_func,
     blk_reduce_bf16,
     blk_reduce_fp16,
     blk_reduce_fp32,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
-    vectorized_atomic_add_bf16x8,
-    vectorized_atomic_add_fp32x2,
 )
 
 """
@@ -206,7 +203,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        use_blkred: bool = False,
         raster_along_m: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
@@ -236,9 +232,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.mma_tiler = (*mma_tiler_mn, 1)
 
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-
-        # Block reduce configuration
-        self.use_blkred = use_blkred
 
         self.occupancy = 1
         self.epilog_warp_id = (0, 1, 2, 3)
@@ -402,7 +395,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.sf_vec_size,
             self.num_smem_capacity,
             self.occupancy,
-            self.use_blkred,
         )
 
         # Compute A/B/C/Scale shared memory layout
@@ -732,11 +724,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 self.buffer_align_bytes,
             ]
 
-            if cutlass.const_expr(self.use_blkred):
-                sC: cute.struct.Align[
-                    cute.struct.MemRange[self.out_dtype, cute.cosize(self.c_smem_layout_staged)],
-                    self.buffer_align_bytes,
-                ]
+            sC: cute.struct.Align[
+                cute.struct.MemRange[self.out_dtype, cute.cosize(self.c_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -914,7 +905,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+        num_acc_consumer_threads = (
+            len(self.epilog_warp_id) * self.threads_per_warp * (2 if use_2cta_instrs else 1)
+        )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -967,8 +960,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
 
-        if cutlass.const_expr(self.use_blkred):
-            sC = storage.sC.get_tensor(c_smem_layout_staged)
+        sC = storage.sC.get_tensor(c_smem_layout_staged)
 
         # (bidx, bidy, bidz, valid)
         info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
@@ -1638,10 +1630,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             )
 
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.out_dtype)
-            if cutlass.const_expr(self.use_blkred):
-                tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
-                    epi_tidx, tTR_rC, sC, tiled_copy_t2r
-                )
+            tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
+                epi_tidx, tTR_rC, sC, tiled_copy_t2r
+            )
 
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
@@ -1736,96 +1727,60 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
-                            with cute.arch.elect_one():
-                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
                     # Get vectorized accumulator and apply alpha scaling
                     acc_vec = tTR_rAcc.load()
                     acc_vec_final = alpha_val * acc_vec
 
-                    if cutlass.const_expr(self.use_blkred):
-                        tRS_rC.store(acc_vec_final.to(self.out_dtype))
-                        if is_valid_row:
-                            cute.copy(
-                                tiled_copy_r2s,
-                                tRS_rC,
-                                tRS_sC[(None, None, real_subtile_idx, None)],
-                            )
-                    else:
-                        tTR_rC.store(acc_vec_final.to(self.out_dtype))
-                        if is_valid_row:
-                            rOut_epi = cute.make_tensor(tTR_rC.iterator, epi_layout)
+                    tRS_rC.store(acc_vec_final.to(self.out_dtype))
+                    if is_valid_row:
+                        cute.copy(
+                            tiled_copy_r2s,
+                            tRS_rC,
+                            tRS_sC[(None, None, real_subtile_idx, None)],
+                        )
 
-                            base_coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[
-                                1
-                            ] + real_subtile_idx * cute.size(tTR_rC)
-
-                            scatter_out = cute.domain_offset(
-                                (token_idx, 0, 0),
-                                out,  # Use original tensor to get real pointer
-                            )
-
-                            for index in cutlass.range(self.epi_loop_size, unroll_full=True):
-                                coord_n = base_coord_n + index * self.element_offset
-                                scatter_out_offset = cute.domain_offset(
-                                    (0, coord_n, 0), scatter_out
-                                )
-                                if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
-                                    rOut_epi_packed = rOut_epi[index, None, None]
-                                    vectorized_atomic_add_bf16x8(
-                                        rOut_epi_packed, scatter_out_offset
-                                    )
-                                elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
-                                    rOut_epi_packed = rOut_epi[index, None]
-                                    vectorized_atomic_add_fp32x2(
-                                        rOut_epi_packed, scatter_out_offset
-                                    )
-                                else:
-                                    rOut_epi_packed = rOut_epi[index]
-                                    atomic_add_func(rOut_epi_packed, scatter_out_offset)
-
-                if cutlass.const_expr(self.use_blkred):
-                    cute.arch.fence_proxy(
-                        "async.shared",
-                        space="cta",
-                    )
+                # Make all R2S smem writes visible to the async bulk-reduce proxy.
+                cute.arch.fence_proxy(
+                    "async.shared",
+                    space="cta",
+                )
                 #
                 # Async arrive accumulator buffer empty
                 #
                 if cutlass.const_expr(not self.overlapping_accum):
                     cute.arch.fence_view_async_tmem_load()
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
-                if cutlass.const_expr(self.use_blkred):
-                    cute.arch.fence_proxy(
-                        "async.shared",
-                        space="cta",
-                    )
-                    if is_valid_row:
-                        coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                        scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), out)
-                        if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
-                            blk_reduce_bf16(
-                                scatter_out_offset,
-                                sC[epi_tidx, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                        elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
-                            blk_reduce_fp32(
-                                scatter_out_offset,
-                                sC[epi_tidx, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                        elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
-                            blk_reduce_fp16(
-                                scatter_out_offset,
-                                sC[epi_tidx, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                    self.epilog_sync_barrier.arrive_and_wait()
+                # Whole-row async bulk reduce (smem -> global scatter-add).
+                if is_valid_row:
+                    coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
+                    scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), out)
+                    if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
+                        blk_reduce_bf16(
+                            scatter_out_offset,
+                            sC[epi_tidx, None, 0],
+                            cutlass.Int32(self.copy_size),
+                        )
+                    elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
+                        blk_reduce_fp32(
+                            scatter_out_offset,
+                            sC[epi_tidx, None, 0],
+                            cutlass.Int32(self.copy_size),
+                        )
+                    elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
+                        blk_reduce_fp16(
+                            scatter_out_offset,
+                            sC[epi_tidx, None, 0],
+                            cutlass.Int32(self.copy_size),
+                        )
+
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                self.epilog_sync_barrier.arrive_and_wait()
 
                 # Advance to next tile
                 #
@@ -1945,7 +1900,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         sf_vec_size: int,
         num_smem_capacity: int,
         occupancy: int,
-        use_blkred: bool,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1969,8 +1923,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type num_smem_capacity: int
         :param occupancy: Target number of CTAs per SM (occupancy).
         :type occupancy: int
-        :param use_blkred: Whether to use block reduce.
-        :type use_blkred: bool
 
         :return: A tuple containing the computed number of stages for:
                  (ACC stages, A/B operand stages, C stages)
@@ -2035,14 +1987,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Start with total smem per CTA (capacity / occupancy)
         # Subtract reserved bytes and initial C stages bytes
         # Divide remaining by bytes needed per A/B stage
-        if cutlass.const_expr(use_blkred):
-            num_ab_stage = (
-                num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
-            ) // ab_bytes_per_stage
-        else:
-            num_ab_stage = (
-                num_smem_capacity // occupancy - mbar_helpers_bytes
-            ) // ab_bytes_per_stage
+        num_ab_stage = (
+            num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
+        ) // ab_bytes_per_stage
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage
 
