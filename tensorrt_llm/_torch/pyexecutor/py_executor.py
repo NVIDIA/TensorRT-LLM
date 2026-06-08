@@ -437,6 +437,7 @@ class PyExecutor:
         self.expected_num_active_requests = 0
         self._skip_current_iteration = False
         self._suppress_next_iter_log = False
+        self._skip_next_iter_profile = False
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
         # from _send_kv_async the owning DP rank has a response but the other
@@ -1092,11 +1093,33 @@ class PyExecutor:
 
         calibrator = get_calibrator()
 
+        def record_start_event():
+            nonlocal start_event_1, start_event_2
+            if it % 2 == 0:
+                if start_event_1 is None:
+                    start_event_1 = torch.cuda.Event(enable_timing=True)
+                start_event_1.record()
+            else:
+                if start_event_2 is None:
+                    start_event_2 = torch.cuda.Event(enable_timing=True)
+                start_event_2.record()
+
         def profile_step():
             nonlocal it, enabled, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
             nonlocal prev_device_step_time
             nonlocal last_profile_start_iter, last_profile_stop_iter
+            if self._skip_next_iter_profile:
+                # The previous loop only waited for delay batching and did
+                # not run a model iteration. Re-arm the same profiler step so
+                # host/device timing for the next real batch stays clean.
+                self._skip_next_iter_profile = False
+                self._suppress_next_iter_log = False
+                calibrator.pre_step(it)
+                start_time = time.time()
+                record_start_event()
+                return
+
             calibrator.post_step(it)
             if (self.iter_counter in self.profile_stop_iters
                     and last_profile_stop_iter != self.iter_counter
@@ -1168,14 +1191,7 @@ class PyExecutor:
                 last_profile_start_iter = self.iter_counter
             calibrator.pre_step(it)
             start_time = time.time()
-            if it % 2 == 0:
-                if start_event_1 is None:
-                    start_event_1 = torch.cuda.Event(enable_timing=True)
-                start_event_1.record()
-            else:
-                if start_event_2 is None:
-                    start_event_2 = torch.cuda.Event(enable_timing=True)
-                start_event_2.record()
+            record_start_event()
 
         try:
             yield profile_step
@@ -2283,6 +2299,7 @@ class PyExecutor:
         if self._skip_current_iteration:
             self.num_scheduled_requests = 0
             self._suppress_next_iter_log = True
+            self._skip_next_iter_profile = True
             return scheduled_batch, iter_stats
 
         if self.kv_cache_transceiver:
