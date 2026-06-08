@@ -324,10 +324,8 @@ def _transform_section(
     modes: list[str] | None = None,
 ) -> list[str]:
     title = _module_title(transform_key)
-    config_title = f"{title} Configuration"
     config_lines: list[str] = [
-        config_title,
-        "^" * len(config_title),
+        ".. rubric:: YAML configuration",
         "",
     ]
     if registered_transform.qualified_config_class_name is None:
