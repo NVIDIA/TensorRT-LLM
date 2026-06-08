@@ -4,6 +4,18 @@
 Core Transform APIs
 ===================
 
+Common Transform Configuration
+------------------------------
+
+Most transforms accept these common fields. Stage pages also show
+transform-specific configuration models when a transform extends this base
+configuration.
+
+.. autopydantic_model:: tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig
+   :members:
+   :show-inheritance:
+   :no-index:
+
 Transform Interface
 -------------------
 

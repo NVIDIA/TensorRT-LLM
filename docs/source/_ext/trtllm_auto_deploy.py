@@ -69,6 +69,8 @@ class RegisteredTransform:
     key: str
     module_name: str
     class_name: str
+    config_class_name: str
+    config_module_name: str | None
 
     @property
     def qualified_class_name(self) -> str:
@@ -77,6 +79,24 @@ class RegisteredTransform:
     @property
     def qualified_module_name(self) -> str:
         return f"{AUTO_DEPLOY_TRANSFORM_LIBRARY_PACKAGE}.{self.module_name}"
+
+    @property
+    def qualified_config_class_name(self) -> str | None:
+        if self.config_module_name is None:
+            return None
+        return (
+            f"{AUTO_DEPLOY_TRANSFORM_LIBRARY_PACKAGE}.{self.config_module_name}"
+            f".{self.config_class_name}"
+        )
+
+
+@dataclass(frozen=True)
+class ParsedClass:
+    module_name: str
+    class_name: str
+    base_class_names: tuple[str, ...]
+    config_class_name: str | None
+    transform_keys: tuple[str, ...]
 
 
 @dataclass
@@ -138,35 +158,125 @@ def _register_key_from_decorator(decorator: ast.expr) -> str | None:
     return None
 
 
-def _discover_registered_transforms(
+def _name_from_expr(expr: ast.expr) -> str | None:
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        return expr.attr
+    return None
+
+
+def _get_config_class_name(node: ast.ClassDef) -> str | None:
+    for child_node in node.body:
+        if not isinstance(child_node, ast.FunctionDef):
+            continue
+        if child_node.name != "get_config_class":
+            continue
+        for statement in child_node.body:
+            if isinstance(statement, ast.Return):
+                return _name_from_expr(statement.value)
+    return None
+
+
+def _parse_transform_classes(
     library_path: Path,
-) -> dict[str, RegisteredTransform]:
-    """Discover registered transform classes without importing transform modules."""
-    registered_transforms: dict[str, RegisteredTransform] = {}
+) -> tuple[list[ParsedClass], dict[str, list[ParsedClass]]]:
+    parsed_classes: list[ParsedClass] = []
+    classes_by_name: dict[str, list[ParsedClass]] = {}
 
     for module_name in _discover_transform_modules(library_path):
         module_path = library_path / f"{module_name}.py"
         tree = ast.parse(module_path.read_text(encoding="utf-8"))
 
-        for node in ast.walk(tree):
+        for node in tree.body:
             if not isinstance(node, ast.ClassDef):
                 continue
 
-            for decorator in node.decorator_list:
-                transform_key = _register_key_from_decorator(decorator)
-                if transform_key is None:
-                    continue
-                if transform_key in registered_transforms:
-                    previous = registered_transforms[transform_key]
-                    raise ValueError(
-                        f"Transform {transform_key!r} is registered by both "
-                        f"{previous.qualified_class_name} and {module_name}.{node.name}"
-                    )
-                registered_transforms[transform_key] = RegisteredTransform(
-                    key=transform_key,
-                    module_name=module_name,
-                    class_name=node.name,
+            parsed_class = ParsedClass(
+                module_name=module_name,
+                class_name=node.name,
+                base_class_names=tuple(
+                    base_class_name
+                    for base in node.bases
+                    if (base_class_name := _name_from_expr(base)) is not None
+                ),
+                config_class_name=_get_config_class_name(node),
+                transform_keys=tuple(
+                    transform_key
+                    for decorator in node.decorator_list
+                    if (transform_key := _register_key_from_decorator(decorator)) is not None
+                ),
+            )
+            parsed_classes.append(parsed_class)
+            classes_by_name.setdefault(parsed_class.class_name, []).append(parsed_class)
+
+    return parsed_classes, classes_by_name
+
+
+def _get_library_class(
+    class_name: str,
+    module_name: str,
+    classes_by_name: dict[str, list[ParsedClass]],
+) -> ParsedClass | None:
+    classes = classes_by_name.get(class_name, [])
+    if len(classes) == 1:
+        return classes[0]
+    for parsed_class in classes:
+        if parsed_class.module_name == module_name:
+            return parsed_class
+    return None
+
+
+def _resolve_config_class(
+    parsed_class: ParsedClass,
+    classes_by_name: dict[str, list[ParsedClass]],
+    seen: set[str] | None = None,
+) -> ParsedClass | None:
+    """Resolve a transform's config class, following simple inheritance."""
+    if parsed_class.config_class_name:
+        if parsed_class.config_class_name == "TransformConfig":
+            return None
+        return _get_library_class(
+            parsed_class.config_class_name,
+            parsed_class.module_name,
+            classes_by_name,
+        )
+
+    seen = seen or set()
+    seen.add(parsed_class.class_name)
+    for base_class_name in parsed_class.base_class_names:
+        if base_class_name in seen:
+            continue
+        base_classes = classes_by_name.get(base_class_name, [])
+        if len(base_classes) != 1:
+            continue
+        return _resolve_config_class(base_classes[0], classes_by_name, seen)
+
+    return None
+
+
+def _discover_registered_transforms(library_path: Path) -> dict[str, RegisteredTransform]:
+    """Discover registered transform classes without importing transform modules."""
+    registered_transforms: dict[str, RegisteredTransform] = {}
+    parsed_classes, classes_by_name = _parse_transform_classes(library_path)
+
+    for parsed_class in parsed_classes:
+        config_class = _resolve_config_class(parsed_class, classes_by_name)
+        for transform_key in parsed_class.transform_keys:
+            if transform_key in registered_transforms:
+                previous = registered_transforms[transform_key]
+                raise ValueError(
+                    f"Transform {transform_key!r} is registered by both "
+                    f"{previous.qualified_class_name} and "
+                    f"{parsed_class.module_name}.{parsed_class.class_name}"
                 )
+            registered_transforms[transform_key] = RegisteredTransform(
+                key=transform_key,
+                module_name=parsed_class.module_name,
+                class_name=parsed_class.class_name,
+                config_class_name=config_class.class_name if config_class else "TransformConfig",
+                config_module_name=config_class.module_name if config_class else None,
+            )
 
     return registered_transforms
 
@@ -214,6 +324,33 @@ def _transform_section(
     modes: list[str] | None = None,
 ) -> list[str]:
     title = _module_title(transform_key)
+    config_title = f"{title} Configuration"
+    config_lines: list[str] = [
+        config_title,
+        "^" * len(config_title),
+        "",
+    ]
+    if registered_transform.qualified_config_class_name is None:
+        config_lines.extend(
+            [
+                "Uses the common ``TransformConfig`` fields documented in :doc:`core`.",
+                "",
+            ]
+        )
+    else:
+        config_lines.extend(
+            [
+                "The fields below can be set under this transform's entry in the "
+                "AutoDeploy config YAML.",
+                "",
+                f".. autopydantic_model:: {registered_transform.qualified_config_class_name}",
+                "   :members:",
+                "   :show-inheritance:",
+                "   :no-index:",
+                "",
+            ]
+        )
+
     return [
         title,
         "~" * len(title),
@@ -226,6 +363,7 @@ def _transform_section(
         f".. autoclass:: {registered_transform.qualified_class_name}",
         *AUTOCLASS_OPTIONS,
         "",
+        *config_lines,
     ]
 
 

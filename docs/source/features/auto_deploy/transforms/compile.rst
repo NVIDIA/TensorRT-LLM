@@ -4,6 +4,9 @@
 Compilation Stage
 =================
 
-Transforms configured with ``stage: compile`` in the checked-in AutoDeploy configs.
+Compilation is the final transform stage before execution. It applies
+runtime-oriented and compiler-oriented changes after graph structure, weights,
+and caches are ready, such as multi-stream kernels, final cleanup, and CUDA graph
+or ``torch.compile`` execution.
 
 .. trtllm_auto_deploy_transform_stage:: compile

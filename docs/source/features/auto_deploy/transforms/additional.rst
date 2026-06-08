@@ -4,7 +4,9 @@
 Additional Registered Transforms
 ================================
 
-Registered transform classes that are not referenced by ``default.yaml`` or
-``transformers.yaml``.
+These transforms are registered in the AutoDeploy transform library but are not
+part of the standard graph-mode or transformers-mode pipelines. They are useful
+for specialized experiments, explicit opt-in configurations, or development
+workflows.
 
 .. trtllm_auto_deploy_additional_transforms::

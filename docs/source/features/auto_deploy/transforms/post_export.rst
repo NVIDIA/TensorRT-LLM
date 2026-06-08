@@ -4,6 +4,8 @@
 Post-Export Stage
 =================
 
-Transforms configured with ``stage: post_export`` in the checked-in AutoDeploy configs.
+Post-export transforms remove low-level export artifacts and simple no-op graph
+patterns. This keeps later pattern-matching, sharding, and fusion passes focused
+on meaningful graph structure.
 
 .. trtllm_auto_deploy_transform_stage:: post_export

@@ -5,9 +5,9 @@ AutoDeploy Transforms
 =====================
 
 This section documents the AutoDeploy transform interfaces and registered
-pipeline transforms. The stage pages are generated from the checked-in
-AutoDeploy config files and ``TransformRegistry.register`` decorators during the
-Sphinx build.
+pipeline transforms. Use the stage pages to find where a transform runs in the
+optimization pipeline, what graph or runtime change it performs, and which
+configuration fields are available.
 
 For an overview of how transforms fit into the AutoDeploy pipeline, see
 :doc:`auto-deploy`. For information on configuring which transforms run and in

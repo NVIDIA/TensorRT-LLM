@@ -4,6 +4,8 @@
 Factory Stage
 =============
 
-Transforms configured with ``stage: factory`` in the checked-in AutoDeploy configs.
+Factory transforms create or wrap the starting model object for AutoDeploy. This
+stage establishes the module that later graph, weight-loading, cache, and
+runtime transforms will optimize.
 
 .. trtllm_auto_deploy_transform_stage:: factory

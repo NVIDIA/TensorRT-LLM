@@ -4,6 +4,9 @@
 Pattern Matching Stage
 ======================
 
-Transforms configured with ``stage: pattern_matcher`` in the checked-in AutoDeploy configs.
+Pattern matching canonicalizes model-specific PyTorch graphs into AutoDeploy's
+standard graph representation. These transforms identify attention, MoE,
+normalization, quantization, activation, and layout patterns before sharding and
+post-load fusion run.
 
 .. trtllm_auto_deploy_transform_stage:: pattern_matcher

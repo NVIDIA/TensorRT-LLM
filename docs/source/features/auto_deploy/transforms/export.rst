@@ -4,6 +4,8 @@
 Export Stage
 ============
 
-Transforms configured with ``stage: export`` in the checked-in AutoDeploy configs.
+Export converts the model into a graph representation that later stages can
+inspect and rewrite. After this point, transforms operate on graph structure
+rather than only on the original model object.
 
 .. trtllm_auto_deploy_transform_stage:: export
