@@ -457,6 +457,22 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """
         return False
 
+    @property
+    def is_behavior_layer_method(self) -> bool:
+        """
+        Whether this sparse-attention method lives in the behavior layer
+        (``SparseAttentionManager`` subclass holding ``KVCacheManagerV2`` as a
+        tool) rather than the memory layer (cache-manager subclass).
+
+        Default ``False``: the method owns a cache-manager subclass (memory
+        layer), dispatched through ``get_sparse_attn_kv_cache_manager``.
+        Methods that instead run their algorithm in a
+        ``SparseAttentionManager`` (behavior layer) override this to ``True``
+        so the framework uses the standard V2 cache manager and instantiates
+        the method via ``create_sparse_attention_manager``.
+        """
+        return False
+
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""

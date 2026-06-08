@@ -538,6 +538,12 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.encoder_attn_metadata = None
+        # KV-cache compression manager (sparse-attention behavior layer). Set
+        # by create_py_executor_instance when a sparse method is configured;
+        # None otherwise. Also registered in the resource-manager registry so
+        # PyExecutor auto-drives its lifecycle; this member exposes it to the
+        # attention-metadata builder for the per-layer attention hooks.
+        self.compression_manager = None
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
@@ -1601,6 +1607,12 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
+        # The KV-cache compression manager is passed to AttentionMetadata at
+        # construction; TrtllmAttention.forward reads
+        # metadata.compression_manager to fire the per-layer attention hooks.
+        # None when no behavior-layer sparse method is configured.
+        compression_manager = self.compression_manager
+
         if kv_cache_manager is None:
             # Cache the no-cache metadata.
             if self.encoder_attn_metadata is not None:
@@ -1617,7 +1629,8 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
                 sparse_attention_config=self.sparse_attention_config,
-                num_heads_per_kv=num_heads_per_kv)
+                num_heads_per_kv=num_heads_per_kv,
+                compression_manager=compression_manager)
             self.encoder_attn_metadata.block_ids_per_seq = None
             self.encoder_attn_metadata.kv_block_ids_per_seq = None
             return self.encoder_attn_metadata
@@ -1641,6 +1654,7 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=cache_indirection,
             sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
+            compression_manager=compression_manager,
         )
 
         return self.attn_metadata
