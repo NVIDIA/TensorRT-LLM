@@ -552,7 +552,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
-                # Use the wrapper method which works for both V1 and V2
+                # Use the wrapper method which works for both KVCacheManager and KVCacheManagerV2
                 self.draft_kv_cache_manager.copy_batch_block_offsets(
                     self.draft_kv_cache_block_offsets, self.request_ids,
                     self.beam_width, self.num_contexts, self.num_seqs)
@@ -1735,10 +1735,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # @property accessors directly on ``self``.
         if (self.sparse_attention_config is not None and not isinstance(
                 self.sparse_attention_config, SkipSoftmaxAttentionConfig)):
-            kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
-                                                    forward_args)
-            at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
-                                                      forward_args)
+            kv_idx, kv_off, at_idx, at_off = None, None, None, None
+            if metadata.coordinator is not None:
+                # Methods driving their algorithm via the KVCacheBehaviorCoordinator
+                # (e.g. rocketkv): HOOK 2/4 fire here; the
+                # coordinator dispatches to the registered executor (returns a
+                # sparse-mask tuple, None for dense-over-compacted, or writes aux state).
+                layer_idx = self.get_local_layer_idx(metadata)
+                ctx_result = metadata.coordinator.on_context_attention(
+                    layer_idx, q, k, None, metadata)
+                if ctx_result is not None:
+                    kv_idx, kv_off = ctx_result
+                gen_result = metadata.coordinator.on_generation_attention(
+                    layer_idx, q, k, None, metadata)
+                if gen_result is not None:
+                    at_idx, at_off = gen_result
+            else:
+                kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
+                                                        forward_args)
+                at_idx, at_off = self.sparse_attn_predict(
+                    q, k, metadata, forward_args)
             forward_args.sparse = AttentionSparseArgs(
                 sparse_kv_indices=kv_idx,
                 sparse_kv_offsets=kv_off,

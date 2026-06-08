@@ -457,6 +457,22 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """
         return False
 
+    @property
+    def is_behavior_layer_method(self) -> bool:
+        """
+        Whether this sparse-attention method lives in the behavior layer
+        (``SparseAttentionExecutor`` subclass holding ``KVCacheManagerV2`` as a
+        tool) rather than the memory layer (cache-manager subclass).
+
+        Default ``False``: the method owns a cache-manager subclass (memory
+        layer), dispatched through ``get_sparse_attn_kv_cache_manager``.
+        Methods that instead run their algorithm in a
+        ``SparseAttentionExecutor`` (behavior layer) override this to ``True``
+        so the framework uses the standard V2 cache manager and instantiates
+        the method via ``create_sparse_attention_manager``.
+        """
+        return False
+
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""
@@ -650,6 +666,65 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                 'prefill': _compute('prefill', self.target_sparsity_prefill),
                 'decode': _compute('decode', self.target_sparsity_decode),
             })
+
+
+class RocketKVSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Configuration for the RocketKV sparse attention executor.
+
+    Routes to the behavior-layer L2 executor framework — uses the standard
+    ``KVCacheManagerV2`` and the ``RocketKV(SparseAttentionExecutor)`` subclass
+    in ``sparse/rocketkv.py``, which implements Stage I (``on_context_attention``
+    / ``on_context_end``) and Stage II HSA (``on_generation_attention``) plus
+    the KT_CACHE auxiliary pool. Coexists with the legacy
+    :class:`RocketSparseAttentionConfig` (``algorithm="rocket"``) which routes
+    to the legacy cache-manager-subclass pattern (:class:`RocketKVCacheManager`
+    subclass in ``sparse/rocket.py``). The Pydantic discriminator picks based
+    on ``algorithm``:
+
+    - ``algorithm="rocket"`` → legacy ``rocket`` path (``RocketKVCacheManager``)
+    - ``algorithm="rocketkv"`` → executor path (this class → ``RocketKV`` executor)
+    """
+    algorithm: Literal["rocketkv"] = "rocketkv"
+    page_size: Optional[int] = Field(
+        default=16, description="KT cache page size (tokens per KT block).")
+    prompt_budget: Optional[int] = Field(
+        default=2048,
+        description="Top-K budget for HSA mask in Stage II decode.")
+    kt_cache_dtype: Optional[str] = Field(
+        default="bfloat16",
+        description="KT cache dtype — bfloat16 or float8_e5m2.")
+    kt_tokens_per_block: Optional[int] = Field(
+        default=None,
+        description="Tokens per KT_CACHE block (page-aligned auxiliary pool); "
+        "None lets the framework compute from page_size.")
+    # Hyperparameters mirrored from RocketSparseAttentionConfig so this
+    # method exposes the same SnapKV / Stage II decision surface as the
+    # legacy ``rocket`` algorithm.
+    window_size: Optional[int] = Field(
+        default=32, description="RocketKV observation window size.")
+    kernel_size: Optional[int] = Field(
+        default=63, description="SnapKV max-pool1d smoothing kernel size.")
+    topk: Optional[int] = Field(
+        default=64,
+        description="Stage II top-k page selection per generation step.")
+    topr: Optional[int] = Field(
+        default=128, description="Top-r filter dim for query projection.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def get_indices_block_size(self) -> int:
+        return self.page_size
+
+    @property
+    def is_behavior_layer_method(self) -> bool:
+        # MEMORY-LAYER method: rocketkv owns a cache-manager subclass
+        # (RocketKVCacheManagerV2, registers the KT pool) + a per-method
+        # attention shim (RocketKVTrtllmAttention). It also uses the
+        # executor/coordinator hook framework, but that is gated on
+        # coordinator presence, NOT on this flag -> False (no dispatch
+        # special-casing).
+        return False
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -2651,6 +2726,7 @@ SpeculativeConfig: TypeAlias = Annotated[
 SparseAttentionConfig: TypeAlias = Annotated[
     Union[
         RocketSparseAttentionConfig,
+        RocketKVSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
     ],

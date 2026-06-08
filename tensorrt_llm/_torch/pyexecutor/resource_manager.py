@@ -100,6 +100,11 @@ class ResourceManagerType(enum.Enum):
     PEFT_CACHE_MANAGER = "PEFT_CACHE_MANAGER"
     SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
     SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
+    # KVCacheBehaviorCoordinator owns N BaseKVCacheCompressionExecutor
+    # instances (one per axis: sparse / storage) and fans out
+    # PyExecutor's BaseResourceManager callbacks (prepare/update/free_resources)
+    # to the 6 semantic hooks on the executors.
+    KV_CACHE_BEHAVIOR_COORDINATOR = "KV_CACHE_BEHAVIOR_COORDINATOR"
 
 
 class Role:
@@ -1067,7 +1072,7 @@ class KVCacheManager(BaseResourceManager):
                 scheduled_batch, self)
 
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
-        """No-op for V1; interface kept consistent with V2."""
+        """No-op for KVCacheManager; interface kept consistent with KVCacheManagerV2."""
 
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
@@ -2368,7 +2373,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
-        # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
+        # Mirror KVCacheManager's KV reserve sizing (see KVCacheManager.__init__ for rationale).
         self._kv_reserve_draft_tokens = self.max_total_draft_tokens
         if (self.is_draft and spec_config is not None
                 and getattr(spec_config, 'use_dynamic_tree', False)

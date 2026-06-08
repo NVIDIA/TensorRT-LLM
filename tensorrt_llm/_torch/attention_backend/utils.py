@@ -19,6 +19,17 @@ def get_attention_backend(
     sparse_attn_config: Optional["SparseAttentionConfig"] = None
 ) -> Type[AttentionBackend]:
     backend_name = backend_name.upper()
+    # Behavior-layer sparse methods (is_behavior_layer_method) drive their
+    # algorithm via PyExecutor hook call sites and use the base attention
+    # class unchanged, so skip the per-method attention dispatch below.
+    # rocketkv stays memory-layer (keeps its own attention shim + Metadata),
+    # so it falls through to the dispatch.
+    if (sparse_attn_config is not None
+            and sparse_attn_config.is_behavior_layer_method):
+        # Behavior-layer methods use the base attention class (no per-method
+        # shim). Memory-layer methods (incl. rocketkv) keep their shim.
+        sparse_attn_config = None
+
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
             return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
