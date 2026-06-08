@@ -90,7 +90,12 @@ def scan_prompt_order(
         # position wins, and a longer placeholder breaks a position tie.
         next_match: Optional[Tuple[int, int, str]] = None
         for modality, placeholders in placeholders_by_modality.items():
-            if actual_counts[modality] >= expected_counts.get(modality, 0):
+            # A modality may appear in placeholder_by_modality without an entry
+            # in expected_counts (e.g. a model's full placeholder map paired with
+            # a per-request count subset). Treat its expected/actual counts as 0
+            # via `.get` so it is simply skipped rather than raising a KeyError.
+            if actual_counts.get(modality,
+                                 0) >= expected_counts.get(modality, 0):
                 continue
             for placeholder in placeholders:
                 position = text.find(placeholder, cursor)
@@ -477,17 +482,27 @@ class MixedModalItemOrder:
 
     @classmethod
     def from_metadata(
-            cls, multimodal_data: Optional[Dict[str, Any]],
-            embedding_lengths: Iterable[int]
+        cls, multimodal_data: Optional[Dict[str, Any]],
+        embedding_lengths: Optional[Iterable[int]]
     ) -> Optional["MixedModalItemOrder"]:
         """Pair the explicit prompt order (if any) with per-item lengths.
 
         Returns `None` when no `multimodal_item_order` key is present, so the
         per-item extractors can fall back to a synthesized default order.
+
+        Raises `ValueError` when an order IS present but `embedding_lengths` is
+        `None`: the two are baked together for a mixed-modality request, so a
+        present-order/missing-lengths metadata state is inconsistent. We surface
+        it explicitly here instead of letting `tuple(int(x) for x in None)` raise
+        an opaque `TypeError`.
         """
         order = cls.order_from_metadata(multimodal_data)
         if order is None:
             return None
+        if embedding_lengths is None:
+            raise ValueError(
+                "multimodal_item_order is present but multimodal_embedding_lengths "
+                "is missing; a mixed-modality request must bake both together.")
         return cls(order=order,
                    embedding_lengths=tuple(int(x) for x in embedding_lengths))
 

@@ -83,3 +83,18 @@ def test_falsy_placeholder_is_skipped():
     order = scan_prompt_order(text, placeholder_by_modality, expected_counts)
 
     assert order == [("image", 0)]
+
+
+def test_placeholder_modality_absent_from_expected_counts_is_skipped():
+    # Regression: placeholder_by_modality may carry a modality that has no entry
+    # in expected_counts (a model's full placeholder map paired with a
+    # per-request count subset). That modality is treated as expected-0 and
+    # skipped -- never a KeyError -- even when its placeholder appears in the
+    # text.
+    text = "a <IMG> b <VID> c"
+    placeholder_by_modality = {"image": "<IMG>", "video": "<VID>"}
+    expected_counts = {"image": 1}  # 'video' intentionally absent
+
+    order = scan_prompt_order(text, placeholder_by_modality, expected_counts)
+
+    assert order == [("image", 0)]

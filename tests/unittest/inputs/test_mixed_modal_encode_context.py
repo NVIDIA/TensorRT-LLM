@@ -44,6 +44,23 @@ def test_from_metadata_pairs_order_with_lengths():
     assert MixedModalItemOrder.from_metadata({}, ()) is None
 
 
+def test_from_metadata_order_present_but_lengths_none_raises_valueerror():
+    # Regression: an order present but embedding_lengths None (e.g. the base
+    # token-id path baked multimodal_item_order without
+    # multimodal_embedding_lengths) must raise a clear ValueError, not an opaque
+    # TypeError from `tuple(int(x) for x in None)`.
+    multimodal_data = {
+        "multimodal_item_order": [
+            {"modality": "image", "index": 0},
+            {"modality": "video", "index": 0},
+        ]
+    }
+    with pytest.raises(ValueError, match="multimodal_embedding_lengths"):
+        MixedModalItemOrder.from_metadata(multimodal_data, None)
+    # No order present: missing lengths is irrelevant; still returns None.
+    assert MixedModalItemOrder.from_metadata({}, None) is None
+
+
 # ---------------------------------------------------------------------------
 # Order resolution / normalization (absorbed from the deleted MultimodalPromptOrder).
 # `resolve_order` returns a bare prompt-order tuple; `from_metadata` pairs an
