@@ -166,6 +166,12 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--custom_tokenizer',
+        type=str,
+        default=None,
+        help='Override the tokenizer. Accepts a built-in alias '
+        "(e.g. 'mistral') or a fully-qualified class import path.")
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -363,6 +369,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        custom_tokenizer=args.custom_tokenizer,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
