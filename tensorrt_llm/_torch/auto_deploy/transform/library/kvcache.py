@@ -349,6 +349,12 @@ class _InsertCachedOperator(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
+        # Record whether this backend's kernel applies the sliding-window mask
+        # itself (cyclic KV indexing, e.g. trtllm). The executor uses this to
+        # decide between passing the full per-window block table + global KV
+        # lengths (cyclic) and host-slicing to the live window (triton/flashinfer).
+        cm.set_kernel_handles_cyclic_swa(attn_descriptor.kernel_handles_cyclic_swa())
+
         # get standard metadata nodes for all source attention nodes
         meta_nodes_std = self._process_metadata_std(gm, cm)
 

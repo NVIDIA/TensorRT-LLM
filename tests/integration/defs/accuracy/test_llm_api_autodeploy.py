@@ -564,6 +564,8 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    @pytest.mark.parametrize("enable_attention_dp", [False, True],
+                             ids=["attn_dp_off", "attn_dp_on"])
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize(
         "model_id",
@@ -574,18 +576,29 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
             pytest.param("nvfp4", marks=skip_pre_blackwell),
         ],
     )
-    def test_accuracy(self, model_id, world_size, attn_backend):
+    def test_accuracy(self, model_id, world_size, enable_attention_dp,
+                      attn_backend):
         if world_size > get_device_count():
             pytest.skip(f"Not enough devices for world_size={world_size}")
+        # attention-DP requires at least 2 ranks to exercise the cross-rank
+        # max_dp_num_tokens path; on world_size=1 it's a no-op.
+        if enable_attention_dp and world_size < 2:
+            pytest.skip("attention_dp requires world_size >= 2")
         model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
         device_memory_mib = get_device_memory()
         # bf16 always needs low-memory overrides; below H100-class total
         # memory, the quantized variants do too, since the 30B FP8 / NVFP4
         # weights leave too little headroom for the nano_v3.yaml defaults.
-        if model_id == "bf16" or device_memory_mib < 80000:
+        # attention_dp adds non-trivial overhead from MoE all-to-all dispatch
+        # buffers and per-rank expert allocations, so the quantized variants
+        # also need low-memory overrides on H100-class hardware when it's on.
+        if (model_id == "bf16" or device_memory_mib < 80000
+                or enable_attention_dp):
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
+        kwargs.setdefault("transforms", {}).setdefault(
+            "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
 
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,

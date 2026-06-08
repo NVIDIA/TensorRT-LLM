@@ -36,7 +36,7 @@ The following is a table of supported models for the PyTorch backend:
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
 | `NemotronForCausalLM`                | Nemotron-3, Nemotron-4, Minitron   | `nvidia/Minitron-8B-Base`                    |
-| `NemotronHForCausalLM`               | Nemotron-3-Nano, Nemotron-3-Super  | `nvidia/nvidia-nemotron-v3`                  |
+| `NemotronHForCausalLM`               | Nemotron-3-Nano, Nemotron-3-Super, Nemotron-3-Ultra | `nvidia/nvidia-nemotron-v3`                  |
 | `NemotronNASForCausalLM`             | NemotronNAS                        | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`     |
 | `Olmo3ForCausalLM` [^5]              | OLMo 3, OLMo 3.1                   | `allenai/Olmo-3.1-32B-Instruct`              |
 | `OpenELMForCausalLM` [^5]            | OpenELM                            | `apple/OpenELM-270M-Instruct`                |
@@ -69,7 +69,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `GptOssForCausalLM`              | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes              | No                | Yes    | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Qwen3_5MoeForCausalLM` [^5]     | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No               | No                | No     | Yes           | Untested         | Yes            | N/A                      | Untested              | Untested        |
 | `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No               | No                | No     | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
-| `NemotronHForCausalLM` (Super)   | Yes               | Yes        | Untested                   | Untested              | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Untested       | N/A                      | Untested              | Untested        |
+| `NemotronHForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Yes            | N/A                      | Untested              | Untested        |
 | `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | No  | No               | No                | No     | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | Yes | No               | No                | No     | Yes           | Untested         | Untested       | Yes                      | Untested              | Untested        |
 
