@@ -2001,6 +2001,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Skip-softmax attention parameters
         fmhaParams.skipSoftmaxThresholdScaleFactor = mSkipSoftmaxThresholdScaleFactorPrefill;
+        // Opt into the halfspec context FMHA on sm_120 / sm_121.
+        fmhaParams.useHalfspecFmha = mUseHalfspecFmha;
 #ifdef SKIP_SOFTMAX_STAT
         fmhaParams.skipSoftmaxTotalBlocks = mSkipSoftmaxTotalBlocks;
         fmhaParams.skipSoftmaxSkippedBlocks = mSkipSoftmaxSkippedBlocks;

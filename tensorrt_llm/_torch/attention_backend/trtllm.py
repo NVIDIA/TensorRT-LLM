@@ -1401,6 +1401,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return self.sparse_attention_config.threshold_scale_factor_decode
         return None
 
+    @property
+    def use_halfspec_fmha(self) -> bool:
+        """Opt into the halfspec (TMA-load + sync-MMA warp-specialized) context
+        FMHA. It is the sm_120 / sm_121 kernel that implements skip-softmax, so
+        it is enabled whenever skip-softmax is configured. The C++ runner
+        restricts dispatch to sm_120 / sm_121 with supported shapes (BF16,
+        causal, head_dim == head_dim_v in {128, 256}, packed QKV) and ignores
+        the flag everywhere else, so this is a no-op on other hardware."""
+        return isinstance(self.sparse_attention_config,
+                          SkipSoftmaxAttentionConfig)
+
     def _get_trtllm_gen_backend(
             self) -> trtllm_gen.FlashInferTrtllmGenAttention:
         backend = getattr(self, "_trtllm_gen_backend", None)
@@ -1659,6 +1670,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 skip_softmax_threshold_scale_factor_decode=self.
                 skip_softmax_threshold_scale_factor_decode,
                 skip_softmax_stat=self.skip_softmax_stat,
+                use_halfspec_fmha=self.use_halfspec_fmha,
 
                 # --- Sparse-specific (AttentionForwardArgs.sparse) ---
                 sparse_kv_indices=forward_args.sparse.sparse_kv_indices,
