@@ -33,6 +33,9 @@ def get_attention_backend(
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
         return StarAttention
+    elif backend_name == "CUTEDSL":
+        from .cute_dsl import CuteDslAttention
+        return CuteDslAttention
 
     return TrtllmAttention
 
