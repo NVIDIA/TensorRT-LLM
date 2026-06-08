@@ -24,8 +24,6 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
-
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -99,6 +97,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.max_seq_len = args.max_seq_len
 
         seq_slots = args.max_num_sequences
+        self.max_num_sequences = seq_slots
         max_tokens = self._get_max_tokens(args, draft_len)
         draft_tokens_size = self._get_draft_tokens_storage_size(args, draft_len)
         self.max_beam_width = args.max_beam_width
@@ -137,6 +136,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """
         return True
 
+    def _is_valid_slot(self, request: LlmRequest) -> bool:
+        slot = request.py_seq_slot
+        return (slot is not None and 0 <= int(slot) < self.max_num_sequences
+                and not request.is_dummy)
+
     def _request_common_handling(
         self,
         request: LlmRequest,
@@ -161,8 +165,58 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 "return_log_probs not supported with speculative decoding, skipping for request %s",
                 request.py_request_id,
             )
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
+        request.py_draft_tokens = next_draft_tokens[
+            request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
+
+    def _ordered_sampling_requests_from_outputs(
+            self,
+            fallback_requests: list[LlmRequest],
+            outputs: dict[str, torch.Tensor],
+            num_skip: int) -> list[LlmRequest]:
+        request_ids = outputs.get("penalty_sampling_request_ids")
+        if request_ids is None:
+            return fallback_requests
+
+        output_request_ids = [int(request_id) for request_id in request_ids]
+        output_seq_slots = outputs.get("penalty_sampling_seq_slots")
+        if output_seq_slots is not None:
+            output_seq_slots = [int(slot) for slot in output_seq_slots]
+
+        row_request_ids = output_request_ids[
+            num_skip:num_skip + len(fallback_requests)]
+        row_seq_slots = None
+        if output_seq_slots is not None:
+            row_seq_slots = output_seq_slots[
+                num_skip:num_skip + len(fallback_requests)]
+        if len(row_request_ids) != len(fallback_requests):
+            return fallback_requests
+
+        available = list(fallback_requests)
+        ordered_requests: list[LlmRequest] = []
+        for row, request_id in enumerate(row_request_ids):
+            row_slot = row_seq_slots[row] if row_seq_slots is not None else None
+            match_idx = None
+            for idx, request in enumerate(available):
+                if int(request.py_request_id) != request_id:
+                    continue
+                if row_slot is not None:
+                    slot = request.py_seq_slot
+                    request_slot = int(slot) if slot is not None else -1
+                    if request_slot != row_slot:
+                        continue
+                match_idx = idx
+                break
+            if match_idx is None and row_slot is not None:
+                for idx, request in enumerate(available):
+                    if int(request.py_request_id) == request_id:
+                        match_idx = idx
+                        break
+            if match_idx is None:
+                return fallback_requests
+            ordered_requests.append(available.pop(match_idx))
+
+        return ordered_requests
 
     def update_requests(
         self,
@@ -224,11 +278,53 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """
         num_skip = len(scheduled_requests.context_requests_chunking)
         finished_context_requests = scheduled_requests.context_requests_last_chunk
-        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
+        fallback_sampling_requests = (
+            finished_context_requests + scheduled_requests.generation_requests)
+        sampling_requests = self._ordered_sampling_requests_from_outputs(
+            fallback_sampling_requests, outputs, num_skip)
         num_sampling_requests = len(sampling_requests)
 
-        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
+        valid_positions: list[int] = []
+        valid_slot_values: list[int] = []
+        penalty_slot_values: list[int] = []
+        valid_sampling_requests: list[LlmRequest] = []
+        for pos, request in enumerate(sampling_requests):
+            if self._is_valid_slot(request):
+                slot = int(request.py_seq_slot)
+                valid_positions.append(pos)
+                valid_slot_values.append(slot)
+                penalty_slot_values.append(slot)
+                valid_sampling_requests.append(request)
+            else:
+                penalty_slot_values.append(-1)
+
+        slots = torch.as_tensor(valid_slot_values, dtype=torch.long)
         slots = slots.to(device="cuda", non_blocking=True)
+        penalty_slots: Optional[torch.Tensor] = None
+
+        def fallback_penalty_slots() -> torch.Tensor:
+            nonlocal penalty_slots
+            if penalty_slots is None:
+                penalty_slots = torch.as_tensor(penalty_slot_values,
+                                                dtype=torch.int32)
+                penalty_slots = penalty_slots.to(device="cuda",
+                                                 non_blocking=True)
+            return penalty_slots
+
+        def output_slot_slice(name: str) -> Optional[torch.Tensor]:
+            seq_slots = outputs.get(name)
+            if seq_slots is None:
+                return None
+            end = num_skip + num_sampling_requests
+            if seq_slots.numel() < end:
+                return None
+            return seq_slots[num_skip:end].contiguous()
+
+        count_penalty_slots = output_slot_slice("penalty_count_seq_slots")
+        history_penalty_slots = output_slot_slice("penalty_history_seq_slots")
+        valid_positions_cuda = torch.as_tensor(valid_positions,
+                                               dtype=torch.long,
+                                               device="cuda")
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -237,6 +333,48 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
+
+        penalty_token_counts = outputs.get("penalty_token_counts")
+        if penalty_token_counts is not None:
+            from .one_model_sampler import append_accepted_tokens_to_counts
+            append_accepted_tokens_to_counts(
+                penalty_token_counts,
+                count_penalty_slots
+                if count_penalty_slots is not None else fallback_penalty_slots(),
+                o_new_tokens.contiguous(),
+                o_new_tokens_lens.contiguous())
+        elif (outputs.get("penalty_sparse_token_ids") is not None
+              and outputs.get("penalty_sparse_token_counts") is not None
+              and outputs.get("penalty_sparse_count_lens") is not None):
+            from .one_model_sampler import append_accepted_tokens_to_sparse_counts
+            append_accepted_tokens_to_sparse_counts(
+                outputs["penalty_sparse_token_ids"],
+                outputs["penalty_sparse_token_counts"],
+                outputs["penalty_sparse_count_lens"],
+                count_penalty_slots
+                if count_penalty_slots is not None else fallback_penalty_slots(),
+                o_new_tokens.contiguous(),
+                o_new_tokens_lens.contiguous(),
+                int(outputs.get("penalty_count_vocab_size", 0)))
+
+        penalty_history_tokens = outputs.get("penalty_history_tokens")
+        penalty_history_lens = outputs.get("penalty_history_lens")
+        if (penalty_history_tokens is not None
+                and penalty_history_lens is not None
+                and not outputs.get("penalty_history_appended", False)):
+            from .one_model_sampler import append_accepted_tokens_to_history
+            append_accepted_tokens_to_history(
+                penalty_history_tokens,
+                penalty_history_lens,
+                history_penalty_slots
+                if history_penalty_slots is not None else fallback_penalty_slots(),
+                o_new_tokens.contiguous(),
+                o_new_tokens_lens.contiguous())
+
+        o_new_tokens = o_new_tokens.index_select(0, valid_positions_cuda)
+        o_new_tokens_lens = o_new_tokens_lens.index_select(0, valid_positions_cuda)
+        o_next_draft_tokens = o_next_draft_tokens.index_select(0, valid_positions_cuda)
+        o_next_new_tokens = o_next_new_tokens.index_select(0, valid_positions_cuda)
 
         # Pad to match fixed-size store buffers for index_copy_.
         if o_new_tokens.shape[1] < (self.draft_len + 1):
@@ -275,10 +413,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # Add dummy draft tokens to context requests for KV cache preparation
         if self._add_dummy_draft_tokens():
             for request in finished_context_requests:
-                request.py_draft_tokens = [1] * self.draft_len
+                if self._is_valid_slot(request):
+                    request.py_draft_tokens = [1] * self.draft_len
 
         return SampleStateSpec(
-            requests=sampling_requests,
+            requests=valid_sampling_requests,
             device=device_tensors,
             host=host_tensors,
             sampler_event=sampler_event,

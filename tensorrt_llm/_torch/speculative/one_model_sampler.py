@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -71,6 +72,106 @@ def apply_temperature(
     temp: torch.Tensor,
 ) -> torch.Tensor:
     return logits.div_(temp.unsqueeze(dim=1))
+
+
+def apply_recent_token_penalties(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    penalty_values: torch.Tensor,
+) -> torch.Tensor:
+    if os.environ.get("TRTLLM_SPEC_USE_PENALTY_OP", "0") == "1":
+        torch.ops.trtllm.speculative_apply_token_penalties(
+            logits, token_ids, penalty_values)
+        return logits
+    return logits.scatter_add_(1, token_ids, -penalty_values.to(logits.dtype))
+
+
+def apply_history_frequency_penalty(
+    logits: torch.Tensor,
+    history_tokens: torch.Tensor,
+    history_lens: torch.Tensor,
+    row_slots: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+) -> torch.Tensor:
+    torch.ops.trtllm.speculative_apply_history_frequency_penalty(
+        logits, history_tokens, history_lens, row_slots, frequency_penalties)
+    return logits
+
+
+def apply_count_frequency_penalty(
+    logits: torch.Tensor,
+    token_counts: torch.Tensor,
+    row_slots: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+) -> torch.Tensor:
+    torch.ops.trtllm.speculative_apply_count_frequency_penalty(
+        logits, token_counts, row_slots, frequency_penalties)
+    return logits
+
+
+def apply_sparse_count_frequency_penalty(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    token_counts: torch.Tensor,
+    count_lens: torch.Tensor,
+    row_slots: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+) -> torch.Tensor:
+    torch.ops.trtllm.speculative_apply_sparse_count_frequency_penalty(
+        logits, token_ids, token_counts, count_lens, row_slots,
+        frequency_penalties)
+    return logits
+
+
+def append_accepted_tokens_to_history(
+    history_tokens: torch.Tensor,
+    history_lens: torch.Tensor,
+    seq_slots: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    accepted_lens: torch.Tensor,
+) -> None:
+    torch.ops.trtllm.speculative_append_accepted_tokens(
+        history_tokens, history_lens, seq_slots, accepted_tokens,
+        accepted_lens)
+
+
+def append_accepted_tokens_to_counts(
+    token_counts: torch.Tensor,
+    seq_slots: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    accepted_lens: torch.Tensor,
+) -> None:
+    torch.ops.trtllm.speculative_append_accepted_token_counts(
+        token_counts, seq_slots, accepted_tokens, accepted_lens)
+
+
+def append_accepted_tokens_to_sparse_counts(
+    token_ids: torch.Tensor,
+    token_counts: torch.Tensor,
+    count_lens: torch.Tensor,
+    seq_slots: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    accepted_lens: torch.Tensor,
+    vocab_size: int,
+) -> None:
+    torch.ops.trtllm.speculative_append_sparse_token_counts(
+        token_ids, token_counts, count_lens, seq_slots, accepted_tokens,
+        accepted_lens, vocab_size)
+
+
+def init_sparse_token_counts(
+    token_ids: torch.Tensor,
+    token_counts: torch.Tensor,
+    count_lens: torch.Tensor,
+    prompt_token_ids: torch.Tensor,
+    prompt_token_counts: torch.Tensor,
+    prompt_lens: torch.Tensor,
+    seq_slots: torch.Tensor,
+    vocab_size: int,
+) -> None:
+    torch.ops.trtllm.speculative_init_sparse_token_counts(
+        token_ids, token_counts, count_lens, prompt_token_ids,
+        prompt_token_counts, prompt_lens, seq_slots, vocab_size)
 
 
 @torch.compile(options={"max-autotune": True})

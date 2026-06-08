@@ -1,5 +1,6 @@
 import copy
 import os
+from collections import Counter
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from ..pyexecutor.resource_manager import (BaseResourceManager,
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+    from ..pyexecutor.llm_request import LlmRequest
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -328,6 +330,9 @@ class SpecMetadata:
     max_draft_len: int
     # The max number of draft tokens for the static tree and dynamic tree   .
     max_total_draft_tokens: int
+    # Capacity for persistent sequence-slot indexed state. This can be larger
+    # than max_num_requests when the executor has multiple sequence slots.
+    max_num_sequence_slots: Optional[int] = None
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.
@@ -384,6 +389,73 @@ class SpecMetadata:
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
+    recent_penalty_token_ids: Optional[torch.Tensor] = field(default=None,
+                                                             repr=False)
+    recent_penalty_values: Optional[torch.Tensor] = field(default=None,
+                                                          repr=False)
+    recent_seq_penalty_token_ids: Optional[torch.Tensor] = field(default=None,
+                                                                 repr=False)
+    recent_seq_penalty_values: Optional[torch.Tensor] = field(default=None,
+                                                              repr=False)
+    draft_prefix_penalty_token_ids: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    draft_prefix_penalty_values: Optional[torch.Tensor] = field(default=None,
+                                                                repr=False)
+    draft_prefix_penalty_rows: Optional[torch.Tensor] = field(default=None,
+                                                              repr=False)
+    device_penalty_history_tokens: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_history_lens: Optional[torch.Tensor] = field(default=None,
+                                                                repr=False)
+    device_penalty_row_slots: Optional[torch.Tensor] = field(default=None,
+                                                             repr=False)
+    device_penalty_seq_slots: Optional[torch.Tensor] = field(default=None,
+                                                             repr=False)
+    device_frequency_penalties: Optional[torch.Tensor] = field(default=None,
+                                                               repr=False)
+    device_seq_frequency_penalties: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_history_capacity: int = 0
+    use_device_penalty_history: bool = False
+    device_penalty_token_counts: Optional[torch.Tensor] = field(default=None,
+                                                                repr=False)
+    device_penalty_sparse_token_ids: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_sparse_token_counts: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_sparse_count_lens: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_count_row_slots: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_count_seq_slots: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_count_frequency_penalties: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_count_seq_frequency_penalties: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_count_reset_slots: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_count_reset_count: int = 0
+    device_penalty_count_prompt_tokens: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_count_prompt_token_counts: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_count_prompt_lens: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_count_prompt_seq_slots: Optional[torch.Tensor] = field(
+        default=None, repr=False)
+    device_penalty_count_prompt_count: int = 0
+    device_penalty_count_prompt_capacity: int = 0
+    device_penalty_sparse_count_capacity: int = 0
+    device_penalty_count_vocab_size: int = 0
+    device_penalty_count_mode: str = "dense"
+    use_device_penalty_counts: bool = False
+    device_penalty_count_slot_request_ids: dict[int, int] = field(
+        default_factory=dict, repr=False)
+    cuda_graph_source_metadata: Optional[object] = field(default=None,
+                                                         repr=False)
+    sampling_request_ids: Optional[list[int]] = field(default=None, repr=False)
+    sampling_seq_slots: Optional[list[int]] = field(default=None, repr=False)
 
     def __post_init__(self):
         pass
@@ -403,8 +475,29 @@ class SpecMetadata:
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
+        cuda_graph_metadata.cuda_graph_source_metadata = self
+        cuda_graph_metadata.device_penalty_count_slot_request_ids = (
+            self.device_penalty_count_slot_request_ids)
+        cuda_graph_metadata._sync_device_penalty_count_state_from_owner()
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
+
+    def _device_penalty_count_state_owner(self):
+        return self.cuda_graph_source_metadata or self
+
+    def _sync_device_penalty_count_state_from_owner(self) -> None:
+        owner = self._device_penalty_count_state_owner()
+        if owner is self:
+            return
+        for name in (
+                "device_penalty_token_counts",
+                "device_penalty_sparse_token_ids",
+                "device_penalty_sparse_token_counts",
+                "device_penalty_sparse_count_lens",
+                "device_penalty_sparse_count_capacity",
+                "device_penalty_count_vocab_size",
+        ):
+            setattr(self, name, getattr(owner, name))
 
     def is_layer_capture(self, layer_id: int):
         """
@@ -420,6 +513,786 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
+
+    @staticmethod
+    def _sampling_config_value(config, name: str, default):
+        value = getattr(config, name, None)
+        if value is None:
+            return default
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return default
+            return value.flatten()[0].item()
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return default
+            value = value[0]
+        return default if value is None else value
+
+    @staticmethod
+    def _effective_prompt_ignore_length(request: "LlmRequest",
+                                        prompt_ignore_length: int) -> int:
+        prompt_len = getattr(request, "py_orig_prompt_len", None)
+        if prompt_len is None:
+            prompt_len = getattr(request, "orig_prompt_len", None)
+        if prompt_len is None:
+            prompt_len = getattr(request, "py_prompt_len", None)
+        if prompt_len is None:
+            prompt_len = getattr(request, "prompt_len", 0)
+        return min(max(prompt_ignore_length, 0), max(int(prompt_len), 0))
+
+    @staticmethod
+    def _prompt_len(request: "LlmRequest") -> int:
+        for attr in ("py_orig_prompt_len", "orig_prompt_len", "py_prompt_len",
+                     "prompt_len"):
+            value = getattr(request, attr, None)
+            if value is not None:
+                return max(int(value), 0)
+        return 0
+
+    def _valid_seq_slot(self, slot: int) -> bool:
+        return 0 <= slot < self._max_num_sequence_slots()
+
+    def _max_num_sequence_slots(self) -> int:
+        max_num_sequence_slots = self.max_num_sequence_slots
+        if max_num_sequence_slots is None or max_num_sequence_slots <= 0:
+            return self.max_num_requests
+        return max(int(max_num_sequence_slots), self.max_num_requests)
+
+    @staticmethod
+    def _env_bool(value: Optional[str]) -> Optional[bool]:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized in ("", "auto"):
+            return None
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+        return None
+
+    @staticmethod
+    def _is_disagg_generation_role() -> bool:
+        role = os.environ.get("TRTLLM_DISAGG_ROLE", "").strip().lower()
+        if role in ("generation", "gen", "decode"):
+            return True
+        return os.environ.get("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+
+    def _force_graph_count_path_enabled(self) -> bool:
+        override = self._env_bool(
+            os.environ.get("TRTLLM_SPEC_FORCE_GRAPH_COUNT_PATH"))
+        if override is not None:
+            return self.is_cuda_graph and override
+        return self.is_cuda_graph and self._is_disagg_generation_role()
+
+    def _ensure_recent_penalty_buffers(self, width: int) -> None:
+        max_rows = (self.max_draft_len + 1) * self.max_num_requests
+        max_seqs = self.max_num_requests
+        needs_alloc = (
+            self.recent_penalty_token_ids is None
+            or self.recent_penalty_values is None
+            or self.recent_seq_penalty_token_ids is None
+            or self.recent_seq_penalty_values is None
+            or self.recent_penalty_token_ids.shape != (max_rows, width)
+            or self.recent_seq_penalty_token_ids.shape != (max_seqs, width))
+        if not needs_alloc:
+            return
+
+        self.recent_penalty_token_ids = torch.zeros((max_rows, width),
+                                                    dtype=torch.long,
+                                                    device="cuda")
+        self.recent_penalty_values = torch.zeros((max_rows, width),
+                                                 dtype=torch.float32,
+                                                 device="cuda")
+        self.recent_seq_penalty_token_ids = torch.zeros((max_seqs, width),
+                                                        dtype=torch.long,
+                                                        device="cuda")
+        self.recent_seq_penalty_values = torch.zeros((max_seqs, width),
+                                                     dtype=torch.float32,
+                                                     device="cuda")
+
+    def _ensure_draft_prefix_penalty_buffers(self, width: int) -> None:
+        max_rows = (self.max_draft_len + 1) * self.max_num_requests
+        needs_alloc = (
+            self.draft_prefix_penalty_token_ids is None
+            or self.draft_prefix_penalty_values is None
+            or self.draft_prefix_penalty_rows is None
+            or self.draft_prefix_penalty_token_ids.shape != (max_rows, width))
+        if not needs_alloc:
+            return
+
+        self.draft_prefix_penalty_token_ids = torch.zeros((max_rows, width),
+                                                          dtype=torch.long,
+                                                          device="cuda")
+        self.draft_prefix_penalty_values = torch.zeros((max_rows, width),
+                                                       dtype=torch.float32,
+                                                       device="cuda")
+        self.draft_prefix_penalty_rows = torch.arange(max_rows,
+                                                      dtype=torch.long,
+                                                      device="cuda")
+
+    def _ensure_device_penalty_history_buffers(self) -> None:
+        max_rows = (self.max_draft_len + 1) * self.max_num_requests
+        slot_capacity = self._max_num_sequence_slots()
+        capacity = int(
+            os.environ.get("TRTLLM_SPEC_PENALTY_HISTORY_TOKENS", "16384"))
+        capacity = max(capacity, 0)
+        if capacity == 0:
+            self.use_device_penalty_history = False
+            return
+
+        needs_alloc = (
+            self.device_penalty_history_tokens is None
+            or self.device_penalty_history_lens is None
+            or self.device_penalty_row_slots is None
+            or self.device_penalty_seq_slots is None
+            or self.device_frequency_penalties is None
+            or self.device_seq_frequency_penalties is None
+            or self.device_penalty_history_tokens.shape !=
+            (slot_capacity, capacity)
+            or self.device_penalty_row_slots.shape != (max_rows, ))
+        if not needs_alloc:
+            return
+
+        self.device_penalty_history_capacity = capacity
+        self.device_penalty_history_tokens = torch.zeros(
+            (slot_capacity, capacity), dtype=torch.int32, device="cuda")
+        self.device_penalty_history_lens = torch.zeros(
+            (slot_capacity, ), dtype=torch.int32, device="cuda")
+        self.device_penalty_row_slots = torch.zeros((max_rows, ),
+                                                    dtype=torch.int32,
+                                                    device="cuda")
+        self.device_penalty_seq_slots = torch.zeros((self.max_num_requests, ),
+                                                    dtype=torch.int32,
+                                                    device="cuda")
+        self.device_frequency_penalties = torch.zeros((max_rows, ),
+                                                      dtype=torch.float32,
+                                                      device="cuda")
+        self.device_seq_frequency_penalties = torch.zeros(
+            (self.max_num_requests, ), dtype=torch.float32, device="cuda")
+
+    def _ensure_device_penalty_count_metadata_buffers(self) -> None:
+        max_rows = (self.max_draft_len + 1) * self.max_num_requests
+        needs_alloc = (
+            self.device_penalty_count_row_slots is None
+            or self.device_penalty_count_seq_slots is None
+            or self.device_count_frequency_penalties is None
+            or self.device_count_seq_frequency_penalties is None
+            or self.device_penalty_count_reset_slots is None
+            or self.device_penalty_count_row_slots.shape != (max_rows, ))
+        if not needs_alloc:
+            return
+
+        self.device_penalty_count_row_slots = torch.zeros((max_rows, ),
+                                                          dtype=torch.int32,
+                                                          device="cuda")
+        self.device_penalty_count_seq_slots = torch.zeros(
+            (self.max_num_requests, ), dtype=torch.int32, device="cuda")
+        self.device_count_frequency_penalties = torch.zeros((max_rows, ),
+                                                            dtype=torch.float32,
+                                                            device="cuda")
+        self.device_count_seq_frequency_penalties = torch.zeros(
+            (self.max_num_requests, ), dtype=torch.float32, device="cuda")
+        self.device_penalty_count_reset_slots = torch.zeros(
+            (self.max_num_requests, ), dtype=torch.int64, device="cuda")
+
+    def ensure_device_penalty_count_buffers(self, vocab_size: int) -> None:
+        if vocab_size <= 0:
+            self.use_device_penalty_counts = False
+            return
+        owner = self._device_penalty_count_state_owner()
+        if owner is not self:
+            owner.device_penalty_count_mode = self.device_penalty_count_mode
+            owner.use_device_penalty_counts = self.use_device_penalty_counts
+            owner.ensure_device_penalty_count_buffers(vocab_size)
+            self._sync_device_penalty_count_state_from_owner()
+            return
+
+        slot_capacity = self._max_num_sequence_slots()
+        if self.device_penalty_count_mode == "dense":
+            if (self.device_penalty_token_counts is not None
+                    and self.device_penalty_count_vocab_size == vocab_size
+                    and self.device_penalty_token_counts.shape ==
+                    (slot_capacity, vocab_size)):
+                return
+
+            self.device_penalty_count_vocab_size = vocab_size
+            self.device_penalty_token_counts = torch.zeros(
+                (slot_capacity, vocab_size),
+                dtype=torch.int32,
+                device="cuda")
+            return
+
+        capacity_env = os.environ.get("TRTLLM_SPEC_SPARSE_COUNT_CAPACITY",
+                                      "").strip()
+        capacity = int(capacity_env) if capacity_env else 0
+        if capacity <= 0:
+            capacity = vocab_size
+        else:
+            capacity = min(capacity, vocab_size)
+        if (self.device_penalty_sparse_token_ids is not None
+                and self.device_penalty_sparse_token_counts is not None
+                and self.device_penalty_sparse_count_lens is not None
+                and self.device_penalty_count_vocab_size == vocab_size
+                and self.device_penalty_sparse_count_capacity == capacity
+                and self.device_penalty_sparse_token_ids.shape ==
+                (slot_capacity, capacity)):
+            return
+
+        self.device_penalty_count_vocab_size = vocab_size
+        self.device_penalty_sparse_count_capacity = capacity
+        self.device_penalty_sparse_token_ids = torch.zeros(
+            (slot_capacity, capacity), dtype=torch.int32, device="cuda")
+        self.device_penalty_sparse_token_counts = torch.zeros(
+            (slot_capacity, capacity), dtype=torch.int32, device="cuda")
+        self.device_penalty_sparse_count_lens = torch.zeros(
+            (slot_capacity, ), dtype=torch.int32, device="cuda")
+
+    def reset_device_penalty_count_slots(self) -> None:
+        if (not self.use_device_penalty_counts
+                or self.device_penalty_count_reset_slots is None
+                or self.device_penalty_count_reset_count == 0):
+            return
+        reset_slots = self.device_penalty_count_reset_slots[:
+                                                            self.device_penalty_count_reset_count]
+        reset_slots = reset_slots[(reset_slots >= 0)
+                                  &
+                                  (reset_slots < self._max_num_sequence_slots())]
+        if reset_slots.numel() == 0:
+            self.device_penalty_count_reset_count = 0
+            return
+        if self.device_penalty_count_mode == "dense":
+            if self.device_penalty_token_counts is None:
+                return
+            self.device_penalty_token_counts.index_fill_(0, reset_slots, 0)
+        else:
+            if self.device_penalty_sparse_count_lens is None:
+                return
+            self.device_penalty_sparse_count_lens.index_fill_(0, reset_slots, 0)
+        self.device_penalty_count_reset_count = 0
+
+    def init_device_penalty_count_prompt_tokens(self) -> None:
+        if (not self.use_device_penalty_counts
+                or self.device_penalty_count_prompt_tokens is None
+                or self.device_penalty_count_prompt_lens is None
+                or self.device_penalty_count_prompt_seq_slots is None
+                or self.device_penalty_count_prompt_count == 0):
+            return
+
+        count = self.device_penalty_count_prompt_count
+        if self.device_penalty_count_mode == "dense":
+            if self.device_penalty_token_counts is None:
+                return
+            from .one_model_sampler import append_accepted_tokens_to_counts
+            append_accepted_tokens_to_counts(
+                self.device_penalty_token_counts,
+                self.device_penalty_count_prompt_seq_slots[:count],
+                self.device_penalty_count_prompt_tokens[:count].contiguous(),
+                self.device_penalty_count_prompt_lens[:count].contiguous())
+        else:
+            if (self.device_penalty_sparse_token_ids is None
+                    or self.device_penalty_sparse_token_counts is None
+                    or self.device_penalty_sparse_count_lens is None
+                    or self.device_penalty_count_prompt_token_counts is None):
+                return
+            width = self.device_penalty_count_prompt_capacity
+            from .one_model_sampler import init_sparse_token_counts
+            init_sparse_token_counts(
+                self.device_penalty_sparse_token_ids,
+                self.device_penalty_sparse_token_counts,
+                self.device_penalty_sparse_count_lens,
+                self.device_penalty_count_prompt_tokens[:count, :
+                                                        width].contiguous(),
+                self.device_penalty_count_prompt_token_counts[:count, :
+                                                              width].contiguous(),
+                self.device_penalty_count_prompt_lens[:count].contiguous(),
+                self.device_penalty_count_prompt_seq_slots[:count].contiguous(),
+                self.device_penalty_count_vocab_size)
+        self.device_penalty_count_prompt_count = 0
+
+    def prepare_device_penalty_counts(self, vocab_size: int) -> None:
+        if not self.use_device_penalty_counts:
+            return
+        self.ensure_device_penalty_count_buffers(vocab_size)
+        self.reset_device_penalty_count_slots()
+        self.init_device_penalty_count_prompt_tokens()
+
+    def _ensure_device_penalty_count_prompt_buffers(
+            self, max_prompt_tokens: int) -> None:
+        if max_prompt_tokens <= 0:
+            return
+        if (self.device_penalty_count_prompt_tokens is not None
+                and self.device_penalty_count_prompt_token_counts is not None
+                and self.device_penalty_count_prompt_lens is not None
+                and self.device_penalty_count_prompt_seq_slots is not None
+                and self.device_penalty_count_prompt_capacity >= max_prompt_tokens):
+            return
+
+        self.device_penalty_count_prompt_capacity = max_prompt_tokens
+        self.device_penalty_count_prompt_tokens = torch.zeros(
+            (self.max_num_requests, max_prompt_tokens),
+            dtype=torch.int32,
+            device="cuda")
+        self.device_penalty_count_prompt_token_counts = torch.zeros(
+            (self.max_num_requests, max_prompt_tokens),
+            dtype=torch.int32,
+            device="cuda")
+        self.device_penalty_count_prompt_lens = torch.zeros(
+            (self.max_num_requests, ), dtype=torch.int32, device="cuda")
+        self.device_penalty_count_prompt_seq_slots = torch.zeros(
+            (self.max_num_requests, ), dtype=torch.int32, device="cuda")
+
+    def _populate_device_count_frequency_penalties(
+            self, requests: list["LlmRequest"]) -> bool:
+        force_graph_count_path = self._force_graph_count_path_enabled()
+        if (os.environ.get("TRTLLM_SPEC_USE_DEVICE_COUNTS", "0") != "1"
+                and not force_graph_count_path):
+            self.use_device_penalty_counts = False
+            return False
+        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
+        ):
+            self.use_device_penalty_counts = False
+            return False
+
+        row_slots: list[int] = []
+        seq_slots: list[int] = []
+        frequency_penalties: list[float] = []
+        seq_frequency_penalties: list[float] = []
+        reset_slots: list[int] = []
+        prompt_init_slots: list[int] = []
+        prompt_init_tokens: list[list[int]] = []
+        prompt_init_token_counts: list[list[int]] = []
+        any_penalty = False
+        can_use = True
+        count_mode = os.environ.get("TRTLLM_SPEC_COUNT_MODE",
+                                    "sparse").strip().lower()
+        if count_mode not in ("dense", "sparse"):
+            count_mode = "sparse"
+        sparse_capacity_limit = int(
+            os.environ.get("TRTLLM_SPEC_SPARSE_COUNT_CAPACITY", "") or "0")
+
+        next_slot_request_ids: dict[int, int] = {}
+
+        for request in requests:
+            raw_slot = getattr(request, "py_seq_slot", None)
+            slot = int(raw_slot) if raw_slot is not None else -1
+            valid_slot = (self._valid_seq_slot(slot)
+                          and not getattr(request, "is_dummy", False))
+            effective_slot = slot if valid_slot else -1
+            seq_slots.append(effective_slot)
+            request_id = int(getattr(request, "py_request_id",
+                                     getattr(request, "request_id", -1)))
+            if valid_slot:
+                next_slot_request_ids[slot] = request_id
+
+            sampling_config = request.sampling_config
+            frequency_penalty = float(
+                self._sampling_config_value(sampling_config,
+                                            "frequency_penalty", 0.0))
+            presence_penalty = float(
+                self._sampling_config_value(sampling_config,
+                                            "presence_penalty", 0.0))
+            prompt_ignore_length = int(
+                self._sampling_config_value(sampling_config,
+                                            "prompt_ignore_length", 0))
+
+            if presence_penalty != 0.0:
+                can_use = False
+                break
+
+            if not valid_slot:
+                frequency_penalty = 0.0
+
+            any_penalty = any_penalty or frequency_penalty != 0.0
+            is_new_slot_request = valid_slot and (
+                self.device_penalty_count_slot_request_ids.get(slot) != request_id)
+            if is_new_slot_request:
+                reset_slots.append(slot)
+                if frequency_penalty != 0.0:
+                    ignore_length = self._effective_prompt_ignore_length(
+                        request, prompt_ignore_length)
+                    tokens = request.get_tokens(0)
+                    count_history = [
+                        int(token) for token in tokens[ignore_length:]
+                        if int(token) >= 0
+                    ]
+                    if count_history:
+                        if count_mode == "sparse":
+                            counts = Counter(count_history)
+                            unique_tokens = list(counts.keys())
+                            if (sparse_capacity_limit > 0
+                                    and len(unique_tokens) >
+                                    sparse_capacity_limit):
+                                # Do not disable device-side generated-token
+                                # counts for the whole batch just because one
+                                # request history cannot fit in the sparse table.
+                                # The request still starts with an empty count
+                                # table, and accepted generated tokens are
+                                # appended below by the sampler.
+                                continue
+                            prompt_init_slots.append(slot)
+                            prompt_init_tokens.append(unique_tokens)
+                            prompt_init_token_counts.append([
+                                int(counts[token]) for token in unique_tokens
+                            ])
+                        else:
+                            prompt_init_slots.append(slot)
+                            prompt_init_tokens.append(count_history)
+                            prompt_init_token_counts.append([])
+
+            from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+            num_rows = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            row_slots.extend(effective_slot for _ in range(num_rows))
+            frequency_penalties.extend(frequency_penalty for _ in range(num_rows))
+            seq_frequency_penalties.append(frequency_penalty)
+
+        if not can_use or not row_slots or (not any_penalty
+                                            and not force_graph_count_path):
+            self.use_device_penalty_counts = False
+            return False
+
+        self.device_penalty_count_slot_request_ids.update(
+            next_slot_request_ids)
+
+        self.device_penalty_count_mode = count_mode
+        self._ensure_device_penalty_count_metadata_buffers()
+        assert self.device_penalty_count_row_slots is not None
+        assert self.device_penalty_count_seq_slots is not None
+        assert self.device_count_frequency_penalties is not None
+        assert self.device_count_seq_frequency_penalties is not None
+        assert self.device_penalty_count_reset_slots is not None
+        max_prompt_tokens = max((len(tokens) for tokens in prompt_init_tokens),
+                                default=0)
+        self._ensure_device_penalty_count_prompt_buffers(max_prompt_tokens)
+
+        self.device_penalty_count_seq_slots[:len(seq_slots)].copy_(
+            torch.tensor(seq_slots, dtype=torch.int32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.device_penalty_count_row_slots[:len(row_slots)].copy_(
+            torch.tensor(row_slots, dtype=torch.int32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.device_count_frequency_penalties[:len(frequency_penalties)].copy_(
+            torch.tensor(frequency_penalties,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.device_count_seq_frequency_penalties[:len(seq_frequency_penalties
+                                                       )].copy_(
+                                                           torch.tensor(
+                                                               seq_frequency_penalties,
+                                                               dtype=torch.float32,
+                                                               pin_memory=prefer_pinned(
+                                                               )),
+                                                           non_blocking=True)
+        self.device_penalty_count_reset_count = len(reset_slots)
+        if reset_slots:
+            self.device_penalty_count_reset_slots[:len(reset_slots)].copy_(
+                torch.tensor(reset_slots,
+                             dtype=torch.int64,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True)
+        self.device_penalty_count_prompt_count = len(prompt_init_tokens)
+        if prompt_init_tokens:
+            assert self.device_penalty_count_prompt_tokens is not None
+            assert self.device_penalty_count_prompt_token_counts is not None
+            assert self.device_penalty_count_prompt_lens is not None
+            assert self.device_penalty_count_prompt_seq_slots is not None
+            prompt_tensor = torch.zeros(
+                (len(prompt_init_tokens), max_prompt_tokens),
+                dtype=torch.int32,
+                pin_memory=prefer_pinned())
+            prompt_counts_tensor = torch.zeros(
+                (len(prompt_init_tokens), max_prompt_tokens),
+                dtype=torch.int32,
+                pin_memory=prefer_pinned())
+            prompt_lens = []
+            for row, tokens in enumerate(prompt_init_tokens):
+                prompt_lens.append(len(tokens))
+                prompt_tensor[row, :len(tokens)] = torch.tensor(
+                    tokens, dtype=torch.int32)
+                if count_mode == "sparse":
+                    prompt_counts_tensor[row, :len(tokens)] = torch.tensor(
+                        prompt_init_token_counts[row], dtype=torch.int32)
+            self.device_penalty_count_prompt_tokens[:len(prompt_init_tokens),
+                                                    :max_prompt_tokens].copy_(
+                                                        prompt_tensor,
+                                                        non_blocking=True)
+            if count_mode == "sparse":
+                self.device_penalty_count_prompt_token_counts[:len(
+                    prompt_init_tokens), :max_prompt_tokens].copy_(
+                        prompt_counts_tensor, non_blocking=True)
+            self.device_penalty_count_prompt_lens[:len(prompt_lens)].copy_(
+                torch.tensor(prompt_lens,
+                             dtype=torch.int32,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True)
+            self.device_penalty_count_prompt_seq_slots[:len(
+                prompt_init_slots)].copy_(torch.tensor(
+                    prompt_init_slots,
+                    dtype=torch.int32,
+                    pin_memory=prefer_pinned()),
+                                          non_blocking=True)
+        self.use_device_penalty_counts = True
+        return True
+
+    def _populate_device_history_frequency_penalties(
+            self, requests: list["LlmRequest"]) -> bool:
+        if os.environ.get("TRTLLM_SPEC_USE_DEVICE_HISTORY", "0") != "1":
+            self.use_device_penalty_history = False
+            return False
+        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
+        ):
+            self.use_device_penalty_history = False
+            return False
+
+        row_slots: list[int] = []
+        seq_slots: list[int] = []
+        frequency_penalties: list[float] = []
+        seq_frequency_penalties: list[float] = []
+        reset_slots: list[int] = []
+        can_use = True
+        row_mode = os.environ.get("TRTLLM_SPEC_PENALTY_ROW_MODE",
+                                  "all").strip().lower()
+        if row_mode not in ("all", "root"):
+            row_mode = "all"
+
+        for request in requests:
+            raw_slot = getattr(request, "py_seq_slot", None)
+            slot = int(raw_slot) if raw_slot is not None else -1
+            valid_slot = (self._valid_seq_slot(slot)
+                          and not getattr(request, "is_dummy", False))
+            effective_slot = slot if valid_slot else -1
+            seq_slots.append(effective_slot)
+
+            sampling_config = request.sampling_config
+            frequency_penalty = float(
+                self._sampling_config_value(sampling_config,
+                                            "frequency_penalty", 0.0))
+            presence_penalty = float(
+                self._sampling_config_value(sampling_config,
+                                            "presence_penalty", 0.0))
+            prompt_ignore_length = int(
+                self._sampling_config_value(sampling_config,
+                                            "prompt_ignore_length", 0))
+            raw_prompt_len = self._prompt_len(request)
+
+            # The device-history fast path intentionally covers the current
+            # NVBug workload: frequency penalty over generated tokens only.
+            # Other token-history semantics fall back to the slower probe path.
+            if presence_penalty != 0.0 or prompt_ignore_length < raw_prompt_len:
+                can_use = False
+                break
+
+            if not valid_slot:
+                frequency_penalty = 0.0
+            seq_frequency_penalties.append(frequency_penalty)
+
+            generated_len = max(request.get_num_tokens(0) - raw_prompt_len, 0)
+            if valid_slot and generated_len == 0:
+                reset_slots.append(slot)
+
+            from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+            num_rows = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            row_slots.append(effective_slot)
+            frequency_penalties.append(frequency_penalty)
+            if num_rows > 1:
+                if row_mode == "all":
+                    row_slots.extend(effective_slot for _ in range(num_rows - 1))
+                    frequency_penalties.extend(frequency_penalty
+                                               for _ in range(num_rows - 1))
+                else:
+                    row_slots.extend(-1 for _ in range(num_rows - 1))
+                    frequency_penalties.extend(0.0 for _ in range(num_rows - 1))
+
+        if not can_use or not row_slots:
+            self.use_device_penalty_history = False
+            return False
+
+        self._ensure_device_penalty_history_buffers()
+        if not self.use_device_penalty_history and self.device_penalty_history_tokens is None:
+            return False
+        assert self.device_penalty_history_tokens is not None
+        assert self.device_penalty_history_lens is not None
+        assert self.device_penalty_row_slots is not None
+        assert self.device_penalty_seq_slots is not None
+        assert self.device_frequency_penalties is not None
+        assert self.device_seq_frequency_penalties is not None
+
+        if reset_slots:
+            reset_slots_cuda = torch.tensor(reset_slots,
+                                            dtype=torch.int64,
+                                            pin_memory=prefer_pinned()).to(
+                                                "cuda", non_blocking=True)
+            self.device_penalty_history_lens.index_fill_(0, reset_slots_cuda, 0)
+
+        self.device_penalty_seq_slots[:len(seq_slots)].copy_(
+            torch.tensor(seq_slots, dtype=torch.int32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.device_penalty_row_slots[:len(row_slots)].copy_(
+            torch.tensor(row_slots, dtype=torch.int32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.device_frequency_penalties[:len(frequency_penalties)].copy_(
+            torch.tensor(frequency_penalties,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.device_seq_frequency_penalties[:len(seq_frequency_penalties)].copy_(
+            torch.tensor(seq_frequency_penalties,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.use_device_penalty_history = True
+        return True
+
+    def append_accepted_tokens_to_penalty_history(
+            self, accepted_tokens: torch.Tensor,
+            num_accepted_tokens: torch.Tensor, batch_size: int) -> None:
+        if (self.use_device_penalty_counts
+                and self.device_penalty_count_seq_slots is not None):
+            if (self.device_penalty_count_mode == "dense"
+                    and self.device_penalty_token_counts is not None):
+                from .one_model_sampler import append_accepted_tokens_to_counts
+                append_accepted_tokens_to_counts(
+                    self.device_penalty_token_counts,
+                    self.device_penalty_count_seq_slots[:batch_size],
+                    accepted_tokens[:batch_size].contiguous(),
+                    num_accepted_tokens[:batch_size].contiguous())
+                return
+            if (self.device_penalty_count_mode == "sparse"
+                    and self.device_penalty_sparse_token_ids is not None
+                    and self.device_penalty_sparse_token_counts is not None
+                    and self.device_penalty_sparse_count_lens is not None):
+                from .one_model_sampler import append_accepted_tokens_to_sparse_counts
+                append_accepted_tokens_to_sparse_counts(
+                    self.device_penalty_sparse_token_ids,
+                    self.device_penalty_sparse_token_counts,
+                    self.device_penalty_sparse_count_lens,
+                    self.device_penalty_count_seq_slots[:batch_size],
+                    accepted_tokens[:batch_size].contiguous(),
+                    num_accepted_tokens[:batch_size].contiguous(),
+                    self.device_penalty_count_vocab_size)
+                return
+
+        if not self.use_device_penalty_history:
+            return
+        if self.device_penalty_history_tokens is None:
+            return
+        assert self.device_penalty_history_lens is not None
+        assert self.device_penalty_seq_slots is not None
+
+        from .one_model_sampler import append_accepted_tokens_to_history
+        append_accepted_tokens_to_history(
+            self.device_penalty_history_tokens,
+            self.device_penalty_history_lens,
+            self.device_penalty_seq_slots[:batch_size],
+            accepted_tokens[:batch_size].contiguous(),
+            num_accepted_tokens[:batch_size].contiguous())
+
+    def _populate_recent_token_penalties_for_one_model(
+            self, requests: list["LlmRequest"]) -> None:
+        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
+        ):
+            return
+
+        width = int(os.environ.get("TRTLLM_SPEC_RECENT_PENALTY_TOKENS", "0"))
+        width = max(width, 0)
+        if width == 0:
+            return
+
+        row_token_ids: list[list[int]] = []
+        row_penalty_values: list[list[float]] = []
+        seq_token_ids: list[list[int]] = []
+        seq_penalty_values: list[list[float]] = []
+        any_penalty = False
+
+        for request in requests:
+            sampling_config = request.sampling_config
+            frequency_penalty = float(
+                self._sampling_config_value(sampling_config,
+                                            "frequency_penalty", 0.0))
+            presence_penalty = float(
+                self._sampling_config_value(sampling_config,
+                                            "presence_penalty", 0.0))
+            prompt_ignore_length = int(
+                self._sampling_config_value(sampling_config,
+                                            "prompt_ignore_length", 0))
+
+            from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+            num_rows = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+
+            if frequency_penalty == 0.0 and presence_penalty == 0.0:
+                ids = [0] * width
+                penalties = [0.0] * width
+            else:
+                prompt_ignore_length = self._effective_prompt_ignore_length(
+                    request, prompt_ignore_length)
+                tokens = request.get_tokens(0)
+                recent_start = max(prompt_ignore_length, len(tokens) - width)
+                counts: dict[int, int] = {}
+                for token in tokens[recent_start:]:
+                    if token < 0:
+                        continue
+                    counts[token] = counts.get(token, 0) + 1
+                items = list(counts.items())[:width]
+                ids = [token for token, _ in items]
+                penalties = [
+                    presence_penalty + frequency_penalty * count
+                    for _, count in items
+                ]
+                if penalties:
+                    any_penalty = True
+                pad = width - len(ids)
+                if pad > 0:
+                    ids.extend([0] * pad)
+                    penalties.extend([0.0] * pad)
+
+            for _ in range(num_rows):
+                row_token_ids.append(ids)
+                row_penalty_values.append(penalties)
+            seq_token_ids.append(ids)
+            seq_penalty_values.append(penalties)
+
+        if not row_token_ids:
+            return
+
+        self._ensure_recent_penalty_buffers(width)
+        assert self.recent_penalty_token_ids is not None
+        assert self.recent_penalty_values is not None
+        assert self.recent_seq_penalty_token_ids is not None
+        assert self.recent_seq_penalty_values is not None
+
+        num_rows = len(row_token_ids)
+        num_seqs = len(seq_token_ids)
+        if not any_penalty:
+            self.recent_penalty_values[:num_rows].zero_()
+            self.recent_seq_penalty_values[:num_seqs].zero_()
+            return
+
+        self.recent_penalty_token_ids[:num_rows].copy_(
+            torch.tensor(row_token_ids,
+                         dtype=torch.long,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.recent_penalty_values[:num_rows].copy_(
+            torch.tensor(row_penalty_values,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.recent_seq_penalty_token_ids[:num_seqs].copy_(
+            torch.tensor(seq_token_ids,
+                         dtype=torch.long,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.recent_seq_penalty_values[:num_seqs].copy_(
+            torch.tensor(seq_penalty_values,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
 
     def populate_sampling_params_for_one_model(
             self, requests: list["LlmRequest"]) -> None:
@@ -498,6 +1371,10 @@ class SpecMetadata:
         self.top_ps[:len(top_ps)].copy_(torch.tensor(
             top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
+        if self._populate_device_count_frequency_penalties(requests):
+            return
+        if not self._populate_device_history_frequency_penalties(requests):
+            self._populate_recent_token_penalties_for_one_model(requests)
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -547,13 +1424,14 @@ class SpecWorkerBase(nn.Module, ABC):
         next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
-        return {
+        outputs = {
             'logits': logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens
         }
+        return self._add_penalty_history_outputs(outputs, spec_metadata)
 
     def skip_drafting(
         self,
@@ -585,7 +1463,6 @@ class SpecWorkerBase(nn.Module, ABC):
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-
         next_draft_tokens = torch.zeros((batch_size, 0),
                                         dtype=torch.int,
                                         device=logits.device)
@@ -595,13 +1472,14 @@ class SpecWorkerBase(nn.Module, ABC):
                                       device=logits.device)
         next_new_tokens[:, 0] = target_tokens
 
-        return {
+        outputs = {
             'logits': logits,
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens
         }
+        return self._add_penalty_history_outputs(outputs, spec_metadata)
 
     def set_guided_decoder(self,
                            guided_decoder: "CapturableGuidedDecoder") -> bool:
@@ -688,8 +1566,12 @@ class SpecWorkerBase(nn.Module, ABC):
                                          device=logits.device)
 
         # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
+        target_tokens = self._sample_tokens_for_batch(
+            logits,
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            draft_tokens=draft_tokens)
 
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -712,6 +1594,38 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens
 
+    @staticmethod
+    def _add_penalty_history_outputs(outputs: dict[str, torch.Tensor],
+                                     spec_metadata: SpecMetadata):
+        if spec_metadata.sampling_request_ids is not None:
+            outputs["penalty_sampling_request_ids"] = spec_metadata.sampling_request_ids
+        if spec_metadata.sampling_seq_slots is not None:
+            outputs["penalty_sampling_seq_slots"] = spec_metadata.sampling_seq_slots
+        if spec_metadata.use_device_penalty_counts:
+            if spec_metadata.device_penalty_count_seq_slots is not None:
+                outputs[
+                    "penalty_count_seq_slots"] = spec_metadata.device_penalty_count_seq_slots
+            if (spec_metadata.device_penalty_count_mode == "dense"
+                    and spec_metadata.device_penalty_token_counts is not None):
+                outputs["penalty_token_counts"] = spec_metadata.device_penalty_token_counts
+            elif (spec_metadata.device_penalty_count_mode == "sparse"
+                  and spec_metadata.device_penalty_sparse_token_ids is not None
+                  and spec_metadata.device_penalty_sparse_token_counts is not None
+                  and spec_metadata.device_penalty_sparse_count_lens is not None):
+                outputs["penalty_sparse_token_ids"] = spec_metadata.device_penalty_sparse_token_ids
+                outputs["penalty_sparse_token_counts"] = spec_metadata.device_penalty_sparse_token_counts
+                outputs["penalty_sparse_count_lens"] = spec_metadata.device_penalty_sparse_count_lens
+                outputs["penalty_count_vocab_size"] = spec_metadata.device_penalty_count_vocab_size
+        if (spec_metadata.use_device_penalty_history
+                and spec_metadata.device_penalty_history_tokens is not None
+                and spec_metadata.device_penalty_history_lens is not None):
+            if spec_metadata.device_penalty_seq_slots is not None:
+                outputs[
+                    "penalty_history_seq_slots"] = spec_metadata.device_penalty_seq_slots
+            outputs["penalty_history_tokens"] = spec_metadata.device_penalty_history_tokens
+            outputs["penalty_history_lens"] = spec_metadata.device_penalty_history_lens
+        return outputs
+
     def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
         """
         Simple greedy draft token sampling using argmax.
@@ -730,6 +1644,172 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_tokens = d2t[draft_tokens] + draft_tokens
 
         return draft_tokens.type(torch.int32)
+
+    @staticmethod
+    def _draft_prefix_frequency_penalties(spec_metadata: SpecMetadata):
+        if spec_metadata.device_count_seq_frequency_penalties is not None:
+            return spec_metadata.device_count_seq_frequency_penalties
+        if spec_metadata.device_seq_frequency_penalties is not None:
+            return spec_metadata.device_seq_frequency_penalties
+        return None
+
+    def _apply_draft_prefix_penalty_values(
+            self, logits: torch.Tensor, spec_metadata: SpecMetadata,
+            row_token_ids: torch.Tensor, row_penalty_values: torch.Tensor,
+            num_rows: int, width: int) -> torch.Tensor:
+        if num_rows <= 0 or width <= 0:
+            return logits
+        if row_token_ids is None or row_penalty_values is None:
+            return logits
+        if os.environ.get("TRTLLM_SPEC_USE_PENALTY_OP", "0") == "1":
+            from .one_model_sampler import apply_recent_token_penalties
+            return apply_recent_token_penalties(
+                logits, row_token_ids[:num_rows, :width],
+                row_penalty_values[:num_rows, :width])
+        # scatter_add handles duplicate prefix tokens in the same row correctly.
+        logits.scatter_add_(1, row_token_ids[:num_rows, :width].long(),
+                            -row_penalty_values[:num_rows, :width].to(
+                                logits.dtype))
+        return logits
+
+    def _apply_target_draft_prefix_frequency_penalty(
+            self, logits: torch.Tensor, spec_metadata: SpecMetadata,
+            num_contexts: int, batch_size: int,
+            draft_tokens: Optional[torch.Tensor]) -> torch.Tensor:
+        if os.environ.get("TRTLLM_SPEC_APPLY_DRAFT_PREFIX_PENALTY",
+                          "0") != "1":
+            return logits
+        if draft_tokens is None or draft_tokens.numel() == 0:
+            return logits
+        runtime_draft_len = int(draft_tokens.shape[-1])
+        if runtime_draft_len <= 0:
+            return logits
+        frequency_penalties = self._draft_prefix_frequency_penalties(
+            spec_metadata)
+        if frequency_penalties is None:
+            return logits
+        num_gens = batch_size - num_contexts
+        if num_gens <= 0:
+            return logits
+
+        num_tokens = num_contexts + num_gens * (runtime_draft_len + 1)
+        spec_metadata._ensure_draft_prefix_penalty_buffers(runtime_draft_len)
+        token_ids = spec_metadata.draft_prefix_penalty_token_ids
+        penalty_values = spec_metadata.draft_prefix_penalty_values
+        rows = spec_metadata.draft_prefix_penalty_rows
+        assert token_ids is not None
+        assert penalty_values is not None
+        assert rows is not None
+
+        token_ids[:num_tokens, :runtime_draft_len].zero_()
+        penalty_values[:num_tokens, :runtime_draft_len].zero_()
+        gen_frequency_penalties = frequency_penalties[
+            num_contexts:batch_size].to(torch.float32)
+        gen_rows = rows[:num_gens]
+        row_stride = runtime_draft_len + 1
+        for pos in range(1, runtime_draft_len + 1):
+            target_rows = num_contexts + gen_rows * row_stride + pos
+            token_ids[target_rows, :pos].copy_(draft_tokens[:, :pos])
+            penalty_values[target_rows, :pos].copy_(
+                gen_frequency_penalties.unsqueeze(1).expand(-1, pos))
+        return self._apply_draft_prefix_penalty_values(
+            logits, spec_metadata, token_ids, penalty_values, num_tokens,
+            runtime_draft_len)
+
+    def _apply_draft_step_prefix_frequency_penalty(
+            self, logits: torch.Tensor, spec_metadata: SpecMetadata,
+            batch_size: int,
+            draft_prefix_tokens: Optional[torch.Tensor]) -> torch.Tensor:
+        if os.environ.get("TRTLLM_SPEC_APPLY_DRAFT_PREFIX_PENALTY",
+                          "0") != "1":
+            return logits
+        if draft_prefix_tokens is None or draft_prefix_tokens.numel() == 0:
+            return logits
+        prefix_len = int(draft_prefix_tokens.shape[-1])
+        if prefix_len <= 0:
+            return logits
+        frequency_penalties = self._draft_prefix_frequency_penalties(
+            spec_metadata)
+        if frequency_penalties is None:
+            return logits
+
+        spec_metadata._ensure_draft_prefix_penalty_buffers(prefix_len)
+        token_ids = spec_metadata.draft_prefix_penalty_token_ids
+        penalty_values = spec_metadata.draft_prefix_penalty_values
+        assert token_ids is not None
+        assert penalty_values is not None
+
+        token_ids[:batch_size, :prefix_len].copy_(
+            draft_prefix_tokens[:batch_size, :prefix_len])
+        penalty_values[:batch_size, :prefix_len].copy_(
+            frequency_penalties[:batch_size].to(torch.float32).unsqueeze(1).
+            expand(-1, prefix_len))
+        return self._apply_draft_prefix_penalty_values(
+            logits, spec_metadata, token_ids, penalty_values, batch_size,
+            prefix_len)
+
+    def _maybe_apply_history_penalty_to_draft_logits(
+            self, logits: torch.Tensor, spec_metadata: SpecMetadata,
+            batch_size: int, d2t=None,
+            draft_prefix_tokens: Optional[torch.Tensor] = None):
+        if os.environ.get("TRTLLM_SPEC_APPLY_HISTORY_TO_DRAFT", "0") != "1":
+            return self._apply_draft_step_prefix_frequency_penalty(
+                logits, spec_metadata, batch_size, draft_prefix_tokens)
+        if d2t is not None:
+            return logits
+        if (spec_metadata.use_device_penalty_counts
+                and spec_metadata.device_penalty_count_seq_slots is not None
+                and spec_metadata.device_count_seq_frequency_penalties is not None):
+            from .one_model_sampler import (apply_count_frequency_penalty,
+                                            apply_sparse_count_frequency_penalty)
+            spec_metadata.ensure_device_penalty_count_buffers(
+                int(logits.shape[-1]))
+            if spec_metadata.device_penalty_count_mode == "dense":
+                if spec_metadata.device_penalty_token_counts is None:
+                    return logits
+                logits = apply_count_frequency_penalty(
+                    logits, spec_metadata.device_penalty_token_counts,
+                    spec_metadata.device_penalty_count_seq_slots[:batch_size],
+                    spec_metadata.device_count_seq_frequency_penalties[:batch_size])
+                return self._apply_draft_step_prefix_frequency_penalty(
+                    logits, spec_metadata, batch_size, draft_prefix_tokens)
+            if (spec_metadata.device_penalty_sparse_token_ids is None
+                    or spec_metadata.device_penalty_sparse_token_counts is None
+                    or spec_metadata.device_penalty_sparse_count_lens is None):
+                return logits
+            logits = apply_sparse_count_frequency_penalty(
+                logits, spec_metadata.device_penalty_sparse_token_ids,
+                spec_metadata.device_penalty_sparse_token_counts,
+                spec_metadata.device_penalty_sparse_count_lens,
+                spec_metadata.device_penalty_count_seq_slots[:batch_size],
+                spec_metadata.device_count_seq_frequency_penalties[:batch_size])
+            return self._apply_draft_step_prefix_frequency_penalty(
+                logits, spec_metadata, batch_size, draft_prefix_tokens)
+        if (spec_metadata.recent_seq_penalty_token_ids is not None
+                and spec_metadata.recent_seq_penalty_values is not None):
+            from .one_model_sampler import apply_recent_token_penalties
+            logits = apply_recent_token_penalties(
+                logits,
+                spec_metadata.recent_seq_penalty_token_ids[:batch_size],
+                spec_metadata.recent_seq_penalty_values[:batch_size])
+            return self._apply_draft_step_prefix_frequency_penalty(
+                logits, spec_metadata, batch_size, draft_prefix_tokens)
+        if (not spec_metadata.use_device_penalty_history
+                or logits.dtype != torch.float32
+                or spec_metadata.device_penalty_history_tokens is None
+                or spec_metadata.device_penalty_history_lens is None
+                or spec_metadata.device_penalty_seq_slots is None
+                or spec_metadata.device_seq_frequency_penalties is None):
+            return logits
+
+        from .one_model_sampler import apply_history_frequency_penalty
+        logits = apply_history_frequency_penalty(
+            logits, spec_metadata.device_penalty_history_tokens,
+            spec_metadata.device_penalty_history_lens,
+            spec_metadata.device_penalty_seq_slots[:batch_size],
+            spec_metadata.device_seq_frequency_penalties[:batch_size])
+        return self._apply_draft_step_prefix_frequency_penalty(
+            logits, spec_metadata, batch_size, draft_prefix_tokens)
 
     def _execute_guided_decoder_if_present(self, logits):
         """Execute guided decoder on target model logits if available."""
@@ -846,6 +1926,7 @@ class SpecWorkerBase(nn.Module, ABC):
         spec_metadata: SpecMetadata,
         num_contexts: int,
         batch_size: int,
+        draft_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample tokens from logits using per-request sampling parameters.
@@ -861,7 +1942,11 @@ class SpecWorkerBase(nn.Module, ABC):
             sampled_tokens: [num_tokens] - Sampled token ids
         """
         if spec_metadata.allow_advanced_sampling:
-            from .one_model_sampler import sampling_batch_spec_dec_one_model
+            from .one_model_sampler import (apply_count_frequency_penalty,
+                                            apply_history_frequency_penalty,
+                                            apply_recent_token_penalties,
+                                            apply_sparse_count_frequency_penalty,
+                                            sampling_batch_spec_dec_one_model)
 
             num_gens = batch_size - num_contexts
             num_tokens = num_contexts + num_gens * (
@@ -870,6 +1955,56 @@ class SpecWorkerBase(nn.Module, ABC):
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
+            if (spec_metadata.use_device_penalty_counts
+                    and spec_metadata.device_penalty_count_row_slots is not None
+                    and spec_metadata.device_count_frequency_penalties is not None):
+                spec_metadata.ensure_device_penalty_count_buffers(
+                    int(logits.shape[-1]))
+                if (spec_metadata.device_penalty_count_mode == "dense"
+                        and spec_metadata.device_penalty_token_counts is not None):
+                    logits = apply_count_frequency_penalty(
+                        logits,
+                        spec_metadata.device_penalty_token_counts,
+                        spec_metadata.device_penalty_count_row_slots[:num_tokens],
+                        spec_metadata.device_count_frequency_penalties[:
+                                                                      num_tokens])
+                elif (spec_metadata.device_penalty_count_mode == "sparse"
+                      and spec_metadata.device_penalty_sparse_token_ids is not None
+                      and spec_metadata.device_penalty_sparse_token_counts is not None
+                      and spec_metadata.device_penalty_sparse_count_lens is not None):
+                    logits = apply_sparse_count_frequency_penalty(
+                        logits,
+                        spec_metadata.device_penalty_sparse_token_ids,
+                        spec_metadata.device_penalty_sparse_token_counts,
+                        spec_metadata.device_penalty_sparse_count_lens,
+                        spec_metadata.device_penalty_count_row_slots[:num_tokens],
+                        spec_metadata.device_count_frequency_penalties[:
+                                                                      num_tokens])
+            elif (spec_metadata.use_device_penalty_history
+                    and logits.dtype == torch.float32
+                    and spec_metadata.device_penalty_history_tokens is not None
+                    and spec_metadata.device_penalty_history_lens is not None
+                    and spec_metadata.device_penalty_row_slots is not None
+                    and spec_metadata.device_frequency_penalties is not None):
+                logits = apply_history_frequency_penalty(
+                    logits,
+                    spec_metadata.device_penalty_history_tokens,
+                    spec_metadata.device_penalty_history_lens,
+                    spec_metadata.device_penalty_row_slots[:num_tokens],
+                    spec_metadata.device_frequency_penalties[:num_tokens])
+            else:
+                recent_penalty_token_ids = (
+                    None if spec_metadata.recent_penalty_token_ids is None else
+                    spec_metadata.recent_penalty_token_ids[:num_tokens])
+                recent_penalty_values = (
+                    None if spec_metadata.recent_penalty_values is None else
+                    spec_metadata.recent_penalty_values[:num_tokens])
+                if recent_penalty_token_ids is not None and recent_penalty_values is not None:
+                    logits = apply_recent_token_penalties(
+                        logits, recent_penalty_token_ids, recent_penalty_values)
+
+            logits = self._apply_target_draft_prefix_frequency_penalty(
+                logits, spec_metadata, num_contexts, batch_size, draft_tokens)
 
             if self.use_flashinfer:
                 top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
