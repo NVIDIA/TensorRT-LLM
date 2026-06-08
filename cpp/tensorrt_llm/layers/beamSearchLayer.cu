@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -335,8 +335,9 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     BeamHypotheses bh;
     // bh's members not used in this function: outputIds, logProbs, outputIdsUnfinish, parentIdsUnfinish
     bh.bVBWS = this->mVBWS;
-    // outputIds is never sliced to active batch size; its dim-0 is always maxBatchSize.
-    // outputIdsPtr is sliced to activeBatchSize in DynamicDecodeLayer and must not be used as a stride.
+    // outputIds retains its full maxBatchSize allocation; outputIdsPtr is sliced to the active
+    // batch size in DynamicDecodeLayer::prepareIdsPtrs (ITensor::slice(mOutputIdsPtrDevice, 0, batchSize))
+    // and must not be used as a stride for the [MSL, maxBatchSize, BM]-shaped logProbsTiled buffer.
     bh.nMaxBatchSize = static_cast<std::int32_t>(op->outputIds->getDimension<0>());
     bh.nBatchSize = ip->localBatchSize;
     bh.nBeamWidth = op->outputIds->getDimension<1>();
@@ -399,7 +400,7 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     T const* bias = static_cast<T const*>(nullptr);
     TLLM_CHECK_WITH_INFO(getWorkspaceSize() >= 2 * bh.nBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2,
         "Workspace size (%lu) is not enough for topk softmax required (%lu).", (uint64_t) getWorkspaceSize(),
-        (uint64_t) (2 * bh.nMaxBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2));
+        (uint64_t) (2 * bh.nBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2));
 
     if (this->mV2 || this->mVBWS)
     {

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -205,6 +205,87 @@ def test_whisper_beam_search_generation_logits(llm_venv, engine_dir,
     env = {
         "HF_DATASETS_OFFLINE":
         "0",
+        "PYTHONPATH":
+        os.pathsep.join(
+            filter(None, [whisper_example_root,
+                          os.environ.get("PYTHONPATH")])),
+    }
+    venv_check_call(llm_venv, run_cmd, env=env)
+
+
+@skip_post_blackwell
+@pytest.mark.parametrize("num_beams", [4],
+                         ids=lambda num_beams: f'nb:{num_beams}')
+@pytest.mark.parametrize("batch_size", [4],
+                         ids=lambda batch_size: f'bs:{batch_size}')
+@pytest.mark.parametrize("whisper_model_root", ['large-v3'], indirect=True)
+def test_whisper_log_probs_determinism(llm_venv, engine_dir,
+                                       whisper_example_root, whisper_model_root,
+                                       num_beams, batch_size,
+                                       llm_datasets_root):
+    """Regression test for nMaxBatchSize stride bug in beam search log_probs.
+
+    Sends a batch of requests with different audio samples so each item produces
+    a different number of output tokens.  When the batch drains unevenly the
+    active batch dimension shrinks; the bug caused beamStage3 to use that
+    shrinking value as the logProbsTiled stride, producing non-deterministic
+    log_probs across runs.
+
+    Runs inference num_runs times and asserts log_probs are bit-identical.
+    """
+    tllm_model_name, model_ckpt_dir = whisper_model_root
+
+    whisper_engine_dir = (f"{engine_dir}/{tllm_model_name}"
+                          f"/float16_bs{batch_size}_nb{num_beams}_logprobs_det")
+
+    converted_weight_dir = convert_weights(llm_venv=llm_venv,
+                                           example_root=whisper_example_root,
+                                           cmodel_dir=whisper_engine_dir,
+                                           model=tllm_model_name,
+                                           model_path=model_ckpt_dir,
+                                           use_weight_only=False,
+                                           weight_only_precision=None)
+
+    print("Build engines for log_probs determinism test...")
+    for component in ["encoder", "decoder"]:
+        build_cmd = [
+            "trtllm-build",
+            f"--checkpoint_dir={converted_weight_dir}/{component}",
+            f"--output_dir={whisper_engine_dir}/{component}",
+            "--paged_kv_cache=enable",
+            "--remove_input_padding=enable",
+            "--moe_plugin=disable",
+            f"--max_batch_size={batch_size}",
+            "--gemm_plugin=float16",
+            "--bert_attention_plugin=float16",
+            "--gpt_attention_plugin=float16",
+        ]
+        if component == "encoder":
+            build_cmd.append("--max_input_len=3000")
+            build_cmd.append("--max_seq_len=3000")
+        if component == "decoder":
+            build_cmd.append("--max_input_len=14")
+            build_cmd.append("--max_seq_len=114")
+            build_cmd.append("--max_encoder_input_len=3000")
+            build_cmd.append(f"--max_beam_width={num_beams}")
+
+        check_call(build_cmd, env=llm_venv._new_env)
+
+    print("Run log_probs determinism validation...")
+    validation_script = os.path.join(
+        os.path.dirname(__file__), "validate_whisper_log_probs_determinism.py")
+    librispeech_dir = os.path.join(llm_datasets_root,
+                                   "hf-internal-testing/librispeech_asr_dummy")
+    run_cmd = [
+        validation_script,
+        f"--engine_dir={whisper_engine_dir}",
+        f"--assets_dir={model_ckpt_dir}",
+        f"--dataset_dir={librispeech_dir}",
+        f"--num_beams={num_beams}",
+        f"--batch_size={batch_size}",
+        "--num_runs=5",
+    ]
+    env = {
         "PYTHONPATH":
         os.pathsep.join(
             filter(None, [whisper_example_root,

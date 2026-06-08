@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -782,8 +782,12 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
 
     tensorrt_llm::kernels::BeamHypotheses bh;
     // logProbsTiled has shape [MSL, maxNumSequences, BM] and is passed unsliced.
-    // Use its actual dim-1 as nMaxBatchSize (stride), and offset the pointer to
-    // the correct batch slot so insertUnfinishedPathKernel indexes correctly.
+    // nMaxBatchSize must equal the allocation stride (dim-1), not the per-slot batchSize=1.
+    // The pointer is pre-offset by batchSlot*BM so that insertUnfinishedPathKernel,
+    // which uses bid=0 / nBatchSize=1, computes:
+    //   (base + batchSlot*BM)[step * maxBS * BM + 0*BM + beamIdx]
+    //   = base[step * maxBS * BM + batchSlot * BM + beamIdx]
+    //   = logProbsTiled[step][batchSlot][beamIdx]  ✓
     auto const logProbsTiledMaxBatchSize = static_cast<SizeType32>(decodingOutput.logProbsTiled->getShape().d[1]);
     bh.nMaxBatchSize = logProbsTiledMaxBatchSize;
     bh.nBatchSize = batchSize;
