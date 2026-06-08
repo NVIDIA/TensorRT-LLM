@@ -15,6 +15,7 @@
 import array
 import functools
 import gc
+import hashlib
 import itertools
 import os
 import random
@@ -52,7 +53,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         TokenIdExt,
         _KVCache,
     )
-    from kv_cache_manager_v2._block_radix_tree import traverse_post_order
+    from kv_cache_manager_v2._block_radix_tree import Hasher, traverse_post_order
     from kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,
@@ -105,7 +106,10 @@ else:
         TokenIdExt,
         _KVCache,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import traverse_post_order
+    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+        Hasher,
+        traverse_post_order,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,
@@ -2554,6 +2558,34 @@ class TestSlotAllocatorShrink(unittest.TestCase):
 
         for s in slots[:8]:
             allocator.release(s)
+
+
+class TestBlockKeyHashing(unittest.TestCase):
+    """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
+
+    @staticmethod
+    def _ref_update(seed: bytes, block: "list[int | bytes]") -> bytes:
+        h = hashlib.sha256()
+        h.update(seed)
+        for item in block:
+            h.update(item.to_bytes(8, "little") if type(item) is int else item)
+        return h.digest()
+
+    def test_update_int_block_matches_reference(self) -> None:
+        rng = random.Random(123)
+        seed = b"\xaa\xbb\xcc"
+        for n in (0, 1, 7, 32, 33, 257):
+            block = [rng.randint(0, (1 << 60)) for _ in range(n)]
+            self.assertEqual(
+                Hasher(seed).update(block).digest,
+                self._ref_update(seed, block),
+                f"int block of length {n}",
+            )
+
+    def test_update_mixed_multimodal_block(self) -> None:
+        block = [randbytes(32), 5, 6, randbytes(32)] + list(range(20))
+        seed = b"\x01"
+        self.assertEqual(Hasher(seed).update(block).digest, self._ref_update(seed, block))
 
 
 if __name__ == "__main__":
