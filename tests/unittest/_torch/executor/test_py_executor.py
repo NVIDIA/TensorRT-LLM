@@ -637,15 +637,7 @@ class _StubDelayBatchExecutor:
         self.dist.world_size = world_size
         self.dist.tp_size = world_size
         self._compute_scheduled_tokens = PyExecutor._compute_scheduled_tokens
-        self._real_generation_requests_for_delay_batch = (
-            PyExecutor._real_generation_requests_for_delay_batch
-        )
-        self._last_delay_batch_debug = {}
         self._delay_batch_fetched_all_ctx_runtime_enabled = True
-        self.delay_batch_debug_enabled = False
-        self.delay_batch_debug_all_ranks = False
-        self._delay_batch_log = Mock()
-        self._log_delay_batch_generation_sources = Mock()
 
 
 def test_delay_batch_timeout_skips_context_only_before_deadline(monkeypatch):
@@ -733,11 +725,11 @@ def test_delay_batch_fetched_all_ctx_updates_from_real_requests():
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
 
-    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [ctx_request], "test")
+    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [ctx_request])
 
     assert stub._delay_batch_fetched_all_ctx_runtime_enabled is True
 
-    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [gen_request], "test")
+    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [gen_request])
 
     assert stub._delay_batch_fetched_all_ctx_runtime_enabled is False
 
@@ -747,7 +739,7 @@ def test_delay_batch_fetched_all_ctx_ignores_dummy_only_update():
     stub._delay_batch_fetched_all_ctx_runtime_enabled = True
     dummy_gen = _make_gen_request(is_attention_dp_dummy=True, is_dummy_request=True)
 
-    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [dummy_gen], "test")
+    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [dummy_gen])
 
     assert stub._delay_batch_fetched_all_ctx_runtime_enabled is True
 
@@ -764,11 +756,11 @@ def test_delay_batch_fetched_all_ctx_uses_fetched_request_type():
         2, types.SimpleNamespace(request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY)
     )
 
-    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [ctx_item], "test")
+    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [ctx_item])
 
     assert stub._delay_batch_fetched_all_ctx_runtime_enabled is True
 
-    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [gen_item], "test")
+    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [gen_item])
 
     assert stub._delay_batch_fetched_all_ctx_runtime_enabled is False
 
@@ -783,7 +775,7 @@ def test_delay_batch_fetched_all_ctx_uses_rank0_broadcast():
         2, types.SimpleNamespace(request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY)
     )
 
-    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [gen_item], "test")
+    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [gen_item])
 
     assert stub._delay_batch_fetched_all_ctx_runtime_enabled is True
     stub.dist.tp_broadcast.assert_called_once_with(None, root=0)
@@ -799,7 +791,7 @@ def test_delay_batch_fetched_all_ctx_ignores_warmup():
         _STATE_GENERATION_IN_PROGRESS, llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
     )
 
-    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [ctx_request], "test")
+    PyExecutor._update_delay_batch_fetched_all_ctx(stub, [ctx_request])
 
     assert stub._delay_batch_fetched_all_ctx_runtime_enabled is False
 
