@@ -45,7 +45,7 @@ Deployment configs (``examples/visual_gen/configs/``):
 - ``cosmos3-super-4gpu.yaml`` — 4 GPU, CFG + Ulysses + parallel VAE
 
 Usage:
-    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \\
+    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
         --prompt "The video opens with a view of a well-lit indoor space featuring a " \\
         "wooden display case with compartments filled with various fruits, " \\
         "including bananas, apples, pears, oranges, and carambolas. " \\
@@ -66,11 +66,38 @@ Usage:
         "position, leaving the display case and surrounding area unchanged. " \\
         "The video showcases a seamless and efficient automated fruit-picking " \\
         "process, highlighting the precision and efficiency of modern robotics " \\
-        "in a retail setting." \\
+        "in a retail setting." \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+        --prompt "A low-angle tracking shot follows a man riding a vintage black motorcycle " \\
+        "across a lush green grassy yard. Sunlight filters through overhead trees, casting " \\
+        "dappled shadows across the vibrating chrome exhaust and the rider's leather jacket. " \\
+        "He kicks up small blades of grass as he maneuvers the bike. He gradually decelerates, " \\
+        "the front fork compressing slightly as he brakes to a smooth halt beside another " \\
+        "individual standing in the shade. The camera settles into a medium two-shot, capturing " \\
+        "the rider lifting his visor to speak, his face framed by a matte helmet. The video is " \\
+        "8 seconds long and is of 24 FPS. This video is of 1280x720 resolution. Audio description: " \\
+        "The rhythmic, mechanical chugging of a four-stroke motorcycle engine dominates the " \\
+        "foreground, characterized by a throaty, guttural timbre. Periodic high-pitched revs " \\
+        "punctuate the steady idle as the throttle is twisted. The sound of tires crunching " \\
+        "softly over dry grass and twigs provides a textured background layer. As the vehicle " \\
+        "slows, the engine note drops to a low-frequency rumble before clicking into neutral. " \\
+        "A muffled, mid-range male voice begins speaking, accompanied by the metallic clink of " \\
+        "a helmet visor snapping upward and the faint chirping of distant birds in an open-air " \\
+        "environment." \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+        --enable_audio
+
+    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+        --prompt "A cute puppy playing with a ball in a park" \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+        --output_type image \
+        --output_path output.png
 """
 
 import argparse
+import json
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 
@@ -108,6 +135,26 @@ def main():
         default="cosmos3_ti2v_output.mp4",
         help="Path to save the output video",
     )
+    parser.add_argument(
+        "--enable_duration_template", action="store_true", help="Enable duration template in prompt"
+    )
+    parser.add_argument(
+        "--enable_resolution_template",
+        action="store_true",
+        help="Enable resolution template in prompt",
+    )
+    parser.add_argument(
+        "--use_system_prompt", action="store_true", help="Use system prompt in prompt"
+    )
+    parser.add_argument("--enable_audio", action="store_true", help="Enable audio generation")
+    parser.add_argument(
+        "--output_type", type=str, default="video", help="Output type (video, image)"
+    )
+
+    # Guardrails
+    parser.add_argument(
+        "--disable_guardrails", action="store_true", help="NOT RECOMMENDED: Disable guardrails"
+    )
     args = parser.parse_args()
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
@@ -120,6 +167,17 @@ def main():
     if args.image_path is not None:
         params.image = args.image_path
 
+    negative_prompt = json.load(open("neg_prompt.json"))
+
+    params.extra_params["use_duration_template"] = args.enable_duration_template
+    params.extra_params["use_resolution_template"] = args.enable_resolution_template
+    params.extra_params["use_system_prompt"] = args.use_system_prompt
+    params.extra_params["enable_audio"] = args.enable_audio
+    params.extra_params["use_guardrails"] = not args.disable_guardrails
+    params.extra_params["output_type"] = args.output_type
+
+    params.negative_prompt = json.dumps(negative_prompt)
+
     output = visual_gen.generate(
         inputs=args.prompt,
         params=params,
@@ -127,6 +185,7 @@ def main():
 
     output.save(args.output_path)
     print(f"Saved: {args.output_path}")
+    print(output.metrics)
 
 
 if __name__ == "__main__":
