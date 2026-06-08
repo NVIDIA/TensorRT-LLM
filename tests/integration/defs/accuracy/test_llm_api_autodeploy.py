@@ -873,19 +873,19 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
 
-            # Ultra V3 uses extended thinking: enable_thinking=True so the model
-            # can use <think>...</think> CoT before the #### answer.
-            # Increase max_tokens to 1024 to allow the full thinking chain to
-            # complete before the "#### N" answer token -- 256 is too short.
-            sampling_params.max_tokens = 1024
+            # MMLU evaluation fills max_tokens with its two-token default.
+            # Reset it for GSM8K and use the no-thinking prompt format used by
+            # other thinking-model accuracy coverage.
+            sampling_params.max_tokens = GSM8K.MAX_OUTPUT_LEN
             task = GSM8K(self.MODEL_NAME)
             task.NUM_SAMPLES = 128
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs={
                               "apply_chat_template": True,
+                              "fewshot_as_multiturn": True,
                               "chat_template_kwargs": {
-                                  "enable_thinking": True
+                                  "enable_thinking": False
                               },
                           })
 
