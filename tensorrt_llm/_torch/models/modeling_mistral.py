@@ -318,18 +318,10 @@ class MistralCommonImageProcessor:
         return ncols * nrows + nrows
 
     def __call__(self, text, images=None, **kwargs):
-        if not images:
-            # Plain-text inputs (e.g. text-only evaluation like MMLU/GSM8K): tokenize
-            # directly without wrapping in a multi-modal chat conversation, which would
-            # otherwise inject chat-template tokens and corrupt continuation prompts.
-            encoded = self.tokenizer.transformers_tokenizer(text,
-                                                            return_tensors='pt')
-            return {"input_ids": encoded["input_ids"]}
-
         mm_items = [{
             "type": "image",
             "base64": encode_base64_image(image)
-        } for image in images]
+        } for image in (images or [])]
 
         conversation = [{
             "role": "user",
@@ -342,11 +334,8 @@ class MistralCommonImageProcessor:
         encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
             conversation, tokenize=True, return_dict=True, return_tensors='pt')
 
-        processed = {
-            "input_ids": encoded.input_ids,
-        }
+        processed = {"input_ids": encoded.input_ids}
 
-        # text-only mode for VLM
         if "pixel_values" in encoded:
             processed.update({
                 "pixel_values":
