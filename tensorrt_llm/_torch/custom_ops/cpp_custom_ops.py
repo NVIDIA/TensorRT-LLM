@@ -401,6 +401,18 @@ def _register_fake():
         dtype = out_dtype if out_dtype is not None else torch.bfloat16
         return act.new_empty((m, n), dtype=dtype)
 
+    @torch.library.register_fake("trtllm::megamoe_prepare")
+    def _(
+        input: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_out: torch.Tensor,
+        x_sf_out: torch.Tensor,
+        topk_idx_out: torch.Tensor,
+        topk_weights_out: torch.Tensor,
+    ):
+        return None
+
     @torch.library.register_fake("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner")
     def _(
         routing_logits: Optional[torch.Tensor],
