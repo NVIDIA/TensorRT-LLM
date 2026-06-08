@@ -21,10 +21,17 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # ============================================================================
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
+from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+    Attention2DAttention,
+    RingAttention,
+    UlyssesAttention,
+)
+from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
 # Import new integrated versions
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
@@ -121,6 +128,9 @@ def create_model_config(
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
     quant_attention_config: "QuantAttentionConfig | None" = None,
+    *,
+    visual_gen_mapping: VisualGenMapping | None = None,
+    skip_create_weights_in_init: bool = False,
 ):
     """Create a mock DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(
@@ -137,11 +147,13 @@ def create_model_config(
             backend=attn_backend,
             quant_attention_config=quant_attention_config,
         ),
-        skip_create_weights_in_init=False,
+        skip_create_weights_in_init=skip_create_weights_in_init,
     )
     config.attention_metadata_state = (
         create_attention_metadata_state() if attn_backend == "TRTLLM" else None
     )
+    if visual_gen_mapping is not None:
+        config.visual_gen_mapping = visual_gen_mapping
     return config
 
 
@@ -157,6 +169,31 @@ def _require_attention_backend(attn_backend: str, head_dim: Optional[int] = None
             pytest.skip("CUTEDSL attention test requires a supported Blackwell-class GPU")
         if head_dim is not None and head_dim != 128:
             pytest.skip("CUTEDSL attention test requires head_dim=128")
+
+
+def _make_cross_attention_with_mapping(
+    visual_gen_mapping: VisualGenMapping,
+    *,
+    enable_sequence_parallel: bool,
+    hidden_size: int = 64,
+    num_heads: int = 4,
+    head_dim: int = 16,
+) -> Attention:
+    config = create_model_config(
+        hidden_size,
+        num_heads,
+        head_dim,
+        visual_gen_mapping=visual_gen_mapping,
+        skip_create_weights_in_init=True,
+    )
+    return Attention(
+        hidden_size=hidden_size,
+        num_attention_heads=num_heads,
+        head_dim=head_dim,
+        qkv_mode=QKVMode.SEPARATE_QKV,
+        config=config,
+        enable_sequence_parallel=enable_sequence_parallel,
+    )
 
 
 def copy_weights_self_attention(naive: NaiveWanSelfAttention, integrated: Attention):
@@ -225,6 +262,44 @@ def generate_rope_embeddings(
         freqs_sin = torch.sin(position * div_term).unsqueeze(0).unsqueeze(2)  # [1, S, 1, D]
 
     return freqs_cos, freqs_sin
+
+
+# ============================================================================
+# Sequence-parallel configuration guards
+# ============================================================================
+
+
+class TestSeparateQkvSequenceParallelGuard:
+    @pytest.mark.parametrize(
+        "vgm_kwargs",
+        [
+            pytest.param(dict(world_size=2, rank=0, ring_size=2), id="ring"),
+            pytest.param(
+                dict(world_size=4, rank=0, attn2d_row_size=2, attn2d_col_size=2),
+                id="attn2d",
+            ),
+        ],
+    )
+    def test_ring_or_attn2d_with_separate_qkv_raises(self, vgm_kwargs):
+        vgm = VisualGenMapping(**vgm_kwargs)
+
+        with pytest.raises(ValueError, match="SEPARATE_QKV cross-attention does not support"):
+            _make_cross_attention_with_mapping(vgm, enable_sequence_parallel=True)
+
+    def test_ring_with_sequence_parallel_disabled_allowed(self):
+        vgm = VisualGenMapping(world_size=2, rank=0, ring_size=2)
+
+        attn = _make_cross_attention_with_mapping(vgm, enable_sequence_parallel=False)
+
+        assert isinstance(attn.attn, VanillaAttention)
+        assert not isinstance(attn.attn, (UlyssesAttention, RingAttention, Attention2DAttention))
+
+    def test_attn2d_with_sequence_parallel_disabled_allowed(self):
+        vgm = VisualGenMapping(world_size=4, rank=0, attn2d_row_size=2, attn2d_col_size=2)
+
+        attn = _make_cross_attention_with_mapping(vgm, enable_sequence_parallel=False)
+
+        assert isinstance(attn.attn, VanillaAttention)
 
 
 # ============================================================================

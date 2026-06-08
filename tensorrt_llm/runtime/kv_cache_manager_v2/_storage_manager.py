@@ -637,6 +637,15 @@ class StorageManager:
         ), "Not enough slots"
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
         assert new_num_slots < pool_group.num_slots, "Not required for expansion of pools"
+        allocator = pool_group._slot_allocator
+        # Fast path: when no slot id has ever been issued in the to-be-removed
+        # range [new_num_slots, _capacity), there is nothing to migrate.
+        # _num_active_slots is a monotone high-water mark of issued ids.
+        if allocator._num_active_slots <= new_num_slots:
+            allocator.prepare_for_shrink(new_num_slots)
+            allocator.finish_shrink()
+            pool_group.resize_pools(new_num_slots)
+            return
         ctrl = self._levels[level].controller
         # pages with overflow slots and their indices in the eviction queue.
         overflow_slots = deque[tuple[int, Page]]()
@@ -647,7 +656,6 @@ class StorageManager:
         num_overflow_persistent = len(overflow_persistent_pages)
         if num_overflow_persistent > new_num_slots:
             raise OutOfPagesError("Not enough slots to hold all persistent pages")
-        allocator = pool_group._slot_allocator
         # prevent allocating slots with id >= new_num_slots
         allocator.prepare_for_shrink(new_num_slots)
         min_num_evicted = 0
@@ -898,3 +906,42 @@ class StorageManager:
         total = sum(num_bytes)
         assert total > 0
         return typed_map(num_bytes, lambda x: x / total)
+
+    def prefetch(
+        self,
+        dst_lvl: CacheLevel,
+        pages: TypedIndexList[PoolGroupIndex, TypedIndexList[CacheLevel, list[Page]]],
+    ) -> None:
+        """Dispatch page migration to the destination cache level.
+
+        Args:
+            dst_lvl: Destination cache level for pages currently in lower tiers.
+            pages: Pages grouped by pool group and current cache level.
+
+        Raises:
+            OutOfPagesError: If there are not enough pages available for the prefetch hint.
+        """
+        num_slots = filled_list(0, self.num_pool_groups)
+        scheduled = list[Page]()
+        try:
+            for pg_idx, pg_pages in typed_enumerate(pages):
+                for lvl, lvl_pages in typed_enumerate(pg_pages):
+                    assert lvl >= dst_lvl or not lvl_pages
+                    for p in lvl_pages:
+                        if p.scheduled_for_eviction:
+                            self.exclude_from_eviction(p)
+                            scheduled.append(p)
+                        elif self.is_evictable(p, dst_lvl):
+                            scheduled.append(p)
+                        assert lvl >= dst_lvl
+                        if lvl == dst_lvl:
+                            continue
+                        num_slots[pg_idx] += 1
+            self.prepare_free_slots(dst_lvl, num_slots)
+            for pg_idx, pg_tasks in typed_enumerate(pages):
+                for lvl in typed_range(CacheLevel(dst_lvl + 1), self.num_cache_levels):
+                    lvl_tasks = pg_tasks[lvl]
+                    self._batched_migrate(pg_idx, dst_lvl, lvl, lvl_tasks, True)
+        finally:
+            for p in scheduled:
+                self.schedule_for_eviction(p)

@@ -84,15 +84,12 @@ from ..attention_interface import (
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
 )
+from .rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
-# Metadata key used by fuse_rope_into_trtllm_mla (at post_load_fusion) to stash
-# rope info on torch_mla nodes, consumed by prepare_node_for_cache_insertion
-# (at cache_init) to materialize the rotary_cos_sin buffer as a graph node.
-_TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
 # ``thop.attention``'s C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``)
 # auto-resizes the workspace tensor when its sizing formula exceeds the
 # tensor's capacity.  ``resize_()`` reallocates storage and rebinds the
@@ -1018,6 +1015,7 @@ def _handle_prefill_thop(
         context_lengths[:pf],  # context_lengths
         host_context_lengths[:pf],  # host_context_lengths
         host_request_types[:pf],  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets (device-filled)
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         planner.host_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1308,6 +1306,7 @@ def _handle_prefill_thop_cached_kv(
             context_lengths[:pf],
             host_context_lengths[:pf],
             host_request_types[:pf],
+            None,  # max_context_q_len_override
             kv_cache_block_offsets,
             host_kv_cache_pool_pointers,
             planner.host_pool_mapping,
@@ -1436,6 +1435,7 @@ def _handle_prefill_thop_cached_kv(
         context_lengths[:pf],
         host_context_lengths[:pf],
         host_request_types[:pf],
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
@@ -1694,6 +1694,7 @@ def _handle_decode_impl(
         context_lengths,  # context_lengths
         host_context_lengths,  # host_context_lengths
         host_request_types,  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping

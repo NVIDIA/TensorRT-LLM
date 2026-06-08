@@ -35,7 +35,7 @@ from typing import Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.mla.trtllm_mla import _TRTLLM_MLA_ROPE_INFO_KEY
+from ...custom_ops.mla.rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger

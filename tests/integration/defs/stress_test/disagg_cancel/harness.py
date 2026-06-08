@@ -28,10 +28,17 @@ suite matures.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import random
 import re
+import signal
+import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Callable, Optional
@@ -146,6 +153,28 @@ class StressConfig:
             raise ValueError(f"transceiver must be 'cpp' or 'python', got {self.transceiver!r}")
 
 
+_INJECTION_TARGET_RE = re.compile(r"^(ctx|gen)_worker_(\d+)$")
+
+
+@dataclass
+class _TrackedWorker:
+    """Runtime binding between a shadow ``WorkerLaunchSpec`` and its subprocess."""
+
+    spec: WorkerLaunchSpec
+    wrapper: Any  # disagg_test_utils.ProcessWrapper
+
+
+@dataclass(frozen=True)
+class _InjectionSpec:
+    """One entry from ``stress_config.injections`` after validation."""
+
+    at_min: float
+    type: str  # sigstop | sigkill
+    target: str
+    duration_s: Optional[float] = None
+    respawn_within_s: Optional[float] = None
+
+
 @dataclass
 class WorkerLaunchSpec:
     """Shadow-tracked launch context for a single worker.
@@ -167,6 +196,9 @@ class WorkerLaunchSpec:
     # ``None`` when launched with ``save_log=False`` (output inherits
     # pytest stdout); log_scanner skips ``None`` paths with a warning.
     log_path: Optional[str] = None
+    # Host for HTTP scraping (Prometheus / health). Multi-host setups
+    # set this from the YAML ``hostname:`` field at cluster-setup time.
+    host: str = "localhost"
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +337,372 @@ def _compile_patterns(raw_patterns: list[Any]) -> list[tuple[str, re.Pattern[str
     return compiled
 
 
+def _parse_injection_schedule(raw_injections: list[Any]) -> list[_InjectionSpec]:
+    """Normalize and validate the YAML ``injections:`` schedule.
+
+    Malformed entries are logged at ERROR and skipped so a typo in one
+    slot does not abort the whole marathon.
+
+    Args:
+        raw_injections: Value of ``stress_config.injections`` from YAML.
+
+    Returns:
+        Sorted list of validated injection specs (by ``at_min``).
+    """
+    specs: list[_InjectionSpec] = []
+    for idx, entry in enumerate(raw_injections):
+        if not isinstance(entry, dict):
+            logger.error("[injector] injections[%d] is not a mapping; skipping", idx)
+            continue
+        try:
+            at_min = float(entry["at_min"])
+            inj_type = str(entry["type"]).lower()
+            target = str(entry["target"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.error("[injector] injections[%d] missing required fields: %s", idx, exc)
+            continue
+        if inj_type not in ("sigstop", "sigkill"):
+            logger.error("[injector] injections[%d] unsupported type %r; skipping", idx, inj_type)
+            continue
+        duration_s = entry.get("duration_s")
+        respawn_within_s = entry.get("respawn_within_s")
+        if inj_type == "sigstop":
+            if duration_s is None:
+                logger.error("[injector] injections[%d] sigstop missing duration_s; skipping", idx)
+                continue
+            try:
+                duration_s = float(duration_s)
+            except (TypeError, ValueError):
+                logger.error(
+                    "[injector] injections[%d] invalid duration_s %r; skipping",
+                    idx,
+                    duration_s,
+                )
+                continue
+        if inj_type == "sigkill" and respawn_within_s is not None:
+            try:
+                respawn_within_s = float(respawn_within_s)
+            except (TypeError, ValueError):
+                logger.error(
+                    "[injector] injections[%d] invalid respawn_within_s %r; skipping",
+                    idx,
+                    respawn_within_s,
+                )
+                continue
+        specs.append(
+            _InjectionSpec(
+                at_min=at_min,
+                type=inj_type,
+                target=target,
+                duration_s=duration_s,
+                respawn_within_s=respawn_within_s,
+            )
+        )
+    specs.sort(key=lambda s: s.at_min)
+    return specs
+
+
+def _resolve_injection_target(target: str, tracked: list[_TrackedWorker]) -> _TrackedWorker:
+    """Map a YAML target string to a tracked worker.
+
+    Args:
+        target: One of ``gen_worker_random``, ``ctx_worker_random``,
+            or ``{ctx|gen}_worker_<index>``.
+        tracked: Workers registered at cluster setup.
+
+    Returns:
+        The selected ``_TrackedWorker``.
+
+    Raises:
+        ValueError: If ``target`` is unknown or no worker matches.
+    """
+    if target == "gen_worker_random":
+        pool = [t for t in tracked if t.spec.role == "gen"]
+    elif target == "ctx_worker_random":
+        pool = [t for t in tracked if t.spec.role == "ctx"]
+    else:
+        match = _INJECTION_TARGET_RE.match(target)
+        if match is None:
+            raise ValueError(f"unsupported injection target {target!r}")
+        role, index = match.group(1), int(match.group(2))
+        pool = [t for t in tracked if t.spec.role == role and t.spec.index == index]
+    if not pool:
+        raise ValueError(f"no worker matches injection target {target!r}")
+    if target.endswith("_random"):
+        return random.choice(pool)
+    return pool[0]
+
+
+def _worker_process_pid(wrapper: Any) -> Optional[int]:
+    """Return the worker subprocess PID, or ``None`` if unavailable."""
+    if wrapper is None or wrapper.process is None:
+        return None
+    return wrapper.process.pid
+
+
+def _signal_process(pid: int, sig: signal.Signals, label: str) -> bool:
+    """Send ``sig`` to ``pid``; log and return False on failure."""
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        logger.warning("[injector] %s: process %d already gone", label, pid)
+        return False
+    except OSError as exc:
+        logger.warning("[injector] %s: os.kill(%d, %s) failed: %s", label, pid, sig.name, exc)
+        return False
+
+
+def _execute_sigstop_pause(
+    wrapper: Any,
+    duration_s: float,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> dict[str, Any]:
+    """SIGSTOP a worker for ``duration_s``, then SIGCONT.
+
+    Args:
+        wrapper: ``ProcessWrapper`` for the victim worker.
+        duration_s: Pause length in seconds.
+        should_stop: Optional predicate polled during the pause; when
+            it returns True the pause is cut short (and ``interrupted``
+            is recorded), but SIGCONT is still sent so the worker is
+            never left stopped.
+
+    Returns:
+        Event metadata dict for ``_injection_events``.
+    """
+    pid = _worker_process_pid(wrapper)
+    outcome: dict[str, Any] = {"type": "sigstop", "duration_s": duration_s, "pid": pid}
+    if pid is None:
+        outcome["skipped"] = "no_process"
+        return outcome
+    stopped = _signal_process(pid, signal.SIGSTOP, "SIGSTOP")
+    outcome["sigstop_sent"] = stopped
+    cont_sent = False
+    try:
+        if stopped and duration_s > 0:
+            deadline = time.monotonic() + duration_s
+            while time.monotonic() < deadline:
+                if should_stop is not None and should_stop():
+                    outcome["interrupted"] = True
+                    break
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    finally:
+        if stopped:
+            cont_sent = _signal_process(pid, signal.SIGCONT, "SIGCONT")
+    outcome["sigcont_sent"] = cont_sent
+    return outcome
+
+
+def _execute_sigkill(wrapper: Any) -> dict[str, Any]:
+    """SIGKILL the worker subprocess.
+
+    Returns:
+        Event metadata dict for ``_injection_events``.
+    """
+    pid = _worker_process_pid(wrapper)
+    outcome: dict[str, Any] = {"type": "sigkill", "pid": pid}
+    if pid is None:
+        outcome["skipped"] = "no_process"
+        return outcome
+    outcome["sigkill_sent"] = _signal_process(pid, signal.SIGKILL, "SIGKILL")
+    if wrapper.process is not None:
+        try:
+            wrapper.process.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            logger.warning("[injector] SIGKILL: pid %d did not exit within 10s", pid)
+    return outcome
+
+
+# ---------------------------------------------------------------------------
+# Metrics-thread helpers
+# ---------------------------------------------------------------------------
+
+
+# Tolerates optional ``{labels}`` and trailing timestamp; captures value in group 1.
+_KV_CACHE_UTIL_RE = re.compile(
+    r"^trtllm_kv_cache_utilization(?:\{[^}]*\})?\s+([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+)
+
+
+def _parse_kv_cache_utilization(metrics_text: str) -> Optional[float]:
+    """Extract ``trtllm_kv_cache_utilization`` from a Prometheus exposition.
+
+    Skips ``# HELP`` / ``# TYPE`` lines. Returns the first matching
+    sample's value as a float, or ``None`` if no sample is present.
+
+    Args:
+        metrics_text: Body of an HTTP response from
+            ``/prometheus/metrics``.
+
+    Returns:
+        Float utilization in the range the worker exposes (typically
+        ``[0.0, 1.0]``), or ``None`` if the metric is absent.
+    """
+    for line in metrics_text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = _KV_CACHE_UTIL_RE.match(line)
+        if m is not None:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _fetch_kv_cache_utilization(
+    host: str, port: int, timeout_s: float
+) -> tuple[Optional[float], Optional[str]]:
+    """HTTP GET ``/prometheus/metrics`` and parse the KV-cache utilization.
+
+    All failures (connection refused, timeout, HTTP error, parse miss)
+    are folded into ``(None, error_string)`` rather than raising. The
+    metrics thread must not fail-fast on transient scrape misses — the
+    worker may be mid-restart, the metrics endpoint may not be wired
+    up on every backend, etc.
+
+    Args:
+        host: Worker hostname or IP.
+        port: Worker HTTP port.
+        timeout_s: Per-request timeout in seconds.
+
+    Returns:
+        Tuple ``(utilization, error)``. Exactly one is ``None``: on
+        success ``utilization`` is the gauge value and ``error`` is
+        ``None``; on failure ``utilization`` is ``None`` and ``error``
+        is a short string explaining why (for the timeseries record).
+    """
+    url = f"http://{host}:{port}/prometheus/metrics"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        return None, f"url_error: {exc.reason}"
+    except (TimeoutError, OSError) as exc:
+        return None, f"io_error: {exc}"
+    util = _parse_kv_cache_utilization(body)
+    if util is None:
+        return None, "metric_absent"
+    return util, None
+
+
+# ---------------------------------------------------------------------------
+# Canary helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_canary_prompts(path: Path) -> list[dict[str, Any]]:
+    """Load and validate the canary prompts JSON.
+
+    Schema (Step 6 reference generator):
+        {"prompts": [{"prompt": str,
+                      "reference_token_ids": [int, ...]?,
+                      "reference_text": str?}, ...]}
+
+    Strict validation here keeps a malformed reference from raising
+    `TypeError` inside the daemon canary thread (which would
+    silently freeze `_canary_records`).
+
+    Raises:
+        OSError: If the file cannot be opened.
+        ValueError: On malformed JSON, top-level not a mapping,
+            missing/non-list `prompts`, entry without a string
+            `prompt`, or `reference_token_ids` present but not a
+            list of ints.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        try:
+            doc = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"canary prompts file {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or "prompts" not in doc:
+        raise ValueError(f"canary prompts file {path} must be an object with a 'prompts' list")
+    prompts = doc["prompts"]
+    if not isinstance(prompts, list):
+        raise ValueError(f"canary prompts file {path}: 'prompts' must be a list")
+    for i, entry in enumerate(prompts):
+        if not isinstance(entry, dict) or not isinstance(entry.get("prompt"), str):
+            raise ValueError(
+                f"canary prompts file {path}: prompts[{i}] must be an object with a string 'prompt'"
+            )
+        ref = entry.get("reference_token_ids")
+        if ref is not None and (
+            not isinstance(ref, list) or not all(isinstance(t, int) for t in ref)
+        ):
+            raise ValueError(
+                f"canary prompts file {path}: prompts[{i}].reference_token_ids "
+                "must be a list of ints (or omitted)"
+            )
+    return prompts
+
+
+def _send_canary_request(
+    server_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    seed: int,
+    timeout_s: float,
+) -> tuple[Optional[list[int]], Optional[str], Optional[str]]:
+    """POST a greedy, deterministic completion to `/v1/completions`.
+
+    Requests `detokenize=False` so the response carries generated
+    `token_ids` on `choices[0]` (see
+    `CompletionResponseChoice.token_ids` in
+    `tensorrt_llm/serve/openai_protocol.py`); `temperature=0.0` and
+    a fixed `seed` request greedy determinism.
+
+    Returns:
+        `(token_ids, text, error)`. On success `error is None`. Any
+        failure — HTTP error, connection refused, timeout, malformed
+        body, or a 200 response that omits `token_ids` — folds into
+        a short `error` string so the canary thread records and
+        continues (only the log scanner is fail-fast).
+    """
+    url = f"{server_url.rstrip('/')}/v1/completions"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "seed": seed,
+        "stream": False,
+        "detokenize": False,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        # HTTPError subclasses URLError — catch it first.
+        return None, None, f"http_error: {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, None, f"url_error: {exc.reason}"
+    except (TimeoutError, OSError) as exc:
+        return None, None, f"io_error: {exc}"
+    try:
+        obj = json.loads(body)
+        choice = obj["choices"][0]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        return None, None, f"parse_error: {exc}"
+    token_ids = choice.get("token_ids") if isinstance(choice, dict) else None
+    text = choice.get("text") if isinstance(choice, dict) else None
+    if token_ids is None:
+        return None, text, "missing_token_ids"
+    return token_ids, text, None
+
+
+def _tokens_equivalent(returned: Optional[list[int]], reference: Optional[list[int]]) -> bool:
+    """True iff `returned` exactly matches `reference`; `None` on either side is non-equivalent."""
+    if returned is None or reference is None:
+        return False
+    return list(returned) == list(reference)
+
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
@@ -326,10 +724,12 @@ class DisaggCancellationStressHarness:
       wind down promptly.
 
     Thread-based composition (rather than asyncio) keeps the
-    subprocess-control injector, the file-tailing log scanner, and
-    the HTTP/Prometheus metrics scraper failure-isolated and debugged
-    independently. The load and canary threads each run their own
-    asyncio event loops internally for HTTP I/O.
+    subprocess-control injector, the file-tailing log scanner, the
+    HTTP/Prometheus metrics scraper, and the HTTP canary client
+    failure-isolated and debugged independently. The metrics and
+    canary threads use blocking `urllib` for their low-rate request
+    streams; the load thread runs its own asyncio event loop
+    internally (wrapping `run_cancel_stress_test`).
     """
 
     def __init__(
@@ -337,6 +737,11 @@ class DisaggCancellationStressHarness:
         yaml_path: Path,
         *,
         log_scanner_poll_interval_s: float = 0.5,
+        metrics_scrape_interval_s: float = 30.0,
+        metrics_scrape_timeout_s: float = 5.0,
+        injector_poll_interval_s: float = 1.0,
+        canary_request_timeout_s: float = 10.0,
+        canary_interval_s: Optional[float] = None,
     ) -> None:
         """Construct a marathon harness.
 
@@ -349,6 +754,25 @@ class DisaggCancellationStressHarness:
                 measurable load source on its own; tests pass a
                 smaller value (e.g. 0.02 s) to keep real-clock
                 latency bounded.
+            metrics_scrape_interval_s: Cadence (seconds) between
+                consecutive Prometheus scrapes of every worker.
+                Default 30 s matches the spec's KV-cache utilization
+                sampling rate; tests pass a smaller value.
+            metrics_scrape_timeout_s: Per-request HTTP timeout for
+                the metrics scrape. Short by design — a slow scrape
+                is recorded as a miss rather than blocking the
+                metrics thread past its next scheduled scrape.
+            injector_poll_interval_s: Poll cadence (seconds) for the
+                injector thread while waiting for the next scheduled
+                event. Tests pass a smaller value to keep wall-clock
+                latency bounded.
+            canary_request_timeout_s: Per-request HTTP timeout for
+                one canary completion; a slow/hung request becomes
+                an error rather than blocking the canary stream.
+            canary_interval_s: Optional override (seconds) for the
+                gap between requests. `None` derives from
+                `canary.rate_per_min` (`60 / rate_per_min`); tests
+                pass a small value.
 
         Raises:
             ValueError: If the YAML is malformed or its
@@ -364,16 +788,24 @@ class DisaggCancellationStressHarness:
         self._failure_reason: Optional[str] = None
         self._failure_lock = threading.Lock()
 
-        # Per-thread tunables. The default cadence is reactive enough
-        # for human-scale debugging (~0.5 s lag from log line to
-        # fail-fast) without becoming a measurable load source on its
-        # own; tests pass a smaller value via the constructor to keep
-        # real-clock latency bounded.
         self._log_scanner_poll_interval_s: float = log_scanner_poll_interval_s
+        self._metrics_scrape_interval_s: float = metrics_scrape_interval_s
+        self._metrics_scrape_timeout_s: float = metrics_scrape_timeout_s
+        self._injector_poll_interval_s: float = injector_poll_interval_s
+        self._canary_request_timeout_s: float = canary_request_timeout_s
+        self._canary_interval_s: Optional[float] = canary_interval_s
 
         # Cluster + worker tracking (populated by setup()).
         self._cluster: Any = None  # tuple returned by setup_disagg_cluster
         self._worker_specs: list[WorkerLaunchSpec] = []
+        self._tracked_workers: list[_TrackedWorker] = []
+        self._marathon_start_monotonic: float = 0.0
+
+        # Disagg-server front-end the canary targets; populated by
+        # setup() or bind_server_endpoint(). None until then — the
+        # canary thread warns and exits.
+        self._server_url: Optional[str] = None
+        self._model_name: Optional[str] = None
 
         # Thread handles (populated by start()).
         self._load_thread: Optional[threading.Thread] = None
@@ -402,6 +834,41 @@ class DisaggCancellationStressHarness:
         """
         logger.info("[harness] setup() — stub: cluster not actually launched")
 
+    def bind_tracked_workers(
+        self,
+        ctx_workers: list[Any],
+        gen_workers: list[Any],
+        ctx_specs: list[WorkerLaunchSpec],
+        gen_specs: list[WorkerLaunchSpec],
+    ) -> None:
+        """Register live ``ProcessWrapper`` handles for the injector thread.
+
+        Called by ``setup()`` once ``setup_disagg_cluster`` returns.
+        Shadow ``WorkerLaunchSpec`` entries must align 1:1 with the
+        wrapper lists (same ordering as ``setup_disagg_cluster``);
+        ``zip(..., strict=True)`` enforces this and raises ``ValueError``
+        on a length mismatch.
+        """
+        self._tracked_workers = [
+            _TrackedWorker(spec=spec, wrapper=wrapper)
+            for spec, wrapper in zip(ctx_specs, ctx_workers, strict=True)
+        ] + [
+            _TrackedWorker(spec=spec, wrapper=wrapper)
+            for spec, wrapper in zip(gen_specs, gen_workers, strict=True)
+        ]
+        self._worker_specs = list(ctx_specs) + list(gen_specs)
+
+    def bind_server_endpoint(self, server_url: str, model_name: str) -> None:
+        """Register the disagg server front-end for the canary client.
+
+        Called by `setup()` (or tests). Until called, the canary
+        thread warns and exits — the lifecycle smoke has no live
+        server. `model_name` goes in the OpenAI envelope only; the
+        disagg server routes regardless.
+        """
+        self._server_url = server_url
+        self._model_name = model_name
+
     def start(self) -> None:
         """Spawn the five worker threads. Returns immediately.
 
@@ -411,7 +878,8 @@ class DisaggCancellationStressHarness:
         stop()`` completes cleanly without waiting out the
         ``wait_until_done`` timeout.
         """
-        logger.info("[harness] start() — spawning 5 stub threads")
+        self._marathon_start_monotonic = time.monotonic()
+        logger.info("[harness] start() — spawning worker threads")
         self._load_thread = threading.Thread(
             target=self._load_thread_body, name="stress-load", daemon=True
         )
@@ -575,22 +1043,281 @@ class DisaggCancellationStressHarness:
         self.stop_event.set()
 
     def _canary_thread_body(self) -> None:
-        """Send greedy-decode canaries, check token-equivalence.
+        """Send greedy canaries and append per-request records to `_canary_records`.
 
-        Stub: no-op. Real implementation loads
-        ``stress_canary_prompts.json``, sends 5 reqs/min, asserts
-        token IDs match the recorded reference.
+        Each record: `{timestamp, elapsed_s, prompt_index, success,
+        token_equivalent, latency_s, error}`. `token_equivalent` is
+        True/False when a reference is recorded and the check is
+        enabled, else None. Failures are recorded — not fail-fast —
+        because errors during bursts/injections are expected; the
+        end-of-marathon gates (error rate, recovery time) are
+        computed from these records later.
+
+        Exits on `stop_event` or `failed_event`. The between-request
+        wait only observes `stop_event`, so `failed_event` is acted
+        on at the next request boundary (max lag = one interval);
+        the metrics thread has the same gap, a shared `wait_for_any`
+        helper is deferred to a follow-up PR. Warns and exits if the
+        server endpoint or prompts file is absent.
         """
-        logger.debug("[canary_thread] stub — exiting immediately")
+        canary_cfg = self.config.raw.get("canary") or {}
+        if not self._server_url:
+            logger.warning("[canary] no server endpoint bound (setup() not wired); exiting")
+            return
+        prompts_file = canary_cfg.get("prompts_file")
+        if not prompts_file:
+            logger.warning("[canary] no canary.prompts_file in config; exiting")
+            return
+        prompts_path = Path(prompts_file)
+        if not prompts_path.is_absolute():
+            prompts_path = self.yaml_path.parent / prompts_path
+        try:
+            prompts = _load_canary_prompts(prompts_path)
+        except (OSError, ValueError) as exc:
+            logger.warning("[canary] cannot load prompts %s: %s; exiting", prompts_path, exc)
+            return
+        if not prompts:
+            logger.warning("[canary] prompts file %s has no prompts; exiting", prompts_path)
+            return
+
+        if self._canary_interval_s is not None:
+            interval_s = self._canary_interval_s
+        else:
+            rate_per_min = float(canary_cfg.get("rate_per_min") or 0)
+            if rate_per_min <= 0:
+                logger.warning(
+                    "[canary] canary.rate_per_min is missing/zero/negative; defaulting to 5/min"
+                )
+                rate_per_min = 5.0
+            interval_s = 60.0 / rate_per_min
+        max_tokens = int(canary_cfg.get("max_tokens", 128))
+        seed = int(canary_cfg.get("seed", 42))
+        check_token_equiv = bool(canary_cfg.get("check_token_equivalent", True))
+        model = self._model_name or "canary"
+
+        logger.info(
+            "[canary] interval %.2fs over %d prompt(s) to %s",
+            interval_s,
+            len(prompts),
+            self._server_url,
+        )
+
+        idx = 0
+        while not self.stop_event.is_set() and not self.failed_event.is_set():
+            send_start = time.monotonic()
+            prompt_index = idx % len(prompts)
+            entry = prompts[prompt_index]
+            idx += 1
+            reference = entry.get("reference_token_ids")
+            token_ids, _, err = _send_canary_request(
+                self._server_url,
+                model,
+                entry["prompt"],
+                max_tokens,
+                seed,
+                self._canary_request_timeout_s,
+            )
+            success = err is None
+            token_equivalent: Optional[bool] = None
+            if success and check_token_equiv and reference is not None:
+                token_equivalent = _tokens_equivalent(token_ids, reference)
+            self._canary_records.append(
+                {
+                    "timestamp": time.time(),
+                    "elapsed_s": time.monotonic() - self._marathon_start_monotonic,
+                    "prompt_index": prompt_index,
+                    "success": success,
+                    "token_equivalent": token_equivalent,
+                    "latency_s": time.monotonic() - send_start,
+                    "error": err,
+                }
+            )
+            remaining = interval_s - (time.monotonic() - send_start)
+            if remaining > 0.0:
+                self.stop_event.wait(timeout=remaining)
+
+        logger.debug("[canary] exiting; %d record(s)", len(self._canary_records))
 
     def _injector_thread_body(self) -> None:
         """Fire SIGSTOP / SIGCONT / SIGKILL+respawn on the configured schedule.
 
-        Stub: no-op. Real implementation reads ``injections:`` schedule
-        from config and uses ``os.kill`` + ``_run_worker`` to act on
-        the shadow-tracked ``self._worker_specs``.
+        Reads ``injections:`` from ``stress_config``, waits until each
+        ``at_min`` offset from marathon start, then acts on
+        ``self._tracked_workers`` via ``os.kill``. SIGKILL entries
+        optionally relaunch the worker via ``disagg_test_utils._run_worker``
+        and fail-fast if ``/health`` does not return 200 within
+        ``respawn_within_s``.
         """
-        logger.debug("[injector_thread] stub — exiting immediately")
+        schedule = _parse_injection_schedule(self.config.raw.get("injections") or [])
+        if not schedule:
+            logger.warning("[injector] no injections in stress_config; exiting immediately")
+            return
+        if not self._tracked_workers:
+            logger.warning(
+                "[injector] no tracked workers (setup() did not register any); "
+                "exiting without running the injection schedule"
+            )
+            return
+
+        pending = list(schedule)
+        logger.info(
+            "[injector] armed with %d injection(s) across %d tracked worker(s)",
+            len(pending),
+            len(self._tracked_workers),
+        )
+
+        try:
+            while pending and not self.stop_event.is_set() and not self.failed_event.is_set():
+                elapsed_s = time.monotonic() - self._marathon_start_monotonic
+                next_inj = pending[0]
+                fire_at_s = next_inj.at_min * 60.0
+                if elapsed_s < fire_at_s:
+                    wait_s = min(self._injector_poll_interval_s, fire_at_s - elapsed_s)
+                    self.stop_event.wait(timeout=wait_s)
+                    continue
+
+                pending.pop(0)
+                try:
+                    tracked = _resolve_injection_target(next_inj.target, self._tracked_workers)
+                except ValueError as exc:
+                    logger.error(
+                        "[injector] skipping injection at T+%.1f min: %s",
+                        next_inj.at_min,
+                        exc,
+                    )
+                    self._record_injection_event(
+                        {
+                            "at_min": next_inj.at_min,
+                            "target": next_inj.target,
+                            "skipped": str(exc),
+                        }
+                    )
+                    continue
+
+                role_idx = f"{tracked.spec.role}_{tracked.spec.index}"
+                logger.info(
+                    "[injector] T+%.1f min: %s on %s (pid=%s)",
+                    next_inj.at_min,
+                    next_inj.type,
+                    role_idx,
+                    _worker_process_pid(tracked.wrapper),
+                )
+                event: dict[str, Any] = {
+                    "at_min": next_inj.at_min,
+                    "elapsed_s": elapsed_s,
+                    "target": next_inj.target,
+                    "role": tracked.spec.role,
+                    "index": tracked.spec.index,
+                }
+                if next_inj.type == "sigstop":
+                    event.update(
+                        _execute_sigstop_pause(
+                            tracked.wrapper,
+                            next_inj.duration_s or 0.0,
+                            should_stop=lambda: self.stop_event.is_set()
+                            or self.failed_event.is_set(),
+                        )
+                    )
+                elif next_inj.type == "sigkill":
+                    event.update(_execute_sigkill(tracked.wrapper))
+                    if next_inj.respawn_within_s is not None:
+                        respawned = self._respawn_tracked_worker(
+                            tracked, timeout_s=next_inj.respawn_within_s
+                        )
+                        event["respawned"] = respawned
+                        event["respawn_within_s"] = next_inj.respawn_within_s
+                        if not respawned:
+                            self.mark_failed(
+                                f"injector: {role_idx} did not become healthy within "
+                                f"{next_inj.respawn_within_s}s after SIGKILL"
+                            )
+                self._record_injection_event(event)
+        finally:
+            logger.debug("[injector] exiting; %d injection(s) remaining", len(pending))
+
+    def _record_injection_event(self, event: dict[str, Any]) -> None:
+        """Append one injector observation (thread-safe for single writer)."""
+        self._injection_events.append(event)
+
+    def _respawn_tracked_worker(self, tracked: _TrackedWorker, *, timeout_s: float) -> bool:
+        """Relaunch a SIGKILLed worker and wait for ``/health``.
+
+        Uses the shadow ``WorkerLaunchSpec`` recorded at setup time so
+        shared ``ProcessWrapper`` infrastructure stays unchanged.
+
+        Args:
+            tracked: Worker to relaunch.
+            timeout_s: Maximum seconds to wait for HTTP 200 on ``/health``.
+
+        Returns:
+            True if the respawned worker reports healthy within the
+            deadline; False otherwise.
+        """
+        from disagg_test_utils import _run_worker, get_free_port
+
+        spec = tracked.spec
+        old = tracked.wrapper
+
+        if old is not None and old.log_file is not None:
+            try:
+                old.log_file.close()
+            except OSError:
+                logger.debug("[injector] closing old log_file raised; ignoring")
+
+        role_key = "ctx" if spec.role == "ctx" else "gen"
+        save_log = spec.log_path is not None
+        new_port = get_free_port()
+        try:
+            new_wrapper = _run_worker(
+                spec.model_name,
+                spec.worker_config,
+                role_key,
+                port=new_port,
+                work_dir=spec.work_dir,
+                device=spec.device,
+                save_log=save_log,
+                env=spec.env,
+            )
+        except Exception:
+            logger.exception(
+                "[injector] failed to respawn %s_%d on port %d",
+                spec.role,
+                spec.index,
+                new_port,
+            )
+            return False
+        tracked.wrapper = new_wrapper
+        spec.port = new_wrapper.port
+        if new_wrapper.log_path is not None:
+            spec.log_path = new_wrapper.log_path
+
+        logger.info(
+            "[injector] respawned %s_%d on port %s; waiting up to %.0fs for /health",
+            spec.role,
+            spec.index,
+            new_wrapper.port,
+            timeout_s,
+        )
+
+        return self._wait_for_worker_health(new_wrapper.port, timeout_s=timeout_s)
+
+    def _wait_for_worker_health(self, port: int, *, timeout_s: float) -> bool:
+        """Poll a worker's ``/health`` endpoint until healthy or timed out."""
+        import requests
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set() or self.failed_event.is_set():
+                return False
+            try:
+                request_timeout = min(5.0, max(0.1, deadline - time.monotonic()))
+                response = requests.get(f"http://localhost:{port}/health", timeout=request_timeout)
+                if response.status_code == 200:
+                    return True
+            except requests.RequestException:
+                logger.debug("[injector] worker %d /health not ready yet", port)
+            self.stop_event.wait(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+        return False
 
     def _log_scanner_thread_body(self) -> None:
         """Tail all worker logs; fail-fast on any hard-zero pattern hit.
@@ -658,13 +1385,59 @@ class DisaggCancellationStressHarness:
             logger.debug("[log_scanner] exiting; closed %d source(s)", len(sources))
 
     def _metrics_thread_body(self) -> None:
-        """Scrape ``/prometheus/metrics`` for KV-cache utilization at ~30 s cadence.
+        """Scrape Prometheus KV-cache utilization from every worker.
 
-        Stub: no-op. Real implementation parses
-        ``trtllm_kv_cache_utilization`` and appends timestamped
-        samples to ``self._kv_utilization_samples``.
+        Polls each ``WorkerLaunchSpec`` at
+        ``_metrics_scrape_interval_s`` cadence, parses
+        ``trtllm_kv_cache_utilization`` out of
+        ``/prometheus/metrics``, and appends a timestamped sample to
+        ``self._kv_utilization_samples``. Each sample records
+        ``timestamp``, ``role``, ``index``, ``host``, ``port``,
+        ``utilization`` (``float`` on success, ``None`` on scrape
+        miss), and ``error`` (``None`` on success, short string on
+        miss). Scrape misses are recorded — not fail-fast — because
+        the worker may be mid-restart from a SIGKILL injection, mid-
+        SIGSTOP pause, or the Prometheus endpoint may not be wired
+        for the active backend.
+
+        Exits when ``stop_event`` or ``failed_event`` is set. Honors
+        either signal between scrapes via ``stop_event.wait`` rather
+        than ``time.sleep`` to keep teardown latency bounded.
         """
-        logger.debug("[metrics_thread] stub — exiting immediately")
+        if not self._worker_specs:
+            logger.warning("[metrics_thread] no worker specs; exiting")
+            return
+
+        logger.info(
+            "[metrics_thread] scraping %d worker(s) every %.1fs",
+            len(self._worker_specs),
+            self._metrics_scrape_interval_s,
+        )
+
+        while not self.stop_event.is_set() and not self.failed_event.is_set():
+            scrape_start = time.monotonic()
+            for spec in self._worker_specs:
+                if self.stop_event.is_set() or self.failed_event.is_set():
+                    break
+                util, err = _fetch_kv_cache_utilization(
+                    spec.host, spec.port, self._metrics_scrape_timeout_s
+                )
+                self._kv_utilization_samples.append(
+                    {
+                        "timestamp": time.time(),
+                        "role": spec.role,
+                        "index": spec.index,
+                        "host": spec.host,
+                        "port": spec.port,
+                        "utilization": util,
+                        "error": err,
+                    }
+                )
+            remaining = self._metrics_scrape_interval_s - (time.monotonic() - scrape_start)
+            if remaining > 0.0:
+                self.stop_event.wait(timeout=remaining)
+
+        logger.debug("[metrics_thread] exiting; %d sample(s)", len(self._kv_utilization_samples))
 
     # ------------------------------------------------------------------
     # Internal helpers
