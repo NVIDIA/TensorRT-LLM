@@ -142,8 +142,8 @@ def add_multimodal_args(parser):
         type=str,
         default=None,
         help="Override the automatically selected input processor. "
-        "Must be a registered model_type string (e.g. 'mistral3_common' for the "
-        "native Mistral VLM processor). None (default) selects automatically.")
+        "Must be a registered model_type. None (default) selects automatically."
+    )
     return parser
 
 
