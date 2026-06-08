@@ -784,8 +784,7 @@ def test_kv_cache_aware_server_state_remove_blocks_silent_on_missing():
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_backfill_stashes_flat_list_at_routing(
-        servers):
+async def test_kv_cache_aware_router_tracks_routed_blocks_at_routing(servers):
     tokens_per_block = 4
     token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -793,25 +792,25 @@ async def test_kv_cache_aware_router_backfill_stashes_flat_list_at_routing(
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=tokens_per_block,
-                                backfill_block_hashes_on_finish=True)
+                                track_routed_blocks=True)
 
     request = CompletionRequest(model="TinyLlama",
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
 
-    assert id(request) in router._inflight_backfill_hashes
-    stashed, stashed_algo = router._inflight_backfill_hashes[id(request)]
+    assert id(request) in router._pending_routed_blocks
+    stashed, stashed_algo = router._pending_routed_blocks[id(request)]
     expected_flat = [h for hl in info["block_hashes"] for h in hl]
     assert stashed == expected_flat
     assert stashed and not isinstance(stashed[0], list)
     assert stashed_algo == info["hash_algo"]
 
     await router.finish_request(request)
-    assert id(request) not in router._inflight_backfill_hashes
+    assert id(request) not in router._pending_routed_blocks
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_backfill_inserts_blocks_on_finish(servers):
+async def test_kv_cache_aware_router_inserts_routed_blocks_on_finish(servers):
     tokens_per_block = 4
     token_lists = [[2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -819,7 +818,7 @@ async def test_kv_cache_aware_router_backfill_inserts_blocks_on_finish(servers):
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=tokens_per_block,
-                                backfill_block_hashes_on_finish=True)
+                                track_routed_blocks=True)
 
     request = CompletionRequest(model="TinyLlama",
                                 prompt=copy.deepcopy(token_lists))
@@ -839,20 +838,22 @@ async def test_kv_cache_aware_router_backfill_inserts_blocks_on_finish(servers):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_backfill_disabled_skips_pending(servers):
+async def test_kv_cache_aware_router_routed_blocks_disabled_skips_pending(
+        servers):
     tokens_per_block = 4
     token_lists = [[3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008]]
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 use_tokens=False,
                                 max_batch_size=32,
-                                tokens_per_block=tokens_per_block)
+                                tokens_per_block=tokens_per_block,
+                                track_routed_blocks=False)
 
     request = CompletionRequest(model="TinyLlama",
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
 
-    assert router._inflight_backfill_hashes == {}
+    assert router._pending_routed_blocks == {}
 
     await router.finish_request(request)
 
@@ -861,7 +862,7 @@ async def test_kv_cache_aware_router_backfill_disabled_skips_pending(servers):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_backfill_drops_on_failure(servers):
+async def test_kv_cache_aware_router_drops_routed_blocks_on_failure(servers):
     tokens_per_block = 4
     token_lists = [[4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -869,16 +870,16 @@ async def test_kv_cache_aware_router_backfill_drops_on_failure(servers):
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=tokens_per_block,
-                                backfill_block_hashes_on_finish=True)
+                                track_routed_blocks=True)
 
     request = CompletionRequest(model="TinyLlama",
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
-    assert id(request) in router._inflight_backfill_hashes
+    assert id(request) in router._pending_routed_blocks
 
     await router.finish_request(request, success=False)
 
-    assert id(request) not in router._inflight_backfill_hashes
+    assert id(request) not in router._pending_routed_blocks
     assert await router._server_state[server].matched_tokens(
         info["block_hashes"], hash_algo=info["hash_algo"]) == 0
 
@@ -1094,7 +1095,8 @@ async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
                                 servers=servers,
                                 use_tokens=False,
                                 max_batch_size=32,
-                                tokens_per_block=32)
+                                tokens_per_block=32,
+                                track_routed_blocks=False)
     results = [await router.get_next_server(req) for req in requests]
     assigned_servers, infos = zip(*results)
     # Initial routing (empty caches): all 3 should get distinct servers
