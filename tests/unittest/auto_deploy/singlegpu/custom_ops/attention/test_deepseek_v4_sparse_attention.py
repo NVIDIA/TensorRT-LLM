@@ -22,10 +22,15 @@ import torch
 from auto_deploy._utils_test._model_test_utils import assert_rmse_close
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.export import Dim
+from torch.fx import Graph
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (  # noqa: E402
     deepseek_v4_sparse_attention as dsv4_sparse,
+)
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention import (  # noqa: E402
+    DeepSeekV4SparseAttention,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm  # noqa: E402
@@ -2072,6 +2077,36 @@ class _TinyDenseAttentionModule(torch.nn.Module):
             None,
             "bsnd",
         )
+
+
+def test_deepseek_sparse_cache_initializers_use_schema_names_for_source_args() -> None:
+    graph = Graph()
+    q_node = graph.placeholder("q")
+    kv_node = graph.placeholder("kv")
+    compressor_kv_node = graph.placeholder("compressor_kv")
+    indexer_compressor_kv_node = graph.placeholder("indexer_compressor_kv")
+
+    kv_node.meta["val"] = torch.empty(1, 2, 4, dtype=torch.float16)
+    compressor_kv_node.meta["val"] = torch.empty(1, 2, 8, dtype=torch.float32)
+    indexer_compressor_kv_node.meta["val"] = torch.empty(1, 2, 3, dtype=torch.float32)
+
+    source_node = graph.call_function(
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default,
+        args=(q_node,),
+        kwargs={
+            "kv": kv_node,
+            "compressor_kv": compressor_kv_node,
+            "indexer_compressor_kv": indexer_compressor_kv_node,
+        },
+    )
+
+    handlers = DeepSeekV4SparseAttention.get_cache_initializers(source_node, KvCacheConfig())
+
+    assert DeepSeekV4SparseAttention.get_num_qkv_args() == len(dsv4_sparse._SOURCE_TENSOR_ARG_NAMES)
+    assert handlers["swa_cache"].token_shape == (4,)
+    assert handlers["swa_cache"].dtype == torch.float16
+    assert handlers["compressor_kv_cache"].token_shape == (8,)
+    assert handlers["indexer_compressor_kv_cache"].token_shape == (3,)
 
 
 @pytest.mark.parametrize("compress_ratio", [0, 4, 128])

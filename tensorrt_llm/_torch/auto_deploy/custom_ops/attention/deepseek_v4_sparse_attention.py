@@ -15,7 +15,7 @@
 
 """DeepSeek V4 sparse attention source and cached reference ops."""
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -47,7 +47,62 @@ __all__ = [
 
 _SPARSE_ATTENTION_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
 _SPARSE_ATTENTION_MAX_CHUNK_TOKENS = 64
-_SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
+_COMPRESS_RATIO_DISABLED = 0
+_COMPRESS_RATIO_OVERLAP_INDEXER = 4
+_COMPRESS_RATIO_DENSE = 128
+
+
+class _CompressionMode(NamedTuple):
+    ratio: int
+    enabled: bool
+    overlap: bool
+    uses_indexer: bool
+    channels: int
+
+
+_COMPRESSION_MODES = {
+    _COMPRESS_RATIO_DISABLED: _CompressionMode(
+        ratio=_COMPRESS_RATIO_DISABLED,
+        enabled=False,
+        overlap=False,
+        uses_indexer=False,
+        channels=1,
+    ),
+    _COMPRESS_RATIO_OVERLAP_INDEXER: _CompressionMode(
+        ratio=_COMPRESS_RATIO_OVERLAP_INDEXER,
+        enabled=True,
+        overlap=True,
+        uses_indexer=True,
+        channels=2,
+    ),
+    _COMPRESS_RATIO_DENSE: _CompressionMode(
+        ratio=_COMPRESS_RATIO_DENSE,
+        enabled=True,
+        overlap=False,
+        uses_indexer=False,
+        channels=1,
+    ),
+}
+_SUPPORTED_COMPRESS_RATIOS = tuple(_COMPRESSION_MODES)
+_SOURCE_TENSOR_ARG_NAMES = (
+    "q",
+    "kv",
+    "attn_sink",
+    "topk_idxs",
+    "compressor_kv",
+    "compressor_gate",
+    "compressor_ape",
+    "compressor_norm_weight",
+    "cos_table",
+    "sin_table",
+    "position_ids",
+    "indexer_q",
+    "indexer_weights",
+    "indexer_compressor_kv",
+    "indexer_compressor_gate",
+    "indexer_compressor_ape",
+    "indexer_compressor_norm_weight",
+)
 
 
 def _validate_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
@@ -55,12 +110,18 @@ def _validate_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
         raise ValueError(f"{name} must have rank {rank}, got rank {tensor.dim()}")
 
 
-def _validate_compress_ratio(compress_ratio: int) -> None:
-    if compress_ratio not in _SUPPORTED_COMPRESS_RATIOS:
+def _compression_mode(compress_ratio: int) -> _CompressionMode:
+    mode = _COMPRESSION_MODES.get(compress_ratio)
+    if mode is None:
         raise ValueError(
             "DeepSeek V4 cached sparse attention supports "
             f"compress_ratio in {_SUPPORTED_COMPRESS_RATIOS}, got {compress_ratio}"
         )
+    return mode
+
+
+def _validate_compress_ratio(compress_ratio: int) -> None:
+    _compression_mode(compress_ratio)
 
 
 def _validate_deepseek_v4_sparse_attention_inputs(
@@ -189,7 +250,8 @@ def _build_full_compressed_kv(
     max_compressed_len: int,
     rotate: bool = False,
 ) -> torch.Tensor:
-    if compress_ratio == 0:
+    mode = _compression_mode(compress_ratio)
+    if not mode.enabled:
         return compressor_kv.new_empty(compressor_kv.shape[0], 0, compressor_kv.shape[-1])
 
     _validate_rank("compressor_kv", compressor_kv, 3)
@@ -208,11 +270,9 @@ def _build_full_compressed_kv(
         raise ValueError(f"max_compressed_len must be positive, got {max_compressed_len}")
 
     batch_size, seq_len, state_dim = compressor_kv.shape
-    overlap = compress_ratio == 4
-    channels = 2 if overlap else 1
-    if state_dim % channels != 0:
-        raise ValueError(f"compressor state dim {state_dim} is not divisible by {channels}")
-    head_dim = state_dim // channels
+    if state_dim % mode.channels != 0:
+        raise ValueError(f"compressor state dim {state_dim} is not divisible by {mode.channels}")
+    head_dim = state_dim // mode.channels
     max_compressed_tokens = max_compressed_len * compress_ratio
     if seq_len > max_compressed_tokens:
         raise ValueError(f"seq_len {seq_len} exceeds compressed capacity {max_compressed_tokens}")
@@ -236,7 +296,7 @@ def _build_full_compressed_kv(
         gate,
         gate.new_full((), -1.0e20),
     )
-    if overlap:
+    if mode.overlap:
         kv = _overlap_transform_projected(kv, head_dim, 0.0)
         gate = _overlap_transform_projected(gate, head_dim, -1.0e20)
 
@@ -461,7 +521,8 @@ def _compressed_row_from_unpaged_state(
     anchor = row_idx * compress_ratio
     kv_rows = []
     gate_rows = []
-    if compress_ratio == 4:
+    mode = _compression_mode(compress_ratio)
+    if mode.overlap:
         for offset in range(compress_ratio):
             position = anchor - compress_ratio + offset
             if position < 0:
@@ -532,7 +593,8 @@ def _update_compressed_unpaged_caches(
     compress_ratio: int,
     max_compressed_len: int,
 ) -> None:
-    if compress_ratio == 0 or compressor_kv_seq.numel() == 0:
+    mode = _compression_mode(compress_ratio)
+    if not mode.enabled or compressor_kv_seq.numel() == 0:
         return
 
     if compressor_kv_seq.shape != compressor_gate_seq.shape:
@@ -541,7 +603,7 @@ def _update_compressed_unpaged_caches(
             f"got {tuple(compressor_kv_seq.shape)} and {tuple(compressor_gate_seq.shape)}"
         )
     state_dim = int(compressor_kv_seq.shape[-1])
-    head_dim = state_dim // (2 if compress_ratio == 4 else 1)
+    head_dim = state_dim // mode.channels
     _write_swa_cache(compressor_kv_seq, compressor_kv_cache, slot_idx, input_pos)
     _write_swa_cache(compressor_gate_seq, compressor_gate_cache, slot_idx, input_pos)
 
@@ -698,7 +760,8 @@ def _cached_compressed_attention(
             q_seq.dtype,
         )
         local_idxs = torch.arange(local_kv.shape[0], dtype=torch.int64, device=q_seq.device)
-        if compress_ratio == 4:
+        mode = _compression_mode(compress_ratio)
+        if mode.uses_indexer:
             if (
                 topk_seq is None
                 or indexer_q_seq is None
@@ -711,7 +774,9 @@ def _cached_compressed_attention(
                 or sin_table is None
                 or rope_dim is None
             ):
-                raise ValueError("Ratio-4 cached decode requires indexer tensors and caches.")
+                raise ValueError(
+                    "Overlap/indexer cached decode requires indexer tensors and caches."
+                )
             index_topk = max(int(topk_seq.shape[-1]) - int(window_size), 0)
             selected_rows = _select_ratio4_indexer_rows(
                 indexer_q_seq[token_offset],
@@ -910,7 +975,8 @@ def _batched_compressed_rows_from_unpaged_state(
     anchor = row_idx.to(torch.long) * compress_ratio
     max_pos = compressor_kv_cache.shape[1] - 1
 
-    if compress_ratio == 4:
+    mode = _compression_mode(compress_ratio)
+    if mode.overlap:
         previous_positions = anchor.unsqueeze(1) - compress_ratio + offsets.view(1, -1)
         current_positions = anchor.unsqueeze(1) + offsets.view(1, -1)
         previous_valid = previous_positions >= 0
@@ -982,11 +1048,12 @@ def _update_decode_compressed_caches(
     compress_ratio: int,
     max_compressed_len: int,
 ) -> None:
-    if compress_ratio == 0 or compressor_kv_decode.numel() == 0:
+    mode = _compression_mode(compress_ratio)
+    if not mode.enabled or compressor_kv_decode.numel() == 0:
         return
 
     state_dim = int(compressor_kv_decode.shape[-1])
-    head_dim = state_dim // (2 if compress_ratio == 4 else 1)
+    head_dim = state_dim // mode.channels
     _write_decode_cache_rows(compressor_kv_cache, compressor_kv_decode, slot_idx, input_pos)
     _write_decode_cache_rows(compressor_gate_cache, compressor_gate_decode, slot_idx, input_pos)
 
@@ -1112,7 +1179,8 @@ def _decode_compressed_cache_attention(
         window_size,
         q_decode.dtype,
     )
-    if compress_ratio == 4:
+    mode = _compression_mode(compress_ratio)
+    if mode.uses_indexer:
         index_topk = max(int(topk_decode.shape[-1]) - int(window_size), 0)
         selected_rows, compressed_valid = _select_decode_ratio4_indexer_rows(
             indexer_q_decode,
@@ -1228,7 +1296,8 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             compress_ratio,
             max_compressed_len,
         )
-        if compress_ratio == 4:
+        mode = _compression_mode(compress_ratio)
+        if mode.uses_indexer:
             indexer_compressor_kv_decode = _flatten_decode_tokens(indexer_compressor_kv, num_decode)
             indexer_compressor_gate_decode = _flatten_decode_tokens(
                 indexer_compressor_gate, num_decode
@@ -1729,7 +1798,8 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 compress_ratio,
                 compressed_capacity,
             )
-            if compress_ratio == 4:
+            mode = _compression_mode(compress_ratio)
+            if mode.uses_indexer:
                 _update_raw_unpaged_caches(
                     indexer_compressor_kv_seq,
                     indexer_compressor_gate_seq,
@@ -1945,7 +2015,7 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
 
     @classmethod
     def get_num_qkv_args(cls) -> int:
-        return 17
+        return len(_SOURCE_TENSOR_ARG_NAMES)
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
@@ -1963,13 +2033,19 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
-        kv_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+        kv_node, compressor_kv_node, indexer_compressor_kv_node = extract_op_args(
+            source_attn_node,
+            "kv",
+            "compressor_kv",
+            "indexer_compressor_kv",
+        )
+        kv_fake: FakeTensor = kv_node.meta["val"]
         head_dim = int(kv_fake.shape[-1])
-        compressor_kv_fake: FakeTensor = source_attn_node.args[4].meta["val"]
+        compressor_kv_fake: FakeTensor = compressor_kv_node.meta["val"]
         compressor_state_dim = int(compressor_kv_fake.shape[-1])
         if compressor_state_dim <= 0:
             compressor_state_dim = head_dim
-        indexer_compressor_kv_fake: FakeTensor = source_attn_node.args[13].meta["val"]
+        indexer_compressor_kv_fake: FakeTensor = indexer_compressor_kv_node.meta["val"]
         indexer_compressor_state_dim = int(indexer_compressor_kv_fake.shape[-1])
         dtype = cls.resolve_cache_dtype(cache_config.dtype, kv_fake.dtype)
         return {
@@ -2024,11 +2100,13 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
                 "DeepSeek V4 sparse attention source node must carry a literal "
                 f"int compress_ratio, got {compress_ratio!r}."
             )
-        if compress_ratio not in _SUPPORTED_COMPRESS_RATIOS:
+        try:
+            _compression_mode(compress_ratio)
+        except ValueError as exc:
             raise RuntimeError(
                 "DeepSeek V4 sparse attention cache insertion supports "
                 f"compress_ratio in {_SUPPORTED_COMPRESS_RATIOS}, got {compress_ratio}."
-            )
+            ) from exc
         if max_compressed_len is not None and not isinstance(max_compressed_len, int):
             raise RuntimeError(
                 "DeepSeek V4 sparse attention source node must carry a literal "
