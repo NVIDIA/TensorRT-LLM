@@ -1034,6 +1034,16 @@ bool cascade_eligible(KernelParamsType const& params)
     {
         return false;
     }
+    // Reject when sliding window or chunked attention is active: the cascade
+    // kernel assumes the full past KV is accessible linearly.
+    if (params.timestep >= params.cyclic_attention_window_size)
+    {
+        return false;
+    }
+    if (params.timestep >= params.chunked_attention_size)
+    {
+        return false;
+    }
     if (params.int8_kv_cache || params.fp8_kv_cache)
     {
         return false;
