@@ -89,7 +89,7 @@ class OpenAIClient(ABC):
         """Finish the request in the router.
 
         ``success`` lets the router distinguish completed vs failed requests
-        (e.g. for cache backfill).
+        (e.g. for routed-block tracking).
         """
         ...
 

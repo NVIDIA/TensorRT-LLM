@@ -28,9 +28,9 @@ generation_servers:
   pipeline_parallel_size: 1
   router:
     type: kv_cache_aware
-    # disagg-gen path doesn't emit kv_cache_events; backfill router-side state from
+    # disagg-gen path doesn't emit kv_cache_events; track router-side state from
     # successfully-routed requests so conditional_disagg can actually trigger.
-    backfill_block_hashes_on_finish: true
+    track_routed_blocks: true
   kv_cache_config:
     enable_block_reuse: true
     enable_partial_reuse: true

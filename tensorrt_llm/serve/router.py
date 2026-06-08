@@ -51,6 +51,12 @@ truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
 BlockHash = Union[int, str]
 
+# Max number of conversations whose home-server pin is retained (LRU).
+ROUTE_AFFINITY_CACHE_SIZE = 50000
+# Leading token-id count folded into the affinity key so pre-tokenized
+# requests (placeholder message content) still key per conversation.
+ROUTE_AFFINITY_TOKEN_PREFIX = 256
+
 
 def get_request_num_tokens(request: OpenAIRequest) -> int:
     if request.disaggregated_params is None or request.disaggregated_params.request_type == "context_only":
@@ -797,16 +803,19 @@ class BlockHashMixin:
     """
 
     def _init_block_hashing(self,
-                            tokens_per_block: int = 32,
+                            tokens_per_block: Optional[int] = None,
                             custom_tokenizer: Optional[str] = None):
         env_tokens_per_block = os.environ.get(
             "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
             tokens_per_block = int(env_tokens_per_block)
-        self._tokens_per_block = tokens_per_block
+        self._tpb_auto = tokens_per_block is None
+        self._tokens_per_block = 32 if tokens_per_block is None \
+            else tokens_per_block
         self._tokenizers: dict = {}
         self._custom_tokenizer = custom_tokenizer
         logger.info(f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
+                    f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
                     f", custom_tokenizer={self._custom_tokenizer}")
 
     def _get_tokenizer(self, model: str):
@@ -995,9 +1004,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
                  max_batch_size: int = 64,
-                 tokens_per_block: int = 32,
+                 tokens_per_block: Optional[int] = None,
                  custom_tokenizer: Optional[str] = None,
-                 backfill_block_hashes_on_finish: bool = False,
+                 track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
                  **kwargs):
@@ -1009,11 +1018,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._max_batch_size = max_batch_size
         self._load_weight = load_weight
         self._load_cap = load_cap
-        # Opt-in workaround for the disagg-gen path that doesn't emit
-        # kv_cache_events. Stash hashes at routing, inject on finish.
-        self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish
-        self._inflight_backfill_hashes: dict[int, tuple[list[BlockHash],
-                                                        str]] = {}
+        self._track_routed_blocks = track_routed_blocks
+        self._pending_routed_blocks: dict[int, tuple[list[BlockHash], str]] = {}
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
@@ -1025,19 +1031,20 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await state.cancel_poll_task()
         await super().close()
 
-    def _stash_backfill_on_route(self, request: OpenAIRequest,
-                                 block_hashes: list[list[BlockHash]],
-                                 hash_algo: str) -> None:
-        if not self._backfill_block_hashes_on_finish:
+    def _stash_routed_blocks_on_route(self, request: OpenAIRequest,
+                                      block_hashes: list[list[BlockHash]],
+                                      hash_algo: str) -> None:
+        if not self._track_routed_blocks:
             return
         flat = [h for hl in block_hashes for h in hl]
-        self._inflight_backfill_hashes[id(request)] = (flat, hash_algo)
+        self._pending_routed_blocks[id(request)] = (flat, hash_algo)
 
-    def _apply_backfill_on_finish(self, request: OpenAIRequest,
-                                  server: Optional[str], success: bool) -> None:
+    def _apply_routed_blocks_on_finish(self, request: OpenAIRequest,
+                                       server: Optional[str],
+                                       success: bool) -> None:
         # Pop unconditionally to avoid leaks; apply only when eligible.
-        entry = self._inflight_backfill_hashes.pop(id(request), None)
-        if not (self._backfill_block_hashes_on_finish and success):
+        entry = self._pending_routed_blocks.pop(id(request), None)
+        if not (self._track_routed_blocks and success):
             return
         if entry is None:
             return
@@ -1052,13 +1059,24 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # by update_with_events.
         return self._server_state[server].hash_algo
 
+    def _events_aligned(self, server: str) -> bool:
+        worker_tpb = self._server_info.get(server, {}).get("tokens_per_block")
+        return worker_tpb is None or worker_tpb == self._tokens_per_block
+
     async def _prepare_server(self, server: str):
         await super()._prepare_server(server)
         if server not in self._prepared_ready_servers:
             return
         info = self._server_info.get(server, {})
         worker_tpb = info.get("tokens_per_block")
-        if worker_tpb is not None and worker_tpb != self._tokens_per_block:
+        if worker_tpb is not None and getattr(self, "_tpb_auto", False):
+            if worker_tpb != self._tokens_per_block:
+                logger.info(
+                    "router tokens_per_block unset: adopting worker's %d on %s",
+                    worker_tpb, server)
+                self._tokens_per_block = worker_tpb
+            self._tpb_auto = False
+        elif worker_tpb is not None and worker_tpb != self._tokens_per_block:
             larger = max(worker_tpb, self._tokens_per_block)
             smaller = min(worker_tpb, self._tokens_per_block)
             if larger % smaller != 0:
@@ -1071,9 +1089,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 )
             logger.warning(
                 "tokens_per_block mismatch on %s: router=%d worker=%d. "
-                "KV events from worker will not align with router block hashes; "
-                "use backfill_block_hashes_on_finish=true for best hit rate.",
-                server, self._tokens_per_block, worker_tpb)
+                "KV events from worker cannot align with router block hashes; "
+                "skipping event polling and relying on routed-block tracking "
+                "for hit rate.", server, self._tokens_per_block, worker_tpb)
         worker_algo = info.get("kv_cache_hash_algo")
         known_algos = {
             KV_CACHE_HASH_ALGO_V1,
@@ -1094,6 +1112,21 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         else:
             # Persist once so per-request reads can skip the lock+await.
             self._server_state[server].set_hash_algo(worker_algo)
+
+    @staticmethod
+    def _content_affinity_key(request: OpenAIRequest) -> Optional[int]:
+        messages = getattr(request, "messages", None)
+        if not messages:
+            return None
+        parts = []
+        for message in messages[:2]:
+            content = (message.get("content") if isinstance(message, dict) else
+                       getattr(message, "content", ""))
+            parts.append(str(content))
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if token_ids:
+            parts.append(str(list(token_ids[:ROUTE_AFFINITY_TOKEN_PREFIX])))
+        return hash("".join(parts))
 
     async def get_next_server(
             self,
@@ -1150,16 +1183,38 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         ]
         if not candidate_idx:
             candidate_idx = list(range(len(servers)))
-        max_score = max(scores[i] for i in candidate_idx)
-        tied = [i for i in candidate_idx if scores[i] == max_score]
-        winner = tied[self._rr_counter % len(tied)]
+        # Conversation affinity: pin all turns of a conversation (keyed by a
+        # content-derived prefix hash, no conversation-id header) to the server
+        # it first landed on, so a worker eviction shrinking the match score
+        # cannot scatter the conversation off its warm home. New conversations
+        # (no pin yet) fall through to the score, which balances them by load.
+        affinity = getattr(self, "_route_affinity", None)
+        if affinity is None:
+            affinity = self._route_affinity = OrderedDict()
+        conv_key = self._content_affinity_key(request)
+        winner = None
+        if conv_key is not None:
+            pinned = affinity.get(conv_key)
+            if pinned in servers:
+                pinned_idx = servers.index(pinned)
+                if pinned_idx in candidate_idx:
+                    winner = pinned_idx
+        if winner is None:
+            max_score = max(scores[i] for i in candidate_idx)
+            tied = [i for i in candidate_idx if scores[i] == max_score]
+            winner = tied[self._rr_counter % len(tied)]
         self._rr_counter += 1
         server = servers[winner]
+        if conv_key is not None:
+            affinity[conv_key] = server
+            affinity.move_to_end(conv_key)
+            while len(affinity) > ROUTE_AFFINITY_CACHE_SIZE:
+                affinity.popitem(last=False)
         hash_algo = hash_algo_by_server[server]
         block_hashes = block_hashes_by_algo[hash_algo]
         async with self._lock:
             await self._register_request(server, request)
-            self._stash_backfill_on_route(request, block_hashes, hash_algo)
+            self._stash_routed_blocks_on_route(request, block_hashes, hash_algo)
         return server, {
             "block_hashes": block_hashes,  # list[list[int | str]]
             "hash_algo": hash_algo,
@@ -1176,8 +1231,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server = self._req_routing_table.pop(id(request), None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
-        self._apply_backfill_on_finish(request, server, success)
-        if server is not None and server in self._server_state:
+        self._apply_routed_blocks_on_finish(request, server, success)
+        if (server is not None and server in self._server_state
+                and self._events_aligned(server)):
             # Fire-and-forget; poll runs in background and coalesces per server.
             self._server_state[server].schedule_poll_and_update(session)
 
