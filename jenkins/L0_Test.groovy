@@ -4031,11 +4031,9 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
-        "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
-        "DGX_H100-2_GPUs-PyTorch-GptOss-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
+        "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-2_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -4128,8 +4126,10 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 2, 4],
-        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 2, 4],
+        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 4, 4],
+        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 4, 4],
+        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4", "l0_gb200_multi_gpus", 3, 4, 4],
+        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4", "l0_gb200_multi_gpus", 4, 4, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1],

@@ -11,7 +11,7 @@ import subprocess  # nosec B404
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Literal, Mapping, Optional, Sequence
+from typing import Any, Dict, Literal, Mapping, Optional, Sequence, Set
 
 import click
 import torch
@@ -23,7 +23,8 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.commands.utils import get_is_diffusion_model
+from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
+                                         get_is_diffusion_model)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -119,13 +120,15 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
-def is_non_default_or_required(param_name, value, backend):
+def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
     Returns True if parameter is either:
     1. Always required (core params that must be present), OR
-    2. Different from its default value in the backend's LlmArgs class
+    2. Set explicitly on the CLI (its name or one of its constructor
+       scalars is in `explicit_cli_keys`), OR
+    3. Different from its default value in the backend's LlmArgs class
     """
     always_include = {
         "model", "backend", "tokenizer", "custom_tokenizer",
@@ -137,6 +140,20 @@ def is_non_default_or_required(param_name, value, backend):
 
     if value is None:
         return False
+
+    if param_name in explicit_cli_keys:
+        return True
+
+    # LlmArgs fields built from CLI scalars whose names differ from the field
+    # name (e.g. `--free_gpu_memory_fraction` constructs `kv_cache_config`).
+    cli_derived_fields = {
+        "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
+        "build_config":
+        ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
+    }
+    if any(s in explicit_cli_keys
+           for s in cli_derived_fields.get(param_name, ())):
+        return True
 
     if backend == "tensorrt":
         llm_args_class = TrtLlmArgs
@@ -192,7 +209,10 @@ def get_llm_args(
         telemetry: bool = True,
         agent_percentage: float = 0.0,
         agent_types: Optional[str] = None,
+        explicit_cli_keys: Optional[Set[str]] = None,
         **llm_args_extra_dict: Any):
+
+    explicit_cli_keys = explicit_cli_keys or set()
 
     if gpus_per_node is None:
         gpus_per_node = device_count()
@@ -209,9 +229,6 @@ def get_llm_args(
             raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
                              f"Must be one of: {', '.join([t.name for t in CpType])}")
 
-    kv_cache_default_fraction = KvCacheConfig.model_fields[
-        'free_gpu_memory_fraction'].default
-
     cli_maybe_overrides = {
         "model":
         model,
@@ -225,8 +242,7 @@ def get_llm_args(
         tokenizer or model,
         "kv_cache_config":
         KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction,
-                      dtype=kv_cache_dtype) if free_gpu_memory_fraction
-        != kv_cache_default_fraction or kv_cache_dtype != "auto" else None,
+                      dtype=kv_cache_dtype),
         "cp_config":
         cp_config,
         "build_config":
@@ -291,10 +307,33 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend)
+        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict
+
+
+def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
+    """Construct llm_args from a disaggregated server config's `other_args`.
+
+    `other_args` is a single source — there is no separate CLI / YAML
+    distinction here. Every key is user-set, so we pass all keys as
+    `explicit_cli_keys` to `get_llm_args` to bypass the value-based filter
+    that would otherwise drop fields equal to their LlmArgs class defaults
+    (e.g. `tensor_parallel_size: 1`).
+
+    Do NOT pass `explicit_cli_keys` to `update_llm_args_with_extra_dict`:
+    `llm_args_extra_dict` here is just the catch-all for kwargs that didn't
+    match `get_llm_args`'s named signature (e.g. `quant_config`,
+    `lora_config`, `pytorch_backend_config`) — it isn't a separate YAML
+    being overridden. Passing the explicit set would trigger the merge
+    function's "drop YAML keys claimed by explicit CLI" filter and
+    silently lose those kwargs.
+    """
+    disagg_explicit_keys = set(other_args)
+    llm_args, llm_args_extra_dict = get_llm_args(
+        **other_args, explicit_cli_keys=disagg_explicit_keys)
+    return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
 
 def launch_server(
@@ -717,9 +756,9 @@ class ChoiceWithAlias(click.Choice):
     type=str,
     default=None,
     help=help_info_with_stability_tag(
-        "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
-        "Can be specified as either --config or --extra_llm_api_options.",
-        "prototype"))
+        "Path to a YAML configuration file. Explicit CLI flags take precedence "
+        "over values in this file. Can be specified as either --config or "
+        "--extra_llm_api_options.", "prototype"))
 @click.option(
     "--reasoning_parser",
     type=click.Choice(["auto"] + list(ReasoningParserFactory.keys())),
@@ -933,6 +972,9 @@ def serve(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
 
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_llm_api_options", "config"))
+
     def _serve_llm():
         nonlocal server_role
         llm_args, _ = get_llm_args(
@@ -964,19 +1006,15 @@ def serve(
             video_pruning_rate=video_pruning_rate,
             telemetry=telemetry,
             agent_percentage=agent_percentage,
-            agent_types=agent_types)
+            agent_types=agent_types,
+            explicit_cli_keys=explicit_cli_keys)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
                 llm_args_extra_dict = yaml.safe_load(f)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
-
-        # CLI --no-telemetry always wins over YAML config
-        if not telemetry:
-            llm_args["telemetry_config"] = llm_args[
-                "telemetry_config"].model_copy(update={"disabled": True})
+        llm_args = update_llm_args_with_extra_dict(
+            llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
@@ -1100,9 +1138,8 @@ def serve(
     "extra_encoder_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
-    "Prefer --config over --extra_encoder_options.")
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Prefer --config over --extra_encoder_options.")
 @click.option("--hf_revision",
               "--revision",
               "revision",
@@ -1143,6 +1180,9 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         logger.warning(
             "--extra_encoder_options is deprecated, use --config instead.")
 
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_encoder_options", "config"))
+
     llm_args, _ = get_llm_args(
         model=model,
         max_batch_size=max_batch_size,
@@ -1152,19 +1192,15 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         revision=revision,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         tensor_parallel_size=tensor_parallel_size,
-        telemetry=telemetry)
+        telemetry=telemetry,
+        explicit_cli_keys=explicit_cli_keys)
 
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
         with open(extra_encoder_options, 'r') as f:
             encoder_args_extra_dict = yaml.safe_load(f)
-    encoder_args = update_llm_args_with_extra_dict(llm_args,
-                                                   encoder_args_extra_dict)
-
-    # CLI --no-telemetry always wins over YAML config
-    if not telemetry:
-        encoder_args["telemetry_config"] = encoder_args[
-            "telemetry_config"].model_copy(update={"disabled": True})
+    encoder_args = update_llm_args_with_extra_dict(
+        llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -1324,9 +1360,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        llm_args = _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         # Ignore the non-LLM args
         llm_args.pop("router", None)
@@ -1349,9 +1383,10 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             instance_idx)
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        # NOTE: the resulting llm_args is currently unused; _launch_disaggregated_leader
+        # does not take it. Keeping the call symmetric with the client branch above
+        # so any future use of llm_args here behaves the same way.
+        _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
                                      log_level)

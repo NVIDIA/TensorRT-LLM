@@ -1339,6 +1339,79 @@ def set_op_args(node: Node, **name_value_pairs) -> None:
     node.kwargs = kwargs
 
 
+# Classification hints are layer-level: they are invariant across the fine-grained ops that
+# make up one logical layer (e.g. all projections of a SwiGLU MLP share the same
+# ``layer_type``) and are consumed by policy filters such as ``shard_layers`` -- NOT by
+# per-weight sharding mechanics. They are therefore the only sharding-related kwargs that are
+# well-defined to carry onto a fused/replacement op produced by an N->1 pattern rewrite (by
+# consensus). Per-weight mechanics (``tp_mode``, ``output_sizes``, ``tp_min_local_shape``,
+# ``tp_scaled_dim``, ``enable_sharding``) are intentionally NOT propagated: a fused op's
+# ShardableNode re-derives those structurally, so copying them across a rewrite is ill-defined
+# (the constituents legitimately disagree -- e.g. an MLA layer mixes ``tp_mode`` none/colwise/
+# rowwise while sharing a single ``layer_type``).
+CLASSIFICATION_HINT_NAMES = frozenset({"layer_type"})
+
+
+def _op_schema_arg_names(node: Node) -> set:
+    """Return the argument names declared by a call_function node's op schema.
+
+    Returns an empty set for non-call_function nodes or ops without an introspectable
+    schema, so callers can use it as a safe membership test.
+    """
+    if not isinstance(node, Node) or node.op != "call_function":
+        return set()
+    try:
+        return {a.name for a in _get_op_schema(node).arguments}
+    except (ValueError, RuntimeError):
+        return set()
+
+
+def collect_classification_hints(nodes: Iterable[Node]) -> dict:
+    """Return a consensus value for each classification hint across ``nodes``.
+
+    For every name in :data:`CLASSIFICATION_HINT_NAMES`, scan the call_function nodes that
+    declare it and collect the distinct *meaningful* values (ignoring ``None`` and the
+    ``"unknown"`` default). A name is included in the result only when exactly one such
+    value is observed; conflicting values are dropped with a warning, since a conflict
+    means the caller grouped nodes that belong to different logical layers.
+    """
+    result: dict = {}
+    for name in CLASSIFICATION_HINT_NAMES:
+        values = set()
+        for n in nodes:
+            if name not in _op_schema_arg_names(n):
+                continue
+            [value] = extract_op_args(n, name)
+            if value is not None and value != "unknown":
+                values.add(value)
+        if len(values) == 1:
+            result[name] = next(iter(values))
+        elif len(values) > 1:
+            ad_logger.warning(
+                f"Conflicting '{name}' hints {sorted(values)} among matched nodes; "
+                "not propagating to the replacement op (matched nodes may span layers)."
+            )
+    return result
+
+
+def stamp_hints(nodes: Iterable[Node], hints: dict) -> int:
+    """Set ``hints`` on every node in ``nodes`` whose op schema declares them.
+
+    Returns the number of nodes updated. Each hint is applied only to nodes whose op
+    actually declares that argument, so passing a heterogeneous node list is safe.
+    """
+    if not hints:
+        return 0
+    count = 0
+    for n in nodes:
+        names = _op_schema_arg_names(n)
+        to_set = {k: v for k, v in hints.items() if k in names}
+        if to_set:
+            set_op_args(n, **to_set)
+            count += 1
+    return count
+
+
 def predecessors(
     node: Node,
     depth: int = 1,

@@ -28,7 +28,7 @@ The deployment guides below provide more detailed instructions for serving speci
    :maxdepth: 1
    :name: Deployment Guides
 
-   deployment-guide-for-nemotron-3-super-on-trtllm.md
+   deployment-guide-for-nemotron-3-on-trtllm.md
    deployment-guide-for-deepseek-r1-on-trtllm.md
    deployment-guide-for-llama3.3-70b-on-trtllm.md
    deployment-guide-for-llama4-scout-on-trtllm.md
