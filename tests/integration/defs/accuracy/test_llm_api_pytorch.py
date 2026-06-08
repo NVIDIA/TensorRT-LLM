@@ -5811,13 +5811,15 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device_memory(90000)
+    @pytest.mark.parametrize("one_model", [True, False],
+                             ids=["one_model", "two_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_pre_blackwell),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
-    def test_eagle3_1gpu(self, moe_backend, mocker):
+    def test_eagle3_1gpu(self, moe_backend, one_model, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.object(GSM8K, "NUM_SAMPLES", 300)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
@@ -5825,7 +5827,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         pytorch_config = dict(
             max_batch_size=8,
-            disable_overlap_scheduler=True,
+            disable_overlap_scheduler=not one_model,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
                                         dtype="auto",
@@ -5835,7 +5837,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         draft_len = 5
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=False)
+                                           eagle3_one_model=one_model)
 
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
