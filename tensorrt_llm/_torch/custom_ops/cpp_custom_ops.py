@@ -204,6 +204,10 @@ def _register_fake():
                                 dtype=scores_with_bias.dtype), scores.new_empty(
                                     shape, dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::inplace_slice_copy")
+    def _(dest, src, dim1_start, dim1_end):
+        pass
+
     @torch.library.register_fake("trtllm::indexer_topk_prefill")
     def _(logits, row_starts, row_ends, indices, index_topk):
         # In-place operation, no return value (void function)
@@ -1075,7 +1079,6 @@ def _register_fake():
         head_size: int,
         tokens_per_block: int,
         attention_window_size: int,
-        sink_token_length: int,
         beam_width: int,
         quant_mode: int,
         q_scaling: float,
@@ -1147,20 +1150,6 @@ def _register_fake():
         output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
-
-    @torch.library.register_fake("trtllm::build_decoder_info")
-    def _(seq_q_offsets, seq_kv_offsets, padding_offsets, tokens_info,
-          encoder_padding_offsets, packed_mask_row_offsets,
-          seq_cp_partial_offsets, attention_mask, seq_q_lengths, seq_kv_lengths,
-          fmha_tile_counter, dequant_scale_qkv, quant_scale_o, fmha_bmm1_scale,
-          fmha_bmm2_scale, rotary_embedding_inv_freq,
-          rotary_embedding_inv_freq_cache, cp_size, separate_qkv_scales,
-          fmha_host_bmm1_scale, batch_size, max_q_seq_length,
-          max_encoder_q_seq_length, attention_window_size, sink_token_length,
-          num_tokens, remove_padding, attention_mask_type,
-          rotary_embedding_scale, rotary_embedding_base, rotary_embedding_dim,
-          rotary_scaling_type, rotary_embedding_max_positions):
-        return True
 
     @torch.library.register_fake("trtllm::convert_req_index_to_global")
     def _(req_id: torch.Tensor, block_table: torch.Tensor,

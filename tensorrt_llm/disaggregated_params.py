@@ -30,9 +30,12 @@ class DisaggregatedParams:
         disagg_request_id (int): The disaggregated request id, if set, both context and generation requests will use it
          as underlying request id.
         first_gen_log_probs (List): The logprobs for first_gen_tokens, produced during prefill.
-         Each entry is a list (one per beam) of TokenLogprobs (list of dict[int, Logprob]).
+         Each entry is a list (one per beam) of either ``TokenLogprobs`` (``list[dict[int, Logprob]]``,
+         default format) or ``SimpleTokenLogprobs`` (``list[float]``, simple format).
         first_gen_logits (List): The generation logits for first_gen_tokens, produced during prefill.
          Each entry is a torch.Tensor of shape [num_tokens, vocab_size] (one per beam/sequence).
+        ctx_usage (Dict[str, Any]): The context usage payload to preserve exact
+         usage accounting on the generation server.
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
@@ -51,6 +54,7 @@ class DisaggregatedParams:
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
+    ctx_usage: Optional[Dict[str, Any]] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (

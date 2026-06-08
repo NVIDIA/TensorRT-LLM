@@ -169,6 +169,8 @@ class Mamba2Mixer(nn.Module):
         # cache manager), so precompute both gate values here.
         sr_base = (self._stochastic_rounding_requested
                    and self._mamba_ssm_cache_dtype == torch.float16)
+        # Keep replay SSM-cache writes on the same stochastic-rounding policy
+        # as flashinfer; the replay kernel masks stale slots before using them.
         self._stochastic_rounding_for_replay = sr_base
         self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
 
@@ -346,6 +348,8 @@ class Mamba2Mixer(nn.Module):
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
+            has_initial_states_p = has_initial_states[:num_prefills]
+            conv_states[state_indices_p[~has_initial_states_p]].zero_()
             # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
             xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
                                                     self.tp_d_inner,
@@ -509,8 +513,22 @@ class Mamba2Mixer(nn.Module):
 
                 philox_kwargs = {}
                 if use_stochastic_rounding:
-                    philox_kwargs['rand_seed'] = torch.randint(
-                        0, 2**62, (1, ), device=x_d.device, dtype=torch.int64)
+                    # Both replay and flashinfer read from the cache manager's
+                    # persistent per-slot Philox seed buffer; replay indexes by
+                    # cache_batch_idx, flashinfer reads slot 0 from a (1,)
+                    # view.  In-place add_(1) keeps CUDA-graph replay fresh
+                    # without allocating any new CUDA tensors per forward.
+                    rand_seed = layer_cache.mamba_ssm_rand_seed
+                    assert rand_seed is not None, (
+                        "Mamba SSM stochastic rounding is enabled but the "
+                        "rand_seed buffer was not allocated; check that "
+                        "_util.py passes mamba_ssm_stochastic_rounding=True "
+                        "to the cache manager.")
+                    rand_seed.add_(1)
+                    if use_replay:
+                        philox_kwargs['rand_seed'] = rand_seed
+                    else:
+                        philox_kwargs['rand_seed'] = rand_seed[:1]
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
@@ -538,6 +556,10 @@ class Mamba2Mixer(nn.Module):
                 elif self._use_mtp_custom_op and not use_stochastic_rounding:
                     # Upstream TRT-LLM CUDA custom op for MTP SSM cache update.
                     # Does not support stochastic rounding.
+                    # CUDA kernel requires contiguous dense inputs.
+                    x_d_4d = x_d_4d.contiguous()
+                    B_d_4d = B_d_4d.contiguous()
+                    C_d_4d = C_d_4d.contiguous()
                     selective_state_update_mtp_ssm_cache_trtllm(
                         ssm_states,
                         x_d_4d,
@@ -557,7 +579,7 @@ class Mamba2Mixer(nn.Module):
                         intermediate_state_indices=intermediate_state_indices,
                     )
                 else:
-                    # Legacy flashinfer path: contiguous copies for alignment.
+                    # Triton kernel + flashinfer need contiguous for alignment.
                     x_d_4d = x_d_4d.contiguous()
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()
@@ -598,10 +620,19 @@ class Mamba2Mixer(nn.Module):
                 # Non-MTP decode only runs through flashinfer, no replay path.
                 use_stochastic_rounding = self._stochastic_rounding_for_flashinfer
                 if use_stochastic_rounding:
-                    ssu_kwargs['rand_seed'] = torch.randint(0,
-                                                            2**62, (1, ),
-                                                            device=x_d.device,
-                                                            dtype=torch.int64)
+                    # Fetch the persistent (cache_size,) Philox seed buffer
+                    # from the cache manager and pass slot 0 as a (1,) view to
+                    # flashinfer.  No per-call CUDA tensor allocation; the
+                    # in-place add_(1) is CUDA-graph-friendly.
+                    rand_seed = (attn_metadata.kv_cache_manager.
+                                 get_mamba_ssm_rand_seed())
+                    assert rand_seed is not None, (
+                        "Mamba SSM stochastic rounding is enabled but the "
+                        "rand_seed buffer was not allocated; check that "
+                        "_util.py passes mamba_ssm_stochastic_rounding=True "
+                        "to the cache manager.")
+                    rand_seed.add_(1)
+                    ssu_kwargs['rand_seed'] = rand_seed[:1]
                     ssu_kwargs['philox_rounds'] = self._philox_rounds
 
                 self.selective_state_update_func(

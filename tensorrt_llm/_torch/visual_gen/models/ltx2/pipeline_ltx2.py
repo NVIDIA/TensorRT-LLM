@@ -8,7 +8,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import safetensors.torch
 import torch
@@ -17,11 +17,11 @@ from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -152,6 +152,23 @@ def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -
         )
 
 
+_LTX2_PREFETCHED_SAFETENSORS: Set[str] = set()
+
+
+def _prefetch_ltx2_safetensors_files(file_names: List[str]) -> bool:
+    """Warm LTX-2 safetensors files in the host page cache.
+
+    For distributed runs, local ranks split the file list and synchronize before
+    weight loading so ranks do not duplicate the prefetch work on the same node.
+    """
+    return prefetch_files_to_host_cache(
+        file_names,
+        description="LTX-2 checkpoint",
+        prefetched_paths=_LTX2_PREFETCHED_SAFETENSORS,
+        ignore_errors=True,
+    )
+
+
 def _load_ltx2_transformer_weights(
     checkpoint_dir: str,
     prefix: str,
@@ -178,6 +195,8 @@ def _load_ltx2_transformer_weights(
 
     if not sft_paths:
         raise ValueError(f"No safetensors files found in {checkpoint_dir}")
+
+    _prefetch_ltx2_safetensors_files(sft_paths)
 
     exclude_prefixes = tuple(exclude_prefixes) if exclude_prefixes else ()
 
@@ -565,7 +584,32 @@ def _load_component_weights(
 # ---------------------------------------------------------------------------
 
 
-@register_pipeline("LTX2Pipeline")
+# ``LTX2Pipeline`` owns the canonical ``Lightricks/LTX-2`` discovery
+# surface. ``_detect_from_checkpoint()`` returns ``"LTX2Pipeline"`` from
+# ``model_index.json`` / safetensors metadata, and the pipeline_config
+# validator runs against this entry's ``defaults`` BEFORE
+# ``resolve_variant()`` swaps in ``LTX2TwoStagesPipeline``. So the
+# superset of knobs (``text_encoder_path`` + the two two-stage paths)
+# lives here; the two-stage class registers without ``hf_ids`` /
+# ``defaults`` to avoid duplicating the discovery entry.
+@register_pipeline(
+    "LTX2Pipeline",
+    hf_ids=[
+        "Lightricks/LTX-2",
+    ],
+    defaults={
+        "text_encoder_path": "google/gemma-3-12b-it",
+        "spatial_upsampler_path": None,
+        "distilled_lora_path": None,
+    },
+    doc=(
+        "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
+        "superset of knobs for one-stage and two-stage. Pipeline will "
+        "run two-stage if both ``spatial_upsampler_path`` and "
+        "``distilled_lora_path`` are not ``None``, either set by the "
+        "user or auto-discovered from the checkpoint."
+    ),
+)
 class LTX2Pipeline(BasePipeline):
     """Pipeline for text-to-video generation with audio using LTX2 model.
 
@@ -690,8 +734,10 @@ class LTX2Pipeline(BasePipeline):
         fall back to the same defaults the reference uses.
         """
         attn_cfg = getattr(self.model_config, "attention", None)
-        if attn_cfg is not None and getattr(attn_cfg, "sage_attention_config", None) is not None:
-            raise NotImplementedError("SageAttention is not yet supported for the LTX-2 pipeline.")
+        if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
+            raise NotImplementedError(
+                "Quantized attention is not yet supported for the LTX-2 pipeline."
+            )
 
         cfg = self.model_config.pretrained_config
 
@@ -760,13 +806,11 @@ class LTX2Pipeline(BasePipeline):
         iterations (WARMUP_STEPS=2), so the captured graph contains the
         optimized compiled kernels.
         """
-        if not self.model_config.cuda_graph.enable_cuda_graph:
+        if not self.model_config.cuda_graph.enable:
             return
 
         runner = _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
-        compile_note = (
-            " (with torch.compile)" if self.model_config.torch_compile.enable_torch_compile else ""
-        )
+        compile_note = " (with torch.compile)" if self.model_config.torch_compile.enable else ""
         logger.info(
             f"CUDA graph runner: wrapping transformer.forward (Modality-aware){compile_note}"
         )
@@ -798,7 +842,8 @@ class LTX2Pipeline(BasePipeline):
             checkpoint_dir: Path to the native LTX-2 checkpoint
                 (directory containing ``*.safetensors`` files).
             device: Target device.
-            skip_components: Components to skip.
+            skip_components: Components to skip loading (internal escape
+                hatch for memory-constrained unit tests).
             text_encoder_path: Path to the Gemma3 model directory.
                 Must contain model weights (``model*.safetensors``),
                 tokenizer files, and ``preprocessor_config.json``.
@@ -813,8 +858,8 @@ class LTX2Pipeline(BasePipeline):
         if needs_text and not text_encoder_path:
             raise ValueError(
                 "text_encoder_path is required for loading the tokenizer "
-                "and text encoder. Set VisualGenArgs.text_encoder_path to "
-                "the Gemma3 model directory."
+                "and text encoder. Set the LTX-2 pipeline_config "
+                "'text_encoder_path' entry to the Gemma3 model directory."
             )
 
         # --- Tokenizer & text encoder (from separate Gemma directory) -----
@@ -835,6 +880,7 @@ class LTX2Pipeline(BasePipeline):
         # --- Resolve native config ----------------------------------------
         native_config = self.model_config.extra_attrs.get("monolithic_safetensors_config")
         sft_paths = _find_safetensors_files(checkpoint_dir)
+        _prefetch_ltx2_safetensors_files(sft_paths)
 
         if native_config is None and sft_paths:
             native_config = _read_safetensors_config(sft_paths[0])
@@ -862,9 +908,10 @@ class LTX2Pipeline(BasePipeline):
         sft_paths: List[str],
         device: torch.device,
         dtype: torch.dtype,
-        skip_components: List,
+        skip_components: Optional[list] = None,
     ) -> None:
         """Instantiate and load weights for native LTX-2 components."""
+        skip_components = skip_components or []
 
         # Video decoder — native checkpoint stores decoder weights under
         # "vae.decoder." and statistics under "vae.per_channel_statistics.".
@@ -1421,8 +1468,7 @@ class LTX2Pipeline(BasePipeline):
         # STG/modality passes run on every GPU before the guidance formula.
         vgm = self.model_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
-        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else (vgm.ulysses_size if vgm else 1)
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
         if do_cfg_parallel_mm and cfg_size != 2:
             raise ValueError(

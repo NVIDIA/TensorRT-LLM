@@ -230,8 +230,19 @@ def fused_moe(
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
     use_dynamic_fc2_scale: bool = False,
+    # Routed-expert LoRA inputs (all optional; presence of fc1_lora_ranks activates LoRA).
+    # Each *_ranks   : CPU int32  [num_seqs]
+    # Each *_weights : CPU int64  [num_seqs, 3]  -- (A_ptr, B_ptr, DoRA_ptr unused)
+    fc1_lora_ranks: Optional[torch.Tensor] = None,
+    fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    fc2_lora_ranks: Optional[torch.Tensor] = None,
+    fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    gated_lora_ranks: Optional[torch.Tensor] = None,
+    gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    host_request_types: Optional[torch.Tensor] = None,
+    host_context_lengths: Optional[torch.Tensor] = None,
+    lora_max_low_rank: int = 0,
 ) -> List[torch.Tensor]:
-
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
@@ -291,17 +302,37 @@ def fused_moe(
         gemm_idx=2,
     )
 
+    lora_active = fc1_lora_ranks is not None
+    if min_latency_mode and lora_active:
+        # Mirror the C++ rejection so the error surfaces before the kernel allocates anything.
+        raise RuntimeError(
+            "MoE LoRA is not supported in min-latency mode. Disable min_latency_mode or pass no LoRA tensors."
+        )
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
     try:
-        output = run_moe(input, token_selected_experts, token_final_scales,
-                         fc1_expert_weights, fc1_expert_biases,
-                         fc2_expert_weights, fc2_expert_biases, quant_scales,
-                         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
-                         swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
-                         cluster_size, cluster_rank, enable_alltoall,
-                         min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
-                         activation_type, unpadded_hidden_size,
-                         tuner_num_tokens, out_tensor, use_dynamic_fc2_scale)
+        if min_latency_mode:
+            output = run_moe(input, token_selected_experts, token_final_scales,
+                             fc1_expert_weights, fc1_expert_biases,
+                             fc2_expert_weights, fc2_expert_biases,
+                             quant_scales, input_sf, swizzled_input_sf,
+                             swiglu_alpha, swiglu_beta, swiglu_limit, tp_size,
+                             tp_rank, ep_size, ep_rank, cluster_size,
+                             cluster_rank, enable_alltoall, min_latency_mode,
+                             [gemm_tactic_1, gemm_tactic_2], activation_type,
+                             unpadded_hidden_size, tuner_num_tokens, out_tensor)
+        else:
+            output = run_moe(
+                input, token_selected_experts, token_final_scales,
+                fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+                fc2_expert_biases, quant_scales, input_sf, swizzled_input_sf,
+                swiglu_alpha, swiglu_beta, swiglu_limit, tp_size, tp_rank,
+                ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
+                min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
+                activation_type, unpadded_hidden_size, tuner_num_tokens,
+                out_tensor, use_dynamic_fc2_scale, fc1_lora_ranks,
+                fc1_lora_weight_ptrs, fc2_lora_ranks, fc2_lora_weight_ptrs,
+                gated_lora_ranks, gated_lora_weight_ptrs, host_request_types,
+                host_context_lengths, lora_max_low_rank)
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
@@ -356,7 +387,16 @@ def _(input: torch.Tensor,
       activation_type: ActivationType = ActivationType.Swiglu,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None,
-      use_dynamic_fc2_scale: bool = False):
+      use_dynamic_fc2_scale: bool = False,
+      fc1_lora_ranks: Optional[torch.Tensor] = None,
+      fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      fc2_lora_ranks: Optional[torch.Tensor] = None,
+      fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      gated_lora_ranks: Optional[torch.Tensor] = None,
+      gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      host_request_types: Optional[torch.Tensor] = None,
+      host_context_lengths: Optional[torch.Tensor] = None,
+      lora_max_low_rank: int = 0):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
@@ -1412,7 +1452,9 @@ def _(
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
-    MAX_SUPPORTED_SM_VERSION = 103
+    MAX_SUPPORTED_SM_VERSION_W4A8 = 103
+    # W4A16 (FP16/BF16 activation): SM120/121 dispatch via cutlass::arch::Sm80.
+    MAX_SUPPORTED_SM_VERSION_W4A16 = 121
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
@@ -1445,9 +1487,16 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
                 do_preparation: bool = False,
                 **kwargs) -> torch.Tensor:
 
-        if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
+        sm = get_sm_version()
+        if (self.activation_dtype == torch.float8_e4m3fn
+                and sm > self.MAX_SUPPORTED_SM_VERSION_W4A8):
             raise ValueError(
-                f"SM version {get_sm_version()} is not supported for W4A16/W4A8 finegrained mixed dtype GEMM"
+                f"SM version {sm} is not supported for W4A8 finegrained mixed dtype GEMM"
+            )
+        if (self.activation_dtype in (torch.float16, torch.bfloat16)
+                and sm > self.MAX_SUPPORTED_SM_VERSION_W4A16):
+            raise ValueError(
+                f"SM version {sm} is not supported for W4A16 finegrained mixed dtype GEMM"
             )
 
         activation, weights_packed, scales = inputs
@@ -1693,17 +1742,29 @@ class Fp8BlockScalingGemmRunner(TunableRunner):
             a, b, a_scale, b_scale)
 
 
-def get_fp8_block_scaling_gemm_constraint_spec():
-    # The implementation aligns with the fp8_quantize_1x128 custom op.
-    def fp8_quantize_1x128_sm90_constrant(inputs: List[List[int]]):
-        pad_m = fp4_utils.pad_up(inputs[0][0], 4)
-        blocked_n = (inputs[0][1] + 127) // 128
-        return fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4
+def _fp8_block_scaling_gemm_sm100_constraint(inputs: List[List[int]]) -> int:
+    return inputs[0][0]
 
-    if get_sm_version() >= 100:
-        return (ConstraintSpec(2, 1, lambda inputs: inputs[0][0]), )
+
+def _fp8_quantize_1x128_sm90_constraint(inputs: List[List[int]]) -> int:
+    # The implementation aligns with the fp8_quantize_1x128 custom op.
+    pad_m = fp4_utils.pad_up(inputs[0][0], 4)
+    blocked_n = (inputs[0][1] + 127) // 128
+    return fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4
+
+
+@lru_cache(maxsize=None)
+def _get_fp8_block_scaling_gemm_constraint_spec(
+        sm_version: int) -> Tuple[ConstraintSpec, ...]:
+    if sm_version >= 100:
+        return (ConstraintSpec(2, 1,
+                               _fp8_block_scaling_gemm_sm100_constraint), )
     else:
-        return (ConstraintSpec(2, 0, fp8_quantize_1x128_sm90_constrant), )
+        return (ConstraintSpec(2, 0, _fp8_quantize_1x128_sm90_constraint), )
+
+
+def get_fp8_block_scaling_gemm_constraint_spec() -> Tuple[ConstraintSpec, ...]:
+    return _get_fp8_block_scaling_gemm_constraint_spec(get_sm_version())
 
 
 @torch.library.custom_op("trtllm::fp8_block_scaling_gemm", mutates_args=())

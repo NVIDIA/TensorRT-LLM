@@ -100,8 +100,7 @@ def build_and_run_tp2(rank, model_name, engine_dir):
 
 
 @force_ampere
-@pytest.mark.parametrize("model_name",
-                         ["llama-models/llama-7b-hf", "Mixtral-8x7B-v0.1"])
+@pytest.mark.parametrize("model_name", ["Mixtral-8x7B-v0.1"])
 def test_multi_gpu(model_name):
     if torch.cuda.device_count() < TP_SIZE:
         print(f"The test needs at least ${TP_SIZE} GPUs, skipping")

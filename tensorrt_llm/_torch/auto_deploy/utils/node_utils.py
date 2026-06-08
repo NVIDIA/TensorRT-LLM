@@ -46,6 +46,10 @@ OpOrOverload = Union[OpOverloadPacket, OpOverload]
 OperatorLike = Union[OpOrOverload, Callable]
 
 
+def _auto_deploy_op(name: str) -> Optional[OpOverloadPacket]:
+    return getattr(torch.ops.auto_deploy, name, None)
+
+
 class LayerType(Enum):
     """Enum for layer type."""
 
@@ -439,27 +443,48 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     return is_match
 
 
-def is_trivial_passthrough_user(node: Node) -> bool:
+_VIEW_METHOD_TARGETS = {"view", "reshape", "transpose", "permute", "contiguous"}
+
+
+def is_call_method_view_op(node: Node) -> bool:
+    """Check whether a node is a method-style tensor view/layout op."""
+    return (
+        node.op == "call_method"
+        and node.target in _VIEW_METHOD_TARGETS
+        and bool(node.args)
+        and isinstance(node.args[0], Node)
+    )
+
+
+def is_view_like_op(node: Node) -> bool:
+    """Check whether a node is a tensor view/layout passthrough op."""
+    if is_call_method_view_op(node):
+        return True
+    return (
+        is_op(node, torch.ops.aten.view)
+        or is_op(node, torch.ops.aten.reshape)
+        or is_op(node, torch.ops.aten.transpose)
+        or is_op(node, torch.ops.aten.permute)
+        or is_op(node, torch.ops.aten.contiguous)
+        or is_op(node, torch.ops.auto_deploy.view)
+    )
+
+
+def is_dtype_cast_op(node: Node) -> bool:
+    """Check whether a node casts only tensor dtype."""
+    return is_op(node, torch.ops.aten.to.dtype)
+
+
+def is_trivial_passthrough_user(node: Node, *, allow_dtype_cast: bool = False) -> bool:
     """Check whether a node is a trivial layout/index passthrough op."""
-    if node.op == "call_method":
-        return node.target in {
-            "view",
-            "reshape",
-            "transpose",
-            "permute",
-            "contiguous",
-            "__getitem__",
-        }
+    if allow_dtype_cast and is_dtype_cast_op(node):
+        return True
+    if is_view_like_op(node):
+        return True
+    if node.op == "call_method" and node.target == "__getitem__":
+        return True
     if node.op == "call_function":
-        if node.target is operator.getitem:
-            return True
-        return (
-            is_op(node, torch.ops.aten.view)
-            or is_op(node, torch.ops.aten.reshape)
-            or is_op(node, torch.ops.aten.transpose)
-            or is_op(node, torch.ops.aten.permute)
-            or is_op(node, torch.ops.aten.contiguous)
-        )
+        return node.target is operator.getitem
     return False
 
 
@@ -467,6 +492,7 @@ def collect_terminal_users_through_passthrough(
     source_node: Node,
     *,
     max_traversal_nodes: int = 256,
+    allow_dtype_cast: bool = False,
 ) -> Tuple[List[Node], bool]:
     """Collect terminal users while traversing trivial passthrough users.
 
@@ -489,13 +515,36 @@ def collect_terminal_users_through_passthrough(
         seen.add(user)
         if len(seen) > max_traversal_nodes:
             return [], False
-        if is_trivial_passthrough_user(user):
+        if is_trivial_passthrough_user(user, allow_dtype_cast=allow_dtype_cast):
             if user.args and isinstance(user.args[0], Node) and user.args[0] in data_nodes:
                 data_nodes.add(user)
                 stack.extend(list(user.users))
                 continue
         terminal_users.append(user)
     return terminal_users, True
+
+
+def unwrap_input_through_passthrough(
+    node: Node,
+    *,
+    allow_dtype_cast: bool = False,
+) -> Tuple[Node, List[Node]]:
+    """Walk backward through view-like passthrough ops from a consumer input.
+
+    The returned post_nodes are ordered from consumer input back toward the
+    source producer. Transforms that can absorb dtype casts may opt in with
+    allow_dtype_cast=True.
+    """
+    current = node
+    post_nodes: List[Node] = []
+    while isinstance(current, Node) and (
+        is_view_like_op(current) or (allow_dtype_cast and is_dtype_cast_op(current))
+    ):
+        if not current.args or not isinstance(current.args[0], Node):
+            break
+        post_nodes.append(current)
+        current = current.args[0]
+    return current, post_nodes
 
 
 def get_shared_input_scale_for_fp8_linears(
@@ -625,13 +674,17 @@ def is_any_moe_op(node: Node) -> bool:
     return is_op(
         node,
         ops=[
-            torch.ops.auto_deploy.torch_moe,
-            torch.ops.auto_deploy.torch_quant_fp8_moe,
-            torch.ops.auto_deploy.torch_quant_nvfp4_moe,
-            torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
-            torch.ops.auto_deploy.triton_mxfp4_moe,
-            torch.ops.auto_deploy.torch_moe_fused,
-            torch.ops.auto_deploy.torch_moe_dense_mlp,
+            op
+            for op in [
+                _auto_deploy_op("torch_moe"),
+                _auto_deploy_op("torch_quant_fp8_moe"),
+                _auto_deploy_op("torch_quant_nvfp4_moe"),
+                _auto_deploy_op("torch_quant_finegrained_fp8_moe"),
+                _auto_deploy_op("triton_mxfp4_moe"),
+                _auto_deploy_op("torch_moe_fused"),
+                _auto_deploy_op("torch_moe_dense_mlp"),
+            ]
+            if op is not None
         ],
     )
 
@@ -1284,6 +1337,79 @@ def set_op_args(node: Node, **name_value_pairs) -> None:
 
     node.args = tuple(args)
     node.kwargs = kwargs
+
+
+# Classification hints are layer-level: they are invariant across the fine-grained ops that
+# make up one logical layer (e.g. all projections of a SwiGLU MLP share the same
+# ``layer_type``) and are consumed by policy filters such as ``shard_layers`` -- NOT by
+# per-weight sharding mechanics. They are therefore the only sharding-related kwargs that are
+# well-defined to carry onto a fused/replacement op produced by an N->1 pattern rewrite (by
+# consensus). Per-weight mechanics (``tp_mode``, ``output_sizes``, ``tp_min_local_shape``,
+# ``tp_scaled_dim``, ``enable_sharding``) are intentionally NOT propagated: a fused op's
+# ShardableNode re-derives those structurally, so copying them across a rewrite is ill-defined
+# (the constituents legitimately disagree -- e.g. an MLA layer mixes ``tp_mode`` none/colwise/
+# rowwise while sharing a single ``layer_type``).
+CLASSIFICATION_HINT_NAMES = frozenset({"layer_type"})
+
+
+def _op_schema_arg_names(node: Node) -> set:
+    """Return the argument names declared by a call_function node's op schema.
+
+    Returns an empty set for non-call_function nodes or ops without an introspectable
+    schema, so callers can use it as a safe membership test.
+    """
+    if not isinstance(node, Node) or node.op != "call_function":
+        return set()
+    try:
+        return {a.name for a in _get_op_schema(node).arguments}
+    except (ValueError, RuntimeError):
+        return set()
+
+
+def collect_classification_hints(nodes: Iterable[Node]) -> dict:
+    """Return a consensus value for each classification hint across ``nodes``.
+
+    For every name in :data:`CLASSIFICATION_HINT_NAMES`, scan the call_function nodes that
+    declare it and collect the distinct *meaningful* values (ignoring ``None`` and the
+    ``"unknown"`` default). A name is included in the result only when exactly one such
+    value is observed; conflicting values are dropped with a warning, since a conflict
+    means the caller grouped nodes that belong to different logical layers.
+    """
+    result: dict = {}
+    for name in CLASSIFICATION_HINT_NAMES:
+        values = set()
+        for n in nodes:
+            if name not in _op_schema_arg_names(n):
+                continue
+            [value] = extract_op_args(n, name)
+            if value is not None and value != "unknown":
+                values.add(value)
+        if len(values) == 1:
+            result[name] = next(iter(values))
+        elif len(values) > 1:
+            ad_logger.warning(
+                f"Conflicting '{name}' hints {sorted(values)} among matched nodes; "
+                "not propagating to the replacement op (matched nodes may span layers)."
+            )
+    return result
+
+
+def stamp_hints(nodes: Iterable[Node], hints: dict) -> int:
+    """Set ``hints`` on every node in ``nodes`` whose op schema declares them.
+
+    Returns the number of nodes updated. Each hint is applied only to nodes whose op
+    actually declares that argument, so passing a heterogeneous node list is safe.
+    """
+    if not hints:
+        return 0
+    count = 0
+    for n in nodes:
+        names = _op_schema_arg_names(n)
+        to_set = {k: v for k, v in hints.items() if k in names}
+        if to_set:
+            set_op_args(n, **to_set)
+            count += 1
+    return count
 
 
 def predecessors(

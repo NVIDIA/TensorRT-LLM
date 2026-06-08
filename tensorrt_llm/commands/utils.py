@@ -2,6 +2,10 @@
 import json
 import logging
 import os
+from typing import Iterable, Mapping, Optional, Set
+
+import click
+from click.core import ParameterSource
 
 from tensorrt_llm._torch.visual_gen.config import ParallelConfig
 from tensorrt_llm.llmapi.utils import download_hf_partial
@@ -134,13 +138,36 @@ def get_visual_gen_model_type(model_path: str):
     )
 
 
+def collect_explicit_cli_keys(
+    *,
+    exclude: Iterable[str] = (),
+    translate: Optional[Mapping[str, str]] = None,
+) -> Set[str]:
+    """Return CLI flag names the user typed on the command line.
+
+    Reads the active Click context and selects parameters whose source is
+    `ParameterSource.COMMANDLINE`. `exclude` removes meta flags that aren't
+    config keys (e.g. `extra_llm_api_options`, `config`). `translate` maps
+    each Click parameter name to the LlmArgs field name (or merge-function
+    CLI scalar name) used by `update_llm_args_with_extra_options`; entries
+    not present in the map pass through unchanged.
+    """
+    ctx = click.get_current_context()
+    explicit = {
+        name for name in ctx.params if ctx.get_parameter_source(name) == ParameterSource.COMMANDLINE
+    } - set(exclude)
+    if translate is None:
+        return explicit
+    return {translate.get(name, name) for name in explicit}
+
+
 def get_visual_gen_num_gpus(diffusion_config: dict) -> int:
     """Compute the number of GPUs from a visual_gen config.
 
     Uses ParallelConfig.model_construct (skips env validators)
     so this is safe to call from non-worker processes.
     """
-    parallel = diffusion_config.get("parallel", {})
+    parallel = diffusion_config.get("parallel_config", {})
     if isinstance(parallel, dict):
         parallel = ParallelConfig.model_construct(**parallel)
     return parallel.n_workers

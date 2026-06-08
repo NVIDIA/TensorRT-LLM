@@ -21,6 +21,11 @@ _logger = logging.getLogger(__name__)
 # Import each custom model individually so that models with transitive TRT-LLM
 # dependencies (e.g., NemotronH needing mamba layernorm_gated) don't prevent
 # other models from loading in standalone mode.
+#
+# NOTE: deepseek, nemotron_h, qwen3, qwen3_5_moe entries are the sharding-IR
+# variants (see PR for #13429). The legacy non-IR versions of these four files
+# were removed in the same change; the canonical name now points to the
+# IR-aware implementation that uses ``apply_sharding_hints`` for TP/EP/BMM.
 _MODEL_MODULES = {
     "modeling_cohere": ["CohereForCausalLM"],
     "modeling_decilm": ["DeciLMForCausalLM"],
@@ -50,6 +55,7 @@ _MODEL_MODULES = {
     "modeling_nemotron_h": ["NemotronHForCausalLM"],
     "modeling_olmo3": ["Olmo3ForCausalLM"],
     "modeling_openelm": ["OpenELMForCausalLM"],
+    "modeling_qwen3": ["Qwen3ForCausalLM"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
     "modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
     "modeling_qwen3_next": ["Qwen3NextForCausalLM"],
@@ -57,17 +63,18 @@ _MODEL_MODULES = {
     "modeling_skywork_r1v2": ["SkyworkR1V2ForConditionalGeneration"],
     "modeling_smollm3": ["SmolLM3ForCausalLM"],
     "modeling_starcoder2": ["Starcoder2ForCausalLM"],
+    "modeling_step3p7": ["Step3p7ForCausalLM"],
 }
 
+# AD_USE_IR_MODELS: opt-in flag for staging additional ``_ir.py`` modeling
+# variants alongside the canonical models above. PR #13478 promoted the
+# deepseek/nemotron_h/qwen3/qwen3_5_moe ``_ir.py`` variants to canonical
+# names, so the gate currently has no entries to load. Keep the hook in
+# place: future model onboardings may stage an ``_ir.py`` variant here
+# for side-by-side comparison while the legacy ``detect_sharding`` path
+# is still supported and the canonical rename hasn't happened yet.
 if os.environ.get("AD_USE_IR_MODELS"):
-    _MODEL_MODULES["modeling_deepseek_ir"] = ["DeepSeekV3ForCausalLM"]
-    _MODEL_MODULES["modeling_llama3_ir"] = ["Llama3ForCausalLM"]
-    _MODEL_MODULES["modeling_nemotron_h_ir"] = ["NemotronHForCausalLM"]
-    _MODEL_MODULES["modeling_qwen3_5_moe_ir"] = [
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    ]
-    _MODEL_MODULES["modeling_qwen3_ir"] = ["Qwen3ForCausalLM"]
+    pass  # no staged _ir.py variants at the moment
 
 __all__ = []
 for _module_name, _names in _MODEL_MODULES.items():

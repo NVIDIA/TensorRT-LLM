@@ -117,11 +117,7 @@ def _load_models(checkpoint_dir: str):
         .eval()
     )
 
-    args = VisualGenArgs(
-        checkpoint_path=checkpoint_dir,
-        device=DEVICE,
-        dtype="bfloat16",
-    )
+    args = VisualGenArgs(model=checkpoint_dir)
     model_config = DiffusionModelConfig.from_pretrained(checkpoint_dir, args=args)
     our_model = WanTransformer3DModel(model_config=model_config).to(DEVICE).eval()
 
