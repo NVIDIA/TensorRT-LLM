@@ -51,6 +51,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
         'cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell',
     ]
 
+    # MegaMoE NVFP4 op probes a strict superset of IS_CUTLASS_DSL_AVAILABLE
+    # (cutlass.torch + cutlass._mlir + cute_nvgpu MMA atoms + the ported
+    # CuteDSL kernel package). The cute_dsl_megamoe_custom_op module
+    # sets ``IS_MEGAMOE_OP_AVAILABLE`` based on its own try/except probe;
+    # importing the module is safe regardless of the result -- it just
+    # logs and leaves ``IS_MEGAMOE_OP_AVAILABLE = False`` on partial
+    # cutlass-dsl installs so callers can fall back via the factory.
+    from .cute_dsl_megamoe_custom_op import IS_MEGAMOE_OP_AVAILABLE
+    if IS_MEGAMOE_OP_AVAILABLE:
+        from .cute_dsl_megamoe_custom_op import cute_dsl_megamoe_nvfp4_blackwell
+        __all__ += ['cute_dsl_megamoe_nvfp4_blackwell']
+
 if IS_CUDA_TILE_AVAILABLE:
     from .cuda_tile_custom_ops import (cuda_tile_rms_norm,
                                        cuda_tile_rms_norm_fuse_residual_)

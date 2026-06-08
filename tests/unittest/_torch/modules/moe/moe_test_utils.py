@@ -47,7 +47,10 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
-from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl import (
+    is_megamoe_cute_dsl_runtime_available,
+)
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -65,7 +68,10 @@ class MoeBackendType(str, Enum):
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
-    MEGAMOE = "MEGAMOE_DEEPGEMM"
+    # Two MegaMoE variants: the DeepGemm path and the CuteDSL path. Both
+    # are spelled out explicitly at call sites.
+    MEGAMOE_DEEPGEMM = "MEGAMOE_DEEPGEMM"
+    MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -76,7 +82,8 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
-        MoeBackendType.MEGAMOE: MegaMoEDeepGemm,
+        MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
+        MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
     }
     return backend_class_map[backend_type]
 
@@ -617,7 +624,7 @@ def should_skip_densegemm(
     return None
 
 
-def should_skip_megamoe(
+def should_skip_megamoe_deepgemm(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo] = None,
     dtype: Optional[torch.dtype] = None,
@@ -627,8 +634,13 @@ def should_skip_megamoe(
     parallel_mode: Optional[str] = None,
     swiglu_gptoss_style: bool = False,
 ) -> Optional[str]:
-    """Check MegaMoE-specific constraints for the generic MoE test matrix."""
-    if backend_type != MoeBackendType.MEGAMOE:
+    """Check MegaMoEDeepGemm-specific constraints for the generic MoE test matrix.
+
+    For MegaMoECuteDsl use :func:`should_skip_megamoe_cutedsl`; the two
+    backends share the FUSED_COMM contract but have different quant/shape
+    constraints (W4A8_MXFP4_MXFP8 + 512-aligned vs NVFP4 + 32-aligned).
+    """
+    if backend_type != MoeBackendType.MEGAMOE_DEEPGEMM:
         return None
 
     if not torch.cuda.is_available():
@@ -660,6 +672,88 @@ def should_skip_megamoe(
                 f"MegaMoEDeepGemm requires 512-aligned hidden/intermediate sizes "
                 f"for DeepGEMM TMA-packed SF rows "
                 f"(got h={hidden_size}, i={intermediate_size})"
+            )
+
+    return None
+
+
+def should_skip_megamoe_cutedsl(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo] = None,
+    dtype: Optional[torch.dtype] = None,
+    model_config: "MoeModelConfig" = None,
+    comm_method: Optional[str] = None,
+    moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
+    swiglu_gptoss_style: bool = False,
+) -> Optional[str]:
+    """Check MegaMoECuteDsl-specific constraints for the generic MoE test matrix.
+
+    Mirrors :func:`should_skip_megamoe_deepgemm` but applies to the
+    CuteDSL variant: NVFP4 + bfloat16 + 32-aligned hidden + 16-aligned
+    intermediate. Multi-rank coverage runs through the kernel's own
+    cuMem-based symmetric-memory provider (``MegaMoeSymmMemProvider``)
+    rather than the host ``Communication.dispatch`` strategies, so the
+    only sanctioned ``comm_method`` value here is the explicit
+    ``IGNORE`` sentinel used by the EPLB / dedicated MegaMoE multi-GPU
+    test paths. ``DEP`` and ``TEP`` parallel modes are accepted (EPLB
+    requires EP-shard routing); TP modes shard intermediate which
+    would break the per-slot weight layout.
+    """
+    if backend_type != MoeBackendType.MEGAMOE_CUTEDSL:
+        return None
+
+    if not torch.cuda.is_available():
+        return "MegaMoECuteDsl requires CUDA"
+
+    ok, reason = is_megamoe_cute_dsl_runtime_available()
+    if not ok:
+        return f"MegaMoECuteDsl runtime symbols missing: {reason}"
+
+    # Host-side comm methods (NVLINK_*, DEEPEP, allgather/reducescatter)
+    # are not compatible with the fused-comm kernel; the only acceptable
+    # comm_method here is the explicit IGNORE sentinel used by the
+    # EPLB / dedicated MegaMoE multi-GPU test paths (mirrors DG).
+    if comm_method is not None and comm_method != "IGNORE":
+        return (
+            "MegaMoECuteDsl uses an in-kernel cuMem symmetric-memory "
+            f"provider; cannot force host comm_method={comm_method}. "
+            "Use comm_method=IGNORE for MegaMoECuteDsl multi-GPU tests."
+        )
+
+    if parallel_mode is not None and parallel_mode not in ("DEP", "TEP"):
+        return f"MegaMoECuteDsl is EP-only; got parallel_mode={parallel_mode}"
+
+    if quant_algo != QuantAlgo.NVFP4:
+        return f"MegaMoECuteDsl only supports NVFP4 (got quant_algo={quant_algo})."
+
+    if dtype is not None and dtype != torch.bfloat16:
+        return f"MegaMoECuteDsl only supports bfloat16 activations (got dtype={dtype})."
+
+    if swiglu_gptoss_style:
+        return "MegaMoECuteDsl does not support swiglu_gptoss_style"
+
+    if moe_tp_size != 1:
+        return f"MegaMoECuteDsl is EP-only (got moe_tp_size={moe_tp_size})"
+
+    if model_config is not None:
+        hidden_size = model_config.hidden_size
+        intermediate_size = model_config.intermediate_size
+        # ProblemDesc.__post_init__ in upstream mega_runner.py:312-339:
+        # hidden % (2 * Nvfp4BlockSize=16) == 0 -> hidden % 32 == 0.
+        # expand_intermediate % (2 * Fc1GateUpInterleave=16) == 0 ->
+        # intermediate % 16 == 0 (since expand_intermediate = 2 *
+        # intermediate in the TRT-LLM convention).
+        if hidden_size % 32 != 0:
+            return (
+                f"MegaMoECuteDsl requires hidden_size % 32 == 0 (NVFP4 "
+                f"SF leg alignment); got hidden_size={hidden_size}"
+            )
+        if intermediate_size % 16 != 0:
+            return (
+                f"MegaMoECuteDsl requires intermediate_size % 16 == 0 "
+                f"(Fc1GateUpInterleave); got "
+                f"intermediate_size={intermediate_size}"
             )
 
     return None
@@ -771,8 +865,13 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM and MEGAMOE do not support autotuner capture
-    if backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.MEGAMOE):
+    # DEEPGEMM and both MegaMoE backends do not support autotuner capture
+    # (fused kernels own dispatch+combine).
+    if backend_type in (
+        MoeBackendType.DEEPGEMM,
+        MoeBackendType.MEGAMOE_DEEPGEMM,
+        MoeBackendType.MEGAMOE_CUTEDSL,
+    ):
         return False
 
     if use_flashinfer:
@@ -814,7 +913,14 @@ def get_quick_skip_reason(
         can_impl_kwargs = {"dtype_activation": dtype}
         if swiglu_gptoss_style:
             can_impl_kwargs["swiglu_gptoss_style"] = swiglu_gptoss_style
-        if backend_type == MoeBackendType.MEGAMOE and model_config is not None:
+        if (
+            backend_type
+            in (
+                MoeBackendType.MEGAMOE_DEEPGEMM,
+                MoeBackendType.MEGAMOE_CUTEDSL,
+            )
+            and model_config is not None
+        ):
             can_impl_kwargs["hidden_size"] = model_config.hidden_size
             can_impl_kwargs["intermediate_size"] = model_config.intermediate_size
         can_impl, skip_reason = backend_cls.can_implement(quant_algo, **can_impl_kwargs)
@@ -841,7 +947,14 @@ def get_quick_skip_reason(
             lambda: should_skip_densegemm(
                 backend_type, quant_algo=quant_algo, model_config=model_config
             ),
-            lambda: should_skip_megamoe(
+            lambda: should_skip_megamoe_deepgemm(
+                backend_type,
+                quant_algo=quant_algo,
+                dtype=dtype,
+                model_config=model_config,
+                swiglu_gptoss_style=swiglu_gptoss_style,
+            ),
+            lambda: should_skip_megamoe_cutedsl(
                 backend_type,
                 quant_algo=quant_algo,
                 dtype=dtype,

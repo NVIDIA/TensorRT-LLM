@@ -643,9 +643,25 @@ class MegaMoEDeepGemm(MoE):
         or ``torch.compile`` fallback ~60-260 us). Byte-identical
         output across all paths so DG's ``fp8_fp4_mega_moe`` consumes
         it unchanged.
+
+        Zero-token short-circuit: returns the DG empty layout (FP8 +
+        packed-UE8M0 int32 SF) directly. ``FusedCommMoEScheduler``
+        unconditionally calls ``quantize_input`` for every chunk
+        including zero-token chunks so peer ranks can cross the in-kernel
+        NVLink barrier; ``torch.ops.trtllm.mxfp8_quantize`` rejects empty
+        input on some builds, so the empty-layout synthesis stays here
+        rather than in the scheduler.
         """
         del post_quant_comm  # MegaMoE runs pre-quant comm via DG SymmBuffer
         x_bf16 = x.to(torch.bfloat16).contiguous()
+        if x_bf16.shape[0] == 0:
+            device = x_bf16.device
+            hidden = x_bf16.shape[1]
+            x_fp8 = torch.empty((0, hidden), dtype=torch.float8_e4m3fn, device=device)
+            # Packed-UE8M0 int32 SF: one int32 per 128 input elements per row,
+            # same stride contract as the non-empty runs for run_moe.
+            x_sf = torch.empty((0, max(hidden // 128, 0)), dtype=torch.int32, device=device)
+            return x_fp8, x_sf
         return _quantize_bf16_to_fp8_ue8m0(x_bf16)
 
     def supports_fused_prepare(self) -> bool:
