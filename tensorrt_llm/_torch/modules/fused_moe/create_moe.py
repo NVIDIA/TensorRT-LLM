@@ -584,7 +584,7 @@ def create_moe(
                                               CuteDslB12xFusedMoE):
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                        CuteDslB12xFusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
-                       MegaMoEDeepGemm, MegaMoECuteDsl):
+                       MegaMoEDeepGemm, MegaMoECuteDsl, MarlinFusedMoE):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

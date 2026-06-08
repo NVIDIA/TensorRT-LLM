@@ -961,7 +961,11 @@ class MarlinNVFP4RefGatedMLPFusedMoE(nn.Module):
                     ew[f"{proj}_bias"] = weights[f"{expert_id}.{proj}.bias"].cuda()
             self._expert_weights[expert_id] = ew
 
-    def cuda(self):
+    def cuda(self, device=None):
+        super().cuda(device)
+        for ew in self._expert_weights.values():
+            for name, tensor in ew.items():
+                ew[name] = tensor.cuda(device)
         return self
 
     def _activation(self, gate, value):

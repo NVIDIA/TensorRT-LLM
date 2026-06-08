@@ -57,6 +57,7 @@ from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
+from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .interface import MoESchedulerKind
 
@@ -781,6 +782,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
+
+        elif moe.backend.__class__ == MarlinFusedMoE:
+            kwargs["router_logits"] = router_logits
 
         return kwargs
 

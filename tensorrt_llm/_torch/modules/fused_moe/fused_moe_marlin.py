@@ -155,6 +155,7 @@ class MarlinFusedMoE(CutlassFusedMoE):
         tuner_top_k: Optional[int] = None,
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: Optional[bool] = None,
+        router_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert output_dtype is None or output_dtype == torch.bfloat16
         assert _has_fused_moe_kernel(), (
@@ -164,6 +165,12 @@ class MarlinFusedMoE(CutlassFusedMoE):
         assert x.dtype == torch.bfloat16
 
         output_dtype = torch.bfloat16
+
+        if token_selected_experts is None:
+            assert router_logits is not None, (
+                "MarlinFusedMoE.run_moe needs token_selected_experts or router_logits"
+            )
+            token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
 
         num_tokens = x.shape[0]
         top_k = token_selected_experts.shape[1]
