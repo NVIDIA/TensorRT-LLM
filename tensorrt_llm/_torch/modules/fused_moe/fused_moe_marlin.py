@@ -104,6 +104,31 @@ class MarlinFusedMoE(CutlassFusedMoE):
     def _supports_load_balancer(self) -> bool:
         return False
 
+    def validate_configurable_moe(self, moe) -> None:
+        """Reject configs that require external-communication MoE dispatch.
+
+        Marlin is W4A16 (``quantize_input`` produces no activation scale) and
+        routes internally inside ``run_moe``. The host-side all-to-all
+        dispatch/combine path that ConfigurableMoE uses for attention-DP
+        expert parallelism needs the routing decided *before* dispatch and a
+        per-token scale payload, so it is incompatible with Marlin and fails
+        inside ``moe_a2a_dispatch``.
+
+        ConfigurableMoE only creates an external communication strategy when
+        ``enable_attention_dp and dp_size > 1`` (see CommunicationFactory);
+        ``moe.comm`` is not assigned yet when this hook runs, so check that
+        same condition via the mapping. Single-GPU, and TP/EP without
+        attention DP, are supported.
+        """
+        if moe.use_dp and moe.mapping.dp_size > 1:
+            raise ValueError(
+                "MarlinFusedMoE does not support external-communication MoE "
+                "(attention data parallelism combined with expert "
+                "parallelism): its W4A16 layout and internal routing are "
+                "incompatible with the all-to-all dispatch path. Use Marlin "
+                "single-node, or with TP/EP without attention DP."
+            )
+
     def _apply_activation(self, gemm1_out: torch.Tensor) -> torch.Tensor:
         """Apply the activation function to the gemm1 output.
 
