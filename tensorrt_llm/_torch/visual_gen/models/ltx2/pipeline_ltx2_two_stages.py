@@ -35,7 +35,12 @@ from .ltx2_core.types import (
 )
 from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
-from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_files
+from .pipeline_ltx2 import (
+    LTX2Pipeline,
+    _assert_resolution,
+    _find_safetensors_files,
+    _prefetch_ltx2_safetensors_files,
+)
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -97,6 +102,7 @@ def _load_lora_deltas(
     sft_paths = _find_safetensors_files(lora_path)
     if not sft_paths:
         raise ValueError(f"No safetensors files found at {lora_path}")
+    _prefetch_ltx2_safetensors_files(sft_paths)
 
     raw: Dict[str, torch.Tensor] = {}
     alpha_dict: Dict[str, float] = {}
@@ -666,6 +672,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             sft_paths = _find_safetensors_files(spatial_upsampler_path)
             if not sft_paths:
                 raise ValueError(f"No safetensors files found at {spatial_upsampler_path}")
+            _prefetch_ltx2_safetensors_files(sft_paths)
 
             config: Dict[str, Any] = {}
             try:

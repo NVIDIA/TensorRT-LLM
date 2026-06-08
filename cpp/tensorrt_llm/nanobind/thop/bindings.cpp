@@ -145,11 +145,11 @@ void initBindings(nb::module_& m)
         nb::arg("is_fused_qkv"), nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"),
         nb::arg("local_layer_idx"), nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("tokens_per_block").none(), nb::arg("max_num_requests"), nb::arg("max_context_length"),
-        nb::arg("attention_window_size"), nb::arg("beam_width"), nb::arg("mask_type"), nb::arg("quant_mode"),
-        nb::arg("q_scaling"), nb::arg("position_embedding_type"), nb::arg("rope_dim"), nb::arg("rope_base"),
-        nb::arg("rope_scale_type"), nb::arg("rope_scale"), nb::arg("rope_short_m_scale"), nb::arg("rope_long_m_scale"),
-        nb::arg("rope_max_positions"), nb::arg("rope_original_max_positions"), nb::arg("use_paged_context_fmha"),
-        nb::arg("attention_input_type").none(), nb::arg("is_mla_enable"),
+        nb::arg("max_seq_len"), nb::arg("attention_window_size"), nb::arg("beam_width"), nb::arg("mask_type"),
+        nb::arg("quant_mode"), nb::arg("q_scaling"), nb::arg("position_embedding_type"), nb::arg("rope_dim"),
+        nb::arg("rope_base"), nb::arg("rope_scale_type"), nb::arg("rope_scale"), nb::arg("rope_short_m_scale"),
+        nb::arg("rope_long_m_scale"), nb::arg("rope_max_positions"), nb::arg("rope_original_max_positions"),
+        nb::arg("use_paged_context_fmha"), nb::arg("attention_input_type").none(), nb::arg("is_mla_enable"),
         nb::arg("chunked_prefill_buffer_batch_size").none(), nb::arg("q_lora_rank").none(),
         nb::arg("kv_lora_rank").none(), nb::arg("qk_nope_head_dim").none(), nb::arg("qk_rope_head_dim").none(),
         nb::arg("v_head_dim").none(), nb::arg("rope_append").none(), nb::arg("mrope_rotary_cos_sin").none(),
@@ -172,10 +172,11 @@ void initBindings(nb::module_& m)
         nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("sage_attn_num_elts_per_blk_q") = 0,
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
-        nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt, nb::arg("cross_attention") = false,
-        nb::arg("cross_kv") = std::nullopt, nb::arg("encoder_input_lengths") = std::nullopt,
-        nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
-        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
+        nb::arg("cross_attention") = false, nb::arg("cross_kv") = std::nullopt,
+        nb::arg("encoder_input_lengths") = std::nullopt, nb::arg("relative_attention_bias") = std::nullopt,
+        nb::arg("relative_attention_max_distance") = 0, "Multi-head attention operation",
+        nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",

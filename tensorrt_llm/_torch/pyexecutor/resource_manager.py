@@ -33,7 +33,7 @@ from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
+    DiskCacheTierConfig, GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManager as KVCacheManagerPy
@@ -674,17 +674,19 @@ class KVCacheManager(BaseResourceManager):
             self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens,
                                                 draft_loop_tokens)
 
+        # Resolve the per-layer window vector and clamp the pool windows to
+        # the same max_seq_len bound, so their window keys agree.
         self.max_attention_window_vec = self._resolve_max_attention_window_vec(
             kv_cache_config=kv_cache_config,
             max_seq_len=max_seq_len,
             num_layers=num_layers,
             layer_mask=layer_mask,
+            pool_configurations=self.pool_configurations,
         )
 
-        # Now that max_attention_window_vec is known, build layer -> pool_idx
-        # from the (pre-clamp) pool_configurations.  Stays valid through the
-        # window clamping below because that only rewrites per-pool
-        # window_size fields; pool indices don't shift.
+        # Build layer -> pool_idx now that the windows agree. Stays valid
+        # through the block-budget clamping below, which only rewrites
+        # per-pool window_size fields; pool indices don't shift.
         self._layer_to_pool_idx = self._build_layer_to_pool_idx()
 
         # Determine if this is VSWA (Variable Sliding Window Attention).
@@ -733,10 +735,9 @@ class KVCacheManager(BaseResourceManager):
                 live_state_slots = self.max_batch_size * pp_size
                 max_snapshots = live_state_slots
                 if kv_cache_config.enable_block_reuse:
-                    max_snapshots = max(
+                    max_snapshots += (
                         kv_cache_config.max_tokens //
-                        linear_attention_metadata.states_snapshot_interval,
-                        live_state_slots)
+                        linear_attention_metadata.states_snapshot_interval)
 
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
@@ -1287,6 +1288,7 @@ class KVCacheManager(BaseResourceManager):
         max_seq_len: int,
         num_layers: int,
         layer_mask: Optional[List[bool]],
+        pool_configurations: Optional[List["PoolConfiguration"]] = None,
     ) -> List[int]:
         """Compute the per-local-layer attention window vector.
 
@@ -1301,7 +1303,13 @@ class KVCacheManager(BaseResourceManager):
         * Otherwise: use the user-supplied vector verbatim, clamped
           element-wise to ``max_seq_len`` so the largest window can't skew
           the KV cache pool sizing.
+
+        ``pool_configurations`` (if given) are clamped in place to the same
+        ``max_seq_len`` bound so their window keys stay consistent with the
+        returned vector; ``_build_layer_to_pool_idx`` relies on that match.
         """
+        for pc in pool_configurations or []:
+            pc.window_size = min(pc.window_size, max_seq_len)
         if kv_cache_config.max_attention_window is None:
             return [max_seq_len]
         if len(kv_cache_config.max_attention_window) == num_layers:
@@ -2050,16 +2058,13 @@ class KVCacheManager(BaseResourceManager):
         pp_size = self.mapping.pp_size if self.mapping is not None else 1
         intercept = self.max_batch_size * pp_size * state_bytes_local
 
-        # heuristic: When block reuse is enabled, we assume the mamba snapshots are dominant instead of active states,
-        # otherwise we may run out of kv cache blocks prior to mamba blocks due to the large number of max_batch_size.
-        # So we ignore intercept and only calculate max_tokens based on slope
-        # This can be improved by a more accurate max_batch_size and ISL/OSL estimation in the future.
-        if mamba_slope > 0:
-            max_tokens = max((primary_budget) // slope, 0)
-        else:
-            max_tokens = max((primary_budget - intercept) // slope, 0)
+        max_tokens = max((primary_budget - intercept) // slope, 0)
         if kv_cache_config.max_tokens is not None:
             max_tokens = min(kv_cache_config.max_tokens, max_tokens)
+            if max_tokens < kv_cache_config.max_tokens:
+                logger.warning(
+                    f'The memory budget for Mamba + KV cache cannot fit the user-specified max_tokens of {kv_cache_config.max_tokens}. The calculated max_tokens based on the memory budget is {max_tokens}. Please consider adjusting max_batch_size/max_tokens/mamba_state_cache_interval.'
+                )
 
         kv_blocks_in_primary_pool = int(max_tokens // self.tokens_per_block)
 
@@ -2082,7 +2087,7 @@ class KVCacheManager(BaseResourceManager):
             max_snapshots += self.spec_config.max_draft_len
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
-            max_snapshots = max(max_tokens // interval, max_snapshots)
+            max_snapshots += max_tokens // interval
 
         secondary_snapshots = int(max_snapshots *
                                   (self._secondary_pool_memory_bytes /
@@ -2571,6 +2576,16 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers.append(HostCacheTierConfig(quota=host_quota))
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
+            )
+        disk_cache_size = kv_cache_config.disk_cache_size
+        if disk_cache_size is not None and disk_cache_size > 0:
+            disk_cache_path = kv_cache_config.disk_cache_path
+            assert disk_cache_path is not None
+            cache_tiers.append(
+                DiskCacheTierConfig(quota=disk_cache_size,
+                                    path=disk_cache_path))
+            logger.info(
+                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
         self.vocab_size = vocab_size
@@ -3105,6 +3120,18 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
+
+    def resume_request(self, req: LlmRequest) -> bool:
+        """Resume a previously-suspended KV cache for *req*.
+
+        Returns True if the cache is (or becomes) active on GPU, False if
+        resume was refused (e.g. GPU pressure above max_util_for_resume)
+        or no cache exists for the request.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        return self._resume_and_restore(req.py_request_id, kv_cache)
 
     # ---- prepare_resources ----
 

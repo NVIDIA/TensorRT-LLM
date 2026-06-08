@@ -375,9 +375,10 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits, std::optional<int64_t> compressed_kv_cache_pool_ptr,
-        bool const cross_attention, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> encoder_input_lengths, std::optional<torch::Tensor> relative_attention_bias) const
+        std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
+        std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const cross_attention,
+        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> encoder_input_lengths,
+        std::optional<torch::Tensor> relative_attention_bias) const
         = 0;
 };
 
@@ -444,9 +445,9 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits, std::optional<int64_t> compressed_kv_cache_pool_ptr,
-        bool const cross_attention, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> encoder_input_lengths,
+        std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
+        std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const cross_attention,
+        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> encoder_input_lengths,
         std::optional<torch::Tensor> relative_attention_bias) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
@@ -765,6 +766,7 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+        common_enqueue_params.trtllm_gen_jit_warmup = trtllm_gen_jit_warmup;
         if (cross_attention && encoder_input_lengths.has_value())
         {
             common_enqueue_params.encoder_input_lengths
@@ -966,9 +968,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool const is_fused_qkv, bool const update_kv_cache, int64_t const predicted_tokens_per_seq,
     int64_t const local_layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
     std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
-    int64_t const attention_window_size, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rope_dim, double const rope_base,
-    int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
+    int64_t const max_seq_len, int64_t const attention_window_size, int64_t const beam_width, int64_t const mask_type,
+    int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type, int64_t const rope_dim,
+    double const rope_base, int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
     double const rope_long_m_scale, int64_t const rope_max_positions, int64_t const rope_original_max_positions,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
@@ -995,7 +997,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
-    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
+    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
     std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const cross_attention,
     std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> encoder_input_lengths,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance)
@@ -1095,6 +1097,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mFP8GenerationMLA = false;
     op->mFuseFp4Quant = is_fp4_out;
     op->mMaxContextLength = max_context_length;
+    op->mMaxSeqLen = max_seq_len;
+    op->mMaxNumRequests = max_num_requests;
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
         = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));
@@ -1289,7 +1293,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            compressed_kv_cache_pool_ptr, cross_attention, cross_kv, encoder_input_lengths, relative_attention_bias);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, cross_attention, cross_kv, encoder_input_lengths,
+            relative_attention_bias);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1311,7 +1316,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            compressed_kv_cache_pool_ptr, cross_attention, cross_kv, encoder_input_lengths, relative_attention_bias);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, cross_attention, cross_kv, encoder_input_lengths,
+            relative_attention_bias);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
