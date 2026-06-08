@@ -14,6 +14,7 @@ from .hf.qwen2vl_weight_mapper import Qwen2VLHfWeightMapper
 from .hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from .hf.qwen3_next_weight_mapper import Qwen3NextHfWeightMapper
+from .hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from .hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .hf.weight_loader import HfWeightLoader
 from .hf.weight_mapper import HfWeightMapper
@@ -34,5 +35,5 @@ __all__ = [
     "Qwen3_5MoeHfWeightMapper", "Qwen3NextHfWeightMapper",
     "Gemma4HfWeightMapper", "LlavaNextHfWeightMapper",
     "MistralLarge3CheckpointLoader", "MistralLarge3WeightMapper",
-    "MXCheckpointLoader", "Qwen3VLHfWeightMapper"
+    "MXCheckpointLoader", "Qwen3VLHfWeightMapper", "Cosmos3HfWeightMapper"
 ]

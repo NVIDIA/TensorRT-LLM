@@ -101,6 +101,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Qwen3VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
 | `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
 | `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested         | Untested       | Untested              | Untested                  | L + I     |
+| `Cosmos3ForConditionalGeneration`    | Yes               | Yes        | Yes             | Untested      | Untested         | Untested       | Untested              | Untested                  | L + I + V |
 
 Note:
 - L: Language

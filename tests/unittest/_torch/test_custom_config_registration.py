@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for the transformers AutoConfig / AutoTokenizer dispatch
-for TRT-LLM-only model_types (deepseek_v32, kimi_k2).
+for TRT-LLM-only model_types (cosmos3_omni, deepseek_v32, kimi_k2).
 
 Before this registration, transformers >= 5.5 falls back to a bare
 PreTrainedConfig that lacks `max_position_embeddings`, and
@@ -17,39 +17,96 @@ import json
 import pytest
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
-from tensorrt_llm._torch.configs import DeepseekV3Config
+from tensorrt_llm._torch.configs import Cosmos3OmniConfig, DeepseekV3Config
+
+_COSMOS3_OMNI_MIN_CONFIG = {
+    "architectures": ["Cosmos3ForConditionalGeneration"],
+    "model_type": "cosmos3_omni",
+    "model": {"_target": "omni_mot_model"},
+    "text_config": {
+        "model_type": "qwen3_vl_text",
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "max_position_embeddings": 8192,
+        "vocab_size": 151936,
+    },
+    "vision_config": {
+        "model_type": "qwen3_vl",
+        "depth": 2,
+        "hidden_size": 256,
+        "intermediate_size": 512,
+        "num_heads": 4,
+        "out_hidden_size": 1024,
+    },
+}
 
 
-@pytest.mark.parametrize("model_type", ["deepseek_v32", "kimi_k2"])
-def test_custom_model_type_registered_with_autoconfig(model_type):
+def _deepseek_min_config(model_type: str) -> dict:
+    return {
+        "model_type": model_type,
+        "max_position_embeddings": 16384,
+    }
+
+
+def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None:
+    assert isinstance(cfg, config_cls)
+    assert cfg.model_type == model_type
+
+    if model_type == "cosmos3_omni":
+        assert not isinstance(cfg.text_config, dict)
+        assert not isinstance(cfg.vision_config, dict)
+        assert cfg.text_config.hidden_size == 1024
+        assert cfg.text_config.max_position_embeddings == 8192
+        assert cfg.vision_config.hidden_size == 256
+        assert cfg.vision_config.out_hidden_size == 1024
+    else:
+        assert cfg.max_position_embeddings == 16384
+
+
+@pytest.mark.parametrize(
+    ("model_type", "config_cls"),
+    [
+        ("cosmos3_omni", Cosmos3OmniConfig),
+        ("deepseek_v32", DeepseekV3Config),
+        ("kimi_k2", DeepseekV3Config),
+    ],
+)
+def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     assert model_type in CONFIG_MAPPING
-    assert CONFIG_MAPPING[model_type] is DeepseekV3Config
+    assert CONFIG_MAPPING[model_type] is config_cls
 
 
-@pytest.mark.parametrize("model_type", ["deepseek_v32", "kimi_k2"])
-def test_autoconfig_from_pretrained_resolves_to_local_config(tmp_path, model_type):
+@pytest.mark.parametrize(
+    ("model_type", "config_cls", "config_dict"),
+    [
+        ("cosmos3_omni", Cosmos3OmniConfig, _COSMOS3_OMNI_MIN_CONFIG),
+        ("deepseek_v32", DeepseekV3Config, _deepseek_min_config("deepseek_v32")),
+        ("kimi_k2", DeepseekV3Config, _deepseek_min_config("kimi_k2")),
+    ],
+)
+def test_autoconfig_from_pretrained_resolves_to_local_config(
+        tmp_path, model_type, config_cls, config_dict):
     # Mirrors what the benchmark_serving subprocess does under the hood:
     # AutoTokenizer.from_pretrained -> AutoConfig.from_pretrained. Without
     # the registration this fails through to a bare PreTrainedConfig that
-    # lacks `max_position_embeddings`.
+    # lacks expected fields (e.g. `max_position_embeddings`, nested
+    # `text_config` for Cosmos3 omni).
     from transformers import AutoConfig
 
     model_dir = tmp_path / model_type
     model_dir.mkdir()
-    (model_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": model_type,
-                "max_position_embeddings": 16384,
-            }
-        )
-    )
+    (model_dir / "config.json").write_text(json.dumps(config_dict))
 
     cfg = AutoConfig.from_pretrained(str(model_dir))
-    assert isinstance(cfg, DeepseekV3Config)
-    assert cfg.max_position_embeddings == 16384
+    _verify_autoconfig_from_pretrained(cfg, model_type, config_cls)
+    if model_type == "cosmos3_omni":
+        assert cfg._name_or_path == str(model_dir)
 
 
 @pytest.mark.parametrize("model_type", ["deepseek_v32", "kimi_k2"])

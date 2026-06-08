@@ -1049,7 +1049,10 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = config.text_config
-        if self.original_arch == "Qwen3VLForConditionalGeneration":
+        if self.original_arch in (
+                "Qwen3VLForConditionalGeneration",
+                "Cosmos3ForConditionalGeneration",
+        ):
             llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
         elif self.original_arch == "Qwen3VLMoeForConditionalGeneration":
             llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
