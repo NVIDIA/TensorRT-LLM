@@ -786,6 +786,7 @@ accuracy/test_llm_api_pytorch.py::TestStep3_7::test_auto_dtype[tp_size=8-ep_size
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=0] TIMEOUT (90)
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] TIMEOUT (90)
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4-mtp_nextn=0] TIMEOUT (90)
+accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4-mtp_nextn=3] TIMEOUT (90)
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-eager]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp]
