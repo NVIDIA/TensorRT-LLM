@@ -53,6 +53,9 @@ BlockHash = Union[int, str]
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
+# Leading token-id count folded into the affinity key so pre-tokenized
+# requests (placeholder message content) still key per conversation.
+ROUTE_AFFINITY_TOKEN_PREFIX = 256
 
 
 def get_request_num_tokens(request: OpenAIRequest) -> int:
@@ -1108,6 +1111,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             content = (message.get("content") if isinstance(message, dict) else
                        getattr(message, "content", ""))
             parts.append(str(content))
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if token_ids:
+            parts.append(str(list(token_ids[:ROUTE_AFFINITY_TOKEN_PREFIX])))
         return hash("".join(parts))
 
     async def get_next_server(
