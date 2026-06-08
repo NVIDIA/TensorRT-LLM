@@ -516,6 +516,15 @@ class RequestBroadcaster:
 
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks."""
+        request_count = len(new_requests) if self.dist.rank == 0 else 0
+        # Idle non-root ranks can wait here while rank 0 blocks in the
+        # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
+        with self.hang_detector.pause():
+            request_count = self._broadcast_request_count(request_count)
+
+        if request_count == 0:
+            return [], None
+
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
         else:
@@ -531,6 +540,30 @@ class RequestBroadcaster:
                 )
 
         return new_requests, py_request_objects
+
+    def _broadcast_request_count(self, request_count: int) -> int:
+        """Broadcast rank 0's request count using the same PP route as requests."""
+        if self.dist.world_size == 1:
+            return request_count
+
+        if not self.dist.has_pp:
+            return self.dist.broadcast(request_count, root=0)
+
+        if self.dist.is_first_pp_rank:
+            with nvtx_range("tp_broadcast_request_count"):
+                request_count = self.dist.tp_cp_broadcast(request_count, root=0)
+
+        tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
+
+        if not self.dist.is_first_pp_rank:
+            with nvtx_range("recv_request_count_from_prev_pp"):
+                request_count = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+
+        if not self.dist.is_last_pp_rank:
+            with nvtx_range("send_request_count_to_next_pp"):
+                self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
+
+        return request_count
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""

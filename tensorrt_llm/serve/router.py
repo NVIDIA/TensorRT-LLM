@@ -136,6 +136,9 @@ class KvCacheAwareServerState(ServerState):
         }
         self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         self._tokens_per_block = tokens_per_block
+        self._poll_task: Optional[asyncio.Task] = None
+        self._poll_pending: bool = False
+        self._poll_session = None
 
     @property
     def hash_algo(self) -> str:
@@ -165,8 +168,7 @@ class KvCacheAwareServerState(ServerState):
         hash_algo = self._resolve_hash_algo(hash_algo)
         self.set_hash_algo(hash_algo)
         block_table = self._block_table(hash_algo)
-        for block_hash in block_hashes:
-            block_table.add(block_hash)
+        block_table.update(block_hashes)
 
     def remove_blocks(self,
                       block_hashes: Iterable[BlockHash],
@@ -174,8 +176,7 @@ class KvCacheAwareServerState(ServerState):
         hash_algo = self._resolve_hash_algo(hash_algo)
         self.set_hash_algo(hash_algo)
         block_table = self._block_table(hash_algo)
-        for block_hash in block_hashes:
-            block_table.discard(block_hash)
+        block_table.difference_update(block_hashes)
 
     def update_with_events(self, events: Iterable[dict]):
         # event_raw: {"id": <id>, "data": <event body>}
@@ -236,6 +237,36 @@ class KvCacheAwareServerState(ServerState):
         except Exception as e:
             logger.warning(
                 f"Failed to poll KV cache events from {self._server}: {e}")
+
+    def schedule_poll_and_update(self, session=None) -> None:
+        # Coalesce concurrent polls into one in-flight task, but record that a
+        # fresh poll was requested so the running task re-polls once more before
+        # exiting. Without the re-arm, a poll requested by the LAST
+        # finish_request while a poll is already in flight would be dropped and
+        # its KV events stranded until the next request (which may never come).
+        # The strong ref on _poll_task keeps the task alive for the GC.
+        self._poll_pending = True
+        self._poll_session = session
+        if self._poll_task is not None and not self._poll_task.done():
+            return
+        self._poll_task = asyncio.create_task(self._drain_poll_and_update())
+
+    async def _drain_poll_and_update(self) -> None:
+        while self._poll_pending:
+            self._poll_pending = False
+            await self.poll_and_update(self._poll_session)
+
+    async def cancel_poll_task(self) -> None:
+        # Cancel and await the background poll so shutdown leaves no orphaned
+        # task polling a closed session.
+        self._poll_pending = False
+        if self._poll_task is not None and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+        self._poll_task = None
 
     def num_active_tokens(self):
         return self._num_active_tokens
@@ -796,40 +827,57 @@ class BlockHashMixin:
                     tokenizer, model, trust_remote_code=True)
         return self._tokenizers[model]
 
+    def _encode_with_prefix_cache(self, rendered: str, key: int,
+                                  tokenizer) -> list[int]:
+        cache = getattr(self, "_tok_prefix_cache", None)
+        if cache is None:
+            cache = self._tok_prefix_cache = OrderedDict()
+        entry = cache.get(key)
+        if entry is not None and len(rendered) > len(entry[0]) and \
+                rendered.startswith(entry[0]):
+            ids = entry[1] + tokenizer.encode(rendered[len(entry[0]):],
+                                              add_special_tokens=False)
+        else:
+            ids = tokenizer.encode(rendered, add_special_tokens=False)
+        cache[key] = (rendered, ids)
+        cache.move_to_end(key)
+        while len(cache) > 1024:
+            cache.popitem(last=False)
+        return ids
+
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
             tokenizer = self._get_tokenizer(request.model)
-            # Forward tools and chat_template_kwargs so custom tokenizers
-            # (e.g. DeepseekV32Tokenizer) render tool schemas and respect
-            # template flags like `thinking=true` when computing the prompt
-            # token ids used for cache-aware routing AND passed downstream
-            # (prompt_token_ids makes the worker skip re-tokenization).
             tool_dicts = (None if getattr(request, "tools", None) is None else [
                 tool.model_dump() if hasattr(tool, "model_dump") else tool
                 for tool in request.tools
             ])
             chat_template_kwargs = (request.chat_template_kwargs if getattr(
                 request, "chat_template_kwargs", None) else {})
-            result = tokenizer.apply_chat_template(
+            rendered = tokenizer.apply_chat_template(
                 [
                     msg if isinstance(msg, dict) else dict(msg)
                     for msg in request.messages
                 ],
                 add_generation_prompt=request.add_generation_prompt,
-                tokenize=True,
+                tokenize=False,
                 return_dict=False,
                 tools=tool_dicts,
                 **chat_template_kwargs,
             )
-            # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
-            # string from apply_chat_template even with tokenize=True.
-            # Encode to token IDs if needed.
-            if isinstance(result, str):
-                result = tokenizer.encode(result, add_special_tokens=False)
-            # Set prompt_token_ids so the worker server skips re-tokenization
+            if isinstance(rendered, str):
+                key = hash("".join(
+                    str(
+                        msg.get("content") if isinstance(msg, dict) else
+                        getattr(msg, "content", ""))
+                    for msg in request.messages[:2]))
+                result = self._encode_with_prefix_cache(rendered, key,
+                                                        tokenizer)
+            else:
+                result = list(rendered)
             request.prompt_token_ids = result
             return [result]
 
@@ -950,6 +998,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  tokens_per_block: int = 32,
                  custom_tokenizer: Optional[str] = None,
                  backfill_block_hashes_on_finish: bool = False,
+                 load_weight: float = 0.25,
+                 load_cap: float = float("inf"),
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -957,20 +1007,93 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        self._load_weight = load_weight
+        self._load_cap = load_cap
         # Opt-in workaround for the disagg-gen path that doesn't emit
         # kv_cache_events. Stash hashes at routing, inject on finish.
         self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish
-        self._pending_block_hashes: dict[int, tuple[list, str]] = {}
+        self._inflight_backfill_hashes: dict[int, tuple[list[BlockHash],
+                                                        str]] = {}
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
                                        self._tokens_per_block,
                                        lambda: self.session)
 
-    async def _get_server_hash_algo(self, server: str) -> str:
-        server_info = self._server_info.get(server, {})
-        hash_algo = server_info.get("kv_cache_hash_algo")
-        return await self._server_state[server].get_hash_algo(hash_algo)
+    async def close(self):
+        for state in self._server_state.values():
+            await state.cancel_poll_task()
+        await super().close()
+
+    def _stash_backfill_on_route(self, request: OpenAIRequest,
+                                 block_hashes: list[list[BlockHash]],
+                                 hash_algo: str) -> None:
+        if not self._backfill_block_hashes_on_finish:
+            return
+        flat = [h for hl in block_hashes for h in hl]
+        self._inflight_backfill_hashes[id(request)] = (flat, hash_algo)
+
+    def _apply_backfill_on_finish(self, request: OpenAIRequest,
+                                  server: Optional[str], success: bool) -> None:
+        # Pop unconditionally to avoid leaks; apply only when eligible.
+        entry = self._inflight_backfill_hashes.pop(id(request), None)
+        if not (self._backfill_block_hashes_on_finish and success):
+            return
+        if entry is None:
+            return
+        if server is None or server not in self._server_state:
+            return
+        flat_block_hashes, hash_algo = entry
+        self._server_state[server].add_blocks(flat_block_hashes,
+                                              hash_algo=hash_algo)
+
+    def _get_server_hash_algo(self, server: str) -> str:
+        # Lock-free attribute read; state is seeded at handshake and refreshed
+        # by update_with_events.
+        return self._server_state[server].hash_algo
+
+    async def _prepare_server(self, server: str):
+        await super()._prepare_server(server)
+        if server not in self._prepared_ready_servers:
+            return
+        info = self._server_info.get(server, {})
+        worker_tpb = info.get("tokens_per_block")
+        if worker_tpb is not None and worker_tpb != self._tokens_per_block:
+            larger = max(worker_tpb, self._tokens_per_block)
+            smaller = min(worker_tpb, self._tokens_per_block)
+            if larger % smaller != 0:
+                self._prepared_ready_servers.discard(server)
+                self._server_info.pop(server, None)
+                raise RuntimeError(
+                    f"tokens_per_block mismatch on {server}: "
+                    f"router={self._tokens_per_block} worker={worker_tpb} are not divisible. "
+                    f"Align kv_cache_config.tokens_per_block so that one evenly divides the other."
+                )
+            logger.warning(
+                "tokens_per_block mismatch on %s: router=%d worker=%d. "
+                "KV events from worker will not align with router block hashes; "
+                "use backfill_block_hashes_on_finish=true for best hit rate.",
+                server, self._tokens_per_block, worker_tpb)
+        worker_algo = info.get("kv_cache_hash_algo")
+        known_algos = {
+            KV_CACHE_HASH_ALGO_V1,
+            KV_CACHE_HASH_ALGO_V2,
+            KV_CACHE_HASH_ALGO_V2_SHA256_64,
+        }
+        if worker_algo is None:
+            # Silent default would map a V2 worker's hashes to V1.
+            logger.warning(
+                f"{server} did not expose kv_cache_hash_algo in /server_info; "
+                f"router will assume {KV_CACHE_HASH_ALGO_DEFAULT}.")
+        elif worker_algo not in known_algos:
+            self._prepared_ready_servers.discard(server)
+            self._server_info.pop(server, None)
+            raise RuntimeError(
+                f"Unknown kv_cache_hash_algo on {server}: {worker_algo!r}. "
+                f"Router supports {sorted(known_algos)}.")
+        else:
+            # Persist once so per-request reads can skip the lock+await.
+            self._server_state[server].set_hash_algo(worker_algo)
 
     async def get_next_server(
             self,
@@ -986,7 +1109,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     f"No available servers after excluding {exclude_server}")
         cache_salt_id = self._get_request_cache_salt_id(request)
         hash_algo_by_server = {
-            server: await self._get_server_hash_algo(server)
+            server: self._get_server_hash_algo(server)
             for server in servers
         }
         # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
@@ -999,18 +1122,13 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         token_lists, block_hashes_by_algo = await asyncio.to_thread(
             self._tokenize_and_compute_block_hashes_by_algo, request,
             hash_algo_by_server.values(), cache_salt_id)
-        padded_tokens_by_algo = {
-            hash_algo:
-            max(
-                sum(len(hash_list)
-                    for hash_list in block_hashes) * self._tokens_per_block, 1)
-            for hash_algo, block_hashes in block_hashes_by_algo.items()
-        }
-        # select the server by (KV match - load)
-        # TODO: more options
+        # select the server by (KV match - load), bounded by load_cap
         workloads = [
             self._server_state[server].num_active_requests()
             for server in servers
+        ]
+        load_fractions = [
+            workloads[i] / self._max_batch_size for i in range(len(servers))
         ]
         scores = []
         matches = []
@@ -1018,15 +1136,22 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server = servers[i]
             hash_algo = hash_algo_by_server[server]
             block_hashes = block_hashes_by_algo[hash_algo]
-            padded_tokens = padded_tokens_by_algo[hash_algo]
             # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
             matches.append(await self._server_state[server].matched_tokens(
                 block_hashes, hash_algo))
-            score = matches[-1] / padded_tokens - workloads[
-                i] / self._max_batch_size
+            score = matches[-1] / self._tokens_per_block - self._load_weight * \
+                workloads[i]
             scores.append(score)
-        max_score = max(scores)
-        tied = [i for i, s in enumerate(scores) if s == max_score]
+        # Optional hard cap: drop servers at/over load_cap; fall back to all if
+        # none remain. Disabled by default (load_cap=inf) to match the original
+        # score-only selection.
+        candidate_idx = [
+            i for i, lf in enumerate(load_fractions) if lf < self._load_cap
+        ]
+        if not candidate_idx:
+            candidate_idx = list(range(len(servers)))
+        max_score = max(scores[i] for i in candidate_idx)
+        tied = [i for i in candidate_idx if scores[i] == max_score]
         winner = tied[self._rr_counter % len(tied)]
         self._rr_counter += 1
         server = servers[winner]
@@ -1034,9 +1159,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         block_hashes = block_hashes_by_algo[hash_algo]
         async with self._lock:
             await self._register_request(server, request)
-            if self._backfill_block_hashes_on_finish:
-                self._pending_block_hashes[id(request)] = (block_hashes,
-                                                           hash_algo)
+            self._stash_backfill_on_route(request, block_hashes, hash_algo)
         return server, {
             "block_hashes": block_hashes,  # list[list[int | str]]
             "hash_algo": hash_algo,
@@ -1051,21 +1174,12 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                              success: bool = True):
         async with self._lock:
             server = self._req_routing_table.pop(id(request), None)
-            # Pop unconditionally to avoid leaks; only use for backfill on success.
-            pending = self._pending_block_hashes.pop(id(request), None)
-            if not (self._backfill_block_hashes_on_finish and success):
-                pending = None
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
+        self._apply_backfill_on_finish(request, server, success)
         if server is not None and server in self._server_state:
-            # Inject just-served block_hashes into server state — see __init__ note.
-            if pending is not None:
-                block_hashes, hash_algo = pending
-                flat_hashes = (h for hash_list in block_hashes
-                               for h in hash_list)
-                self._server_state[server].add_blocks(flat_hashes,
-                                                      hash_algo=hash_algo)
-            await self._server_state[server].poll_and_update(session)
+            # Fire-and-forget; poll runs in background and coalesces per server.
+            self._server_state[server].schedule_poll_and_update(session)
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
@@ -1435,91 +1549,71 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         self._validate_servers_available()
 
-        # Pre-compute outside the lock (tokenization + hashing)
         conv_id = self._get_conversation_id(request)
+
+        # Explicit conversation_id: route by the session table alone and never
+        # touch request content. Block hashes are consumed only by the implicit
+        # prefix-match path below (requests with no conversation_id), so for a
+        # pinned session -- new or already-seen -- the GIL-bound
+        # _request_to_block_hashes is pure overhead that would serialize the
+        # single orchestrator event loop and cap dispatch throughput.
+        if conv_id:
+            weight = self._estimate_content_weight(request)
+            async with self._lock:
+                entry = self._session_table.get(conv_id)
+                if (entry is not None and entry[0] in self._server_state
+                        and entry[0] != exclude_server):
+                    # Sticky hit: keep the pinned server, refresh LRU only.
+                    server = entry[0]
+                    self._session_table.move_to_end(conv_id)
+                    await self._register_request(server, request)
+                    self._add_content_load(server, request, weight)
+                else:
+                    # New conversation_id (or its server is gone/excluded):
+                    # pin to the least-loaded server. Store no block hashes --
+                    # the trie is only read for conversation_id-less requests.
+                    server = self._select_least_loaded(exclude_server)
+                    if server is None:
+                        raise ValueError("No available servers after excluding "
+                                         f"{exclude_server}")
+                    await self._register_request(server, request)
+                    self._add_content_load(server, request, weight)
+                    self._update_session(conv_id, server, [])
+                return server, {
+                    "server_info": self._server_info.get(server, {})
+                }
+
+        # No conversation_id: content-based routing. Compute block hashes
+        # (outside the lock) for implicit prefix matching, else least-loaded.
         block_hashes = self._request_to_block_hashes(request)
         weight = self._estimate_content_weight(request, block_hashes)
 
         async with self._lock:
+            matched_id = self._find_matching_session(block_hashes,
+                                                     exclude_server)
+            if matched_id is not None:
+                server, _ = self._session_table[matched_id]
+                self._update_session(matched_id, server, block_hashes)
+                await self._register_request(server, request)
+                self._add_content_load(server, request, weight)
+                logger.debug(
+                    f"ConversationRouter: IMPLICIT match conv_id={matched_id} "
+                    f"-> server={server}, weight={weight}")
+                return server, {
+                    "server_info": self._server_info.get(server, {})
+                }
 
-            # 1. Explicit conversation_id — sticky routing.
-            #    Always honour session affinity when the server is alive
-            #    and not explicitly excluded.  No overload gate — the
-            #    server itself provides backpressure.
-            if conv_id and conv_id in self._session_table:
-                sticky_server, _ = self._session_table[conv_id]
-                if sticky_server not in self._server_state:
-                    logger.debug(
-                        f"ConversationRouter: STICKY MISS conv_id={conv_id} "
-                        f"-> server={sticky_server} NOT in server_state, "
-                        f"falling through to FALLBACK")
-                elif sticky_server == exclude_server:
-                    logger.debug(
-                        f"ConversationRouter: STICKY MISS conv_id={conv_id} "
-                        f"-> server={sticky_server} is exclude_server")
-                else:
-                    self._update_session(conv_id, sticky_server, block_hashes)
-                    await self._register_request(sticky_server, request)
-                    self._add_content_load(sticky_server, request, weight)
-                    loads = {
-                        s: self._get_content_load(s)
-                        for s in self._servers
-                    }
-                    logger.debug(
-                        f"ConversationRouter: STICKY conv_id={conv_id} "
-                        f"-> server={sticky_server}, "
-                        f"content_loads={loads}, weight={weight}")
-                    return sticky_server, {
-                        "server_info": self._server_info.get(sticky_server, {})
-                    }
-            elif conv_id:
-                logger.debug(f"ConversationRouter: NEW conv_id={conv_id} "
-                             f"not in session_table "
-                             f"(size={len(self._session_table)})")
-
-            # 2. Implicit block-hash prefix matching.
-            #    Always honour match when the server is alive.
-            matched_id = None
-            if not conv_id:
-                matched_id = self._find_matching_session(
-                    block_hashes, exclude_server)
-                if matched_id is not None:
-                    sticky_server, _ = self._session_table[matched_id]
-                    self._update_session(matched_id, sticky_server,
-                                         block_hashes)
-                    await self._register_request(sticky_server, request)
-                    self._add_content_load(sticky_server, request, weight)
-                    loads = {
-                        s: self._get_content_load(s)
-                        for s in self._servers
-                    }
-                    logger.debug(
-                        f"ConversationRouter: IMPLICIT match "
-                        f"conv_id={matched_id} -> server={sticky_server}, "
-                        f"content_loads={loads}, weight={weight}")
-                    return sticky_server, {
-                        "server_info": self._server_info.get(sticky_server, {})
-                    }
-
-            # 3. Fallback — least-loaded server for new sessions or
-            #    sessions whose sticky server is unavailable.
             server = self._select_least_loaded(exclude_server)
             if server is None:
                 raise ValueError(
                     f"No available servers after excluding {exclude_server}")
             await self._register_request(server, request)
             self._add_content_load(server, request, weight)
-
-            # Store session mapping.
-            if not conv_id:
-                conv_id = self._generate_implicit_id()
-            self._update_session(conv_id, server, block_hashes)
-            loads = {s: self._get_content_load(s) for s in self._servers}
-            logger.debug(
-                f"ConversationRouter: FALLBACK conv_id={conv_id} "
-                f"-> server={server}, content_loads={loads}, weight={weight}")
-
-        return server, {"server_info": self._server_info.get(server, {})}
+            implicit_id = self._generate_implicit_id()
+            self._update_session(implicit_id, server, block_hashes)
+            logger.debug(f"ConversationRouter: FALLBACK conv_id={implicit_id} "
+                         f"-> server={server}, weight={weight}")
+            return server, {"server_info": self._server_info.get(server, {})}
 
     async def finish_request(self,
                              request: OpenAIRequest,

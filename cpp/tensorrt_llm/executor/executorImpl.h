@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -310,12 +310,12 @@ private:
     std::unordered_map<IdType, std::vector<IdType>> mChildReqIdsMap;
 
     // Iteration stats
-    IterationType mIterStatsMaxIterations;
+    SizeType32 mIterStatsMaxIterations;
     std::mutex mIterStatsMtx;
     std::deque<IterationStats> mIterationStats;
 
     // Request stats
-    IterationType mRequestStatsMaxIterations;
+    SizeType32 mRequestStatsMaxIterations;
     std::mutex mRequestStatsMtx;
     std::deque<RequestStatsPerIteration> mRequestStats;
 

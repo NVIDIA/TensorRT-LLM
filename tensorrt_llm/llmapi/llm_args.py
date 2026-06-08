@@ -395,6 +395,27 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
                         f"for non-Blackwell GPUs.")
         return self
 
+    @model_validator(mode="after")
+    def _warn_heuristic_topk_unsupported(self):
+        """Warn (not raise) when GVR Top-K is enabled with an index_topk the
+        kernel cannot accelerate.
+
+        The C++ ``indexer_topk_decode`` dispatcher silently falls back to the
+        radix Top-K path for unsupported K, so without this warning a user may
+        believe GVR is active when it is not. ``index_topk`` may still be None
+        here (it is filled from the checkpoint later), so only validate
+        concrete values.
+        """
+        supported_topk = (512, 1024, 2048)
+        if (self.enable_heuristic_topk and self.index_topk is not None
+                and self.index_topk not in supported_topk):
+            logger.warning(
+                f"enable_heuristic_topk=True but index_topk={self.index_topk} "
+                f"is not in the GVR-supported set {supported_topk}; the indexer "
+                f"will silently fall back to the radix Top-K path. Set "
+                f"index_topk to one of {supported_topk} to use GVR.")
+        return self
+
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
@@ -743,6 +764,19 @@ class AttentionDpConfig(StrictBaseModel):
         "share a long system prefix; for diverse-prompt workloads this can "
         "scatter requests that would otherwise consolidate on a single warm "
         "rank, wasting prefill. Default False preserves pre-warmup routing. "
+        "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_account_for_in_transfer: bool = Field(
+        default=False,
+        description=
+        "In-transfer load accounting in KV cache-aware routing. When True, "
+        "requests still streaming KV to the GEN worker (tracked by the "
+        "PyExecutor AsyncTransferManager but no longer in active_requests) "
+        "are folded back into the per-rank load reported via RankState. "
+        "This can improve balance under heavy disagg traffic but inflates "
+        "num_active_requests reported upstream, which lets the inference "
+        "loop's idle-fetch wait expire even when no requests are runnable "
+        "and causes empty fetch cycles. Default False preserves the prior "
+        "behaviour (fetch blocks when truly idle). "
         "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
@@ -3094,12 +3128,18 @@ class BaseLlmArgs(StrictBaseModel):
 
     iter_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for iter stats.",
+        ge=-1,
+        description=
+        "The maximum number of iterations for iter stats. Set to -1 to keep all iteration stats. "
+        "Set to 0 to disable iteration stats in the TensorRT executor.",
         status="prototype")
 
     request_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for request stats.",
+        ge=-1,
+        description=
+        "The maximum number of iterations for request stats. Set to -1 to keep all request stats. "
+        "Set to 0 to disable request stats.",
         status="prototype")
 
     # A handful of options from PretrainedConfig
@@ -4146,9 +4186,19 @@ class TorchLlmArgs(BaseLlmArgs):
 
     max_stats_len: int = Field(
         default=1000,
-        description="The max number of performance statistic entries.",
+        ge=-1,
+        description=
+        "The max number of performance statistic entries. Set to -1 to keep all entries. "
+        "Set to 0 to use a minimum buffer size of 1.",
         status="prototype",
     )
+
+    @field_validator('max_stats_len')
+    @classmethod
+    def normalize_max_stats_len(cls, v):
+        if v == -1:
+            return v
+        return max(v, 1)
 
     layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
         default_factory=LayerwiseBenchmarksConfig,
