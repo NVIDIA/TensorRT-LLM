@@ -2423,6 +2423,22 @@ class AttentionDescriptor(ABC):
         return False
 
     @classmethod
+    def kernel_handles_cyclic_swa(cls) -> bool:
+        """Whether the backend's kernel applies the sliding-window mask itself.
+
+        When ``True`` (e.g. the trtllm ``thop.attention`` kernel), the kernel
+        cyclically indexes the KV cache internally using the per-layer attention
+        window, so the executor must hand it the *full* per-window block table
+        and a *global* (un-window-capped) KV length -- the same contract as the
+        PyTorch backend.
+
+        When ``False`` (default; e.g. triton / flashinfer), the kernel does not
+        cyclic-index, so the executor must host-slice the block table down to the
+        live sliding-window view (see ``ad_executor._compute_window_local_view``).
+        """
+        return False
+
+    @classmethod
     @abstractmethod
     def get_standard_metadata_args(cls) -> List[str]:
         """Get the list of standard metadata arguments that are expected by the attention op."""

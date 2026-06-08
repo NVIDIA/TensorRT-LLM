@@ -54,8 +54,13 @@ def test_custom_values():
 
 
 def test_requires_uniform_kv_caches_follows_attention_backend():
-    """TRTLLM requires stricter KV cache compatibility than FlashInfer."""
-    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is True
+    """No attention backend currently requires uniform KV caches.
+
+    The trtllm backend used to force a single KV pool, but it now supports
+    multiple KV cache memory pools for non-uniform sliding-window models, so the
+    flag defaults to False for all backends.
+    """
+    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is False
     assert (
         LlmArgs(model="test-model", attn_backend="flashinfer").requires_uniform_kv_caches is False
     )
