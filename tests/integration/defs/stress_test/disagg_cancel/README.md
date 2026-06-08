@@ -1,7 +1,7 @@
 # Disaggregated Cancellation Stress-Test Suite
 
 Marathon-style stress tests that gate regressions of the bug class
-fixed by [PR #13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713)
+fixed by <https://github.com/NVIDIA/TensorRT-LLM/pull/13713>
 (cleanup / lifetime / quiescence invariants in the disagg KV
 transceiver under heavy mid-flight cancellation).
 
@@ -9,7 +9,7 @@ transceiver under heavy mid-flight cancellation).
 |---|---|
 | **Tracked by** | [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648), [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) |
 | **Bug it gates** | NVBug 6104831 (disaggregated permanent wedge) |
-| **Fix it gates** | [PR #13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) |
+| **Fix it gates** | <https://github.com/NVIDIA/TensorRT-LLM/pull/13713> |
 
 ## Status
 
@@ -22,12 +22,12 @@ land incrementally:
 | `metrics_thread` | Implemented — `trtllm_kv_cache_utilization` scraper |
 | `injector_thread` | Implemented — SIGSTOP/SIGCONT/SIGKILL + respawn |
 | `canary_thread` | Implemented — greedy canaries + token-equivalence |
-| `load_thread` | Stub |
+| `load_thread` | Implemented — duration-bounded steady/burst cancellation load |
 
 Component-level coverage: `test_log_scanner.py`, `test_metrics_thread.py`,
-`test_injector.py`, `test_canary.py`. The parametrized marathon pytest
-still runs a lifecycle smoke until `setup()` launches a real cluster
-and the remaining thread (`load`) is wired.
+`test_injector.py`, `test_canary.py`, `test_load_thread.py`. The
+parametrized marathon pytest still runs a lifecycle smoke until
+`setup()` launches a real cluster.
 
 ## File layout
 
@@ -41,6 +41,7 @@ tests/integration/defs/stress_test/disagg_cancel/
 ├── test_metrics_thread.py          (metrics_thread unit tests)
 ├── test_injector.py                (injector unit tests)
 ├── test_canary.py                  (canary_thread unit tests)
+├── test_load_thread.py             (load_thread unit tests)
 └── configs/
     ├── README.md                   (YAML schema + how to add a config)
     ├── marathon_cpp_v1_deepseek.yaml
@@ -61,7 +62,7 @@ Future additions:
 The marathons are **not** registered in pre-merge CI. They are run
 nightly / weekly via
 `tests/integration/test_lists/qa/llm_function_stress.txt` (wiring
-lands together with the load-thread implementation).
+lands with the explicit CI-registration change).
 
 ### Unit tests (no GPU, no cluster)
 
@@ -77,21 +78,26 @@ cd /path/to/TensorRT-LLM
 
 export PYTHONPATH=tests/integration/defs:tests/integration/defs/disaggregated
 
-# Step 4 — canary thread (greedy canaries + token-equivalence)
+# Steps 1-2 — log scanner + metrics (optional sanity)
 python3 -m pytest -c /dev/null -o addopts= \
   --confcutdir=tests/integration/defs/stress_test \
-  tests/integration/defs/stress_test/disagg_cancel/test_canary.py -v
+  tests/integration/defs/stress_test/disagg_cancel/test_log_scanner.py \
+  tests/integration/defs/stress_test/disagg_cancel/test_metrics_thread.py -v
 
 # Step 3 — injector thread (SIGSTOP / SIGCONT / SIGKILL + respawn)
 python3 -m pytest -c /dev/null -o addopts= \
   --confcutdir=tests/integration/defs/stress_test \
   tests/integration/defs/stress_test/disagg_cancel/test_injector.py -v
 
-# Steps 1-2 — log scanner + metrics (optional sanity)
+# Step 4 — canary thread (greedy canaries + token-equivalence)
 python3 -m pytest -c /dev/null -o addopts= \
   --confcutdir=tests/integration/defs/stress_test \
-  tests/integration/defs/stress_test/disagg_cancel/test_log_scanner.py \
-  tests/integration/defs/stress_test/disagg_cancel/test_metrics_thread.py -v
+  tests/integration/defs/stress_test/disagg_cancel/test_canary.py -v
+
+# Step 5 — load thread (steady/burst wrapper around cancel stress load)
+python3 -m pytest -c /dev/null -o addopts= \
+  --confcutdir=tests/integration/defs/stress_test \
+  tests/integration/defs/stress_test/disagg_cancel/test_load_thread.py -v
 
 # Marathon YAML parse/validate (includes stress_config.injections schedule)
 python3 -m pytest -c /dev/null -o addopts= \
@@ -99,7 +105,7 @@ python3 -m pytest -c /dev/null -o addopts= \
   tests/integration/defs/stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_all_marathon_yamls_parse_and_validate -v
 ```
 
-All three together:
+All component tests together:
 
 ```bash
 python3 -m pytest -c /dev/null -o addopts= \
@@ -125,7 +131,7 @@ pytest -sv tests/integration/defs/stress_test/disagg_cancel/test_disagg_cancel_s
 immediately because no workers are registered via
 `bind_tracked_workers()`.
 
-### Local marathon (after `setup()` + load/canary land)
+### Local marathon (after `setup()` lands)
 
 Once `setup()` launches a real 3P3D cluster and registers workers,
 the full 2-hour marathon runs via the same pytest entry point. For
@@ -171,7 +177,7 @@ For now, when the skeleton test fails:
 
 ## Cross-references
 
-- [PR #13713](https://github.com/NVIDIA/TensorRT-LLM/pull/13713) —
+- <https://github.com/NVIDIA/TensorRT-LLM/pull/13713> —
   the bug fix this suite gates regressions against.
 - [TRTLLM-12648](https://jirasw.nvidia.com/browse/TRTLLM-12648),
   [TRTLLM-12721](https://jirasw.nvidia.com/browse/TRTLLM-12721) —
