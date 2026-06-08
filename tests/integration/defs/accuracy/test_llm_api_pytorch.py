@@ -6253,7 +6253,14 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=enable_block_reuse)
-        moe_config = MoeConfig(backend='DEEPGEMM')
+        # DeepGEMM MoE kernels only support datacenter Blackwell (SM100/SM103).
+        # Fall back to the CUTLASS MoE backend (which supports FP8 block scales)
+        # on other architectures such as Hopper (SM90) and consumer Blackwell
+        # (SM120/SM121); otherwise the unsupported kernel trips a scale-factor
+        # dtype assertion at warmup.
+        moe_backend = "DEEPGEMM" if get_sm_version() in (100,
+                                                         103) else "CUTLASS"
+        moe_config = MoeConfig(backend=moe_backend)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=128)
         with LLM(model_dir,
