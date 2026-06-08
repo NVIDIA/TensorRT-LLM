@@ -183,6 +183,25 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_ssm_replay_requires_spec(self):
+        """Reject the replay SSM kernel when speculative decoding is off.
+
+        ``ssm_replay`` makes the SSM backend emit per-layer replay state buffers (``Replay*``
+        handlers), which are read only on the speculative extend (draft-verification) path.
+        Those handlers carry the ``SpeculativeOnly`` trait, so without ``speculative_config``
+        the kvcache insert transform drops them entirely and the ``ssm_replay`` flag becomes a
+        no-op. Reject the contradictory config here rather than silently ignoring the flag.
+        """
+        ssm_cfg = self.transforms.get("insert_cached_ssm_attention", {})
+        if ssm_cfg.get("ssm_replay", False) and self.speculative_config is None:
+            raise ValueError(
+                "transforms.insert_cached_ssm_attention.ssm_replay=True requires speculative "
+                "decoding (speculative_config must be set). Replay buffers are only used on the "
+                "speculative extend path."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_parallel_config(self):
         """Setup parallel config according to world_size.
 
