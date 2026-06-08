@@ -68,11 +68,8 @@ class MoeBackendType(str, Enum):
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
-    # ``MEGAMOE`` is the canonical DeepGemm MegaMoE member on this branch;
-    # ``MEGAMOE_DEEPGEMM`` is kept as an explicit alias so call sites that
-    # spell out the variant resolve to the same member. ``MEGAMOE_CUTEDSL``
-    # is the new CuteDSL MegaMoE backend.
-    MEGAMOE = "MEGAMOE_DEEPGEMM"
+    # Two MegaMoE variants: the DeepGemm path and the CuteDSL path. Both
+    # are spelled out explicitly at call sites.
     MEGAMOE_DEEPGEMM = "MEGAMOE_DEEPGEMM"
     MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
 
