@@ -939,7 +939,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # flag and d2t for next-iter target-side verification.
         if spec_metadata.use_rejection_sampling:
             if not spec_metadata.is_all_greedy_sample:
-                d2t_param = getattr(draft_model.model, "d2t", None)
+                d2t_param = getattr(getattr(draft_model, 'model', None), "d2t",
+                                    None)
                 spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
                 spec_metadata.draft_probs_valid = True
             else:
@@ -1187,7 +1188,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 the correct slice of spec_metadata.draft_probs.
         '''
 
-        d2t = getattr(draft_model.model, "d2t", None)
+        d2t = getattr(getattr(draft_model, 'model', None), "d2t", None)
         if (spec_metadata.use_rejection_sampling and draft_step is not None
                 and not spec_metadata.is_all_greedy_sample):
             return self._draft_sampler_advanced_for_rejection(
