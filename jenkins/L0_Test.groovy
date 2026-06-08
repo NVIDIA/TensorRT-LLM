@@ -299,7 +299,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     return rerunFailed  // Return the updated value
 }
 
-def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
+def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
@@ -366,8 +366,11 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
             "--test-list=${cleanedTestDBList}",
             "--quiet",
             "--splits ${splits}",
-            "--group ${splitId}"
+            "--group ${splitId}",
         ]
+        if (durationsPath) {
+            testListCmd += ["--durations-path ${durationsPath}"]
+        }
 
         try {
             // First execute the pytest command and check if it succeeds
@@ -581,7 +584,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     }
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -951,7 +954,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1082,6 +1085,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
 
+                def clusterDurationsArgsNode = []
+                if (useClusterDurations) {
+                    def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+                    def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
+                    clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
                     stageName,
@@ -1095,7 +1104,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                       "--test-list=$testListPathNode",
                       "--splitting-algorithm least_duration",
                       "--splits $splits",
-                      "--group $splitId"
+                      "--group $splitId",
+                      *clusterDurationsArgsNode,
                     ]
                 ).join(" ")
 
@@ -1484,7 +1494,7 @@ def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
     return [skip: false, splits: 1, splitId: 1]
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="")
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false)
 {
   def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
   if (collapse.skip) {
@@ -1519,9 +1529,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       def postTag = "${outerAttemptTag}${innerSuffix}"
 
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations)
       }
 
       // Job succeeded
@@ -3028,7 +3038,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="")
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="", boolean useClusterDurations=false)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -3188,8 +3198,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt", postTag)
         }
 
+        // When useClusterDurations is set, use a per-cluster durations file keyed on
+        // partition.clusterName (e.g. "aws-dfw", "dlcluster").  This lets each cluster
+        // build its own timing baseline so sharding is not skewed by timings collected
+        // on different hardware.  Falls back to the shared .test_durations when unset.
+        def clusterDurationsArgs = []
+        def clusterDurationsPath = ""
+        if (useClusterDurations) {
+            def partition = SlurmConfig.resolvePlatform(platform)
+            def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+            clusterDurationsPath = "${llmSrc}/tests/integration/defs/.test_durations_${clusterKey}"
+            clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
+        }
+
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode, clusterDurationsPath)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -3223,7 +3246,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             TRTLLM_WHL_PATH,
             coverageConfigFile,
             "",  // pytestUtil
-            [],  // extraArgs
+            clusterDurationsArgs,
             containerPortStart,
             containerPortNum
         )
@@ -3395,7 +3418,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
     if (collapse.skip) {
@@ -3405,7 +3428,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
     splitId = collapse.splitId
 
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag)
+        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag, useClusterDurations)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -3900,11 +3923,11 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     }
 }
 
-def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false) {
+def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false, useClusterDurations=false) {
     def configs = [:]
     for (int k = 1; k <= testCount; k++) {
         def key = "${stageName}-${k}"
-        configs[key] = [platform, testlist, k, testCount, gpuCount, nodeCount, runWithSbatch]
+        configs[key] = [platform, testlist, k, testCount, gpuCount, nodeCount, runWithSbatch, useClusterDurations]
     }
     return configs
 }
@@ -4126,15 +4149,18 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 1, 8, 4],
-        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 2, 8, 4],
-        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 3, 8, 4],
-        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 4, 8, 4],
-        "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 5, 8, 4],
-        "GB200-4_GPUs-PyTorch-6": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 6, 8, 4],
-        "GB200-4_GPUs-PyTorch-7": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 7, 8, 4],
-        "GB200-4_GPUs-PyTorch-8": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 8, 8, 4],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 1, 1, 4],
+        // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
+        // useClusterDurations=true: record actual test times so each cluster builds its own
+        // .test_durations_<clusterName> baseline for load-balanced sharding.
+        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 1, 8, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 2, 8, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 3, 8, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 4, 8, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 5, 8, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-6": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 6, 8, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-7": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 7, 8, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-8": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 8, 8, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4],
@@ -4322,7 +4348,7 @@ def launchTestJobs(pipeline, testFilter)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext, values[4] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
@@ -4341,7 +4367,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false)
         }, [singleAttempt: true]]]}
         parallelJobs += parallelSlurmJobs
 
@@ -4355,7 +4381,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false)
         }, [singleAttempt: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
