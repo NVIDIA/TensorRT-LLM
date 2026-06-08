@@ -202,32 +202,18 @@ class StatsKeeper:
             num_draft_tokens) if num_draft_tokens else None
         num_accepted_draft_tokens_percentiles = PercentileStats.from_iterable(
             num_accepted_draft_tokens) if num_accepted_draft_tokens else None
+        # Weight the per-request acceptance rate (AR) and acceptance length
+        # (AL) averages by output length. An equally-weighted mean would bias
+        # the result toward short requests, which run fewer decoding
+        # iterations; output-length weighting makes the .average a token-level
+        # mean so longer requests contribute proportionally. Percentiles are
+        # unaffected.
         draft_acceptance_rate_percentiles = PercentileStats.from_iterable(
-            draft_acceptance_rate) if draft_acceptance_rate else None
+            draft_acceptance_rate,
+            weights=output_tokens) if draft_acceptance_rate else None
         acceptance_length_percentiles = PercentileStats.from_iterable(
-            acceptance_length) if acceptance_length else None
-
-        # Determine whether every request produced the same number of output
-        # tokens. When the output lengths differ, an equally-weighted mean over
-        # per-request AR/AL biases the result toward short requests (which run
-        # fewer decoding iterations). In that case report an output-length
-        # weighted average so longer requests contribute proportionally.
-        output_lengths_consistent = len(set(output_tokens)) <= 1
-        if not output_lengths_consistent:
-            total_output_tokens = sum(output_tokens)
-            if total_output_tokens > 0:
-                if draft_acceptance_rate_percentiles is not None:
-                    draft_acceptance_rate_percentiles.average = sum(
-                        w * v
-                        for w, v in zip(output_tokens,
-                                        draft_acceptance_rate,
-                                        strict=True)) / total_output_tokens
-                if acceptance_length_percentiles is not None:
-                    acceptance_length_percentiles.average = sum(
-                        w * v
-                        for w, v in zip(output_tokens,
-                                        acceptance_length,
-                                        strict=True)) / total_output_tokens
+            acceptance_length,
+            weights=output_tokens) if acceptance_length else None
 
         requests = list(self.requests.values())
         stats = BenchmarkStatistics(
