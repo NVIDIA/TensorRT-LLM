@@ -1873,15 +1873,23 @@ CUBIN_EXPORT __global__ __launch_bounds__(32 * 4 * 3, 1) void kernel_mha(
 // Flash-decoding-style global-memory combine. The main kernel writes one normalized
 // partial output plus (rowMax,rowSum) per KV subsequence; this kernel applies the
 // online-softmax correction across subsequences and writes the final normalized O.
+// Column-tile granularity for the split-KV partial reduce. Each (colTile, chunk, token) is one CTA.
+// At batch=1/decode the reduce grid is {nbColTiles, nbChunks(=2), 1}; the original 128-elem tile gave
+// only 4*2=8 CTAs on a 192-SM GPU (~4% occupancy), making the reduce the single most expensive decode
+// kernel. Shrinking the tile to 8 elems gives 64*2=128 CTAs (1 elem/thread at 256 threads), filling
+// the GPU and overlapping the dependent 48-way online-softmax fold across many more resident warps.
+inline constexpr uint32_t kReduceColTileElems = 8;
+inline constexpr uint32_t kReduceNbColTiles = exactDiv(validElemsPerVHead, kReduceColTileElems);
+
 CUBIN_EXPORT __global__ __launch_bounds__(256, 1) void reduce_mla_flash_decode_partials(
     OutputHead* __restrict__ const output, PartialResult const* __restrict__ const partialResults,
     uint32_t const* __restrict__ const seqLenList, uint32_t const maxNbSubSeq, uint32_t const inputSeqLen)
 {
     static_assert(validElemsPerVHead == 512);
     static_assert(PartialResult::nbRowsPerChunk == warp_size);
-    constexpr uint32_t colTileElems = 128;
-    constexpr uint32_t nbColTiles = exactDiv(validElemsPerVHead, colTileElems);
-    static_assert(nbColTiles == 4);
+    constexpr uint32_t colTileElems = kReduceColTileElems;
+    constexpr uint32_t nbColTiles = kReduceNbColTiles;
+    static_assert(nbColTiles * colTileElems == validElemsPerVHead);
 
     uint32_t const idxColTile = blockIdx.x;
     uint32_t const idxChunk = blockIdx.y;
@@ -2079,7 +2087,7 @@ void launchMLA(cudaDeviceProp const& prop,
     checkCuda(err);
     if (useSeparateReduce && nbSubSeqPerSeq > 1)
     {
-        dim3 const reduceGrid{4, PartialResult::nbChunks, inputSeqLen * batchSize};
+        dim3 const reduceGrid{kReduceNbColTiles, PartialResult::nbChunks, inputSeqLen * batchSize};
         reduce_mla_flash_decode_partials<<<reduceGrid, 256, 0, stream>>>(
             output, partialResults, seqLen, nbSubSeqPerSeq, inputSeqLen);
         checkCuda(cudaPeekAtLastError());
