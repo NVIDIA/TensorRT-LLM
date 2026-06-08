@@ -262,10 +262,6 @@ def _apply_swiglu(
     raise ValueError(f"Unsupported swiglu_mode: {swiglu_mode}.")
 
 
-def _is_cuda_graph_capture_active(tensor: torch.Tensor) -> bool:
-    return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
-
-
 def _router_topk(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -295,7 +291,7 @@ def _split_range_last_remainder(num_experts: int, world_size: int, rank: int) ->
     return lo, hi
 
 
-def _run_torch_mxfp4_from_routing_capture_safe(
+def _run_torch_mxfp4_from_routing_slots(
     x: torch.Tensor,
     leading_shape: torch.Size,
     selected_experts: torch.Tensor,
@@ -315,7 +311,7 @@ def _run_torch_mxfp4_from_routing_capture_safe(
     output = torch.zeros((x.shape[0], hidden_size), device=x.device, dtype=torch.float32)
     local_experts = gate_up_weight.shape[0]
     if local_experts <= 0:
-        raise ValueError("MXFP4 MoE capture path requires at least one local expert.")
+        raise ValueError("MXFP4 MoE requires at least one local expert.")
 
     local_expert_idx = selected_experts - int(expert_start)
     valid_route = (local_expert_idx >= 0) & (local_expert_idx < local_experts)
@@ -414,49 +410,22 @@ def _run_torch_mxfp4_from_routing_core(
             f"does not match hidden states dimension {hidden_size}."
         )
 
-    if _is_cuda_graph_capture_active(x):
-        return _run_torch_mxfp4_from_routing_capture_safe(
-            x,
-            leading_shape,
-            selected_experts,
-            routing_weights,
-            gate_up_weight,
-            gate_up_bias,
-            down_weight,
-            down_bias,
-            alpha,
-            limit,
-            expert_start,
-            gate_up_order,
-            swiglu_mode,
-            hidden_states.dtype,
-        )
-
-    output = torch.zeros((x.shape[0], hidden_size), device=x.device, dtype=torch.float32)
-    local_experts = gate_up_weight.shape[0]
-
-    for local_expert_idx in range(local_experts):
-        global_expert_idx = expert_start + local_expert_idx
-        token_idx, route_idx = torch.where(selected_experts == global_expert_idx)
-        if token_idx.numel() == 0:
-            continue
-
-        expert_input = x[token_idx]
-        gate_up = F.linear(
-            expert_input,
-            gate_up_weight[local_expert_idx],
-            gate_up_bias[local_expert_idx].to(torch.float32),
-        )
-        inter = _apply_swiglu(gate_up, alpha, limit, gate_up_order, swiglu_mode)
-        expert_output = F.linear(
-            inter,
-            down_weight[local_expert_idx],
-            down_bias[local_expert_idx].to(torch.float32),
-        )
-        expert_output = expert_output * routing_weights[token_idx, route_idx, None]
-        output.index_add_(0, token_idx, expert_output)
-
-    return output.reshape(*leading_shape, hidden_size).to(hidden_states.dtype)
+    return _run_torch_mxfp4_from_routing_slots(
+        x,
+        leading_shape,
+        selected_experts,
+        routing_weights,
+        gate_up_weight,
+        gate_up_bias,
+        down_weight,
+        down_bias,
+        alpha,
+        limit,
+        expert_start,
+        gate_up_order,
+        swiglu_mode,
+        hidden_states.dtype,
+    )
 
 
 def _prepare_weights_scales(
