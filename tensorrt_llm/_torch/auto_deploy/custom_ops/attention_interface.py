@@ -526,6 +526,9 @@ class BatchInfo:
     def get_max_context_length(self) -> int:
         return int(self._batch_info[6])
 
+    def get_max_seq_len(self) -> int:
+        return self.get_max_context_length()
+
     def get_max_blocks_per_seq(self) -> int:
         return int(self._batch_info[7])
 
