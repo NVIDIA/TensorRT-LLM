@@ -1,4 +1,5 @@
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from .cute_dsl import CuteDslAttention
 from .interface import AttentionBackend, AttentionForwardArgs, AttentionMetadata
 from .sparse import get_sparse_attn_kv_cache_manager
 from .trtllm import AttentionInputType, TrtllmAttention, TrtllmAttentionMetadata
@@ -9,6 +10,7 @@ __all__ = [
     "AttentionBackend",
     "AttentionForwardArgs",
     "AttentionInputType",
+    "CuteDslAttention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
     "VanillaAttention",
