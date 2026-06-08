@@ -1,3 +1,4 @@
+import os
 import time
 from typing import List, Optional, Union
 
@@ -104,6 +105,14 @@ class WanPipeline(BasePipeline):
                 "TeaCache is not supported for Wan 2.2 models. "
                 "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
+
+        # MLPerf-deterministic fixed latent (lazy-loaded on first real inference).
+        # __init__ runs under MetaInitMode where torch.load triggers aten.set_ on
+        # a meta tensor and raises MetaInitException, so we only stash the path.
+        # Path is sourced exclusively from the TLLM_MLPERF_FIXED_LATENT_PATH env
+        # var (debug/benchmark knob; not a serving-config field).
+        self.fixed_latent_path: Optional[str] = os.environ.get("TLLM_MLPERF_FIXED_LATENT_PATH")
+        self.fixed_latent: Optional[torch.Tensor] = None
 
         super().__init__(model_config)
 
@@ -334,6 +343,7 @@ class WanPipeline(BasePipeline):
                 guidance_scale=5.0,
                 seed=42,
                 max_sequence_length=512,
+                _use_fixed_latent=False,
             )
 
     @property
@@ -392,6 +402,7 @@ class WanPipeline(BasePipeline):
         seed: int = 42,
         max_sequence_length: int = 512,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        _use_fixed_latent: bool = True,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -450,7 +461,7 @@ class WanPipeline(BasePipeline):
             guidance_scale = defaults["guidance_scale"]
 
         if self.is_wan22_14b and guidance_scale_2 is None:
-            guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
+            guidance_scale_2 = 3.0
 
         # Validate two-stage denoising configuration
         if guidance_scale_2 is not None and boundary_ratio is None:
@@ -469,13 +480,44 @@ class WanPipeline(BasePipeline):
         )
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
-        # Prepare Latents. Pure noise for T2V. Image-conditioned latent for Wan 2.25B I2V
+        # Prepare Latents. Pure noise for T2V (or pre-loaded fixed latent for
+        # MLPerf-deterministic generation), image-conditioned latent for Wan 2.2 5B I2V.
         i2v_condition = None
         i2v_first_frame_mask = None
         if is_i2v:
             latents, i2v_condition, i2v_first_frame_mask = self._prepare_latents_wan22_5B_i2v(
                 batch_size, image, height, width, num_frames, generator
             )
+        elif _use_fixed_latent and self.fixed_latent_path is not None:
+            if self.fixed_latent is None:
+                self.fixed_latent = torch.load(
+                    self.fixed_latent_path,
+                    map_location=self.device,
+                    weights_only=True,
+                )
+                logger.info(
+                    f"Loaded fixed latent from {self.fixed_latent_path}, "
+                    f"shape={self.fixed_latent.shape}"
+                )
+            # The fixed latent is reused across requests, so it must match the
+            # request shape exactly; otherwise the mismatch surfaces deep inside
+            # denoising/decoding with an unactionable error.
+            expected_shape = (
+                batch_size,
+                getattr(self.transformer.config, "in_channels", 16),
+                (num_frames - 1) // self.vae_scale_factor_temporal + 1,
+                height // self.vae_scale_factor_spatial,
+                width // self.vae_scale_factor_spatial,
+            )
+            if tuple(self.fixed_latent.shape) != expected_shape:
+                raise ValueError(
+                    f"Fixed latent shape {tuple(self.fixed_latent.shape)} does not match "
+                    f"expected request shape {expected_shape} "
+                    f"(batch_size={batch_size}, num_frames={num_frames}, "
+                    f"height={height}, width={width}). "
+                    f"Regenerate the fixed latent at {self.fixed_latent_path}."
+                )
+            latents = self.fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")

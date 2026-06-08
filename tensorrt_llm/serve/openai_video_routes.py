@@ -95,7 +95,24 @@ class _VideoRoutesMixin:
             # download while persisting all of them to disk.
             actual_path = saved_paths[0]
             actual_output_path = str(actual_path)
-            media_type = "video/mp4" if actual_path.suffix == ".mp4" else "video/x-msvideo"
+
+            # response_format=video_path: return JSON pointer instead of streaming
+            # the video payload — avoids HTTP body for clients that share lustre
+            # with the server.
+            if request.response_format == "video_path":
+                return JSONResponse(
+                    content={
+                        "video_id": video_id,
+                        "video_path": actual_output_path,
+                    }
+                )
+
+            if actual_path.suffix == ".mp4":
+                media_type = "video/mp4"
+            elif actual_path.suffix == ".pt":
+                media_type = "application/octet-stream"
+            else:
+                media_type = "video/x-msvideo"
 
             return FileResponse(
                 actual_output_path,
@@ -146,7 +163,7 @@ class _VideoRoutesMixin:
                 raise ValueError("'prompt' is required")
 
             # Optional string fields
-            for field in ["model", "size", "negative_prompt", "output_format"]:
+            for field in ["model", "size", "negative_prompt", "output_format", "response_format"]:
                 if field in form and form[field]:
                     data[field] = form[field]
 
@@ -161,8 +178,16 @@ class _VideoRoutesMixin:
                 data["num_inference_steps"] = int(form["num_inference_steps"])
             if "guidance_scale" in form and form["guidance_scale"]:
                 data["guidance_scale"] = float(form["guidance_scale"])
+            # Numeric guards must preserve valid zero values
+            # (boundary_ratio explicitly allows 0.0).
+            if form.get("guidance_scale_2") not in (None, ""):
+                data["guidance_scale_2"] = float(form["guidance_scale_2"])
+            if form.get("boundary_ratio") not in (None, ""):
+                data["boundary_ratio"] = float(form["boundary_ratio"])
             if "guidance_rescale" in form and form["guidance_rescale"]:
                 data["guidance_rescale"] = float(form["guidance_rescale"])
+            if form.get("num_frames") not in (None, ""):
+                data["num_frames"] = int(form["num_frames"])
             if "seed" in form and form["seed"]:
                 data["seed"] = int(form["seed"])
 

@@ -385,6 +385,8 @@ def resolve_video_format(output_format) -> Tuple[str, str]:
         )
     elif output_format == "avi":
         return "avi", ".avi"
+    elif output_format == "pt":
+        return "pt", ".pt"
     elif output_format == "auto":
         if _check_ffmpeg_available():
             return "mp4", ".mp4"
@@ -559,6 +561,17 @@ def save_video(
 
     if format in ("mp4", "avi"):
         return _save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate)
+    if format == "pt":
+        # No encoding: persist the video tensor with torch.save for
+        # cross-framework reuse (e.g. MLPerf-deterministic comparisons).
+        # Audio is dropped — pt mode only carries video pixel data.
+        tensor = video
+        if hasattr(tensor, "detach"):
+            tensor = tensor.detach()
+        if hasattr(tensor, "cpu"):
+            tensor = tensor.cpu()
+        torch.save(tensor.contiguous(), output_path)
+        return output_path
     logger.warning(f"Unsupported video format: {format}, defaulting to mp4")
     output_path = output_path.rsplit(".", 1)[0] + ".mp4"
     return _save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate)
