@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -28,6 +29,37 @@ from .utils import has_event_loop
 __all__ = [
     "RayExecutor",
 ]
+
+
+def _ray_init_local_with_retry(max_attempts: int = 3,
+                               backoff_s: float = 5.0,
+                               **ray_init_args) -> None:
+    """Start a local Ray cluster, retrying on transient GCS startup timeouts.
+
+    On busy CI runners the raylet/GCS sometimes fails to register within
+    Ray's internal 30s grace period and raises "The current node timed out
+    during startup ... GCS has become overloaded." The error is intermittent
+    and clears on retry. ConnectionError is re-raised immediately so the
+    caller's address="auto" fall-through stays intact.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ray.init(**ray_init_args)
+            return
+        except ConnectionError:
+            raise
+        except Exception as e:
+            msg = str(e)
+            transient = ("timed out during startup" in msg
+                         or "GCS has become overloaded" in msg)
+            if not transient or attempt == max_attempts:
+                raise
+            logger.warning(
+                f"ray.init failed on attempt {attempt}/{max_attempts}: {e}. "
+                f"Retrying after {backoff_s}s.")
+            if ray.is_initialized():
+                ray.shutdown()
+            time.sleep(backoff_s)
 
 
 class RayExecutor(RpcExecutorMixin, GenerationExecutor):
@@ -67,10 +99,10 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                     logger.info(f"Ray cluster not found, starting a new one.")
 
                 if not ray.is_initialized():
-                    ray.init(**ray_init_args)
+                    _ray_init_local_with_retry(**ray_init_args)
                     self.has_start_local_cluser = True
             else:
-                ray.init(address="local", **ray_init_args)
+                _ray_init_local_with_retry(address="local", **ray_init_args)
                 self.has_start_local_cluser = True
 
             self.world_size = model_world_size
