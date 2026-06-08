@@ -5,6 +5,7 @@ import torch
 
 
 def _write_qwen_image_bench_config(model_dir):
+    text_config = _qwen3_5_text_config()
     config = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "dtype": "bfloat16",
@@ -16,45 +17,7 @@ def _write_qwen_image_bench_config(model_dir):
         "video_token_id": 248057,
         "vision_end_token_id": 248054,
         "vision_start_token_id": 248053,
-        "text_config": {
-            "architectures": ["Qwen3_5ForCausalLM"],
-            "attn_output_gate": True,
-            "dtype": "bfloat16",
-            "full_attention_interval": 4,
-            "head_dim": 64,
-            "hidden_size": 256,
-            "intermediate_size": 512,
-            "layer_types": [
-                "linear_attention",
-                "linear_attention",
-                "linear_attention",
-                "full_attention",
-            ],
-            "linear_conv_kernel_dim": 4,
-            "linear_key_head_dim": 32,
-            "linear_num_key_heads": 4,
-            "linear_num_value_heads": 8,
-            "linear_value_head_dim": 32,
-            "max_position_embeddings": 4096,
-            "mamba_ssm_dtype": "float32",
-            "model_type": "qwen3_5_text",
-            "num_attention_heads": 4,
-            "num_hidden_layers": 4,
-            "num_key_value_heads": 2,
-            "output_gate_type": "swish",
-            "partial_rotary_factor": 0.25,
-            "rms_norm_eps": 1e-6,
-            "rope_parameters": {
-                "mrope_interleaved": True,
-                "mrope_section": [1, 1, 2],
-                "partial_rotary_factor": 0.25,
-                "rope_theta": 10000000,
-                "rope_type": "default",
-            },
-            "tie_word_embeddings": False,
-            "use_cache": False,
-            "vocab_size": 1024,
-        },
+        "text_config": text_config,
         "vision_config": {
             "deepstack_visual_indexes": [],
             "depth": 1,
@@ -73,7 +36,49 @@ def _write_qwen_image_bench_config(model_dir):
     (model_dir / "config.json").write_text(json.dumps(config))
 
 
-def test_qwen_image_bench_config_preserves_multimodal_and_normalizes_text(tmp_path):
+def _qwen3_5_text_config():
+    return {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "attn_output_gate": True,
+        "dtype": "bfloat16",
+        "full_attention_interval": 4,
+        "head_dim": 64,
+        "hidden_size": 256,
+        "intermediate_size": 512,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 32,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 8,
+        "linear_value_head_dim": 32,
+        "max_position_embeddings": 4096,
+        "mamba_ssm_dtype": "float32",
+        "model_type": "qwen3_5_text",
+        "num_attention_heads": 4,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 2,
+        "output_gate_type": "swish",
+        "partial_rotary_factor": 0.25,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [1, 1, 2],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000,
+            "rope_type": "default",
+        },
+        "tie_word_embeddings": False,
+        "use_cache": False,
+        "vocab_size": 1024,
+    }
+
+
+def test_qwen_image_bench_config_uses_internal_arch_and_normalizes_text(tmp_path):
     import transformers
 
     from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -82,11 +87,13 @@ def test_qwen_image_bench_config_preserves_multimodal_and_normalizes_text(tmp_pa
         load_pretrained_config,
     )
 
-    _write_qwen_image_bench_config(tmp_path)
+    model_dir = tmp_path / "Qwen-Image-Bench"
+    model_dir.mkdir()
+    _write_qwen_image_bench_config(model_dir)
 
-    config = load_pretrained_config(str(tmp_path))
+    config = load_pretrained_config(str(model_dir))
 
-    assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
+    assert config.architectures == ["QwenImageBenchForConditionalGeneration"]
     assert config.model_type == "qwen3_5"
     assert config.vision_config.depth == 1
     assert isinstance(config.text_config, transformers.Qwen3NextConfig)
@@ -102,6 +109,34 @@ def test_qwen_image_bench_config_preserves_multimodal_and_normalizes_text(tmp_pa
     assert extract_mamba_kv_cache_params(config.text_config).mamba_ssm_cache_dtype is torch.float32
 
 
+def test_qwen3_5_conditional_text_config_does_not_use_image_bench_arch(tmp_path):
+    import transformers
+
+    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+
+    (tmp_path / "config.json").write_text(json.dumps(_qwen3_5_text_config()))
+
+    config = load_pretrained_config(str(tmp_path))
+
+    assert isinstance(config, transformers.Qwen3NextConfig)
+    assert config.architectures == ["Qwen3_5ForCausalLM"]
+
+
+def test_qwen3_5_composite_config_requires_image_bench_model_name(tmp_path):
+    import transformers
+
+    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+
+    model_dir = tmp_path / "Qwen3.6-27B-FP8"
+    model_dir.mkdir()
+    _write_qwen_image_bench_config(model_dir)
+
+    config = load_pretrained_config(str(model_dir))
+
+    assert isinstance(config, transformers.Qwen3NextConfig)
+    assert config.architectures == ["Qwen3_5ForCausalLM"]
+
+
 def test_qwen_image_bench_model_and_mapper_registration():
     from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import (
         Qwen3_5MoeHfWeightMapper,
@@ -113,10 +148,12 @@ def test_qwen_image_bench_model_and_mapper_registration():
         MODEL_CLASS_VISION_ENCODER_MAPPING,
     )
 
-    assert MODEL_CLASS_MAPPING["Qwen3_5ForConditionalGeneration"] is QwenImageBenchModel
-    assert "Qwen3_5ForConditionalGeneration" in MODEL_CLASS_VISION_ENCODER_MAPPING
+    assert MODEL_CLASS_MAPPING["QwenImageBenchForConditionalGeneration"] is QwenImageBenchModel
+    assert "Qwen3_5ForConditionalGeneration" not in MODEL_CLASS_MAPPING
+    assert "QwenImageBenchForConditionalGeneration" in MODEL_CLASS_VISION_ENCODER_MAPPING
     assert (
-        MODEL_CLASS_MAPPER_MAPPING["Qwen3_5ForConditionalGeneration_HF"] is Qwen3_5MoeHfWeightMapper
+        MODEL_CLASS_MAPPER_MAPPING["QwenImageBenchForConditionalGeneration_HF"]
+        is Qwen3_5MoeHfWeightMapper
     )
 
 

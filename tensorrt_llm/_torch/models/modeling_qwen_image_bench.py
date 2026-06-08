@@ -54,28 +54,13 @@ class _QwenImageBenchModelMixin:
 
 @support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
-@register_auto_model("Qwen3_5ForConditionalGeneration")
+@register_auto_model("QwenImageBenchForConditionalGeneration")
 @register_input_processor(
     Qwen3VLInputProcessorBase,
     model_type="qwen3_5",
     placeholder_metadata=_QWEN_IMAGE_BENCH_PLACEHOLDERS,
 )
 class QwenImageBenchModel(_QwenImageBenchModelMixin, Qwen3VLModelBase):
-    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
-        kwargs["vision_model_class"] = Qwen3VisionModel
-        kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)
-        super().__init__(model_config, *args, **kwargs)
-
-
-@support_multimodal_disaggregated
-@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
-@register_auto_model("Qwen3_5MoeForConditionalGeneration")
-@register_input_processor(
-    Qwen3VLInputProcessorBase,
-    model_type="qwen3_5_moe",
-    placeholder_metadata=_QWEN_IMAGE_BENCH_PLACEHOLDERS,
-)
-class QwenImageBenchMoeModel(_QwenImageBenchModelMixin, Qwen3VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
         kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)
