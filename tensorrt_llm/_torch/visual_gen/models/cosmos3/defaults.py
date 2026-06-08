@@ -30,9 +30,22 @@ COSMOS3_720P_PARAMS = {
     "width": 1280,
     "num_inference_steps": 35,
     "guidance_scale": 6.0,
-    "max_sequence_length": 1024,
+    "max_sequence_length": 4096,
     "num_frames": 189,
     "frame_rate": 24.0,
+}
+
+# Text-to-image (``output_type="image"``) defaults. Applied by the pipeline when
+# the corresponding request field still carries the merged video default, since
+# the executor merges a single ``default_generation_params`` dict (the video
+# params above) into the request before ``infer()`` runs.
+COSMOS3_T2I_PARAMS = {
+    "height": 1024,
+    "width": 1024,
+    "num_inference_steps": 50,
+    "guidance_scale": 7.0,
+    "flow_shift": 3.0,
+    "guidance_interval": (400.0, 1000.0),
 }
 
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
@@ -60,5 +73,10 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         type="bool",
         default=False,
         description="Whether to enable audio generation.",
+    ),
+    "output_type": ExtraParamSchema(
+        type="str",
+        default="video",
+        description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
     ),
 }
