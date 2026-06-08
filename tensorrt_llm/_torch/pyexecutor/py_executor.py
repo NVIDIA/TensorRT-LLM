@@ -1936,14 +1936,18 @@ class PyExecutor:
                     # _check_disagg_ctx_cache_transfer_status together or skips
                     # it together, so the internal allgather in
                     # CacheTransceiver::checkContextTransferStatus always has
-                    # full quorum. With PP > 1 the schedule is broadcast from
-                    # rank 0 so num_fitting_reqs should already be uniform, but
-                    # has_any_inflight_requests is rank-local and could
-                    # otherwise diverge.
+                    # full quorum. The C++ syncComm inside that helper is at
+                    # most TP-wide (mGroupTensorParaComm; mGroupTPInDPComm
+                    # with attention_dp), so a TP-scoped OR vote is sufficient.
+                    # Using WORLD allreduce here serialized the disagg prefill
+                    # host loop on every iter (nvbug/6280060).
                     local_need_check = (num_fitting_reqs == 0 and
                                         not fitting_disagg_gen_init_requests)
-                    any_need_check = self.dist.allreduce(int(local_need_check),
-                                                         op=ReduceOp.MAX)
+                    if self.dist.tp_size > 1:
+                        any_need_check = self.dist.tp_allreduce(
+                            int(local_need_check), op=ReduceOp.MAX)
+                    else:
+                        any_need_check = int(local_need_check)
                     if any_need_check > 0:
                         if local_need_check and not all_gen_first:
                             logger.warning(
@@ -2487,7 +2491,7 @@ class PyExecutor:
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
             # [disagg-ctx-deadlock-fix] _check_disagg_ctx_cache_transfer_status
-            # internally invokes a TP-wide allgather inside
+            # internally invokes a TP-scoped allgather inside
             # CacheTransceiver::checkContextTransferStatus. Gating the call on
             # rank-local `num_fitting_reqs` (which can drift between ranks by
             # one block due to per-rank UCX/CUDA-event-sync timing variance)
@@ -2496,11 +2500,16 @@ class PyExecutor:
             # deadlock. OR the decision across TP ranks: if ANY rank wants the
             # call, ALL ranks call it. Ranks that don't locally need it use the
             # non-blocking variant so the collective stays in sync without
-            # holding any individual rank.
+            # holding any individual rank. Use TP-scoped allreduce (matches
+            # the C++ syncComm scope) instead of WORLD to avoid serializing
+            # the disagg prefill host loop on every iter (nvbug/6280060).
             local_need_check = (num_fitting_reqs == 0
                                 and not fitting_disagg_gen_init_requests)
-            any_need_check = self.dist.allreduce(int(local_need_check),
-                                                 op=ReduceOp.MAX)
+            if self.dist.tp_size > 1:
+                any_need_check = self.dist.tp_allreduce(int(local_need_check),
+                                                        op=ReduceOp.MAX)
+            else:
+                any_need_check = int(local_need_check)
             if any_need_check > 0:
                 if local_need_check and not all_gen_first:
                     logger.warning(
