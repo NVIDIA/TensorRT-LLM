@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,7 +59,9 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
     return {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, kernel_m_tilesize,
         xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0, xqaParams.paged_kv_cache,
         xqaParams.multi_query_tokens, isXqaJit ? xqaParams.is_fp8_output : false,
-        isXqaJit ? std::optional(xqaParams.position_embedding_type) : std::nullopt};
+        isXqaJit ? std::optional(xqaParams.position_embedding_type) : std::nullopt,
+        // Only the JIT path bakes the rotary dim into the cubin
+        isXqaJit ? std::optional<int>(xqaParams.rotary_embedding_dim) : std::nullopt};
 }
 
 } // namespace kernels
