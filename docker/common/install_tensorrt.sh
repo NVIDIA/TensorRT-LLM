@@ -10,7 +10,7 @@ CUDA_VER="13.2" # 13.2.1
 # PyTorch 2.x can compile with cuDNN v9.
 CUDNN_VER="9.22.0.52-1"
 NCCL_VER="2.30.4-1+cuda13.2"
-CUBLAS_VER="13.4.1.1-1"
+CUBLAS_VER="13.4.1.2-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.2.78-1"
