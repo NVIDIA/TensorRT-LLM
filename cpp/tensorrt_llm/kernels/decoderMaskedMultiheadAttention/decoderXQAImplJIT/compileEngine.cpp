@@ -57,17 +57,7 @@ CubinObj CompileEngine::compile() const
     tllmXqaJitProgram program;
     bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
     tllmXqaJitRopeStyle ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
-    // The in-kernel RoPE path rotates the first rotary_embedding_dim elements of each head (the rope
-    // region) and copies the remaining elements unrotated, so it supports both full and partial rotary.
-    // It requires the rope region to be 16B-aligned for any supported cache dtype (rotary_embedding_dim
-    // a multiple of 16). Shapes that do not satisfy this fall back to invokeQKVPreprocessing, which also
-    // honors rotary_embedding_dim. Must stay in sync with the same condition in decoderXQAImplJIT.cpp.
-    bool const isSupportedRotary = mXqaParams.rotary_embedding_dim > 0
-        && mXqaParams.rotary_embedding_dim <= mXqaParams.head_size && mXqaParams.rotary_embedding_dim % 16 == 0;
-    bool const applyRoPEInXqaKernel = !mXqaParams.multi_query_tokens && useQGMMAKernel && isSupportedRotary
-        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
-                                              PositionEmbeddingType::kROPE_GPTJ},
-            mXqaParams.position_embedding_type);
+    bool const applyRoPEInXqaKernel = appliesRoPEInXqaKernel(mXqaParams, useQGMMAKernel);
     if (applyRoPEInXqaKernel)
     {
         TLLM_CHECK(useQGMMAKernel);

@@ -247,19 +247,8 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     //  * If applyRoPEInXqaKernel is false, a separate kernel applies RoPE (see invokeQKVPreprocessing), then XQA kernel
     //  performs SDPA.
     //    In this case, xqa_q_input_ptr (see below) serves as the scratch space to store intermediate RoPE output.
-    // The in-kernel RoPE path rotates the first rotary_embedding_dim elements of each head (the rope
-    // region) and copies the remaining elements unrotated, so it supports both full and partial rotary.
-    // It requires the rope region to be 16B-aligned for any supported cache dtype (rotary_embedding_dim
-    // a multiple of 16). Shapes that do not satisfy this fall back to invokeQKVPreprocessing below, which
-    // also honors rotary_embedding_dim. Must stay in sync with the same condition in compileEngine.cpp so
-    // the compiled cubin and the runtime launch agree.
-    bool const isSupportedRotary = xqaParams.rotary_embedding_dim > 0
-        && xqaParams.rotary_embedding_dim <= xqaParams.head_size && xqaParams.rotary_embedding_dim % 16 == 0;
-    bool const applyRoPEInXqaKernel = isGMMAKernel && !isSpecDec && isSupportedRotary
-        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
-                                              PositionEmbeddingType::kROPE_GPTJ},
-            xqaParams.position_embedding_type)
-        && !xqaParams.isMLA();
+
+    bool const applyRoPEInXqaKernel = jit::appliesRoPEInXqaKernel(xqaParams, isGMMAKernel);
 
     unsigned int head_size = xqaParams.head_size;
     int num_q_heads = xqaParams.num_q_heads;
