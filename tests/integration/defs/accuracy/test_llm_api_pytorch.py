@@ -4091,6 +4091,7 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=8,
                  kv_cache_config=kv_cache_config,
+                 trust_remote_code=True,
                  **pytorch_config) as llm:
 
             task = CnnDailymail(self.MODEL_NAME)
