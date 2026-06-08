@@ -84,15 +84,12 @@ from ..attention_interface import (
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
 )
+from .rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
-# Metadata key used by fuse_rope_into_trtllm_mla (at post_load_fusion) to stash
-# rope info on torch_mla nodes, consumed by prepare_node_for_cache_insertion
-# (at cache_init) to materialize the rotary_cos_sin buffer as a graph node.
-_TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
 # ``thop.attention``'s C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``)
 # auto-resizes the workspace tensor when its sizing formula exceeds the
 # tensor's capacity.  ``resize_()`` reallocates storage and rebinds the
@@ -856,6 +853,7 @@ def _handle_prefill_thop(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     quant_mode: int,
     sequence_length: torch.Tensor,
     context_lengths: torch.Tensor,
@@ -913,6 +911,7 @@ def _handle_prefill_thop(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             quant_mode,
             sequence_length,
             context_lengths,
@@ -1018,6 +1017,7 @@ def _handle_prefill_thop(
         context_lengths[:pf],  # context_lengths
         host_context_lengths[:pf],  # host_context_lengths
         host_request_types[:pf],  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets (device-filled)
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         planner.host_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1041,6 +1041,7 @@ def _handle_prefill_thop(
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
@@ -1124,6 +1125,7 @@ def _handle_prefill_thop_cached_kv(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     quant_mode: int,
     sequence_length: torch.Tensor,
     context_lengths: torch.Tensor,
@@ -1308,6 +1310,7 @@ def _handle_prefill_thop_cached_kv(
             context_lengths[:pf],
             host_context_lengths[:pf],
             host_request_types[:pf],
+            None,  # max_context_q_len_override
             kv_cache_block_offsets,
             host_kv_cache_pool_pointers,
             planner.host_pool_mapping,
@@ -1331,6 +1334,7 @@ def _handle_prefill_thop_cached_kv(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,  # max_seq_len
             max_context_length,
             1,  # beam_width
             int(AttentionMaskType.padding),  # FULL mask: every Q attends to every K in this chunk
@@ -1436,6 +1440,7 @@ def _handle_prefill_thop_cached_kv(
         context_lengths[:pf],
         host_context_lengths[:pf],
         host_request_types[:pf],
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
@@ -1459,6 +1464,7 @@ def _handle_prefill_thop_cached_kv(
         tokens_per_block,
         max_num_requests,
         max_context_length,
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # CAUSAL: new Q tokens with causal mask over new K/V
@@ -1552,6 +1558,7 @@ def _handle_decode_impl(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     q_scaling: float,
     quant_mode: int,
     sequence_length: torch.Tensor,
@@ -1694,6 +1701,7 @@ def _handle_decode_impl(
         context_lengths,  # context_lengths
         host_context_lengths,  # host_context_lengths
         host_request_types,  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1717,6 +1725,7 @@ def _handle_decode_impl(
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
@@ -1832,6 +1841,7 @@ def _mla_with_cache_impl(
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
+    max_seq_len = batch_info.get_max_seq_len()
     max_context_length = batch_info.get_max_context_length()
     max_num_requests = batch_info.get_max_batch_size()
 
@@ -1965,6 +1975,7 @@ def _mla_with_cache_impl(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             quant_mode,
             sequence_length,
             context_lengths,
@@ -2000,6 +2011,7 @@ def _mla_with_cache_impl(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             q_scaling,
             quant_mode,
             sequence_length,

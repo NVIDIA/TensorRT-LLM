@@ -432,6 +432,15 @@ class _InsertCachedOperator(BaseTransform):
                         # None sentinel: pass literal None positionally, no resource allocated.
                         cache_in_nodes.append(None)
                     else:
+                        # A window that can't slide within max_seq_len is functionally
+                        # full attention; normalize it to 0 so the layer shares the
+                        # full-attention pool instead of forking a redundant
+                        # single-window pool.
+                        if (
+                            isinstance(resource_handler, KVPagedResourceHandler)
+                            and resource_handler.sliding_window >= cm.info.max_seq_len
+                        ):
+                            resource_handler.sliding_window = 0
                         resource_name = cm.add_resource(k, resource_handler)
                         node = self._process_cache_node(gm, resource_name)
                         cache_in_nodes.append(node)

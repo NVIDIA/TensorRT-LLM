@@ -569,6 +569,7 @@ def trtllm_mha_with_cache(
     batch_info = BatchInfo(batch_info_host)
     num_seq = batch_info.get_total_num_sequences()
     num_tokens = batch_info.get_total_num_tokens()
+    max_seq_len = batch_info.get_max_seq_len()
     max_context_length = batch_info.get_max_context_length()
     max_num_requests = batch_info.get_max_batch_size()
     # Use sliding_window for attention_window_size if provided, else full context length
@@ -655,6 +656,7 @@ def trtllm_mha_with_cache(
         context_lengths,  # context_lengths
         _GlobalTrtllmPlanner.host_context_lengths[:num_seq],  # host_context_lengths
         host_request_types,  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -678,6 +680,7 @@ def trtllm_mha_with_cache(
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         attention_window_size,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type

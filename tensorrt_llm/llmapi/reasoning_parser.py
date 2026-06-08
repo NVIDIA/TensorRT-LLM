@@ -207,8 +207,8 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
     "laguna": "laguna",
-    "nemotron_h": "nano-v3",
-    "nemotron_h_puzzle": "nano-v3",
+    "nemotron_h": "nemotron-v3",
+    "nemotron_h_puzzle": "nemotron-v3",
     "gemma4": "gemma4",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",
@@ -301,6 +301,7 @@ def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
     return MODEL_TYPE_TO_REASONING_PARSER.get(model_type)
 
 
+@register_reasoning_parser("nemotron-v3")
 @register_reasoning_parser("nano-v3")
 class NemotronV3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for Nemotron Nano v3.

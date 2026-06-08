@@ -1,7 +1,6 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
-import java.nio.charset.StandardCharsets
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -780,7 +779,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // that is what travels on the wire); oversize → drop piggyback,
         // Layer 3 falls back to source.
         final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
-        def inputJsonB64 = inputJson.getBytes(StandardCharsets.UTF_8).encodeBase64().toString()
+        def inputJsonB64 = inputJson.bytes.encodeBase64().toString()
         def inputJsonB64Size = inputJsonB64.length()
         if (inputJsonB64Size <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
             result.cbts_input_json_b64 = inputJsonB64
@@ -1097,10 +1096,11 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
-def collectTestResults(pipeline, testFilter)
+def collectTestResults(pipeline, testFilter, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
+        // 1. Serial: download tarballs, extract, and run junit
         stage ("Collect Test Result") {
             sh "rm -rf **/*.xml *.tar.gz"
 
@@ -1130,80 +1130,192 @@ def collectTestResults(pipeline, testFilter)
             }
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
-        } // Collect test result stage
-        stage("Rerun Report") {
-            sh "rm -rf rerun && mkdir -p rerun"
-            sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
-            sh "find rerun -type f"
-            def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
-            if (rerunFileCount == 0) {
-                echo "Rerun report is skipped because there is no rerun test data file."
-                return
-            }
-            def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
-            def xmlFileList = xmlFiles.collect { it.path }
-            def inputfiles = xmlFileList.join(',')
-            echo "inputfiles: ${inputfiles}"
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+
+            // Pre-install shared dependencies for parallel tasks
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-            sh """
-                python3 llm/jenkins/scripts/test_rerun.py \
-                generate_rerun_report \
-                --output-file=rerun/rerun_report.xml \
-                --input-files=${inputfiles}
-            """
-            trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
-            echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
-            catchError(
-                buildResult: 'SUCCESS',
-                stageResult: 'UNSTABLE') {
-                error "Some failed tests were reruned, please check the rerun report."
-            }
-        } // Rerun report stage
-        try {
-            stage("Test Coverage") {
-                sh "ls"
-                def CUR_PATH = sh(returnStdout: true, script: 'pwd').replaceAll("\\s","")
-                sh "echo ${CUR_PATH}"
-                sh "rm -rf cov && mkdir -p cov"
-                sh "find . -type f -wholename '*/.coverage.*' -exec mv {} cov/ \\; || true"
-                sh "cd cov && find . -type f"
-                def fileCount = sh(returnStdout: true, script: 'find cov -type f | wc -l').replaceAll("\\s","").toInteger()
-                if (fileCount == 0) {
-                    echo "Test coverage is skipped because there is no test data file."
+        } // Collect test result stage
+
+        // 2. Parallel: Rerun Report, Test Coverage, and AI Failure Analysis
+        def parallelTasks = [:]
+        parallelTasks["Rerun Report"] = {
+            try {
+            timeout(time: 10, unit: 'MINUTES') {
+            stage("Rerun Report") {
+                sh "rm -rf rerun && mkdir -p rerun"
+                sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
+                sh "find rerun -type f"
+                def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
+                if (rerunFileCount == 0) {
+                    echo "Rerun report is skipped because there is no rerun test data file."
                     return
                 }
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
-                sh "coverage --version"
-
-                sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
-                def coverageConfigFile = "cov/.coveragerc"
+                def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
+                def xmlFileList = xmlFiles.collect { it.path }
+                def inputfiles = xmlFileList.join(',')
+                echo "inputfiles: ${inputfiles}"
                 sh """
-                    echo '[paths]' > ${coverageConfigFile}
-                    echo 'source1=\n    ${CUR_PATH}/llm/examples/\n    */TensorRT-LLM/src/examples/' >> ${coverageConfigFile}
-                    echo 'source2=\n    ${CUR_PATH}/llm/tensorrt_llm/\n    */tensorrt_llm/' >> ${coverageConfigFile}
-                    cat ${coverageConfigFile}
+                    python3 llm/jenkins/scripts/test_rerun.py \
+                    generate_rerun_report \
+                    --output-file=rerun/rerun_report.xml \
+                    --input-files=${inputfiles}
                 """
+                trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+                echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                catchError(
+                    buildResult: 'SUCCESS',
+                    stageResult: 'UNSTABLE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            } // Rerun report stage
+            } // timeout 10 min
+            } catch (Exception e) {
+                echo "Rerun Report failed or timed out: ${e.toString()}"
+            }
+        }
+        parallelTasks["Test Coverage"] = {
+            try {
+            timeout(time: 10, unit: 'MINUTES') {
+            try {
+                stage("Test Coverage") {
+                    sh "ls"
+                    def CUR_PATH = sh(returnStdout: true, script: 'pwd').replaceAll("\\s","")
+                    sh "echo ${CUR_PATH}"
+                    sh "rm -rf cov && mkdir -p cov"
+                    sh "find . -type f -wholename '*/.coverage.*' -exec mv {} cov/ \\; || true"
+                    sh "cd cov && find . -type f"
+                    def fileCount = sh(returnStdout: true, script: 'find cov -type f | wc -l').replaceAll("\\s","").toInteger()
+                    if (fileCount == 0) {
+                        echo "Test coverage is skipped because there is no test data file."
+                        return
+                    }
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
+                    sh "coverage --version"
 
-                sh "cd cov && coverage combine"
-                sh "cd cov && find . -type f"
-                sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
-                sh "cd cov && coverage html -d test_coverage_html -i"
-                trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
-                echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
-            } // Test coverage
+                    sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
+                    def coverageConfigFile = "cov/.coveragerc"
+                    sh """
+                        echo '[paths]' > ${coverageConfigFile}
+                        echo 'source1=\n    ${CUR_PATH}/llm/examples/\n    */TensorRT-LLM/src/examples/' >> ${coverageConfigFile}
+                        echo 'source2=\n    ${CUR_PATH}/llm/tensorrt_llm/\n    */tensorrt_llm/' >> ${coverageConfigFile}
+                        cat ${coverageConfigFile}
+                    """
+
+                    sh "cd cov && coverage combine"
+                    sh "cd cov && find . -type f"
+                    sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
+                    sh "cd cov && coverage html -d test_coverage_html -i"
+                    trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
+                    echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
+                } // Test coverage
+            }
+            catch (InterruptedException e)
+            {
+                throw e
+            }
+            catch (Exception e)
+            {
+                pipeline.echo("Test coverage failed execution.")
+            }
+            } // timeout 10 min
+            } catch (Exception e) {
+                echo "Test Coverage failed or timed out: ${e.toString()}"
+            }
         }
-        catch (InterruptedException e)
-        {
-            throw e
+        if (currentBuild.currentResult == 'FAILURE') {
+            parallelTasks["AI Failure Analysis"] = {
+                try {
+                timeout(time: 10, unit: 'MINUTES') {
+                stage("AI Failure Analysis") {
+                    try {
+                        def prNumber = null
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+                            if (prMatch) {
+                                prNumber = prMatch[0][1]
+                            }
+                        }
+                        def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
+                            pipeline, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
+                        if (analysis) {
+                            def bucket = 'sw-tensorrt-ci-analysis'
+                            def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.html"
+                            def htmlUrl = "https://pbss.s8k.io/v1/AUTH_svc_tensorrt/${bucket}/${key}"
+                            // Self-rendering HTML page: marked.js parses the analysis at page load
+                            // and DOMPurify sanitises the result before injection into the DOM. The
+                            // analysis text comes from the CI agent which consumes build logs (which
+                            // can include attacker-controlled PR content), so we treat it as untrusted.
+                            // Hardening:
+                            //   1. CDN scripts pinned to specific versions and protected with SRI.
+                            //   2. Analysis embedded in a `<script type="application/json">` data
+                            //      block read via textContent + JSON.parse — never inlined into
+                            //      executable JS source. Every `<` in the JSON is rewritten to its
+                            //      JSON unicode escape so a payload cannot smuggle a `</script>`
+                            //      and break out of the data block.
+                            //   3. marked output is run through DOMPurify before innerHTML assignment
+                            //      to strip event-handler attributes and other XSS vectors.
+                            def jsonAnalysis = groovy.json.JsonOutput.toJson(analysis).replace("<", "\\u003c")
+                            def htmlDoc = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>CI Failure Analysis &middot; ${env.JOB_NAME} #${env.BUILD_NUMBER}</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js" integrity="sha384-lqPzN0kmFw9t2syAMwVPM4VbAyqsz/lPyYWbb2Xt6nSPM0WPNrpSWCUBgdcAdgnC" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu" crossorigin="anonymous"></script>
+<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:2em auto;padding:0 1em;color:#24292e}h1,h2,h3{border-bottom:1px solid #eaecef;padding-bottom:.3em}pre{background:#f6f8fa;padding:1em;overflow:auto;border-radius:6px}code{background:#f6f8fa;padding:.2em .4em;border-radius:3px}pre code{background:none;padding:0}a{color:#0366d6}blockquote{border-left:4px solid #dfe2e5;padding:0 1em;color:#6a737d}table{border-collapse:collapse}th,td{border:1px solid #dfe2e5;padding:6px 13px}header{margin-bottom:1.5em;color:#586069}</style>
+</head><body>
+<header><a href="${env.BUILD_URL}">${env.JOB_NAME} #${env.BUILD_NUMBER}</a></header>
+<main id="md"></main>
+<script id="md-source" type="application/json">${jsonAnalysis}</script>
+<script>
+  // Disable marked's strikethrough tokenizer: CI failure-analysis text routinely
+  // contains literal tildes (~/path, ~50ms, regex anchors, etc.) that should not
+  // be interpreted as markup. Other GFM extensions (tables, fences, autolinks,
+  // task lists) stay enabled.
+  marked.use({ tokenizer: { del() { return false; } } });
+  const src = JSON.parse(document.getElementById('md-source').textContent);
+  document.getElementById('md').innerHTML = DOMPurify.sanitize(marked.parse(src));
+</script>
+</body></html>
+"""
+                            writeFile file: 'failure_analysis.html', text: htmlDoc
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: 'apk add --no-cache aws-cli')
+                            // Alpine's musl libc fires A and AAAA queries in parallel; pbss.s8k.io's AAAA
+                            // returns SERVFAIL and musl treats that as a fatal lookup failure (glibc would
+                            // not). Pin the A-record IP in /etc/hosts so getaddrinfo resolves from files.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: '''
+                                if ! grep -q 'pbss.s8k.io' /etc/hosts; then
+                                    ip=$(nslookup -type=A pbss.s8k.io 2>/dev/null | awk '/^Address[: ]/ && $NF !~ /:53$/ && $NF !~ /#53$/ { print $NF; exit }')
+                                    if [ -n "$ip" ]; then
+                                        printf '%s\\n' "$ip pbss.s8k.io" >> /etc/hosts
+                                    fi
+                                fi
+                            ''')
+                            withCredentials([string(
+                                    credentialsId: 'svc_tensorrt-swift-stack-key',
+                                    variable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script:
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp failure_analysis.html" +
+                                    " 's3://${bucket}/${key}' --endpoint-url https://pbss.s8k.io" +
+                                    " --content-type text/html")
+                            }
+                            // Surface the URL via currentBuild.description so the upstream PR_Github
+                            // wrapper can extract it and include it in the GitHub PR comment.
+                            def existingDesc = currentBuild.description ?: ""
+                            currentBuild.description = existingDesc +
+                                (existingDesc ? "<br/>" : "") +
+                                "<a href='${htmlUrl}'>CI Agent Failure Analysis</a>"
+                            echo "CI Agent Failure Analysis: ${htmlUrl}"
+                        }
+                    } catch (Exception e) {
+                        // Analysis is best-effort; do not fail the pipeline
+                    }
+                }
+                } // timeout 10 min
+                } catch (Exception e) {
+                    echo "AI Failure Analysis failed or timed out: ${e.toString()}"
+                }
+            }
         }
-        catch (Exception e)
-        {
-            pipeline.echo("Test coverage failed execution.")
-        }
+        parallel parallelTasks
     })
 }
 
@@ -1614,98 +1726,8 @@ pipeline {
                 }
             }
         }
-        failure {
-            script {
-                try {
-                    def prNumber = null
-                    if (globalVars[GITHUB_PR_API_URL]) {
-                        def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
-                        if (prMatch) {
-                            prNumber = prMatch[0][1]
-                        }
-                    }
-                    def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
-                        this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
-                    if (analysis) {
-                        def bucket = 'sw-tensorrt-ci-analysis'
-                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.html"
-                        def htmlUrl = "https://pbss.s8k.io/v1/AUTH_svc_tensorrt/${bucket}/${key}"
-                        // Self-rendering HTML page: marked.js parses the analysis at page load
-                        // and DOMPurify sanitises the result before injection into the DOM. The
-                        // analysis text comes from the CI agent which consumes build logs (which
-                        // can include attacker-controlled PR content), so we treat it as untrusted.
-                        // Hardening:
-                        //   1. CDN scripts pinned to specific versions and protected with SRI.
-                        //   2. Analysis embedded in a `<script type="application/json">` data
-                        //      block read via textContent + JSON.parse — never inlined into
-                        //      executable JS source. Every `<` in the JSON is rewritten to its
-                        //      JSON unicode escape so a payload cannot smuggle a `</script>`
-                        //      and break out of the data block.
-                        //   3. marked output is run through DOMPurify before innerHTML assignment
-                        //      to strip event-handler attributes and other XSS vectors.
-                        def jsonAnalysis = groovy.json.JsonOutput.toJson(analysis).replace("<", "\\u003c")
-                        def htmlDoc = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<title>CI Failure Analysis &middot; ${env.JOB_NAME} #${env.BUILD_NUMBER}</title>
-<script src="https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js" integrity="sha384-lqPzN0kmFw9t2syAMwVPM4VbAyqsz/lPyYWbb2Xt6nSPM0WPNrpSWCUBgdcAdgnC" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu" crossorigin="anonymous"></script>
-<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:2em auto;padding:0 1em;color:#24292e}h1,h2,h3{border-bottom:1px solid #eaecef;padding-bottom:.3em}pre{background:#f6f8fa;padding:1em;overflow:auto;border-radius:6px}code{background:#f6f8fa;padding:.2em .4em;border-radius:3px}pre code{background:none;padding:0}a{color:#0366d6}blockquote{border-left:4px solid #dfe2e5;padding:0 1em;color:#6a737d}table{border-collapse:collapse}th,td{border:1px solid #dfe2e5;padding:6px 13px}header{margin-bottom:1.5em;color:#586069}</style>
-</head><body>
-<header><a href="${env.BUILD_URL}">${env.JOB_NAME} #${env.BUILD_NUMBER}</a></header>
-<main id="md"></main>
-<script id="md-source" type="application/json">${jsonAnalysis}</script>
-<script>
-  // Disable marked's strikethrough tokenizer: CI failure-analysis text routinely
-  // contains literal tildes (~/path, ~50ms, regex anchors, etc.) that should not
-  // be interpreted as markup. Other GFM extensions (tables, fences, autolinks,
-  // task lists) stay enabled.
-  marked.use({ tokenizer: { del() { return false; } } });
-  const src = JSON.parse(document.getElementById('md-source').textContent);
-  document.getElementById('md').innerHTML = DOMPurify.sanitize(marked.parse(src));
-</script>
-</body></html>
-"""
-                        writeFile file: 'failure_analysis.html', text: htmlDoc
-                        container("alpine") {
-                            trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
-                            // Alpine's musl libc fires A and AAAA queries in parallel; pbss.s8k.io's AAAA
-                            // returns SERVFAIL and musl treats that as a fatal lookup failure (glibc would
-                            // not). Pin the A-record IP in /etc/hosts so getaddrinfo resolves from files.
-                            trtllm_utils.llmExecStepWithRetry(this, script: '''
-                                if ! grep -q 'pbss.s8k.io' /etc/hosts; then
-                                    ip=$(nslookup -type=A pbss.s8k.io 2>/dev/null | awk '/^Address[: ]/ && $NF !~ /:53$/ && $NF !~ /#53$/ { print $NF; exit }')
-                                    if [ -n "$ip" ]; then
-                                        printf '%s\\n' "$ip pbss.s8k.io" >> /etc/hosts
-                                    fi
-                                fi
-                            ''')
-                            withCredentials([string(
-                                    credentialsId: 'svc_tensorrt-swift-stack-key',
-                                    variable: 'AWS_SECRET_ACCESS_KEY')]) {
-                                trtllm_utils.llmExecStepWithRetry(this, script:
-                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp failure_analysis.html" +
-                                    " 's3://${bucket}/${key}' --endpoint-url https://pbss.s8k.io" +
-                                    " --content-type text/html")
-                            }
-                        }
-                        // Surface the URL via currentBuild.description so the upstream PR_Github
-                        // wrapper can extract it and include it in the GitHub PR comment.
-                        def existingDesc = currentBuild.description ?: ""
-                        currentBuild.description = existingDesc +
-                            (existingDesc ? "<br/>" : "") +
-                            "<a href='${htmlUrl}'>CI Agent Failure Analysis</a>"
-                        echo "CI Agent Failure Analysis: ${htmlUrl}"
-                    }
-                } catch (Exception e) {
-                    // Analysis is best-effort; do not fail the pipeline
-                }
-            }
-        }
         always {
             script {
-                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
-                    collectTestResults(this, testFilter)
-                }
                 stage("Upload Build Info") {
                     try {
                         def branch = env.gitlabBranch ? env.gitlabBranch : "main"
@@ -1722,6 +1744,9 @@ pipeline {
                     } catch (Exception e) {
                         echo "Upload Build Info failed: ${e.toString()}"
                     }
+                }
+                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
+                    collectTestResults(this, testFilter, globalVars)
                 }
             }
         }

@@ -8,6 +8,7 @@ from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..attention_backend.interface import AttentionTensorLayout
+from ..attention_backend.parallel import wrap_parallel_attention
 from ..attention_backend.utils import create_attention
 from ..config import DiffusionModelConfig, SkipSoftmaxConfig
 from ..modules.rms_norm import RMSNormTPAware
@@ -51,7 +52,7 @@ class Attention(nn.Module):
         fuse_qk_norm_rope: Optional[bool] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
-        enable_ulysses: bool = True,  # make this enable sequence parallelism
+        enable_sequence_parallel: bool = True,
     ):
         super().__init__()
 
@@ -90,7 +91,6 @@ class Attention(nn.Module):
 
         # Select compute backend (orthogonal to parallelism)
         vgm = config.visual_gen_mapping
-        ring_size = vgm.ring_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
@@ -160,15 +160,9 @@ class Attention(nn.Module):
             ]
         )
 
-        # TODO: Support combined Ulysses + CP. Ulysses shards heads while CP shards sequence.
-        # Currently kept as mutually exclusive.
-        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
-        use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
-        use_ulysses = ulysses_size > 1 and enable_ulysses
-
-        # Compute head counts for the backend
-        # Ulysses shards heads across workers; inner backend sees sharded count
-        # Attention2D gathers sequence (not heads); inner backend sees full count
+        # Ulysses shards heads across workers; inner backend sees sharded head count.
+        # Attention2D gathers sequence (not heads); see wrap_parallel_attention for nesting.
+        use_ulysses = ulysses_size > 1 and enable_sequence_parallel
         if use_ulysses:
             backend_num_heads = self.local_num_attention_heads // ulysses_size
             backend_num_kv_heads = self.local_num_key_value_heads // ulysses_size
@@ -206,30 +200,21 @@ class Attention(nn.Module):
             sparse_attention_config=sparse_attention_config,
         )
 
-        # Wrap with parallelism strategy (orthogonal to backend choice)
-        if use_attn2d:
-            from ..attention_backend.parallel import Attention2DAttention
+        if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
+            ring_size = vgm.ring_size
+            attn2d_size = vgm.attn2d_row_size * vgm.attn2d_col_size
+            if ring_size > 1 or attn2d_size > 1:
+                raise ValueError(
+                    "SEPARATE_QKV cross-attention does not support Ring or Attention2D "
+                    "sequence parallelism; use enable_sequence_parallel=False or Ulysses-only "
+                    f"(ring_size={ring_size}, attn2d_size={attn2d_size})."
+                )
 
-            self.attn = Attention2DAttention(
-                inner_backend=self.attn,
-                row_process_group=vgm.attn2d_row_group,
-                col_process_group=vgm.attn2d_col_group,
-            )
-        else:
-            # Ring shards the sequence dim and therefore requires S_q == S_kv,
-            # so only self-attention is eligible.
-            if ring_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV:
-                from ..attention_backend.parallel import RingAttention
-
-                self.attn = RingAttention(self.attn, process_group=vgm.ring_group)
-            # Ulysses shards the head dim and is value-preserving under
-            # different Q/KV sequence lengths, so it is valid on cross-attn too.
-            # ``use_ulysses`` already folds in the caller-provided
-            # ``enable_ulysses`` flag.
-            if use_ulysses:
-                from ..attention_backend.parallel import UlyssesAttention
-
-                self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
+        self.attn = wrap_parallel_attention(
+            self.attn,
+            visual_gen_mapping=vgm,
+            enable_sequence_parallel=enable_sequence_parallel,
+        )
 
     def _init_qkv_proj(self) -> None:
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None

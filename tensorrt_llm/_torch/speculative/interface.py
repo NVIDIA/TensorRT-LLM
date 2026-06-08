@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import os
 from abc import ABC, abstractmethod
@@ -220,7 +235,10 @@ class SpeculativeDecodingMode(IntEnum):
     AUTO = auto()
 
     def is_mtp_one_model(self):
-        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+        # Union: covers vanilla MTP and MTP_EAGLE_ONE_MODEL. Use is_mtp_vanilla()
+        # when only the vanilla MTP variant should match.
+        return (self == SpeculativeDecodingMode.MTP
+                or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
 
     def is_mtp_eagle_one_model(self):
         return self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
@@ -296,7 +314,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def support_dynamic_draft_len(self):
         # TODO: expand to all one-model algorithms
-        return self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp_eagle_one_model()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -716,8 +734,15 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata,
         spec_metadata,
         draft_model,
+        resource_manager=None,
     ):
-        """Skip spec dec for non-last rank (PP). Returns placeholder outputs."""
+        """Skip spec dec for non-last rank (PP). Returns placeholder outputs.
+
+        ``resource_manager`` is accepted but unused; it appears in the
+        ``forward()`` signature of one-model workers (Eagle3 / MTP-Eagle) and
+        the caller in ``modeling_speculative.py`` forwards it unconditionally,
+        so the skip path must accept it as well.
+        """
         batch_size = attn_metadata.num_seqs
         accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,

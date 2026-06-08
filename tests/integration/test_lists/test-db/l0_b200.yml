@@ -105,6 +105,7 @@ l0_b200:
   - unittest/_torch/modules/test_moe_load_balancer.py
   - unittest/_torch/modules/test_moe_routing.py
   - unittest/_torch/modules/test_moe_host_sharer.py
+  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   # ------------- legacy MoE tests ---------------
   - unittest/_torch/modules/test_fused_moe.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
@@ -119,6 +120,7 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
@@ -133,6 +135,7 @@ l0_b200:
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
@@ -207,6 +210,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
+  - unittest/_torch/visual_gen/test_cosmos3_transformer.py
+  - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - examples/test_visual_gen.py::test_wan_t2v_example
   # - examples/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
@@ -303,6 +308,16 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
+  # ------------- VisualGen single-GPU tests ---------------
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
+  - examples/test_visual_gen.py::test_visual_gen_api_walkthrough
+  - examples/test_visual_gen.py::test_flux1_lpips_against_golden
+  - examples/test_visual_gen.py::test_flux2_lpips_against_golden
+  - examples/test_visual_gen.py::test_ltx2_lpips_against_golden
+  - examples/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
+  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
+  - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:
@@ -320,7 +335,7 @@ l0_b200:
   tests:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[bf16]
   # ------------- AutoDeploy unit tests ---------------
@@ -362,7 +377,7 @@ l0_b200:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_nvfp4[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[fp8]
   # ------------- AutoDeploy Perf Sanity ---------------
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)
