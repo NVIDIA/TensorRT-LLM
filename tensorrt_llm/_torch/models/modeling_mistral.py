@@ -558,13 +558,13 @@ class MistralNativeInputProcessor(MistralInputProcessorBase):
 # Mistral is the only supported case where HF preprocessor can be used with
 # non-HF checkpoints, so this hack is preferred to changing the registry itself.
 MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
-    "mistral3_common",
+    "mistral_common",
     MultimodalPlaceholderMetadata(
         placeholder_map={"image": "[IMG]"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.PASSTHROUGH,
     ))
-MistralNativeInputProcessor._registered_model_type = "mistral3_common"
+MistralNativeInputProcessor._registered_model_type = "mistral_common"
 
 
 @register_auto_model("Mistral3ForConditionalGeneration")
