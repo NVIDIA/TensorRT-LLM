@@ -221,7 +221,7 @@ class DynamicTreeOpsConverter:
 
     def verify_dynamic_tree_rejection_out(
         self,
-        candidates: torch.Tensor,
+        draft_tokens: torch.Tensor,
         target_logits_tree: torch.Tensor,
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
@@ -245,12 +245,13 @@ class DynamicTreeOpsConverter:
         accept_tok_num = self._rej_accept_token_num_buf[:num_gens]
         seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed")
         offset_tensor = self._get_rejection_rng_tensor(offset, self._rej_offset_buf, "offset")
-        num_draft_tokens = candidates.shape[1]
+        # draft_tokens has shape [num_gens, N-1]; derive total tree nodes N from target_logits_tree.
+        num_draft_tokens = target_logits_tree.shape[0] // num_gens
         if num_gens <= 0:
             raise ValueError(f"num_gens must be positive, got {num_gens}")
 
         if tree_valid is None:
-            tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
+            tree_valid = torch.ones(num_gens, dtype=torch.bool, device=draft_tokens.device)
         tree_valid = tree_valid.contiguous()
 
         # Expand per-request sampling params to per-tree-position (num_gens * N rows).
@@ -272,7 +273,7 @@ class DynamicTreeOpsConverter:
 
         try:
             torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
-                candidates,
+                draft_tokens,
                 target_probs_tree,
                 retrieve_next_token,
                 retrieve_next_sibling,
@@ -287,7 +288,7 @@ class DynamicTreeOpsConverter:
         except Exception as e:
             raise RuntimeError(
                 f"dynamic tree rejection target-only op chain failed: {e}\n"
-                f"Inputs: num_gens={num_gens}, N={candidates.shape[1]}, "
+                f"Inputs: num_gens={num_gens}, N={draft_tokens.shape[1] + 1}, "
                 f"target_vocab={target_logits_tree.shape[-1]}, num_spec_step={num_spec_step}"
             ) from e
 

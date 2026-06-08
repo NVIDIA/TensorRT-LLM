@@ -992,7 +992,7 @@ constexpr int32_t kMaxTriedPerLevel = 32;
 //! \param offset              [1] int64 on GPU. Philox RNG offset.
 template <int32_t BLOCK_SIZE>
 __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
-    int64_t const* candidates, float const* targetProbs, int32_t const* retrieveNextToken,
+    int64_t const* draftTokens, float const* targetProbs, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, bool const* treeValid, uint32_t batchSize, uint32_t numSpeculativeTokens,
     uint32_t numDraftTokens, uint32_t vocabSize, int64_t const* seed, int64_t const* offset)
 {
@@ -1311,7 +1311,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
             int32_t childIdx = sFirstChild;
             while (childIdx != -1)
             {
-                int64_t const tokenId = candidates[batchOffset + childIdx];
+                int64_t const tokenId = draftTokens[bx * (numDraftTokens - 1) + (childIdx - 1)];
                 float const tProb = parentProbs[static_cast<uint64_t>(tokenId)];
                 probAcc += tProb;
 
@@ -1384,7 +1384,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
 }
 
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
-    int64_t const* candidates, float const* targetProbs, int32_t const* retrieveNextToken,
+    int64_t const* draftTokens, float const* targetProbs, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, bool const* treeValid, SizeType32 batchSize, SizeType32 numDraftTokens,
     SizeType32 numSpecStep, SizeType32 vocabSize, int64_t const* seed, int64_t const* offset, cudaStream_t stream)
 {
@@ -1393,7 +1393,7 @@ void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptToken
     dim3 block(kBlockSize);
 
     verifyDynamicTreeRejectionKernel<kBlockSize><<<grid, block, 0, stream>>>(acceptIndex, acceptTokenNum, acceptToken,
-        candidates, targetProbs, retrieveNextToken, retrieveNextSibling, treeValid, static_cast<uint32_t>(batchSize),
+        draftTokens, targetProbs, retrieveNextToken, retrieveNextSibling, treeValid, static_cast<uint32_t>(batchSize),
         static_cast<uint32_t>(numSpecStep), static_cast<uint32_t>(numDraftTokens), static_cast<uint32_t>(vocabSize),
         seed, offset);
 

@@ -100,7 +100,7 @@ void invokeVerifyDynamicTreeGreedyPacked(int32_t* acceptIndex, int32_t* acceptTo
 //! \param offset         [1] int64 on GPU. Philox RNG offset.
 //! \param stream         cudaStream_t.
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
-    int64_t const* candidates, float const* targetProbs, int32_t const* retrieveNextToken,
+    int64_t const* draftTokens, float const* targetProbs, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, bool const* treeValid, runtime::SizeType32 batchSize,
     runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep, runtime::SizeType32 vocabSize,
     int64_t const* seed, int64_t const* offset, cudaStream_t stream);

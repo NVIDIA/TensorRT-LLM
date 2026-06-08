@@ -147,19 +147,19 @@ th::Tensor compute_probs_from_logits_op(th::Tensor logits, th::Tensor temperatur
 }
 
 //! \brief Target-only rejection sampling verify op (no draft probabilities needed).
-void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& targetProbs,
+void verify_dynamic_tree_rejection_out_op(th::Tensor& draftTokens, th::Tensor& targetProbs,
     th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling, th::Tensor& treeValid, th::Tensor& acceptIndex,
     th::Tensor& acceptTokenNum, th::Tensor& acceptToken, int64_t numSpecStep, th::Tensor& seed, th::Tensor& offset)
 {
-    TORCH_CHECK(candidates.dim() == 2, "candidates must be 2D tensor");
+    TORCH_CHECK(draftTokens.dim() == 2, "draftTokens must be 2D tensor");
     TORCH_CHECK(targetProbs.dim() == 3, "targetProbs must be 3D tensor");
     TORCH_CHECK(retrieveNextToken.dim() == 2, "retrieveNextToken must be 2D tensor");
     TORCH_CHECK(retrieveNextSibling.dim() == 2, "retrieveNextSibling must be 2D tensor");
     TORCH_CHECK(treeValid.dim() == 1, "treeValid must be 1D tensor");
-    TORCH_CHECK(candidates.scalar_type() == torch::kInt64, "candidates must be int64 tensor");
+    TORCH_CHECK(draftTokens.scalar_type() == torch::kInt64, "draftTokens must be int64 tensor");
     TORCH_CHECK(targetProbs.scalar_type() == torch::kFloat32, "targetProbs must be float32 tensor");
     TORCH_CHECK(treeValid.scalar_type() == torch::kBool, "treeValid must be bool tensor");
-    TORCH_CHECK(candidates.is_cuda(), "candidates must be a CUDA tensor");
+    TORCH_CHECK(draftTokens.is_cuda(), "draftTokens must be a CUDA tensor");
     TORCH_CHECK(targetProbs.is_cuda(), "targetProbs must be a CUDA tensor");
     TORCH_CHECK(retrieveNextToken.is_cuda(), "retrieveNextToken must be a CUDA tensor");
     TORCH_CHECK(retrieveNextSibling.is_cuda(), "retrieveNextSibling must be a CUDA tensor");
@@ -168,8 +168,9 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& ta
     TORCH_CHECK(acceptTokenNum.is_cuda(), "acceptTokenNum must be a CUDA tensor");
     TORCH_CHECK(acceptToken.is_cuda(), "acceptToken must be a CUDA tensor");
 
-    int64_t const batchSize = candidates.size(0);
-    int64_t const numDraftTokens = candidates.size(1);
+    int64_t const batchSize = draftTokens.size(0);
+    // draftTokens has shape [batchSize, N-1]; numDraftTokens is the total tree nodes N (including root).
+    int64_t const numDraftTokens = draftTokens.size(1) + 1;
     int64_t const vocabSize = targetProbs.size(2);
 
     TORCH_CHECK(targetProbs.size(0) == batchSize, "targetProbs batch size mismatch");
@@ -190,14 +191,14 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& ta
     TORCH_CHECK(offset.scalar_type() == torch::kInt64 && offset.numel() >= 1 && offset.is_cuda(),
         "offset must be int64 CUDA tensor with >=1 element");
 
-    auto stream = at::cuda::getCurrentCUDAStream(candidates.device().index());
+    auto stream = at::cuda::getCurrentCUDAStream(draftTokens.device().index());
 
     acceptIndex.zero_();
     acceptTokenNum.zero_();
     acceptToken.zero_();
 
     tk::invokeVerifyDynamicTreeRejection(acceptIndex.data_ptr<int64_t>(), acceptTokenNum.data_ptr<int64_t>(),
-        acceptToken.data_ptr<int64_t>(), candidates.data_ptr<int64_t>(), targetProbs.data_ptr<float>(),
+        acceptToken.data_ptr<int64_t>(), draftTokens.data_ptr<int64_t>(), targetProbs.data_ptr<float>(),
         retrieveNextToken.data_ptr<int32_t>(), retrieveNextSibling.data_ptr<int32_t>(), treeValid.data_ptr<bool>(),
         batchSize, numDraftTokens, numSpecStep, vocabSize, seed.data_ptr<int64_t>(), offset.data_ptr<int64_t>(),
         stream);
@@ -245,7 +246,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "verify_dynamic_tree_rejection_out_op("
-        "Tensor candidates, Tensor targetProbs, "
+        "Tensor draftTokens, Tensor targetProbs, "
         "Tensor retrieveNextToken, Tensor retrieveNextSibling, Tensor treeValid, "
         "Tensor(a!) acceptIndex, Tensor(b!) acceptTokenNum, Tensor(c!) acceptToken, "
         "int numSpecStep, Tensor seed, Tensor offset) -> ()");

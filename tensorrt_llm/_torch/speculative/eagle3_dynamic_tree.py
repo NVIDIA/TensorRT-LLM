@@ -25,6 +25,7 @@ from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ..attention_backend import AttentionMetadata
 from .eagle3 import Eagle3OneModelWorker
+from .one_model_sampler import sampling_batch_spec_dec_one_model
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
@@ -293,9 +294,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._candidates_buf = torch.zeros(
             max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
         )
-        self._rejection_candidates_buf = torch.zeros(
-            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
-        )
         self._target_predict_buf = torch.zeros(
             max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
         )
@@ -459,9 +457,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_dynamic_tree(
-            logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
-        )
+        if self._can_use_rejection_sampling(spec_metadata):
+            accepted_tokens, num_accepted_tokens = self._sample_and_accept_dynamic_tree_rejection(
+                logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
+            )
+        else:
+            accepted_tokens, num_accepted_tokens = self._sample_and_accept_dynamic_tree(
+                logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
+            )
         if num_gens > 0:
             self._relocate_kv_eagerly(attn_metadata, batch_size)
         return accepted_tokens, num_accepted_tokens
@@ -749,7 +752,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     def _sample_and_accept_dynamic_tree(
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
     ):
-        """Dynamic tree verification using CUDA kernel."""
+        """Dynamic tree verification: greedy and non-greedy-without-rejection paths."""
         if num_gens > self._max_batch_size:
             raise RuntimeError(
                 f"Dynamic tree batch size {num_gens} exceeds configured "
@@ -766,8 +769,29 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
         num_flat_tokens = logits.shape[0]
-        # torch.argmax writes LongTensor indices; token storage below remains int32.
-        torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
+        if not spec_metadata.is_all_greedy_sample:
+            # Non-greedy: sample target tokens with per-request temperature/top_k/top_p.
+            # Lazily initialize RNG tensors for CUDA graph compatibility.
+            if self.seed is None:
+                self.seed = torch.tensor([0], dtype=torch.int64, device=logits.device)
+                self.offset = torch.tensor([0], dtype=torch.int64, device=logits.device)
+            self.seed.add_(1).remainder_(2**31)
+            top_ks = spec_metadata.top_ks[:num_flat_tokens]
+            if self.use_flashinfer:
+                top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
+            sampled = sampling_batch_spec_dec_one_model(
+                logits,
+                spec_metadata.temperatures[:num_flat_tokens],
+                top_ks,
+                spec_metadata.top_ps[:num_flat_tokens],
+                use_flashinfer=self.use_flashinfer,
+                seed=self.seed,
+                offset=self.offset,
+            )
+            self._target_tokens_buf[:num_flat_tokens].copy_(sampled)
+        else:
+            # Greedy fast path (CUDA graph key: is_all_greedy_sample=True).
+            torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
         target_tokens = self._target_tokens_buf[:num_flat_tokens]
 
         # Context requests: accept sampled token
@@ -796,79 +820,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             tree_valid = slot_storage.has_tree[gen_slot_ids]
             retrieve_packed = slot_storage.pack_retrieve_from_slots(gen_slot_ids, num_gens)
 
-            if self._can_use_rejection_sampling(spec_metadata):
-                vocab_size = logits.shape[-1]
-                num_ctx_tokens = logits.shape[0] - num_gens * N
-                device = logits.device
-
-                target_logits_tree = logits[num_ctx_tokens:].reshape(-1, vocab_size)
-                gen_slice = slice(num_contexts, num_contexts + num_gens)
-                skip_top_k = getattr(spec_metadata, "skip_top_k", False)
-                skip_top_p = getattr(spec_metadata, "skip_top_p", False)
-
-                if spec_metadata.request_temperatures is None:
-                    temps = torch.ones(num_gens, dtype=torch.float32, device=device)
-                else:
-                    temps = spec_metadata.request_temperatures[gen_slice]
-
-                top_ks = None
-                if not skip_top_k and spec_metadata.request_top_ks is not None:
-                    top_ks = spec_metadata.request_top_ks[gen_slice]
-
-                top_ps = None
-                if not skip_top_p and spec_metadata.request_top_ps is not None:
-                    top_ps = spec_metadata.request_top_ps[gen_slice]
-
-                # Lazily initialize seed/offset tensors on correct device
-                if self.seed is None:
-                    self.seed = torch.tensor([0], dtype=torch.int64, device=device)
-                    self.offset = torch.tensor([0], dtype=torch.int64, device=device)
-                # Use in-place operations for CUDA graph compatibility
-                self.seed.add_(1).remainder_(2**31)
-                rejection_candidates = self._rejection_candidates_buf[:num_gens]
-                rejection_candidates[:, 1:].copy_(
-                    spec_metadata.draft_tokens.reshape(num_gens, N - 1)
-                )
-                rejection_candidates[:, 0].copy_(
-                    target_tokens[num_contexts:].reshape(num_gens, N)[:, 0]
-                )
-                retrieve_next_token, retrieve_next_sibling = slot_storage.next_links_from_slots(
-                    gen_slot_ids, num_gens
-                )
-
-                accept_index, accept_token_num, accept_token = (
-                    self.tree_ops_converter.verify_dynamic_tree_rejection_out(
-                        rejection_candidates,
-                        target_logits_tree,
-                        retrieve_next_token,
-                        retrieve_next_sibling,
-                        tree_valid,
-                        temps,
-                        top_ks,
-                        top_ps,
-                        num_gens,
-                        self._max_path_len,
-                        seed=self.seed,
-                        offset=self.offset,
-                    )
-                )
-
-                self._finalize_dynamic_tree_verify_outputs(
-                    accept_index=accept_index,
-                    accept_token_num=accept_token_num,
-                    accept_token=accept_token,
-                    accepted_tokens=accepted_tokens,
-                    num_accepted_tokens=num_accepted_tokens,
-                    num_contexts=num_contexts,
-                    batch_size=batch_size,
-                    num_gens=num_gens,
-                    max_path_len=max_path_len,
-                )
-                num_accepted_tokens = self._apply_force_accepted_tokens(
-                    num_accepted_tokens, num_contexts, self.max_draft_len
-                )
-                return accepted_tokens, num_accepted_tokens
-
             accept_index, accept_token_num, accept_token = (
                 self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
                     candidates,
@@ -877,6 +828,118 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     num_gens,
                     self._max_path_len,
                     tree_valid=tree_valid,
+                )
+            )
+
+            self._finalize_dynamic_tree_verify_outputs(
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                accept_token=accept_token,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                num_contexts=num_contexts,
+                batch_size=batch_size,
+                num_gens=num_gens,
+                max_path_len=max_path_len,
+            )
+
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, self.max_draft_len
+        )
+
+        return accepted_tokens, num_accepted_tokens
+
+    def _sample_and_accept_dynamic_tree_rejection(
+        self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
+    ):
+        """Dynamic tree rejection sampling path (non-greedy only).
+
+        Context tokens are sampled directly (they bypass the rejection kernel).
+        Gen tokens are handled entirely by the rejection kernel, which samples
+        from the target distribution internally — so only the raw logits (not
+        pre-sampled token IDs) are passed to the kernel.
+        """
+        if num_gens > self._max_batch_size:
+            raise RuntimeError(
+                f"Dynamic tree batch size {num_gens} exceeds configured "
+                f"max_batch_size {self._max_batch_size}"
+            )
+        N = self.tokens_per_gen_step
+        max_path_len = self._max_path_len
+        vocab_size = logits.shape[-1]
+        device = logits.device
+
+        # Reset output buffers
+        self._accepted_tokens_buf[:batch_size].zero_()
+        accepted_tokens = self._accepted_tokens_buf[:batch_size, :max_path_len]
+        self._num_accepted_tokens_buf[:batch_size].fill_(1)
+        num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
+        self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
+
+        # Lazily initialize RNG tensors (needed by rejection kernel).
+        if self.seed is None:
+            self.seed = torch.tensor([0], dtype=torch.int64, device=device)
+            self.offset = torch.tensor([0], dtype=torch.int64, device=device)
+        self.seed.add_(1).remainder_(2**31)
+
+        # Context tokens bypass the rejection kernel — sample them directly.
+        if num_contexts > 0:
+            top_ks_ctx = spec_metadata.top_ks[:num_contexts]
+            if self.use_flashinfer:
+                top_ks_ctx = top_ks_ctx.clamp(min=1, max=vocab_size - 1)
+            sampled_ctx = sampling_batch_spec_dec_one_model(
+                logits[:num_contexts],
+                spec_metadata.temperatures[:num_contexts],
+                top_ks_ctx,
+                spec_metadata.top_ps[:num_contexts],
+                use_flashinfer=self.use_flashinfer,
+                seed=self.seed,
+                offset=self.offset,
+            )
+            accepted_tokens[:num_contexts, 0].copy_(sampled_ctx)
+
+        if num_gens > 0:
+            spec_tree_manager = self.spec_tree_manager
+
+            if spec_tree_manager is None:
+                # CUDA graph warmup: accept only the root token per request.
+                # Use argmax of root-position logits as the accepted token.
+                gen_root_tokens = torch.argmax(
+                    logits[num_contexts:].reshape(num_gens, N, vocab_size)[:, 0, :], dim=-1
+                )
+                num_accepted_tokens[num_contexts:batch_size] = 1
+                accepted_tokens[num_contexts:batch_size, 0] = gen_root_tokens
+                self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
+                return accepted_tokens, num_accepted_tokens
+
+            target_logits_tree = logits[-num_gens * N:].reshape(-1, vocab_size)
+            gen_slice = slice(num_contexts, num_contexts + num_gens)
+            temps = spec_metadata.request_temperatures[gen_slice]
+            top_ks_rej = spec_metadata.request_top_ks[gen_slice]
+            top_ps_rej = spec_metadata.request_top_ps[gen_slice]
+
+            slot_storage = spec_tree_manager.slot_storage
+            gen_slot_ids = slot_storage.all_ids_buf[num_contexts : num_contexts + num_gens]
+            tree_valid = slot_storage.has_tree[gen_slot_ids]
+
+            retrieve_next_token, retrieve_next_sibling = slot_storage.next_links_from_slots(
+                gen_slot_ids, num_gens
+            )
+
+            accept_index, accept_token_num, accept_token = (
+                self.tree_ops_converter.verify_dynamic_tree_rejection_out(
+                    spec_metadata.draft_tokens.reshape(num_gens, N - 1).long(),
+                    target_logits_tree,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    tree_valid,
+                    temps,
+                    top_ks_rej,
+                    top_ps_rej,
+                    num_gens,
+                    self._max_path_len,
+                    seed=self.seed,
+                    offset=self.offset,
                 )
             )
 
