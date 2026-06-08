@@ -1189,9 +1189,8 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
             });
         if (sDebug)
         {
-            fprintf(stderr,
-                "[Scheme X] numRows=%d numColumns=%d kBsLarge=%d kSeqSmall=%d -> %s path\n", numRows, numColumns,
-                bounds.kBsLarge, bounds.kSeqSmall, canUseHeuristic ? "Heuristic" : "Radix");
+            fprintf(stderr, "[Scheme X] numRows=%d numColumns=%d kBsLarge=%d kSeqSmall=%d -> %s path\n", numRows,
+                numColumns, bounds.kBsLarge, bounds.kSeqSmall, canUseHeuristic ? "Heuristic" : "Radix");
         }
     }
 
