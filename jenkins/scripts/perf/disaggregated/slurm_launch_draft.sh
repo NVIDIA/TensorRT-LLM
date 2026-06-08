@@ -17,7 +17,7 @@ chmod +x $installScript
 # for the rootfs flock and fail with "Could not acquire rootfs lock".
 echo "Pre-initializing pyxis container on all nodes..."
 if ! srun "${srunArgs[@]}" --ntasks-per-node=1 --kill-on-bad-exit=1 true \
-    &> $jobWorkspace/container_preinit.log; then
+    &> "$jobWorkspace/container_preinit.log"; then
     cleanup_on_failure "Failed to pre-initialize container. Check $jobWorkspace/container_preinit.log"
 fi
 echo "Pyxis container pre-initialized on all nodes"
