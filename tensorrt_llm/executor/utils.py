@@ -48,6 +48,38 @@ def get_spawn_proxy_process_env() -> bool:
     return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS) == "1"
 
 
+# ---------------------------------------------------------------------------
+# In-process rank-0 worker registry (RPC local fast-path).
+#
+# Under MpiCommSession the rank-0 RpcWorker runs in a thread of the proxy
+# process, yet the proxy still reaches it over a loopback ZMQ socket
+# (pickle + HMAC + dispatch) -- pure self-inflicted overhead that competes for
+# the GIL with the co-located executor loop. The worker registers itself here
+# keyed by its rpc_addr (which the proxy also knows), so the proxy can call it
+# directly. A lookup miss -- e.g. the spawn-proxy topology where the worker
+# lives in a different process, so this process's registry does not contain it
+# -- transparently falls back to RPC. This makes the local/remote decision
+# automatic per-process, with no explicit topology detection.
+# ---------------------------------------------------------------------------
+_local_rpc_workers: dict = {}
+_local_rpc_workers_lock = threading.Lock()
+
+
+def register_local_rpc_worker(rpc_addr: str, worker: Any) -> None:
+    with _local_rpc_workers_lock:
+        _local_rpc_workers[rpc_addr] = worker
+
+
+def unregister_local_rpc_worker(rpc_addr: str) -> None:
+    with _local_rpc_workers_lock:
+        _local_rpc_workers.pop(rpc_addr, None)
+
+
+def get_local_rpc_worker(rpc_addr: str) -> Optional[Any]:
+    with _local_rpc_workers_lock:
+        return _local_rpc_workers.get(rpc_addr)
+
+
 def create_mpi_comm_session(
         n_workers: int) -> RemoteMpiCommSessionClient | MpiPoolSession:
     assert mpi_rank(

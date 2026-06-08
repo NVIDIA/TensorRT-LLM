@@ -12,7 +12,7 @@ from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import get_unique_ipc_addr
-from .utils import ErrorResponse, is_llm_response
+from .utils import ErrorResponse, get_local_rpc_worker, is_llm_response
 
 
 class RpcExecutorMixin:
@@ -37,6 +37,15 @@ class RpcExecutorMixin:
         self.main_loop_task_obj = None
         self.main_loop = None
         self.main_loop_thread = None
+
+        # In-process RPC fast-path (opt-in). When the rank-0 worker is
+        # co-located in this process (MpiCommSession), submit() calls it
+        # directly instead of going through the loopback pickle/HMAC/ZMQ RPC,
+        # which otherwise burns the GIL on rank 0 in competition with the
+        # executor loop. Disabled by default; falls back to RPC when the worker
+        # is not local (e.g. spawn-proxy topology).
+        self._local_fastpath = os.getenv("TLLM_RPC_LOCAL_FASTPATH",
+                                         "0") == "1"
 
     def setup_mainloop(
         self, tasks: Optional[List[Callable]] = None, thread_name: str = "rpc_proxy_main_loop"
@@ -83,10 +92,8 @@ class RpcExecutorMixin:
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
+        # Register the result before sending so a response can never arrive for
+        # a client_id that is not yet tracked (see handle_responses()).
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
@@ -95,6 +102,19 @@ class RpcExecutorMixin:
             logprob_params=logprob_params,
         )
         self._results[request.id] = result
+
+        # In-process fast-path: when the rank-0 worker lives in this process,
+        # call it directly and skip the loopback pickle / HMAC / ZMQ / dispatch.
+        # A miss (e.g. spawn-proxy topology) falls back to RPC automatically.
+        local_worker = (get_local_rpc_worker(self.rpc_addr)
+                        if self._local_fastpath else None)
+        if local_worker is not None:
+            with nvtx_range_debug("RPCExecutor.submit.local", color="green", category="Proxy"):
+                local_worker.submit(request)
+        else:
+            # submit is a fire-and-forget operation, don't need to wait for response
+            with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
+                self.rpc_client.submit(request).remote(need_response=False)
 
         return result
 

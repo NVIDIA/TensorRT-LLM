@@ -19,6 +19,7 @@ from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
 from .rpc import RPCServer
 from .rpc_worker_mixin import RpcWorkerMixin
+from .utils import register_local_rpc_worker, unregister_local_rpc_worker
 
 
 class RpcWorker(RpcWorkerMixin, BaseWorker):
@@ -164,11 +165,19 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
             logger_debug(f"[worker] RPC server {mpi_rank()} is started",
                          color="yellow")
 
+            # Expose the worker in-process so a co-located proxy
+            # (MpiCommSession) can bypass the loopback RPC for hot-path calls.
+            # In the spawn-proxy topology this runs in a different process than
+            # the proxy, so the proxy's registry stays empty and it falls back
+            # to RPC -- the decision is automatic per-process.
+            register_local_rpc_worker(rpc_addr, worker)
+
             # Step 3: Wait for the worker to shutdown
             logger_debug(
                 f"[worker] Worker {mpi_rank()} is waiting for shutdown event",
                 color="yellow")
             worker.shutdown_event.wait()
+            unregister_local_rpc_worker(rpc_addr)
             rpc_server.shutdown()
 
     def __enter__(self):
