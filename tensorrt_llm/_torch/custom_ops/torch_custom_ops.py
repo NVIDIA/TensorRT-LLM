@@ -558,9 +558,10 @@ class FP4GemmRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         mat1, mat2, mat1_scale, mat2_scale, global_scale = inputs
-        return self.fp4_gemm_runner.run_gemm(
+        out = self.fp4_gemm_runner.run_gemm(
             mat1,
             mat2,
             mat1_scale,
@@ -569,7 +570,9 @@ class FP4GemmRunner(TunableRunner):
             self.output_buffer_kind,
             tactic,
             self.group,
+            bias,
         )
+        return out
 
 
 class CublasLtFP4GemmRunner(TunableRunner):
@@ -621,6 +624,7 @@ class CublasLtFP4GemmRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
         result = self.cublaslt_runner.run_gemm(
@@ -632,6 +636,7 @@ class CublasLtFP4GemmRunner(TunableRunner):
             self.output_buffer_kind,
             tactic,
             self.group,
+            bias,
         )
         return result
 
@@ -688,6 +693,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
@@ -697,14 +703,13 @@ class CudaCoreNVFP4Runner(TunableRunner):
         act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
             act_sf.view((m + 128 - 1) // 128 * 128, -1))
 
-        # Call CUDA Core NVFP4 GEMM
         result = torch.ops.trtllm.cuda_core_nvfp4_gemm(
             act_fp4,
             weight,
             scale_a=act_sf_unswizzled,
             scale_b=weight_scale,
             alpha=alpha,
-            bias=None,
+            bias=bias,
             out_dtype=self.output_dtype,
             output_buffer_kind=self.output_buffer_kind,
             group=self.group,
@@ -714,15 +719,19 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
 @torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
 def nvfp4_gemm_cublaslt(
-        act_fp4: torch.Tensor,
-        weight: torch.Tensor,
-        act_sf: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
-        output_dtype: torch.dtype,
-        output_buffer_kind: int = int(BufferKind.DEFAULT),
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning.
+
+    Args:
+        bias: Optional per-N bias [N], fused via CUBLASLT_EPILOGUE_BIAS.
 
     Note:
         This function is primarily used internally by nvfp4_gemm.
@@ -742,24 +751,27 @@ def nvfp4_gemm_cublaslt(
         [nvfp4_gemm_runner],
         nvfp4_gemm_runner.tuning_config,
         [act_fp4, weight, act_sf, weight_scale, alpha],
+        bias=bias,
     )
 
     result = nvfp4_gemm_runner(
         inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-        tactic=best_tactic)
+        tactic=best_tactic,
+        bias=bias)
 
     return result
 
 
 @nvfp4_gemm_cublaslt.register_fake
 def _(
-        act_fp4: torch.Tensor,
-        weight: torch.Tensor,
-        act_sf: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
-        output_dtype: torch.dtype,
-        output_buffer_kind: int = int(BufferKind.DEFAULT),
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
@@ -767,15 +779,20 @@ def _(
 
 @torch.library.custom_op("trtllm::nvfp4_gemm_cutlass", mutates_args=())
 def nvfp4_gemm_cutlass(
-        act_fp4: torch.Tensor,
-        weight: torch.Tensor,
-        act_sf: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
-        output_dtype: torch.dtype,
-        output_buffer_kind: int = int(BufferKind.DEFAULT),
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUTLASS-based NVFP4 GEMM with auto-tuning.
+
+    Args:
+        bias: Optional per-N bias [N], fused via the CUTLASS
+            LinCombPerColBias epilogue.
 
     Note:
         This function is primarily used internally by nvfp4_gemm.
@@ -794,22 +811,25 @@ def nvfp4_gemm_cutlass(
         [nvfp4_gemm_runner],
         nvfp4_gemm_runner.tuning_config,
         [act_fp4, weight, act_sf, weight_scale, alpha],
+        bias=bias,
     )
 
     return nvfp4_gemm_runner(
         inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-        tactic=best_tactic)
+        tactic=best_tactic,
+        bias=bias)
 
 
 @nvfp4_gemm_cutlass.register_fake
 def _(
-        act_fp4: torch.Tensor,
-        weight: torch.Tensor,
-        act_sf: torch.Tensor,
-        weight_scale: torch.Tensor,
-        alpha: torch.Tensor,
-        output_dtype: torch.dtype,
-        output_buffer_kind: int = int(BufferKind.DEFAULT),
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
@@ -961,6 +981,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         tactic: Union[
             Tuple,
             int] = -1,  # tuple: (backend name, sub_tactic_id), or int: -1 for fallback
+        bias: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Handle fallback tactic on cache miss
@@ -977,22 +998,27 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             return CudaCoreNVFP4Runner(self.output_buffer_kind,
                                        self.output_dtype,
                                        group=self.group)(inputs,
-                                                         tactic=sub_tactic)
+                                                         tactic=sub_tactic,
+                                                         bias=bias)
         elif backend == "cutlass":
             return FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
                                  self.output_buffer_kind,
                                  self.output_dtype,
-                                 group=self.group)(inputs, tactic=sub_tactic)
+                                 group=self.group)(inputs,
+                                                   tactic=sub_tactic,
+                                                   bias=bias)
         elif backend == "cublaslt":
             return CublasLtFP4GemmRunner(self.output_buffer_kind,
                                          self.output_dtype,
                                          group=self.group)(inputs,
-                                                           tactic=sub_tactic)
+                                                           tactic=sub_tactic,
+                                                           bias=bias)
         elif backend == "cutedsl":
             return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
                                                self.output_buffer_kind,
                                                self.group)(inputs,
-                                                           tactic=sub_tactic)
+                                                           tactic=sub_tactic,
+                                                           bias=bias)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
 
@@ -1008,6 +1034,7 @@ def nvfp4_gemm(
     output_buffer_kind: int = int(BufferKind.DEFAULT),
     allowed_backends: str = "cutlass,cublaslt,cuda_core",
     group: Optional[List[int]] = None,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Unified NVFP4 GEMM with automatic backend selection.
 
@@ -1077,6 +1104,7 @@ def nvfp4_gemm(
             NVFP4GemmUnifiedRunner.
             tuning_config,  # All runners use the same tuning_config
             [act_fp4, weight, act_sf, weight_scale, alpha],
+            bias=bias,
         )
     except IndexError as e:
         # Provide more helpful error message
@@ -1091,6 +1119,7 @@ def nvfp4_gemm(
     return runner(
         inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
         tactic=best_tactic,
+        bias=bias,
     )
 
 
@@ -1105,6 +1134,7 @@ def _(
     output_buffer_kind: int = int(BufferKind.DEFAULT),
     allowed_backends: str = "cutlass,cublaslt,cuda_core",
     group: Optional[List[int]] = None,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile support."""
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
