@@ -12,23 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for the halfspec (TMA-load + sync-MMA warp-specialized)
-sm_120 / sm_121 context FMHA.
+"""Correctness tests for the halfspec sm_120 / sm_121 context FMHA.
 
-The halfspec kernel is the sm_120 / sm_121 context attention path that backs
-skip-softmax, so it is exercised here by attaching a ``SkipSoftmaxAttentionConfig``
-to ``TrtllmAttention`` (which flips ``use_halfspec_fmha`` on). A tiny
-``threshold_scale_factor`` (1e-30) keeps skip-softmax effectively disabled --
-``log(thr / seqlen)`` is hugely negative so no tile is ever skipped -- so the
-kernel computes full softmax and must match a standard attention reference.
-
-For the supported config (BF16 in/out, head_dim == head_dim_v in {128, 256},
-causal, packed QKV) the C++ dispatch in ``FusedMultiHeadAttentionXMMAKernelV2::run``
-routes unconditionally to the halfspec kernel, so a correct result here is a
-direct check of the halfspec kernel itself.
-
-Regression coverage: the multi-request (batch > 1) cases guard against a
-per-request TMA offset bug where every batch element re-read request 0's tokens.
+halfspec backs skip-softmax, so it is forced on by attaching a
+``SkipSoftmaxAttentionConfig`` with a tiny ``threshold_scale_factor`` (no tile
+is ever skipped, i.e. full softmax). For BF16 / head_dim in {128, 256} / causal
+/ packed QKV the runner dispatches unconditionally to halfspec, so these checks
+target the kernel directly. The multi-request cases guard the per-request TMA
+offset fix (every batch element used to re-read request 0's tokens).
 """
 
 import math
@@ -149,8 +140,7 @@ def test_halfspec_context_matches_reference(num_heads, num_kv_heads, head_dim, s
     _, _, out_default = _run_context(
         num_heads, num_kv_heads, head_dim, seq_lens, q, k, v, sparse_attention_config=None
     )
-    # Under test: halfspec, forced on via a skip-softmax cfg with a tiny
-    # threshold so no tile is actually skipped (full softmax).
+    # Under test: halfspec, forced on via the skip-softmax cfg.
     halfspec_layer, _, out_halfspec = _run_context(
         num_heads,
         num_kv_heads,
@@ -165,11 +155,9 @@ def test_halfspec_context_matches_reference(num_heads, num_kv_heads, head_dim, s
 
     assert halfspec_layer.use_halfspec_fmha, "skip-softmax cfg did not enable halfspec"
 
-    # Sanity: the trusted baseline matches the fp32 reference.
+    # Baseline sanity, then the regression checks: halfspec must match both the
+    # reference and the default kernel (pre-fix, batches >1 were off by ~0.2).
     torch.testing.assert_close(out_default.float(), ref.float(), atol=2e-2, rtol=2e-2)
-    # The actual regression assertions: halfspec matches the reference and the
-    # trusted kernel. Pre-fix, multi-request batches returned request 0's result
-    # for every request (mean abs error ~0.2), far outside these tolerances.
     torch.testing.assert_close(out_halfspec.float(), ref.float(), atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(out_halfspec.float(), out_default.float(), atol=2e-2, rtol=2e-2)
 

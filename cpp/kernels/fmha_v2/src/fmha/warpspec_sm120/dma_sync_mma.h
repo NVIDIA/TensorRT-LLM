@@ -182,18 +182,12 @@ struct DMA
         int const bidh_kv = bidh / static_cast<int>(params.h_q_per_kv);
         int const q_row = static_cast<int>(blockIdx.x) * STEP_Q;
 
-        // Per-request token offset into the packed [total_tokens, H, D] buffer.
-        // The Q/K/V TMA descriptors span the whole packed buffer (seq dim =
-        // total_q_seqlen) with a single base pointer, so the seq coordinate must
-        // be the *global* row = cumulative token offset of this batch element
-        // (binfo.sum_s == cu_q_seqlens[bidb]) plus the request-local position.
-        // Without it, every batch element re-reads request 0's tokens.
-        //
-        // halfspec is PACKED_QKV-only, so K and V share each request's token
-        // range with Q -- the KV offset is the same cumulative Q offset. We
-        // deliberately do NOT read binfo.sum_s_kv: cu_kv_seqlens is null on the
-        // self-attention path (only cu_q_seqlens is populated), and sum_s_kv
-        // dereferences it unconditionally in the Single_cta ctor.
+        // The Q/K/V TMA descriptors span the whole packed [total_tokens, H, D]
+        // buffer, so the seq coordinate is the global row = this request's
+        // cumulative token offset (binfo.sum_s == cu_q_seqlens[bidb]) plus the
+        // request-local position; without it every batch element re-reads
+        // request 0. KV reuses sum_s (PACKED_QKV: K/V share Q's token range) --
+        // sum_s_kv would deref the null cu_kv_seqlens on the self-attention path.
         int const q_seq_offset = binfo.sum_s;
         int const kv_seq_offset = binfo.sum_s;
 
