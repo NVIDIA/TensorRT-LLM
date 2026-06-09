@@ -27,6 +27,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `black-forest-labs/FLUX.2-dev` | Text-to-Image |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
+| `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` | Text-to-Video (VSA) |
 | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
@@ -42,19 +43,22 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
-|---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image** [^2] | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
+|---|---|---|---|---|---|---|---|---|---|--|--|--|--|
+| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1 VSA** [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image** [^2] | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
-[^2]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required. 
+[^2]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required.
+
+[^3]: `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` — VSA-fine-tuned checkpoint with learned sparse-attention gates. Requires `CUTEDSL` on Blackwell sm_100+ (falls back to dense SDPA on older hardware). Ring and Attention2D not supported (no LSE output); Ulysses supported.
 
 ## Quick Start
 
@@ -165,6 +169,57 @@ cache_config:
 ```
 
 The `teacache_thresh` parameter controls the similarity threshold. Cache-DiT is also supported via `cache_backend: cache_dit` with its own set of knobs (see `CacheDiTConfig`).
+
+### Video Sparse Attention (VSA)
+
+VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs a block-sparse CuTe kernel over only those blocks. The two outputs are blended with learned gates.
+
+**Requirements:**
+- VSA-fine-tuned checkpoint: [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not have the learned VSA gates.
+- Blackwell GPU (sm_100+) for the CuTe JIT kernel. Falls back to dense SDPA on older hardware with no accuracy loss.
+- `CUTEDSL` attention backend.
+- BF16 or FP16 dtype; `head_dim = 128`; multi-head attention (MHA) — GQA/MQA models are not supported.
+- Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.
+
+**`vsa_sparsity`** controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.
+
+Python API:
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
+
+args = VisualGenArgs(
+    model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
+    attention_config=AttentionConfig(
+        backend="CUTEDSL",
+        sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+    ),
+)
+```
+
+YAML (for use with `--visual_gen_args` or `trtllm-serve`):
+
+```yaml
+attention_config:
+  backend: CUTEDSL
+  sparse_attention_config:
+    algorithm: vsa
+    vsa_sparsity: 0.90
+```
+
+Ready-to-use configs are provided in [`examples/visual_gen/configs/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/configs):
+- `wan-vsa-1gpu.yaml` — single-GPU VSA with NVFP4 quantization
+- `wan-vsa-4gpu.yaml` — 4-GPU VSA with Ulysses parallelism
+- `wan-vsa-8gpu.yaml` — 8-GPU VSA with Ulysses parallelism
+
+Run with the existing Wan example script:
+
+```bash
+python examples/visual_gen/models/wan_t2v.py \
+    --model FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers \
+    --visual_gen_args examples/visual_gen/configs/wan-vsa-1gpu.yaml
+```
 
 ### Multi-GPU Parallelism
 

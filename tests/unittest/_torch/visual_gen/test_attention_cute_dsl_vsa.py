@@ -309,8 +309,6 @@ def test_cute_kernel_matches_ref_with_independent_indices():
         q, k, v, q2k_idx, q2k_num, variable_block_sizes
     )
 
-    # Manual fp32 masked-softmax: bf16 inputs + an fp32 -inf mask through SDPA
-    # mishandle the masked region at this shape, so compute it explicitly.
     scale = 1.0 / (D**0.5)
     scores = (q.float() @ k.float().transpose(-2, -1)) * scale
     scores = scores + attn_mask
@@ -326,4 +324,119 @@ def test_cute_kernel_matches_ref_with_independent_indices():
         f"CuTe kernel with independent per-Q-block indices deviated from masked fp32 "
         f"reference: max_diff={max_diff:.3e}, mean_diff={mean_diff:.3e} "
         f"(rtol={rtol}, atol={atol}, pair_mismatch={pair_mismatch})"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel test needs CUDA")
+def test_cute_kernel_50pct_sparsity_quality_vs_dense():
+    """50% sparse CuTe kernel with score-based topk should stay close to dense SDPA."""
+
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+        CUTE_AVAILABLE,
+        block_sparse_attn_from_indices_cute,
+        is_cute_supported,
+    )
+
+    if not CUTE_AVAILABLE:
+        pytest.skip("cuda-bindings or cutlass-dsl not importable")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+
+    B, H, num_cubes, D = 1, 4, 16, 128
+    block_size = 64
+    topk = num_cubes // 2
+    seq_len = num_cubes * block_size
+
+    q = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
+    k = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
+    v = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
+
+    if not is_cute_supported(q):
+        pytest.skip("CuTe path needs sm_100+ Blackwell (current device unsupported)")
+
+    q_blocks = q.reshape(B, H, num_cubes, block_size, D).mean(dim=3)
+    k_blocks = k.reshape(B, H, num_cubes, block_size, D).mean(dim=3)
+    scale = D**-0.5
+    block_scores = torch.einsum("bhqd,bhkd->bhqk", q_blocks.float(), k_blocks.float()) * scale
+    q2k_idx = block_scores.topk(topk, dim=-1).indices.to(torch.int32).contiguous()
+
+    q2k_num = torch.full((B, H, num_cubes), topk, dtype=torch.int32, device=device)
+    variable_block_sizes = torch.full((num_cubes,), block_size, dtype=torch.int32, device=device)
+
+    out_sparse, _lse = block_sparse_attn_from_indices_cute(
+        q, k, v, q2k_idx, q2k_num, variable_block_sizes
+    )
+    out_dense = F.scaled_dot_product_attention(q, k, v)
+
+    cos_sim = F.cosine_similarity(
+        out_sparse.float().reshape(-1), out_dense.float().reshape(-1), dim=0
+    ).item()
+    print(f"\n  50% sparse (score-based topk) vs dense SDPA cos_sim: {cos_sim:.4f}")
+
+    assert cos_sim >= 0.65, (
+        f"50% sparse CuTe kernel deviated too far from dense SDPA: cos_sim={cos_sim:.4f} < 0.65"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel test needs CUDA")
+@pytest.mark.parametrize(
+    "num_cubes",
+    [1, 3, 9],
+    ids=["1cube_odd", "3cubes_odd", "9cubes_odd"],
+)
+def test_cute_kernel_odd_num_cubes_correctness(num_cubes):
+    """CuTe kernel with odd num_cubes must match dense SDPA (last Q-block has no pair)."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+        CUTE_AVAILABLE,
+        block_sparse_attn_from_indices_cute,
+        is_cute_supported,
+    )
+
+    if not CUTE_AVAILABLE:
+        pytest.skip("cuda-bindings or cutlass-dsl not importable")
+
+    assert num_cubes % 2 == 1, f"pre-condition: num_cubes={num_cubes} must be odd"
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+
+    B, H, D = 1, 4, 128
+    block_size = 64
+    seq_len = num_cubes * block_size
+
+    q = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
+    k = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
+    v = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
+
+    if not is_cute_supported(q):
+        pytest.skip("CuTe path needs sm_100+ Blackwell (current device unsupported)")
+
+    topk = num_cubes
+    q2k_idx = (
+        torch.arange(num_cubes, device=device, dtype=torch.int32)
+        .view(1, 1, 1, num_cubes)
+        .expand(B, H, num_cubes, topk)
+        .contiguous()
+    )
+    q2k_num = torch.full((B, H, num_cubes), topk, dtype=torch.int32, device=device)
+    variable_block_sizes = torch.full((num_cubes,), block_size, dtype=torch.int32, device=device)
+
+    out_kernel, _lse = block_sparse_attn_from_indices_cute(
+        q, k, v, q2k_idx, q2k_num, variable_block_sizes
+    )
+    out_ref = F.scaled_dot_product_attention(q, k, v)
+
+    assert torch.isfinite(out_kernel).all(), (
+        f"CuTe kernel produced non-finite output for odd num_cubes={num_cubes}"
+    )
+
+    max_diff = (out_kernel - out_ref).abs().max().item()
+    mean_diff = (out_kernel - out_ref).abs().mean().item()
+    rtol, atol = 1e-2, 1e-2
+    assert torch.allclose(out_kernel, out_ref, rtol=rtol, atol=atol), (
+        f"CuTe kernel deviated from dense SDPA for odd num_cubes={num_cubes}: "
+        f"max_diff={max_diff:.3e}, mean_diff={mean_diff:.3e} (rtol={rtol}, atol={atol})"
     )

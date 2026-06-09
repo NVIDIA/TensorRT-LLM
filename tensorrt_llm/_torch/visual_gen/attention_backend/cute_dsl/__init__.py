@@ -17,7 +17,6 @@ CuTe DSL attention backend family for visual generation models.
 
   fmha.py  — CuTeDSLAttention  (dense cubin path, head_dim=128)
   vsa.py   — VSAAttention       (Video Sparse Attention, CuTe JIT + SDPA fallback)
-  _common.py — shared CuTe DSL plumbing
 """
 
 from .fmha import CuTeDSLAttention, _cute_dsl_import_error

@@ -46,13 +46,6 @@ class VisualGenParams(StrictBaseModel):
     max_sequence_length: Optional[int] = Field(
         default=None, description="Max tokens for text encoding."
     )
-    flow_shift: Optional[float] = Field(
-        default=None,
-        description=(
-            "Override the scheduler's flow-matching shift. None = pipeline's "
-            "per-variant recommended default. Currently honored only by the Wan pipelines."
-        ),
-    )
     seed: int = Field(default=42, description="Random seed for reproducibility.")
 
     # Video

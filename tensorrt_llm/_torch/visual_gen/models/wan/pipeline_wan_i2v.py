@@ -412,7 +412,6 @@ class WanImageToVideoPipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             last_image=last_image,
-            flow_shift=req.params.flow_shift,
         )
 
     @torch.no_grad()
@@ -431,7 +430,6 @@ class WanImageToVideoPipeline(BasePipeline):
         seed: int = 42,
         max_sequence_length: int = 512,
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
-        flow_shift: Optional[float] = None,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -539,28 +537,7 @@ class WanImageToVideoPipeline(BasePipeline):
             batch_size, image, height, width, num_frames, generator, last_image
         )
 
-        # Apply an explicit user flow_shift override; otherwise keep the checkpoint scheduler default.
-        sched_cfg = self.scheduler.config
-        shift_key = None
-        orig_shift = None
-        if flow_shift is not None:
-            shift_key = (
-                "shift"
-                if "shift" in sched_cfg
-                else "flow_shift"
-                if "flow_shift" in sched_cfg
-                else None
-            )
-            if shift_key is not None and sched_cfg[shift_key] != flow_shift:
-                orig_shift = sched_cfg[shift_key]
-                logger.info(f"flow_shift: {orig_shift} -> {flow_shift} (user)")
-                self.scheduler.register_to_config(**{shift_key: flow_shift})
-
-        try:
-            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        finally:
-            if orig_shift is not None:
-                self.scheduler.register_to_config(**{shift_key: orig_shift})
+        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
         # Wan2.2: Calculate boundary timestep for two-stage denoising
         boundary_timestep = None

@@ -92,6 +92,7 @@ class Attention(nn.Module):
         # Select compute backend (orthogonal to parallelism)
         vgm = config.visual_gen_mapping
         ulysses_size = vgm.ulysses_size if vgm else 1
+        ring_size = vgm.ring_size if vgm else 1
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
         base_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
@@ -111,6 +112,12 @@ class Attention(nn.Module):
             raise ValueError(
                 f"VSA needs the full token sequence per rank, so it is incompatible "
                 f"with Attention2D (attn2d_size={attn2d_size}). Use ulysses or cfg "
+                f"parallelism instead."
+            )
+        if _is_vsa and ring_size > 1:
+            raise ValueError(
+                f"VSA needs the full token sequence per rank, so it is incompatible "
+                f"with Ring attention (ring_size={ring_size}). Use ulysses or cfg "
                 f"parallelism instead."
             )
         self.attn_backend = backend_name

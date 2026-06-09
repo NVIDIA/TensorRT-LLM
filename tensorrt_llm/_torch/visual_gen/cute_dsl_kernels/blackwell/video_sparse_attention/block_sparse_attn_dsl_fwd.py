@@ -1536,6 +1536,34 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
             return ptx.max3f(local_max[0], local_max[2], local_max[3])
 
     @cute.jit
+    def cal_local_max(
+        self,
+        tensor: cute.Tensor,
+    ) -> cutlass.Float32:
+        # Full-block fast path: no column is masked, so read directly without
+        # the per-element bound test / -inf write that mask_then_cal_local_max
+        # performs. Mirrors the masked variant's reduction structure exactly.
+        if cutlass.const_expr(cute.size(tensor, mode=[0]) < 8):
+            _max = -cutlass.Float32.inf
+            for i in cutlass.range_constexpr(0, cute.size(tensor, mode=[0]), 2):
+                _max = ptx.max3f(_max, tensor[i], tensor[i + 1])
+            return _max
+        else:
+            local_max = [
+                ptx.max3f(tensor[0], tensor[1], -cutlass.Float32.inf),
+                ptx.max3f(tensor[2], tensor[3], -cutlass.Float32.inf),
+                ptx.max3f(tensor[4], tensor[5], -cutlass.Float32.inf),
+                ptx.max3f(tensor[6], tensor[7], -cutlass.Float32.inf),
+            ]
+            for i in cutlass.range_constexpr(8, cute.size(tensor, mode=[0]), 8):
+                local_max[0] = ptx.max3f(local_max[0], tensor[i], tensor[i + 1])
+                local_max[1] = ptx.max3f(local_max[1], tensor[i + 2], tensor[i + 3])
+                local_max[2] = ptx.max3f(local_max[2], tensor[i + 4], tensor[i + 5])
+                local_max[3] = ptx.max3f(local_max[3], tensor[i + 6], tensor[i + 7])
+            local_max[0] = cute.arch.fmax(local_max[0], local_max[1])
+            return ptx.max3f(local_max[0], local_max[2], local_max[3])
+
+    @cute.jit
     def cal_local_sum(
         self,
         tensor: cute.Tensor,
@@ -1621,7 +1649,18 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
             tCrS_ld,
         )
         # calculate P
-        _max = self.mask_then_cal_local_max(tCrS_ld, n_size)
+        # Full-block fast path: when the KV block is full (n_size == tile width,
+        # i.e. BLOCK==64 at the focus shapes) the variable-block mask masks
+        # nothing every iteration. Skip the per-element bound test / -inf write
+        # and take the unmasked local-max path. The masked path is preserved for
+        # the partial-block case (n_size < tile width) so correctness holds.
+        # NOTE: predeclare _max before the dynamic branch — CuTe DSL does not
+        # propagate variables first bound inside dynamic control flow.
+        _max = -cutlass.Float32.inf
+        if n_size >= cute.size(tCrS_ld, mode=[0]):
+            _max = self.cal_local_max(tCrS_ld)
+        else:
+            _max = self.mask_then_cal_local_max(tCrS_ld, n_size)
         _max_safe, _acc_scale = self.update_row_max(
             max_new=_max,
             is_first=is_first,
@@ -2151,7 +2190,8 @@ class VideoSparseAttentionForwardGroup2QInterleaveKV:
     ):
         tidx = cute.arch.thread_idx()[0] % (self.threads_per_warp * len(self.correction_warp_ids))
         in_which = cute.arch.make_warp_uniform(tidx // self.block_m)
-        corr_ld_inst: int = 32
+        # A-tmem: widen correction TMEM<->reg copy 32->64 cols (halve LDTM/STTM count)
+        corr_ld_inst: int = 64
         corr_ld_repeat: int = cute.ceil_div(self.mma_tiler_pv[1], corr_ld_inst)
 
         corr_copy_atom_t2r = cute.make_copy_atom(

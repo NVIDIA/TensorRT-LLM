@@ -256,7 +256,7 @@ class VSAAttention(AttentionBackend):
         self,
         layer_idx: int = 0,
         num_heads: int = 8,
-        head_dim: int = 64,
+        head_dim: int = 128,
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
         sparse_attention_config=None,
@@ -266,6 +266,11 @@ class VSAAttention(AttentionBackend):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or num_heads
+        assert self.num_kv_heads == self.num_heads, (
+            f"VSA coarse mean-pool assumes MHA (num_kv_heads == num_heads), "
+            f"got num_kv_heads={self.num_kv_heads}, num_heads={self.num_heads}. "
+            f"GQA/MQA is not supported."
+        )
         self.dtype = dtype
         self.sparse_attention_config = sparse_attention_config
 
