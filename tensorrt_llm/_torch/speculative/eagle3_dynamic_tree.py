@@ -912,7 +912,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
                 return accepted_tokens, num_accepted_tokens
 
-            target_logits_tree = logits[-num_gens * N:].reshape(-1, vocab_size)
+            target_logits_tree = logits[-num_gens * N :].reshape(-1, vocab_size)
             gen_slice = slice(num_contexts, num_contexts + num_gens)
             temps = spec_metadata.request_temperatures[gen_slice]
             top_ks_rej = spec_metadata.request_top_ks[gen_slice]
