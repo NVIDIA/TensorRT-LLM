@@ -1236,7 +1236,7 @@ class MegaMoECuteDsl(MoE):
         # a plain sum over the top-k axis. Accumulate in fp32 explicitly to
         # match the design reference ``bf16(sum_fp32(term))`` and to be robust
         # against any future change to the bf16 reduction accumulator type.
-        out = combine_output[:num_tokens].to(torch.float32).sum(dim=1).to(output_dtype)
+        out = combine_output[:num_tokens].sum(dim=1, dtype=torch.float32).to(output_dtype)
         return out
 
     def _run_moe(
