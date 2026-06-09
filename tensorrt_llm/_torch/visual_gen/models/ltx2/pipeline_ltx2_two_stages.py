@@ -40,9 +40,9 @@ from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
 from .pipeline_ltx2 import (
     LTX2Pipeline,
-    _LTX2CUDAGraphRunner,
     _assert_resolution,
     _find_safetensors_files,
+    _LTX2CUDAGraphRunner,
     _prefetch_ltx2_safetensors_files,
 )
 
