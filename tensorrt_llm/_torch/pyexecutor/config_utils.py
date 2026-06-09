@@ -310,11 +310,15 @@ class _Qwen35ConfigCompat:
     _QWEN_IMAGE_BENCH_ARCHITECTURE = "QwenImageBenchForConditionalGeneration"
 
     @staticmethod
-    def is_qwen_image_bench_config(config_dict: dict) -> bool:
+    def is_qwen_image_bench_config(config_dict: dict,
+                                   model_name_or_path: str) -> bool:
         architectures = config_dict.get("architectures") or []
+        model_id = str(model_name_or_path).rstrip("/\\")
+        model_name = re.split(r"[/\\]", model_id)[-1].casefold()
         return (architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
                 and bool(config_dict.get("text_config"))
-                and bool(config_dict.get("vision_config")))
+                and bool(config_dict.get("vision_config"))
+                and model_name == "qwen-image-bench")
 
     @staticmethod
     def _extract_text_config(config_dict: dict) -> dict:
@@ -461,7 +465,8 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
-    elif _Qwen35ConfigCompat.is_qwen_image_bench_config(config_dict):
+    elif _Qwen35ConfigCompat.is_qwen_image_bench_config(config_dict,
+                                                        model_name_or_path):
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
         # Keep the composite VLM config so the vision encoder and multimodal

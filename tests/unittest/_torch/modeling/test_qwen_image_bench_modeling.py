@@ -87,9 +87,11 @@ def test_qwen_image_bench_config_uses_internal_arch_and_normalizes_text(tmp_path
         load_pretrained_config,
     )
 
-    _write_qwen_image_bench_config(tmp_path)
+    model_dir = tmp_path / "Qwen-Image-Bench"
+    model_dir.mkdir()
+    _write_qwen_image_bench_config(model_dir)
 
-    config = load_pretrained_config(str(tmp_path))
+    config = load_pretrained_config(str(model_dir))
 
     assert config.architectures == ["QwenImageBenchForConditionalGeneration"]
     assert config.model_type == "qwen3_5"
@@ -115,6 +117,21 @@ def test_qwen3_5_conditional_text_config_does_not_use_image_bench_arch(tmp_path)
     (tmp_path / "config.json").write_text(json.dumps(_qwen3_5_text_config()))
 
     config = load_pretrained_config(str(tmp_path))
+
+    assert isinstance(config, transformers.Qwen3NextConfig)
+    assert config.architectures == ["Qwen3_5ForCausalLM"]
+
+
+def test_qwen3_5_composite_config_requires_image_bench_model_name(tmp_path):
+    import transformers
+
+    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+
+    model_dir = tmp_path / "Qwen3.6-27B-FP8"
+    model_dir.mkdir()
+    _write_qwen_image_bench_config(model_dir)
+
+    config = load_pretrained_config(str(model_dir))
 
     assert isinstance(config, transformers.Qwen3NextConfig)
     assert config.architectures == ["Qwen3_5ForCausalLM"]
