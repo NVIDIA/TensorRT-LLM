@@ -53,6 +53,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <numeric>
 #include <unordered_map>
@@ -65,6 +66,20 @@ std::mutex CacheTransceiver::mDllMutex;
 
 namespace
 {
+
+constexpr int kTransferFuturePollIntervalMs = 10;
+
+// Finite status checks are scheduler polls, not terminal deadlines. Keep each
+// slice short so the caller can yield back to scheduling and transfer progress.
+std::chrono::milliseconds getTransferFuturePollInterval(std::optional<int> const& configuredTimeoutMs)
+{
+    auto waitMs = kTransferFuturePollIntervalMs;
+    if (configuredTimeoutMs.has_value())
+    {
+        waitMs = std::max(1, std::min(configuredTimeoutMs.value(), kTransferFuturePollIntervalMs));
+    }
+    return std::chrono::milliseconds(waitMs);
+}
 
 using RequestIdType = LlmRequest::RequestIdType;
 
@@ -700,13 +715,13 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
 RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
-    bool blockAll = !atLeastRequestNum.has_value();
+    bool const blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
-    // If blockAll is true, we want to block and not use a timeout
-    if (!blockAll && mCacheTransceiverConfig.has_value())
+    if (mCacheTransceiverConfig.has_value())
     {
         senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
     }
+    auto const futurePollInterval = getTransferFuturePollInterval(senderFutureTimeoutMs);
     // Observe-only: WARN per-request when the wall-clock transfer time exceeds
     // kvTransferTimeoutMs. No cancellation, eviction, or state transition.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
@@ -770,27 +785,26 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
+        auto const requestId = request->mRequestId;
         if (kvTransferTimeoutMs.has_value())
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
             auto elapsedMs = static_cast<long>(elapsed.count());
-            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(request->mRequestId).second)
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(requestId).second)
             {
                 TLLM_LOG_WARNING(
                     "Context KV cache transfer for request %ld exceeded configured timeout: "
                     "elapsed %ld ms > limit %d ms (observe-only).",
-                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                    requestId, elapsedMs, kvTransferTimeoutMs.value());
             }
         }
-        if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
+        if (blockAll || (toCompleteIdSet.find(requestId) != toCompleteIdSet.end()))
         {
-            auto const requestId = request->mRequestId;
             try
             {
-                // Wait for up to a specified timeout
-                auto status = future.wait_for(std::chrono::milliseconds(senderFutureTimeoutMs.value_or(0)));
-                if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
+                auto const status = blockAll ? std::future_status::ready : future.wait_for(futurePollInterval);
+                if (status == std::future_status::ready)
                 {
                     future.get();
                     bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
@@ -800,8 +814,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
+                    TLLM_LOG_DEBUG(
+                        "Context KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping it "
+                        "in progress.",
+                        requestId, static_cast<long>(futurePollInterval.count()));
                     ++it;
                 }
                 else
@@ -866,7 +882,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
-    bool blockAll = !atLeastRequestNum.has_value();
+    bool const blockAll = !atLeastRequestNum.has_value();
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
     for (auto&& [request, future] : mRequesterFutures)
     {
@@ -977,6 +993,13 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
+    std::optional<int> requesterFutureTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
+    {
+        requesterFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+    }
+    auto const futurePollInterval = getTransferFuturePollInterval(requesterFutureTimeoutMs);
+
     // Observe-only: gen-side mirror of the context-side timeout WARN.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
@@ -992,28 +1015,48 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
             auto elapsedMs = static_cast<long>(elapsed.count());
-            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(request->mRequestId).second)
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(requestId).second)
             {
                 TLLM_LOG_WARNING(
                     "Generation KV cache transfer for request %ld exceeded configured timeout: "
                     "elapsed %ld ms > limit %d ms (observe-only).",
-                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                    requestId, elapsedMs, kvTransferTimeoutMs.value());
             }
         }
         if (blockAll || toCompleteIdSet.find(requestId) != toCompleteIdSet.end())
         {
             try
             {
-                it->second.get();
-                bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
-                if (failed)
+                auto const status = blockAll ? std::future_status::ready : it->second.wait_for(futurePollInterval);
+                if (status == std::future_status::ready)
                 {
-                    // The receiver uses the error state as a local transfer-failed signal.
-                    // Keep that signal local until the consensus outcome commits it globally.
-                    request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+                    it->second.get();
+                    bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                    if (failed)
+                    {
+                        // The receiver uses the error state as a local transfer-failed signal.
+                        // Keep that signal local until the consensus outcome commits it globally.
+                        request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+                    }
+                    recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
+                        mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
                 }
-                recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
-                    mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+                else if (status == std::future_status::timeout)
+                {
+                    TLLM_LOG_DEBUG(
+                        "Generation KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping "
+                        "it in progress.",
+                        requestId, static_cast<long>(futurePollInterval.count()));
+                    ++it;
+                    continue;
+                }
+                else
+                {
+                    TLLM_LOG_ERROR(
+                        "Future returned unexpected status for request %ld. Recording as failed.", requestId);
+                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedRequesterRequestIds,
+                        mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+                }
             }
             catch (std::exception const& e)
             {
