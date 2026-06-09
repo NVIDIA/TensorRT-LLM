@@ -395,21 +395,18 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             multimodal_lengths: List[int]):
+                             mm_embedding_lengths: List[int]):
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
-            multimodal_lengths: Current per-item split lengths.
+            mm_embedding_lengths: Per-item encoder-output embedding lengths.
         """
-        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
-        # a prompt-side MM-token count that may include non-embedding
-        # special/framing tokens. This split needs per-item encoder-output
-        # embedding lengths instead.
-        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+        split_embeddings = torch.split(mm_embeddings,
+                                       mm_embedding_lengths,
+                                       dim=0)
 
-        # Create a SharedTensorContainer handle for each split
         self._mm_embeddings = [
             SharedTensorContainer.from_tensor(emb).dump_to_dict()
             for emb in split_embeddings
@@ -421,10 +418,10 @@ class PyResult:
         mrope_position_ids: torch.Tensor,
         mrope_position_deltas: torch.Tensor,
     ):
-        self._mrope_position_ids = (SharedTensorContainer.from_tensor(
-            mrope_position_ids).dump_to_dict())
-        self._mrope_position_deltas = (SharedTensorContainer.from_tensor(
-            mrope_position_deltas).dump_to_dict())
+        self._mrope_position_ids = SharedTensorContainer.from_tensor(
+            mrope_position_ids).dump_to_dict()
+        self._mrope_position_deltas = SharedTensorContainer.from_tensor(
+            mrope_position_deltas).dump_to_dict()
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
 
@@ -660,7 +657,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 return_perf_metrics=return_perf_metrics,
                 stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
                 if stop_words_list else None,
-                **kwargs)
+                **kwargs,
+            )
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
@@ -939,6 +937,50 @@ def convert_wordlist(word_list) -> List[List[int]]:
     if len(tokens) > len(offsets):
         offsets.extend([-1] * (len(tokens) - len(offsets)))
     return [tokens, offsets]
+
+
+def _validate_optional_int_list(values: Any,
+                                field_name: str) -> Optional[List[int]]:
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise TypeError(f"{field_name} must be a list")
+    if not all(isinstance(value, int) for value in values):
+        raise TypeError(f"{field_name} must contain only integers")
+    return values
+
+
+def get_multimodal_embedding_lengths(
+        request: LlmRequest) -> Optional[List[int]]:
+    """Return explicit per-item encoder-output lengths for a multimodal request."""
+    py_multimodal_data = request.py_multimodal_data
+    if py_multimodal_data is not None and not isinstance(
+            py_multimodal_data, dict):
+        raise TypeError("py_multimodal_data must be a dict")
+    # `multimodal_embedding_lengths` is Python-side layout metadata, not a
+    # nanobind request field, so validate the flat handoff contract here.
+    multimodal_embedding_lengths = _validate_optional_int_list(
+        py_multimodal_data.get("multimodal_embedding_lengths")
+        if py_multimodal_data is not None else None,
+        "multimodal_embedding_lengths")
+    if multimodal_embedding_lengths is None:
+        return None
+
+    if any(length < 0 for length in multimodal_embedding_lengths):
+        raise ValueError("multimodal_embedding_lengths must be non-negative")
+    multimodal_lengths = request.multimodal_lengths
+    if multimodal_lengths is not None:
+        if len(multimodal_embedding_lengths) != len(multimodal_lengths):
+            raise ValueError("multimodal_embedding_lengths length must match "
+                             "multimodal_lengths")
+        for item_idx, (embedding_length, prompt_length) in enumerate(
+                zip(multimodal_embedding_lengths, multimodal_lengths)):
+            if embedding_length > prompt_length:
+                raise ValueError(
+                    f"multimodal_embedding_lengths[{item_idx}] exceeds "
+                    f"multimodal_lengths[{item_idx}]")
+
+    return multimodal_embedding_lengths
 
 
 def executor_request_to_llm_request(

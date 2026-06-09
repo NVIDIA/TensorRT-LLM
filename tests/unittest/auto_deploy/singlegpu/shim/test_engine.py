@@ -376,6 +376,7 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     # Flat prompt-length mask: text at [0,1,6,7], embeds at [2..5].
     req.py_multimodal_data = {
         "mm_bidirectional_blocks": False,
+        "multimodal_embedding": {"handle": "not-a-forward-tensor"},
         "multimodal_embed_mask_cumsum": torch.tensor(
             [False, False, True, True, True, True, False, False]
         )
@@ -395,6 +396,8 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     assert "mm_bidirectional_blocks" not in named_args
     assert "mm_special_offsets_cu_seqlen" in named_args
     assert "mm_special_offsets" in named_args
+    assert "multimodal_embedding_lengths" not in named_args
+    assert "multimodal_embed_mask_cumsum" not in named_args
 
     torch.testing.assert_close(
         named_args["mm_item_cu_seqlen"].cpu(), torch.tensor([0, 1], dtype=torch.int32)
