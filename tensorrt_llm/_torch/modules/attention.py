@@ -27,10 +27,12 @@ from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_enabled, is_torch_compiling,
-                     maybe_compiled_cat, maybe_compiled_copy_)
-from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ..utils import (Fp4QuantizedTensor, compute_swizzled_sf_shape,
+                     get_model_extra_attrs, is_nvfp4_marlin_enabled,
+                     is_torch_compiling, maybe_compiled_cat,
+                     maybe_compiled_copy_)
+from .linear import (Linear, TensorParallelMode, WeightMode,
+                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
@@ -53,6 +55,49 @@ def _lower_sparse_attention_params(sparse_attn_cfg,
             sparse_attn_cfg, pretrained_config=pretrained_config)
     return sparse_attn_cfg.to_sparse_params(pretrained_config=pretrained_config,
                                             layer_idx=layer_idx)
+
+
+def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
+    """Drop CUDA-graph padding by slicing hidden_states to num_tokens rows.
+
+    For a plain tensor this is the usual row slice. For an Fp4QuantizedTensor
+    (produced when the previous layer's boundary fusion pre-quantized this
+    layer's input) the slice must act on the packed FP4 form:
+      - fp4_tensor: row-major [m, k//2], so [:num_tokens] is a plain row slice;
+      - scaling_factor: 1D swizzled buffer of padUp(m,128)*padUp(cols,4). NVFP4
+        quant is per-row independent and the swizzle is laid out in independent
+        128-row tiles, so the leading padUp(num_tokens,128)*padUp(cols,4) bytes
+        are exactly the scale factors for the first num_tokens rows (verified by
+        tests/unittest/_torch/modules/test_fp4_num_tokens_slice.py).
+      - bf16_hidden_states (when present): plain row slice.
+    """
+    if not isinstance(hidden_states, Fp4QuantizedTensor):
+        return hidden_states[:num_tokens, ...]
+
+    fp4 = hidden_states.fp4_tensor
+    if fp4.shape[0] == num_tokens:
+        return hidden_states  # no padding to strip
+    # The row-slice math below relies on the swizzled 128-row-tile layout; a
+    # non-swizzled (linear) scale buffer would be sliced incorrectly and then
+    # silently relabeled as swizzled. Reject it rather than corrupt the SF.
+    if not hidden_states.is_sf_swizzled:
+        raise ValueError(
+            "_slice_hidden_states_to_num_tokens only supports swizzled FP4 "
+            "scaling factors")
+    sf = hidden_states.scaling_factor
+    # fp4 packs 2 elements/byte, so the logical hidden dim is fp4_cols*2 and the
+    # scale-factor column count is that / SF_VEC_SIZE(16). The swizzled SF is
+    # laid out in independent 128-row tiles, so the leading num_tokens rows'
+    # scale factors occupy exactly the first padded_rows*padded_cols bytes.
+    sf_cols = fp4.shape[-1] * 2 // 16
+    padded_rows, padded_cols = compute_swizzled_sf_shape(num_tokens, sf_cols)
+    sf_len = padded_rows * padded_cols
+    sliced_bf16 = (hidden_states.bf16_hidden_states[:num_tokens]
+                   if hidden_states.bf16_hidden_states is not None else None)
+    return Fp4QuantizedTensor(fp4_tensor=fp4[:num_tokens].contiguous(),
+                              scaling_factor=sf.view(-1)[:sf_len].contiguous(),
+                              is_sf_swizzled=True,
+                              bf16_hidden_states=sliced_bf16)
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -1138,9 +1183,27 @@ def mla_custom_op_inplace(
     layer_idx: str,
     output: torch.Tensor,
     latent_cache_gen: Optional[torch.Tensor],
+    hidden_states_fp4: Optional[torch.Tensor] = None,
+    hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> None:
+    # When hidden_states_fp4/_sf are provided, the previous layer's boundary
+    # fusion pre-quantized this layer's kv_a_proj NVFP4 input. Custom ops can't
+    # take dataclasses, so the Fp4QuantizedTensor is passed as explicit tensors
+    # and reconstructed here (mirrors mla_dsa_proj). bf16_hidden_states carries
+    # the un-quantized view for the o_proj output sizing in create_output.
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
+    if hidden_states_fp4 is not None or hidden_states_sf is not None:
+        assert (hidden_states_fp4 is not None
+                and hidden_states_sf is not None), (
+                    "hidden_states_fp4 and hidden_states_sf must be passed "
+                    "together")
+        hidden_states = Fp4QuantizedTensor(fp4_tensor=hidden_states_fp4,
+                                           scaling_factor=hidden_states_sf,
+                                           bf16_hidden_states=hidden_states)
     if mla_layer.is_deepseek_v4:
+        # DeepSeek-V4 uses MQA mode and has no residual-less RMSNorm+quant
+        # fusion entry point, so it cannot be reached with a pre-quantized
+        # Fp4QuantizedTensor input; the call site passes plain hidden_states.
         mla_layer.forward_impl_with_deepseek_v4(position_ids,
                                                 hidden_states,
                                                 metadata,
@@ -1158,6 +1221,8 @@ def mla_dsa_proj(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
+    hidden_states_fp4: Optional[torch.Tensor] = None,
+    hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """Token-wise projections for DSA MLA (CUDA-graph-capturable).
 
@@ -1165,6 +1230,14 @@ def mla_dsa_proj(
     indexer.pre_indexer_proj (FP8/FP4 quantize, weight scaling).  Does NOT
     update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
     because the scatter kernel accesses batch-specific metadata.
+
+    When ``hidden_states_fp4`` / ``hidden_states_sf`` are provided, the
+    previous layer's boundary fusion already produced a fused NVFP4 view of
+    the post-RMSNorm hidden states (via fused_add_rmsnorm_fp4_quantize). The
+    op rebuilds an ``Fp4QuantizedTensor`` carrying the BF16 view in
+    ``hidden_states`` (for DSA's ``pre_indexer_proj``) plus the
+    pre-quantized FP4 form (consumed by ``kv_a_proj_with_mqa``).
+    Both must be passed together; passing either alone is rejected.
 
     Returns [q, compressed_kv, k_pe, latent_cache] when the short-MHA path
     handles all tokens, or [q, compressed_kv, k_pe, latent_cache, q_fp8,
@@ -1175,7 +1248,17 @@ def mla_dsa_proj(
     path ignores it in forward_dsa_attn.
     """
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
+    if hidden_states_fp4 is not None or hidden_states_sf is not None:
+        assert (hidden_states_fp4 is not None
+                and hidden_states_sf is not None), (
+                    "hidden_states_fp4 and hidden_states_sf must be passed "
+                    "together")
+        hs = Fp4QuantizedTensor(fp4_tensor=hidden_states_fp4,
+                                scaling_factor=hidden_states_sf,
+                                bf16_hidden_states=hidden_states)
+    else:
+        hs = hidden_states
+    return mla_layer.forward_dsa_proj(position_ids, hs, metadata)
 
 
 @mla_dsa_proj.register_fake
@@ -1183,6 +1266,8 @@ def _mla_dsa_proj_fake(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
+    hidden_states_fp4: Optional[torch.Tensor] = None,
+    hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     # Under torch compile _should_use_short_mha is False, so the result is
     # always 9 tensors (4 attention inputs + 5 indexer intermediates, with
@@ -1398,6 +1483,14 @@ class MLA(nn.Module):
         sparse_algorithm = getattr(sparse_params, "algorithm", None)
         self.is_dsa = sparse_algorithm == "dsa"
         self.is_deepseek_v4 = sparse_algorithm == "deepseek_v4"
+
+        # Fold of the residual-less q_a_layernorm -> q_b_proj NVFP4 input
+        # quantize into a single fused (rmsnorm + fp4_quantize) kernel. Self-
+        # gating on q_b_proj being static-NVFP4 (see _resolve_qa_fused_scale);
+        # resolved lazily on first forward because q_b_proj.input_scale is only
+        # finalized after weight loading.
+        # None = not yet resolved; False = disabled; tensor = q_b_proj input_scale.
+        self._qa_fused_scale = None
 
         # tensor parallel
         if mapping_with_cp is not None:
@@ -1924,6 +2017,16 @@ class MLA(nn.Module):
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
+        # Upstream POST_MoE/MLP fusion (or attention-DP no-fusion fold) may pass
+        # an Fp4QuantizedTensor here; unpack to the BF16 view for sizing. The
+        # producing fold must have requested return_norm_out so the BF16 view
+        # is present (folds feeding an MLA always do).
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            assert hidden_states.bf16_hidden_states is not None, (
+                "MLA.create_output received an Fp4QuantizedTensor without a "
+                "bf16_hidden_states view; the producing fusion must use "
+                "return_norm_out=True")
+            hidden_states = hidden_states.bf16_hidden_states
         num_tokens = hidden_states.shape[0]
         if self.is_deepseek_v4:
             hidden_size = self.num_heads_tp_cp * self.v_head_dim
@@ -2019,6 +2122,67 @@ class MLA(nn.Module):
         output = self.o_b_proj(o_lora)
         return output
 
+    def _resolve_qa_fused_scale(self):
+        """Lazily decide whether the residual-less q_a_layernorm -> q_b_proj
+        NVFP4 fusion can run, caching q_b_proj's static input_scale.
+
+        Returns the input_scale tensor when eligible, else None. Eligible iff:
+          (1) model is non-lite (has a distinct q_a_layernorm / q_b_proj),
+          (2) q_b_proj is static-NVFP4 (calibrated input_scale, no
+              pre_quant_scale / AWQ, not forced-dynamic),
+          (3) q_a_layernorm is a plain (non-gemma, non-quantizing) RMSNorm.
+        """
+        if self._qa_fused_scale is not None:
+            # Already resolved: tensor (enabled) or False (disabled).
+            return self._qa_fused_scale if self._qa_fused_scale is not False else None
+        eligible = False
+        if (not self.is_lite
+                and getattr(self, "q_a_layernorm", None) is not None
+                and getattr(self, "q_b_proj", None) is not None):
+            qb = self.q_b_proj
+            qa = self.q_a_layernorm
+            # q_b_proj must be static-NVFP4 (shared predicate) and q_a_layernorm
+            # a plain (non-gemma, non-quantizing) RMSNorm.
+            if (is_static_nvfp4_input_eligible(qb)
+                    and not getattr(qa, "use_gemma", False)
+                    and not getattr(qa, "is_nvfp4", False)):
+                eligible = True
+        if eligible:
+            # Mark q_a_layernorm as an NVFP4 norm and attach q_b_proj's static
+            # input_scale, so RMSNorm.forward folds the residual-less
+            # q_a_layernorm + q_b_proj NVFP4 input-quant into one kernel (the
+            # size gate routes this N=q_lora_rank<2048 edge to reduce_fusion).
+            self.q_a_layernorm.is_nvfp4 = True
+            self.q_a_layernorm.nvfp4_scale = qb.input_scale
+        self._qa_fused_scale = qb.input_scale if eligible else False
+        return self._qa_fused_scale if eligible else None
+
+    def _q_a_layernorm_maybe_fused(self,
+                                   q: torch.Tensor,
+                                   return_norm_out: bool = False):
+        """Apply q_a_layernorm, optionally folding the q_b_proj NVFP4 input
+        quantize into the same kernel.
+
+        When fusion is disabled, returns the BF16/FP16 normed tensor (and, if
+        return_norm_out, the same tensor again so callers have a stable arity).
+
+        When fusion is enabled, returns an Fp4QuantizedTensor (consumed by
+        q_b_proj without re-quantizing). If return_norm_out is set, also returns
+        the BF16 post-RMSNorm value, needed by the DSA indexer's
+        pre_indexer_proj which requires a float q."""
+        scale = self._resolve_qa_fused_scale()
+        if scale is None:
+            normed = self.q_a_layernorm(q)
+            return (normed, normed) if return_norm_out else normed
+        # q is typically the leading q_lora_rank columns of the
+        # kv_a_proj_with_mqa output split, i.e. a column slice whose last dim is
+        # unit-stride but whose row pitch is the full projection width. The
+        # fused RMSNorm+NVFP4-quant kernel reads that strided layout directly,
+        # so no .contiguous() copy is needed. _resolve_qa_fused_scale has
+        # attached .nvfp4_scale to q_a_layernorm, so RMSNorm.forward folds the
+        # residual-less RMSNorm + NVFP4 quant automatically.
+        return self.q_a_layernorm(q, return_norm_out=return_norm_out)
+
     def forward_impl(self,
                      position_ids: Optional[torch.Tensor],
                      hidden_states: torch.Tensor,
@@ -2041,7 +2205,8 @@ class MLA(nn.Module):
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_tokens = attn_metadata.num_tokens
 
-        hidden_states = hidden_states[:num_tokens, ...]
+        hidden_states = _slice_hidden_states_to_num_tokens(
+            hidden_states, num_tokens)
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
@@ -2057,7 +2222,7 @@ class MLA(nn.Module):
                 ], -1)
 
             q, compressed_kv = maybe_execute_in_parallel(
-                lambda: self.q_a_layernorm(q),
+                lambda: self._q_a_layernorm_maybe_fused(q),
                 lambda: self.kv_a_layernorm(compressed_kv),
                 self.ln_events[0],
                 self.ln_events[1],
@@ -2181,14 +2346,17 @@ class MLA(nn.Module):
         q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
 
-        q, compressed_kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q),
+        # When the q_a_layernorm -> q_b_proj NVFP4 fusion is active, q becomes an
+        # Fp4QuantizedTensor consumed by q_b_proj; qr (fed to the indexer) needs
+        # the BF16 post-RMSNorm value, so request return_norm_out here.
+        q_pair, compressed_kv = maybe_execute_in_parallel(
+            lambda: self._q_a_layernorm_maybe_fused(q, return_norm_out=True),
             lambda: self.kv_a_layernorm(compressed_kv),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
-        qr = q
+        q, qr = q_pair
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
         q = self.q_b_proj(q)
@@ -3488,8 +3656,18 @@ class MLA(nn.Module):
                                          attn_metadata.num_contexts)
         if self.register_to_config:
             if self.is_dsa:
-                proj_outputs = torch.ops.trtllm.mla_dsa_proj(
-                    hidden_states, position_ids, self.layer_idx_str)
+                # When the previous layer's boundary fusion pre-quantized this
+                # layer's kv_a_proj NVFP4 input, hidden_states is an
+                # Fp4QuantizedTensor with both BF16 + FP4 views. Custom ops
+                # can't take dataclasses, so pass tensors explicitly.
+                if isinstance(hidden_states, Fp4QuantizedTensor):
+                    proj_outputs = torch.ops.trtllm.mla_dsa_proj(
+                        hidden_states.bf16_hidden_states, position_ids,
+                        self.layer_idx_str, hidden_states.fp4_tensor,
+                        hidden_states.scaling_factor)
+                else:
+                    proj_outputs = torch.ops.trtllm.mla_dsa_proj(
+                        hidden_states, position_ids, self.layer_idx_str)
                 q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
                 indexer_intermediates = proj_outputs[4:]
                 torch.ops.trtllm.mla_dsa_attn_inplace(
@@ -3498,11 +3676,20 @@ class MLA(nn.Module):
             else:
                 # DeepSeek-V4 and vanilla MLA both use the single custom op.
                 # DeepSeek-V4 dispatches to forward_impl_with_deepseek_v4 inside.
-                torch.ops.trtllm.mla_custom_op_inplace(hidden_states,
-                                                       position_ids,
-                                                       self.layer_idx_str,
-                                                       attn_output,
-                                                       latent_cache_gen)
+                #
+                # Non-DSA (e.g. Kimi-K2.5): when the previous layer's boundary
+                # fusion pre-quantized this layer's input, hidden_states is an
+                # Fp4QuantizedTensor. Custom ops can't take dataclasses, so pass
+                # the BF16 + FP4 + SF views as explicit tensors.
+                if isinstance(hidden_states, Fp4QuantizedTensor):
+                    torch.ops.trtllm.mla_custom_op_inplace(
+                        hidden_states.bf16_hidden_states, position_ids,
+                        self.layer_idx_str, attn_output, latent_cache_gen,
+                        hidden_states.fp4_tensor, hidden_states.scaling_factor)
+                else:
+                    torch.ops.trtllm.mla_custom_op_inplace(
+                        hidden_states, position_ids, self.layer_idx_str,
+                        attn_output, latent_cache_gen)
         elif self.is_dsa:
             self.forward_impl_with_dsa(position_ids,
                                        hidden_states,
