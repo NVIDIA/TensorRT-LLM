@@ -277,6 +277,7 @@ class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
 
 
 class MistralCommonImageProcessor:
+    is_mistral_native_processor = True
 
     def __init__(self, tokenizer: MistralTokenizer, dtype) -> None:
         super().__init__()
