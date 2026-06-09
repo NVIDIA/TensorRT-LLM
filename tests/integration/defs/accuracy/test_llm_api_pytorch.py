@@ -696,6 +696,27 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_acc_spec="beam_width=2")
 
+    def test_v2_beam_search(self):
+        max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
+
+        with LLM(
+                model=self.MODEL_PATH,
+                kv_cache_config=KvCacheConfig(
+                    free_gpu_memory_fraction=0.5,
+                    use_kv_cache_manager_v2=True,
+                ),
+                max_batch_size=max_beam_width,
+                max_seq_len=2048,
+                max_beam_width=max_beam_width,
+        ) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_acc_spec="beam_width=2")
+
     @skip_pre_hopper
     @parametrize_with_ids("sampler_async_worker", [True, False])
     @parametrize_with_ids("disable_overlap_scheduler", [False, True])
