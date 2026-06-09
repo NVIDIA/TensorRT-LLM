@@ -981,7 +981,7 @@ class PyTorchModelEngine(ModelEngine):
     @contextmanager
     def _maybe_flashinfer_moe_autotune(self):
         autotune_env = os.environ.get("TRTLLM_FLASHINFER_MOE_AUTOTUNE",
-                                      "1").strip().lower()
+                                      "0").strip().lower()
         if autotune_env in ("", "0", "false", "off", "no"):
             yield
             return
