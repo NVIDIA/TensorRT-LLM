@@ -146,6 +146,45 @@ class GenerationRequest:
         self.id = id
         return self
 
+    # --- int32-byte serialization of token-id lists (kills per-token pickle PyLong) ---
+    _I32 = "\x00i32be"
+
+    @staticmethod
+    def _enc_tokens(v):
+        # flat list[int] -> (_I32, int32 bytes); leave anything else (None,
+        # list[list[int]], ndarray) untouched.
+        if type(v) is list and (len(v) == 0 or type(v[0]) is int):
+            import numpy as _np
+            return (GenerationRequest._I32,
+                    _np.asarray(v, dtype=_np.int32).tobytes())
+        return v
+
+    @staticmethod
+    def _dec_tokens(v):
+        if type(v) is tuple and len(v) == 2 and v[0] == GenerationRequest._I32:
+            import numpy as _np
+            return _np.frombuffer(v[1], dtype=_np.int32).tolist()
+        return v
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        if "prompt_token_ids" in state:
+            state["prompt_token_ids"] = GenerationRequest._enc_tokens(
+                state["prompt_token_ids"])
+        if state.get("query_token_ids") is not None:
+            state["query_token_ids"] = GenerationRequest._enc_tokens(
+                state["query_token_ids"])
+        return state
+
+    def __setstate__(self, state):
+        if "prompt_token_ids" in state:
+            state["prompt_token_ids"] = GenerationRequest._dec_tokens(
+                state["prompt_token_ids"])
+        if state.get("query_token_ids") is not None:
+            state["query_token_ids"] = GenerationRequest._dec_tokens(
+                state["query_token_ids"])
+        self.__dict__.update(state)
+
 
 class TruncateKVCacheRequest:
 
