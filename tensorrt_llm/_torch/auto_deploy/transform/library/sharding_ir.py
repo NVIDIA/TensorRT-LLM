@@ -159,6 +159,13 @@ _SHARDING_HINT_NAMES = frozenset(
     }
 )
 
+
+def _auto_deploy_ops(*names: str) -> Tuple[OpOverloadPacket, ...]:
+    return tuple(
+        op for name in names if (op := getattr(torch.ops.auto_deploy, name, None)) is not None
+    )
+
+
 # =============================================================================
 # ShardableNode abstract base class
 # =============================================================================
@@ -183,6 +190,8 @@ class ShardableNode(ABC):
 
         def decorator(subcls):
             for target in op_targets:
+                if target is None:
+                    continue
                 if isinstance(target, OpOverloadPacket):
                     for overload_name in target.overloads():
                         cls._REGISTRY[getattr(target, overload_name)] = subcls
@@ -586,10 +595,7 @@ class WeightedParamShardableNode(ShardableNode):
         return 1 if count > 0 else 0
 
 
-@ShardableNode.register(
-    torch.ops.auto_deploy.torch_rmsnorm_gated,
-    torch.ops.auto_deploy.triton_rmsnorm_gated,
-)
+@ShardableNode.register(*_auto_deploy_ops("torch_rmsnorm_gated", "triton_rmsnorm_gated"))
 class NormShardableNode(ShardableNode):
     """Gated RMSNorm op: shard weight parameter."""
 
@@ -806,9 +812,15 @@ class MoEShardableNode(ShardableNode):
         self.node.args = tuple(args)
 
         if enable_alltoall:
-            # mapping and max_num_tokens are needed downstream for MoE all-to-all dispatcher
             mapping_config = dc.serialize()
-            set_op_args(self.node, mapping_config=mapping_config, max_num_tokens=max_num_tokens)
+            batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
+            batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
+            set_op_args(
+                self.node,
+                mapping_config=mapping_config,
+                max_num_tokens=max_num_tokens,
+                batch_info_host=batch_info_host_node,
+            )
         else:
             # with pure EP/TP parallelism, global expert indices must be localized
             self._localize_expert_indices(
@@ -1163,6 +1175,14 @@ class ApplyShardingHints(BaseTransform):
             )
 
         max_num_tokens = cm.info.max_num_tokens if (cm and cm.info) else 0
+
+        # When attention-DP is active with EP, the MoE all-to-all ops need
+        # runtime token counts (batch_info_host slot 14, ``max_dp_num_tokens``)
+        # to avoid over-padding.
+        # Add the placeholder before the node loop so MoEShardableNode.apply()
+        # can find and wire it into each MoE node.
+        if dc.enable_attention_dp and dc.moe_ep_size > 1 and cm is not None:
+            self._add_or_retrieve_input(gm, cm, "batch_info_host", init_val=True)
 
         num_updates = 0
         if self.config.simple_shard_only:

@@ -50,12 +50,18 @@ else:
 
 from ..custom_ops.attention_interface import (
     CausalConvResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
     KVPagedResourceHandler,
+    ReplayCacheBufIdxHandler,
+    ReplayOldBHandler,
+    ReplayOldDAcumsumHandler,
+    ReplayOldDtHandler,
+    ReplayOldXHandler,
+    ReplayPrevNumAcceptedHandler,
     ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
-    SpecCausalConvResourceHandler,
-    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
 )
@@ -141,6 +147,12 @@ class CachedSequenceInterface:
         # same order as the C++ manager's internal pool ordering (i.e. the
         # insertion order of the per-window shape map keys).
         self._kv_group_windows: List[int] = []
+        # Whether the attention backend's kernel applies the sliding-window mask
+        # itself via cyclic KV indexing (trtllm). When True the executor passes
+        # the full per-window block table and global KV lengths instead of
+        # host-slicing to the live window. Set by the kvcache transform from the
+        # attention descriptor's ``kernel_handles_cyclic_swa()``.
+        self._kernel_handles_cyclic_swa: bool = False
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
@@ -151,6 +163,8 @@ class CachedSequenceInterface:
         self.info.batch_info.update_max_draft_len(
             spec_config.max_draft_len if spec_config is not None else 0
         )
+        # Default to non-replay; updated in initialize_cache once resources are identified.
+        self.info.batch_info.update_use_replay(False)
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -446,8 +460,8 @@ class CachedSequenceInterface:
         ssm_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecSSMResourceHandler)
-            and handler == SpecSSMResourceHandler.from_base(ssm_ref)
+            if isinstance(handler, IntermediateSSMStateHandler)
+            and handler == IntermediateSSMStateHandler.from_base(ssm_ref)
         ]
         conv_managed = [
             (name, handler)
@@ -457,23 +471,93 @@ class CachedSequenceInterface:
         conv_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecCausalConvResourceHandler)
-            and handler == SpecCausalConvResourceHandler.from_base(conv_ref)
+            if isinstance(handler, IntermediateConvStateHandler)
+            and handler == IntermediateConvStateHandler.from_base(conv_ref)
+        ]
+
+        # Replay SSM buffers — per-layer (old_x, old_B, old_dt, old_dA_cumsum)
+        # and global (cache_buf_idx, prev_num_accepted_tokens).
+        replay_old_x = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayOldXHandler)
+        ]
+        replay_old_B = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayOldBHandler)
+        ]
+        replay_old_dt = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayOldDtHandler)
+        ]
+        replay_old_dA_cumsum = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayOldDAcumsumHandler)
+        ]
+        replay_cache_buf_idx = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayCacheBufIdxHandler)
+        ]
+        replay_prev_num_accepted = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayPrevNumAcceptedHandler)
         ]
 
         # When speculative decoding is enabled, the backend must supply matching spec buffers.
         # When it is not enabled, spec buffers may still be registered by the backend (e.g.
         # triton_ssm always registers intermediate_ssm_state_cache) but will not be bound.
-        if self._spec_config is not None:
-            assert len(ssm_spec) == len(ssm_managed), (
-                f"Mismatched SSM spec layer count: expected {len(ssm_managed)}, got {len(ssm_spec)}"
+        # Exception: in replay mode intermediate_ssm_state_cache is omitted entirely from
+        # get_cache_initializers and uses the function's default (None) via kwarg routing.
+        use_replay = len(replay_old_x) > 0
+        if use_replay:
+            n = len(ssm_managed)
+            for lst, name in [
+                (replay_old_x, "replay_old_x"),
+                (replay_old_B, "replay_old_B"),
+                (replay_old_dt, "replay_old_dt"),
+                (replay_old_dA_cumsum, "replay_old_dA_cumsum"),
+            ]:
+                assert len(lst) == n, (
+                    f"Replay bundle mismatch: {name} has {len(lst)} entries, "
+                    f"expected {n} (== len(ssm_managed))"
+                )
+            assert len(replay_cache_buf_idx) == n, (
+                f"Replay bundle mismatch: replay_cache_buf_idx has {len(replay_cache_buf_idx)} "
+                f"entries, expected {n} (== len(ssm_managed))"
             )
+            assert len(replay_prev_num_accepted) == n, (
+                f"Replay bundle mismatch: replay_prev_num_accepted has "
+                f"{len(replay_prev_num_accepted)} entries, expected {n} (== len(ssm_managed))"
+            )
+        if self._spec_config is not None:
+            if not use_replay:
+                assert len(ssm_spec) == len(ssm_managed), (
+                    f"Mismatched SSM spec layer count: expected {len(ssm_managed)}, got {len(ssm_spec)}"
+                )
             assert len(conv_spec) == len(conv_managed), (
                 f"Mismatched Conv spec layer count: expected {len(conv_managed)}, "
                 f"got {len(conv_spec)}"
             )
 
-        return ssm_ref, ssm_managed, ssm_spec, conv_ref, conv_managed, conv_spec
+        return (
+            ssm_ref,
+            ssm_managed,
+            ssm_spec,
+            conv_ref,
+            conv_managed,
+            conv_spec,
+            replay_old_x,
+            replay_old_B,
+            replay_old_dt,
+            replay_old_dA_cumsum,
+            replay_cache_buf_idx,
+            replay_prev_num_accepted,
+        )
 
     def _prepare_kv_cache_config(
         self,
@@ -511,6 +595,9 @@ class CachedSequenceInterface:
             ]
         else:
             kv_cache_config.max_attention_window = None
+        has_swa_window = kv_cache_config.max_attention_window is not None and any(
+            window < self.info.max_seq_len for window in kv_cache_config.max_attention_window
+        )
 
         # Update kv_cache_config based on max_tokens if provided
         if max_tokens is not None:
@@ -519,7 +606,11 @@ class CachedSequenceInterface:
                 max_tokens_gathered = [None] * get_world_size()
                 all_gather_object(max_tokens_gathered, max_tokens)
                 max_tokens = min(max_tokens_gathered)
-            kv_cache_config.free_gpu_memory_fraction = None
+            # VSWA uses a memory-fraction/byte pool split across window groups.
+            # Keep the fraction even when AD passes a synthetic token estimate,
+            # because VSWA ignores max_tokens during final block allocation.
+            if not has_swa_window:
+                kv_cache_config.free_gpu_memory_fraction = None
             kv_cache_config.max_tokens = min(kv_cache_config.max_tokens or max_tokens, max_tokens)
 
         # Check if we should disable block reuse
@@ -653,6 +744,12 @@ class CachedSequenceInterface:
         conv_ref: Optional[CausalConvResourceHandler],
         conv_managed: list,
         conv_spec: list,
+        replay_old_x: list = (),
+        replay_old_B: list = (),
+        replay_old_dt: list = (),
+        replay_old_dA_cumsum: list = (),
+        replay_cache_buf_idx: list = (),
+        replay_prev_num_accepted: list = (),
     ) -> Tuple[MambaHybridCacheManager, int]:
         """Create MambaHybridCacheManager and assign views for state resources.
 
@@ -668,20 +765,26 @@ class CachedSequenceInterface:
             conv_ref: Reference Conv handler or None.
             conv_managed: List of base Conv resources.
             conv_spec: List of speculative Conv resources.
+            replay_old_x/B/dt/dA_cumsum: Per-layer replay cache resource lists.
+            replay_cache_buf_idx/prev_num_accepted: Global replay resource lists.
 
         Returns:
             Tuple of (manager, num_managed_mamba_layers).
         """
+        # Detect replay mode from presence of ReplayOldXHandler resources.
+        use_replay = len(replay_old_x) > 0
+
         # Mamba state params can be derived from reference handlers and number of managed (non-speculative) resources.
         mamba_params = self._get_mamba_state_params(
             ssm_ref, len(ssm_managed), conv_ref, len(conv_managed)
         )
         num_managed_mamba_layers = mamba_params["mamba_num_layers"]
 
-        # Create the hybrid cache manager
+        # Create the hybrid cache manager, enabling replay path if detected.
         manager = MixedMambaHybridCacheManager(
             **mamba_params,
             **kv_cache_kwargs,
+            use_replay_state_update=use_replay,
         )
 
         # Retrieve and assign views for Mamba-managed resources (up to num_managed_mamba_layers).
@@ -716,6 +819,36 @@ class CachedSequenceInterface:
                     )
                 assert spec_view.is_contiguous(), f"Non-contiguous state {spec_conv_name}"
                 self._caches[spec_conv_name] = spec_view
+
+            # Replay per-layer buffers (only when replay mode is active and spec dec enabled).
+            if use_replay and self._spec_config is not None:
+                for buf_list, getter, label in [
+                    (replay_old_x, manager.get_replay_old_x, "old_x"),
+                    (replay_old_B, manager.get_replay_old_B, "old_B"),
+                    (replay_old_dt, manager.get_replay_old_dt, "old_dt"),
+                    (replay_old_dA_cumsum, manager.get_replay_old_dA_cumsum, "old_dA_cumsum"),
+                ]:
+                    if buf_list:
+                        buf_name = buf_list[layer_idx][0]
+                        buf_view = getter(layer_idx)
+                        if buf_view is None:
+                            raise RuntimeError(
+                                f"Replay buffer {label} not allocated for layer {layer_idx}. "
+                                "Is use_replay_state_update=True in the cache manager?"
+                            )
+                        self._caches[buf_name] = buf_view
+
+        # Replay global buffers — same tensor for every layer; bind once per resource entry.
+        if use_replay and self._spec_config is not None:
+            global_buf_map = [
+                (replay_cache_buf_idx, manager.get_replay_cache_buf_idx()),
+                (replay_prev_num_accepted, manager.get_replay_prev_num_accepted_tokens()),
+            ]
+            for buf_list, global_tensor in global_buf_map:
+                if global_tensor is None:
+                    continue
+                for buf_name, _ in buf_list:
+                    self._caches[buf_name] = global_tensor
 
         return manager, num_managed_mamba_layers
 
@@ -879,10 +1012,24 @@ class CachedSequenceInterface:
         """
         # 1. Identify managed resources and per-pool configurations
         kv_managed, pool_configurations = self._identify_managed_kv_resources()
+        (
+            ssm_ref,
+            ssm_managed,
+            ssm_spec,
+            conv_ref,
+            conv_managed,
+            conv_spec,
+            replay_old_x,
+            replay_old_B,
+            replay_old_dt,
+            replay_old_dA_cumsum,
+            replay_cache_buf_idx,
+            replay_prev_num_accepted,
+        ) = self._identify_managed_state_resources()
 
-        ssm_ref, ssm_managed, ssm_spec, conv_ref, conv_managed, conv_spec = (
-            self._identify_managed_state_resources()
-        )
+        # Propagate replay mode into BatchInfo so SSM backends can branch on it
+        # without inspecting the presence/absence of Optional cache tensors.
+        self.info.batch_info.update_use_replay(len(replay_old_x) > 0)
         has_state_resources = ssm_managed or conv_managed
 
         # 2. Compute the total token budget; the C++ side splits it across pools.
@@ -913,6 +1060,12 @@ class CachedSequenceInterface:
                 conv_ref,
                 conv_managed,
                 conv_spec,
+                replay_old_x=replay_old_x,
+                replay_old_B=replay_old_B,
+                replay_old_dt=replay_old_dt,
+                replay_old_dA_cumsum=replay_old_dA_cumsum,
+                replay_cache_buf_idx=replay_cache_buf_idx,
+                replay_prev_num_accepted=replay_prev_num_accepted,
             )
         else:
             self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
@@ -978,16 +1131,14 @@ class CachedSequenceInterface:
             1 for h in self._resource_lookup.values() if isinstance(h, SSMResourceHandler)
         )
         num_ssm_spec_total = sum(
-            1 for h in self._resource_lookup.values() if isinstance(h, SpecSSMResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateSSMStateHandler)
         )
         num_ssm_total = num_ssm_base_total + num_ssm_spec_total
         num_conv_base_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, CausalConvResourceHandler)
         )
         num_conv_spec_total = sum(
-            1
-            for h in self._resource_lookup.values()
-            if isinstance(h, SpecCausalConvResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateConvStateHandler)
         )
         num_conv_total = num_conv_base_total + num_conv_spec_total
         num_state_other = num_state_total - num_ssm_total - num_conv_total
@@ -1159,6 +1310,21 @@ class CachedSequenceInterface:
         insertion order of the per-window keys).
         """
         self._kv_group_windows = list(group_windows)
+
+    @property
+    def kernel_handles_cyclic_swa(self) -> bool:
+        """Whether the attention kernel applies the sliding-window mask itself.
+
+        When True (trtllm), the executor passes the full per-window block table
+        and global KV lengths; when False (triton/flashinfer), it host-slices to
+        the live sliding window.
+        """
+        return self._kernel_handles_cyclic_swa
+
+    def set_kernel_handles_cyclic_swa(self, value: bool) -> None:
+        """Record the attention backend's cyclic-SWA capability (called by the
+        kvcache transform from ``AttentionDescriptor.kernel_handles_cyclic_swa``)."""
+        self._kernel_handles_cyclic_swa = bool(value)
 
     @property
     def kv_cache_manager(self) -> Optional[KVCacheManager]:

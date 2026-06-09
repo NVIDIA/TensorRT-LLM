@@ -49,7 +49,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -1052,13 +1052,6 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
         )
 
-        # transformers 5.5.x ``AutoTokenizer`` may route K2.5 to the Rust
-        # fast backend, which BPE-splits ``<|media_pad|>`` / ``<|im_user|>``
-        # / etc. instead of mapping them to their canonical IDs. Force the
-        # K2.5 slow ``TikTokenTokenizer`` for deterministic tokenization.
-        # See NVBug 6182617.
-        self._ensure_k25_slow_tokenizer()
-
     @property
     def config(self) -> PretrainedConfig:
         return self._config
@@ -1175,37 +1168,8 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 total_tokens += self.get_num_tokens_per_image(image=chunk[0])
         return total_tokens
 
-    def _ensure_k25_slow_tokenizer(self) -> None:
-        """Override ``self._tokenizer`` and ``self._processor.tokenizer``
-        with the model's slow ``TikTokenTokenizer``.
-
-        Done unconditionally because transformers 5.5.x's ``AutoTokenizer``
-        sometimes returns a Rust fast backend that BPE-splits K2.5 special
-        tokens instead of preserving their canonical IDs. The slow class'
-        ``tokens_trie`` always splits them correctly. See NVBug 6182617.
-        """
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-        slow_cls = get_class_from_dynamic_module(
-            "tokenization_kimi.TikTokenTokenizer",
-            self._model_path,
-        )
-        slow_tok = slow_cls.from_pretrained(self._model_path, trust_remote_code=True)
-
-        logger.info(
-            "K2.5 InputProcessor forcing slow TikTokenTokenizer "
-            "(originally %s). See NVBug 6182617.",
-            type(self._tokenizer).__name__,
-        )
-
-        self._tokenizer = slow_tok
-        # Image-only path uses ``self._processor.tokenizer`` (an
-        # independent instance from ``AutoProcessor``); swap it too.
-        if getattr(self._processor, "tokenizer", None) is not None:
-            self._processor.tokenizer = slow_tok
-
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self,
         inputs: TextPrompt,
         sampling_params: SamplingParams,
@@ -1447,12 +1411,12 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             "multimodal_data": multimodal_data,
         }
 
-    def get_prompt_token_ids(
+    def build_disagg_prefill_multimodal_inputs(
         self,
         inputs: TextPrompt,
         mm_handles: List[Dict[str, Any]],
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Build token IDs with multimodal placeholders expanded for disaggregated serving.
+    ) -> DisaggPrefillMultimodalInputs:
+        """Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container.
@@ -1460,7 +1424,9 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 context phase, each containing ``tensor_size``.
 
         Returns:
-            Tuple of (expanded_ids, mm_token_lengths, mm_token_offsets).
+            DisaggPrefillMultimodalInputs containing expanded token IDs,
+            prompt-side MM positions/lengths, exact runs, and encoder-output
+            embedding lengths.
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
@@ -1508,7 +1474,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 expanded_ids[write_pos] = input_ids[read_pos]
                 write_pos += 1
 
-        return (expanded_ids.to(torch.int32).tolist(), mm_token_length, mm_token_offsets)
+        return DisaggPrefillMultimodalInputs(
+            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+            multimodal_lengths=mm_token_length,
+            multimodal_positions=mm_token_offsets,
+            multimodal_embedding_lengths=[mm_handle["tensor_size"][0] for mm_handle in mm_handles],
+            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) + 1)),
+            multimodal_run_positions=mm_token_offsets,
+            multimodal_run_lengths=mm_token_length,
+        )
 
 
 # ---------------------------------------------------------------------------

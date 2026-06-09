@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const&
 {
     return {kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth, kernelMeta.mNumQHeadsOverKV,
         kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache, kernelMeta.mMultiQueryTokens, false,
-        std::nullopt};
+        std::nullopt, std::nullopt};
 }
 
 } // anonymous namespace
@@ -247,11 +247,8 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     //  * If applyRoPEInXqaKernel is false, a separate kernel applies RoPE (see invokeQKVPreprocessing), then XQA kernel
     //  performs SDPA.
     //    In this case, xqa_q_input_ptr (see below) serves as the scratch space to store intermediate RoPE output.
-    bool const applyRoPEInXqaKernel = isGMMAKernel && !isSpecDec
-        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
-                                              PositionEmbeddingType::kROPE_GPTJ},
-            xqaParams.position_embedding_type)
-        && !xqaParams.isMLA();
+
+    bool const applyRoPEInXqaKernel = jit::appliesRoPEInXqaKernel(xqaParams, isGMMAKernel);
 
     unsigned int head_size = xqaParams.head_size;
     int num_q_heads = xqaParams.num_q_heads;
