@@ -84,26 +84,6 @@ class Buffers:
                 # A suitable buffer was found, so reuse it.
                 best_fit_block.is_reserved = True
             return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
-            # else:
-            # TODO: to reuse tensors both in graph pool and normal pool.
-            # if best_fit_block.is_reserved:
-            #     return self._view_as(best_fit_block.buffer, tensor_shape,
-            #                          dtype)
-            # else:
-            # del best_fit_block.buffer
-            # candidate_blocks.remove(best_fit_block)
-
-        # for block in list(candidate_blocks):
-        #     if not block.is_reserved:
-        #         if best_fit_block is not None:
-        #             if block is not best_fit_block:
-        #                 # Need to call del BufferBlock.buffer, otherwise memory isn't
-        #                 # released and OOM may happen.
-        #                 del block.buffer
-        #                 candidate_blocks.remove(block)
-        #         else:
-        #             del block.buffer
-        #             candidate_blocks.remove(block)
 
         for block in list(candidate_blocks):
             if not block.is_reserved:

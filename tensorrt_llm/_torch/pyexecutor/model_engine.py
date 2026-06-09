@@ -542,7 +542,6 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_metadata = None
         self.encoder_attn_metadata = None
         self.iter_states = {}
-
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool if self._torch_compile_enabled else None
         self._cuda_graph_mem_pool_handle = self._cuda_graph_mem_pool.id if self._cuda_graph_mem_pool else None
 

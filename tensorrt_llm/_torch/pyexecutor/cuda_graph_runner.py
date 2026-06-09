@@ -572,7 +572,7 @@ class CUDAGraphRunner:
         self.memory_pool_handle = None
         del self.memory_pool
         self.memory_pool = None
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
 
 EncoderKeyType: TypeAlias = Tuple[int, int, int]
