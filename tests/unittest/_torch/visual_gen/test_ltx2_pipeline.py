@@ -549,13 +549,13 @@ class TestTwoStageLoRAHelpers:
 
         gib = 1024**3
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (116 * gib, 180 * gib))
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (116 * gib, 180 * gib))
         assert _should_save_bf16_weights()
 
-        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (115 * gib, 180 * gib))
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (115 * gib, 180 * gib))
         assert not _should_save_bf16_weights()
 
-        def _raise_mem_query_error():
+        def _raise_mem_query_error(device=None):
             raise RuntimeError("mem_get_info failed")
 
         monkeypatch.setattr(torch.cuda, "mem_get_info", _raise_mem_query_error)
