@@ -13,17 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 4-GPU Wan 2.2 T2V with NVFP4 dynamic quantization.
-# Shared by offline examples (--extra_visual_gen_options) and trtllm-serve.
-quant_config:
-  quant_algo: NVFP4
-  dynamic: true
+# 4-GPU LTX-2 AudioVideo parallel config (precision-agnostic — picks up
+# whatever checkpoint is passed via --model_path). Shared by offline
+# examples (--extra_visual_gen_options) and trtllm-serve.
 attention_config:
   backend: VANILLA
 parallel_config:
   cfg_size: 2
   ulysses_size: 2
   async_ulysses: true
-  parallel_vae_size: 4
+torch_compile_config:
+  enable: true
 cuda_graph_config:
-  enable: false
+  enable: true

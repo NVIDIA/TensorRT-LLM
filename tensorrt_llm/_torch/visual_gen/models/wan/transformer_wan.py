@@ -28,7 +28,6 @@ except ImportError:
     def get_parameter_device(module):
         return next(module.parameters()).device
 
-
 # =========================================================================
 # 1. Rotary Positional Embeddings
 # =========================================================================
@@ -291,17 +290,30 @@ class WanBlock(nn.Module):
         # However, this kernel does not support TP due to the cross-head
         # normalization being a collective op. Thus, we must disable it if
         # using TP.
+        # When ulysses_size > 1 AND parallel.async_ulysses is set, switch
+        # to SEPARATE_QKV so V/Q/K projections can stream-pipeline through
+        # the async ulysses A2A path.
         tp_size = model_config.mapping.tp_size if model_config.mapping else 1
+        vgm_self = model_config.visual_gen_mapping
+        ulysses_size_self = vgm_self.ulysses_size if vgm_self is not None else 1
+        _async_a2a = model_config.parallel.async_ulysses if model_config is not None else False
+        self._use_async_ulysses = bool(ulysses_size_self > 1) and _async_a2a
+        _qkv_mode_self = QKVMode.SEPARATE_QKV if self._use_async_ulysses else QKVMode.FUSE_QKV
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=_qkv_mode_self,
             qk_norm=True,
             eps=eps,
+            # fuse_qk_norm_rope=True drives the packed kernel on sync (FUSE_QKV)
+            # and the split kernel on async (SEPARATE_QKV via forward_async).
+            # Disabled when TP>1 since the fused kernel lacks cross-rank
+            # all-reduce for the cross-head RMSNorm variance.
             fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
+            async_ulysses=self._use_async_ulysses,
         )
 
         # Cross-attention with separate Q, K, V
@@ -415,15 +427,15 @@ class WanBlock(nn.Module):
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
 
-        # Self-attention with RoPE
-        x = (
-            x.float()
-            + self.attn1(
-                normed,
-                freqs=freqs,
-            ).float()
-            * gate_msa
-        ).to(x.dtype)
+        # Self-attention with RoPE. Async-ulysses dispatches to forward_async
+        # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
+        # side stream; both paths return 3D [B, S, H*D].
+        if self._use_async_ulysses:
+            attn1_out = self.attn1.forward_async(normed, freqs=freqs)
+        else:
+            attn1_out = self.attn1(normed, freqs=freqs)
+
+        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
         norm_x = self.norm2(x.float()).to(x.dtype)
 
