@@ -98,6 +98,9 @@ accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first[noadp-ctx_tp2pp1-gen_tp1pp1]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first[adp-ctx_tp2pp1-gen_tp2pp1]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
+accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[qwen3vl_2b_instruct]
+accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_fp8]
+accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True]
 accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy

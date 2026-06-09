@@ -66,6 +66,8 @@ _RESERVED_MM_DATA_KEYS = frozenset(
     {
         "layout_metadata",
         "mm_bidirectional_blocks",
+        "multimodal_embedding",
+        "multimodal_embedding_lengths",
         "special_token_offsets",
         "multimodal_embed_mask_cumsum",
     }
