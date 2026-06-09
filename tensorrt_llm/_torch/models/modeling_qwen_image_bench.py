@@ -54,7 +54,7 @@ class _QwenImageBenchModelMixin:
 
 @support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
-@register_auto_model("Qwen3_5ForConditionalGeneration")
+@register_auto_model("QwenImageBenchForConditionalGeneration")
 @register_input_processor(
     Qwen3VLInputProcessorBase,
     model_type="qwen3_5",
