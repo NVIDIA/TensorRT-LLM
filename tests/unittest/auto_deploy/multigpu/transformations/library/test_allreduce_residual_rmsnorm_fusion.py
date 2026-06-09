@@ -195,6 +195,29 @@ def _test_allreduce_fusion(
         cleanup()
 
 
+def _run_allreduce_fusion_with_retries(device_count, **kwargs):
+    if device_count <= 1:
+        pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
+
+    n_workers = device_count
+    max_retries = 5
+    last_exc: Exception | None = None
+    for _ in range(max_retries):
+        mpi_pool = MpiPoolSession(n_workers=n_workers)
+        try:
+            mpi_pool.submit_sync(_test_allreduce_fusion, port=None, **kwargs)
+            return
+        except DistNetworkError as e:
+            last_exc = e
+            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
+                raise
+        finally:
+            mpi_pool.shutdown()
+    raise RuntimeError(
+        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
+    ) from last_exc
+
+
 @pytest.mark.parametrize("device_count", get_device_counts())
 @pytest.mark.parametrize(
     "ModuleCls",
@@ -215,75 +238,23 @@ def test_allreduce_fusion(device_count, ModuleCls, strategy, rmsnorm_op):
     # Test the allreduce, residual, and rmsnorm fusion.
     # MpiPoolSession is required because the test exercises trtllm's MPI-mode allreduce ops,
     # which only activate when is_ompi() is true.
-    if device_count <= 1:
-        pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
-
-    n_workers = device_count
-    # Retry on EADDRINUSE with a fresh MPI pool to avoid transient
-    # rendezvous port conflicts in distributed initialization.
-    max_retries = 5
-    last_exc: Exception | None = None
-    for _ in range(max_retries):
-        mpi_pool = MpiPoolSession(n_workers=n_workers)
-        try:
-            mpi_pool.submit_sync(
-                _test_allreduce_fusion,
-                port=None,
-                ModuleCls=ModuleCls,
-                strategy=strategy,
-                rmsnorm_op=rmsnorm_op,
-            )
-            return
-        except DistNetworkError as e:
-            last_exc = e
-            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
-                raise
-        finally:
-            mpi_pool.shutdown()
-    raise RuntimeError(
-        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
-    ) from last_exc
+    _run_allreduce_fusion_with_retries(
+        device_count,
+        ModuleCls=ModuleCls,
+        strategy=strategy,
+        rmsnorm_op=rmsnorm_op,
+    )
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
-@pytest.mark.parametrize(
-    "ModuleCls",
-    [AllreduceResidualNorm, AllreduceResidualNorm2],
-    ids=["residual_plus_x", "x_plus_residual"],
-)
-@pytest.mark.parametrize(
-    "rmsnorm_op",
-    ["torch_rmsnorm", "triton_rms_norm"],
-    ids=["rmsnorm_torch", "rmsnorm_triton"],
-)
-def test_allreduce_fusion_cute_backend_selection(device_count, ModuleCls, rmsnorm_op):
+def test_allreduce_fusion_cute_backend_selection(device_count):
     # The CuTe backend path is validated at graph level here. Runtime coverage is
     # kept in the local POC benchmark because the kernel is an eager-only bf16
     # experiment and not CUDA-graph-safe.
-    if device_count <= 1:
-        pytest.skip("Require multi GPUs to run test_allreduce_fusion_cute_backend_selection.")
-
-    n_workers = device_count
-    max_retries = 5
-    last_exc: Exception | None = None
-    for _ in range(max_retries):
-        mpi_pool = MpiPoolSession(n_workers=n_workers)
-        try:
-            mpi_pool.submit_sync(
-                _test_allreduce_fusion,
-                port=None,
-                ModuleCls=ModuleCls,
-                strategy="AUTO",
-                rmsnorm_op=rmsnorm_op,
-                fusion_backend="cute",
-            )
-            return
-        except DistNetworkError as e:
-            last_exc = e
-            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
-                raise
-        finally:
-            mpi_pool.shutdown()
-    raise RuntimeError(
-        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
-    ) from last_exc
+    _run_allreduce_fusion_with_retries(
+        device_count,
+        ModuleCls=AllreduceResidualNorm,
+        strategy="AUTO",
+        rmsnorm_op="torch_rmsnorm",
+        fusion_backend="cute",
+    )

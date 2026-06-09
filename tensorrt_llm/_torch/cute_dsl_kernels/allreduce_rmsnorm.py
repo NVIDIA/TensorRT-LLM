@@ -42,15 +42,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from cutlass._mlir.dialects import arith, llvm, vector
     from cutlass.cute.runtime import make_fake_stream
     from cutlass.cutlass_dsl import dsl_user_op
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import (
-        TRTLLM_ENABLE_PDL,
-        griddepcontrol_launch_dependents,
-        griddepcontrol_wait,
-    )
 
 _DEFAULT_TPC_VALUES = (64, 128, 256, 512, 1024)
-# Keep the two-kernel path opt-in until benchmarks show a size where it wins.
-_DEFAULT_AUTO_TWOSHOT_MIN_ELEMENTS = 1 << 30
 _SYNC_MODE_INTERNAL = "internal"
 _SYNC_MODE_CALLER = "caller"
 _SYNC_MODES = (_SYNC_MODE_INTERNAL, _SYNC_MODE_CALLER)
@@ -75,12 +68,9 @@ class _Runtime:
     symm_input: _SymmTensor
     launch: Callable
     threads_per_cta: int
-    implementation: str
-    parts_per_row: int = 1
-    partial_sums: torch.Tensor | None = None
 
 
-_RUNTIME_CACHE: dict[tuple[int, int, int, torch.dtype, str], _Runtime] = {}
+_RUNTIME_CACHE: dict[tuple[int, int, int, torch.dtype], _Runtime] = {}
 _REGISTERED_SYMM_INPUTS: dict[tuple[int, int, int, torch.dtype], _SymmTensor] = {}
 
 
@@ -93,7 +83,7 @@ def _current_cu_stream():
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
-def _valid_threads_per_cta(hidden_size: int, implementation: str) -> int:
+def _valid_threads_per_cta(hidden_size: int) -> int:
     valid = tuple(tpc for tpc in _DEFAULT_TPC_VALUES if hidden_size % (tpc * 8) == 0)
     if not valid:
         raise NotImplementedError(f"hidden_size={hidden_size} is not supported")
@@ -106,35 +96,6 @@ def _valid_threads_per_cta(hidden_size: int, implementation: str) -> int:
             )
         return threads_per_cta
     return valid[-1]
-
-
-def _select_implementation(rows: int, hidden_size: int) -> str:
-    implementation = os.environ.get("TRTLLM_CUTE_AR_RMSNORM_IMPL", "single").lower()
-    if implementation not in ("single", "twoshot", "auto"):
-        raise NotImplementedError(f"unknown CuTe AR RMSNorm implementation: {implementation}")
-    if implementation == "auto":
-        min_elements = int(
-            os.environ.get(
-                "TRTLLM_CUTE_AR_RMSNORM_TWOSHOT_MIN_ELEMENTS",
-                str(_DEFAULT_AUTO_TWOSHOT_MIN_ELEMENTS),
-            )
-        )
-        if min_elements < 0:
-            raise NotImplementedError(
-                "TRTLLM_CUTE_AR_RMSNORM_TWOSHOT_MIN_ELEMENTS must be non-negative"
-            )
-        if rows * hidden_size >= min_elements:
-            return "twoshot"
-        return "single"
-    return implementation
-
-
-def _twoshot_parts_per_row(hidden_size: int, threads_per_cta: int) -> int:
-    max_parts = hidden_size // (threads_per_cta * 8)
-    for parts_per_row in (8, 4, 2):
-        if parts_per_row <= max_parts and hidden_size % (parts_per_row * threads_per_cta * 8) == 0:
-            return parts_per_row
-    return 1
 
 
 def _world_size_supports_multicast(world_size: int) -> bool:
@@ -412,179 +373,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 stream=stream,
             )
 
-    class _TwoShotArRmsnormBf16Launcher:
-        def __init__(self, rows: int, hidden_size: int, threads_per_cta: int, parts_per_row: int):
-            self.rows = rows
-            self.hidden_size = hidden_size
-            self.threads_per_cta = threads_per_cta
-            self.parts_per_row = parts_per_row
-            self.part_hidden_size = hidden_size // parts_per_row
-            self.vec_chunks_per_part = self.part_hidden_size // (threads_per_cta * 8)
-
-        @cute.kernel
-        def reduce_residual_kernel(
-            self,
-            mc_in: cute.Tensor,
-            uc_residual: cute.Tensor,
-            uc_h_out: cute.Tensor,
-            partial_sums: cute.Tensor,
-        ):
-            tidx, _, _ = cute.arch.thread_idx()
-            row, part_idx, _ = cute.arch.block_idx()
-            part_base = part_idx * self.part_hidden_size
-            sum_sq = Float32(0.0)
-
-            for c in cutlass.range_constexpr(self.vec_chunks_per_part):
-                col = part_base + c * self.threads_per_cta * 8 + tidx * 8
-                offset = row * self.hidden_size + col
-
-                r0, r1, r2, r3 = utils.distributed.multimem_ld_reduce_8xbf16(
-                    mc_in.iterator + offset
-                )
-                b0, b1 = _i32_to_bf16_pair(r0)
-                b2, b3 = _i32_to_bf16_pair(r1)
-                b4, b5 = _i32_to_bf16_pair(r2)
-                b6, b7 = _i32_to_bf16_pair(r3)
-
-                h0 = Float32(b0) + Float32(uc_residual[row, col + 0])
-                h1 = Float32(b1) + Float32(uc_residual[row, col + 1])
-                h2 = Float32(b2) + Float32(uc_residual[row, col + 2])
-                h3 = Float32(b3) + Float32(uc_residual[row, col + 3])
-                h4 = Float32(b4) + Float32(uc_residual[row, col + 4])
-                h5 = Float32(b5) + Float32(uc_residual[row, col + 5])
-                h6 = Float32(b6) + Float32(uc_residual[row, col + 6])
-                h7 = Float32(b7) + Float32(uc_residual[row, col + 7])
-
-                uc_h_out[row, col + 0] = BFloat16(h0)
-                uc_h_out[row, col + 1] = BFloat16(h1)
-                uc_h_out[row, col + 2] = BFloat16(h2)
-                uc_h_out[row, col + 3] = BFloat16(h3)
-                uc_h_out[row, col + 4] = BFloat16(h4)
-                uc_h_out[row, col + 5] = BFloat16(h5)
-                uc_h_out[row, col + 6] = BFloat16(h6)
-                uc_h_out[row, col + 7] = BFloat16(h7)
-
-                sum_sq = (
-                    sum_sq
-                    + h0 * h0
-                    + h1 * h1
-                    + h2 * h2
-                    + h3 * h3
-                    + h4 * h4
-                    + h5 * h5
-                    + h6 * h6
-                    + h7 * h7
-                )
-
-            lane_idx = cute.arch.lane_idx()
-            warp_idx = cute.arch.warp_idx()
-            num_warps = self.threads_per_cta // 32
-
-            sum_sq = cute.arch.warp_reduction_sum(sum_sq)
-            smem_ptr = cute.arch.alloc_smem(Float32, num_warps + 1)
-            smem = cute.make_tensor(smem_ptr, cute.make_layout((num_warps + 1,)))
-
-            if lane_idx == 0:
-                smem[warp_idx] = sum_sq
-            cute.arch.barrier()
-
-            if warp_idx == 0:
-                part_sum = Float32(0.0)
-                if lane_idx < num_warps:
-                    part_sum = smem[lane_idx]
-                part_sum = cute.arch.warp_reduction_sum(part_sum)
-                if lane_idx == 0:
-                    partial_sums[row, part_idx] = part_sum
-            griddepcontrol_launch_dependents()
-
-        @cute.kernel
-        def rmsnorm_kernel(
-            self,
-            uc_weight: cute.Tensor,
-            uc_h_out: cute.Tensor,
-            uc_y_out: cute.Tensor,
-            partial_sums: cute.Tensor,
-            eps: Float32,
-        ):
-            tidx, _, _ = cute.arch.thread_idx()
-            row, part_idx, _ = cute.arch.block_idx()
-            part_base = part_idx * self.part_hidden_size
-
-            griddepcontrol_wait()
-            row_sum = Float32(0.0)
-            for p in cutlass.range_constexpr(self.parts_per_row):
-                row_sum = row_sum + partial_sums[row, p]
-            inv_rms = cute.math.rsqrt(row_sum / Float32(self.hidden_size) + eps, fastmath=True)
-
-            for c in cutlass.range_constexpr(self.vec_chunks_per_part):
-                col = part_base + c * self.threads_per_cta * 8 + tidx * 8
-
-                h0 = Float32(uc_h_out[row, col + 0])
-                h1 = Float32(uc_h_out[row, col + 1])
-                h2 = Float32(uc_h_out[row, col + 2])
-                h3 = Float32(uc_h_out[row, col + 3])
-                h4 = Float32(uc_h_out[row, col + 4])
-                h5 = Float32(uc_h_out[row, col + 5])
-                h6 = Float32(uc_h_out[row, col + 6])
-                h7 = Float32(uc_h_out[row, col + 7])
-
-                uc_y_out[row, col + 0] = BFloat16(h0 * inv_rms * Float32(uc_weight[col + 0]))
-                uc_y_out[row, col + 1] = BFloat16(h1 * inv_rms * Float32(uc_weight[col + 1]))
-                uc_y_out[row, col + 2] = BFloat16(h2 * inv_rms * Float32(uc_weight[col + 2]))
-                uc_y_out[row, col + 3] = BFloat16(h3 * inv_rms * Float32(uc_weight[col + 3]))
-                uc_y_out[row, col + 4] = BFloat16(h4 * inv_rms * Float32(uc_weight[col + 4]))
-                uc_y_out[row, col + 5] = BFloat16(h5 * inv_rms * Float32(uc_weight[col + 5]))
-                uc_y_out[row, col + 6] = BFloat16(h6 * inv_rms * Float32(uc_weight[col + 6]))
-                uc_y_out[row, col + 7] = BFloat16(h7 * inv_rms * Float32(uc_weight[col + 7]))
-
-        @cute.jit
-        def __call__(
-            self,
-            mc_addr_in: Int64,
-            uc_addr_residual: Int64,
-            uc_addr_weight: Int64,
-            uc_addr_h_out: Int64,
-            uc_addr_y_out: Int64,
-            uc_addr_partial_sums: Int64,
-            eps: Float32,
-            stream: cuda.CUstream,
-        ):
-            mc_in = _raw_tensor_2d(mc_addr_in, BFloat16, self.rows, self.hidden_size)
-            uc_res = _raw_tensor_2d(uc_addr_residual, BFloat16, self.rows, self.hidden_size)
-            uc_w = _raw_tensor_1d(uc_addr_weight, BFloat16, self.hidden_size)
-            uc_h = _raw_tensor_2d(uc_addr_h_out, BFloat16, self.rows, self.hidden_size)
-            uc_y = _raw_tensor_2d(uc_addr_y_out, BFloat16, self.rows, self.hidden_size)
-            partial_sums = _raw_tensor_2d(
-                uc_addr_partial_sums,
-                Float32,
-                self.rows,
-                self.parts_per_row,
-            )
-
-            self.reduce_residual_kernel(
-                mc_in,
-                uc_res,
-                uc_h,
-                partial_sums,
-            ).launch(
-                grid=[self.rows, self.parts_per_row, 1],
-                block=[self.threads_per_cta, 1, 1],
-                stream=stream,
-                use_pdl=TRTLLM_ENABLE_PDL,
-            )
-            self.rmsnorm_kernel(
-                uc_w,
-                uc_h,
-                uc_y,
-                partial_sums,
-                eps,
-            ).launch(
-                grid=[self.rows, self.parts_per_row, 1],
-                block=[self.threads_per_cta, 1, 1],
-                stream=stream,
-                use_pdl=TRTLLM_ENABLE_PDL,
-            )
-
 
 def _make_runtime(
     input_2d: torch.Tensor,
@@ -592,7 +380,6 @@ def _make_runtime(
     weight: torch.Tensor,
     eps: float,
     threads_per_cta: int,
-    implementation: str,
 ) -> _Runtime:
     _require_cute()
     rows, hidden_size = input_2d.shape
@@ -603,42 +390,6 @@ def _make_runtime(
 
     h_out = torch.empty_like(input_2d)
     y_out = torch.empty_like(input_2d)
-    if implementation == "twoshot":
-        parts_per_row = _twoshot_parts_per_row(hidden_size, threads_per_cta)
-        if parts_per_row == 1:
-            implementation = "single"
-        else:
-            partial_sums = torch.empty(
-                (rows, parts_per_row),
-                dtype=torch.float32,
-                device=input_2d.device,
-            )
-            compile_args = (
-                Int64(mc_addr),
-                Int64(residual_2d.data_ptr()),
-                Int64(weight.data_ptr()),
-                Int64(h_out.data_ptr()),
-                Int64(y_out.data_ptr()),
-                Int64(partial_sums.data_ptr()),
-                Float32(eps),
-                make_fake_stream(),
-            )
-            launcher = _TwoShotArRmsnormBf16Launcher(
-                rows,
-                hidden_size,
-                threads_per_cta,
-                parts_per_row,
-            )
-            launch = cute.compile(launcher, *compile_args)
-            return _Runtime(
-                symm_input=symm_input,
-                launch=launch,
-                threads_per_cta=threads_per_cta,
-                implementation=implementation,
-                parts_per_row=parts_per_row,
-                partial_sums=partial_sums,
-            )
-
     compile_args = (
         Int64(mc_addr),
         Int64(residual_2d.data_ptr()),
@@ -654,7 +405,6 @@ def _make_runtime(
         symm_input=symm_input,
         launch=launch,
         threads_per_cta=threads_per_cta,
-        implementation=implementation,
     )
 
 
@@ -664,18 +414,16 @@ def _get_runtime(
     weight: torch.Tensor,
     eps: float,
     threads_per_cta: int,
-    implementation: str,
 ) -> _Runtime:
     key = (
         torch.cuda.current_device(),
         input_2d.shape[0],
         input_2d.shape[1],
         input_2d.dtype,
-        implementation,
     )
     runtime = _RUNTIME_CACHE.get(key)
     if runtime is None or runtime.threads_per_cta != threads_per_cta:
-        runtime = _make_runtime(input_2d, residual_2d, weight, eps, threads_per_cta, implementation)
+        runtime = _make_runtime(input_2d, residual_2d, weight, eps, threads_per_cta)
         _RUNTIME_CACHE[key] = runtime
     return runtime
 
@@ -689,28 +437,15 @@ def _launch_runtime(
     y_out: torch.Tensor,
     eps: float,
 ) -> None:
-    if runtime.implementation == "twoshot":
-        assert runtime.partial_sums is not None
-        runtime.launch(
-            Int64(mc_addr),
-            Int64(residual_2d.data_ptr()),
-            Int64(weight.data_ptr()),
-            Int64(h_out.data_ptr()),
-            Int64(y_out.data_ptr()),
-            Int64(runtime.partial_sums.data_ptr()),
-            Float32(eps),
-            _current_cu_stream(),
-        )
-    else:
-        runtime.launch(
-            Int64(mc_addr),
-            Int64(residual_2d.data_ptr()),
-            Int64(weight.data_ptr()),
-            Int64(h_out.data_ptr()),
-            Int64(y_out.data_ptr()),
-            Float32(eps),
-            _current_cu_stream(),
-        )
+    runtime.launch(
+        Int64(mc_addr),
+        Int64(residual_2d.data_ptr()),
+        Int64(weight.data_ptr()),
+        Int64(h_out.data_ptr()),
+        Int64(y_out.data_ptr()),
+        Float32(eps),
+        _current_cu_stream(),
+    )
 
 
 class FusedAllreduceResidualRmsnormBf16Context:
@@ -754,8 +489,7 @@ class FusedAllreduceResidualRmsnormBf16Context:
         self.h_out = torch.empty_like(self.input_2d)
         self.y_out = torch.empty_like(self.input_2d)
 
-        self.implementation = _select_implementation(self.input_2d.shape[0], hidden_size)
-        self.threads_per_cta = _valid_threads_per_cta(hidden_size, self.implementation)
+        self.threads_per_cta = _valid_threads_per_cta(hidden_size)
 
         _enable_symmetric_memory()
         cutlass.cuda.initialize_cuda_context(torch.cuda.current_device())
@@ -765,10 +499,7 @@ class FusedAllreduceResidualRmsnormBf16Context:
             self.weight,
             eps,
             self.threads_per_cta,
-            self.implementation,
         )
-        self.implementation = self.runtime.implementation
-        self.parts_per_row = self.runtime.parts_per_row
 
         symm_input = _lookup_symmetric_input(self.input_2d)
         if symm_input is None:
@@ -848,25 +579,6 @@ class FusedAllreduceResidualRmsnormBf16Context:
         y_view = self.y_out.view(self.shape)
         h_view = self.h_out.view(self.shape)
 
-        if self.runtime.implementation == "twoshot":
-            assert self.runtime.partial_sums is not None
-            partial_sums_addr = Int64(self.runtime.partial_sums.data_ptr())
-
-            def run() -> tuple[torch.Tensor, torch.Tensor]:
-                self.runtime.launch(
-                    mc_addr,
-                    residual_addr,
-                    weight_addr,
-                    h_out_addr,
-                    y_out_addr,
-                    partial_sums_addr,
-                    eps,
-                    _current_cu_stream(),
-                )
-                return y_view, h_view
-
-            return run
-
         def run() -> tuple[torch.Tensor, torch.Tensor]:
             self.runtime.launch(
                 mc_addr,
@@ -930,12 +642,11 @@ def fused_allreduce_residual_rmsnorm_bf16(
 
     input_2d = input.contiguous().view(-1, hidden_size)
     residual_2d = residual.contiguous().view(-1, hidden_size)
-    implementation = _select_implementation(input_2d.shape[0], hidden_size)
-    threads_per_cta = _valid_threads_per_cta(hidden_size, implementation)
+    threads_per_cta = _valid_threads_per_cta(hidden_size)
 
     _enable_symmetric_memory()
     cutlass.cuda.initialize_cuda_context(torch.cuda.current_device())
-    runtime = _get_runtime(input_2d, residual_2d, weight, eps, threads_per_cta, implementation)
+    runtime = _get_runtime(input_2d, residual_2d, weight, eps, threads_per_cta)
     symm_input = _lookup_symmetric_input(input_2d)
     if symm_input is None:
         symm_input = runtime.symm_input
