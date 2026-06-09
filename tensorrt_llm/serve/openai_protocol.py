@@ -1,10 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
-import hashlib
-import hmac
 import math
-import os
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -52,7 +49,6 @@ from tensorrt_llm.scheduling_params import AgentHierarchy
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
-_OPAQUE_STATE_HMAC_ENV = "TLLM_DISAGG_OPAQUE_STATE_HMAC_KEY"
 
 
 def ensure_request_chat_template_allowed(request: Any,
@@ -164,7 +160,6 @@ class DisaggregatedParams(OpenAIBaseModel):
     first_gen_logits: Optional[List] = None
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
-    opaque_state_tag: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
     disagg_request_id: Optional[int] = None
     ctx_dp_rank: Optional[int] = None
@@ -1224,26 +1219,15 @@ class UpdateWeightsRequest(OpenAIBaseModel):
 def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:
     if opaque_state is None:
         return None
-    return base64.b64encode(opaque_state).decode("utf-8")
+    raise ValueError(
+        "opaque_state cannot be serialized through the OpenAI protocol")
 
 
-def _opaque_state_tag(encoded_opaque_state: Optional[str]) -> Optional[str]:
-    key = os.getenv(_OPAQUE_STATE_HMAC_ENV)
-    if key is None or encoded_opaque_state is None:
-        return None
-    return hmac.new(key.encode("utf-8"), encoded_opaque_state.encode("utf-8"),
-                    hashlib.sha256).hexdigest()
-
-
-def decode_opaque_state(encoded_opaque_state: Optional[str],
-                        opaque_state_tag: Optional[str]) -> Optional[bytes]:
+def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
     if encoded_opaque_state is None:
         return None
-    expected_tag = _opaque_state_tag(encoded_opaque_state)
-    if expected_tag is None or not hmac.compare_digest(
-            opaque_state_tag or "", expected_tag):
-        raise ValueError("encoded_opaque_state is missing a valid tag")
-    return base64.b64decode(encoded_opaque_state, validate=True)
+    raise ValueError(
+        "encoded_opaque_state is not accepted from OpenAI requests")
 
 
 def _serialize_first_gen_log_probs(
@@ -1359,7 +1343,6 @@ def to_disaggregated_params(
     ctx_usage = tllm_disagg_params.ctx_usage
     if ctx_usage is not None and not isinstance(ctx_usage, UsageInfo):
         ctx_usage = UsageInfo.model_validate(ctx_usage)
-    encoded_opaque_state = encode_opaque_state(tllm_disagg_params.opaque_state)
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
@@ -1368,8 +1351,8 @@ def to_disaggregated_params(
         first_gen_logits=_serialize_first_gen_logits(
             tllm_disagg_params.first_gen_logits),
         ctx_request_id=tllm_disagg_params.ctx_request_id,
-        encoded_opaque_state=encoded_opaque_state,
-        opaque_state_tag=_opaque_state_tag(encoded_opaque_state),
+        encoded_opaque_state=encode_opaque_state(
+            tllm_disagg_params.opaque_state),
         draft_tokens=tllm_disagg_params.draft_tokens,
         disagg_request_id=tllm_disagg_params.disagg_request_id,
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
@@ -1394,8 +1377,7 @@ def to_llm_disaggregated_params(
             disaggregated_params.first_gen_logits),
         ctx_request_id=disaggregated_params.ctx_request_id,
         opaque_state=decode_opaque_state(
-            disaggregated_params.encoded_opaque_state,
-            disaggregated_params.opaque_state_tag),
+            disaggregated_params.encoded_opaque_state),
         draft_tokens=disaggregated_params.draft_tokens,
         disagg_request_id=disaggregated_params.disagg_request_id,
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
