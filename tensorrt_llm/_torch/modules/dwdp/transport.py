@@ -169,7 +169,6 @@ class DWDPTransport:
         "_imported_handles",
         "_peer_va_mappings",
         "_local_export_fds",
-        "_imported_local_fds",
         "_released",
     )
 
@@ -186,7 +185,6 @@ class DWDPTransport:
         imported_handles: List[int],
         peer_va_mappings: List[Tuple[int, int]],
         local_export_fds: List[int],
-        imported_local_fds: List[int],
     ) -> None:
         """Internal constructor. Use DWDPTransport.create() instead.
 
@@ -217,7 +215,6 @@ class DWDPTransport:
         self._imported_handles = imported_handles
         self._peer_va_mappings = peer_va_mappings
         self._local_export_fds = local_export_fds
-        self._imported_local_fds = imported_local_fds
         self._released = False
 
     @classmethod
@@ -290,15 +287,17 @@ class DWDPTransport:
         # after Phase 3 Barrier.  ``peer_pidfds`` is empty on the FABRIC
         # path (aarch64 / GB200).
         peer_pidfds: Dict[int, int] = {}
-        # FDs we own in our fd table that must be closed at release time:
-        # - ``local_export_fds``: FDs returned by cuMemExportToShareableHandle
-        #   on this rank.  Must outlive every peer's pidfd_getfd; closed
-        #   only at transport release / failure cleanup.
-        # - ``imported_local_fds``: FDs dup-ed from peers via pidfd_getfd.
-        #   Each backs an imported CUDA handle and must stay open as long
-        #   as that handle is in use; closed at transport release.
+        # FDs returned by ``cuMemExportToShareableHandle`` on this rank.
+        # Must outlive every peer's ``pidfd_getfd`` (Phase 2) but are
+        # closed right after the Phase 3 Barrier — at that point every
+        # peer has finished dup-ing them and the FDs no longer back
+        # anything we need.  ``cuMemImportFromShareableHandle`` dups the
+        # peer-side FD internally, so we do NOT have to track imported
+        # FDs across phases: each one is closed inline immediately after
+        # the import call returns, capping fd usage at ~num_handles
+        # rather than ``dwdp_size × num_handles``.  The list is empty on
+        # the FABRIC path (aarch64 / GB200).
         local_export_fds: List[int] = []
-        imported_local_fds: List[int] = []
 
         # Pick any spec to read the model's total expert count.  All layers
         # share the same ``num_experts`` (the gate-side global expert table).
@@ -473,12 +472,21 @@ class DWDPTransport:
                         # (b) Import the handle.  On POSIX_FD we first dup
                         # the peer's FD into our fd table via pidfd_getfd;
                         # cuMemImportFromShareableHandle then accepts that
-                        # local FD.  On FABRIC the bytes blob is consumed
-                        # directly.
+                        # local FD and dups it internally, so we close
+                        # ours immediately after the import returns.  On
+                        # FABRIC the bytes blob is consumed directly.
                         if is_posix_fd:
                             local_fd = _pidfd_getfd(peer_pidfds[peer_rank], int(peer_payload))
-                            imported_local_fds.append(local_fd)
-                            imported_handle = _import_handle(local_fd, htype)
+                            try:
+                                imported_handle = _import_handle(local_fd, htype)
+                            finally:
+                                try:
+                                    os.close(local_fd)
+                                except OSError as e:
+                                    logger.warning(
+                                        f"[DWDPTransport] Failed to close "
+                                        f"imported FD {local_fd}: {e}"
+                                    )
                         else:
                             imported_handle = _import_handle(peer_payload, htype)
                         imported_handles.append(imported_handle)
@@ -520,6 +528,18 @@ class DWDPTransport:
                     logger.warning(f"[DWDPTransport] Failed to close pidfd {pidfd}: {e}")
             peer_pidfds.clear()
 
+            # POSIX_FD: close our exported FDs.  They had to stay open
+            # through Phase 2 so peers could ``pidfd_getfd`` them, but
+            # the Barrier above guarantees every peer has finished doing
+            # so.  Closing here (instead of at ``release()``) caps peak
+            # fd usage during setup at ~num_handles per rank.
+            for fd in local_export_fds:
+                try:
+                    os.close(fd)
+                except OSError as e:
+                    logger.warning(f"[DWDPTransport] Failed to close local export FD {fd}: {e}")
+            local_export_fds.clear()
+
             logger.info(
                 f"[DWDPTransport] Rank {dwdp_rank}: setup complete. "
                 f"{len(handles)} local handles, "
@@ -540,7 +560,6 @@ class DWDPTransport:
                 imported_handles=imported_handles,
                 peer_va_mappings=peer_va_mappings,
                 local_export_fds=local_export_fds,
-                imported_local_fds=imported_local_fds,
             )
 
         except Exception as exc:
@@ -560,7 +579,6 @@ class DWDPTransport:
                 imported_handles=imported_handles,
                 peer_va_mappings=peer_va_mappings,
                 local_export_fds=local_export_fds,
-                imported_local_fds=imported_local_fds,
             )
             raise
 
@@ -660,14 +678,12 @@ class DWDPTransport:
             imported_handles=self._imported_handles,
             peer_va_mappings=self._peer_va_mappings,
             local_export_fds=self._local_export_fds,
-            imported_local_fds=self._imported_local_fds,
         )
 
         self._local_handles.clear()
         self._imported_handles.clear()
         self._peer_va_mappings.clear()
         self._local_export_fds.clear()
-        self._imported_local_fds.clear()
 
         logger.debug(f"[DWDPTransport] Rank {self._dwdp_rank}: released all resources")
 
@@ -693,25 +709,29 @@ def _cleanup_resources(
     imported_handles: List[int],
     peer_va_mappings: List[Tuple[int, int]],
     local_export_fds: List[int],
-    imported_local_fds: List[int],
 ) -> None:
     """Best-effort cleanup of CUDA resources.
 
     Unmap and free all peer VA regions, release imported handles, then
-    release local handles. On the POSIX_FD path, also close the local
-    export FDs and the dup-ed FDs from peers (after their backing handles
-    are released). Errors are logged but not raised so that cleanup
-    proceeds as far as possible.
+    release local handles.  Errors are logged but not raised so that
+    cleanup proceeds as far as possible.
+
+    The POSIX_FD path releases its FDs eagerly during ``create()`` —
+    imported FDs are closed inline right after
+    ``cuMemImportFromShareableHandle`` (which dups them internally), and
+    local export FDs are closed right after the Phase 3 Barrier — so by
+    the time normal-path ``release()`` runs ``local_export_fds`` is
+    already empty.  This function still iterates it because the
+    error-path caller invokes us with whatever FDs were tracked at the
+    moment of failure, which may include in-flight export FDs that the
+    Phase 3 cleanup never reached.
 
     Args:
         local_handles: Local MNNVL handle integers.
         imported_handles: Imported MNNVL handle integers.
         peer_va_mappings: List of (va, size) for peer VA regions.
         local_export_fds: POSIX FDs returned by cuMemExportToShareableHandle
-            on this rank (POSIX_FD path only). Closed last.
-        imported_local_fds: POSIX FDs dup-ed from peers via pidfd_getfd
-            (POSIX_FD path only). Closed after the imported handles they
-            back are released.
+            that have not yet been closed (POSIX_FD path only).
     """
     # Step 1: Unmap and free peer VA regions
     for va, size in peer_va_mappings:
@@ -731,21 +751,16 @@ def _cleanup_resources(
         except Exception as e:
             logger.warning(f"[DWDPTransport] Failed to release imported handle {h}: {e}")
 
-    # Step 3: Close dup-ed peer FDs (no longer referenced by any handle).
-    for fd in imported_local_fds:
-        try:
-            os.close(fd)
-        except OSError as e:
-            logger.warning(f"[DWDPTransport] Failed to close imported FD {fd}: {e}")
-
-    # Step 4: Release local handles
+    # Step 3: Release local handles
     for h in local_handles:
         try:
             release_handle(h)
         except Exception as e:
             logger.warning(f"[DWDPTransport] Failed to release local handle {h}: {e}")
 
-    # Step 5: Close local export FDs (after the underlying handle is gone).
+    # Step 4: Defensively close any local export FDs still tracked (only
+    # populated on the POSIX_FD failure path; empty on the normal path
+    # since Phase 3 already closed them).
     for fd in local_export_fds:
         try:
             os.close(fd)
