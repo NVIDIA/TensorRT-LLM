@@ -769,27 +769,22 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                           "Reasons: ${result.reasons.join('; ')}")
             return null
         }
-        // Piggyback input JSON on testFilter so each L0_Test stage agent can
-        // re-run main.py and regenerate cbts_test_db/ locally. The payload is
-        // base64-encoded because the raw JSON contains PR diffs and may include
-        // ${...} or {...} sequences that the Jenkins tokenmacro plugin would
-        // try to evaluate when the parent serializes globalVars for the
-        // Parameterized-Remote-Trigger plugin, raising MacroEvaluationException
-        // and blocking test dispatch. Capped at 256 KB (post-encoding, since
-        // that is what travels on the wire); oversize → drop piggyback,
-        // Layer 3 falls back to source.
-        final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
-        def inputJsonB64 = inputJson.bytes.encodeBase64().toString()
-        def inputJsonB64Size = inputJsonB64.length()
-        if (inputJsonB64Size <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
-            result.cbts_input_json_b64 = inputJsonB64
-            pipeline.echo("CBTS Layer 3: cbts_input_json_b64 piggyback enabled " +
-                          "(${inputJsonB64Size} bytes encoded, ${inputJson.length()} bytes raw)")
-        } else {
-            pipeline.echo("CBTS Layer 3: cbts_input_json_b64 is ${inputJsonB64Size} bytes, " +
-                          "exceeds ${CBTS_INPUT_PIGGYBACK_MAX_BYTES}-byte piggyback limit; " +
-                          "downstream stages will fall back to source test-db " +
-                          "(Layer 2 stage filtering still applies)")
+        // Upload the generated cbts_test_db/ to Artifactory so each L0_Test
+        // stage agent can download it directly instead of re-running main.py
+        // with the raw PR diff. This avoids passing large payloads as Jenkins
+        // parameters (env vars), which caused "Argument list too long" failures
+        // when diffs were large. Agents fall back to the source test-db if the
+        // download fails.
+        if (result.test_db_dir_override) {
+            try {
+                sh "tar czf /tmp/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
+                trtllm_utils.uploadArtifacts("/tmp/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
+                result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
+                pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
+            } catch (Exception e) {
+                pipeline.echo("CBTS Layer 3: artifact upload failed (${e.message}); " +
+                              "agents will fall back to source test-db")
+            }
         }
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
@@ -1329,20 +1324,6 @@ def getCommonParameters()
     ]
 }
 
-// Strip cbts_input_json_b64 before passing testFilter as a Jenkins parameter.
-// The b64 payload can be up to 256 KB; combined with other env vars it can
-// exceed ARG_MAX and cause "git: error=7, Argument list too long" on agents.
-// Layer 2 stage filtering survives; Layer 3 test-db regeneration falls back
-// to the source test-db on agents that don't receive the piggyback.
-def _testFilterForDownstream(testFilter) {
-    def cbts = testFilter[(CBTS_RESULT)]
-    if (cbts == null || !cbts.containsKey('cbts_input_json_b64')) {
-        return testFilter
-    }
-    def cbtsStripped = cbts.findAll { k, v -> k != 'cbts_input_json_b64' }
-    return testFilter + [(CBTS_RESULT): cbtsStripped]
-}
-
 def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
@@ -1441,7 +1422,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        String testFilterJson = writeJSON returnText: true, json: _testFilterForDownstream(testFilter)
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
@@ -1497,7 +1478,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        def testFilterJson = writeJSON returnText: true, json: _testFilterForDownstream(testFilter)
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
@@ -1553,7 +1534,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        String testFilterJson = writeJSON returnText: true, json: _testFilterForDownstream(testFilter)
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
@@ -1608,7 +1589,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        def testFilterJson = writeJSON returnText: true, json: _testFilterForDownstream(testFilter)
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
