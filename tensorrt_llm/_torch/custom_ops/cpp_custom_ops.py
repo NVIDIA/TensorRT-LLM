@@ -680,6 +680,7 @@ def _register_fake():
         cluster_rank: int,
         min_latency_mode: bool,
         use_fp8_block_scaling: bool,
+        skip_data_expand: bool = False,
     ):
 
         experts_per_token = token_selected_experts.shape[1]
