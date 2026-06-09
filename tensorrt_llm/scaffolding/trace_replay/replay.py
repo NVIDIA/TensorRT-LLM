@@ -102,7 +102,7 @@ class ReplayGenerationStats:
     per-trace clusters without guessing from durations.
     """
 
-    __slots__ = ("_entries", "session_index", "trace_index")
+    __slots__ = ("_entries", "parallel_regions", "session_index", "trace_index")
 
     def __init__(
         self,
@@ -111,6 +111,7 @@ class ReplayGenerationStats:
         trace_index: Optional[int] = None,
     ) -> None:
         self._entries: List[Dict[str, Optional[float]]] = []
+        self.parallel_regions: List[Dict[str, float]] = []
         self.session_index = session_index
         self.trace_index = trace_index
 
@@ -147,6 +148,11 @@ class ReplayGenerationStats:
                 "client_request_start_s": client_request_start_s,
                 "client_request_end_s": client_request_end_s,
             }
+        )
+
+    def record_parallel_region(self, start_s: float, end_s: float) -> None:
+        self.parallel_regions.append(
+            {"start_s": start_s, "end_s": end_s, "duration_s": end_s - start_s}
         )
 
     @property
@@ -858,6 +864,7 @@ class ReplayEngine:
         drop_path_stats: Optional[DropPathStats] = None,
         retention_probe_stats: Optional[RetentionProbeStats] = None,
     ):
+        self._generation_stats = generation_stats
         self._system_token_cache: Dict[str, List[int]] = (
             system_token_cache if system_token_cache is not None else {}
         )
@@ -886,7 +893,8 @@ class ReplayEngine:
         # Root queue for branch_path = ()
         root_queue_id = self.queue_manager.allocate_queue(trace_id, ())
 
-        parallel_stack: List[List[str]] = []
+        # Each entry: (child_queue_ids, parallel_start_s)
+        parallel_stack: List[Tuple[List[str], float]] = []
 
         for event in trace.events:
             if event.event_type == "parallel_start":
@@ -898,6 +906,7 @@ class ReplayEngine:
                 # children must not start hitting the server while the
                 # parent's last ``worker.run_task`` is still in flight.
                 await self.queue_manager.drain_branch(parent_path)
+                parallel_start_s = time.perf_counter()
 
                 num_branches = event.num_branches or 0
                 child_queue_ids = []
@@ -905,13 +914,16 @@ class ReplayEngine:
                     child_path = parent_path + (i,)
                     child_qid = self.queue_manager.allocate_queue(trace_id, child_path)
                     child_queue_ids.append(child_qid)
-                parallel_stack.append(child_queue_ids)
+                parallel_stack.append((child_queue_ids, parallel_start_s))
 
             elif event.event_type == "parallel_end":
-                child_queue_ids = parallel_stack.pop()
+                child_queue_ids, parallel_start_s = parallel_stack.pop()
                 for qid in child_queue_ids:
                     self.queue_manager.close_queue(qid)
                 await self.queue_manager.wait_all_done(child_queue_ids)
+                parallel_end_s = time.perf_counter()
+                if self._generation_stats is not None:
+                    self._generation_stats.record_parallel_region(parallel_start_s, parallel_end_s)
                 for qid in child_queue_ids:
                     self.queue_manager.unregister_queue(qid)
 
