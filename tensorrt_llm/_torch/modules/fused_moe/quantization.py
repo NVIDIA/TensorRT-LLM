@@ -2468,13 +2468,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                              module.fc2_input_scale.data,
                                              dst_fc2_alpha[expert_idx])
 
-            if dst_fc31_weight_scale_2 is not None:
-                dst_fc31_weight_scale_2[expert_idx] = w1_ws2[...].reshape(
-                    []).float()
-            if dst_fc2_weight_scale_2 is not None:
-                dst_fc2_weight_scale_2[expert_idx] = w2_ws2[...].reshape(
-                    []).float()
-
+            # --- FIX: Added bounds check to prevent IndexError under active load_balancer ---
+            if dst_fc31_weight_scale_2 is not None and expert_idx < dst_fc31_weight_scale_2.shape[0]:
+                dst_fc31_weight_scale_2[expert_idx] = w1_ws2[...].reshape([]).float()
+            if dst_fc2_weight_scale_2 is not None and expert_idx < dst_fc2_weight_scale_2.shape[0]:
+                dst_fc2_weight_scale_2[expert_idx] = w2_ws2[...].reshape([]).float()
     def _finalize_pre_quant_scales(self, module: torch.nn.Module):
         """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
         if not hasattr(module, 'tmp_pre_quant_scales'):
