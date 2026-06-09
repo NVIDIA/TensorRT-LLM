@@ -1503,6 +1503,31 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.get_num_front_blocks_removed(request_id,
                                                       window_size=window_size)
 
+    def commit_and_get_block_hashes(
+            self,
+            request: LlmRequest,
+            window_size: Optional[int] = None) -> List[int]:
+        """Commit and return the chain of stored block hashes for ``request``.
+
+        Wraps ``BaseKVCacheManager::commitAndGetBlockHashesForRequest``. The C++
+        side sets each block's ``mBlockKey`` and ``mHash`` on first call so the
+        hash matches what ``storeBlocks`` would later compute. Beam-width-1
+        only; the connector enforces this at startup.
+        """
+        if window_size is None:
+            # ``is_vswa`` (distinct window sizes) is the real VSWA signal; a
+            # uniform per-layer vector such as ``[4096, 4096, ...]`` has
+            # ``len > 1`` yet a single effective window, so keying off the
+            # length would spuriously reject it for connector callers that omit
+            # ``window_size``.
+            if self.is_vswa:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
+        return list(
+            self.impl.commit_and_get_block_hashes_for_request(
+                request, window_size))
+
     def unpin_blocks_by_id(self, kv_cache_block_id: int):
         self.impl.unpin_blocks_by_id(kv_cache_block_id)
 
