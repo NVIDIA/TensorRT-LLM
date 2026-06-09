@@ -1956,21 +1956,17 @@ class OpenAIServer(_VideoRoutesMixin):
             msg = str(e)
             if "already in progress" in msg or "pending" in msg:
                 logger.info(f"/start_profile rejected: {msg}")
-                return JSONResponse(
-                    content={
-                        "success": False,
-                        "message": msg
-                    },
-                    status_code=409,
-                )
-            logger.error(f"/start_profile failed: {e}")
-            return JSONResponse(
-                content={
+                return JSONResponse(content={
                     "success": False,
-                    "message": msg,
+                    "message": msg
                 },
-                status_code=500,
-            )
+                                    status_code=409)
+            logger.error(f"/start_profile failed: {e}")
+            return JSONResponse(content={
+                "success": False,
+                "message": msg
+            },
+                                status_code=500)
         except (OSError, ValueError, TimeoutError) as e:
             # OSError: filesystem/IPC failures while preparing the
             # profile window. ValueError: schema-level rejections that
@@ -1979,13 +1975,11 @@ class OpenAIServer(_VideoRoutesMixin):
             # FastAPI's middleware so we get a real stack trace in the
             # server log instead of swallowing it as a generic 500.
             logger.error(f"/start_profile failed: {e}")
-            return JSONResponse(
-                content={
-                    "success": False,
-                    "message": str(e),
-                },
-                status_code=500,
-            )
+            return JSONResponse(content={
+                "success": False,
+                "message": str(e)
+            },
+                                status_code=500)
 
         return JSONResponse(content={"message": "Profiling started"})
 
