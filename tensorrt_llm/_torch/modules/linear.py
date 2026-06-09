@@ -3497,6 +3497,25 @@ class Linear(nn.Module):
         self.quant_method.pre_reload_weights(self)
 
 
+def is_static_nvfp4_input_eligible(linear) -> bool:
+    """Whether ``linear`` consumes a static (calibrated) NVFP4 input, making it
+    eligible to have its input-quantize folded into a producing RMSNorm.
+
+    Eligible iff the Linear has NVFP4 weights, a calibrated (static)
+    ``input_scale``, no AWQ ``pre_quant_scale``, and is not forced to dynamic
+    quantization. This is the single canonical definition shared by every
+    NVFP4-fold site (the layer-boundary / dense folds in modeling_deepseekv3.py
+    and the q_a_layernorm -> q_b_proj fold in attention.py's MLA) so the gate
+    cannot drift between them.
+    """
+    if linear is None:
+        return False
+    return (getattr(linear, "has_nvfp4", False)
+            and not getattr(linear, "force_dynamic_quantization", False)
+            and getattr(linear, "input_scale", None) is not None
+            and getattr(linear, "pre_quant_scale", None) is None)
+
+
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
