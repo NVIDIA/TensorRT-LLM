@@ -697,6 +697,8 @@ class TestKVCacheV2SchedulerCrossParam:
         llm_args = SimpleNamespace(
             extra_resource_managers={},
             disable_overlap_scheduler=True,
+            enable_early_first_token_response=False,
+            kv_cache_config=SimpleNamespace(enable_kv_pool_rebalance=False),
         )
 
         with (
