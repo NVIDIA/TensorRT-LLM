@@ -18,7 +18,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
-#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_pipeline.h>
@@ -79,7 +78,7 @@ __device__ __forceinline__ void bar_sync_consumer(int count)
 }
 
 // combine_modulator_chunk: combine 8 bf16 ts + 8 fp32 table into 8 bf16 (one uint4).
-// Matches PyTorch eager `_get_all_ada_values` semantics: narrow fp32 table to
+// Matches PyTorch eager `_get_ada_values` semantics: narrow fp32 table to
 // bf16 FIRST, then bf16 hw add. Used for gate / scale / shift modulators alike.
 __device__ __forceinline__ uint4 combine_modulator_chunk(uint4 const& ts_v, float4 const& tbl_lo, float4 const& tbl_hi)
 {
@@ -953,7 +952,8 @@ __global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormP
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Host launcher template + KABCD specializations.
+// Host launcher template + explicit specializations for each (residual, gate, modulate, num_out)
+// combination consumed by LTX-2's transformer block.
 
 template <bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_MODULATE, int NUM_OUT, bool HAS_QUANT>
 void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStream_t stream)
@@ -978,18 +978,13 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
     cfg.attrs = attrs;
     cfg.numAttrs = 1;
 
-    // Optional pipelined dispatch (multi-row CTA + circular TMA stages + warp specialization).
-    // Enabled by env var TLLM_DIT_NORM_PIPELINED=1. Fires only when:
+    // Pipelined dispatch (multi-row CTA + circular TMA stages + warp specialization).
+    // Auto-selected on shapes where it wins; otherwise falls through to the default path below.
     //   - hidden_dim == 4096 (video path; audio D=2048 has too small a grid to amortize the
     //     warp-specialization overhead and bench-regresses)
-    //   - variant is KA/KB/KC (KD's HAS_GATE && !HAS_MODULATE is HBM-bound and bench-regresses)
+    //   - HAS_MODULATE || !HAS_GATE (the HAS_GATE && !HAS_MODULATE variant is HBM-bound and bench-regresses)
     //   - tokens_per_batch >= 4 && % 4 == 0 (R_CTA=4 rows share batchIdx for per-CTA mod cache)
-    // Otherwise falls through to the default path below.
-    static bool const pipelined_enabled = []()
-    {
-        char const* env = std::getenv("TLLM_DIT_NORM_PIPELINED");
-        return env != nullptr && env[0] != '\0' && env[0] != '0';
-    }();
+    //   - num_tokens % 4 == 0 (whole grid must be R_CTA-aligned)
     constexpr bool kPipelinedVariantOK = HAS_MODULATE || !HAS_GATE;
     if constexpr (kPipelinedVariantOK)
     {
@@ -1000,8 +995,8 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
         constexpr int PIPE_BLOCK_SIZE = 288;
         constexpr int PIPE_D = 4096;
         constexpr int PIPE_R_CTA = 4;
-        if (pipelined_enabled && hidden_dim == PIPE_D && (params.num_tokens % PIPE_R_CTA == 0)
-            && (params.tokens_per_batch >= PIPE_R_CTA) && (params.tokens_per_batch % PIPE_R_CTA == 0))
+        if (hidden_dim == PIPE_D && (params.num_tokens % PIPE_R_CTA == 0) && (params.tokens_per_batch >= PIPE_R_CTA)
+            && (params.tokens_per_batch % PIPE_R_CTA == 0))
         {
             constexpr int pipe_stage_elems = HAS_RESIDUAL ? (2 * PIPE_D) : PIPE_D;
             size_t const pipe_smem_bytes
@@ -1019,7 +1014,6 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
             return;
         }
     }
-    (void) pipelined_enabled;
 
 #define LAUNCH(D_VAL)                                                                                                  \
     do                                                                                                                 \
@@ -1047,23 +1041,23 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
 #undef LAUNCH
 }
 
-// Explicit instantiations -- one (bf16, fp4) pair per KABCD family.
-//   KA: !RESIDUAL, !GATE, MODULATE, NUM_OUT=1
+// Explicit instantiations -- one (bf16, fp4) pair per (residual, gate, modulate, num_out) variant.
+//   !RESIDUAL, !GATE, MODULATE, NUM_OUT=1: post-pre-norm RMSNorm + shift_scale modulate
 template void launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true, /*NUM_OUT=*/1,
     /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
 template void launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true, /*NUM_OUT=*/1,
     /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
-//   KB: RESIDUAL, !GATE, MODULATE, NUM_OUT=2
+//   RESIDUAL, !GATE, MODULATE, NUM_OUT=2: post-text-attn residual + RMSNorm + dual shift_scale
 template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true, /*NUM_OUT=*/2,
     /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
 template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true, /*NUM_OUT=*/2,
     /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
-//   KC: RESIDUAL, GATE, MODULATE, NUM_OUT=1
+//   RESIDUAL, GATE, MODULATE, NUM_OUT=1: post-cross-attn FFN pre-norm gate*attn + residual + RMSNorm + shift_scale
 template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/true, /*NUM_OUT=*/1,
     /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
 template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/true, /*NUM_OUT=*/1,
     /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
-//   KD: RESIDUAL, GATE, !MODULATE, NUM_OUT=1
+//   RESIDUAL, GATE, !MODULATE, NUM_OUT=1: post-self-attn gate*attn + residual + RMSNorm (+ optional quant)
 template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/false, /*NUM_OUT=*/1,
     /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
 template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/false, /*NUM_OUT=*/1,

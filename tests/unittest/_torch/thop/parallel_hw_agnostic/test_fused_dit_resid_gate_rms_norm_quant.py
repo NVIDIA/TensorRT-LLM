@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Tests for the LTX-2 fused residual + gate_mul + RMSNorm + NVFP4 quant kernel (KD).
+# Tests for the LTX-2 fused residual + gate_mul + RMSNorm + NVFP4 quant kernel.
 #
 # Math (per token n, batch b = n / tokens_per_batch):
 #   gate[d]    = gate_table[d].to(bf16) + gate_ts[b, d]    (bf16 narrow, bf16 hw add)
@@ -20,7 +20,7 @@ import tensorrt_llm  # noqa: F401  -- triggers libth_common.so load (registers t
 @torch.inference_mode()
 def torch_ref_bf16(x_2d, attn_2d, gate_table, gate_ts, tokens_per_batch, eps):
     """Reference matching kernel: gate built bf16-narrow-first to match
-    PyTorch eager `_get_all_ada_values[2]`. Returns (normed_bf16, x_new_bf16)."""
+    PyTorch eager `_get_ada_values[2]`. Returns (normed_bf16, x_new_bf16)."""
     B = gate_ts.shape[0]
     D = x_2d.shape[-1]
     x_3d = x_2d.view(B, tokens_per_batch, D).float()
@@ -56,7 +56,7 @@ def test_resid_gate_rms_norm_bf16(hidden_dim, batch_size, tokens_per_batch):
     x_impl = x.clone()
     out = torch.ops.trtllm.fused_dit_resid_gate_rms_norm(x_impl, attn, gate_table, gate_ts, eps)
 
-    # Tolerance: same as KC -- bf16-narrow-first kernel vs fp32 ref differs at the
+    # Tolerance: same as the modulate variants -- bf16-narrow-first kernel vs fp32 ref differs at the
     # bf16 ULP edge; longer-S reductions can push 1 element over the tighter 5e-3.
     torch.testing.assert_close(out, ref_normed, rtol=2e-2, atol=1e-2)
     torch.testing.assert_close(x_impl, ref_x_new, rtol=2e-2, atol=1e-2)
@@ -83,7 +83,7 @@ def test_resid_gate_rms_norm_quant_fp4(hidden_dim, batch_size):
     sf_scale_x = (448.0 * 6.0) / normed_bf16.abs().max().float()
     sf_scale_w = (448.0 * 6.0) / W.abs().max().float()
 
-    # KD op: in-place x <- x + attn * gate, produces (fp4, sf) of normed.
+    # bf16 op: in-place x <- x + attn * gate, produces (fp4, sf) of normed.
     x_fp4 = x.clone()
     out_fp4, out_sf = torch.ops.trtllm.fused_dit_resid_gate_rms_norm_quant(
         x_fp4, attn, gate_table, gate_ts, sf_scale_x, eps

@@ -25,7 +25,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// Fused residual + weightless RMSNorm + DUAL AdaLN modulation (KB).
+// Fused residual + weightless RMSNorm + DUAL AdaLN modulation .
 //
 // Each of the 4 modulators is built inline by the C++ op:
 //   m[b,d] = m_table[d].to(bf16) + m_ts[b,d]    (bf16 narrow first, bf16 hw add)

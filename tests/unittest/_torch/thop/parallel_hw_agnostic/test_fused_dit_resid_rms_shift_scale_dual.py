@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Tests for the LTX-2 fused residual + RMSNorm + dual AdaLN modulate kernel (KB).
+# Tests for the LTX-2 fused residual + RMSNorm + dual AdaLN modulate kernel.
 #
 # bf16 variant:   fused_dit_resid_rms_shift_scale_dual  -> (out_dir1, out_dir2)
 # NVFP4 variant:  fused_dit_resid_rms_shift_scale_dual_quant
 #                 -> (fp4_dir1, sf_dir1, fp4_dir2, sf_dir2)
 #
-# KB lives at the post-attn2 site: residual_add(x, attn2_out) -> rms_norm ->
+# The fused kernel lives at the post-attn2 site: residual_add(x, attn2_out) -> rms_norm ->
 # two independent (1+s)*normed+h modulations, feeding the FFN up_proj
 # (dir1) and the AV cross-attn to_q (dir2).
 #
@@ -109,7 +109,7 @@ def test_resid_rms_shift_scale_dual_bf16(hidden_dim, batch_size, tokens_per_batc
         x_impl, attn2, s1_table, s1_ts, h1_table, h1_ts, s2_table, s2_ts, h2_table, h2_ts, eps
     )
 
-    # Tolerance: same as KC -- bf16-narrow-first kernel vs fp32 ref differs at the
+    # Tolerance: same as the gate-residual variant -- bf16-narrow-first kernel vs fp32 ref differs at the
     # bf16 ULP edge; longer-S reductions can push 1 element over the tighter 5e-3.
     # Kernel uses pure bf16 hw `__hadd2`/`__hmul2` modulate; production eager uses bf16
     # with fp32-accumulator internally. ~1 bf16 ULP per element on rare tail samples.
@@ -120,10 +120,10 @@ def test_resid_rms_shift_scale_dual_bf16(hidden_dim, batch_size, tokens_per_batc
 
 @pytest.mark.parametrize("hidden_dim", [2048, 4096])
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_resid_rms_shift_scale_dual_fp4_quant(hidden_dim, batch_size):
+@pytest.mark.parametrize("tokens_per_batch", [126, 128])
+def test_resid_rms_shift_scale_dual_fp4_quant(hidden_dim, batch_size, tokens_per_batch):
     """NVFP4 variant: both quantized outputs (dir1 -> FFN up_proj, dir2 -> AV cross-attn
     to_q) pass end-to-end GEMM cosine > 0.98 vs the bf16 F.linear reference."""
-    tokens_per_batch = 126
     num_tokens = batch_size * tokens_per_batch
     out_dim = 1024
     (x, attn2, s1_table, s1_ts, h1_table, h1_ts, s2_table, s2_ts, h2_table, h2_ts) = _make_inputs(
@@ -135,7 +135,7 @@ def test_resid_rms_shift_scale_dual_fp4_quant(hidden_dim, batch_size):
     W1 = torch.randn(out_dim, hidden_dim, dtype=torch.bfloat16, device="cuda") * 0.05
     W2 = torch.randn(out_dim, hidden_dim, dtype=torch.bfloat16, device="cuda") * 0.05
 
-    # bf16 reference: KB bf16 outputs -> F.linear with random W1 / W2.
+    # bf16 reference: fused-kernel bf16 outputs -> F.linear with random W1 / W2.
     x_bf16 = x.clone()
     o1_bf16, o2_bf16 = torch.ops.trtllm.fused_dit_resid_rms_shift_scale_dual(
         x_bf16, attn2, s1_table, s1_ts, h1_table, h1_ts, s2_table, s2_ts, h2_table, h2_ts, eps
@@ -148,7 +148,7 @@ def test_resid_rms_shift_scale_dual_fp4_quant(hidden_dim, batch_size):
     sf_scale_w1 = (448.0 * 6.0) / W1.abs().max().float()
     sf_scale_w2 = (448.0 * 6.0) / W2.abs().max().float()
 
-    # KB FP4 path: dual quant in one kernel.
+    # FP4 path: dual quant in one kernel.
     x_fp4 = x.clone()
     o1_fp4, o1_sf, o2_fp4, o2_sf = torch.ops.trtllm.fused_dit_resid_rms_shift_scale_dual_quant(
         x_fp4,
@@ -167,7 +167,7 @@ def test_resid_rms_shift_scale_dual_fp4_quant(hidden_dim, batch_size):
     )
 
     # Weight quantize: trtllm.fp4_quantize defaults (sfUseUE8M0=False,
-    # isSfSwizzledLayout=True) match KB quant kernel's SWIZZLED SF layout.
+    # isSfSwizzledLayout=True) match the quant kernel's SWIZZLED SF layout.
     W1_fp4, W1_sf = torch.ops.trtllm.fp4_quantize(W1, sf_scale_w1, 16)
     W2_fp4, W2_sf = torch.ops.trtllm.fp4_quantize(W2, sf_scale_w2, 16)
 

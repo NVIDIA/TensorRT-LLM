@@ -25,13 +25,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// Fused residual add + gate multiply + weightless RMSNorm + optional NVFP4 quant (KD).
+// Fused residual add + gate multiply + weightless RMSNorm + optional NVFP4 quant
 //
 // The gate modulator is built inline by the C++ op:
 //   gate[b,d] = gate_table[d].to(bf16) + gate_ts[b,d]    (bf16 narrow first, bf16 hw add)
 // This folds the upstream broadcast-add Triton prep kernel (which Inductor would
 // fuse with the `attn_out * gate` mul) into Phase 0b. Matches PyTorch eager
-// `_get_all_ada_values` semantics byte-for-byte.
+// `_get_ada_values` semantics byte-for-byte.
 //
 // In-place:
 //   x <- x + attn_out * gate

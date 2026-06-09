@@ -8,11 +8,11 @@ import torch
 
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
-# NVFP4 fused-quant AdaLN: the KA / KB / KC CUDA kernels can emit packed FP4 +
-# per-16-elem FP8 (e4m3) scale factors (128x4 SWIZZLED layout) directly. Call
-# sites pass ``fp4_input_scale`` (the calibrated NVFP4 ``input_scale`` of the
-# downstream Linear) to dispatch to the quant variant; passing ``None`` runs
-# the bf16-output variant.
+# NVFP4 fused-quant AdaLN: every fused AdaLN CUDA kernel below has a ``_quant``
+# template specialization that emits packed FP4 + per-16-elem FP8 (e4m3) scale
+# factors (128x4 SWIZZLED layout) directly. Call sites pass ``fp4_input_scale``
+# (the calibrated NVFP4 ``input_scale`` of the downstream Linear) to dispatch
+# to the quant variant; passing ``None`` runs the bf16-output variant.
 
 
 def get_nvfp4_input_scale(linear) -> Optional[torch.Tensor]:
@@ -165,7 +165,8 @@ def apply_fused_gate_resid_rms_modulate(
     *,
     fp4_input_scale: Optional[torch.Tensor] = None,
 ) -> "tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, Fp4QuantizedTensor]":
-    """Fused KC: ``x_new = x + attn * gate``; ``normed = rms_norm(x_new)``;
+    """Fused gate-residual + RMSNorm + shift/scale modulate:
+    ``x_new = x + attn * gate``; ``normed = rms_norm(x_new)``;
     ``out = (1+scale)*normed + shift``.
 
     Each modulator is built inline by the C++ op:
@@ -234,7 +235,8 @@ def apply_fused_resid_gate_rms_quant(
     *,
     fp4_input_scale: Optional[torch.Tensor] = None,
 ) -> "tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, Fp4QuantizedTensor]":
-    """Fused KD: ``x_new = x + attn_out * gate``; ``normed = rms_norm(x_new)``; optional
+    """Fused gate-residual + RMSNorm (no modulate):
+    ``x_new = x + attn_out * gate``; ``normed = rms_norm(x_new)``; optional
     NVFP4 quant of ``normed``.
 
     Gate modulator is composed inline by the C++ op from a (table, ts) pair:
@@ -261,7 +263,7 @@ def apply_fused_resid_gate_rms_quant(
     assert attn_out.is_contiguous(), "attn_out must be contiguous"
 
     if fp4_input_scale is not None:
-        # KD quant: residual_add + gate_mul + rms_norm + NVFP4 quant in one kernel.
+        # Quant variant: residual_add + gate_mul + rms_norm + NVFP4 quant in one kernel.
         # Kernel returns flat [num_tokens, D/2] FP4; reshape back to caller's
         # rank so downstream (e.g. attn2 Q-norm) sees the same [B, S, D/2].
         out_fp4, out_sf = torch.ops.trtllm.fused_dit_resid_gate_rms_norm_quant(
@@ -270,7 +272,7 @@ def apply_fused_resid_gate_rms_quant(
         out_fp4 = _maybe_reshape_fp4(out_fp4, x.shape, D)
         return x, Fp4QuantizedTensor(out_fp4, out_sf)
 
-    # KD bf16: residual_add + gate_mul + rms_norm, no quant.
+    # bf16 variant: residual_add + gate_mul + rms_norm, no quant.
     out = torch.ops.trtllm.fused_dit_resid_gate_rms_norm(
         x.view(-1, D), attn_out.view(-1, D), gate_table, gate_ts, eps
     )
@@ -297,7 +299,8 @@ def apply_fused_resid_rms_dual_shift_scale(
     "tuple[torch.Tensor, torch.Tensor, torch.Tensor] "
     "| tuple[torch.Tensor, Fp4QuantizedTensor, Fp4QuantizedTensor]"
 ):
-    """Fused KB: ``x_new = x + attn2_out``; ``normed = rms_norm(x_new)``;
+    """Fused residual + RMSNorm + dual shift/scale modulate:
+    ``x_new = x + attn2_out``; ``normed = rms_norm(x_new)``;
     ``out1 = (1+scale1)*normed + shift1``; ``out2 = (1+scale2)*normed + shift2``.
 
     Each modulator is built inline by the C++ op:

@@ -25,7 +25,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// Fused gated residual + weightless RMSNorm + (gate, scale, shift) AdaLN modulation (KC).
+// Fused gated residual + weightless RMSNorm + (gate, scale, shift) AdaLN modulation .
 //
 // Each modulator is built inline from a (table, ts) pair:
 //   gate[b,d]  = gate_table[d]  + gate_ts[b,d]   (fp32 add, bf16 narrow)

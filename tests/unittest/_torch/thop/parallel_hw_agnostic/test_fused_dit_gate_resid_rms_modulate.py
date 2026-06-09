@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Tests for the LTX-2 fused gate-residual + RMSNorm + AdaLN modulate kernel (KC).
+# Tests for the LTX-2 fused gate-residual + RMSNorm + AdaLN modulate kernel.
 #
 # bf16 variant:   fused_dit_gate_resid_rms_modulate
 # NVFP4 variant:  fused_dit_gate_resid_rms_modulate_quant
@@ -32,7 +32,7 @@ def torch_ref(
     eps,
 ):
     """Reference matching production semantics (apply_fused_gate_resid_modulate
-    eager fallback + _get_all_ada_values combine):
+    eager fallback + _get_ada_values combine):
        gate_bf16 = gate_table.to(bf16) + gate_ts                  (bf16 narrow, bf16 add)
        x_new     = x + attn * gate_bf16                            (bf16)
        normed    = rms_norm(x_new)                                 (bf16)
@@ -98,7 +98,7 @@ def test_gate_resid_rms_modulate_bf16(hidden_dim, batch_size, tokens_per_batch):
     )
 
     # Tolerance bumped vs old test: kernel now narrows table->bf16 then bf16-add
-    # (PyTorch eager `_get_all_ada_values` semantics) which differs from the
+    # (PyTorch eager `_get_ada_values` semantics) which differs from the
     # all-fp32 reference at the bf16 ULP boundary; the longer-S reductions amplify
     # the per-element diff slightly. Still well within bf16 noise.
     # Kernel uses pure bf16 hw `__hadd2`/`__hmul2` modulate; production eager uses bf16
@@ -109,10 +109,10 @@ def test_gate_resid_rms_modulate_bf16(hidden_dim, batch_size, tokens_per_batch):
 
 @pytest.mark.parametrize("hidden_dim", [2048, 4096])
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_gate_resid_rms_modulate_fp4_quant(hidden_dim, batch_size):
+@pytest.mark.parametrize("tokens_per_batch", [126, 128])
+def test_gate_resid_rms_modulate_fp4_quant(hidden_dim, batch_size, tokens_per_batch):
     """NVFP4 variant: end-to-end GEMM quality (cosine > 0.98) vs the bf16
     F.linear reference, matching the canonical FP4 test pattern."""
-    tokens_per_batch = 126
     num_tokens = batch_size * tokens_per_batch
     out_dim = 1024
     x, attn, gate_table, gate_ts, scale_table, scale_ts, shift_table, shift_ts = _make_inputs(
@@ -120,7 +120,7 @@ def test_gate_resid_rms_modulate_fp4_quant(hidden_dim, batch_size):
     )
     eps = 1e-6
 
-    # bf16 reference: compute KC's bf16 output, then F.linear with random W.
+    # bf16 reference: compute the fused kernel.s bf16 output, then F.linear with random W.
     torch.manual_seed(13)
     W = torch.randn(out_dim, hidden_dim, dtype=torch.bfloat16, device="cuda") * 0.05
 
@@ -134,7 +134,7 @@ def test_gate_resid_rms_modulate_fp4_quant(hidden_dim, batch_size):
     sf_scale_x = (448.0 * 6.0) / out_bf16.abs().max().float()
     sf_scale_w = (448.0 * 6.0) / W.abs().max().float()
 
-    # KC FP4 path: produces packed FP4 + SWIZZLED 1x16 FP8 SF directly.
+    # FP4 path: produces packed FP4 + SWIZZLED 1x16 FP8 SF directly.
     x_fp4 = x.clone()
     out_fp4, out_sf = torch.ops.trtllm.fused_dit_gate_resid_rms_modulate_quant(
         x_fp4,
@@ -150,7 +150,7 @@ def test_gate_resid_rms_modulate_fp4_quant(hidden_dim, batch_size):
     )
 
     # Weight quantized via trtllm.fp4_quantize (defaults: sfUseUE8M0=False,
-    # isSfSwizzledLayout=True) -- matches KC quant kernel's SWIZZLED SF layout.
+    # isSfSwizzledLayout=True) -- matches the quant kernel's SWIZZLED SF layout.
     W_fp4, W_sf = torch.ops.trtllm.fp4_quantize(W, sf_scale_w, 16)
 
     alpha = 1.0 / (sf_scale_x * sf_scale_w).float()

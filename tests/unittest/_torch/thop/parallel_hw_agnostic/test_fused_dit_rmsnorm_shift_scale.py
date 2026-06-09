@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Tests for the LTX-2 fused RMSNorm + AdaLN affine-modulation kernel (KA).
+# Tests for the LTX-2 fused RMSNorm + AdaLN affine-modulation kernel.
 #
 # bf16 variant:   fused_dit_rmsnorm_shift_scale
 # NVFP4 variant:  fused_dit_rmsnorm_shift_scale_quant
@@ -20,7 +20,7 @@ import tensorrt_llm  # noqa: F401  -- triggers libth_common.so load (registers t
 @torch.inference_mode()
 def torch_ref(x_2d, scale_table, scale_ts, shift_table, shift_ts, tokens_per_batch, eps):
     """Reference matching production semantics (apply_fused_adaln_modulate
-    eager fallback in utils_ltx2.py + _get_all_ada_values modulator combine):
+    eager fallback in utils_ltx2.py + _get_ada_values modulator combine):
 
     Phase 0b: scale_bf16 = scale_table.to(bf16) + scale_ts  (bf16 narrow, bf16 hw add)
     Phase 1:  normed     = rms_norm(x)                      (bf16 in / out)
@@ -170,12 +170,12 @@ def test_rmsnorm_shift_scale_rejects_unsupported_dim():
 
 @pytest.mark.parametrize("hidden_dim", [2048, 4096])
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_rmsnorm_shift_scale_fp4_quant(hidden_dim, batch_size):
+@pytest.mark.parametrize("tokens_per_batch", [126, 128])
+def test_rmsnorm_shift_scale_fp4_quant(hidden_dim, batch_size, tokens_per_batch):
     """NVFP4 variant: end-to-end GEMM quality (cosine > 0.98) vs the bf16
     F.linear reference, matching the canonical FP4 test pattern."""
     device = "cuda"
     torch.manual_seed(7)
-    tokens_per_batch = 126
     num_tokens = batch_size * tokens_per_batch
     out_dim = 1024
     eps = 1e-6
@@ -187,7 +187,7 @@ def test_rmsnorm_shift_scale_fp4_quant(hidden_dim, batch_size):
     shift_ts = torch.randn(batch_size, hidden_dim, dtype=torch.bfloat16, device=device) * 0.3
     W = torch.randn(out_dim, hidden_dim, dtype=torch.bfloat16, device=device) * 0.05
 
-    # bf16 reference: KA bf16 output -> F.linear with random W.
+    # bf16 reference: fused-kernel bf16 output -> F.linear with random W.
     out_bf16 = torch.ops.trtllm.fused_dit_rmsnorm_shift_scale(
         x, scale_table, scale_ts, shift_table, shift_ts, eps
     )
@@ -196,13 +196,13 @@ def test_rmsnorm_shift_scale_fp4_quant(hidden_dim, batch_size):
     sf_scale_x = (448.0 * 6.0) / out_bf16.abs().max().float()
     sf_scale_w = (448.0 * 6.0) / W.abs().max().float()
 
-    # KA FP4 path: packed FP4 + SWIZZLED 1x16 FP8 SF directly.
+    # FP4 path: packed FP4 + SWIZZLED 1x16 FP8 SF directly.
     out_fp4, out_sf = torch.ops.trtllm.fused_dit_rmsnorm_shift_scale_quant(
         x, scale_table, scale_ts, shift_table, shift_ts, sf_scale_x, eps
     )
 
     # Weight quantize: trtllm.fp4_quantize defaults (sfUseUE8M0=False,
-    # isSfSwizzledLayout=True) match KA quant kernel's SWIZZLED SF layout.
+    # isSfSwizzledLayout=True) match the quant kernel's SWIZZLED SF layout.
     W_fp4, W_sf = torch.ops.trtllm.fp4_quantize(W, sf_scale_w, 16)
 
     alpha = 1.0 / (sf_scale_x * sf_scale_w).float()
