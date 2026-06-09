@@ -144,7 +144,7 @@ class ZeroMqQueue:
                 self.socket.connect(self.address_endpoint)
 
             self.poller = zmq.Poller()
-            self.poller.register(self.socket, zmq.POLLIN)
+            self.poller.register(self.socket, zmq.POLLIN | zmq.POLLOUT)
 
     def _check_thread_safety(self):
         """Check if the current thread is the same as the thread that first used the socket."""
@@ -192,6 +192,43 @@ class ZeroMqQueue:
             else:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
+
+    def put_bounded(self,
+                    obj: Any,
+                    *,
+                    timeout: float = 3.0,
+                    routing_id: Optional[bytes] = None) -> bool:
+        """Send an object, polling for POLLOUT up to timeout seconds.
+
+        Returns:
+            bool: True if the object was sent, False on timeout or send failure.
+        """
+        self.setup_lazily()
+        self._check_thread_safety()
+        deadline = time.monotonic() + timeout
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            while time.monotonic() < deadline:
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                events = dict(self.poller.poll(timeout=min(remaining_ms, 100)))
+                if (self.socket in events
+                        and events[self.socket] & zmq.POLLOUT):
+                    try:
+                        if (self.use_hmac_encryption
+                                or self.socket_type == zmq.ROUTER):
+                            data = self._prepare_data(obj)
+                            self._send_data(data, routing_id=routing_id)
+                        else:
+                            self.socket.send_pyobj(obj)
+                        return True
+                    except zmq.ZMQError as e:
+                        logger.error(
+                            f"Failed to send object after POLLOUT: {e}")
+                        return False
+        logger.error(
+            f"Timed out after {timeout}s waiting to send shutdown sentinel")
+        return False
 
     def put_noblock(self,
                     obj: Any,

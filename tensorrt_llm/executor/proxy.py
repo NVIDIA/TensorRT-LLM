@@ -475,7 +475,14 @@ class GenerationExecutorProxy(GenerationExecutor):
         # to bare ``any(...)`` to better handle partial crashes regressed
         # case (a); keep both behaviours explicit.
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
-            self.request_queue.put_noblock(None, retry=4)
+            if not self.request_queue.put_bounded(None, timeout=3.0):
+                logger.error(
+                    "Failed to deliver shutdown sentinel to executor workers")
+                if isinstance(self.mpi_session, MpiPoolSession):
+                    logger.error(
+                        "Force-shutting down MPI pool after sentinel delivery failure"
+                    )
+                    self.mpi_session.shutdown(wait=False)
 
     def shutdown(self):
         if not self.workers_started:
@@ -486,41 +493,43 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         logger_debug('Proxy.shutdown...\n', "yellow")
 
-        for f in self.mpi_futures:
-            try:
-                f.result()
-            except:
-                # The errors are already captured in mpi_done_callback, ignored
-                # here
-                pass
+        try:
+            for f in self.mpi_futures:
+                try:
+                    f.result()
+                except:
+                    # The errors are already captured in mpi_done_callback, ignored
+                    # here
+                    pass
 
-        # step2: notify the background threads to quit
-        if (hasattr(self, '_error_monitor_thread')
-                and self._error_monitor_thread.is_alive() and
-                threading.current_thread() is not self._error_monitor_thread):
-            self._error_monitor_thread.join(timeout=5)
+            # step2: notify the background threads to quit
+            if (hasattr(self, '_error_monitor_thread')
+                    and self._error_monitor_thread.is_alive()
+                    and threading.current_thread()
+                    is not self._error_monitor_thread):
+                self._error_monitor_thread.join(timeout=5)
 
-        if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
-        ):
-            self.dispatch_result_thread.stop()
-            self.dispatch_result_thread.join()
+            if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
+            ):
+                self.dispatch_result_thread.stop()
+                self.dispatch_result_thread.join()
 
-        # step3: finish all remaining work
+            # step3: finish all remaining work
 
-        # close the RPC client
-        if self.rpc_client is not None:
-            self.rpc_client.close()
-            self.rpc_client = None
+            # close the RPC client
+            if self.rpc_client is not None:
+                self.rpc_client.close()
+                self.rpc_client = None
 
-        # close all the sockets
-        self.request_queue.close()
-        self.worker_init_status_queue.close()
-        self.result_queue.close()
-        if self._resource_governor_queue is not None:
-            self._resource_governor_queue.close()
-
-        self.workers_started = False
-        self.mpi_session.shutdown()
+            # close all the sockets
+            self.request_queue.close()
+            self.worker_init_status_queue.close()
+            self.result_queue.close()
+            if self._resource_governor_queue is not None:
+                self._resource_governor_queue.close()
+        finally:
+            self.workers_started = False
+            self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
