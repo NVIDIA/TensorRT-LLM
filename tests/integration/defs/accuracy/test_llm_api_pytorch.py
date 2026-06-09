@@ -2752,6 +2752,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                               attention_dp, enable_lm_head_tp_in_adp,
                               cuda_graph, overlap_scheduler, max_batch_size,
                               moe_backend):
+
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
