@@ -43,6 +43,7 @@ from _torch.modules.moe.moe_test_utils import (
     iter_base_test_configs,
     replay_tactics_and_check,
     should_skip_to_accelerate_ci,
+    should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
 )
@@ -51,7 +52,10 @@ from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+from tensorrt_llm._torch.modules.fused_moe import (
+    DeepSeekV3MoeRoutingMethod,
+    RenormalizeMoeRoutingMethod,
+)
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
@@ -129,6 +133,7 @@ def create_test_backend(
     swiglu_limit: Optional[torch.Tensor] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     activation_type: ActivationType = ActivationType.Swiglu,
+    reduce_results: bool = True,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -159,7 +164,7 @@ def create_test_backend(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         dtype=dtype,
-        reduce_results=True,
+        reduce_results=reduce_results,
         model_config=model_config,
         init_load_balancer=False,
         bias=bias,
@@ -744,3 +749,131 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+
+def test_trtllm_backend_do_finalize_preserves_unscaled_routed_weights():
+    backend_type = MoeBackendType.TRTLLM
+    quant_algo = QuantAlgo.NVFP4
+    dtype_activation = torch.bfloat16
+    seq_len = 4
+    model_config = MoeModelConfig(32, 4, 512, 512)
+
+    if not torch.cuda.is_available():
+        pytest.skip("TRTLLMGen NVFP4 MoE tests require CUDA")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("TRTLLMGen NVFP4 MoE tests require Blackwell GPUs")
+
+    skip_reason = should_skip_trtllm(
+        backend_type,
+        quant_algo,
+        model_config,
+        routing_method_cls=None,
+        swiglu_gptoss_style=False,
+        seq_len=seq_len,
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        dtype_activation,
+    )
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routed_scaling_factor = 2.5
+        n_group = 8
+        topk_group = 4
+        e_score_correction_bias = torch.zeros(
+            model_config.num_experts, dtype=dtype_activation, device="cuda"
+        )
+        routing_method = DeepSeekV3MoeRoutingMethod(
+            top_k=model_config.top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+            is_fused=False,
+        )
+
+        x = torch.randn(
+            (seq_len, model_config.hidden_size),
+            dtype=dtype_activation,
+            device="cuda",
+        )
+        router_logits = torch.randn(
+            (seq_len, model_config.num_experts), dtype=torch.float32, device="cuda"
+        )
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=model_config.num_experts,
+            dtype=dtype_activation,
+            intermediate_size=model_config.intermediate_size,
+            hidden_size=model_config.hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            activation_type=ActivationType.Swiglu,
+        )
+        quant_kwargs = dict(quant_kwargs)
+        quant_kwargs.pop("ref_cls", None)
+        weight_loading_mode = getattr(
+            quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
+        )
+
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=model_config.num_experts,
+            hidden_size=model_config.hidden_size,
+            intermediate_size=model_config.intermediate_size,
+            dtype=dtype_activation,
+            quant_config=quant_config,
+            mapping=mapping,
+            weight_loading_mode=weight_loading_mode,
+            reduce_results=False,
+        )
+
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        with torch.inference_mode():
+            expected_selected_experts, expected_scaled_weights = routing_method.apply(
+                router_logits
+            )
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            outputs = backend.run_moe(
+                x=x_quantized,
+                token_selected_experts=None,
+                token_final_scales=None,
+                x_sf=x_sf,
+                router_logits=router_logits,
+                do_finalize=False,
+            )
+
+        assert len(outputs) == 3
+        assert outputs[1].shape == (seq_len, model_config.top_k)
+        assert torch.equal(outputs[2], expected_selected_experts)
+
+        expected_expert_scale_factor = (
+            expected_scaled_weights / routed_scaling_factor
+        ).to(outputs[1].dtype)
+        torch.testing.assert_close(
+            outputs[1],
+            expected_expert_scale_factor,
+            atol=2e-2,
+            rtol=2e-2,
+        )

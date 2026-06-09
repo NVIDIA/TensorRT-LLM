@@ -968,13 +968,27 @@ def _register_fake():
         return torch.empty_like(sf, dtype=torch.uint8)
 
     @torch.library.register_fake("trtllm::moe_finalize_allreduce")
-    def _(input, residual, norm_weight, expanded_idx_to_permuted_idx,
-          shared_expert_output, expert_scale_factor, workspace, rank, nranks,
+    def _(input_tensor, residual, norm_weight, expanded_idx_to_permuted_idx,
+          shared_expert_output, expert_scale_factor, routed_scale_factor,
+          return_quant_outputs, workspace, rank, nranks,
           eps) -> List[torch.Tensor]:
-        return [
-            torch.empty_like(residual),
-            torch.empty_like(residual),
-        ]
+        num_tokens = (
+            residual.shape[0] if residual is not None else
+            shared_expert_output.shape[0] if shared_expert_output is not None else
+            expanded_idx_to_permuted_idx.shape[0])
+        hidden_size = norm_weight.shape[0]
+
+        outputs = [input_tensor.new_empty((num_tokens, hidden_size))]
+        if residual is not None:
+            outputs.append(torch.empty_like(residual))
+
+        if return_quant_outputs:
+            output_shape, scale_shape = fp4_utils.get_fp4_shape(
+                (num_tokens, hidden_size), 16)
+            outputs.append(input_tensor.new_empty(output_shape, dtype=torch.uint8))
+            outputs.append(input_tensor.new_empty((scale_shape, ), dtype=torch.uint8))
+
+        return outputs
 
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
     def _(router_logits, topk, output_dtype: torch.dtype = None):

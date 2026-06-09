@@ -751,6 +751,9 @@ class Glm4DecoderLayer(DecoderLayer):
                     expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                     expert_scale_factor=expert_scale_factor,
                     shared_expert_output=shared_output,
+                    # The block-scale MoE kernel already applied routed scaling
+                    # to expert_scale_factor in the do_finalize=False path.
+                    routed_scale_factor=None,
                     residual=residual,
                     norm_weight=self.next_layer_layernorm.weight,
                     eps=self.next_layer_layernorm.variance_epsilon,

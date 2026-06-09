@@ -1473,7 +1473,7 @@ private:
 #endif // ENABLE_MULTI_DEVICE
 
 void preallocateNCCLWindowBuffer(
-    torch::Tensor const& input, torch::List<int64_t> const& group, const int64_t buffersPerSize)
+    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t const buffersPerSize)
 {
 #if ENABLE_MULTI_DEVICE
     if (buffersPerSize <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
@@ -1496,15 +1496,15 @@ void preallocateNCCLWindowBuffer(
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
     auto& allocator = NCCLWindowAllocator::getInstance();
-    const ncclComm_t comm = *commPtr;
+    ncclComm_t const comm = *commPtr;
 
-    const int64_t numTokens = input.size(0);
-    const int64_t elementsPerToken = input.numel() / numTokens;
+    int64_t const numTokens = input.size(0);
+    int64_t const elementsPerToken = input.numel() / numTokens;
     if (elementsPerToken <= 0)
     {
         return;
     }
-    const size_t bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
+    size_t const bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
         * static_cast<size_t>(input.element_size());
     if (bufferSize == 0)
     {
@@ -1660,7 +1660,7 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
 
 // Pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
 // expert_reduction = finalize(input, expanded_idx_to_permuted_idx, expert_scale_factor)
-// output_add = expert_reduction + shared_expert_output
+// output_add = routed_scale_factor * expert_reduction + shared_expert_output
 // output_residual = output_add + residual
 // output_hidden_states = rms_norm(output_residual, norm_weight, eps)
 //
@@ -1675,16 +1675,23 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
 std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
     torch::optional<torch::Tensor> const& residual, torch::Tensor const& norm_weight,
     torch::Tensor const& expanded_idx_to_permuted_idx, torch::optional<torch::Tensor> const& shared_expert_output,
-    torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
-    int64_t const nranks, double const eps)
+    torch::optional<torch::Tensor> const& expert_scale_factor, torch::optional<double> const& routed_scale_factor,
+    bool const return_quant_outputs, torch::Tensor workspace, int64_t const rank, int64_t const nranks,
+    double const eps)
 {
+    constexpr int64_t kSfVecSize = 16;
+    constexpr float kDefaultQuantScaleFactor = 1.0f;
     auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeFinalizeAllReduceFusionParams();
 
-    int hidden_dim = norm_weight.size(0);
-    int top_k = expanded_idx_to_permuted_idx.size(-1);
+    TORCH_CHECK(input.dim() == 2, "input must be 2D");
+    TORCH_CHECK(norm_weight.dim() == 1, "norm_weight must be 1D");
+    TORCH_CHECK(expanded_idx_to_permuted_idx.dim() == 2, "expanded_idx_to_permuted_idx must be 2D");
 
-    allreduce_fusion_params.quant_out = nullptr;
-    allreduce_fusion_params.scale_out = nullptr;
+    int const hidden_dim = norm_weight.size(0);
+    int const top_k = expanded_idx_to_permuted_idx.size(-1);
+    bool const hasQuantOutputs = return_quant_outputs;
+
+    TORCH_CHECK(input.size(-1) == hidden_dim, "input hidden dimension must match norm_weight");
 
     allreduce_fusion_params.nranks = static_cast<int>(nranks);
     allreduce_fusion_params.rank = static_cast<int>(rank);
@@ -1704,6 +1711,28 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
     {
         // Fallback: infer from expanded_idx_to_permuted_idx
         num_tokens = expanded_idx_to_permuted_idx.size(0);
+    }
+
+    TORCH_CHECK(
+        expanded_idx_to_permuted_idx.size(0) == num_tokens, "expanded_idx_to_permuted_idx must match num_tokens");
+    if (residual.has_value())
+    {
+        TORCH_CHECK(residual.value().size(1) == hidden_dim, "residual hidden dimension must match norm_weight");
+    }
+    if (shared_expert_output.has_value())
+    {
+        TORCH_CHECK(
+            shared_expert_output.value().size(1) == hidden_dim, "shared_expert_output hidden dimension must match");
+    }
+    if (expert_scale_factor.has_value())
+    {
+        TORCH_CHECK(expert_scale_factor.value().sizes() == expanded_idx_to_permuted_idx.sizes(),
+            "expert_scale_factor must match expanded_idx_to_permuted_idx shape");
+    }
+
+    if (hasQuantOutputs)
+    {
+        TORCH_CHECK(hidden_dim % kSfVecSize == 0, "hidden dimension must be divisible by 16 for FP4 quantization");
     }
 
     // size: num_token * hidden_dim
@@ -1735,6 +1764,8 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
     auto output_opts = torch::TensorOptions().dtype(input.dtype()).device(input.device());
     torch::Tensor norm_out = torch::empty({num_tokens, hidden_dim}, output_opts);
     torch::Tensor residual_out;
+    torch::Tensor quant_out;
+    torch::Tensor scale_out;
 
     allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
 
@@ -1748,9 +1779,41 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
         allreduce_fusion_params.residual_out = nullptr;
     }
 
+    if (hasQuantOutputs)
+    {
+        int64_t const scale_size = tensorrt_llm::computeSwizzledLayoutSFSize(num_tokens, hidden_dim / kSfVecSize);
+
+        quant_out = torch::empty(
+            {num_tokens, hidden_dim / 2}, torch::dtype(FLOAT4_E2M1X2).device(input.device()).requires_grad(false));
+        scale_out = torch::empty({scale_size}, torch::dtype(SF_DTYPE).device(input.device()).requires_grad(false));
+
+        allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
+        allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
+    }
+    else
+    {
+        allreduce_fusion_params.quant_out = nullptr;
+        allreduce_fusion_params.scale_out = nullptr;
+    }
+    allreduce_fusion_params.scale_factor = kDefaultQuantScaleFactor;
+
+    allreduce_fusion_params.routed_scale_factor
+        = routed_scale_factor.has_value() ? static_cast<float>(routed_scale_factor.value()) : 1.0f;
+
     tensorrt_llm::kernels::ar_fusion::moe::moefinalize_allreduce_fusion_op(allreduce_fusion_params);
 
-    if (residual.has_value())
+    if (hasQuantOutputs)
+    {
+        if (residual.has_value())
+        {
+            return {norm_out, residual_out, quant_out, scale_out};
+        }
+        else
+        {
+            return {norm_out, quant_out, scale_out};
+        }
+    }
+    else if (residual.has_value())
     {
         return {norm_out, residual_out};
     }
@@ -1977,6 +2040,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor expanded_idx_to_permuted_idx,"
         "Tensor? shared_expert_output,"
         "Tensor? expert_scale_factor,"
+        "float? routed_scale_factor,"
+        "bool return_quant_outputs,"
         "Tensor workspace,"
         "int rank,"
         "int nranks,"

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -165,7 +165,7 @@ __device__ __forceinline__ void fused_op(
             access_id_in_token, std::nullopt /* numRows */, params.hidden_dim / SF_VEC_SIZE,
             reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
         reinterpret_cast<uint32_t*>(params.quant_out)[access_id]
-            = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, *params.scale_factor, sf_out);
+            = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, params.scale_factor, sf_out);
     }
 }
 
@@ -545,6 +545,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
 
     int top_k = params.top_k;
     bool use_scale_factor = params.expert_scale_factor != nullptr;
+    float routed_scale_factor = params.routed_scale_factor;
+    bool use_routed_scale_factor = routed_scale_factor != 1.0f;
 
     // Persistent Kernel
     // Each cluster iterate through all token it need to handle
@@ -572,23 +574,41 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
                 continue;
 
             int thread_offset_across_token = permuted_idx * params.hidden_dim + thread_offset_within_token;
-            float block_scale = 1.0;
-            if (use_scale_factor)
-            {
-                block_scale = static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
-            }
 
             ACC_TYPE permuted_data;
             permuted_data.packed
                 = reinterpret_cast<float4 const*>(params.allreduce_in)[thread_offset_across_token / kElemsPerAccess];
 
             // * acc += scale(data)
+            if (use_scale_factor)
+            {
+                float block_scale
+                    = static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
+#pragma unroll
+                for (int i = 0; i < kElemsPerAccess; ++i)
+                {
+                    float const scaledVal = static_cast<float>(permuted_data.unpacked[i]) * block_scale;
+                    accumulator.unpacked[i]
+                        = static_cast<DType>(static_cast<float>(accumulator.unpacked[i]) + scaledVal);
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (int i = 0; i < kElemsPerAccess; ++i)
+                {
+                    accumulator.unpacked[i] += static_cast<ScaleType>(permuted_data.unpacked[i]);
+                }
+            }
+        }
+
+        if (use_routed_scale_factor)
+        {
 #pragma unroll
             for (int i = 0; i < kElemsPerAccess; ++i)
             {
-                // assume computation is done in ScaleType
                 accumulator.unpacked[i]
-                    += static_cast<DType>((static_cast<float>(permuted_data.unpacked[i]) * block_scale));
+                    = static_cast<DType>(static_cast<float>(accumulator.unpacked[i]) * routed_scale_factor);
             }
         }
 
@@ -742,6 +762,10 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
     TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
+    TLLM_CHECK_WITH_INFO((params.quant_out == nullptr) == (params.scale_out == nullptr),
+        "moefinalize_allreduce_fusion_op: quant_out and scale_out must be set together!");
+    TLLM_CHECK_WITH_INFO(params.residual_out || params.norm_out || params.quant_out,
+        "moefinalize_allreduce_fusion_op: at least one of residual_out, norm_out, or quant_out must be set!");
     if (params.residual_out && not params.norm_out && params.quant_out)
     {
         // pattern1: AR+Add_RMS+Quant
@@ -761,6 +785,13 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
         MOE_FINALIZE_DISPATCH0(4, false, true, false);
         MOE_FINALIZE_DISPATCH0(8, false, true, false);
         MOE_FINALIZE_DISPATCH0(16, false, true, false);
+    }
+    else if (not params.residual_out && params.norm_out && params.quant_out)
+    {
+        MOE_FINALIZE_DISPATCH0(2, false, true, true);
+        MOE_FINALIZE_DISPATCH0(4, false, true, true);
+        MOE_FINALIZE_DISPATCH0(8, false, true, true);
+        MOE_FINALIZE_DISPATCH0(16, false, true, true);
     }
     else if (params.residual_out && params.norm_out && not params.quant_out)
     {

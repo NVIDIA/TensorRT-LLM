@@ -945,13 +945,19 @@ class MoEAllReduce(nn.Module):
             output_residual = output_add + residual
             output_hidden_states = rms_norm(output_residual, norm_weight, eps)
 
+            The min-latency path uses `trtllm::moe_allreduce`, which does not
+            support routed scaling or optional FP4 quantized outputs.
+
             * regular mode:
 
             Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
             expert_reduction = local_reduction(input, expanded_idx_to_permuted_idx, expert_scale_factor)
-            output_add = expert_reduction + shared_expert_output
+            output_add = routed_scale_factor * expert_reduction + shared_expert_output
             output_residual = output_add + residual
             output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+
+            If `return_quant_outputs` is true, the return value appends FP4
+            quantized outputs after `norm_out` and the optional `residual_out`.
         """
         super().__init__()
         self.mapping = mapping
@@ -964,9 +970,12 @@ class MoEAllReduce(nn.Module):
         input: torch.Tensor,
         *,
         all_reduce_params: MoEAllReduceParams,
-    ) -> torch.Tensor:
+    ) -> List[torch.Tensor]:
 
-        assert all_reduce_params.is_valid(), "MoEAllReduceParams is not valid"
+        if not all_reduce_params.is_valid():
+            raise ValueError(
+                "MoEAllReduceParams is not valid for the selected MoE allreduce path"
+            )
 
         if all_reduce_params.is_cutlass_min_latency:
             """
@@ -983,7 +992,6 @@ class MoEAllReduce(nn.Module):
                 hidden_states: hidden_states of the model
                 residual: residual tensor
             """
-
             return torch.ops.trtllm.moe_allreduce(
                 active_experts_token_input=input,
                 residual=all_reduce_params.residual,
@@ -996,24 +1004,26 @@ class MoEAllReduce(nn.Module):
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
             )
-        else:
-            if all_reduce_params.residual is not None:
-                assert all_reduce_params.residual.shape[
-                    0] <= self.max_token, "Num tokens must be less than or equal to max_token"
 
-            return torch.ops.trtllm.moe_finalize_allreduce(
-                input=input,
-                residual=all_reduce_params.residual,
-                norm_weight=all_reduce_params.norm_weight,
-                expanded_idx_to_permuted_idx=all_reduce_params.
-                expanded_idx_to_permuted_idx,
-                shared_expert_output=all_reduce_params.shared_expert_output,
-                expert_scale_factor=all_reduce_params.expert_scale_factor,
-                workspace=self.workspace,
-                rank=self.mapping.tp_rank,
-                nranks=self.mapping.tp_size,
-                eps=all_reduce_params.eps,
-            )
+        if all_reduce_params.residual is not None:
+            assert all_reduce_params.residual.shape[
+                0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+
+        return torch.ops.trtllm.moe_finalize_allreduce(
+            input=input,
+            residual=all_reduce_params.residual,
+            norm_weight=all_reduce_params.norm_weight,
+            expanded_idx_to_permuted_idx=all_reduce_params.
+            expanded_idx_to_permuted_idx,
+            shared_expert_output=all_reduce_params.shared_expert_output,
+            expert_scale_factor=all_reduce_params.expert_scale_factor,
+            routed_scale_factor=all_reduce_params.routed_scale_factor,
+            return_quant_outputs=all_reduce_params.return_quant_outputs,
+            workspace=self.workspace,
+            rank=self.mapping.tp_rank,
+            nranks=self.mapping.tp_size,
+            eps=all_reduce_params.eps,
+        )
 
 
 def all_to_all_4d(
