@@ -16,7 +16,7 @@
 import math
 import os
 import time
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import PIL.Image
 import torch
@@ -71,25 +71,31 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
 )
 class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, pipeline_config):
-        super().__init__(pipeline_config)
-
+        primary_pretrained_config = pipeline_config.primary_pretrained_config
         self.audio_gen = False
         self.action_gen = False
         if getattr(
-            model_config.pretrained_config,
+            primary_pretrained_config,
             "audio_gen",
-            getattr(model_config.pretrained_config, "sound_gen", False),
+            getattr(primary_pretrained_config, "sound_gen", False),
         ):
             logger.info("Initializing Cosmos3OmniMoTPipeline with audio generation.")
             self.audio_gen = True
 
-        if getattr(model_config.pretrained_config, "action_gen", False):
+        if getattr(primary_pretrained_config, "action_gen", False):
             logger.info("Initializing Cosmos3OmniMoTPipeline with action generation.")
             self.action_gen = True
 
+        super().__init__(pipeline_config)
+
+    @property
+    def dtype(self):
+        return self.pipeline_config.torch_dtype
+
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
-        self.transformer = Cosmos3VFMTransformer(self.pipeline_config.model_configs["transformer"])
+        model_config = self.pipeline_config.model_configs["transformer"]
+        self.transformer = Cosmos3VFMTransformer(model_config)
 
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
@@ -562,67 +568,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         """
         return self.audio_tokenizer.decode(latent)  # [B, audio_channels, N_samples]
 
-    @nvtx_range("Cosmos3OmniMoTPipeline._denoise_t2i", color="blue")
-    def _denoise_t2i(
-        self,
-        latents: torch.Tensor,
-        cond_ids: torch.Tensor,
-        cond_mask: torch.Tensor,
-        uncond_ids: torch.Tensor,
-        uncond_mask: torch.Tensor,
-        guidance_scale: float,
-        video_shape: Tuple[int, int, int],
-        frame_rate: float,
-        guidance_interval: Optional[Tuple[float, float]],
-    ) -> torch.Tensor:
-        """Denoise loop for text-to-image.
-
-        The only T2I-specific behavior is the guidance interval — CFG is applied
-        only when the scheduler timestep falls inside ``guidance_interval``;
-        outside it the conditional prediction is used directly.
-        """
-        do_cfg = guidance_scale > 1.0
-        if guidance_interval is not None:
-            interval_lo, interval_hi = guidance_interval
-        else:
-            interval_lo, interval_hi = float("-inf"), float("inf")
-
-        if do_cfg:
-            vgm = self.model_config.visual_gen_mapping
-            if vgm is not None and getattr(vgm, "cfg_size", 1) >= 2 and self.rank == 0:
-                raise RuntimeError("Cosmos3 T2I does not use CFG-parallel. Use cfg_size=1.")
-            text_ids = torch.cat([uncond_ids, cond_ids], dim=0)
-            text_mask = torch.cat([uncond_mask, cond_mask], dim=0)
-        else:
-            text_ids = cond_ids
-            text_mask = cond_mask
-
-        for t in self.scheduler.timesteps:
-            latent_input = torch.cat([latents] * 2) if do_cfg else latents
-            timestep = t.expand(latent_input.shape[0])
-
-            noise_pred = self.transformer(
-                hidden_states=latent_input,
-                timestep=timestep,
-                text_ids=text_ids,
-                text_mask=text_mask,
-                video_shape=video_shape,
-                fps=frame_rate,
-                noisy_frame_mask=None,
-            ).video
-
-            if do_cfg:
-                noise_uncond, noise_cond = noise_pred.chunk(2)
-                t_val = t.item() if t.dim() == 0 else t[0].item()
-                if interval_lo <= t_val <= interval_hi:
-                    noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
-                else:
-                    noise_pred = noise_cond
-
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-        return latents
-
     # =========================================================================
     # Forward (main generation entry point)
     # =========================================================================
@@ -876,42 +821,25 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 6. Denoise
         timer.mark_denoise_start()
-        if is_t2i:
-            # T2I uses a dedicated loop with sequential CFG (separate cond/uncond
-            # K/V caches) and a CFG guidance interval. The shared BasePipeline
-            # denoise() batches [uncond, cond] and applies CFG at every step,
-            # which cannot express the guidance interval.
-            latents = self._denoise_t2i(
-                latents=latents,
-                cond_ids=cond_ids,
-                cond_mask=cond_mask,
-                uncond_ids=uncond_ids,
-                uncond_mask=uncond_mask,
-                guidance_scale=guidance_scale,
-                video_shape=video_shape,
-                frame_rate=frame_rate,
-                guidance_interval=guidance_interval,
-            )
-            audio_latents = None
-        else:
-            extra_streams = {"audio": (audio_latents, self.audio_scheduler)} if do_audio else None
-            denoise_result = self.denoise(
-                latents=latents,
-                scheduler=self.scheduler,
-                prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
-                neg_prompt_embeds=uncond_ids,
-                guidance_scale=guidance_scale,
-                forward_fn=forward_fn,
-                extra_cfg_tensors=extra_cfg_tensors,
-                extra_streams=extra_streams,
-            )
+        extra_streams = {"audio": (audio_latents, self.audio_scheduler)} if do_audio else None
+        denoise_result = self.denoise(
+            latents=latents,
+            scheduler=self.scheduler,
+            prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
+            neg_prompt_embeds=uncond_ids,
+            guidance_scale=guidance_scale,
+            forward_fn=forward_fn,
+            extra_cfg_tensors=extra_cfg_tensors,
+            extra_streams=extra_streams,
+            guidance_interval=guidance_interval,
+        )
 
-            if extra_streams is not None:
-                latents, extra_latents = denoise_result
-                audio_latents = extra_latents.get("audio")
-            else:
-                latents = denoise_result
-                audio_latents = None
+        if extra_streams is not None:
+            latents, extra_latents = denoise_result
+            audio_latents = extra_latents.get("audio")
+        else:
+            latents = denoise_result
+            audio_latents = None
 
         timer.mark_post_start()
 
