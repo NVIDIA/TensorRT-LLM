@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc17" />
+  <meta name="docsearch:version" content="1.3.0rc18" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -810,6 +810,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="examples/aiperf_client.html">Aiperf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
@@ -829,7 +833,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
@@ -1927,6 +1931,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    --post_process_fn
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-post_process_fn">trtllm-eval-mmmu command line option</a>
+</li>
+      </ul></li>
+      <li>
     --pp
 
       <ul>
@@ -1944,6 +1955,13 @@ window.runMermaid = runMermaid;</script>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-pp_size">trtllm-eval command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pipeline_parallel_size">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --preserve_caller_max_tokens
+
+      <ul>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-preserve_caller_max_tokens">trtllm-eval-mmmu command line option</a>
 </li>
       </ul></li>
       <li>
@@ -2462,7 +2480,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ContextChunkingPolicy.__init__">(tensorrt_llm.llmapi.ContextChunkingPolicy method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.__init__">(tensorrt_llm.llmapi.CudaGraphConfig method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.__init__">(tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.__init__">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
@@ -2479,6 +2497,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.__init__">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.__init__">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.__init__">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.__init__">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
 </li>
@@ -2807,8 +2827,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.batch_size">batch_size (tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.batch_sizes">batch_sizes (tensorrt_llm.llmapi.CudaGraphConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.batch_sizes">batch_sizes (tensorrt_llm.llmapi.DecodeCudaGraphConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.batch_sizes">(tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.batch_wait_max_tokens_ratio">batch_wait_max_tokens_ratio (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.batch_wait_timeout_iters">batch_wait_timeout_iters (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -3120,7 +3144,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.construct">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.construct">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.construct">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.construct">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -3133,6 +3157,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.construct">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.construct">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.construct">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.construct">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -3244,7 +3270,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.copy">(tensorrt_llm.llmapi.CalibConfig method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.copy">(tensorrt_llm.llmapi.CudaGraphConfig method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.copy">(tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.copy">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
@@ -3257,6 +3283,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.copy">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.copy">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.copy">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.copy">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
 </li>
@@ -3377,9 +3405,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.cuda_stream_sync">cuda_stream_sync() (in module tensorrt_llm.functional)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig">CudaGraphConfig (class in tensorrt_llm.llmapi)</a>
-</li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.Config">CudaGraphConfig.Config (class in tensorrt_llm.llmapi)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig">CudaGraphConfig (in module tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.cumsum">cumsum() (in module tensorrt_llm.functional)</a>
 </li>
@@ -3422,6 +3448,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.decode_stream">decode_stream() (tensorrt_llm.runtime.GenerationSession method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.decode_words_list">decode_words_list() (in module tensorrt_llm.runtime)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig">DecodeCudaGraphConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.Config">DecodeCudaGraphConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.DecoderModel">DecoderModel (class in tensorrt_llm.models)</a>
 </li>
@@ -3506,7 +3536,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.dict">(tensorrt_llm.llmapi.CalibConfig method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.dict">(tensorrt_llm.llmapi.CudaGraphConfig method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.dict">(tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.dict">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
@@ -3519,6 +3549,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.dict">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.dict">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.dict">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.dict">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
 </li>
@@ -3602,6 +3634,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams">DisaggregatedParams (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle">DisaggScheduleStyle (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.disk_cache_path">disk_cache_path (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.disk_cache_size">disk_cache_size (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT">DiT (class in tensorrt_llm.models)</a>
 </li>
@@ -3819,6 +3855,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.enable_kv_cache_aware_routing">enable_kv_cache_aware_routing (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.enable_kv_pool_rebalance">enable_kv_pool_rebalance (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.enable_layerwise_nvtx_marker">enable_layerwise_nvtx_marker (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.enable_lm_head_tp_in_adp">enable_lm_head_tp_in_adp (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -3837,8 +3875,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.enable_min_latency">enable_min_latency (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.enable_padding">enable_padding (tensorrt_llm.llmapi.CudaGraphConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.enable_padding">enable_padding (tensorrt_llm.llmapi.DecodeCudaGraphConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.enable_padding">(tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.enable_paged_kv_cache">enable_paged_kv_cache() (tensorrt_llm.plugin.PluginConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.enable_partial_reuse">enable_partial_reuse (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
@@ -3876,6 +3918,10 @@ window.runMermaid = runMermaid;</script>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.encode_only">encode_only (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig">EncodeCudaGraphConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.Config">EncodeCudaGraphConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.encoder_run">encoder_run() (tensorrt_llm.runtime.EncDecModelRunner method)</a>
 </li>
@@ -3966,7 +4012,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.Config.extra">(tensorrt_llm.llmapi.CalibConfig.Config attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.Config.extra">(tensorrt_llm.llmapi.CudaGraphConfig.Config attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.Config.extra">(tensorrt_llm.llmapi.DecodeCudaGraphConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.Config.extra">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.Config attribute)</a>
 </li>
@@ -3979,6 +4025,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.Config.extra">(tensorrt_llm.llmapi.Eagle3DecodingConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.Config.extra">(tensorrt_llm.llmapi.EagleDecodingConfig.Config attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.Config.extra">(tensorrt_llm.llmapi.EncodeCudaGraphConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.Config.extra">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.Config attribute)</a>
 </li>
@@ -4420,7 +4468,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.from_orm">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.from_orm">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.from_orm">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.from_orm">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -4433,6 +4481,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.from_orm">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.from_orm">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.from_orm">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.from_orm">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -4919,6 +4969,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.indexer_rope_interleave">indexer_rope_interleave (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.infer_cuda_graph_config_mode">infer_cuda_graph_config_mode() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.Session.infer_shapes">infer_shapes() (tensorrt_llm.runtime.Session method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.INFLIGHT">INFLIGHT (tensorrt_llm.llmapi.BatchingType attribute)</a>
@@ -5182,7 +5234,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.json">(tensorrt_llm.llmapi.CalibConfig method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.json">(tensorrt_llm.llmapi.CudaGraphConfig method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.json">(tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.json">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
@@ -5195,6 +5247,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.json">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.json">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.json">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.json">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
 </li>
@@ -5479,6 +5533,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.logprobs_mode">logprobs_mode (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.logprobs_simple_format">logprobs_simple_format (tensorrt_llm.llmapi.SamplingParams attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.long_rope">long_rope (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RotaryScalingType.longrope">longrope (tensorrt_llm.functional.RotaryScalingType attribute)</a>
@@ -5634,7 +5690,9 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.max_batch_size">max_batch_size (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 
       <ul>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.max_batch_size">(tensorrt_llm.llmapi.CudaGraphConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.max_batch_size">(tensorrt_llm.llmapi.DecodeCudaGraphConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.max_batch_size">(tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.max_batch_size">(tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
@@ -5747,6 +5805,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.max_num_streams">max_num_streams (tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.max_num_token">max_num_token (tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.max_num_tokens">max_num_tokens (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 
       <ul>
@@ -5776,6 +5836,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.max_seq_len">max_seq_len (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.max_seq_len">(tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.max_seq_len">(tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.max_seq_len">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
@@ -5945,6 +6007,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceStrategy.MNNVL">MNNVL (tensorrt_llm.functional.AllReduceStrategy attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.mode">mode (tensorrt_llm.llmapi.DecodeCudaGraphConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.mode">(tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
+</li>
+      </ul></li>
       <li>
     MODEL
 
@@ -5973,7 +6041,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_computed_fields">(tensorrt_llm.llmapi.CalibConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_computed_fields">(tensorrt_llm.llmapi.CudaGraphConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_computed_fields">(tensorrt_llm.llmapi.DecodeCudaGraphConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_computed_fields">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 </li>
@@ -5986,6 +6054,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_computed_fields">(tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_computed_fields">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig attribute)</a>
 </li>
@@ -6039,7 +6109,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_config">(tensorrt_llm.llmapi.CalibConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_config">(tensorrt_llm.llmapi.CudaGraphConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_config">(tensorrt_llm.llmapi.DecodeCudaGraphConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_config">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 </li>
@@ -6052,6 +6122,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_config">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_config">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_config">(tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_config">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig attribute)</a>
 </li>
@@ -6105,7 +6177,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_construct">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_construct">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_construct">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_construct">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -6118,6 +6190,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_construct">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_construct">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_construct">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_construct">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -6171,7 +6245,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_copy">(tensorrt_llm.llmapi.CalibConfig method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_copy">(tensorrt_llm.llmapi.CudaGraphConfig method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_copy">(tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_copy">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
@@ -6184,6 +6258,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_copy">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_copy">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_copy">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_copy">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
 </li>
@@ -6237,7 +6313,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_dump">(tensorrt_llm.llmapi.CalibConfig method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_dump">(tensorrt_llm.llmapi.CudaGraphConfig method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_dump">(tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_dump">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
@@ -6250,6 +6326,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_dump">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_dump">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_dump">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_dump">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
 </li>
@@ -6303,7 +6381,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_dump_json">(tensorrt_llm.llmapi.CalibConfig method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_dump_json">(tensorrt_llm.llmapi.CudaGraphConfig method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_dump_json">(tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_dump_json">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
@@ -6316,6 +6394,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_dump_json">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_dump_json">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_dump_json">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
 </li>
@@ -6369,7 +6449,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_extra">(tensorrt_llm.llmapi.CalibConfig property)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_extra">(tensorrt_llm.llmapi.CudaGraphConfig property)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_extra">(tensorrt_llm.llmapi.DecodeCudaGraphConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_extra">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig property)</a>
 </li>
@@ -6382,6 +6462,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_extra">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_extra">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_extra">(tensorrt_llm.llmapi.EncodeCudaGraphConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_extra">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig property)</a>
 </li>
@@ -6437,7 +6519,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_fields">(tensorrt_llm.llmapi.CalibConfig attribute)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_fields">(tensorrt_llm.llmapi.CudaGraphConfig attribute)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_fields">(tensorrt_llm.llmapi.DecodeCudaGraphConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_fields">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 </li>
@@ -6450,6 +6532,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_fields">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_fields">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_fields">(tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_fields">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig attribute)</a>
 </li>
@@ -6503,7 +6587,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_fields_set">(tensorrt_llm.llmapi.CalibConfig property)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_fields_set">(tensorrt_llm.llmapi.CudaGraphConfig property)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_fields_set">(tensorrt_llm.llmapi.DecodeCudaGraphConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_fields_set">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig property)</a>
 </li>
@@ -6516,6 +6600,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_fields_set">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_fields_set">(tensorrt_llm.llmapi.EncodeCudaGraphConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_fields_set">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig property)</a>
 </li>
@@ -6575,7 +6661,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_json_schema">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_json_schema">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_json_schema">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_json_schema">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -6588,6 +6674,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_json_schema">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_json_schema">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_json_schema">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -6649,7 +6737,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_parametrized_name">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_parametrized_name">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_parametrized_name">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_parametrized_name">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -6662,6 +6750,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_parametrized_name">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_parametrized_name">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -6715,7 +6805,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_post_init">(tensorrt_llm.llmapi.CalibConfig method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_post_init">(tensorrt_llm.llmapi.CudaGraphConfig method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_post_init">(tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_post_init">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 </li>
@@ -6728,6 +6818,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_post_init">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_post_init">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_post_init">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_post_init">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig method)</a>
 </li>
@@ -6783,7 +6875,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_rebuild">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_rebuild">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_rebuild">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_rebuild">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -6796,6 +6888,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_rebuild">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_rebuild">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_rebuild">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -6849,7 +6943,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_validate">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_validate">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_validate">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_validate">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -6862,6 +6956,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_validate">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_validate">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_validate">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_validate">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -6915,7 +7011,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_validate_json">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_validate_json">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_validate_json">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_validate_json">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -6928,6 +7024,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_validate_json">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_validate_json">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_validate_json">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -6981,7 +7079,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_validate_strings">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.model_validate_strings">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.model_validate_strings">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.model_validate_strings">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -6994,6 +7092,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.model_validate_strings">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.model_validate_strings">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -7335,6 +7435,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.num_return_sequences">num_return_sequences (tensorrt_llm.runtime.SamplingConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.num_tokens">num_tokens (tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.TensorInfo.numel">numel() (tensorrt_llm.runtime.TensorInfo method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle.numerator">numerator (tensorrt_llm.llmapi.DisaggScheduleStyle attribute)</a>
@@ -7462,7 +7564,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.parse_file">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.parse_file">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.parse_file">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.parse_file">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -7475,6 +7577,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.parse_file">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.parse_file">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.parse_file">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.parse_file">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -7528,7 +7632,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.parse_obj">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.parse_obj">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.parse_obj">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.parse_obj">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -7541,6 +7645,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.parse_obj">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.parse_obj">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.parse_obj">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.parse_obj">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -7594,7 +7700,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.parse_raw">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.parse_raw">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.parse_raw">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.parse_raw">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -7607,6 +7713,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.parse_raw">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.parse_raw">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.parse_raw">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.parse_raw">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -7851,6 +7959,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.prompt_logprobs">(tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.prompt_logprobs_simple_format">prompt_logprobs_simple_format (tensorrt_llm.llmapi.SamplingParams attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.prompt_token_ids">prompt_token_ids (tensorrt_llm.llmapi.RequestOutput attribute)</a>
 
       <ul>
@@ -8384,7 +8494,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.schema">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.schema">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.schema">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.schema">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -8397,6 +8507,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.schema">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.schema">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.schema">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.schema">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -8450,7 +8562,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.schema_json">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.schema_json">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.schema_json">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.schema_json">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -8463,6 +8575,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.schema_json">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.schema_json">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.schema_json">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.schema_json">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -8531,6 +8645,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.seq_len_threshold">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig attribute)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.seq_lens">seq_lens (tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner.serialize_engine">serialize_engine() (tensorrt_llm.runtime.ModelRunner method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.Session">Session (class in tensorrt_llm.runtime)</a>
@@ -8607,6 +8723,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output.should_abort">should_abort (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.shutdown">shutdown() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
@@ -8617,8 +8735,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MultimodalEncoder.shutdown">(tensorrt_llm.llmapi.MultimodalEncoder method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.shutdown_abort">shutdown_abort() (tensorrt_llm.llmapi.MpiCommSession method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.SideStreamIDType">SideStreamIDType (class in tensorrt_llm.functional)</a>
@@ -12382,10 +12498,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState24getCacheIndirectionInputEv">tensorrt_llm::runtime::decoder::DecoderState::getCacheIndirectionInput (C++ function)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState25getCacheIndirectionOutputEv">tensorrt_llm::runtime::decoder::DecoderState::getCacheIndirectionOutput (C++ function)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState14getCumLogProbsE10SizeType32">tensorrt_llm::runtime::decoder::DecoderState::getCumLogProbs (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState14getCumLogProbsEv">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getEagleBuffersEv">tensorrt_llm::runtime::decoder::DecoderState::getEagleBuffers (C++ function)</a>
@@ -15639,6 +15755,10 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-output_path">--output_path</a>
 </li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-post_process_fn">--post_process_fn</a>
+</li>
+        <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-preserve_caller_max_tokens">--preserve_caller_max_tokens</a>
+</li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-random_seed">--random_seed</a>
 </li>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-mmmu-system_prompt">--system_prompt</a>
@@ -15934,7 +16054,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.update_forward_refs">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.update_forward_refs">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.update_forward_refs">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.update_forward_refs">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -15947,6 +16067,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.update_forward_refs">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.update_forward_refs">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -16009,10 +16131,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.use_beam_search">use_beam_search (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.use_cute_dsl_bf16_bmm">use_cute_dsl_bf16_bmm (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.use_cute_dsl_bf16_bmm">use_cute_dsl_bf16_bmm (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.use_cute_dsl_bf16_gemm">use_cute_dsl_bf16_gemm (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.use_cute_dsl_blockscaling_bmm">use_cute_dsl_blockscaling_bmm (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -16144,7 +16266,7 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.validate">(tensorrt_llm.llmapi.CalibConfig class method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.validate">(tensorrt_llm.llmapi.CudaGraphConfig class method)</a>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.validate">(tensorrt_llm.llmapi.DecodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.validate">(tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig class method)</a>
 </li>
@@ -16157,6 +16279,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate">(tensorrt_llm.llmapi.EagleDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.validate">(tensorrt_llm.llmapi.EncodeCudaGraphConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.validate">(tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig class method)</a>
 </li>
@@ -16205,6 +16329,12 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.validate_attention_dp_config">validate_attention_dp_config() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.validate_base_cuda_graph_config">validate_base_cuda_graph_config() (tensorrt_llm.llmapi.DecodeCudaGraphConfig method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.validate_base_cuda_graph_config">(tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
+</li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_remaining">validate_build_config_remaining() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_build_config_with_runtime_params">validate_build_config_with_runtime_params() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
@@ -16213,9 +16343,9 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format">validate_checkpoint_format() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.validate_cuda_graph_config">validate_cuda_graph_config() (tensorrt_llm.llmapi.CudaGraphConfig method)</a>
-</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_cute_dsl_bf16">validate_cute_dsl_bf16() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_disk_cache_config">validate_disk_cache_config() (tensorrt_llm.llmapi.KvCacheConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.validate_draft_len_schedule_and_sort">validate_draft_len_schedule_and_sort() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
 
@@ -16273,14 +16403,20 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache">validate_enable_build_cache() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_encode_only_torch_compile_config">validate_encode_only_torch_compile_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.validate_encoder_cuda_graph_config">validate_encoder_cuda_graph_config() (tensorrt_llm.llmapi.EncodeCudaGraphConfig method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_encoder_modes">validate_encoder_modes() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_free_gpu_memory_fraction">validate_free_gpu_memory_fraction() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_gms_config">validate_gms_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_gms_moe_compat">validate_gms_moe_compat() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_gpus_per_node">validate_gpus_per_node() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 
       <ul>
@@ -16662,9 +16798,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 01, 2026.</p>
+  <p>Last updated on June 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
   
 </div></div>
       

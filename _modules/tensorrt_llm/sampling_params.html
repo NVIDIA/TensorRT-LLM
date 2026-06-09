@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc17" />
+  <meta name="docsearch:version" content="1.3.0rc18" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -810,6 +810,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
@@ -829,7 +833,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
@@ -1087,6 +1091,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">drop_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Drop the geneation_logits once the logprobs are computed</span>
     <span class="n">drop_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Return generation logprobs as `list[float]` instead of the default</span>
+    <span class="c1"># `list[dict[int, Logprob]]`. Only valid when logprobs == 0.</span>
+    <span class="n">logprobs_simple_format</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Return prompt logprobs as `list[float]` instead of the default</span>
+    <span class="c1"># `list[dict[int, Logprob]]`. Only valid when prompt_logprobs == 0.</span>
+    <span class="n">prompt_logprobs_simple_format</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">LogprobMode</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
@@ -1232,8 +1242,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token&#39;s log probability.</span>
 <span class="sd">                                  When set to K&gt;0, return top-K log probabilities + the sampled token&#39;s log probability (last entry) if it&#39;s not in the Top-K. Defaults to None.</span>
 <span class="sd">        logprobs_mode (LogprobMode): The mode of log probabilities to return. Defaults to LogprobMode.RAW.</span>
+<span class="sd">        logprobs_simple_format (bool): If True (and `logprobs == 0`), return generation logprobs as a flat `list[float]` (one logprob per generated token) instead of the default `list[dict[int, Logprob]]` format. Reduces per-token allocation overhead when only the sampled-token logprob is needed. Incompatible with `logprobs is None or logprobs &gt; 0` and with beam search. Defaults to False.</span>
 <span class="sd">        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. When set to 0, return only the actual prompt token&#39;s log probability.</span>
 <span class="sd">                                  When set to K&gt;0, return top-K log probabilities + the actual prompt token&#39;s log probability (last entry) if it&#39;s not in the Top-K. Defaults to None.</span>
+<span class="sd">        prompt_logprobs_simple_format (bool): If True (and `prompt_logprobs == 0`), return prompt logprobs as a flat `list[float]` instead of the default `list[dict[int, Logprob]]` format. Incompatible with `prompt_logprobs is None or prompt_logprobs &gt; 0`. Defaults to False.</span>
 <span class="sd">        return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.</span>
 <span class="sd">        return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.</span>
 <span class="sd">        exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.</span>
@@ -1305,6 +1317,8 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Keep the below fields in sync with tllme.OutputConfig</span>
     <span class="n">logprobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">prompt_logprobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">logprobs_simple_format</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">prompt_logprobs_simple_format</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">return_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">return_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">exclude_input_from_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
@@ -1402,6 +1416,18 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="n">check_logprobs_limit</span><span class="p">(</span><span class="s2">&quot;logprobs&quot;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="p">)</span>
         <span class="n">check_logprobs_limit</span><span class="p">(</span><span class="s2">&quot;prompt_logprobs&quot;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs_simple_format</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;logprobs_simple_format=True requires logprobs == 0, got logprobs=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs_simple_format</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;prompt_logprobs_simple_format=True requires prompt_logprobs == 0, got &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;prompt_logprobs=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">prompt_logprobs</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs_simple_format</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;logprobs_simple_format is not supported with beam search&quot;</span><span class="p">)</span>
 
     <span class="c1"># NB: Static, because downstream code only holds instances of</span>
     <span class="c1">#     bindings.SamplingConfig (not SamplingParams).</span>
@@ -1732,9 +1758,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 01, 2026.</p>
+  <p>Last updated on June 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
   
 </div></div>
       
