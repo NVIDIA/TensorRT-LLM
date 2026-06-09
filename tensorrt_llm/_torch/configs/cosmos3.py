@@ -26,8 +26,8 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING, AutoConf
 
 
 @strict
-class Cosmos3OmniConfig(PreTrainedConfig):
-    model_type = "cosmos3_omni"
+class Cosmos3Config(PreTrainedConfig):
+    model_type = "cosmos3"
     sub_configs = {"vision_config": AutoConfig, "text_config": AutoConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -76,7 +76,7 @@ class Cosmos3OmniConfig(PreTrainedConfig):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         config = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
         # Same as from_dict above: copy the resolved checkpoint identifier onto the
-        # config so Cosmos3OmniModel can find the unified checkpoint root.
+        # config so Cosmos3Model can find the unified checkpoint root.
         if not getattr(config, "_name_or_path", None) or len(str(config._name_or_path)) < 2:
             config._name_or_path = os.fspath(pretrained_model_name_or_path)
         return config

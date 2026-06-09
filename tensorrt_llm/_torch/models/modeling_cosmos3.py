@@ -65,7 +65,7 @@ def _get_cosmos3_model_paths(config: PretrainedConfig) -> Tuple[str, str, str]:
 @register_auto_model("Cosmos3ForConditionalGeneration")
 @register_input_processor(
     Qwen3VLInputProcessorBase,
-    model_type="cosmos3_omni",
+    model_type="cosmos3",
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
             "image": "<|vision_start|><|image_pad|><|vision_end|>",
@@ -76,12 +76,12 @@ def _get_cosmos3_model_paths(config: PretrainedConfig) -> Tuple[str, str, str]:
         content_format=ContentFormat.STRING,
     ),
 )
-class Cosmos3OmniModel(Qwen3VLModel):
+class Cosmos3Model(Qwen3VLModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         omni_config = model_config.pretrained_config
         if omni_config is None:
             raise ValueError(
-                "Cosmos3OmniModel requires model_config.pretrained_config to resolve "
+                "Cosmos3Model requires model_config.pretrained_config to resolve "
                 "the LLM and vision encoder checkpoint paths, but it was None."
             )
         (self._checkpoint_root, self.llm_path, self._vision_encoder_path) = (

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for the transformers AutoConfig / AutoTokenizer dispatch
-for TRT-LLM-only model_types (cosmos3_omni, deepseek_v32, kimi_k2).
+for TRT-LLM-only model_types (cosmos3, deepseek_v32, kimi_k2).
 
 Before this registration, transformers >= 5.5 falls back to a bare
 PreTrainedConfig that lacks `max_position_embeddings`, and
@@ -17,11 +17,11 @@ import json
 import pytest
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
-from tensorrt_llm._torch.configs import Cosmos3OmniConfig, DeepseekV3Config
+from tensorrt_llm._torch.configs import Cosmos3Config, DeepseekV3Config
 
-_COSMOS3_OMNI_MIN_CONFIG = {
+_COSMOS3_MIN_CONFIG = {
     "architectures": ["Cosmos3ForConditionalGeneration"],
-    "model_type": "cosmos3_omni",
+    "model_type": "cosmos3",
     "model": {"_target": "omni_mot_model"},
     "text_config": {
         "model_type": "qwen3_vl_text",
@@ -56,7 +56,7 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
     assert isinstance(cfg, config_cls)
     assert cfg.model_type == model_type
 
-    if model_type == "cosmos3_omni":
+    if model_type == "cosmos3":
         assert not isinstance(cfg.text_config, dict)
         assert not isinstance(cfg.vision_config, dict)
         assert cfg.text_config.hidden_size == 1024
@@ -70,7 +70,8 @@ def _verify_autoconfig_from_pretrained(cfg, model_type: str, config_cls) -> None
 @pytest.mark.parametrize(
     ("model_type", "config_cls"),
     [
-        ("cosmos3_omni", Cosmos3OmniConfig),
+        ("cosmos3", Cosmos3Config),
+        ("cosmos3_omni", Cosmos3Config),  # backward-compat alias
         ("deepseek_v32", DeepseekV3Config),
         ("kimi_k2", DeepseekV3Config),
     ],
@@ -85,7 +86,7 @@ def test_custom_model_type_registered_with_autoconfig(model_type, config_cls):
 @pytest.mark.parametrize(
     ("model_type", "config_cls", "config_dict"),
     [
-        ("cosmos3_omni", Cosmos3OmniConfig, _COSMOS3_OMNI_MIN_CONFIG),
+        ("cosmos3", Cosmos3Config, _COSMOS3_MIN_CONFIG),
         ("deepseek_v32", DeepseekV3Config, _deepseek_min_config("deepseek_v32")),
         ("kimi_k2", DeepseekV3Config, _deepseek_min_config("kimi_k2")),
     ],
@@ -97,7 +98,7 @@ def test_autoconfig_from_pretrained_resolves_to_local_config(
     # AutoTokenizer.from_pretrained -> AutoConfig.from_pretrained. Without
     # the registration this fails through to a bare PreTrainedConfig that
     # lacks expected fields (e.g. `max_position_embeddings`, nested
-    # `text_config` for Cosmos3 omni).
+    # `text_config` for Cosmos3).
     from transformers import AutoConfig
 
     model_dir = tmp_path / model_type
@@ -106,8 +107,24 @@ def test_autoconfig_from_pretrained_resolves_to_local_config(
 
     cfg = AutoConfig.from_pretrained(str(model_dir))
     _verify_autoconfig_from_pretrained(cfg, model_type, config_cls)
-    if model_type == "cosmos3_omni":
+    if model_type == "cosmos3":
         assert cfg._name_or_path == str(model_dir)
+
+
+def test_legacy_cosmos3_omni_model_type_still_resolves(tmp_path):
+    # "cosmos3_omni" is the pre-rename model_type. Checkpoints created before
+    # the rename to "cosmos3" must keep loading via the backward-compat alias.
+    from transformers import AutoConfig
+
+    legacy_config = {**_COSMOS3_MIN_CONFIG, "model_type": "cosmos3_omni"}
+    model_dir = tmp_path / "cosmos3_omni_legacy"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(legacy_config))
+
+    cfg = AutoConfig.from_pretrained(str(model_dir))
+    assert isinstance(cfg, Cosmos3Config)
+    assert not isinstance(cfg.text_config, dict)
+    assert cfg.text_config.hidden_size == 1024
 
 
 @pytest.mark.parametrize("model_type", ["deepseek_v32", "kimi_k2"])

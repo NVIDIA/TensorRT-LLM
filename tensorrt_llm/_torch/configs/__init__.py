@@ -1,4 +1,4 @@
-from tensorrt_llm._torch.configs.cosmos3_omni import Cosmos3OmniConfig
+from tensorrt_llm._torch.configs.cosmos3 import Cosmos3Config
 from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 
@@ -19,12 +19,15 @@ def _register_custom_configs_with_transformers() -> None:
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 
     custom_configs = {
-        "cosmos3_omni": Cosmos3OmniConfig,
+        # "cosmos3" is the canonical model_type; "cosmos3_omni" is kept as a
+        # backward-compat alias for checkpoints that predate the rename.
+        "cosmos3": Cosmos3Config,
+        "cosmos3_omni": Cosmos3Config,
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
         "laguna": LagunaConfig,
     }
-    # Cosmos3OmniConfig resolves vision sub-configs via ``qwen3_vl_vision``; that
+    # Cosmos3Config resolves vision sub-configs via ``qwen3_vl_vision``; that
     # alias is only present in newer transformers releases.
     if "qwen3_vl_vision" not in CONFIG_MAPPING:
         CONFIG_MAPPING.register("qwen3_vl_vision", Qwen3VLVisionConfig, exist_ok=True)
@@ -37,4 +40,4 @@ def _register_custom_configs_with_transformers() -> None:
 _register_custom_configs_with_transformers()
 del _register_custom_configs_with_transformers
 
-__all__ = ["Cosmos3OmniConfig", "DeepseekV3Config", "LagunaConfig"]
+__all__ = ["Cosmos3Config", "DeepseekV3Config", "LagunaConfig"]
