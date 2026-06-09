@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc17" />
+  <meta name="docsearch:version" content="1.3.0rc18" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -810,6 +810,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client.html">Aiperf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
@@ -829,7 +833,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
@@ -997,7 +1001,22 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for tensorrt_llm.llmapi.llm_args</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">ast</span>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="c1"># you may not use this file except in compliance with the License.</span>
+<span class="c1"># You may obtain a copy of the License at</span>
+<span class="c1">#</span>
+<span class="c1"># http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="c1"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="c1"># See the License for the specific language governing permissions and</span>
+<span class="c1"># limitations under the License.</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">ast</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">functools</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
@@ -1105,10 +1124,8 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="n">PydanticField</span><span class="p">(</span><span class="n">default</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
 
-<div class="viewcode-block" id="CudaGraphConfig">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for CUDA graphs.&quot;&quot;&quot;</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">BaseCudaGraphConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Common configuration for CUDA graphs.&quot;&quot;&quot;</span>
     <span class="c1"># List of batch sizes to create CUDA graphs for.</span>
     <span class="n">batch_sizes</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -1123,10 +1140,8 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance.&quot;</span>
     <span class="p">)</span>
 
-<div class="viewcode-block" id="CudaGraphConfig.validate_cuda_graph_config">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig.validate_cuda_graph_config">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">validate_cuda_graph_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;CudaGraphConfig&#39;</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_base_cuda_graph_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;BaseCudaGraphConfig&#39;</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate CUDA graph configuration.</span>
 
 <span class="sd">        Ensures that:</span>
@@ -1151,13 +1166,12 @@ window.runMermaid = runMermaid;</script>
                     <span class="sa">f</span><span class="s2">&quot;CudaGraphConfig.max_batch_size: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">or</span> <span class="mi">128</span>
-            <span class="n">generated_sizes</span> <span class="o">=</span> <span class="n">CudaGraphConfig</span><span class="o">.</span><span class="n">_generate_cuda_graph_batch_sizes</span><span class="p">(</span>
+            <span class="n">generated_sizes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generate_cuda_graph_batch_sizes</span><span class="p">(</span>
                 <span class="n">max_batch_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_padding</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">batch_sizes</span> <span class="o">=</span> <span class="n">generated_sizes</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">max_batch_size</span>
 
-        <span class="k">return</span> <span class="bp">self</span></div>
-
+        <span class="k">return</span> <span class="bp">self</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_generate_cuda_graph_batch_sizes</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -1194,11 +1208,19 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">return</span> <span class="n">batch_sizes</span>
 
+
+<div class="viewcode-block" id="DecodeCudaGraphConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">DecodeCudaGraphConfig</span><span class="p">(</span><span class="n">BaseCudaGraphConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;CUDA graph configuration for decode requests.&quot;&quot;&quot;</span>
+
+    <span class="n">mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;decode&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;decode&quot;</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;CUDA graph configuration mode.&quot;</span><span class="p">)</span>
+
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_merge_schedule_keys</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
                              <span class="n">schedule</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Merge draft_len_schedule keys into batch_sizes so that each</span>
-<span class="sd">        schedule threshold has a corresponding CUDA graph.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Merge draft_len_schedule keys into batch_sizes so that each schedule threshold has a corresponding CUDA graph.</span>
 
 <span class="sd">        e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300</span>
 <span class="sd">        into batch_sizes.</span>
@@ -1233,6 +1255,171 @@ window.runMermaid = runMermaid;</script>
         <span class="n">merged</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">extra</span><span class="p">[</span><span class="n">j</span><span class="p">:])</span>
         <span class="k">return</span> <span class="n">merged</span></div>
 
+
+
+<div class="viewcode-block" id="EncodeCudaGraphConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">EncodeCudaGraphConfig</span><span class="p">(</span><span class="n">BaseCudaGraphConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;CUDA graph configuration for encode-only requests.&quot;&quot;&quot;</span>
+
+    <span class="n">mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;encode&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;encode&quot;</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;CUDA graph configuration mode.&quot;</span><span class="p">)</span>
+
+    <span class="n">num_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">min_length</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;List of total token counts (sum of all per-request sequence lengths &quot;</span>
+        <span class="s2">&quot;in a batch) to create encoder CUDA graphs for.&quot;</span><span class="p">)</span>
+
+    <span class="n">max_num_token</span><span class="p">:</span> <span class="n">NonNegativeInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Maximum total number of tokens for encoder CUDA graphs. If &quot;</span>
+        <span class="s2">&quot;`num_tokens` is provided, must equal max(num_tokens); otherwise &quot;</span>
+        <span class="s2">&quot;`num_tokens` is generated from this value.&quot;</span><span class="p">)</span>
+
+    <span class="n">seq_lens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">min_length</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;List of max per-request sequence lengths to create encoder CUDA &quot;</span>
+        <span class="s2">&quot;graphs for.&quot;</span><span class="p">)</span>
+
+    <span class="n">max_seq_len</span><span class="p">:</span> <span class="n">NonNegativeInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Maximum per-request sequence length for encoder CUDA graphs. If &quot;</span>
+        <span class="s2">&quot;`seq_lens` is provided, must equal max(seq_lens); otherwise &quot;</span>
+        <span class="s2">&quot;`seq_lens` is generated from this value.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="EncodeCudaGraphConfig.validate_encoder_cuda_graph_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.validate_encoder_cuda_graph_config">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_encoder_cuda_graph_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;EncodeCudaGraphConfig&#39;</span><span class="p">:</span>
+        <span class="c1"># Encoder fields — only generate defaults when the user opted in by</span>
+        <span class="c1"># setting at least one of num_tokens / max_num_token. Leaving both at</span>
+        <span class="c1"># the defaults keeps encoder CUDA graphs disabled. Same for seq_lens / max_seq_len.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">)</span>
+            <span class="n">derived_max_nt</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_token</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_num_token</span> <span class="o">=</span> <span class="n">derived_max_nt</span>
+            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_token</span> <span class="o">!=</span> <span class="n">derived_max_nt</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;CudaGraphConfig.max_num_token is incompatible with &quot;</span>
+                    <span class="s2">&quot;CudaGraphConfig.num_tokens. When both are provided, &quot;</span>
+                    <span class="s2">&quot;max_num_token must equal max(num_tokens).</span><span class="se">\n</span><span class="s2">&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;CudaGraphConfig.num_tokens: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2">, &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;max(num_tokens): </span><span class="si">{</span><span class="n">derived_max_nt</span><span class="si">}</span><span class="s2">, &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;CudaGraphConfig.max_num_token: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_token</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generate_cuda_graph_num_tokens</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_num_token</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_padding</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">seq_lens</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">)</span>
+            <span class="n">derived_max_sl</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">derived_max_sl</span>
+            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">!=</span> <span class="n">derived_max_sl</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;CudaGraphConfig.max_seq_len is incompatible with &quot;</span>
+                    <span class="s2">&quot;CudaGraphConfig.seq_lens. When both are provided, &quot;</span>
+                    <span class="s2">&quot;max_seq_len must equal max(seq_lens).</span><span class="se">\n</span><span class="s2">&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;CudaGraphConfig.seq_lens: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">seq_lens</span><span class="si">}</span><span class="s2">, &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;max(seq_lens): </span><span class="si">{</span><span class="n">derived_max_sl</span><span class="si">}</span><span class="s2">, &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;CudaGraphConfig.max_seq_len: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">seq_lens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generate_cuda_graph_seq_lens</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_padding</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_generate_cuda_graph_num_tokens</span><span class="p">(</span><span class="n">max_num_token</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                                        <span class="n">enable_padding</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate a list of total token counts for encoder CUDA graphs.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            max_num_token: Maximum total tokens to generate up to.</span>
+<span class="sd">            enable_padding: Whether padding is enabled, which affects the</span>
+<span class="sd">                size distribution.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            List of total token counts to create encoder CUDA graphs for.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">enable_padding</span><span class="p">:</span>
+            <span class="c1"># Coarser: aligned with piecewise CUDA graph capture sizes.</span>
+            <span class="n">sizes</span> <span class="o">=</span> <span class="p">[</span><span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">)]</span>  <span class="c1"># 1, 2, 4 .. 128</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">256</span><span class="p">,</span> <span class="mi">3073</span><span class="p">,</span> <span class="mi">256</span><span class="p">))</span>  <span class="c1"># 256, 512, ..., 3072</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># Finer: progressively coarser steps.</span>
+            <span class="n">sizes</span> <span class="o">=</span> <span class="p">[</span><span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">5</span><span class="p">)]</span>  <span class="c1"># 1, 2, 4 .. 16</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">65</span><span class="p">,</span> <span class="mi">16</span><span class="p">))</span>  <span class="c1"># 16, 32, ..., 64</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">96</span><span class="p">,</span> <span class="mi">257</span><span class="p">,</span> <span class="mi">32</span><span class="p">))</span>  <span class="c1"># 96, 128, ..., 256</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">384</span><span class="p">,</span> <span class="mi">1025</span><span class="p">,</span> <span class="mi">128</span><span class="p">))</span>  <span class="c1"># 384, 512, ..., 1024</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">1280</span><span class="p">,</span> <span class="mi">3073</span><span class="p">,</span> <span class="mi">256</span><span class="p">))</span>  <span class="c1"># 1280, 1536, ..., 3072</span>
+
+        <span class="c1"># Beyond the base range: powers of 2 up to max_num_token.</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="mi">4096</span>
+        <span class="k">while</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="n">max_num_token</span><span class="p">:</span>
+            <span class="n">sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p</span><span class="p">)</span>
+            <span class="n">p</span> <span class="o">*=</span> <span class="mi">2</span>
+
+        <span class="n">sizes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">s</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sizes</span> <span class="k">if</span> <span class="n">s</span> <span class="o">&lt;=</span> <span class="n">max_num_token</span><span class="p">))</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">sizes</span> <span class="ow">or</span> <span class="n">sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="n">max_num_token</span><span class="p">:</span>
+            <span class="n">sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">max_num_token</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">sizes</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_generate_cuda_graph_seq_lens</span><span class="p">(</span><span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                                      <span class="n">enable_padding</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Generate a list of max per-request sequence lengths for encoder CUDA graphs.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            max_seq_len: Maximum per-request sequence length to generate up to.</span>
+<span class="sd">            enable_padding: Whether padding is enabled, which affects the</span>
+<span class="sd">                size distribution.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            List of max sequence lengths to create encoder CUDA graphs for.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">enable_padding</span><span class="p">:</span>
+            <span class="c1"># Coarser buckets for rounding up.</span>
+            <span class="n">sizes</span> <span class="o">=</span> <span class="p">[</span><span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">7</span><span class="p">)]</span>  <span class="c1"># 1, 2, 4 .. 64</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">128</span><span class="p">,</span> <span class="mi">1025</span><span class="p">,</span> <span class="mi">128</span><span class="p">))</span>  <span class="c1"># 128, 256, ..., 1024</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># Finer: progressive steps for exact matching.</span>
+            <span class="n">sizes</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">9</span><span class="p">))</span>  <span class="c1"># 1 .. 8</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span> <span class="mi">65</span><span class="p">,</span> <span class="mi">8</span><span class="p">))</span>  <span class="c1"># 16, 24, ..., 64</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">96</span><span class="p">,</span> <span class="mi">257</span><span class="p">,</span> <span class="mi">32</span><span class="p">))</span>  <span class="c1"># 96, 128, ..., 256</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">320</span><span class="p">,</span> <span class="mi">513</span><span class="p">,</span> <span class="mi">64</span><span class="p">))</span>  <span class="c1"># 320, 384, 448, 512</span>
+            <span class="n">sizes</span> <span class="o">+=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">640</span><span class="p">,</span> <span class="mi">1025</span><span class="p">,</span> <span class="mi">128</span><span class="p">))</span>  <span class="c1"># 640, 768, 896, 1024</span>
+
+        <span class="c1"># Beyond the base range: powers of 2 up to max_seq_len.</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="mi">2048</span>
+        <span class="k">while</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="n">max_seq_len</span><span class="p">:</span>
+            <span class="n">sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p</span><span class="p">)</span>
+            <span class="n">p</span> <span class="o">*=</span> <span class="mi">2</span>
+
+        <span class="n">sizes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">[</span><span class="n">Any</span> <span class="o">|</span> <span class="nb">int</span><span class="p">](</span><span class="n">s</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sizes</span> <span class="k">if</span> <span class="n">s</span> <span class="o">&lt;=</span> <span class="n">max_seq_len</span><span class="p">))</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">sizes</span> <span class="ow">or</span> <span class="n">sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="n">max_seq_len</span><span class="p">:</span>
+            <span class="n">sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">max_seq_len</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">sizes</span></div>
+
+
+
+<span class="c1"># For CudaGraphConfig&#39;s backward compatibility</span>
+<span class="n">CudaGraphConfig</span> <span class="o">=</span> <span class="n">DecodeCudaGraphConfig</span>
+
+<span class="n">CudaGraphConfigType</span><span class="p">:</span> <span class="n">TypeAlias</span> <span class="o">=</span> <span class="n">Annotated</span><span class="p">[</span>
+    <span class="n">Union</span><span class="p">[</span><span class="n">DecodeCudaGraphConfig</span><span class="p">,</span> <span class="n">EncodeCudaGraphConfig</span><span class="p">],</span>
+    <span class="n">Field</span><span class="p">(</span><span class="n">discriminator</span><span class="o">=</span><span class="s2">&quot;mode&quot;</span><span class="p">),</span>
+<span class="p">]</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">GuidedDecodingConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
@@ -2703,13 +2890,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Enable relaxed acceptance during thinking phase for reasoning models. Accepts draft tokens matching any top-K candidate instead of exact top-1.&quot;</span>
     <span class="p">)</span>
-    <span class="n">relaxed_topk</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">relaxed_topk</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Number of top candidate tokens to consider for relaxed acceptance. Draft token is accepted if it matches any of these.&quot;</span>
     <span class="p">)</span>
-    <span class="n">relaxed_delta</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mf">0.</span><span class="p">,</span>
+    <span class="n">relaxed_delta</span><span class="p">:</span> <span class="n">NonNegativeFloat</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Probability threshold for relaxed acceptance. Only candidates with prob &gt;= (top-1 prob - delta) are kept.&quot;</span>
     <span class="p">)</span>
@@ -2740,12 +2927,12 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;Auto-populated from the model&#39;s pretrained config. Do not set manually.&quot;</span>
     <span class="p">)</span>
 
-    <span class="n">begin_thinking_phase_token</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">begin_thinking_phase_token</span><span class="p">:</span> <span class="n">NonNegativeInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">128798</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Token ID marking start of thinking phase. Relaxed acceptance only applies within this phase.&quot;</span>
     <span class="p">)</span>
-    <span class="n">end_thinking_phase_token</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">end_thinking_phase_token</span><span class="p">:</span> <span class="n">NonNegativeInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">128799</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Token ID marking end of thinking phase. Strict acceptance resumes after this.&quot;</span>
@@ -2770,14 +2957,15 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.set_max_total_draft_tokens">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_max_total_draft_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="c1"># Default max_draft_len to 1 if not set by the user.</span>
-        <span class="c1"># For vanilla MTP, update_spec_config_from_model_config will override this</span>
-        <span class="c1"># with the actual num_nextn_predict_layers from the model.</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="mi">1</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;max_draft_len must be &gt; 0 for MTP&quot;</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>  <span class="c1"># Current MTP only supports linear tree</span>
+        <span class="c1"># Leave max_draft_len as None (&quot;use the model&#39;s num_nextn_predict_layers&quot;)</span>
+        <span class="c1"># when the user doesn&#39;t set it; update_spec_config_from_model_config</span>
+        <span class="c1"># resolves it from the checkpoint before the model runs. When the user</span>
+        <span class="c1"># does set it, validate and mirror to max_total_draft_tokens (current MTP</span>
+        <span class="c1"># only supports a linear tree).</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;max_draft_len must be &gt; 0 for MTP&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -2800,6 +2988,14 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_capture_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># MTP_EAGLE (two-model) feeds captured target hidden states into the</span>
+        <span class="c1"># separate draft engine, so the shared Eagle3ResourceManager must</span>
+        <span class="c1"># allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes</span>
+        <span class="c1"># the target model&#39;s hidden_states straight to the MTP layer</span>
+        <span class="c1"># (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,</span>
+        <span class="c1"># both gated on self.is_mtp_eagle), so no capture buffer is needed</span>
+        <span class="c1"># and we should skip allocation to avoid disabling post-MLP/MoE</span>
+        <span class="c1"># fusion via the layer-capture hook.</span>
         <span class="k">return</span> <span class="mi">1</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_dec_mode</span><span class="o">.</span><span class="n">is_mtp_eagle</span><span class="p">()</span> <span class="k">else</span> <span class="mi">0</span>
 
     <span class="nd">@property</span>
@@ -3734,6 +3930,16 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used.&quot;</span>
     <span class="p">)</span>
+    <span class="n">disk_cache_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">NonNegativeInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Size of the disk cache in bytes. Only used by KV cache manager v2 in the PyTorch backend.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">disk_cache_path</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive.&quot;</span>
+    <span class="p">)</span>
     <span class="n">cross_kv_cache_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -3834,6 +4040,19 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental).&quot;</span>
     <span class="p">)</span>
 
+    <span class="n">enable_kv_pool_rebalance</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for &quot;</span>
+        <span class="s2">&quot;rebalancing pool-group ratios between iterations. When True the &quot;</span>
+        <span class="s2">&quot;PyExecutor calls ``adjust()`` opportunistically; the auto-tuner &quot;</span>
+        <span class="s2">&quot;itself remains gated by V2&#39;s internal 2000-sample / 120s cooldown. &quot;</span>
+        <span class="s2">&quot;When False (default) the rebalance hook is skipped entirely and &quot;</span>
+        <span class="s2">&quot;pool ratios remain at their warmup-derived values. Beta: enable at &quot;</span>
+        <span class="s2">&quot;your own risk. Only used when using KV cache manager v2 &quot;</span>
+        <span class="s2">&quot;(experimental).&quot;</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">_KvCacheConfig</span><span class="p">(</span>
             <span class="n">enable_block_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">,</span>
@@ -3889,6 +4108,22 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="s2">&quot;kv_cache_config.max_gpu_total_bytes must be non-negative&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_disk_cache_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_disk_cache_config">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_disk_cache_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">disk_cache_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">disk_cache_size</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">disk_cache_path</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;kv_cache_config.disk_cache_path must be set when disk_cache_size is positive&quot;</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isdir</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">disk_cache_path</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;kv_cache_config.disk_cache_path </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">disk_cache_path</span><span class="si">}</span><span class="s2"> does not exist or is not a directory&quot;</span>
+                <span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
 
 
 <div class="viewcode-block" id="KvCacheConfig.validate_max_attention_window">
@@ -4050,11 +4285,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    DWDP accelerates the context (prefill) phase of disaggregated MoE serving</span>
 <span class="sd">    by combining data parallelism with NVLink-based expert weight sharing.</span>
 <span class="sd">    Each worker holds a subset of experts locally and asynchronously prefetches</span>
-<span class="sd">    the remaining experts from peer workers via CUDA IPC, enabling fully</span>
-<span class="sd">    asynchronous execution across ranks without synchronization barriers.</span>
+<span class="sd">    the remaining experts from peer workers via CUDA VMM + MNNVL fabric</span>
+<span class="sd">    handles (composite virtual-address layout with zero-copy local mapping and</span>
+<span class="sd">    double-buffered P2P remote regions), enabling fully asynchronous execution</span>
+<span class="sd">    across ranks without synchronization barriers.</span>
 
 <span class="sd">    Currently supported with the CuteDSL MoE backend and NVFP4 quantization</span>
-<span class="sd">    on NVLink-connected multi-GPU systems.</span>
+<span class="sd">    on MNNVL-connected multi-GPU systems (e.g., GB200).</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">dwdp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
                            <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of GPUs per DWDP group.&quot;</span><span class="p">)</span>
@@ -5077,7 +5314,7 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;Lower values trigger more frequent garbage collection.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 
-    <span class="n">cuda_graph_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">CudaGraphConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">cuda_graph_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">CudaGraphConfigType</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default_factory</span><span class="o">=</span><span class="n">CudaGraphConfig</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;CUDA graph config. If true, use CUDA graphs for decoding. </span><span class="se">\</span>
 <span class="s2">        CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, </span><span class="se">\</span>
@@ -5086,6 +5323,21 @@ window.runMermaid = runMermaid;</script>
 <span class="s2">        since the input shapes are a function of the sequence lengths).</span><span class="se">\</span>
 <span class="s2">         Note that each CUDA graph can use up to 200 MB of extra memory.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="TorchLlmArgs.infer_cuda_graph_config_mode">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.infer_cuda_graph_config_mode">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;cuda_graph_config&#39;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;before&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">infer_cuda_graph_config_mode</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="ow">and</span> <span class="s2">&quot;mode&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">v</span><span class="p">:</span>
+            <span class="n">encoder_keys</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="s2">&quot;num_tokens&quot;</span><span class="p">,</span> <span class="s2">&quot;max_num_token&quot;</span><span class="p">,</span> <span class="s2">&quot;seq_lens&quot;</span><span class="p">,</span> <span class="s2">&quot;max_seq_len&quot;</span>
+            <span class="p">}</span>
+            <span class="n">v</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+            <span class="n">v</span><span class="p">[</span><span class="s2">&quot;mode&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;encode&quot;</span> <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">k</span> <span class="ow">in</span> <span class="n">v</span> <span class="ow">and</span> <span class="n">v</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+                                        <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">encoder_keys</span><span class="p">)</span> <span class="k">else</span> <span class="s2">&quot;decode&quot;</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+
 
     <span class="n">attention_dp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AttentionDpConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -5456,6 +5708,32 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_model_format</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_format</span> <span class="o">=</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">HF</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="TorchLlmArgs.validate_encoder_modes">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_encoder_modes">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_encoder_modes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encode_only</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mm_encoder_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;encode_only and mm_encoder_only are mutually exclusive. &quot;</span>
+                <span class="s2">&quot;Use encode_only=True for LLM.encode(), or use &quot;</span>
+                <span class="s2">&quot;MultimodalEncoder/mm_encoder_only for multimodal encoder &quot;</span>
+                <span class="s2">&quot;execution.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="TorchLlmArgs.validate_encode_only_torch_compile_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_encode_only_torch_compile_config">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_encode_only_torch_compile_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">encode_only</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span><span class="n">enable_piecewise_cuda_graph</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;encode_only does not support piecewise CUDA graph in &quot;</span>
+                <span class="s2">&quot;TorchCompileConfig. Use cuda_graph_config for encoder CUDA &quot;</span>
+                <span class="s2">&quot;graphs or disable enable_piecewise_cuda_graph.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -5869,23 +6147,56 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">update_llm_args_with_extra_dict</span><span class="p">(</span>
         <span class="n">llm_args</span><span class="p">:</span> <span class="n">Dict</span><span class="p">,</span>
         <span class="n">llm_args_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">,</span>
-        <span class="n">extra_llm_api_options</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">:</span>
+        <span class="n">extra_llm_api_options</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">explicit_cli_keys</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Merge YAML overrides into a CLI-derived llm_args dict.</span>
+
+<span class="sd">    If `explicit_cli_keys` is provided, those CLI flag names override any</span>
+<span class="sd">    conflicting YAML values. CLI flags whose name does not match the</span>
+<span class="sd">    LlmArgs field name (e.g. `--free_gpu_memory_fraction` constructs</span>
+<span class="sd">    `kv_cache_config.free_gpu_memory_fraction`) are mapped to the nested</span>
+<span class="sd">    field they target.</span>
+
+<span class="sd">    If `explicit_cli_keys` is None, YAML wins on conflicts.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="c1"># CLI scalar -&gt; nested KvCacheConfig field. Callers add the CLI scalar</span>
+    <span class="c1"># name to `explicit_cli_keys` to make it win over YAML&#39;s same-named</span>
+    <span class="c1"># field inside `kv_cache_config:`.</span>
+    <span class="n">cli_to_kv_cache_field</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;free_gpu_memory_fraction&quot;</span><span class="p">:</span> <span class="s2">&quot;free_gpu_memory_fraction&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;kv_cache_dtype&quot;</span><span class="p">:</span> <span class="s2">&quot;dtype&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;enable_block_reuse&quot;</span><span class="p">:</span> <span class="s2">&quot;enable_block_reuse&quot;</span><span class="p">,</span>
+    <span class="p">}</span>
+    <span class="c1"># Scalars that live both at the top level of LlmArgs and inside</span>
+    <span class="c1"># `build_config`. The build_config patch propagates the winning source</span>
+    <span class="c1"># to the nested location.</span>
+    <span class="n">build_config_dual_loc_keys</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="s2">&quot;max_batch_size&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;max_num_tokens&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;max_beam_width&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;max_seq_len&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">explicit_cli_keys</span> <span class="o">=</span> <span class="n">explicit_cli_keys</span> <span class="ow">or</span> <span class="nb">set</span><span class="p">()</span>
 
     <span class="k">if</span> <span class="s1">&#39;hf_revision&#39;</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
         <span class="n">llm_args_dict</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s1">&#39;revision&#39;</span><span class="p">,</span> <span class="n">llm_args_dict</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;hf_revision&#39;</span><span class="p">))</span>
 
     <span class="c1"># Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config</span>
     <span class="k">if</span> <span class="s1">&#39;kv_cache_config&#39;</span> <span class="ow">in</span> <span class="n">llm_args</span> <span class="ow">and</span> <span class="s1">&#39;kv_cache_config&#39;</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
-        <span class="c1"># Convert KvCacheConfig object to dict if necessary</span>
         <span class="n">base_kv_config</span> <span class="o">=</span> <span class="n">llm_args</span><span class="p">[</span><span class="s1">&#39;kv_cache_config&#39;</span><span class="p">]</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">base_kv_config</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">):</span>
             <span class="n">base_kv_config</span> <span class="o">=</span> <span class="n">base_kv_config</span><span class="o">.</span><span class="n">model_dump</span><span class="p">(</span><span class="n">exclude_unset</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-        <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;kv_cache_config&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">base_kv_config</span> <span class="o">|</span> <span class="n">llm_args_dict</span><span class="p">[</span>
-            <span class="s1">&#39;kv_cache_config&#39;</span><span class="p">]</span>
+        <span class="n">merged</span> <span class="o">=</span> <span class="n">base_kv_config</span> <span class="o">|</span> <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;kv_cache_config&#39;</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">cli_name</span><span class="p">,</span> <span class="n">kv_field</span> <span class="ow">in</span> <span class="n">cli_to_kv_cache_field</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">cli_name</span> <span class="ow">in</span> <span class="n">explicit_cli_keys</span> <span class="ow">and</span> <span class="n">kv_field</span> <span class="ow">in</span> <span class="n">base_kv_config</span><span class="p">:</span>
+                <span class="n">merged</span><span class="p">[</span><span class="n">kv_field</span><span class="p">]</span> <span class="o">=</span> <span class="n">base_kv_config</span><span class="p">[</span><span class="n">kv_field</span><span class="p">]</span>
+        <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;kv_cache_config&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">merged</span>
 
     <span class="c1"># Deep merge telemetry_config: YAML can override fields like `disabled`,</span>
     <span class="c1"># but `usage_context` is determined by the CLI entry point and must not</span>
-    <span class="c1"># be overridden by user config.</span>
+    <span class="c1"># be overridden by user config. When `--telemetry/--no-telemetry` was</span>
+    <span class="c1"># typed explicitly, CLI&#39;s `disabled` wins over YAML.</span>
     <span class="k">if</span> <span class="s1">&#39;telemetry_config&#39;</span> <span class="ow">in</span> <span class="n">llm_args</span> <span class="ow">and</span> <span class="s1">&#39;telemetry_config&#39;</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
         <span class="n">yaml_tc</span> <span class="o">=</span> <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;telemetry_config&#39;</span><span class="p">]</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">yaml_tc</span><span class="p">,</span> <span class="p">(</span><span class="nb">dict</span><span class="p">,</span> <span class="n">TelemetryConfig</span><span class="p">)):</span>
@@ -5899,7 +6210,27 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">yaml_tc</span><span class="p">,</span> <span class="n">TelemetryConfig</span><span class="p">):</span>
                 <span class="n">yaml_tc</span> <span class="o">=</span> <span class="n">yaml_tc</span><span class="o">.</span><span class="n">model_dump</span><span class="p">(</span><span class="n">exclude_unset</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
             <span class="n">yaml_tc</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;usage_context&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;telemetry_config&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">base_tc</span> <span class="o">|</span> <span class="n">yaml_tc</span>
+            <span class="n">merged</span> <span class="o">=</span> <span class="n">base_tc</span> <span class="o">|</span> <span class="n">yaml_tc</span>
+            <span class="k">if</span> <span class="s2">&quot;telemetry&quot;</span> <span class="ow">in</span> <span class="n">explicit_cli_keys</span> <span class="ow">and</span> <span class="s1">&#39;disabled&#39;</span> <span class="ow">in</span> <span class="n">base_tc</span><span class="p">:</span>
+                <span class="n">merged</span><span class="p">[</span><span class="s1">&#39;disabled&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">base_tc</span><span class="p">[</span><span class="s1">&#39;disabled&#39;</span><span class="p">]</span>
+            <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;telemetry_config&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">merged</span>
+
+    <span class="c1"># Drop YAML keys claimed by explicit CLI flags so the outer merge below</span>
+    <span class="c1"># cannot overwrite them. Warn only when the CLI value actually differs from</span>
+    <span class="c1"># the YAML value, so users who relied on the previous &quot;YAML wins&quot; behavior</span>
+    <span class="c1"># are notified that CLI now takes precedence.</span>
+    <span class="k">if</span> <span class="n">explicit_cli_keys</span><span class="p">:</span>
+        <span class="n">overridden</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
+            <span class="n">k</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">llm_args_dict</span>
+            <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">explicit_cli_keys</span> <span class="ow">and</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">)</span> <span class="o">!=</span> <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">k</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">overridden</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Explicit CLI flag(s) </span><span class="si">{</span><span class="n">overridden</span><span class="si">}</span><span class="s2"> override the value(s) set &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;in the YAML config; CLI takes precedence.&quot;</span><span class="p">)</span>
+        <span class="n">llm_args_dict</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">k</span><span class="p">:</span> <span class="n">v</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">explicit_cli_keys</span>
+        <span class="p">}</span>
 
     <span class="n">field_mapping</span> <span class="o">=</span> <span class="p">{</span>
         <span class="s2">&quot;quant_config&quot;</span><span class="p">:</span> <span class="n">QuantConfig</span><span class="p">,</span>
@@ -5919,8 +6250,9 @@ window.runMermaid = runMermaid;</script>
     <span class="k">for</span> <span class="n">field_name</span><span class="p">,</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="n">field_mapping</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
             <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">field_type</span><span class="p">(</span><span class="o">**</span><span class="n">llm_args_dict</span><span class="p">[</span><span class="n">field_name</span><span class="p">])</span>
-            <span class="n">extra_llm_str</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;because it&#39;s specified in </span><span class="si">{</span><span class="n">extra_llm_api_options</span><span class="si">}</span><span class="s2">&quot;</span> <span class="k">if</span> <span class="n">extra_llm_api_options</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Overriding </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">extra_llm_str</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args</span><span class="p">:</span>
+                <span class="n">extra_llm_str</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot; because it&#39;s specified in </span><span class="si">{</span><span class="n">extra_llm_api_options</span><span class="si">}</span><span class="s2">&quot;</span> <span class="k">if</span> <span class="n">extra_llm_api_options</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;YAML overrides </span><span class="si">{</span><span class="n">field_name</span><span class="si">}{</span><span class="n">extra_llm_str</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
     <span class="n">llm_args</span> <span class="o">=</span> <span class="n">llm_args</span> <span class="o">|</span> <span class="n">llm_args_dict</span>
 
@@ -5930,28 +6262,45 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">llm_args</span><span class="p">[</span><span class="s2">&quot;build_config&quot;</span><span class="p">],</span> <span class="nb">dict</span><span class="p">):</span>
             <span class="n">llm_args</span><span class="p">[</span><span class="s2">&quot;build_config&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">(</span><span class="o">**</span><span class="n">llm_args</span><span class="p">[</span><span class="s2">&quot;build_config&quot;</span><span class="p">])</span>
 
-        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">[</span>
-                <span class="s2">&quot;max_batch_size&quot;</span><span class="p">,</span>
-                <span class="s2">&quot;max_num_tokens&quot;</span><span class="p">,</span>
-                <span class="s2">&quot;max_beam_width&quot;</span><span class="p">,</span>
-                <span class="s2">&quot;max_seq_len&quot;</span><span class="p">,</span>
-        <span class="p">]:</span>
-            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;Overriding </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> from build_config to </span><span class="si">{</span><span class="n">llm_args_dict</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span>
-                <span class="p">)</span>
+        <span class="c1"># Propagate dual-location scalars into build_config: explicit CLI flag</span>
+        <span class="c1"># wins; otherwise YAML&#39;s top-level scalar; otherwise leave alone. Warn</span>
+        <span class="c1"># only when the explicit CLI value actually differs from the YAML</span>
+        <span class="c1"># build_config value being replaced (a genuine override).</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">build_config_dual_loc_keys</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">explicit_cli_keys</span> <span class="ow">and</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">llm_args</span><span class="p">:</span>
+                <span class="c1"># Warn only on a genuine override of a YAML build_config value;</span>
+                <span class="c1"># otherwise just record where the value came from.</span>
+                <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">llm_args</span><span class="p">[</span><span class="s2">&quot;build_config&quot;</span><span class="p">],</span> <span class="n">key</span><span class="p">)</span> <span class="o">!=</span> <span class="n">llm_args</span><span class="p">[</span><span class="n">key</span><span class="p">]:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;Explicit CLI flag --</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">llm_args</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="si">}</span><span class="s2"> overrides &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;the value set in the YAML build_config; CLI takes &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;precedence.&quot;</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;build_config.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> set to </span><span class="si">{</span><span class="n">llm_args</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="si">}</span><span class="s2"> from explicit CLI flag&quot;</span>
+                    <span class="p">)</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="n">llm_args</span><span class="p">[</span><span class="s2">&quot;build_config&quot;</span><span class="p">],</span> <span class="n">key</span><span class="p">,</span> <span class="n">llm_args</span><span class="p">[</span><span class="n">key</span><span class="p">])</span>
+            <span class="k">elif</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
                 <span class="nb">setattr</span><span class="p">(</span><span class="n">llm_args</span><span class="p">[</span><span class="s2">&quot;build_config&quot;</span><span class="p">],</span> <span class="n">key</span><span class="p">,</span> <span class="n">llm_args_dict</span><span class="p">[</span><span class="n">key</span><span class="p">])</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;build_config.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> set to </span><span class="si">{</span><span class="n">llm_args_dict</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="si">}</span><span class="s2"> from YAML top-level scalar&quot;</span>
+                <span class="p">)</span>
 
     <span class="k">return</span> <span class="n">llm_args</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">update_llm_args_with_extra_options</span><span class="p">(</span><span class="n">llm_args</span><span class="p">:</span> <span class="n">Dict</span><span class="p">,</span>
-                                       <span class="n">extra_llm_api_options</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">update_llm_args_with_extra_options</span><span class="p">(</span>
+        <span class="n">llm_args</span><span class="p">:</span> <span class="n">Dict</span><span class="p">,</span>
+        <span class="n">extra_llm_api_options</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">explicit_cli_keys</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">:</span>
     <span class="k">if</span> <span class="n">extra_llm_api_options</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">extra_llm_api_options</span><span class="p">,</span> <span class="s1">&#39;r&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">llm_args_dict</span> <span class="o">=</span> <span class="n">yaml</span><span class="o">.</span><span class="n">safe_load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-            <span class="n">llm_args</span> <span class="o">=</span> <span class="n">update_llm_args_with_extra_dict</span><span class="p">(</span><span class="n">llm_args</span><span class="p">,</span> <span class="n">llm_args_dict</span><span class="p">,</span>
-                                                       <span class="n">extra_llm_api_options</span><span class="p">)</span>
+            <span class="n">llm_args</span> <span class="o">=</span> <span class="n">update_llm_args_with_extra_dict</span><span class="p">(</span>
+                <span class="n">llm_args</span><span class="p">,</span>
+                <span class="n">llm_args_dict</span><span class="p">,</span>
+                <span class="n">extra_llm_api_options</span><span class="p">,</span>
+                <span class="n">explicit_cli_keys</span><span class="o">=</span><span class="n">explicit_cli_keys</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">llm_args</span>
 
 
@@ -6100,9 +6449,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 01, 2026.</p>
+  <p>Last updated on June 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
   
 </div></div>
       

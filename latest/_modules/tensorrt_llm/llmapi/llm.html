@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc17" />
+  <meta name="docsearch:version" content="1.3.0rc18" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -810,6 +810,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client.html">Aiperf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
@@ -829,7 +833,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
@@ -1734,8 +1738,9 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">]],</span>
         <span class="n">add_special_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">return_raw_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="o">**</span><span class="n">model_kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">EncoderOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">EncoderOutput</span><span class="p">]]:</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">EncoderOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">EncoderOutput</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Encode inputs using an encoder-only model (PyTorch backend only).</span>
 
 <span class="sd">        Only available when encode_only=True is set in the LLM constructor.</span>
@@ -1744,11 +1749,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.</span>
 <span class="sd">                It can be a single prompt or batched prompts.</span>
 <span class="sd">            add_special_tokens (bool): Whether to add special tokens (e.g., [CLS]/[SEP]) during tokenization. Defaults to True.</span>
+<span class="sd">            return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.</span>
 <span class="sd">            model_kwargs (Any): Model-specific inputs passed through to the model&#39;s forward(). Examples: token_type_ids (BERT),</span>
 <span class="sd">                inputs_embeds (reward models).</span>
 
 <span class="sd">        Returns:</span>
-<span class="sd">            Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]: The encoder output(s) containing logits or embeddings.</span>
+<span class="sd">            Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:</span>
+<span class="sd">            If return_raw_logits=True, returns the raw CPU logits tensor for the</span>
+<span class="sd">            whole input batch. Otherwise, returns one EncoderOutput for a single</span>
+<span class="sd">            input, or a list of EncoderOutput objects for batched inputs.</span>
 
 <span class="sd">        Raises:</span>
 <span class="sd">            RuntimeError: If encode_only mode is not enabled.</span>
@@ -1780,47 +1789,38 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># Tokenize each input (reuses existing input_processor)</span>
         <span class="n">token_ids_list</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">sequence_lengths</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">prompts</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">add_special_tokens</span><span class="o">=</span><span class="n">add_special_tokens</span><span class="p">)</span>
 
-        <span class="n">total_tokens</span> <span class="o">=</span> <span class="mi">0</span>
-        <span class="n">max_seq_len_batch</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
             <span class="n">inp</span> <span class="o">=</span> <span class="n">prompt_inputs</span><span class="p">(</span><span class="n">inp</span><span class="p">)</span>
             <span class="k">if</span> <span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inp</span><span class="p">:</span>
                 <span class="n">token_ids_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="p">[</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">])</span>
-                <span class="n">seq_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">inp</span><span class="p">[</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">])</span>
-                <span class="n">total_tokens</span> <span class="o">+=</span> <span class="n">seq_len</span>
-                <span class="n">max_seq_len_batch</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_seq_len_batch</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">)</span>
+                <span class="n">sequence_lengths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">inp</span><span class="p">[</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">]))</span>
                 <span class="n">prompts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
             <span class="k">elif</span> <span class="s2">&quot;prompt&quot;</span> <span class="ow">in</span> <span class="n">inp</span><span class="p">:</span>
                 <span class="n">token_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span><span class="n">inp</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
                 <span class="n">token_ids_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span>
-                <span class="n">seq_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span>
-                <span class="n">total_tokens</span> <span class="o">+=</span> <span class="n">seq_len</span>
-                <span class="n">max_seq_len_batch</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_seq_len_batch</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">)</span>
+                <span class="n">sequence_lengths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">))</span>
                 <span class="n">prompts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="p">[</span><span class="s2">&quot;prompt&quot;</span><span class="p">])</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported input type: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inp</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
         <span class="c1"># Validate inputs against model capacity</span>
-        <span class="k">if</span> <span class="n">total_tokens</span> <span class="o">&gt;</span> <span class="n">max_num_tokens</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">sum</span><span class="p">(</span><span class="n">sequence_lengths</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_num_tokens</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Total tokens (</span><span class="si">{</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">) across the batch exceeds &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;Total tokens (</span><span class="si">{</span><span class="nb">sum</span><span class="p">(</span><span class="n">sequence_lengths</span><span class="p">)</span><span class="si">}</span><span class="s2">) across the batch exceeds &quot;</span>
                 <span class="sa">f</span><span class="s2">&quot;max_num_tokens (</span><span class="si">{</span><span class="n">max_num_tokens</span><span class="si">}</span><span class="s2">). Reduce batch size or &quot;</span>
                 <span class="sa">f</span><span class="s2">&quot;sequence lengths.&quot;</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">max_seq_len_batch</span> <span class="o">&gt;</span> <span class="n">max_seq_len</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">max</span><span class="p">(</span><span class="n">sequence_lengths</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_seq_len</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Max sequence length (</span><span class="si">{</span><span class="n">max_seq_len_batch</span><span class="si">}</span><span class="s2">) exceeds &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;Max sequence length (</span><span class="si">{</span><span class="nb">max</span><span class="p">(</span><span class="n">sequence_lengths</span><span class="p">)</span><span class="si">}</span><span class="s2">) exceeds &quot;</span>
                 <span class="sa">f</span><span class="s2">&quot;max_seq_len (</span><span class="si">{</span><span class="n">max_seq_len</span><span class="si">}</span><span class="s2">). Truncate the input or increase &quot;</span>
                 <span class="sa">f</span><span class="s2">&quot;max_seq_len.&quot;</span><span class="p">)</span>
 
-        <span class="c1"># Pack into flat tensors</span>
-        <span class="n">seq_lens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="nb">len</span><span class="p">(</span><span class="n">t</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">token_ids_list</span><span class="p">],</span>
-                                <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
-        <span class="n">flat_token_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
-            <span class="p">[</span><span class="n">tid</span> <span class="k">for</span> <span class="n">tids</span> <span class="ow">in</span> <span class="n">token_ids_list</span> <span class="k">for</span> <span class="n">tid</span> <span class="ow">in</span> <span class="n">tids</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+        <span class="n">flat_token_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">tid</span> <span class="k">for</span> <span class="n">tids</span> <span class="ow">in</span> <span class="n">token_ids_list</span> <span class="k">for</span> <span class="n">tid</span> <span class="ow">in</span> <span class="n">tids</span><span class="p">]</span>
 
         <span class="c1"># Build inputs dict — common + model-specific kwargs.</span>
         <span class="c1"># Filter keys that are set internally by _prepare_encoder_inputs or</span>
@@ -1835,20 +1835,30 @@ window.runMermaid = runMermaid;</script>
             <span class="n">k</span><span class="p">:</span> <span class="n">v</span>
             <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">model_kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_RESERVED_KEYS</span>
         <span class="p">}</span>
+
+        <span class="k">if</span> <span class="n">filtered_kwargs</span> <span class="ow">and</span> <span class="n">engine</span><span class="o">.</span><span class="n">encoder_cuda_graph_runner</span><span class="o">.</span><span class="n">enabled</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                <span class="s2">&quot;LLM.encode(..., **model_kwargs) is not supported when encoder CUDA &quot;</span>
+                <span class="s2">&quot;graphs are enabled. Disable encoder CUDA graphs or omit model_kwargs. &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;Unsupported keys: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">filtered_kwargs</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
         <span class="n">forward_inputs</span> <span class="o">=</span> <span class="p">{</span>
             <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span> <span class="n">flat_token_ids</span><span class="p">,</span>
-            <span class="s1">&#39;seq_lens&#39;</span><span class="p">:</span> <span class="n">seq_lens</span><span class="p">,</span>
+            <span class="s1">&#39;seq_lens&#39;</span><span class="p">:</span> <span class="n">sequence_lengths</span><span class="p">,</span>
             <span class="o">**</span><span class="n">filtered_kwargs</span><span class="p">,</span>
         <span class="p">}</span>
 
         <span class="c1"># Single forward pass</span>
         <span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span><span class="o">.</span><span class="n">batch_forward</span><span class="p">(</span><span class="n">forward_inputs</span><span class="p">)</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;logits&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+
+        <span class="k">if</span> <span class="n">return_raw_logits</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">logits</span>
 
         <span class="c1"># Package as EncoderOutput.</span>
         <span class="c1"># NOTE: logits[i] assumes batch-indexed output (e.g., BERT classification</span>
         <span class="c1"># returns [batch_size, num_classes]). Per-token models that return packed</span>
         <span class="c1"># [total_tokens, hidden_size] would need cumulative-sum slicing instead.</span>
-        <span class="n">logits</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;logits&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
         <span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">token_ids_list</span><span class="p">)):</span>
             <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
@@ -2701,9 +2711,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 01, 2026.</p>
+  <p>Last updated on June 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
   
 </div></div>
       

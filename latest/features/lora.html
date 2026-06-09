@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc17" />
+  <meta name="docsearch:version" content="1.3.0rc18" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -381,6 +381,10 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
@@ -400,7 +404,7 @@
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
@@ -581,6 +585,7 @@
 <ul class="simple">
 <li><p><a class="reference internal" href="#lora-with-quantization">LoRA with Quantization</a></p></li>
 <li><p><a class="reference internal" href="#nemo-lora-format">NeMo LoRA Format</a></p></li>
+<li><p><a class="reference internal" href="#routed-expert-moe-lora">Routed-Expert MoE LoRA</a></p></li>
 <li><p><a class="reference internal" href="#cache-management">Cache Management</a></p></li>
 </ul>
 </li>
@@ -717,6 +722,104 @@
 <span class="p">)</span>
 </pre></div>
 </div>
+</section>
+<section id="routed-expert-moe-lora">
+<h3>Routed-Expert MoE LoRA<a class="headerlink" href="#routed-expert-moe-lora" title="Link to this heading">#</a></h3>
+<p>LoRA can be applied to the routed-expert projections of a Mixture-of-Experts (MoE) layer in addition to the attention modules. The PyTorch backend’s Cutlass MoE kernel fuses the LoRA application into the MoE forward pass, so multi-adapter batches run without an extra GEMM pass per layer.</p>
+<section id="supported-configuration">
+<h4>Supported configuration<a class="headerlink" href="#supported-configuration" title="Link to this heading">#</a></h4>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Aspect</p></th>
+<th class="head"><p>Supported</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>MoE backend</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTLASS</span></code> only (other backends raise an error at construction).</p></td>
+</tr>
+<tr class="row-odd"><td><p>Base-weight dtype</p></td>
+<td><p>bf16 / fp16. Quantized base weights (FP8, NVFP4, INT4, INT8) are not yet supported.</p></td>
+</tr>
+<tr class="row-even"><td><p>Adapter modules</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">moe_h_to_4h</span></code> (gate side of SwiGLU), <code class="docutils literal notranslate"><span class="pre">moe_gate</span></code> (up side), <code class="docutils literal notranslate"><span class="pre">moe_4h_to_h</span></code> (down). At minimum, <code class="docutils literal notranslate"><span class="pre">moe_gate</span></code> and <code class="docutils literal notranslate"><span class="pre">moe_4h_to_h</span></code> must be present together.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Adapter layout</p></td>
+<td><p>Per-expert (stacked <code class="docutils literal notranslate"><span class="pre">[num_experts,</span> <span class="pre">...]</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p>Multi-LoRA in flight</p></td>
+<td><p>Yes. Reuses the existing slot manager.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Execution paths</p></td>
+<td><p>Eager only (CUDA-graph capture is rejected; see below).</p></td>
+</tr>
+<tr class="row-even"><td><p>min-latency mode</p></td>
+<td><p>Not supported with MoE LoRA.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Alltoall (WideEP)</p></td>
+<td><p>Not supported with MoE LoRA.</p></td>
+</tr>
+<tr class="row-even"><td><p>DoRA on MoE modules</p></td>
+<td><p>Not supported (and rejected at load time).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">register_to_config</span></code> + <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code></p></td>
+<td><p>Not supported with MoE LoRA.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="enabling-routed-expert-moe-lora">
+<h4>Enabling routed-expert MoE LoRA<a class="headerlink" href="#enabling-routed-expert-moe-lora" title="Link to this heading">#</a></h4>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraConfig</span>
+
+<span class="n">lora_config</span> <span class="o">=</span> <span class="n">LoraConfig</span><span class="p">(</span>
+    <span class="n">lora_target_modules</span><span class="o">=</span><span class="p">[</span>
+        <span class="s2">&quot;attn_q&quot;</span><span class="p">,</span> <span class="s2">&quot;attn_k&quot;</span><span class="p">,</span> <span class="s2">&quot;attn_v&quot;</span><span class="p">,</span>  <span class="c1"># optional: standard attention LoRA</span>
+        <span class="s2">&quot;moe_gate&quot;</span><span class="p">,</span>                    <span class="c1"># up projection (required for MoE LoRA)</span>
+        <span class="s2">&quot;moe_4h_to_h&quot;</span><span class="p">,</span>                 <span class="c1"># down projection (required for MoE LoRA)</span>
+        <span class="s2">&quot;moe_h_to_4h&quot;</span><span class="p">,</span>                 <span class="c1"># gate projection (SwiGLU; optional)</span>
+    <span class="p">],</span>
+    <span class="n">max_lora_rank</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>
+    <span class="n">max_loras</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">max_cpu_loras</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;/path/to/moe_base_model&quot;</span><span class="p">,</span>
+    <span class="n">lora_config</span><span class="o">=</span><span class="n">lora_config</span><span class="p">,</span>
+    <span class="c1"># The MoE LoRA path requires the Cutlass backend. Other moe_backend values</span>
+    <span class="c1"># raise ValueError at construction.</span>
+    <span class="n">moe_backend</span><span class="o">=</span><span class="s2">&quot;CUTLASS&quot;</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Adapters are loaded via <code class="docutils literal notranslate"><span class="pre">LoRARequest</span></code> exactly like attention-only LoRA; no API change.</p>
+</section>
+<section id="adapter-layout">
+<h4>Adapter layout<a class="headerlink" href="#adapter-layout" title="Link to this heading">#</a></h4>
+<p>Each routed expert has its own <code class="docutils literal notranslate"><span class="pre">(A,</span> <span class="pre">B)</span></code> matrices, stored as stacked <code class="docutils literal notranslate"><span class="pre">[num_experts,</span> <span class="pre">rank,</span> <span class="pre">in_dim]</span></code> and <code class="docutils literal notranslate"><span class="pre">[num_experts,</span> <span class="pre">out_dim,</span> <span class="pre">rank]</span></code> tensors. This is the standard HuggingFace PEFT export shape for MoE LoRA; the MoE kernel reads each expert’s slice at offset <code class="docutils literal notranslate"><span class="pre">expert_index</span> <span class="pre">*</span> <span class="pre">dim</span> <span class="pre">*</span> <span class="pre">rank</span></code>.</p>
+<p>A helper for assembling synthetic per-expert adapters (for unit tests and experimentation) is provided at <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch.peft.lora.moe_layout</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.peft.lora.moe_layout</span><span class="w"> </span><span class="kn">import</span> <span class="n">make_per_expert_lora</span>
+
+<span class="n">fc1_adapter</span> <span class="o">=</span> <span class="n">make_per_expert_lora</span><span class="p">(</span>
+    <span class="n">num_experts</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span> <span class="n">in_dim</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">out_dim</span><span class="o">=</span><span class="mi">5632</span><span class="p">,</span>
+    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="c1"># fc1_adapter[&quot;A&quot;].shape == (8, 16, 2048)  -- independent per expert</span>
+<span class="c1"># fc1_adapter[&quot;B&quot;].shape == (8, 5632, 16)  -- independent per expert</span>
+</pre></div>
+</div>
+</section>
+<section id="cuda-graph-decode">
+<h4>CUDA-graph decode<a class="headerlink" href="#cuda-graph-decode" title="Link to this heading">#</a></h4>
+<p>MoE LoRA runs in eager mode. CUDA-graph capture of a LoRA-active routed-expert MoE layer is not supported: the fused MoE kernel’s LoRA path performs a host-side <code class="docutils literal notranslate"><span class="pre">cudaEventSynchronize</span></code> after a device-to-host pointer-expansion copy, which is not capturable. When CUDA-graph decode is enabled and an MoE LoRA is active, the fused MoE op detects the capturing stream and raises a clear error, so disable CUDA-graph capture when running MoE LoRA.</p>
+</section>
+<section id="what-is-rejected-and-where">
+<h4>What is rejected, and where<a class="headerlink" href="#what-is-rejected-and-where" title="Link to this heading">#</a></h4>
+<p>If you supply MoE LoRA on a non-Cutlass backend or with quantization, <code class="docutils literal notranslate"><span class="pre">create_moe</span></code> raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, and CUDA-graph capture + LoRA.</p>
+</section>
 </section>
 <section id="cache-management">
 <h3>Cache Management<a class="headerlink" href="#cache-management" title="Link to this heading">#</a></h3>
@@ -878,6 +981,14 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-usage">Advanced Usage</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#lora-with-quantization">LoRA with Quantization</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#nemo-lora-format">NeMo LoRA Format</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#routed-expert-moe-lora">Routed-Expert MoE LoRA</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-configuration">Supported configuration</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#enabling-routed-expert-moe-lora">Enabling routed-expert MoE LoRA</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#adapter-layout">Adapter layout</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-decode">CUDA-graph decode</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-rejected-and-where">What is rejected, and where</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cache-management">Cache Management</a></li>
 </ul>
 </li>
@@ -983,9 +1094,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 01, 2026.</p>
+  <p>Last updated on June 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
   
 </div></div>
       
