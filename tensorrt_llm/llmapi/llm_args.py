@@ -731,27 +731,31 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-            SkipSoftmaxParams, SkipSoftmaxScheduler)
+            SkipSoftmaxParams, SkipSoftmaxScheduler,
+            skip_softmax_target_sparsity_from_checkpoint_config)
 
         checkpoint_config = kwargs.get("checkpoint_config", None)
         pretrained_config = kwargs.get("pretrained_config", None)
         if checkpoint_config is None and pretrained_config is not None:
             checkpoint_config = getattr(pretrained_config,
                                         "sparse_attention_config", None)
-        if (self.threshold_scale_factor is None
-                and self.target_sparsity is not None
+        target_sparsity = self.target_sparsity
+        if target_sparsity is None:
+            target_sparsity = skip_softmax_target_sparsity_from_checkpoint_config(
+                checkpoint_config)
+        if (self.threshold_scale_factor is None and target_sparsity is not None
                 and not isinstance(checkpoint_config, dict)):
             raise ValueError(
                 "sparse_attention_config with target_sparsity requires formula "
                 "coefficients in the model's config.json "
-                "(sparse_attention_config.threshold_scale_factor.{prefill,decode}.{a,b}), "
+                "(sparse_attention_config.config_groups.*."
+                "threshold_scale_factor.{prefill,decode}.{a,b}), "
                 "but sparse_attention_config was not found or was not dict type in config.json."
             )
         scheduler = (SkipSoftmaxScheduler.from_threshold_scale_factor(
             self.threshold_scale_factor) if self.threshold_scale_factor
                      is not None else SkipSoftmaxScheduler.from_target_sparsity(
-                         self.target_sparsity,
-                         checkpoint_config=checkpoint_config))
+                         target_sparsity, checkpoint_config=checkpoint_config))
         return SkipSoftmaxParams(scheduler=scheduler)
 
 
