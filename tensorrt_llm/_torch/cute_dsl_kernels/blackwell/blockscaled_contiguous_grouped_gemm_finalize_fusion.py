@@ -238,6 +238,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.sched_warp_id = 6
+        self.meta_load_warp_id = 7
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
@@ -245,6 +246,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 self.mma_warp_id,
                 self.tma_warp_id,
                 self.sched_warp_id,
+                self.meta_load_warp_id,
             )
         )
         self.threads_wo_sched = self.threads_per_warp * len(
@@ -252,6 +254,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 *self.epilog_warp_id,
                 self.mma_warp_id,
                 self.tma_warp_id,
+                self.meta_load_warp_id,
             )
         )
         self.num_regs_uniform_warps = 64
@@ -378,6 +381,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         self.epi_tile_n = cute.size(self.epi_tile[1])
 
+        # Metadata loader pipeline depth (meta warp -> epilogue). Lets the loader
+        # prefetch the per-row {token_idx, combined_scale} ahead of the epilogue.
+        self.num_meta_stage = 2
+        # Per-row metadata smem held by the loader: token_idx (int32) +
+        # combined_scale (final_scale_dtype), cta_M rows per stage.
+        meta_smem_bytes = (
+            self.cta_tile_shape_mnk[0]
+            * self.num_meta_stage
+            * (4 + self.final_scale_dtype.width // 8)
+        )
+
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
             self.num_acc_stage,
@@ -395,6 +409,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.sf_vec_size,
             self.num_smem_capacity,
             self.occupancy,
+            meta_smem_bytes,
         )
 
         # Compute A/B/C/Scale shared memory layout
@@ -701,6 +716,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
+            meta_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_meta_stage * 2]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             # (MMA, MMA_M, MMA_K, STAGE)
@@ -727,6 +743,18 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             sC: cute.struct.Align[
                 cute.struct.MemRange[self.out_dtype, cute.cosize(self.c_smem_layout_staged)],
                 self.buffer_align_bytes,
+            ]
+            meta_token_idx: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32, self.cta_tile_shape_mnk[0] * self.num_meta_stage
+                ],
+                1,
+            ]
+            meta_scale: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.final_scale_dtype, self.cta_tile_shape_mnk[0] * self.num_meta_stage
+                ],
+                1,
             ]
 
         self.shared_storage = SharedStorage
@@ -935,6 +963,22 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             consumer_group=tile_info_pipeline_consumer_group,
         )
 
+        # Initialize metadata pipeline (meta loader warp -> epilogue warps)
+        meta_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            self.threads_per_warp * 1,
+        )
+        meta_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            self.threads_per_warp * len(self.epilog_warp_id),
+        )
+        meta_pipeline = pipeline.PipelineAsync.create(
+            barrier_storage=storage.meta_mbar_ptr.data_ptr(),
+            num_stages=self.num_meta_stage,
+            producer_group=meta_pipeline_producer_group,
+            consumer_group=meta_pipeline_consumer_group,
+        )
+
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
@@ -965,6 +1009,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # (bidx, bidy, bidz, valid)
         info_layout = cute.make_layout((5, self.num_tile_stage), stride=(1, 5))
         sInfo = storage.sInfo.get_tensor(info_layout)
+
+        # Per-row finalize metadata staged by the meta loader warp: (row, stage)
+        meta_layout = cute.make_layout(
+            (self.cta_tile_shape_mnk[0], self.num_meta_stage),
+            stride=(1, self.cta_tile_shape_mnk[0]),
+        )
+        sMetaTokenIdx = storage.meta_token_idx.get_tensor(meta_layout)
+        sMetaScale = storage.meta_scale.get_tensor(meta_layout)
 
         #
         # Compute multicast mask for A/B buffer full
@@ -1597,6 +1649,65 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             acc_pipeline.producer_tail(acc_producer_state)
 
         #
+        # Specialized metadata loader warp
+        #
+        if warp_idx == self.meta_load_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            meta_lane = tidx % self.threads_per_warp
+
+            tile_info_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_tile_stage
+            )
+            meta_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_meta_stage
+            )
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            for idx in cutlass.range(5, unroll_full=True):
+                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            is_valid_tile = tile_info[3] == 1
+            cute.arch.fence_proxy("async.shared", space="cta")
+            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            tile_info_consumer_state.advance()
+
+            while is_valid_tile:
+                tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
+                expert_idx = tile_info[2]
+                alpha_val = alpha_tuple[0][expert_idx]
+
+                meta_pipeline.producer_acquire(meta_producer_state)
+                meta_stage = meta_producer_state.index
+                # Strided row assignment keeps the permuted_idx loads and smem
+                # stores coalesced (each fixed j: 32 lanes touch 32 contiguous
+                # rows). Padding rows hold -1; clamp the gather index in-bounds
+                # (branchless) -- the epilogue ignores padding rows via
+                # is_valid_row, so the value staged for them is irrelevant.
+                for j in cutlass.range(
+                    self.cta_tile_shape_mnk[0] // self.threads_per_warp,
+                    unroll_full=True,
+                ):
+                    r = meta_lane + j * self.threads_per_warp
+                    expanded_idx = permuted_idx_to_expanded_idx[tile_m_start + r]
+                    safe_idx = cutlass.max(expanded_idx, cutlass.Int32(0))
+                    token_idx = safe_idx // topK
+                    topk_idx = safe_idx % topK
+                    token_scale = token_final_scales[(token_idx, topk_idx)]
+                    sMetaTokenIdx[(r, meta_stage)] = token_idx
+                    sMetaScale[(r, meta_stage)] = alpha_val * token_scale
+                cute.arch.fence_proxy("async.shared", space="cta")
+                meta_pipeline.producer_commit(meta_producer_state)
+                meta_producer_state.advance()
+
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                for idx in cutlass.range(5, unroll_full=True):
+                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                is_valid_tile = tile_info[3] == 1
+                cute.arch.fence_proxy("async.shared", space="cta")
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+            meta_pipeline.producer_tail(meta_producer_state)
+
+        #
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
@@ -1641,9 +1752,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
+            meta_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_meta_stage
+            )
 
             token_idx = cutlass.Int32(0)
-            token_scale = self.final_scale_dtype(0.0)
 
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
@@ -1669,13 +1782,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 # Get alpha for current group
                 #
 
-                expert_idx = mma_tile_coord_mnl[2]
-                alpha_val = alpha_tuple[0][expert_idx]
-
                 tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                 permuted_row = tile_m_start + epi_tidx
-                expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
                 is_valid_row = permuted_row < tile_info[4]
+
+                # Read per-row finalize metadata prefetched by the meta loader
+                # warp (token_idx for scatter, combined_scale = alpha * token_scale).
+                meta_pipeline.consumer_wait(meta_consumer_state)
+                token_idx = sMetaTokenIdx[(epi_tidx, meta_consumer_state.index)]
+                meta_scale = sMetaScale[(epi_tidx, meta_consumer_state.index)]
 
                 # Get accumulator stage index
                 if cutlass.const_expr(self.overlapping_accum):
@@ -1702,12 +1817,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
-                if is_valid_row:
-                    token_idx = expanded_idx // topK
-                    topk_idx = expanded_idx % topK
-                    token_scale = token_final_scales[(token_idx, topk_idx)]
-                    alpha_val = alpha_val * token_scale
-
                 for subtile_idx in cutlass.range(subtile_cnt):
                     real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
@@ -1730,9 +1839,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
-                    # Get vectorized accumulator and apply alpha scaling
+                    # Get vectorized accumulator and apply the combined finalize scale
                     acc_vec = tTR_rAcc.load()
-                    acc_vec_final = alpha_val * acc_vec
+                    acc_vec_final = meta_scale * acc_vec
 
                     tRS_rC.store(acc_vec_final.to(self.out_dtype))
                     if is_valid_row:
@@ -1781,6 +1890,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()
+
+                # Release the prefetched metadata slot for this tile.
+                meta_pipeline.consumer_release(meta_consumer_state)
+                meta_consumer_state.advance()
 
                 # Advance to next tile
                 #
@@ -1900,6 +2013,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         sf_vec_size: int,
         num_smem_capacity: int,
         occupancy: int,
+        meta_smem_bytes: int,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1985,10 +2099,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         # Calculate A/B stages:
         # Start with total smem per CTA (capacity / occupancy)
-        # Subtract reserved bytes and initial C stages bytes
+        # Subtract reserved bytes, initial C stages bytes, and the per-row
+        # metadata smem held by the loader warp
         # Divide remaining by bytes needed per A/B stage
         num_ab_stage = (
-            num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
+            num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + meta_smem_bytes)
         ) // ab_bytes_per_stage
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage
