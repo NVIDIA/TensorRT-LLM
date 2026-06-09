@@ -474,6 +474,9 @@ class SpecMetadata:
     skip_top_k: bool = False
     skip_top_p: bool = False
     has_greedy_requests: bool = False
+    # Pre-computed top_k_max scalar (CPU-side) to avoid CUDA-graph-incompatible
+    # dynamic boolean tensor indexing inside verify_dynamic_tree_rejection_from_logits_out.
+    top_k_max: int = 0
     # Sampling parameters indexed per request.
     request_temperatures: Optional[torch.Tensor] = None
     request_top_ks: Optional[torch.Tensor] = None
@@ -707,7 +710,12 @@ class SpecMetadata:
 
         tokens_per_request = (self.max_total_draft_tokens + 1 if
                               self.is_spec_dec_tree else self.max_draft_len + 1)
-        required_flat_size = tokens_per_request * self.max_num_requests
+        # Warmup batches may exceed max_num_requests * tokens_per_request (e.g.
+        # when CUDA-graph warmup passes use max_batch_size > max_num_requests).
+        actual_flat_size = sum(
+            num_tokens for _, _, _, num_tokens in per_request_normalized)
+        required_flat_size = max(tokens_per_request * self.max_num_requests,
+                                 actual_flat_size)
 
         if self.temperatures is None or self.temperatures.numel(
         ) < required_flat_size:
@@ -789,6 +797,13 @@ class SpecMetadata:
                          pin_memory=prefer_pinned()),
             non_blocking=True,
         )
+
+        # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
+        # encounter boolean-tensor indexing (dynamic size) or .item() calls.
+        # DISABLE_TOPK_VAL (INT32_MAX) is the sentinel for "top-k disabled".
+        _disable_topk = torch.iinfo(torch.int32).max
+        self.top_k_max = max(
+            (tk for tk in request_top_ks if 0 < tk < _disable_topk), default=0)
 
 
 class SpecWorkerBase(nn.Module, ABC):
