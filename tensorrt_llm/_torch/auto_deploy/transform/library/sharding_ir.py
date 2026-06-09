@@ -893,8 +893,13 @@ class AttentionSinkShardableNode(ShardableNode):
         if enable_sharding is False:
             return 0
 
+        [sinks_node] = extract_op_args(self.node, "sinks")
+        if not isinstance(sinks_node, Node):
+            return 0
+
+        weight_nodes = extract_weight_nodes(sinks_node)
         count = 0
-        for wn in extract_weight_nodes(self.node).weights:
+        for wn in weight_nodes.weights:
             # Only the per-head ``sinks`` (1-D) follows the head split; never a 2-D weight.
             if wn.tensor.dim() != 1:
                 continue
@@ -956,11 +961,10 @@ for _sparse_attention_op_name in (
     "torch_deepseek_v4_sparse_attention_with_cache",
 ):
     try:
-        ShardableNode.register(getattr(torch.ops.auto_deploy, _sparse_attention_op_name))(
-            AttentionSinkArgShardableNode
-        )
+        _sparse_attention_op = getattr(torch.ops.auto_deploy, _sparse_attention_op_name)
     except AttributeError:
-        pass
+        continue
+    ShardableNode.register(_sparse_attention_op)(AttentionSinkArgShardableNode)
 
 
 @ShardableNode.register(*_auto_deploy_ops("torch_rmsnorm_gated", "triton_rmsnorm_gated"))
@@ -1529,6 +1533,9 @@ def _register_stacked_mxfp4_moe_variant(base_name: str, ep_name: str) -> None:
     """Register an optional stacked MXFP4 MoE op pair when both schemas exist."""
     try:
         base_target = getattr(torch.ops.auto_deploy, base_name)
+    except AttributeError:
+        return
+    try:
         ep_target = getattr(torch.ops.auto_deploy, ep_name).default
     except AttributeError:
         return

@@ -23,20 +23,25 @@ compressor projections, and top-k indices; the source/cache ops own
 compressed-row construction plus attention over those rows and the sink term.
 """
 
+import json
 import math
 import operator
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from tokenizers import Tokenizer
 from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
+from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 from transformers.utils import ModelOutput
+from transformers.utils.hub import cached_file
 
 from ... import custom_ops  # noqa: F401 -- register custom ops
 from ...utils.quantization_utils import fake_fp4_act_quant as _fake_fp4_act_quant
@@ -57,6 +62,144 @@ from ..quant_checkpoint_layout import (
 @dataclass
 class DeepseekV4CausalLMOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
+
+
+_TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
+_TOKENIZER_FILE = "tokenizer.json"
+_BOS_TOKEN = "<｜begin▁of▁sentence｜>"
+_EOS_TOKEN = "<｜end▁of▁sentence｜>"
+_THINKING_START_TOKEN = "<think>"
+_THINKING_END_TOKEN = "</think>"
+_USER_TOKEN = "<｜User｜>"
+_ASSISTANT_TOKEN = "<｜Assistant｜>"
+_LATEST_REMINDER_TOKEN = "<｜latest_reminder｜>"
+_DSV4_CHAT_TEMPLATE_MARKER = "deepseek_v4_chat"
+
+
+def _token_content(token: object) -> object:
+    if isinstance(token, Mapping):
+        return token.get("content")
+    return token
+
+
+def _message_content_text(message: Mapping[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Sequence):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, Mapping) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n\n".join(parts)
+    return str(content)
+
+
+def _format_deepseek_v4_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
+    """Render the official DeepSeek V4 chat prompt for text messages."""
+
+    rendered = _BOS_TOKEN
+    last_user_idx = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") in ("user", "developer"):
+            last_user_idx = idx
+            break
+
+    for idx, message in enumerate(messages):
+        role = message.get("role")
+        content = _message_content_text(message)
+        if role == "system":
+            rendered += content
+        elif role in ("user", "developer"):
+            rendered += _USER_TOKEN + content
+        elif role == "latest_reminder":
+            rendered += _LATEST_REMINDER_TOKEN + content
+        elif role == "assistant":
+            rendered += content
+            if not message.get("wo_eos", False):
+                rendered += _EOS_TOKEN
+        else:
+            raise NotImplementedError(f"Unsupported DeepSeek V4 chat role: {role}")
+
+        has_next = idx + 1 < len(messages)
+        if has_next and messages[idx + 1].get("role") not in ("assistant", "latest_reminder"):
+            continue
+        if role in ("user", "developer"):
+            rendered += _ASSISTANT_TOKEN
+            if idx >= last_user_idx and message.get("thinking_mode") == "thinking":
+                rendered += _THINKING_START_TOKEN
+            else:
+                rendered += _THINKING_END_TOKEN
+
+    return rendered
+
+
+class ADDeepseekV4Tokenizer(PreTrainedTokenizerFast):
+    """Tokenizer wrapper that exposes DeepSeek V4's official chat encoding."""
+
+    vocab_files_names = {"tokenizer_file": _TOKENIZER_FILE}
+    model_input_names = ["input_ids", "attention_mask"]
+    slow_tokenizer_class = None
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        *inputs,
+        **kwargs,
+    ) -> "ADDeepseekV4Tokenizer":
+        del inputs
+        for key in ("_from_auto", "_commit_hash", "trust_remote_code"):
+            kwargs.pop(key, None)
+
+        config_path = cached_file(pretrained_model_name_or_path, _TOKENIZER_CONFIG_FILE, **kwargs)
+        assert config_path is not None
+        config = json.loads(Path(config_path).read_text())
+
+        tokenizer_file = cached_file(pretrained_model_name_or_path, _TOKENIZER_FILE, **kwargs)
+        assert tokenizer_file is not None
+
+        tokenizer = cls(
+            tokenizer_object=Tokenizer.from_file(tokenizer_file),
+            name_or_path=str(pretrained_model_name_or_path),
+            bos_token=_token_content(config.get("bos_token")),
+            eos_token=_token_content(config.get("eos_token")),
+            unk_token=_token_content(config.get("unk_token")),
+            pad_token=_token_content(config.get("pad_token")),
+            clean_up_tokenization_spaces=config.get("clean_up_tokenization_spaces", False),
+            model_max_length=config.get("model_max_length"),
+            padding_side=config.get("padding_side", "left"),
+            truncation_side=config.get("truncation_side", "left"),
+            is_local=True,
+            fix_mistral_regex=False,
+        )
+        tokenizer.chat_template = _DSV4_CHAT_TEMPLATE_MARKER
+        return tokenizer
+
+    def apply_chat_template(
+        self,
+        conversation: Sequence[Mapping[str, Any]],
+        tokenize: bool = True,
+        return_dict: bool = False,
+        return_tensors: Optional[str] = None,
+        return_attention_mask: bool = True,
+        **kwargs,
+    ):
+        prompt = _format_deepseek_v4_chat_messages(conversation)
+        if not tokenize:
+            return prompt
+
+        kwargs.pop("add_generation_prompt", None)
+        kwargs["add_special_tokens"] = False
+        encoded = self(
+            prompt,
+            return_tensors=return_tensors,
+            return_attention_mask=return_attention_mask,
+            **kwargs,
+        )
+        if return_dict:
+            return encoded
+        return encoded["input_ids"]
 
 
 def _normalize_deepseek_v4_rope_scaling(
@@ -740,7 +883,7 @@ class DeepseekV4MoE(nn.Module):
         self.shared_experts = DeepseekV4MLP(
             config.hidden_size,
             shared_intermediate_size,
-            swiglu_limit=0.0,
+            swiglu_limit=self.swiglu_limit,
         )
 
     def _register_mxfp4_runtime_buffers(self) -> None:
@@ -922,8 +1065,9 @@ class DeepseekV4Compressor(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len, _ = kv_all.shape
         ratio = self.compress_ratio
-        assert seq_len <= self.max_compressed_tokens, (
-            "DeepSeek V4 compressor sequence length exceeds ad_compress_max_seq_len"
+        torch._check(
+            seq_len <= self.max_compressed_tokens,
+            lambda: "DeepSeek V4 compressor sequence length exceeds ad_compress_max_seq_len",
         )
 
         row_offsets = torch.arange(self.max_compressed_len, device=kv_all.device)
@@ -1571,6 +1715,11 @@ AutoModelForCausalLMFactory.register_custom_model_cls("DeepseekV4Config", Deepse
 @ModelFactoryRegistry.register("DeepseekV4AutoModelForCausalLM")
 class DeepseekV4AutoModelForCausalLMFactory(AutoModelForCausalLMFactory):
     """DeepSeek V4 factory for export sizing and config overrides."""
+
+    def init_tokenizer(self) -> Optional[Any]:
+        if self.tokenizer is None:
+            return None
+        return ADDeepseekV4Tokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
     def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         model_config, unused_kwargs = super()._get_model_config()

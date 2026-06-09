@@ -506,6 +506,7 @@ def _compressed_row_from_unpaged_state(
     compressor_gate_cache: torch.Tensor,
     slot_idx: int,
     row_idx: int,
+    row_position_id: int,
     compressor_ape: torch.Tensor,
     compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
@@ -565,8 +566,9 @@ def _compressed_row_from_unpaged_state(
     pooled = (kv * gate.softmax(dim=0)).sum(dim=0)
     pooled = _rms_norm_ref(pooled.unsqueeze(0), compressor_norm_weight, rms_norm_eps).squeeze(0)
     del state_dim
-    cos = cos_table[anchor].unsqueeze(0)
-    sin = sin_table[anchor].unsqueeze(0)
+    row_position_id = max(0, min(row_position_id, cos_table.shape[0] - 1))
+    cos = cos_table[row_position_id].unsqueeze(0)
+    sin = sin_table[row_position_id].unsqueeze(0)
     return _apply_compressed_rope_and_quantize(
         pooled.unsqueeze(0),
         cos,
@@ -579,6 +581,7 @@ def _compressed_row_from_unpaged_state(
 def _update_compressed_unpaged_caches(
     compressor_kv_seq: torch.Tensor,
     compressor_gate_seq: torch.Tensor,
+    position_ids_seq: torch.Tensor,
     compressor_ape: torch.Tensor,
     compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
@@ -612,13 +615,21 @@ def _update_compressed_unpaged_caches(
         (input_pos + compressor_kv_seq.shape[0]) // compress_ratio, max_compressed_len
     )
     compressed_rows = []
+    flat_position_ids = position_ids_seq.reshape(-1)
+    first_position_id = int(flat_position_ids[0].item())
     for row_idx in range(old_completed, new_completed):
+        row_token_offset = row_idx * compress_ratio - input_pos
+        if 0 <= row_token_offset < flat_position_ids.numel():
+            row_position_id = int(flat_position_ids[row_token_offset].item())
+        else:
+            row_position_id = first_position_id + row_token_offset
         compressed_rows.append(
             _compressed_row_from_unpaged_state(
                 compressor_kv_cache,
                 compressor_gate_cache,
                 slot_idx,
                 row_idx,
+                row_position_id,
                 compressor_ape,
                 compressor_norm_weight,
                 cos_table,
@@ -666,6 +677,7 @@ def _select_ratio4_indexer_rows(
     indexer_compressor_gate_cache: torch.Tensor,
     slot_idx: int,
     query_pos: int,
+    query_position_id: int,
     index_topk: int,
     indexer_compressor_ape: torch.Tensor,
     indexer_compressor_norm_weight: torch.Tensor,
@@ -691,6 +703,7 @@ def _select_ratio4_indexer_rows(
                 indexer_compressor_gate_cache,
                 slot_idx,
                 row_idx,
+                query_position_id - (query_pos - row_idx * 4),
                 indexer_compressor_ape,
                 indexer_compressor_norm_weight,
                 cos_table,
@@ -732,6 +745,7 @@ def _cached_compressed_attention(
     mhc_cache: torch.Tensor,
     slot_idx: int,
     input_pos: int,
+    position_ids_seq: torch.Tensor,
     window_size: int,
     compress_ratio: int,
     max_compressed_len: int,
@@ -749,8 +763,10 @@ def _cached_compressed_attention(
     rope_dim: Optional[int] = None,
 ) -> torch.Tensor:
     outputs = []
+    flat_position_ids = position_ids_seq.reshape(-1)
     for token_offset in range(q_seq.shape[0]):
         query_pos = input_pos + token_offset
+        query_position_id = int(flat_position_ids[token_offset].item())
         local_start = max(0, query_pos - window_size + 1)
         local_kv = _gather_unpaged_rows(
             swa_cache,
@@ -785,6 +801,7 @@ def _cached_compressed_attention(
                 indexer_compressor_gate_cache,
                 slot_idx,
                 query_pos,
+                query_position_id,
                 index_topk,
                 indexer_compressor_ape,
                 indexer_compressor_norm_weight,
@@ -960,6 +977,7 @@ def _batched_compressed_rows_from_unpaged_state(
     compressor_gate_cache: torch.Tensor,
     slot_idx: torch.Tensor,
     row_idx: torch.Tensor,
+    row_position_id: torch.Tensor,
     compressor_ape: torch.Tensor,
     compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
@@ -1020,8 +1038,9 @@ def _batched_compressed_rows_from_unpaged_state(
 
     pooled = (kv * gate.softmax(dim=1)).sum(dim=1)
     pooled = _rms_norm_ref(pooled, compressor_norm_weight, rms_norm_eps)
-    cos = cos_table[anchor.clamp(min=0, max=cos_table.shape[0] - 1)]
-    sin = sin_table[anchor.clamp(min=0, max=sin_table.shape[0] - 1)]
+    row_position_id = row_position_id.to(torch.long).clamp(min=0, max=cos_table.shape[0] - 1)
+    cos = cos_table[row_position_id]
+    sin = sin_table[row_position_id]
     return _apply_compressed_rope_and_quantize(
         pooled,
         cos,
@@ -1034,6 +1053,7 @@ def _batched_compressed_rows_from_unpaged_state(
 def _update_decode_compressed_caches(
     compressor_kv_decode: torch.Tensor,
     compressor_gate_decode: torch.Tensor,
+    position_ids_decode: torch.Tensor,
     compressor_ape: torch.Tensor,
     compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
@@ -1061,11 +1081,13 @@ def _update_decode_compressed_caches(
     new_completed = (input_pos + 1) // compress_ratio
     row_valid = (new_completed > old_completed) & (old_completed < max_compressed_len)
     row_idx = old_completed.clamp(min=0, max=max_compressed_len - 1)
+    row_position_id = position_ids_decode.to(torch.long) - (input_pos - row_idx * compress_ratio)
     compressed_rows = _batched_compressed_rows_from_unpaged_state(
         compressor_kv_cache,
         compressor_gate_cache,
         slot_idx,
         row_idx,
+        row_position_id,
         compressor_ape,
         compressor_norm_weight,
         cos_table,
@@ -1092,6 +1114,7 @@ def _select_decode_ratio4_indexer_rows(
     indexer_compressor_gate_cache: torch.Tensor,
     slot_idx: torch.Tensor,
     input_pos: torch.Tensor,
+    position_ids_decode: torch.Tensor,
     index_topk: int,
     indexer_compressor_ape: torch.Tensor,
     indexer_compressor_norm_weight: torch.Tensor,
@@ -1110,12 +1133,17 @@ def _select_decode_ratio4_indexer_rows(
     candidate_rows = candidate_rows.view(1, -1).expand(q_index.shape[0], -1)
     flat_slot_idx = slot_idx.unsqueeze(1).expand_as(candidate_rows).reshape(-1)
     flat_rows = candidate_rows.reshape(-1)
+    row_position_id = position_ids_decode.unsqueeze(1) - (
+        input_pos.unsqueeze(1) - candidate_rows * 4
+    )
+    flat_row_position_id = row_position_id.reshape(-1)
     index_head_dim = int(q_index.shape[-1])
     index_k = _batched_compressed_rows_from_unpaged_state(
         indexer_compressor_kv_cache,
         indexer_compressor_gate_cache,
         flat_slot_idx,
         flat_rows,
+        flat_row_position_id,
         indexer_compressor_ape,
         indexer_compressor_norm_weight,
         cos_table,
@@ -1165,6 +1193,7 @@ def _decode_compressed_cache_attention(
     sin_table: torch.Tensor,
     slot_idx: torch.Tensor,
     input_pos: torch.Tensor,
+    position_ids_decode: torch.Tensor,
     window_size: int,
     compress_ratio: int,
     max_compressed_len: int,
@@ -1189,6 +1218,7 @@ def _decode_compressed_cache_attention(
             indexer_compressor_gate_cache,
             slot_idx,
             input_pos,
+            position_ids_decode,
             index_topk,
             indexer_compressor_ape,
             indexer_compressor_norm_weight,
@@ -1248,6 +1278,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     indexer_compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
     sin_table: torch.Tensor,
+    position_ids: torch.Tensor,
     input_pos: torch.Tensor,
     slot_idx: torch.Tensor,
     swa_cache: torch.Tensor,
@@ -1271,6 +1302,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     topk_decode = _flatten_decode_tokens(topk_idxs, num_decode)
     slot_idx_decode = slot_idx.reshape(-1)[:num_decode].to(torch.long)
     input_pos_decode = input_pos.reshape(-1)[:num_decode].to(torch.long)
+    position_ids_decode = position_ids.reshape(-1)[:num_decode].to(torch.long)
 
     _write_decode_cache_rows(swa_cache, kv_decode, slot_idx_decode, input_pos_decode)
     if compress_ratio:
@@ -1282,6 +1314,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
         _update_decode_compressed_caches(
             compressor_kv_decode,
             compressor_gate_decode,
+            position_ids_decode,
             compressor_ape,
             compressor_norm_weight,
             cos_table,
@@ -1332,6 +1365,7 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             sin_table,
             slot_idx_decode,
             input_pos_decode,
+            position_ids_decode,
             window_size,
             compress_ratio,
             max_compressed_len,
@@ -1709,6 +1743,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             indexer_compressor_norm_weight,
             cos_table,
             sin_table,
+            position_ids,
             input_pos,
             slot_idx,
             swa_cache,
@@ -1748,6 +1783,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
         q_seq = q_flat[flat_start : flat_start + seq_len_i]
         kv_seq = _slice_sequence_tokens(kv, seq_idx, flat_start, seq_len_i)
         topk_seq = _slice_sequence_tokens(topk_idxs, seq_idx, flat_start, seq_len_i)
+        position_ids_seq = _slice_sequence_positions(position_ids, seq_idx, flat_start, seq_len_i)
         indexer_q_seq = _slice_sequence_tokens(indexer_q, seq_idx, flat_start, seq_len_i)
         indexer_weights_seq = _slice_sequence_tokens(
             indexer_weights, seq_idx, flat_start, seq_len_i
@@ -1784,6 +1820,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             _update_compressed_unpaged_caches(
                 compressor_kv_seq,
                 compressor_gate_seq,
+                position_ids_seq,
                 compressor_ape,
                 compressor_norm_weight,
                 cos_table,
@@ -1810,9 +1847,6 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 )
 
             if input_pos_i == 0:
-                position_ids_seq = _slice_sequence_positions(
-                    position_ids, seq_idx, flat_start, seq_len_i
-                )
                 output_flat[flat_start : flat_start + seq_len_i] = (
                     torch_deepseek_v4_sparse_attention(
                         q_seq.unsqueeze(0),
@@ -1848,6 +1882,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                     mhc_cache,
                     slot_idx_i,
                     input_pos_i,
+                    position_ids_seq,
                     window_size,
                     compress_ratio,
                     compressed_capacity,

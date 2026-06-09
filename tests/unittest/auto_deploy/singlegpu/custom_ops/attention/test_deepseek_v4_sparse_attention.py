@@ -1155,6 +1155,125 @@ def test_cached_ratio128_token_input_pos_matches_full_source() -> None:
     )
 
 
+def test_cached_ratio128_decode_uses_offset_position_ids_for_compressed_row() -> None:
+    torch.manual_seed(229)
+    compress_ratio = 128
+    total_len = 128
+    compressed_capacity_tokens = 256
+    prefill_len = total_len - 1
+    position_offset = 17
+    window_size = 4
+    q = torch.randn(1, total_len, 1, 8)
+    kv = torch.randn(1, total_len, 8)
+    attn_sink = torch.tensor([-0.5])
+    (
+        compressor_kv,
+        compressor_gate,
+        _,
+        compressor,
+        _,
+        _,
+        position_ids,
+    ) = _compressor_case(
+        compress_ratio,
+        total_len,
+        compressed_capacity_tokens=compressed_capacity_tokens,
+    )
+    cos_table, sin_table = _rope_tables(
+        position_offset + compressed_capacity_tokens,
+        compressor.rope_head_dim,
+    )
+    position_ids = position_ids + position_offset
+    state_dim = compressor_kv.shape[-1]
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_sparse_attention_caches(
+            compressed_capacity_tokens,
+            kv.shape[-1],
+            state_dim,
+            fill_value=777.0,
+        )
+    )
+
+    topk_prefill = _visible_source_topk(
+        prefill_len,
+        0,
+        prefill_len,
+        window_size,
+        compress_ratio,
+        compressor.max_compressed_len,
+        q.device,
+    )
+    _run_cached_sparse_attention_with_compressor(
+        q[:, :prefill_len],
+        kv[:, :prefill_len],
+        attn_sink,
+        topk_prefill,
+        compressor_kv[:, :prefill_len],
+        compressor_gate[:, :prefill_len],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, :prefill_len],
+        _context_meta(seq_len=prefill_len),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+
+    output = _run_cached_sparse_attention_with_compressor(
+        q[:, prefill_len:],
+        kv[:, prefill_len:],
+        attn_sink,
+        torch.zeros(1, 1, 1, dtype=torch.int64),
+        compressor_kv[:, prefill_len:],
+        compressor_gate[:, prefill_len:],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, prefill_len:],
+        _decode_meta(input_pos=prefill_len),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+    expected_topk = _visible_source_topk(
+        1,
+        prefill_len,
+        total_len,
+        window_size,
+        compress_ratio,
+        compressor.max_compressed_len,
+        q.device,
+    )
+    expected = _run_sparse_attention_with_compressor(
+        q[:, prefill_len:],
+        kv,
+        attn_sink,
+        expected_topk,
+        compressor_kv,
+        compressor_gate,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+
+    assert_rmse_close(
+        output,
+        expected,
+        rmse_ratio_tol=1e-6,
+        msg="cached ratio-128 offset position_ids decode: ",
+    )
+
+
 def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots() -> None:
     torch.manual_seed(217)
     batch_size = 2
@@ -1816,6 +1935,7 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
     compressor_gate.copy_(compressor_gate_values[1:2, replay_pos : replay_pos + 1])
     metadata[2].copy_(torch.tensor([replay_pos], dtype=torch.int32, device="cuda"))
     metadata[3].copy_(torch.tensor([1], dtype=torch.int64, device="cuda"))
+    position_ids.copy_(torch.tensor([[replay_pos]], dtype=torch.int64, device="cuda"))
     mhc_cache[1, 1].fill_(-33.0)
 
     graph.replay()
@@ -1826,6 +1946,7 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
         compressor_gate_cache,
         1,
         1,
+        compress_ratio,
         compressor_ape,
         compressor_norm_weight,
         cos_table,

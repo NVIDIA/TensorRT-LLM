@@ -36,7 +36,9 @@ def has_safetensors_metadata(ckpt_dir: str | Path) -> bool:
                 f"safetensors index is missing a non-empty weight_map: {index_path}"
             )
         return any((ckpt_path / str(filename)).exists() for filename in set(weight_map.values()))
-    return any(path.name.endswith(".safetensors") for path in ckpt_path.iterdir())
+    if not ckpt_path.is_dir():
+        return False
+    return any(ckpt_path.glob("*.safetensors"))
 
 
 def read_safetensors_metadata(ckpt_dir: str | Path) -> dict[str, dict[str, object]]:

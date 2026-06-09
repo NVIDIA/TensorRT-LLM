@@ -17,6 +17,7 @@ import json
 import struct
 from pathlib import Path
 
+from tensorrt_llm._torch.auto_deploy.models.checkpoint_metadata import has_safetensors_metadata
 from tensorrt_llm._torch.auto_deploy.models.quant_config_reader import HFQuantConfigReader
 
 
@@ -101,3 +102,7 @@ def test_non_deepseek_fp8_config_uses_generic_hf_behavior() -> None:
     assert qcfg["quant_method"] == "fp8"
     assert qcfg["exclude_modules"] == ["custom", "lm_head", "model.embed_tokens"]
     assert "checkpoint_layout" not in qcfg
+
+
+def test_safetensors_metadata_probe_tolerates_missing_directory(tmp_path: Path) -> None:
+    assert not has_safetensors_metadata(tmp_path / "missing")

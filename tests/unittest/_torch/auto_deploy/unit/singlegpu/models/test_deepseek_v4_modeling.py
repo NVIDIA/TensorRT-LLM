@@ -949,6 +949,40 @@ def test_mlp_swiglu_limit_matches_reference() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+def test_deepseek_v4_chat_prompt_format_matches_reference() -> None:
+    assert (
+        dsv4._format_deepseek_v4_chat_messages(
+            [{"role": "user", "content": "How big is the universe? "}]
+        )
+        == "<｜begin▁of▁sentence｜><｜User｜>How big is the universe? <｜Assistant｜></think>"
+    )
+    assert dsv4._format_deepseek_v4_chat_messages(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": "u2"},
+        ]
+    ) == (
+        "<｜begin▁of▁sentence｜>sys<｜User｜>u<｜Assistant｜></think>"
+        "a<｜end▁of▁sentence｜><｜User｜>u2<｜Assistant｜></think>"
+    )
+
+
+def test_moe_shared_experts_use_configured_swiglu_limit() -> None:
+    config = _small_config(num_hidden_layers=1, compress_ratios=(0,))
+    assert config.swiglu_limit > 0
+    moe = DeepseekV4MoE(config, layer_idx=0).eval()
+    _set_mlp_weights(moe.shared_experts, offset=0.4)
+    x = torch.linspace(-2.0, 2.0, 2 * 3 * config.hidden_size).view(2, 3, config.hidden_size)
+
+    assert moe.shared_experts.swiglu_limit == config.swiglu_limit
+    actual = moe.shared_experts(x)
+    expected = _ref_mlp(moe.shared_experts, x, swiglu_limit=config.swiglu_limit)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
 def test_router_hash_and_score_routing_match_reference() -> None:
     assert DeepseekV4Router is not None, "DeepSeek V4 router class must be exposed for tests"
     config = _small_config()

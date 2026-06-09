@@ -14,6 +14,7 @@
 # limitations under the License.
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from functools import partial
 from typing import Dict, List, Optional, Tuple
 
@@ -914,6 +915,14 @@ class INT4GPTQLinearQuantizationFromConfig(Quantization):
         del state_dict[qweight_ckpt]
 
 
+@dataclass(frozen=True)
+class _FineGrainedFP8LinearContext:
+    weight_block_size: Tuple[int, int]
+    runtime_scale_name: str
+    default_scales_layout: Optional[object]
+    input_scale_fmt: str
+
+
 @TransformRegistry.register("quantize_finegrained_fp8_linear_from_config")
 class FineGrainedFP8LinearQuantization(Quantization):
     """Quantization transform for FineGrainedFP8 (block-wise FP8) models.
@@ -932,12 +941,6 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
     algo_name = "fp8"
 
-    def _post_init(self):
-        self._weight_block_size = (128, 128)
-        self._runtime_scale_name = "weight_scale_inv"
-        self._default_scales_layout = None
-        self._input_scale_fmt = ""
-
     def target_op(self):
         return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default
 
@@ -947,22 +950,106 @@ class FineGrainedFP8LinearQuantization(Quantization):
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
 
-    def scale_names(self) -> List[str]:
-        return [self._runtime_scale_name]
+    def scale_names(self, context: Optional[_FineGrainedFP8LinearContext] = None) -> List[str]:
+        runtime_scale_name = context.runtime_scale_name if context else "weight_scale_inv"
+        return [runtime_scale_name]
 
-    def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
-        if self._default_scales_layout is not None:
-            return self._default_scales_layout.default_scales(original_weight_shape)
+    def default_scales(
+        self,
+        original_weight_shape: Tuple,
+        context: Optional[_FineGrainedFP8LinearContext] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if context and context.default_scales_layout is not None:
+            return context.default_scales_layout.default_scales(original_weight_shape)
 
         N, K = original_weight_shape
-        block_n, block_k = self._weight_block_size
+        block_n, block_k = context.weight_block_size if context else (128, 128)
         # Use ceil to handle dimensions smaller than or not divisible by block size
         # (e.g. after TP sharding or small projection weights).
         scale_shape = (math.ceil(N / block_n), math.ceil(K / block_k))
-        return {self._runtime_scale_name: torch.ones(scale_shape, dtype=torch.float32)}
+        return {self.scale_names(context)[0]: torch.ones(scale_shape, dtype=torch.float32)}
 
-    def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
-        return ([], [scales[self.scale_names()[0]]], [], [])
+    def build_custom_args_for_linear(
+        self,
+        scales: Dict[str, Node],
+        context: Optional[_FineGrainedFP8LinearContext] = None,
+    ) -> Tuple:
+        return ([], [scales[self.scale_names(context)[0]]], [], [])
+
+    def _insert_quantized_linear(
+        self,
+        gm: GraphModule,
+        node: Node,
+        is_quantized_graph: bool = False,
+        load_hook_kwargs: Optional[Dict[str, object]] = None,
+        custom_kwargs: Optional[Dict[str, object]] = None,
+        context: Optional[_FineGrainedFP8LinearContext] = None,
+    ):
+        """Replaces a linear node with a fine-grained FP8 custom op."""
+        weight_nodes = extract_weight_nodes(node)
+        if len(weight_nodes.weights) == 0:
+            raise ValueError(f"Linear node {node.name} has no weight")
+        lin_weight = weight_nodes.weights[0]
+
+        new_param = nn.Parameter(self.quantize_weight(lin_weight.tensor), requires_grad=False)
+        modname, _, attrname = lin_weight.node_key.rpartition(".")
+        setattr(lin_weight.submod, attrname, new_param)
+
+        if is_quantized_graph:
+            input_params, weight_params, _output_params = get_quantization_params_from_linear_node(
+                node
+            )
+            node.args = (input_params.input_node, weight_params.input_node, *node.args[2:])
+
+            user = list(node.users.keys())[0]
+            if len(node.users) == 1 and is_quantized_op(user):
+                user.replace_all_uses_with(node)
+
+            input_scale_name = self.scale_names(context)[0]
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    self.convert_amax_hook,
+                    scale_name=modname + "." + input_scale_name,
+                    amax_name=input_params.amax.target,
+                )
+            )
+
+        for scale_name, scale in self.default_scales(lin_weight.tensor.shape, context).items():
+            lin_weight.submod.register_buffer(scale_name, scale)
+
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                self.load_hook,
+                weight_name=lin_weight.node_key,
+                **(load_hook_kwargs or {}),
+            )
+        )
+        if self.post_load_hook:
+            gm.register_load_state_dict_post_hook(
+                partial(self.post_load_hook, weight_name=lin_weight.node_key)
+            )
+
+        with gm.graph.inserting_before(node):
+            scales = {}
+            for scale_name in self.scale_names(context):
+                scales[scale_name] = gm.graph.create_node("get_attr", modname + "." + scale_name)
+
+        custom_args = self.build_custom_args_for_linear(scales, context)
+
+        [tp_mode, output_sizes, tp_min_local_shape, layer_type] = extract_op_args(
+            node, "tp_mode", "output_sizes", "tp_min_local_shape", "layer_type"
+        )
+        [inp, weight, bias] = extract_op_args(node, "input", "weight", "bias")
+        node.target = self.target_op()
+        node.args = (inp, weight, bias, *custom_args)
+        node.kwargs = {
+            **node.kwargs,
+            "tp_mode": tp_mode,
+            "output_sizes": output_sizes,
+            "tp_min_local_shape": tp_min_local_shape,
+            "layer_type": layer_type,
+            **(custom_kwargs or {}),
+        }
 
     def _extract_grouped_linear_match(
         self,
@@ -1012,6 +1099,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
         weight_name: str,
         rank: int,
         load_hook_kwargs: Optional[Dict[str, object]] = None,
+        context: Optional[_FineGrainedFP8LinearContext] = None,
     ) -> None:
         original_weight = gm.get_parameter(weight_name)
         new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
@@ -1020,7 +1108,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
         setattr(submod, attrname, new_param)
         weight_node.meta["val"] = new_param.detach()
 
-        for scale_name, scale in self.default_scales(original_weight.shape).items():
+        for scale_name, scale in self.default_scales(original_weight.shape, context).items():
             if scale_name in submod._buffers:
                 submod._buffers[scale_name] = scale
             else:
@@ -1034,7 +1122,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
             )
         )
 
-        scale_name = self.scale_names()[0]
+        scale_name = self.scale_names(context)[0]
         scale_target = f"{modname}.{scale_name}" if modname else scale_name
         layer_type = _extract_layer_type_hint(source_node, _extract_layer_type_hint(input_node))
 
@@ -1049,7 +1137,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
                     "output_sizes": None,
                     "tp_min_local_shape": rank,
                     "layer_type": layer_type,
-                    "input_scale_fmt": self._input_scale_fmt,
+                    "input_scale_fmt": context.input_scale_fmt if context else "",
                 },
             )
 
@@ -1196,14 +1284,16 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        self._weight_block_size = self._resolve_weight_block_size(qcfg, checkpoint_layout)
-        self._default_scales_layout = checkpoint_layout
-        self._runtime_scale_name = (
-            checkpoint_layout.runtime_scale_name
-            if checkpoint_layout is not None
-            else "weight_scale_inv"
+        quant_context = _FineGrainedFP8LinearContext(
+            weight_block_size=self._resolve_weight_block_size(qcfg, checkpoint_layout),
+            runtime_scale_name=(
+                checkpoint_layout.runtime_scale_name
+                if checkpoint_layout is not None
+                else "weight_scale_inv"
+            ),
+            default_scales_layout=checkpoint_layout,
+            input_scale_fmt=self._resolve_input_scale_fmt(qcfg, checkpoint_layout),
         )
-        self._input_scale_fmt = self._resolve_input_scale_fmt(qcfg, checkpoint_layout)
         if checkpoint_layout is not None:
             excluded = list(
                 dict.fromkeys(
@@ -1237,7 +1327,8 @@ class FineGrainedFP8LinearQuantization(Quantization):
                     n,
                     is_quantized_graph=False,
                     load_hook_kwargs=load_hook_kwargs,
-                    custom_kwargs={"input_scale_fmt": self._input_scale_fmt},
+                    custom_kwargs={"input_scale_fmt": quant_context.input_scale_fmt},
+                    context=quant_context,
                 )
                 cnt += 1
 
@@ -1261,6 +1352,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
                         weight_name,
                         rank,
                         load_hook_kwargs=load_hook_kwargs,
+                        context=quant_context,
                     )
                     cnt += 1
 

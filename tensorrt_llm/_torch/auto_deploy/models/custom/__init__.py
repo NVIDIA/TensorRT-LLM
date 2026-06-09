@@ -31,7 +31,7 @@ _MODEL_MODULES = {
     "modeling_decilm": ["DeciLMForCausalLM"],
     "modeling_deepseek": ["DeepSeekV3ForCausalLM"],
     "modeling_deepseek_v2": ["DeepSeekV2ForCausalLM"],
-    "modeling_deepseek_v4": ["DeepseekV4ForCausalLM"],
+    "modeling_deepseek_v4": ["ADDeepseekV4Tokenizer", "DeepseekV4ForCausalLM"],
     "modeling_exaone": ["ExaoneForCausalLM"],
     "modeling_gemma": ["GemmaADForCausalLM"],
     "modeling_gemma2": ["Gemma2ForCausalLM"],
