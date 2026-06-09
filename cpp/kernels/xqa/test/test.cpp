@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,6 +42,10 @@
 #define USE_SMALL_IO 0
 #else
 #define USE_SMALL_IO 1
+#endif
+
+#ifndef XQA_TEST_POISON_SLIDING_WINDOW_PREFIX_PAGES
+#define XQA_TEST_POISON_SLIDING_WINDOW_PREFIX_PAGES 1
 #endif
 
 void warmup(cudaDeviceProp const& prop, float ms, cudaStream_t stream = nullptr);
@@ -655,6 +659,36 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         }
     }
 
+#if USE_PAGED_KV_CACHE && SLIDING_WINDOW && XQA_TEST_POISON_SLIDING_WINDOW_PREFIX_PAGES
+    {
+        constexpr KVCachePageIndex kPoisonPageIdx = static_cast<KVCachePageIndex>(1U << 20);
+#if SPEC_DEC
+        uint32_t const firstQSeqLen = seqLen - qSeqLen + 1;
+        uint32_t const seqBeg = firstQSeqLen < slidingWinSize ? 0 : firstQSeqLen - slidingWinSize;
+#else
+        uint32_t const seqBeg = seqLen < slidingWinSize ? 0 : seqLen - slidingWinSize;
+#endif
+        uint32_t const nbPoisonPages = std::min<uint32_t>(seqBeg / tokensPerPage, nbPagesPerSeq);
+#if PAGED_KV_CACHE_LAYOUT == 1
+        for (uint32_t batch = 0; batch < batchSize; batch++)
+        {
+            std::fill_n(pageList[batch], nbPoisonPages, kPoisonPageIdx);
+        }
+#else
+        for (uint32_t batch = 0; batch < batchSize; batch++)
+        {
+            for (uint32_t beam = 0; beam < beamWidth; beam++)
+            {
+                for (uint32_t kv = 0; kv < 2; kv++)
+                {
+                    std::fill_n(pageList[batch][beam][kv], nbPoisonPages, kPoisonPageIdx);
+                }
+            }
+        }
+#endif
+    }
+#endif
+
     // Allocate the attention sinks (per head)
     auto attentionSinks = ManagedMemBuf<float>(nbQHeads);
     // The attention sinks ptr.
@@ -1255,6 +1289,7 @@ TEST(RefCheck, llama_V2_70b_3)
 
 #endif
 }
+
 #endif
 
 #else
@@ -1591,6 +1626,19 @@ TEST(NVRTC, compile)
             }
         }
     }
+}
+#endif
+#endif
+
+#if SLIDING_WINDOW && USE_PAGED_KV_CACHE && !IS_MLA
+#if !SPEC_DEC || (!IS_SPEC_DEC_TREE && !defined(SPEC_Q_SEQ_LEN))
+TEST(RefCheck, sliding_window_invalid_prefix_pages)
+{
+#if SPEC_DEC
+    runTest<1, HEAD_GRP_SIZE, 3>(16, 256 + 57, false, true, false, false, false, ~0U, 128);
+#else
+    runTest<1>(16, 256 + 57, false, true, false, false, false, ~0U, 128);
+#endif
 }
 #endif
 #endif

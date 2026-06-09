@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pipeline registry for unified config flow.
 
-Follows: VisualGenArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
+Follows: VisualGenArgs → PipelineLoader → DiffusionPipelineConfig → AutoPipeline → BasePipeline
 
-All pipelines (Wan, Flux, Flux2, LTX2) register via @register_pipeline decorator.
+All pipelines (Wan, Flux, Flux2, LTX2, QwenImage) register via @register_pipeline decorator.
 
 The registry value is a private ``_PipelineEntry`` dataclass that carries
 the pipeline class plus three pieces of per-family metadata:
@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
-    from .config import DiffusionModelConfig
+    from .config import DiffusionPipelineConfig
     from .pipeline import BasePipeline
 
 
@@ -123,11 +123,11 @@ class AutoPipeline:
 
     @staticmethod
     def from_config(
-        config: "DiffusionModelConfig",
+        config: "DiffusionPipelineConfig",
         checkpoint_dir: str,
     ) -> "BasePipeline":
         """
-        Create pipeline instance from DiffusionModelConfig.
+        Create pipeline instance from DiffusionPipelineConfig.
         """
         # Detect pipeline type from model_index.json or from model safetensors
         class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
@@ -147,7 +147,7 @@ class AutoPipeline:
 
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
 
-        # Instantiate pipeline with DiffusionModelConfig
+        # Instantiate pipeline with DiffusionPipelineConfig
         return pipeline_class(config)
 
     @staticmethod
@@ -181,7 +181,13 @@ class AutoPipeline:
                 return "Flux2Pipeline"
             if "Flux" in class_name:
                 return "FluxPipeline"
+            if "QwenImage" in class_name:
+                return "QwenImagePipeline"
 
+            if "Cosmos3" in class_name:
+                return "Cosmos3OmniMoTPipeline"
+
+        #########################################################
         # 2. Single-safetensors with embedded metadata (LTX-2 specific)
         detected = AutoPipeline._detect_from_single_safetensors(checkpoint_dir)
         if detected is not None:

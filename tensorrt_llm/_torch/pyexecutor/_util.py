@@ -1308,14 +1308,14 @@ def _create_kv_cache_manager(
         # Flashinfer has a SW fallback at any SM.
         if (stochastic_rounding
                 and mamba_params.mamba_ssm_cache_dtype == torch.float16
-                and sm < 100 or sm in (120, 121)):
+                and (sm < 100 or sm in (120, 121))):
             logger.info("Replay kernel Philox requires 100 <= sm < 120; "
                         "using legacy MTP path for stochastic rounding support")
             use_replay = False
 
-        # Use replay algorithm for mamba (default is off).
+        # Use replay algorithm for mamba (default is on).
         enforce_disable_replay = os.environ.get('TRTLLM_USE_MAMBA_REPLAY',
-                                                '0') == '0'
+                                                '1') == '0'
         if enforce_disable_replay:
             logger.info(
                 "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
@@ -1324,6 +1324,14 @@ def _create_kv_cache_manager(
             logger.info(
                 "Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
 
+        # Stochastic-rounding seeds must live on the cache manager (not be
+        # re-created with torch.randint per forward) whenever SR can fire
+        # on the fp16 SSM cache.  This mirrors the predicate the mixer uses
+        # internally (`_stochastic_rounding_for_flashinfer` /
+        # `_stochastic_rounding_for_replay`) so allocation matches consumption.
+        mamba_ssm_stochastic_rounding = (stochastic_rounding
+                                         and mamba_params.mamba_ssm_cache_dtype
+                                         == torch.float16)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -1353,6 +1361,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             model_type="nemotron_hybrid",
             use_replay_state_update=use_replay,
+            mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1752,6 +1761,8 @@ def create_py_executor_instance(
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
         dwdp_manager=dwdp_manager,
+        enable_kv_pool_rebalance=llm_args.kv_cache_config.
+        enable_kv_pool_rebalance,
     )
 
 

@@ -25,11 +25,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
-from tensorrt_llm.quantization.modelopt_config import (
-    is_modelopt_quant_config,
-    read_modelopt_quant_config,
-)
-
+from .._compat import is_modelopt_quant_config, read_modelopt_quant_config
 from ..utils.logger import ad_logger
 
 

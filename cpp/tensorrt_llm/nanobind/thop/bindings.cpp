@@ -73,8 +73,9 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), std::get<3>(result), std::get<4>(result), std::get<5>(result),
-        std::get<6>(result), std::get<7>(result), std::get<8>(result));
+        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)),
+        optionalTensorToObject(std::get<4>(result)), optionalTensorToObject(std::get<5>(result)), std::get<6>(result),
+        std::get<7>(result), std::get<8>(result), std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
 nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::Tensor workspace,
@@ -108,8 +109,9 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), std::get<3>(result), optionalTensorToObject(std::get<4>(result)),
-        std::get<5>(result), std::get<6>(result), std::get<7>(result), std::get<8>(result));
+        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)), std::get<4>(result),
+        std::get<5>(result), std::get<6>(result), optionalTensorToObject(std::get<7>(result)), std::get<8>(result),
+        std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
 } // namespace
@@ -134,25 +136,30 @@ void initBindings(nb::module_& m)
         nb::arg("q"), nb::arg("k").none(), nb::arg("v").none(), nb::arg("output"), nb::arg("output_sf").none(),
         nb::arg("workspace_").none(), nb::arg("sequence_length"), nb::arg("host_past_key_value_lengths"),
         nb::arg("host_total_kv_lens"), nb::arg("context_lengths"), nb::arg("host_context_lengths"),
-        nb::arg("host_request_types"), nb::arg("kv_cache_block_offsets").none(),
-        nb::arg("host_kv_cache_pool_pointers").none(), nb::arg("host_kv_cache_pool_mapping").none(),
-        nb::arg("cache_indirection").none(), nb::arg("kv_scale_orig_quant").none(),
-        nb::arg("kv_scale_quant_orig").none(), nb::arg("out_scale").none(), nb::arg("rotary_inv_freq").none(),
-        nb::arg("rotary_cos_sin").none(), nb::arg("latent_cache").none(), nb::arg("q_pe").none(),
-        nb::arg("block_ids_per_seq").none(), nb::arg("attention_sinks").none(), nb::arg("is_fused_qkv"),
-        nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"), nb::arg("layer_idx"), nb::arg("num_heads"),
-        nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block").none(), nb::arg("max_num_requests"),
-        nb::arg("max_context_length"), nb::arg("attention_window_size"), nb::arg("beam_width"), nb::arg("mask_type"),
-        nb::arg("quant_mode"), nb::arg("q_scaling"), nb::arg("position_embedding_type"),
-        nb::arg("rotary_embedding_dim"), nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"),
-        nb::arg("rotary_embedding_scales"), nb::arg("rotary_embedding_max_position_info"),
+        nb::arg("host_request_types"), nb::arg("max_context_q_len_override").none(),
+        nb::arg("kv_cache_block_offsets").none(), nb::arg("host_kv_cache_pool_pointers").none(),
+        nb::arg("host_kv_cache_pool_mapping").none(), nb::arg("cache_indirection").none(),
+        nb::arg("kv_scale_orig_quant").none(), nb::arg("kv_scale_quant_orig").none(), nb::arg("out_scale").none(),
+        nb::arg("rotary_inv_freq").none(), nb::arg("rotary_cos_sin").none(), nb::arg("latent_cache").none(),
+        nb::arg("q_pe").none(), nb::arg("block_ids_per_seq").none(), nb::arg("attention_sinks").none(),
+        nb::arg("is_fused_qkv"), nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"),
+        nb::arg("local_layer_idx"), nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
+        nb::arg("tokens_per_block").none(), nb::arg("max_num_requests"), nb::arg("max_context_length"),
+        nb::arg("max_seq_len"), nb::arg("attention_window_size"), nb::arg("beam_width"), nb::arg("mask_type"),
+        nb::arg("quant_mode"), nb::arg("q_scaling"), nb::arg("position_embedding_type"), nb::arg("rope_dim"),
+        nb::arg("rope_base"), nb::arg("rope_scale_type"), nb::arg("rope_scale"), nb::arg("rope_short_m_scale"),
+        nb::arg("rope_long_m_scale"), nb::arg("rope_max_positions"), nb::arg("rope_original_max_positions"),
         nb::arg("use_paged_context_fmha"), nb::arg("attention_input_type").none(), nb::arg("is_mla_enable"),
         nb::arg("chunked_prefill_buffer_batch_size").none(), nb::arg("q_lora_rank").none(),
         nb::arg("kv_lora_rank").none(), nb::arg("qk_nope_head_dim").none(), nb::arg("qk_rope_head_dim").none(),
         nb::arg("v_head_dim").none(), nb::arg("rope_append").none(), nb::arg("mrope_rotary_cos_sin").none(),
-        nb::arg("mrope_position_deltas").none(), nb::arg("helix_tensor_params"), nb::arg("attention_chunk_size").none(),
-        nb::arg("softmax_stats_tensor").none(), nb::arg("spec_decoding_bool_params"),
-        nb::arg("spec_decoding_tensor_params"), nb::arg("sparse_kv_indices").none(),
+        nb::arg("mrope_position_deltas").none(), nb::arg("helix_position_offsets").none(),
+        nb::arg("helix_is_inactive_rank").none(), nb::arg("attention_chunk_size").none(),
+        nb::arg("softmax_stats_tensor").none(), nb::arg("is_spec_decoding_enabled"), nb::arg("use_spec_decoding"),
+        nb::arg("is_spec_dec_tree"), nb::arg("spec_decoding_generation_lengths").none(),
+        nb::arg("spec_decoding_position_offsets_for_cpp").none(), nb::arg("spec_decoding_packed_mask").none(),
+        nb::arg("spec_decoding_bl_tree_mask_offset").none(), nb::arg("spec_decoding_bl_tree_mask").none(),
+        nb::arg("spec_bl_tree_first_sparse_mask_offset_kv").none(), nb::arg("sparse_kv_indices").none(),
         nb::arg("sparse_kv_offsets").none(), nb::arg("sparse_attn_indices").none(),
         nb::arg("sparse_attn_offsets").none(), nb::arg("sparse_attn_indices_block_size"),
         nb::arg("num_sparse_topk") = std::nullopt, nb::arg("sparse_mla_topk_lens") = std::nullopt,
@@ -165,8 +172,8 @@ void initBindings(nb::module_& m)
         nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("sage_attn_num_elts_per_blk_q") = 0,
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
-        nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt, "Multi-head attention operation",
-        nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
+        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",
@@ -287,13 +294,18 @@ void initBindings(nb::module_& m)
             int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks, int64_t kv_cache_quant_mode,
             int64_t batch_start, int64_t batch_size, at::ScalarType dtype) -> nb::tuple
         {
-            nb::gil_scoped_release release;
-            auto kvPool = torch_ext::buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping, layer_idx, num_kv_heads, tokens_per_block, head_dim, kv_factor,
-                total_num_blocks, kv_cache_quant_mode, dtype);
-            auto const mapping = torch_ext::readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
-            auto blockTables = kv_cache_block_offsets.select(0, mapping.poolIndex).narrow(0, batch_start, batch_size);
-            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables));
+            at::Tensor kvPool;
+            std::optional<at::Tensor> kvScalePool;
+            at::Tensor blockTables;
+            {
+                nb::gil_scoped_release release;
+                std::tie(kvPool, kvScalePool) = torch_ext::buildFlashinferTrtllmGenPagedKvCacheBuffers(
+                    host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, layer_idx, num_kv_heads, tokens_per_block,
+                    head_dim, kv_factor, total_num_blocks, kv_cache_quant_mode, dtype);
+                auto const mapping = torch_ext::readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
+                blockTables = kv_cache_block_offsets.select(0, mapping.poolIndex).narrow(0, batch_start, batch_size);
+            }
+            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables), optionalTensorToObject(kvScalePool));
         },
         nb::arg("host_kv_cache_pool_pointers"), nb::arg("host_kv_cache_pool_mapping"),
         nb::arg("kv_cache_block_offsets"), nb::arg("layer_idx"), nb::arg("num_kv_heads"), nb::arg("tokens_per_block"),

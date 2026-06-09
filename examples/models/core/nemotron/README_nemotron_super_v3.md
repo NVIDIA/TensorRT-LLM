@@ -200,4 +200,4 @@ Key options:
 # Notes
 
 * prefix-cache is not supported for Nemotron Super V3 yet, so please set `enable_block_reuse: false` when launching a server.
-* For detailed deployment instructions, see the [deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.md).
+* For detailed deployment instructions, see the [deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.md).

@@ -16,8 +16,8 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
-from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
-                                     RotaryScalingType)
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RopeEmbeddingUtils, RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -321,12 +321,16 @@ class AttentionMetadata:
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
                                    max_draft_tokens: int = 0,
-                                   buffers=None) -> Self:
+                                   buffers=None,
+                                   encode_only: bool = False) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        When encode_only is True, initialize seq_lens as ones(max_batch_size)
+        and leave num_contexts at the caller's discretion.
         """
         if self.is_cuda_graph:
             return self
@@ -336,13 +340,20 @@ class AttentionMetadata:
         cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True)
+                max_batch_size, True, max_draft_tokens, buffers, encode_only)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
             cuda_graph_metadata._seq_lens_cuda = None
-            cuda_graph_metadata.seq_lens = torch.ones(
-                (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
+            if encode_only:
+                # Encoder: variable seq_lens per batch; the runner in-place
+                # updates them via the seq_lens setter each replay.
+                cuda_graph_metadata.seq_lens = torch.ones((max_batch_size, ),
+                                                          dtype=torch.int)
+            else:
+                cuda_graph_metadata.seq_lens = torch.ones(
+                    (max_batch_size, ),
+                    dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
@@ -357,7 +368,11 @@ class AttentionMetadata:
                     device='cuda',
                 )
 
-        cuda_graph_metadata.num_contexts = 0
+        if not encode_only:
+            # Decoder CUDA graphs are always generation-only (no context
+            # requests). Encoder CUDA graphs are the opposite (all context);
+            # the caller sets num_contexts = padded_batch_size.
+            cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -695,6 +710,20 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
+class AttentionSparseArgs:
+    """Sparse-attention inputs passed to the attention op.
+
+    Backends without sparse attention leave ``AttentionForwardArgs.sparse``
+    at its default-constructed value (all-``None`` / ``0`` fields).
+    """
+    sparse_kv_indices: Optional[torch.Tensor] = None
+    sparse_kv_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices_block_size: int = 0
+
+
+@dataclass(kw_only=True, slots=True)
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
@@ -703,8 +732,8 @@ class AttentionForwardArgs:
 
     out_scale: Optional[torch.Tensor] = None
     out_scale_sf: Optional[torch.Tensor] = None
-    kv_scales_sf: Optional[torch.Tensor] = None
-    kv_scales_sf_inv: Optional[torch.Tensor] = None
+    kv_scale_orig_quant: Optional[torch.Tensor] = None
+    kv_scale_quant_orig: Optional[torch.Tensor] = None
 
     attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
     attention_input_type: AttentionInputType = AttentionInputType.mixed
@@ -734,6 +763,22 @@ class AttentionForwardArgs:
     sage_attn_qk_int8: bool = False
 
     topk_indices: Optional[torch.Tensor] = None
+
+    is_fused_qkv: bool = False
+    update_kv_cache: bool = True
+
+    sparse: AttentionSparseArgs = field(default_factory=AttentionSparseArgs)
+
+    @property
+    def mask_type(self) -> int:
+        """Integer mask type accepted by the C++ attention op
+        (``causal`` or ``padding``)."""
+        if self.attention_mask == PredefinedAttentionMask.CAUSAL:
+            return int(AttentionMaskType.causal)
+        if self.attention_mask == PredefinedAttentionMask.FULL:
+            return int(AttentionMaskType.padding)
+        raise ValueError(
+            f"Unexpected attention mask type: {self.attention_mask!r}")
 
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(

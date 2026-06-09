@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -108,10 +109,11 @@ class DeepEPLowLatency(Communication):
 
     @staticmethod
     def is_platform_supported() -> bool:
-        """
-        Check if DeepEP Low Latency is supported on the current platform
-        """
+        """Check if DeepEP Low Latency is supported on the current platform."""
         if not deep_ep_installed:
+            return False
+        # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
+        if get_sm_version() in (120, 121):
             return False
         return True
 

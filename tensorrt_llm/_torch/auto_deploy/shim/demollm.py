@@ -34,7 +34,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
-from .ad_executor import ADEngine
+from .ad_executor import _RESERVED_MM_DATA_KEYS, ADEngine
 
 FusedMHACallable = Callable[..., torch.Tensor]
 
@@ -164,6 +164,8 @@ class DemoEngine(ADEngine):
             cu_seqlen.append(len(input_ids_flat))
             if request.multimodal_params is not None:
                 for k, v in request.multimodal_params.multimodal_data.items():
+                    if k in _RESERVED_MM_DATA_KEYS:
+                        continue
                     extra_args[k].append(v)
 
         sequence_info.reset()
@@ -173,8 +175,8 @@ class DemoEngine(ADEngine):
             input_ids=input_ids_flat,
             cu_seqlen=cu_seqlen,
             input_pos=[0] * len(total_lens),
-            cache_loc=cache_loc,
-            cu_num_pages=cu_num_pages,
+            cache_loc_per_pool=[cache_loc],
+            cu_num_pages_per_pool=[cu_num_pages],
             slot_idx=list(range(len(total_lens))),
             **extra_args,
         )
@@ -217,8 +219,8 @@ class DemoEngine(ADEngine):
                 input_ids=input_ids_flat,
                 cu_seqlen=cu_seqlen,
                 input_pos=input_pos_next,
-                cache_loc=cache_loc,
-                cu_num_pages=cu_num_pages,
+                cache_loc_per_pool=[cache_loc],
+                cu_num_pages_per_pool=[cu_num_pages],
                 slot_idx=list(range(batch_size)),
                 prompt_lens=total_lens,
             )
