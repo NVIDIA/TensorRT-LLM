@@ -1121,6 +1121,12 @@ class Qwen3VLModelBase(PreTrainedModel):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
+    def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
+        # TODO: Move this hook to MultimodalModelMixin once multimodal models
+        # consistently expose an LLM compile contract.
+        """Compile only the LLM decoder; the vision encoder stays eager."""
+        self.llm.model = torch.compile(self.llm.model, backend=backend, fullgraph=fullgraph)
+
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config.text_config
         pos_embd_params = PositionalEmbeddingParams(
