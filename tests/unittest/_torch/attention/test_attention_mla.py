@@ -394,7 +394,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
     class FakeTrtllmAttention:
 
         @staticmethod
-        def is_chunked_prefill_mla_context_for_warmup(_metadata):
+        def has_cached_kv_for_mla_context_warmup(_metadata):
             return False
 
         @staticmethod
