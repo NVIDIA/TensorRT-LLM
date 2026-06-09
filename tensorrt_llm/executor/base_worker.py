@@ -468,21 +468,8 @@ class BaseWorker(GenerationExecutor):
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
-                multimodal_input = tllm.MultimodalInput(
-                    multimodal_hashes=request.multimodal_params.
-                    multimodal_input.multimodal_hashes,
-                    multimodal_positions=request.multimodal_params.
-                    multimodal_input.multimodal_positions,
-                    multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths,
-                    multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids,
-                    multimodal_item_run_cu_offsets=request.multimodal_params.
-                    multimodal_input.multimodal_item_run_cu_offsets,
-                    multimodal_run_positions=request.multimodal_params.
-                    multimodal_input.multimodal_run_positions,
-                    multimodal_run_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_run_lengths)
+                multimodal_input = request.multimodal_params.multimodal_input.to_binding(
+                    tllm)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -623,7 +610,8 @@ class BaseWorker(GenerationExecutor):
                 executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
+                    # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 

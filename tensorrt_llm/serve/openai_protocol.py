@@ -158,6 +158,10 @@ class DisaggregatedParams(OpenAIBaseModel):
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
     ctx_usage: Optional[UsageInfo] = None
+    # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
+    # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
+    # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
+    # before routing MM encoder -> context -> generation through OpenAI protocol.
 
 
 class ErrorResponse(OpenAIBaseModel):

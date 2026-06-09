@@ -23,7 +23,6 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -51,7 +50,12 @@ from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
-from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
+from .modeling_multimodal_utils import (
+    _MULTIMODAL_ENV_NAME,
+    _is_mm_disagg,
+    find_input_mm_embeds,
+    fuse_input_embeds,
+)
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -68,12 +72,6 @@ from transformers import (  # noqa: E402
     PretrainedConfig,
     PreTrainedModel,
 )
-
-_MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
-
-
-def _is_disagg() -> bool:
-    return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
 class RMSNormNoScale(nn.Module):
@@ -602,7 +600,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return None
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
-        if _is_disagg():
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Gemma4ForConditionalGeneration does not support "
                 "disaggregated inference yet. Please unset the "

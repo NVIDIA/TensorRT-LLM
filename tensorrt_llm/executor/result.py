@@ -546,7 +546,6 @@ class GenerationResultBase:
 
             if hasattr(response_result, "mm_embedding_handles"
                        ) and response_result.mm_embedding_handles is not None:
-                # mm_embedding_handles is a list of handles (one per multimodal item).
                 mm_embedding_handles = response_result.mm_embedding_handles
                 if self._disaggregated_params is not None:
                     self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
