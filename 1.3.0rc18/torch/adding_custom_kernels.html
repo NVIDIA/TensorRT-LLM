@@ -1,0 +1,1074 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Integrating Custom Kernels in TensorRT-LLM &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+
+
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/config_selector.js?v=52eb2d38"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'torch/adding_custom_kernels';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc18" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
+
+
+<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Integrating Custom Kernels in TensorRT-LLM</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="integrating-custom-kernels-in-tensorrt-llm">
+<h1>Integrating Custom Kernels in TensorRT-LLM<a class="headerlink" href="#integrating-custom-kernels-in-tensorrt-llm" title="Link to this heading">#</a></h1>
+<p>This guide walks through adding or modifying GPU kernels and exposing them through the TensorRT-LLM PyTorch path. It covers source/JIT integration flows: <strong>CUDA C++</strong> kernels, <strong>CuTe DSL</strong> kernels, and <strong>cuTile</strong> (<code class="docutils literal notranslate"><span class="pre">cuda.tile</span></code>) kernels. The <strong>trtllm-gen</strong> path (with pre-built CUBIN integration) is <strong>not</strong> covered here.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#overview">Overview</a></p></li>
+<li><p><a class="reference internal" href="#what-defining-a-new-op-involves">What defining a new op involves</a></p></li>
+<li><p><a class="reference internal" href="#cuda-custom-kernel-path">CUDA custom kernel path</a></p></li>
+<li><p><a class="reference internal" href="#cute-dsl-cutile-jit-kernel-path">CuTe DSL / cuTile JIT kernel path</a></p></li>
+<li><p><a class="reference internal" href="#example-walkthrough-indexer-k-cache-scatter-op">Example walkthrough: <code class="docutils literal notranslate"><span class="pre">indexer_k_cache_scatter_op</span></code></a></p></li>
+<li><p><a class="reference internal" href="#testing-and-validation">Testing and validation</a></p></li>
+<li><p><a class="reference internal" href="#common-mistakes">Common mistakes</a></p></li>
+</ol>
+</section>
+<hr class="docutils" />
+<section id="overview">
+<h2>1. Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>A <strong>custom kernel</strong> is any GPU kernel that TensorRT-LLM dispatches to from the PyTorch backend. In practice, the backend never calls a kernel directly: the kernel is wrapped by a <strong>PyTorch custom op</strong> (a <code class="docutils literal notranslate"><span class="pre">torch.ops.trtllm.&lt;name&gt;</span></code> call) and the model code calls that op like any other PyTorch operator.</p>
+<p>This guide focuses on source-level integration where the kernel ships as either:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Flavor</p></th>
+<th class="head text-left"><p>Source language</p></th>
+<th class="head text-left"><p>When it is built</p></th>
+<th class="head text-left"><p>Where it lives</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>CUDA C++</p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">.cu</span></code> / <code class="docutils literal notranslate"><span class="pre">.h</span></code></p></td>
+<td class="text-left"><p>At wheel build time (CMake → <code class="docutils literal notranslate"><span class="pre">nvcc</span></code>)</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/</span></code></a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference external" href="https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html">CuTe DSL</a> (Python)</p></td>
+<td class="text-left"><p>Python using <code class="docutils literal notranslate"><span class="pre">cutlass.cute</span></code> / <code class="docutils literal notranslate"><span class="pre">&#64;cute.kernel</span></code></p></td>
+<td class="text-left"><p>JIT, on first call (cached in-process)</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cute_dsl_kernels/</span></code></a></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><a class="reference external" href="https://docs.nvidia.com/cuda/cutile-python/">cuTile</a> (Python)</p></td>
+<td class="text-left"><p>Python using <code class="docutils literal notranslate"><span class="pre">cuda.tile</span></code> / <code class="docutils literal notranslate"><span class="pre">&#64;ct.kernel</span></code></p></td>
+<td class="text-left"><p>JIT, on first call (cached in-process)</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cuda_tile_kernels/</span></code></a></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<hr class="docutils" />
+<section id="what-defining-a-new-op-involves">
+<h2>2. What defining a new op involves<a class="headerlink" href="#what-defining-a-new-op-involves" title="Link to this heading">#</a></h2>
+<p>Adding a new <code class="docutils literal notranslate"><span class="pre">torch.ops.trtllm.&lt;name&gt;</span></code> means producing four things:</p>
+<ul class="simple">
+<li><p><strong>The kernel</strong> — the kernel source code itself, in CUDA C++ or a Python DSL (CuTe / cuTile).</p></li>
+<li><p><strong>The binding</strong> — a thin C++ or Python wrapper that registers the kernel as a Torch op, validates inputs, and launches it on the right stream.</p></li>
+<li><p><strong>The integration</strong> — <code class="docutils literal notranslate"><span class="pre">torch.ops.trtllm.&lt;name&gt;(...)</span></code> from the existing forward path.</p></li>
+<li><p><strong>The tests</strong> — a unit test that compares the op output against a PyTorch reference.</p></li>
+</ul>
+<p>Sections 3 and 4 cover the kernel and binding; section 6 covers tests; section 5 walks through a complete example. The integration path into the module should follow one principle — <strong>minimal, in-place change</strong>:</p>
+<p>Identify the boundary your op sits at within the <code class="docutils literal notranslate"><span class="pre">nn.Module</span></code>, then wire it into the corresponding call site with a fallback. If an existing op operates at a similar boundary, follow its integration path. Either way, keep the change minimal.</p>
+</section>
+<hr class="docutils" />
+<section id="cuda-custom-kernel-path">
+<h2>3. CUDA custom kernel path<a class="headerlink" href="#cuda-custom-kernel-path" title="Link to this heading">#</a></h2>
+<p>This is the path to take when you want a CUDA C++ kernel that is compiled into the TRT-LLM wheel. <strong>Before you start, scan the existing kernels.</strong> Look under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/</span></code></a> for anything close to what you need.</p>
+<section id="kernel-source">
+<h3>3.1 Kernel source<a class="headerlink" href="#kernel-source" title="Link to this heading">#</a></h3>
+<p>Place the kernel under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/</span></code></a>. The convention is one header (<code class="docutils literal notranslate"><span class="pre">MyKernel.h</span></code>) and one source file (<code class="docutils literal notranslate"><span class="pre">myKernel.cu</span></code>):</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// cpp/tensorrt_llm/kernels/MyKernel.h</span>
+<span class="cp">#pragma once</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/common/config.h&quot;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/common/cudaUtils.h&quot;</span>
+
+<span class="n">TRTLLM_NAMESPACE_BEGIN</span>
+<span class="k">namespace</span><span class="w"> </span><span class="nn">kernels</span><span class="w"> </span><span class="p">{</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">invokeMyKernel</span><span class="p">(</span><span class="cm">/* typed pointers, dims, strides */</span><span class="w"> </span><span class="n">cudaStream_t</span><span class="w"> </span><span class="n">stream</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+
+<span class="p">}</span>
+<span class="n">TRTLLM_NAMESPACE_END</span>
+</pre></div>
+</div>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// cpp/tensorrt_llm/kernels/myKernel.cu</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;MyKernel.h&quot;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/common/assert.h&quot;</span>
+
+<span class="n">TRTLLM_NAMESPACE_BEGIN</span>
+<span class="k">namespace</span><span class="w"> </span><span class="nn">kernels</span><span class="w"> </span><span class="p">{</span>
+
+<span class="k">namespace</span><span class="w"> </span><span class="p">{</span>
+<span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">myKernelImpl</span><span class="p">(</span><span class="cm">/* ... */</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* ... */</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="n">invokeMyKernel</span><span class="p">(</span><span class="cm">/* ... */</span><span class="w"> </span><span class="n">cudaStream_t</span><span class="w"> </span><span class="n">stream</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// shape/dtype assertions via TLLM_CHECK_WITH_INFO</span>
+<span class="w">    </span><span class="n">dim3</span><span class="w"> </span><span class="nf">block</span><span class="p">(</span><span class="cm">/* ... */</span><span class="p">);</span>
+<span class="w">    </span><span class="n">dim3</span><span class="w"> </span><span class="nf">grid</span><span class="p">(</span><span class="cm">/* ... */</span><span class="p">);</span>
+<span class="w">    </span><span class="n">myKernelImpl</span><span class="o">&lt;&lt;&lt;</span><span class="n">grid</span><span class="p">,</span><span class="w"> </span><span class="n">block</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">stream</span><span class="o">&gt;&gt;&gt;</span><span class="p">(</span><span class="cm">/* ... */</span><span class="p">);</span>
+<span class="w">    </span><span class="n">TLLM_CUDA_CHECK</span><span class="p">(</span><span class="n">cudaGetLastError</span><span class="p">());</span>
+<span class="p">}</span>
+
+<span class="p">}</span>
+<span class="n">TRTLLM_NAMESPACE_END</span>
+</pre></div>
+</div>
+<p>The top-level kernels <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/CMakeLists.txt"><code class="docutils literal notranslate"><span class="pre">CMakeLists.txt</span></code></a> already globs <code class="docutils literal notranslate"><span class="pre">*.cu</span></code> and <code class="docutils literal notranslate"><span class="pre">*.cpp</span></code> in this directory, so a new file is picked up automatically. (Subdirectories with their own <code class="docutils literal notranslate"><span class="pre">add_subdirectory(...)</span></code> are excluded from the glob — if you create one, register it in the parent <code class="docutils literal notranslate"><span class="pre">CMakeLists.txt</span></code> like the existing entries.)</p>
+</section>
+<section id="torch-op-binding">
+<h3>3.2 Torch op binding<a class="headerlink" href="#torch-op-binding" title="Link to this heading">#</a></h3>
+<p>Bindings live under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/thop"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/thop/</span></code></a>. A binding is a single <code class="docutils literal notranslate"><span class="pre">.cpp</span></code> file that:</p>
+<ol class="arabic simple">
+<li><p>Wraps the kernel launcher in a function that takes <code class="docutils literal notranslate"><span class="pre">torch::Tensor</span></code> arguments.</p></li>
+<li><p>Validates shapes, dtypes, devices, and contiguity.</p></li>
+<li><p>Registers the op into the <code class="docutils literal notranslate"><span class="pre">trtllm</span></code> <code class="docutils literal notranslate"><span class="pre">torch.library</span></code> namespace and provides a CUDA implementation.</p></li>
+</ol>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// cpp/tensorrt_llm/thop/MyKernelOp.cpp</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/common/opUtils.h&quot;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/runtime/torchUtils.h&quot;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;tensorrt_llm/kernels/MyKernel.h&quot;</span>
+
+<span class="k">namespace</span><span class="w"> </span><span class="nn">th</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">torch</span><span class="p">;</span>
+<span class="k">namespace</span><span class="w"> </span><span class="nn">tk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="o">::</span><span class="nn">kernels</span><span class="p">;</span>
+
+<span class="n">TRTLLM_NAMESPACE_BEGIN</span>
+<span class="k">namespace</span><span class="w"> </span><span class="nn">torch_ext</span><span class="w"> </span><span class="p">{</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">my_kernel_op</span><span class="p">(</span><span class="n">th</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="k">const</span><span class="o">&amp;</span><span class="w"> </span><span class="n">x</span><span class="p">,</span><span class="w"> </span><span class="n">th</span><span class="o">::</span><span class="n">Tensor</span><span class="o">&amp;</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="cm">/*, ... */</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">TORCH_CHECK</span><span class="p">(</span><span class="n">x</span><span class="p">.</span><span class="n">is_cuda</span><span class="p">()</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">out</span><span class="p">.</span><span class="n">is_cuda</span><span class="p">(),</span><span class="w"> </span><span class="s">&quot;Tensors must be CUDA&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">TORCH_CHECK</span><span class="p">(</span><span class="n">x</span><span class="p">.</span><span class="n">is_contiguous</span><span class="p">(),</span><span class="w"> </span><span class="s">&quot;x must be contiguous&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// ... more validation ...</span>
+
+<span class="w">    </span><span class="k">auto</span><span class="w"> </span><span class="n">stream</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">at</span><span class="o">::</span><span class="n">cuda</span><span class="o">::</span><span class="n">getCurrentCUDAStream</span><span class="p">(</span><span class="n">x</span><span class="p">.</span><span class="n">get_device</span><span class="p">());</span>
+<span class="w">    </span><span class="n">tk</span><span class="o">::</span><span class="n">invokeMyKernel</span><span class="p">(</span><span class="cm">/* ... */</span><span class="p">,</span><span class="w"> </span><span class="n">stream</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="p">}</span><span class="w"> </span><span class="c1">// namespace torch_ext</span>
+<span class="n">TRTLLM_NAMESPACE_END</span>
+
+<span class="n">TORCH_LIBRARY_FRAGMENT</span><span class="p">(</span><span class="n">trtllm</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Schema string. Use Tensor(a!) for in-place / mutated outputs.</span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;my_kernel_op(Tensor x, Tensor(a!) out) -&gt; ()&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">TORCH_LIBRARY_IMPL</span><span class="p">(</span><span class="n">trtllm</span><span class="p">,</span><span class="w"> </span><span class="n">CUDA</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">impl</span><span class="p">(</span><span class="s">&quot;my_kernel_op&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">tensorrt_llm</span><span class="o">::</span><span class="n">torch_ext</span><span class="o">::</span><span class="n">my_kernel_op</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Then add the new file to the <code class="docutils literal notranslate"><span class="pre">th_common</span></code> library in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/thop/CMakeLists.txt"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/thop/CMakeLists.txt</span></code></a> (it is <strong>not</strong> globbed; new entries are listed explicitly).</p>
+<p>After rebuilding the wheel, the op is callable from Python as:</p>
+<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">trtllm</span><span class="o">.</span><span class="n">my_kernel_op</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">out</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="calling-the-op-from-python">
+<h3>3.3 Calling the op from Python<a class="headerlink" href="#calling-the-op-from-python" title="Link to this heading">#</a></h3>
+<p>From the PyTorch backend (e.g., a module forward, an attention backend, a metadata helper), call the op directly:</p>
+<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">trtllm</span><span class="o">.</span><span class="n">my_kernel_op</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">out</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>If your op returns tensors and you want it to be <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>/FakeTensor friendly, also register a <em>fake/meta</em> implementation so shape inference works. For C++-defined ops, fakes are typically registered together in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py</span></code></a> inside the <code class="docutils literal notranslate"><span class="pre">_register_fake()</span></code> function, using <code class="docutils literal notranslate"><span class="pre">&#64;torch.library.register_fake(&quot;trtllm::my_kernel_op&quot;)</span></code>.</p>
+</section>
+<section id="tests">
+<h3>3.4 Tests<a class="headerlink" href="#tests" title="Link to this heading">#</a></h3>
+<p>Add a unit test under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tests/unittest"><code class="docutils literal notranslate"><span class="pre">tests/unittest/</span></code></a>. For an op that touches an attention backend the natural location is <code class="docutils literal notranslate"><span class="pre">tests/unittest/_torch/...</span></code>. Write a Python reference, run both, and compare with <code class="docutils literal notranslate"><span class="pre">torch.testing.assert_close</span></code> (or a stricter exact comparison if the kernel is deterministic and integer-typed).</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="cute-dsl-cutile-jit-kernel-path">
+<h2>4. CuTe DSL / cuTile JIT kernel path<a class="headerlink" href="#cute-dsl-cutile-jit-kernel-path" title="Link to this heading">#</a></h2>
+<p>CuTe DSL and cuTile kernels are written in Python and JIT-compiled at runtime. They never appear in the C++ build — they are imported from <code class="docutils literal notranslate"><span class="pre">_torch/</span></code> and launched directly.</p>
+<section id="where-they-live">
+<h3>4.1 Where they live<a class="headerlink" href="#where-they-live" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Flavor</p></th>
+<th class="head text-left"><p>Directory</p></th>
+<th class="head text-left"><p>Availability flag</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>CuTe DSL</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cute_dsl_kernels/</span></code></a> (Blackwell variants under <code class="docutils literal notranslate"><span class="pre">blackwell/</span></code>)</p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">IS_CUTLASS_DSL_AVAILABLE</span></code> in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_utils.py"><code class="docutils literal notranslate"><span class="pre">cute_dsl_utils.py</span></code></a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>cuTile</p></td>
+<td class="text-left"><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cuda_tile_kernels/</span></code></a></p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">IS_CUDA_TILE_AVAILABLE</span></code> in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_utils.py"><code class="docutils literal notranslate"><span class="pre">cuda_tile_utils.py</span></code></a></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="kernel-skeleton">
+<h3>4.2 Kernel skeleton<a class="headerlink" href="#kernel-skeleton" title="Link to this heading">#</a></h3>
+<p><strong>CuTe DSL.</strong> The kernel is a class (or a free function) decorated with <code class="docutils literal notranslate"><span class="pre">&#64;cute.jit</span></code> for host code and <code class="docutils literal notranslate"><span class="pre">&#64;cute.kernel</span></code> for the device entry point. Compilation is cached by the call site and reused across launches. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/argmax.py"><code class="docutils literal notranslate"><span class="pre">cute_dsl_kernels/argmax.py</span></code></a> for a self-contained reduction example, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_gemm_persistent.py"><code class="docutils literal notranslate"><span class="pre">cute_dsl_kernels/blackwell/dense_gemm_persistent.py</span></code></a> for a GEMM with TMA + persistent scheduling.</p>
+<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="c1"># tensorrt_llm/_torch/cute_dsl_kernels/my_kernel.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..cute_dsl_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IS_CUTLASS_DSL_AVAILABLE</span>
+
+<span class="k">if</span> <span class="n">IS_CUTLASS_DSL_AVAILABLE</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">cuda.bindings.driver</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">cuda</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">cutlass</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">cutlass.cute</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">cute</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">cutlass.cute.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="n">from_dlpack</span>
+
+    <span class="k">class</span><span class="w"> </span><span class="nc">MyKernel</span><span class="p">:</span>
+        <span class="nd">@cute</span><span class="o">.</span><span class="n">jit</span>
+        <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mX</span><span class="p">:</span> <span class="n">cute</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">mO</span><span class="p">:</span> <span class="n">cute</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">cuda</span><span class="o">.</span><span class="n">CUstream</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kernel</span><span class="p">(</span><span class="n">mX</span><span class="p">,</span> <span class="n">mO</span><span class="p">)</span><span class="o">.</span><span class="n">launch</span><span class="p">(</span><span class="n">grid</span><span class="o">=</span><span class="p">[</span><span class="o">...</span><span class="p">],</span> <span class="n">block</span><span class="o">=</span><span class="p">[</span><span class="o">...</span><span class="p">],</span> <span class="n">stream</span><span class="o">=</span><span class="n">stream</span><span class="p">)</span>
+
+        <span class="nd">@cute</span><span class="o">.</span><span class="n">kernel</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">kernel</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mX</span><span class="p">:</span> <span class="n">cute</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">mO</span><span class="p">:</span> <span class="n">cute</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+            <span class="c1"># device-side code</span>
+            <span class="o">...</span>
+
+    <span class="n">_compile_cache</span> <span class="o">=</span> <span class="p">{}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">my_kernel</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_compile_cache</span><span class="p">:</span>
+            <span class="n">_compile_cache</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">cute</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
+                <span class="n">MyKernel</span><span class="p">(),</span> <span class="n">from_dlpack</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">from_dlpack</span><span class="p">(</span><span class="n">out</span><span class="p">),</span>
+                <span class="n">cuda</span><span class="o">.</span><span class="n">CUstream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">cuda_stream</span><span class="p">),</span>
+            <span class="p">)</span>
+        <span class="n">_compile_cache</span><span class="p">[</span><span class="n">key</span><span class="p">](</span>
+            <span class="n">from_dlpack</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">from_dlpack</span><span class="p">(</span><span class="n">out</span><span class="p">),</span>
+            <span class="n">cuda</span><span class="o">.</span><span class="n">CUstream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">cuda_stream</span><span class="p">),</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="n">out</span>
+</pre></div>
+</div>
+<p><strong>cuTile.</strong> The kernel is a Python function decorated with <code class="docutils literal notranslate"><span class="pre">&#64;ct.kernel</span></code> that takes tensors plus <code class="docutils literal notranslate"><span class="pre">ct.Constant[...]</span></code> compile-time parameters, and is launched via <code class="docutils literal notranslate"><span class="pre">ct.launch(stream,</span> <span class="pre">grid,</span> <span class="pre">kernel,</span> <span class="pre">args)</span></code>. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_kernels/rms_norm.py"><code class="docutils literal notranslate"><span class="pre">cuda_tile_kernels/rms_norm.py</span></code></a> and the corresponding Torch op wrapper in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py"><code class="docutils literal notranslate"><span class="pre">custom_ops/cuda_tile_custom_ops.py</span></code></a>.</p>
+<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="c1"># tensorrt_llm/_torch/cuda_tile_kernels/my_kernel.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..cuda_tile_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IS_CUDA_TILE_AVAILABLE</span>
+
+<span class="k">if</span> <span class="n">IS_CUDA_TILE_AVAILABLE</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">cuda.tile</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ct</span>
+
+    <span class="nd">@ct</span><span class="o">.</span><span class="n">kernel</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">my_kernel</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">TILE</span><span class="p">:</span> <span class="n">ct</span><span class="o">.</span><span class="n">Constant</span><span class="p">[</span><span class="nb">int</span><span class="p">]):</span>
+        <span class="n">i</span> <span class="o">=</span> <span class="n">ct</span><span class="o">.</span><span class="n">bid</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+        <span class="n">xi</span> <span class="o">=</span> <span class="n">ct</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="p">(</span><span class="n">i</span><span class="p">,),</span> <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="n">TILE</span><span class="p">,))</span>
+        <span class="n">ct</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">y</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="p">(</span><span class="n">i</span><span class="p">,),</span> <span class="n">tile</span><span class="o">=</span><span class="n">xi</span> <span class="o">*</span> <span class="mf">2.0</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="wrapping-the-jit-kernel-as-a-torch-custom-op">
+<h3>4.3 Wrapping the JIT kernel as a Torch custom op<a class="headerlink" href="#wrapping-the-jit-kernel-as-a-torch-custom-op" title="Link to this heading">#</a></h3>
+<p>For both flavors, register a Python custom op so the rest of the codebase calls it through <code class="docutils literal notranslate"><span class="pre">torch.ops.trtllm.&lt;name&gt;(...)</span></code> exactly like a C++ op. Define the op in a guarded block under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/custom_ops"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/custom_ops/</span></code></a> and re-export it from the package <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/__init__.py"><code class="docutils literal notranslate"><span class="pre">__init__.py</span></code></a>.</p>
+<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="c1"># tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py (excerpt)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..cuda_tile_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IS_CUDA_TILE_AVAILABLE</span>
+
+<span class="k">if</span> <span class="n">IS_CUDA_TILE_AVAILABLE</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">cuda.tile</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ct</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">..cuda_tile_kernels</span><span class="w"> </span><span class="kn">import</span> <span class="n">rms_norm_kernel</span>  <span class="c1"># the JIT kernel above</span>
+
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">&quot;trtllm::cuda_tile_rms_norm&quot;</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cuda_tile_rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="n">ct</span><span class="o">.</span><span class="n">launch</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">(),</span> <span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],),</span>
+                  <span class="n">rms_norm_kernel</span><span class="p">,</span> <span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="o">...</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">y</span>
+
+    <span class="nd">@cuda_tile_rms_norm</span><span class="o">.</span><span class="n">register_fake</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">contiguous</span><span class="p">())</span>
+</pre></div>
+</div>
+<p>The same pattern (<code class="docutils literal notranslate"><span class="pre">&#64;torch.library.custom_op(&quot;trtllm::...&quot;)</span></code>, <code class="docutils literal notranslate"><span class="pre">register_fake</span></code>, conditional import gated on the availability flag) is used throughout <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py"><code class="docutils literal notranslate"><span class="pre">cute_dsl_custom_ops.py</span></code></a>.</p>
+</section>
+<section id="runtime-caveats">
+<h3>4.4 Runtime caveats<a class="headerlink" href="#runtime-caveats" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Compute capability checks.</strong> Kernels under <code class="docutils literal notranslate"><span class="pre">cute_dsl_kernels/blackwell/</span></code> and the entire <code class="docutils literal notranslate"><span class="pre">cuda_tile_kernels/</span></code> tree assume sm_100+. Always probe with <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._utils.get_sm_version()</span></code> (see <code class="docutils literal notranslate"><span class="pre">_should_use_torch_fallback</span></code> in <code class="docutils literal notranslate"><span class="pre">argmax.py</span></code>) and route to a fallback otherwise.</p></li>
+<li><p><strong>DLPack/CUDA Graphs.</strong> When exporting tensors via DLPack, use the stream override that mimics the <code class="docutils literal notranslate"><span class="pre">CUDAGraphCompatibleWrapper</span></code> in <code class="docutils literal notranslate"><span class="pre">argmax.py</span></code> so the capture replays cleanly.</p></li>
+<li><p><strong>JIT compile cache.</strong> Always cache compiled kernels by the keys that affect codegen (dtype, last-dim size, hardware variant). <code class="docutils literal notranslate"><span class="pre">argmax.py</span></code> and the <code class="docutils literal notranslate"><span class="pre">cute_dsl_custom_ops.py</span></code> runners are good references.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="example-walkthrough-indexer-k-cache-scatter-op">
+<h2>5. Example walkthrough: <code class="docutils literal notranslate"><span class="pre">indexer_k_cache_scatter_op</span></code><a class="headerlink" href="#example-walkthrough-indexer-k-cache-scatter-op" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">indexer_k_cache_scatter_op</span></code> scatters DeepSeek FP8 indexer K-cache entries — per-token quantized keys plus per-block scales — into a paged K-cache in a single CUDA kernel launch.</p>
+<ul class="simple">
+<li><p><strong>The kernel.</strong> <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/IndexerKCacheScatter.h"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/IndexerKCacheScatter.h</span></code></a> declares <code class="docutils literal notranslate"><span class="pre">invokeIndexerKCacheScatter(...)</span></code>; <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/indexerKCacheScatter.cu"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/indexerKCacheScatter.cu</span></code></a> defines the <code class="docutils literal notranslate"><span class="pre">__global__</span></code> kernel and the host launcher. Picked up automatically by the <code class="docutils literal notranslate"><span class="pre">*.cu</span></code> glob in <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/CMakeLists.txt</span></code>.</p></li>
+<li><p><strong>The binding.</strong> <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/thop/IndexerKCacheScatterOp.cpp"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/thop/IndexerKCacheScatterOp.cpp</span></code></a> validates inputs, fetches the stream, and calls the launcher; registers the op via <code class="docutils literal notranslate"><span class="pre">TORCH_LIBRARY_FRAGMENT(trtllm,</span> <span class="pre">m)</span></code> and <code class="docutils literal notranslate"><span class="pre">TORCH_LIBRARY_IMPL(trtllm,</span> <span class="pre">CUDA,</span> <span class="pre">m)</span></code>. A one-line addition to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/thop/CMakeLists.txt"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/thop/CMakeLists.txt</span></code></a> wires it into <code class="docutils literal notranslate"><span class="pre">th_common</span></code> (this directory is not globbed).</p></li>
+<li><p><strong>The integration.</strong> In <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention_backend/sparse/dsa.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/sparse/dsa.py</span></code></a>, <code class="docutils literal notranslate"><span class="pre">_update_k_cache</span></code> calls <code class="docutils literal notranslate"><span class="pre">torch.ops.trtllm.indexer_k_cache_scatter_op(...)</span></code> in place of the prior Python scatter loop.</p></li>
+<li><p><strong>The tests.</strong> <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py"><code class="docutils literal notranslate"><span class="pre">tests/unittest/_torch/attention/sparse/test_dsa_indexer.py</span></code></a> — <code class="docutils literal notranslate"><span class="pre">test_indexer_k_cache_scatter_custom_op</span></code> runs the CUDA op against a PyTorch reference on two layers of the same cache pool and asserts the outputs match.</p></li>
+</ul>
+<p>The full call chain is three lines:</p>
+<div class="highlight-py notranslate"><div class="highlight"><pre><span></span><span class="c1"># tensorrt_llm/_torch/attention_backend/sparse/dsa.py</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">trtllm</span><span class="o">.</span><span class="n">indexer_k_cache_scatter_op</span><span class="p">(</span>
+    <span class="n">k_fp8</span><span class="p">,</span> <span class="n">k_scale</span><span class="p">,</span> <span class="n">k_cache</span><span class="p">,</span>
+    <span class="n">metadata</span><span class="o">.</span><span class="n">slot_mapping_fp8</span><span class="p">,</span> <span class="n">metadata</span><span class="o">.</span><span class="n">slot_mapping_scale</span><span class="p">,</span>
+    <span class="n">num_tokens</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// cpp/tensorrt_llm/thop/IndexerKCacheScatterOp.cpp</span>
+<span class="n">tk</span><span class="o">::</span><span class="n">invokeIndexerKCacheScatter</span><span class="p">(</span><span class="cm">/* unpacked tensors and strides */</span><span class="p">,</span><span class="w"> </span><span class="n">stream</span><span class="p">);</span>
+</pre></div>
+</div>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// cpp/tensorrt_llm/kernels/indexerKCacheScatter.cu</span>
+<span class="n">indexerKCacheScatterUnifiedKernel</span><span class="o">&lt;&lt;&lt;</span><span class="n">grid</span><span class="p">,</span><span class="w"> </span><span class="n">block</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">stream</span><span class="o">&gt;&gt;&gt;</span><span class="p">(</span><span class="cm">/* ... */</span><span class="p">);</span>
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="testing-and-validation">
+<h2>6. Testing and validation<a class="headerlink" href="#testing-and-validation" title="Link to this heading">#</a></h2>
+<p>A custom kernel without tests is a regression waiting to happen. At minimum:</p>
+<ol class="arabic simple">
+<li><p><strong>Unit test.</strong> Add a test under <code class="docutils literal notranslate"><span class="pre">tests/unittest/_torch/...</span></code> that:</p>
+<ul class="simple">
+<li><p>constructs typical inputs on CUDA;</p></li>
+<li><p>runs your op (<code class="docutils literal notranslate"><span class="pre">torch.ops.trtllm.&lt;name&gt;</span></code>);</p></li>
+<li><p>runs a Python reference (use plain PyTorch — <code class="docutils literal notranslate"><span class="pre">torch.scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">torch.softmax</span></code>, etc.);</p></li>
+<li><p>compares with <code class="docutils literal notranslate"><span class="pre">torch.testing.assert_close</span></code> (and an exact comparison if the kernel is integer/byte-deterministic).</p></li>
+</ul>
+</li>
+<li><p><strong>Shape, dtype, device coverage.</strong> Parametrize at least:</p>
+<ul class="simple">
+<li><p>typical and edge shapes (small N, large N, non-power-of-2 sizes);</p></li>
+<li><p>every supported dtype (especially mixed-precision pairs like <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code> weights × <code class="docutils literal notranslate"><span class="pre">float32</span></code> accumulator);</p></li>
+<li><p>non-contiguous inputs if the kernel claims to support them; otherwise assert and document the contiguity requirement.</p></li>
+</ul>
+</li>
+<li><p><strong>Numerical correctness.</strong> For reductions, fused activations, or attention variants, validate against a deliberately simple, slow PyTorch reference. Avoid comparing to another optimized kernel — that hides bugs that correlate between the two.</p></li>
+<li><p><strong>Performance sanity check (optional but recommended).</strong> A small benchmark in the test file (or in <code class="docutils literal notranslate"><span class="pre">examples/</span></code>) that prints wall-time for a representative shape gives reviewers a concrete improvement number.</p></li>
+<li><p><strong>Hardware availability.</strong> Decorate tests that require Hopper or newer with the appropriate skip (e.g., <code class="docutils literal notranslate"><span class="pre">&#64;skip_pre_hopper</span></code> / <code class="docutils literal notranslate"><span class="pre">&#64;pytest.mark.skipif(not</span> <span class="pre">has_&lt;dep&gt;(),</span> <span class="pre">...)</span></code>), as is done in <code class="docutils literal notranslate"><span class="pre">test_dsa_indexer.py</span></code>.</p></li>
+</ol>
+<p>Set <code class="docutils literal notranslate"><span class="pre">LLM_MODELS_ROOT</span></code> for any test that loads weights — most kernel-only unit tests do <strong>not</strong> need it, but full-model integration tests do (see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/AGENTS.md"><code class="docutils literal notranslate"><span class="pre">AGENTS.md</span></code></a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/ci-overview.md"><code class="docutils literal notranslate"><span class="pre">docs/source/developer-guide/ci-overview.md</span></code></a>).</p>
+</section>
+<hr class="docutils" />
+<section id="common-mistakes">
+<h2>7. Common mistakes<a class="headerlink" href="#common-mistakes" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Forgetting op registration.</strong> The op must be visible on <code class="docutils literal notranslate"><span class="pre">torch.ops.trtllm.&lt;name&gt;</span></code> <em>and</em> have its module imported on Python startup. For C++ ops, <code class="docutils literal notranslate"><span class="pre">TORCH_LIBRARY_FRAGMENT</span></code> + <code class="docutils literal notranslate"><span class="pre">TORCH_LIBRARY_IMPL</span></code> is enough; for Python ops, make sure the wrapper module is imported via <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/__init__.py"><code class="docutils literal notranslate"><span class="pre">custom_ops/__init__.py</span></code></a>.</p></li>
+<li><p><strong>Assuming contiguity.</strong> The PyTorch tensor you receive may be a non-trivial view (e.g., a slice of a paged KV cache). Either handle strides in the kernel (as <code class="docutils literal notranslate"><span class="pre">indexerKCacheScatter.cu</span></code> does) or call <code class="docutils literal notranslate"><span class="pre">.contiguous()</span></code> in Python before the op.</p></li>
+<li><p><strong>Missing the thop CMake entry.</strong> <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/thop/</span></code> source files are listed explicitly in <code class="docutils literal notranslate"><span class="pre">CMakeLists.txt</span></code>. Forgetting to add yours leads to “undefined reference to” or “no implementation for op” errors that are easy to misdiagnose.</p></li>
+<li><p><strong>Schema / signature mismatch.</strong> The Python call site, the C++ schema string in <code class="docutils literal notranslate"><span class="pre">m.def(...)</span></code>, and the C++ implementation must agree on argument count, argument names, optionality, and return type. A <code class="docutils literal notranslate"><span class="pre">Tensor(a!)</span></code> in the schema is required if you mutate that tensor in place.</p></li>
+<li><p><strong>Missing dtype / device / contiguity checks.</strong> A kernel that does <code class="docutils literal notranslate"><span class="pre">reinterpret_cast&lt;uint32_t*&gt;(...)</span></code> is implicitly assuming element size and alignment. Always assert these in the binding (<code class="docutils literal notranslate"><span class="pre">TORCH_CHECK(t.element_size()</span> <span class="pre">==</span> <span class="pre">...,</span> <span class="pre">...)</span></code>, <code class="docutils literal notranslate"><span class="pre">TORCH_CHECK(t.is_contiguous(),</span> <span class="pre">...)</span></code>).</p></li>
+<li><p><strong>Skipping the fake/meta registration.</strong> Ops that don’t have a fake registered will break under <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> and FakeTensor-based shape inference. Register one whenever the op returns a tensor.</p></li>
+<li><p><strong>JIT compile-cache key bugs.</strong> For CuTe DSL / cuTile, an under-specified cache key (e.g., omitting dtype) produces correct results until someone changes the dtype of the call site. Include every parameter that influences codegen.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">1. Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-defining-a-new-op-involves">2. What defining a new op involves</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-custom-kernel-path">3. CUDA custom kernel path</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-source">3.1 Kernel source</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#torch-op-binding">3.2 Torch op binding</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#calling-the-op-from-python">3.3 Calling the op from Python</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tests">3.4 Tests</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cute-dsl-cutile-jit-kernel-path">4. CuTe DSL / cuTile JIT kernel path</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#where-they-live">4.1 Where they live</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-skeleton">4.2 Kernel skeleton</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#wrapping-the-jit-kernel-as-a-torch-custom-op">4.3 Wrapping the JIT kernel as a Torch custom op</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-caveats">4.4 Runtime caveats</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#example-walkthrough-indexer-k-cache-scatter-op">5. Example walkthrough: <code class="docutils literal notranslate"><span class="pre">indexer_k_cache_scatter_op</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing-and-validation">6. Testing and validation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#common-mistakes">7. Common mistakes</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 08, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
