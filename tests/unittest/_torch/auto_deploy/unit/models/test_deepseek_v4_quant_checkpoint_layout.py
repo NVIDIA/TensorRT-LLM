@@ -65,7 +65,7 @@ def _write_deepseek_v4_checkpoint_fixture(tmp_path: Path) -> None:
     (tmp_path / safetensors_name).write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes)
 
 
-def test_deepseek_v4_hf_reader_selects_checkpoint_layout_and_model_kwargs(
+def test_deepseek_v4_hf_reader_selects_checkpoint_layout_and_quant_config(
     tmp_path: Path,
 ) -> None:
     _write_deepseek_v4_checkpoint_fixture(tmp_path)
@@ -75,7 +75,7 @@ def test_deepseek_v4_hf_reader_selects_checkpoint_layout_and_model_kwargs(
     assert result is not None
     reader, extra_model_kwargs = result
     qcfg = reader.get_config()
-    assert extra_model_kwargs == {"ad_use_mxfp4_experts": True}
+    assert extra_model_kwargs == {}
     assert qcfg["checkpoint_layout"] is not None
     assert qcfg["expert_quant_method"] == "mxfp4"
     assert qcfg["expert_block_size"] == 32

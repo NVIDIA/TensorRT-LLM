@@ -39,7 +39,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from ... import custom_ops  # noqa: F401 -- register custom ops
-from ..._compat import ActivationType
 from ...utils.quantization_utils import fake_fp4_act_quant as _fake_fp4_act_quant
 from ...utils.quantization_utils import fake_fp8_act_quant as _fake_fp8_act_quant
 from ...utils.quantization_utils import hadamard_rotate as _hadamard_rotate
@@ -134,7 +133,6 @@ class DeepseekV4Config(PretrainedConfig):
         hc_eps: float = 1e-6,
         ad_rope_cache_len: Optional[int] = None,
         ad_compress_max_seq_len: Optional[int] = None,
-        ad_use_mxfp4_experts: bool = False,
         skip_mtp: bool = True,
         use_cache: bool = False,
         attention_bias: bool = False,
@@ -187,7 +185,6 @@ class DeepseekV4Config(PretrainedConfig):
         self.hc_eps = hc_eps
         self.ad_rope_cache_len = ad_rope_cache_len or min(max_position_embeddings, 4096)
         self.ad_compress_max_seq_len = ad_compress_max_seq_len or self.ad_rope_cache_len
-        self.ad_use_mxfp4_experts = ad_use_mxfp4_experts
         self.skip_mtp = skip_mtp
         self.use_cache = use_cache
         self.attention_bias = attention_bias
@@ -326,7 +323,6 @@ def _build_deepseek_v4_checkpoint_layout(
             scale_fmt=scale_fmt,
         ),
         checkpoint_consumers=(expert_layout,),
-        extra_model_kwargs={"ad_use_mxfp4_experts": True},
         extra_quant_config={
             "expert_quant_method": expert_layout.quant_method,
             "expert_block_size": expert_layout.expert_block_size,
@@ -339,16 +335,6 @@ _EXPERT_ALIAS_TO_WEIGHT = {
     "up_proj": "w3",
     "down_proj": "w2",
 }
-
-_STACKED_EXPERT_RE = re.compile(
-    r"^(?P<prefix>layers\.\d+\.ffn\.)experts\.(?P<which>w[123])\.weight$"
-)
-_FUSED_EXPERT_GATE_UP_RE = re.compile(
-    r"^(?P<prefix>layers\.\d+\.ffn\.)experts\.gate_up_proj(?:\.weight)?$"
-)
-_STACKED_EXPERT_DOWN_RE = re.compile(
-    r"^(?P<prefix>layers\.\d+\.ffn\.)experts\.down_proj(?:\.weight)?$"
-)
 
 
 def _rename_deepseek_v4_checkpoint_key(key: str) -> str:
@@ -374,40 +360,6 @@ def _rename_deepseek_v4_checkpoint_key(key: str) -> str:
     )
 
 
-def _expand_deepseek_v4_expert_checkpoint_key(
-    key: str,
-    tensor: torch.Tensor,
-) -> Optional[dict[str, torch.Tensor]]:
-    direct_match = _STACKED_EXPERT_RE.match(key)
-    if direct_match is not None:
-        prefix = direct_match.group("prefix")
-        which = direct_match.group("which")
-        return {
-            f"{prefix}experts.{expert_idx}.{which}.weight": tensor[expert_idx]
-            for expert_idx in range(tensor.shape[0])
-        }
-
-    gate_up_match = _FUSED_EXPERT_GATE_UP_RE.match(key)
-    if gate_up_match is not None:
-        prefix = gate_up_match.group("prefix")
-        gate, up = tensor.chunk(2, dim=1)
-        expanded = {}
-        for expert_idx in range(tensor.shape[0]):
-            expanded[f"{prefix}experts.{expert_idx}.w1.weight"] = gate[expert_idx]
-            expanded[f"{prefix}experts.{expert_idx}.w3.weight"] = up[expert_idx]
-        return expanded
-
-    down_match = _STACKED_EXPERT_DOWN_RE.match(key)
-    if down_match is not None:
-        prefix = down_match.group("prefix")
-        return {
-            f"{prefix}experts.{expert_idx}.w2.weight": tensor[expert_idx]
-            for expert_idx in range(tensor.shape[0])
-        }
-
-    return None
-
-
 def _remap_deepseek_v4_checkpoint_keys(state_dict: dict[str, torch.Tensor]) -> None:
     removals = []
     updates = {}
@@ -417,11 +369,7 @@ def _remap_deepseek_v4_checkpoint_keys(state_dict: dict[str, torch.Tensor]) -> N
             removals.append(key)
             continue
 
-        expanded = _expand_deepseek_v4_expert_checkpoint_key(new_key, tensor)
-        if expanded is not None:
-            removals.append(key)
-            updates.update(expanded)
-        elif new_key != key:
+        if new_key != key:
             removals.append(key)
             updates[new_key] = tensor
 
@@ -784,21 +732,10 @@ class DeepseekV4MoE(nn.Module):
         self.intermediate_size = config.moe_intermediate_size
         self.n_routed_experts = config.n_routed_experts
         self.swiglu_limit = config.swiglu_limit
-        self.ad_use_mxfp4_experts = bool(getattr(config, "ad_use_mxfp4_experts", False))
         self.gate = DeepseekV4MoEGate(config, layer_idx)
-        self.experts = nn.ModuleList(
-            [
-                DeepseekV4MLP(
-                    config.hidden_size,
-                    config.moe_intermediate_size,
-                    swiglu_limit=config.swiglu_limit,
-                )
-                for _ in range(config.n_routed_experts)
-            ]
-        )
-        if self.ad_use_mxfp4_experts:
-            self._register_mxfp4_runtime_buffers()
-            self._register_load_state_dict_pre_hook(self._load_mxfp4_checkpoint_experts)
+        self.experts = nn.Module()
+        self._register_mxfp4_runtime_buffers()
+        self._register_load_state_dict_pre_hook(self._load_mxfp4_checkpoint_experts)
         shared_intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.shared_experts = DeepseekV4MLP(
             config.hidden_size,
@@ -879,9 +816,6 @@ class DeepseekV4MoE(nn.Module):
         *args,
     ) -> None:
         del args
-        if not self.ad_use_mxfp4_experts:
-            return
-
         layout = build_deepseek_v4_packed_mxfp4_experts_layout()
         target_names = {
             "gate_up_blocks": f"{prefix}experts.gate_up_proj_blocks",
@@ -921,36 +855,22 @@ class DeepseekV4MoE(nn.Module):
         original_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, original_shape[-1])
         selected_experts, routing_weights = self.gate(hidden_states_flat, input_ids.reshape(-1))
-        if self.ad_use_mxfp4_experts:
-            routed = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
-                hidden_states_flat,
-                selected_experts,
-                routing_weights.to(hidden_states_flat.dtype),
-                self.experts.gate_up_proj_blocks,
-                self.experts.gate_up_proj_bias,
-                self.experts.gate_up_proj_scales,
-                1.0,
-                float(self.swiglu_limit),
-                self.experts.down_proj_blocks,
-                self.experts.down_proj_bias,
-                self.experts.down_proj_scales,
-                "up_gate",
-                "deepseek",
-                "moe",
-            )
-        else:
-            routed = torch.ops.auto_deploy.torch_moe(
-                hidden_states_flat,
-                selected_experts,
-                routing_weights.to(hidden_states_flat.dtype),
-                w1_weight=[expert.w1.weight for expert in self.experts],
-                w2_weight=[expert.w2.weight for expert in self.experts],
-                w3_weight=[expert.w3.weight for expert in self.experts],
-                is_gated_mlp=True,
-                act_fn=int(ActivationType.Silu),
-                swiglu_limit=self.swiglu_limit,
-                layer_type="moe",
-            )
+        routed = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+            hidden_states_flat,
+            selected_experts,
+            routing_weights.to(hidden_states_flat.dtype),
+            self.experts.gate_up_proj_blocks,
+            self.experts.gate_up_proj_bias,
+            self.experts.gate_up_proj_scales,
+            1.0,
+            float(self.swiglu_limit),
+            self.experts.down_proj_blocks,
+            self.experts.down_proj_bias,
+            self.experts.down_proj_scales,
+            "up_gate",
+            "deepseek",
+            "moe",
+        )
         return routed.view(*original_shape).to(hidden_states.dtype) + self.shared_experts(
             hidden_states
         )
@@ -1650,7 +1570,7 @@ AutoModelForCausalLMFactory.register_custom_model_cls("DeepseekV4Config", Deepse
 
 @ModelFactoryRegistry.register("DeepseekV4AutoModelForCausalLM")
 class DeepseekV4AutoModelForCausalLMFactory(AutoModelForCausalLMFactory):
-    """DeepSeek V4 factory for PR1 export sizing and config overrides."""
+    """DeepSeek V4 factory for export sizing and config overrides."""
 
     def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
         model_config, unused_kwargs = super()._get_model_config()

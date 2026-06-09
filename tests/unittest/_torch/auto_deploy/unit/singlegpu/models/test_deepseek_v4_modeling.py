@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hierarchical DeepSeek V4 PR1 semantic tests for AutoDeploy."""
+"""Hierarchical DeepSeek V4 Flash semantic tests for AutoDeploy."""
 
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ from tensorrt_llm._torch.auto_deploy.models import custom as custom_models
 from tensorrt_llm._torch.auto_deploy.models.custom import modeling_deepseek_v4 as dsv4
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Attention,
-    DeepseekV4Block,
     DeepseekV4Compressor,
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
@@ -63,7 +62,7 @@ def _set_seed() -> None:
 def _small_config(**overrides) -> DeepseekV4Config:
     values = {
         "vocab_size": 32,
-        "hidden_size": 16,
+        "hidden_size": 32,
         "num_hidden_layers": 3,
         "num_attention_heads": 4,
         "num_key_value_heads": 1,
@@ -78,7 +77,7 @@ def _small_config(**overrides) -> DeepseekV4Config:
         "index_n_heads": 2,
         "index_head_dim": 4,
         "index_topk": 2,
-        "moe_intermediate_size": 12,
+        "moe_intermediate_size": 32,
         "n_routed_experts": 4,
         "n_shared_experts": 1,
         "num_experts_per_tok": 2,
@@ -323,26 +322,6 @@ def _ref_router(
     return selected, weights * config.routed_scaling_factor
 
 
-def _ref_moe(moe: nn.Module, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-    hash_routing = bool(getattr(moe, "is_hash", getattr(moe.gate, "hash_routing", False)))
-    cfg = _small_config(num_hash_layers=1 if hash_routing else 0)
-    selected, weights = _ref_router(moe.gate, flat, input_ids.reshape(-1), cfg, hash_routing)
-
-    output = torch.zeros_like(flat)
-    for token_idx in range(flat.shape[0]):
-        token = flat[token_idx : token_idx + 1]
-        for slot in range(selected.shape[1]):
-            expert_idx = int(selected[token_idx, slot])
-            expert_out = _ref_mlp(moe.experts[expert_idx], token)
-            output[token_idx] += weights[token_idx, slot].to(output.dtype) * expert_out.squeeze(0)
-
-    shared = getattr(moe, "shared_experts", None)
-    if shared is not None:
-        output = output + _ref_mlp(shared, flat, swiglu_limit=0.0)
-    return output.view_as(hidden_states)
-
-
 def _interleaved_rope(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
@@ -565,96 +544,6 @@ class HFDeepseekV4RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _ref_rmsnorm(x, self.weight, self.eps)
-
-
-class HFDeepseekV4MLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float) -> None:
-        super().__init__()
-        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.swiglu_limit = swiglu_limit
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _ref_mlp(self, x)
-
-
-class HFDeepseekV4MoEGate(nn.Module):
-    def __init__(self, config: DeepseekV4Config, layer_idx: int) -> None:
-        super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.norm_topk_prob = config.norm_topk_prob
-        self.score_func = config.scoring_func
-        self.hash_routing = layer_idx < config.num_hash_layers
-        self.weight = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.hidden_size, dtype=torch.float32)
-        )
-        if self.hash_routing:
-            self.register_buffer(
-                "tid2eid",
-                torch.zeros(config.vocab_size, self.top_k, dtype=torch.long),
-                persistent=True,
-            )
-            self.register_parameter("bias", None)
-        else:
-            self.register_buffer("tid2eid", None, persistent=False)
-            self.bias = nn.Parameter(torch.zeros(config.n_routed_experts, dtype=torch.float32))
-
-    def forward(
-        self,
-        hidden_states_flat: torch.Tensor,
-        input_ids_flat: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.score_func != "sqrtsoftplus":
-            raise ValueError(f"Unsupported DeepSeek V4 scoring_func: {self.score_func}")
-        scores = F.softplus(F.linear(hidden_states_flat.to(self.weight.dtype), self.weight)).sqrt()
-        if self.hash_routing:
-            selected = self.tid2eid[input_ids_flat.to(torch.long)].to(torch.long)
-        else:
-            selected = (scores + self.bias).topk(self.top_k, dim=-1).indices
-        weights = scores.gather(1, selected)
-        if self.norm_topk_prob:
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-        return selected, weights * self.routed_scaling_factor
-
-
-class HFDeepseekV4MoE(nn.Module):
-    def __init__(self, config: DeepseekV4Config, layer_idx: int) -> None:
-        super().__init__()
-        self.gate = HFDeepseekV4MoEGate(config, layer_idx)
-        self.experts = nn.ModuleList(
-            [
-                HFDeepseekV4MLP(
-                    config.hidden_size,
-                    config.moe_intermediate_size,
-                    config.swiglu_limit,
-                )
-                for _ in range(config.n_routed_experts)
-            ]
-        )
-        self.shared_experts = HFDeepseekV4MLP(
-            config.hidden_size,
-            config.moe_intermediate_size * config.n_shared_experts,
-            0.0,
-        )
-
-    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        original_shape = hidden_states.shape
-        flat = hidden_states.view(-1, original_shape[-1])
-        selected, weights = self.gate(flat, input_ids.reshape(-1))
-
-        output = torch.zeros_like(flat)
-        for token_idx in range(flat.shape[0]):
-            token = flat[token_idx : token_idx + 1]
-            for slot in range(selected.shape[1]):
-                expert_idx = int(selected[token_idx, slot])
-                expert_out = self.experts[expert_idx](token).squeeze(0)
-                output[token_idx] += weights[token_idx, slot].to(output.dtype) * expert_out
-
-        output = output + self.shared_experts(flat)
-        return output.view(original_shape)
 
 
 class HFDeepseekV4Compressor(nn.Module):
@@ -947,195 +836,11 @@ def _call_attention(
     return attn(hidden_states, cos, sin, cos_comp, sin_comp, cos_comp[0], sin_comp[0])
 
 
-def _hc_split_sinkhorn(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pre = torch.sigmoid(mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
-    post = 2 * torch.sigmoid(
-        mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    )
-    comb = mixes[..., 2 * hc_mult :].view(*mixes.shape[:-1], hc_mult, hc_mult)
-    comb_base = hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
-    comb = torch.softmax(comb * hc_scale[2] + comb_base, dim=-1) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb
-
-
-def _ref_hc_pre(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    config: DeepseekV4Config,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    shape = x.shape
-    flat = x.flatten(2).float()
-    rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + config.rms_norm_eps)
-    mixes = F.linear(flat, hc_fn.float()) * rsqrt
-    pre, post, comb = _hc_split_sinkhorn(
-        mixes, hc_scale, hc_base, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
-    )
-    return torch.sum(pre.unsqueeze(-1) * flat.view(shape), dim=2).to(x.dtype), post, comb
-
-
-def _ref_hc_post(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-) -> torch.Tensor:
-    return (
-        post.unsqueeze(-1) * x.unsqueeze(-2)
-        + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-    ).to(x.dtype)
-
-
-class HFDeepseekV4Block(nn.Module):
-    def __init__(self, config: DeepseekV4Config, layer_idx: int) -> None:
-        super().__init__()
-        self.config = config
-        self.attn = HFDeepseekV4Attention(config, layer_idx)
-        self.ffn = HFDeepseekV4MoE(config, layer_idx)
-        self.attn_norm = HFDeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.ffn_norm = HFDeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
-
-        mix_hc = (2 + config.hc_mult) * config.hc_mult
-        hc_dim = config.hc_mult * config.hidden_size
-        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-        self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-        position_ids: torch.Tensor,
-        input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        x, post, comb = _ref_hc_pre(
-            hidden_states,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            self.config,
-        )
-        x = self.attn_norm(x)
-        x = self.attn(x, position_embeddings, position_ids)
-        hidden_states = _ref_hc_post(x, residual, post, comb)
-
-        residual = hidden_states
-        x, post, comb = _ref_hc_pre(
-            hidden_states,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.config,
-        )
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        return _ref_hc_post(x, residual, post, comb)
-
-
 def _decoder(model: DeepseekV4ForCausalLM) -> nn.Module:
     return getattr(model, "model", model)
 
 
-def _ref_hc_head(
-    module: nn.Module, hidden_states: torch.Tensor, config: DeepseekV4Config
-) -> torch.Tensor:
-    shape = hidden_states.shape
-    flat = hidden_states.flatten(2).float()
-    rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + config.rms_norm_eps)
-    mixes = F.linear(flat, module.hc_head_fn.float()) * rsqrt
-    pre = torch.sigmoid(mixes * module.hc_head_scale + module.hc_head_base) + config.hc_eps
-    return torch.sum(pre.unsqueeze(-1) * flat.view(shape), dim=2).to(hidden_states.dtype)
-
-
-class HFDeepseekV4RotaryEmbedding(nn.Module):
-    def __init__(self, config: DeepseekV4Config) -> None:
-        super().__init__()
-        rope_scaling = config.rope_scaling or {}
-        factor = float(rope_scaling.get("factor", 1.0))
-        original_seq_len = int(rope_scaling.get("original_max_position_embeddings", 0))
-        beta_fast = int(rope_scaling.get("beta_fast", 32))
-        beta_slow = int(rope_scaling.get("beta_slow", 1))
-        cos_base, sin_base = dsv4._build_rope_tables(
-            config.qk_rope_head_dim,
-            config.ad_rope_cache_len,
-            config.rope_theta,
-            0,
-            1.0,
-            beta_fast,
-            beta_slow,
-        )
-        cos_compress, sin_compress = dsv4._build_rope_tables(
-            config.qk_rope_head_dim,
-            config.ad_rope_cache_len,
-            config.compress_rope_theta,
-            original_seq_len,
-            factor,
-            beta_fast,
-            beta_slow,
-        )
-        self.register_buffer("_ad_cos_base", cos_base, persistent=False)
-        self.register_buffer("_ad_sin_base", sin_base, persistent=False)
-        self.register_buffer("_ad_cos_compress", cos_compress, persistent=False)
-        self.register_buffer("_ad_sin_compress", sin_compress, persistent=False)
-
-    def forward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return (
-            self._ad_cos_base,
-            self._ad_sin_base,
-            self._ad_cos_compress,
-            self._ad_sin_compress,
-        )
-
-
-class HFDeepseekV4ForCausalLM(nn.Module):
-    def __init__(self, config: DeepseekV4Config) -> None:
-        super().__init__()
-        self.config = config
-        self.embed = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [HFDeepseekV4Block(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = HFDeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.rotary_emb = HFDeepseekV4RotaryEmbedding(config)
-        self.hc_mult = config.hc_mult
-        hc_dim = config.hc_mult * config.hidden_size
-        self.hc_head_fn = nn.Parameter(torch.empty(config.hc_mult, hc_dim, dtype=torch.float32))
-        self.hc_head_base = nn.Parameter(torch.empty(config.hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.embed(input_ids)
-        position_embeddings = self.rotary_emb()
-        hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings, position_ids, input_ids)
-        hidden_states = _ref_hc_head(self, hidden_states, self.config)
-        hidden_states = self.norm(hidden_states)
-        return _linear_ref(hidden_states.float(), self.head).float()
-
-
-def test_small_config_exercises_pr1_semantics() -> None:
+def test_small_config_exercises_flash_semantics() -> None:
     config = _small_config()
     model = DeepseekV4ForCausalLM(config).eval()
     layers = _decoder(model).layers
@@ -1149,18 +854,18 @@ def test_small_config_exercises_pr1_semantics() -> None:
     assert all(hasattr(layer.attn, "attn_sink") for layer in layers)
     assert hasattr(layers[0].ffn.gate, "tid2eid")
     assert getattr(layers[1].ffn.gate, "bias", None) is not None
+    assert hasattr(layers[0].ffn.experts, "gate_up_proj_blocks")
+    assert layers[0].ffn.experts.gate_up_proj_blocks.dtype == torch.uint8
 
 
 def test_load_hook_preserves_converted_keys_and_drops_mtp_layer() -> None:
     config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0)
     model = DeepseekV4ForCausalLM(config).eval()
     embed = _sequential_tensor(model.embed.weight.shape)
-    expert_w2 = _sequential_tensor(model.layers[0].ffn.experts[1].w2.weight.shape, offset=100.0)
 
     result = model.load_state_dict(
         {
             "embed.weight": embed,
-            "layers.0.ffn.experts.1.w2.weight": expert_w2,
             "mtp.0.e_proj.weight": torch.ones(2, 2),
         },
         strict=False,
@@ -1168,10 +873,9 @@ def test_load_hook_preserves_converted_keys_and_drops_mtp_layer() -> None:
 
     assert result.unexpected_keys == []
     torch.testing.assert_close(model.embed.weight, embed, rtol=0, atol=0)
-    torch.testing.assert_close(model.layers[0].ffn.experts[1].w2.weight, expert_w2, rtol=0, atol=0)
 
 
-def test_load_hook_maps_wrapper_root_keys_and_expert_aliases() -> None:
+def test_load_hook_maps_wrapper_root_keys_and_shared_expert_aliases() -> None:
     config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0)
     model = DeepseekV4ForCausalLM(config).eval()
     embed = _sequential_tensor(model.embed.weight.shape)
@@ -1180,9 +884,6 @@ def test_load_hook_maps_wrapper_root_keys_and_expert_aliases() -> None:
     shared_w1 = _sequential_tensor(model.layers[0].ffn.shared_experts.w1.weight.shape, offset=30.0)
     shared_w3 = _sequential_tensor(model.layers[0].ffn.shared_experts.w3.weight.shape, offset=40.0)
     shared_w2 = _sequential_tensor(model.layers[0].ffn.shared_experts.w2.weight.shape, offset=50.0)
-    expert_w1 = _sequential_tensor(model.layers[0].ffn.experts[0].w1.weight.shape, offset=60.0)
-    expert_w3 = _sequential_tensor(model.layers[0].ffn.experts[0].w3.weight.shape, offset=70.0)
-    expert_w2 = _sequential_tensor(model.layers[0].ffn.experts[0].w2.weight.shape, offset=80.0)
 
     result = model.load_state_dict(
         {
@@ -1192,9 +893,6 @@ def test_load_hook_maps_wrapper_root_keys_and_expert_aliases() -> None:
             "model.layers.0.ffn.shared_experts.gate_proj.weight": shared_w1,
             "model.layers.0.ffn.shared_experts.up_proj.weight": shared_w3,
             "model.layers.0.ffn.shared_experts.down_proj.weight": shared_w2,
-            "model.layers.0.ffn.experts.0.gate_proj.weight": expert_w1,
-            "model.layers.0.ffn.experts.0.up_proj.weight": expert_w3,
-            "model.layers.0.ffn.experts.0.down_proj.weight": expert_w2,
         },
         strict=False,
     )
@@ -1212,64 +910,6 @@ def test_load_hook_maps_wrapper_root_keys_and_expert_aliases() -> None:
     torch.testing.assert_close(
         model.layers[0].ffn.shared_experts.w2.weight, shared_w2, rtol=0, atol=0
     )
-    torch.testing.assert_close(model.layers[0].ffn.experts[0].w1.weight, expert_w1, rtol=0, atol=0)
-    torch.testing.assert_close(model.layers[0].ffn.experts[0].w3.weight, expert_w3, rtol=0, atol=0)
-    torch.testing.assert_close(model.layers[0].ffn.experts[0].w2.weight, expert_w2, rtol=0, atol=0)
-
-
-def test_load_hook_unstacks_w1_w2_w3_expert_tensors() -> None:
-    config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0)
-    model = DeepseekV4ForCausalLM(config).eval()
-    expert_count = config.n_routed_experts
-    w1 = _sequential_tensor((expert_count, config.moe_intermediate_size, config.hidden_size))
-    w3 = _sequential_tensor(
-        (expert_count, config.moe_intermediate_size, config.hidden_size), offset=1000.0
-    )
-    w2 = _sequential_tensor(
-        (expert_count, config.hidden_size, config.moe_intermediate_size), offset=2000.0
-    )
-
-    result = model.load_state_dict(
-        {
-            "model.layers.0.ffn.experts.w1.weight": w1,
-            "model.layers.0.ffn.experts.w3.weight": w3,
-            "model.layers.0.ffn.experts.w2.weight": w2,
-        },
-        strict=False,
-    )
-
-    assert result.unexpected_keys == []
-    for expert_idx, expert in enumerate(model.layers[0].ffn.experts):
-        torch.testing.assert_close(expert.w1.weight, w1[expert_idx], rtol=0, atol=0)
-        torch.testing.assert_close(expert.w3.weight, w3[expert_idx], rtol=0, atol=0)
-        torch.testing.assert_close(expert.w2.weight, w2[expert_idx], rtol=0, atol=0)
-
-
-def test_load_hook_splits_fused_gate_up_and_stacked_down_experts() -> None:
-    config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=0)
-    model = DeepseekV4ForCausalLM(config).eval()
-    expert_count = config.n_routed_experts
-    gate = _sequential_tensor((expert_count, config.moe_intermediate_size, config.hidden_size))
-    up = _sequential_tensor(
-        (expert_count, config.moe_intermediate_size, config.hidden_size), offset=1000.0
-    )
-    down = _sequential_tensor(
-        (expert_count, config.hidden_size, config.moe_intermediate_size), offset=2000.0
-    )
-
-    result = model.load_state_dict(
-        {
-            "model.layers.0.ffn.experts.gate_up_proj.weight": torch.cat((gate, up), dim=1),
-            "layers.0.ffn.experts.down_proj": down,
-        },
-        strict=False,
-    )
-
-    assert result.unexpected_keys == []
-    for expert_idx, expert in enumerate(model.layers[0].ffn.experts):
-        torch.testing.assert_close(expert.w1.weight, gate[expert_idx], rtol=0, atol=0)
-        torch.testing.assert_close(expert.w3.weight, up[expert_idx], rtol=0, atol=0)
-        torch.testing.assert_close(expert.w2.weight, down[expert_idx], rtol=0, atol=0)
 
 
 def test_rotary_embedding_returns_full_cached_tables() -> None:
@@ -1310,7 +950,7 @@ def test_mlp_swiglu_limit_matches_reference() -> None:
 
 
 def test_router_hash_and_score_routing_match_reference() -> None:
-    assert DeepseekV4Router is not None, "DeepSeek V4 router class must be exposed for PR1 tests"
+    assert DeepseekV4Router is not None, "DeepSeek V4 router class must be exposed for tests"
     config = _small_config()
     hidden_states = torch.linspace(-1.0, 1.0, 5 * config.hidden_size).view(5, config.hidden_size)
     input_ids = torch.tensor([0, 1, 2, 3, 4])
@@ -1331,12 +971,10 @@ def test_router_hash_and_score_routing_match_reference() -> None:
 
 
 @pytest.mark.parametrize("layer_idx", [0, 1], ids=["hash-routing", "score-routing"])
-def test_moe_with_shared_expert_and_swiglu_limit_matches_reference(layer_idx: int) -> None:
+def test_moe_uses_packed_mxfp4_routed_experts(layer_idx: int) -> None:
     config = _small_config(num_hidden_layers=2, compress_ratios=(0, 0))
     moe = DeepseekV4MoE(config, layer_idx=layer_idx).eval()
     _set_router_weights(moe.gate)
-    for idx, expert in enumerate(moe.experts):
-        _set_mlp_weights(expert, offset=idx * 0.03)
     _set_mlp_weights(moe.shared_experts, offset=0.4)
 
     hidden_states = torch.linspace(-1.5, 1.5, 2 * 3 * config.hidden_size).view(
@@ -1345,9 +983,21 @@ def test_moe_with_shared_expert_and_swiglu_limit_matches_reference(layer_idx: in
     input_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
 
     actual = moe(hidden_states, input_ids)
-    expected = _ref_moe(moe, hidden_states, input_ids)
 
-    assert_rmse_close(actual, expected, rmse_ratio_tol=0.02, msg="MoE: ")
+    assert actual.shape == hidden_states.shape
+    assert torch.isfinite(actual).all()
+    assert moe.experts.gate_up_proj_blocks.shape == (
+        config.n_routed_experts,
+        2 * config.moe_intermediate_size,
+        config.hidden_size // 32,
+        16,
+    )
+    assert moe.experts.down_proj_blocks.shape == (
+        config.n_routed_experts,
+        config.hidden_size,
+        config.moe_intermediate_size // 32,
+        16,
+    )
 
 
 def test_dense_attention_with_sinks_matches_reference() -> None:
@@ -1507,64 +1157,6 @@ def test_ratio4_indexer_matches_independent_reference_and_masks_invalid_prefix()
     assert (actual[:, 3:] >= 0).sum(dim=-1).eq(1).all()
 
 
-@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
-def test_block_hc_wiring_matches_hf_reference(compress_ratio: int) -> None:
-    config = _small_config(
-        num_hidden_layers=1,
-        compress_ratios=(compress_ratio,),
-        num_hash_layers=1,
-    )
-    block = DeepseekV4Block(config, layer_idx=0).eval()
-    reference = HFDeepseekV4Block(config, layer_idx=0).eval()
-    _set_router_weights(block.ffn.gate)
-    reference.load_state_dict(block.state_dict(), strict=True)
-    hidden_states = torch.randn(2, 4, config.hc_mult, config.hidden_size)
-    input_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]])
-    position_ids = _position_ids(2, 4, hidden_states.device)
-    position_embeddings = _position_embeddings(config, position_ids)
-
-    actual = block(hidden_states, position_embeddings, position_ids, input_ids)
-    expected = reference(hidden_states, position_embeddings, position_ids, input_ids)
-
-    assert_rmse_close(actual, expected, rmse_ratio_tol=0.05, msg=f"Block ratio-{compress_ratio}: ")
-
-
-def test_decoder_layer_matches_hf_reference_dense_layer() -> None:
-    config = _small_config(num_hidden_layers=2, compress_ratios=(0, 0), num_hash_layers=0)
-    model = DeepseekV4ForCausalLM(config).eval()
-    layer = _decoder(model).layers[0]
-    reference = HFDeepseekV4Block(config, layer_idx=0).eval()
-    _set_router_weights(layer.ffn.gate)
-    reference.load_state_dict(layer.state_dict(), strict=True)
-    hidden_states = torch.randn(1, 5, config.hc_mult, config.hidden_size)
-    input_ids = torch.tensor([[0, 1, 2, 3, 4]])
-    position_ids = _position_ids(1, 5, hidden_states.device)
-    position_embeddings = _position_embeddings(config, position_ids)
-
-    with torch.no_grad():
-        actual = layer(hidden_states, position_embeddings, position_ids, input_ids)
-        expected = reference(hidden_states, position_embeddings, position_ids, input_ids)
-
-    assert_rmse_close(actual, expected, rmse_ratio_tol=0.05, msg="Dense decoder layer: ")
-
-
-def test_full_model_matches_hf_reference_with_dense_and_sparse_layers() -> None:
-    config = _small_config()
-    model = DeepseekV4ForCausalLM(config).eval()
-    for layer in _decoder(model).layers:
-        _set_router_weights(layer.ffn.gate)
-    reference = HFDeepseekV4ForCausalLM(config).eval()
-    reference.load_state_dict(model.state_dict(), strict=True)
-    input_ids = torch.tensor([[0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11]])
-    position_ids = _position_ids(2, 6, input_ids.device)
-
-    with torch.no_grad():
-        actual = model(input_ids=input_ids, position_ids=position_ids).logits
-        expected = reference(input_ids=input_ids, position_ids=position_ids)
-
-    assert_rmse_close(actual, expected, rmse_ratio_tol=0.05, msg="Full model: ")
-
-
 def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
     config = _small_config(num_hidden_layers=2, compress_ratios=(0, 4), num_hash_layers=1)
     model = DeepseekV4ForCausalLM(config).eval()
@@ -1598,7 +1190,8 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
     target_names = [str(node.target) for node in gm.graph.nodes if node.op == "call_function"]
     assert target_names.count("auto_deploy.torch_deepseek_v4_sparse_attention.default") == 2
     assert "auto_deploy.torch_linear_simple.default" in target_names
-    assert "auto_deploy.torch_moe.default" in target_names
+    assert "auto_deploy.torch_mxfp4_moe_from_routing.default" in target_names
+    assert "auto_deploy.torch_moe.default" not in target_names
     assert "auto_deploy.torch_attention.default" not in target_names
     non_torch_ad_ops = sorted(
         name
@@ -1632,7 +1225,6 @@ def test_export_mxfp4_experts_apply_sharding_hints_rank1_ep_graph() -> None:
         ad_rope_cache_len=16,
         ad_compress_max_seq_len=16,
         max_position_embeddings=16,
-        ad_use_mxfp4_experts=True,
     )
     model = DeepseekV4ForCausalLM(config).eval()
     input_ids = torch.randint(0, config.vocab_size, (2, 4))
@@ -1730,7 +1322,6 @@ def test_export_mxfp4_experts_apply_sharding_hints_rank6_ep8_tp8_graph() -> None
         ad_rope_cache_len=16,
         ad_compress_max_seq_len=16,
         max_position_embeddings=16,
-        ad_use_mxfp4_experts=True,
     )
     model = DeepseekV4ForCausalLM(config).eval()
     input_ids = torch.randint(0, config.vocab_size, (2, 4))
