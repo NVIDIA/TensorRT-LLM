@@ -40,7 +40,40 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
 from ..trt_test_alternative import check_call, exists
+from .mixed_modality import (MODALITY_AUDIO, MODALITY_IMAGE, MODALITY_VIDEO,
+                             MixedModalityEvaluator)
 from .video_mme import VideoMME as VideoMMEEvaluator
+
+_DEFAULT_MIXED_MOD_NUM_SAMPLES = 50
+
+
+def _env_num_samples(*env_vars: str,
+                     default: int = _DEFAULT_MIXED_MOD_NUM_SAMPLES) -> int:
+    """Read a positive sample count from the first set env var, else `default`.
+
+    Parsing happens lazily/defensively rather than at class-body import time: a
+    non-integer or non-positive value logs a warning and falls back to `default`
+    instead of raising `ValueError` during module import and taking down
+    unrelated test collection.
+    """
+    for env_var in env_vars:
+        raw = os.getenv(env_var)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning(
+                f"Ignoring non-integer {env_var}={raw!r}; using default {default}."
+            )
+            return default
+        if value <= 0:
+            logger.warning(
+                f"Ignoring non-positive {env_var}={value}; using default {default}."
+            )
+            return default
+        return value
+    return default
 
 
 def compute_theta(num_samples: int,
@@ -310,6 +343,133 @@ class VideoMME(AccuracyTask):
         "dataset_path": DATASET_DIR,
         "random_seed": 0,
         "num_frames": 8,
+    }
+
+
+class MixedModality(AccuracyTask):
+    """One-request image+audio+video accuracy task for Nemotron Nano Omni."""
+
+    DATASET = "mixed_modality_omni"
+    MMMU_DATASET_DIR = f"{llm_models_root()}/datasets/MMMU"
+    VOXPOPULI_DATASET_DIR = f"{llm_models_root()}/datasets/facebook/voxpopuli"
+    VIDEOMME_DATASET_DIR = f"{llm_models_root()}/datasets/lmms-lab__Video-MME-short-v1"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = _env_num_samples("TRTLLM_MIXED_MOD_NUM_SAMPLES")
+
+    MAX_BATCH_SIZE = 64
+    MAX_INPUT_LEN = 32768
+    MAX_OUTPUT_LEN = 256
+
+    EVALUATOR_CLS = MixedModalityEvaluator
+    EVALUATOR_KWARGS = {
+        "modality_dataset_paths": {
+            MODALITY_IMAGE: MMMU_DATASET_DIR,
+            MODALITY_AUDIO: VOXPOPULI_DATASET_DIR,
+            MODALITY_VIDEO: VIDEOMME_DATASET_DIR,
+        },
+        "active_modalities": (MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO),
+        "random_seed": 0,
+        "num_frames": 8,
+        "pure_baseline_max_accuracy_drop": 5.0,
+        "pure_baseline_max_per_target_accuracy_drop": 10.0,
+    }
+
+
+class MixedModalityVideoAudio(AccuracyTask):
+    """One-request image + audio-in-video accuracy task for Nemotron Nano Omni.
+
+    Like `MixedModality`, but the video items are loaded with their embedded
+    audio track extracted (`extract_video_audio=True`), so each request mixes an
+    image with a video that carries audio. Nano hoists that embedded audio to a
+    first-class top-level `(audio, k)` item (no ghosts, no shared slots, no
+    post-encode re-placement), driving the hoisted-audio path end-to-end, which
+    the standalone image/audio/video `MixedModality` task never exercises. The
+    mixed-vs-pure gate is inherited from `MixedModalityEvaluator`.
+
+    NOTE: audio extraction needs PyAV (the evaluator sets `TRTLLM_ENABLE_PYAV=1`
+    when `extract_video_audio` is enabled); the container must have `av`
+    installed. The VideoMME short-v1 clips all carry AAC audio tracks.
+    """
+
+    DATASET = "mixed_modality_video_audio_omni"
+    MMMU_DATASET_DIR = f"{llm_models_root()}/datasets/MMMU"
+    VIDEOMME_DATASET_DIR = f"{llm_models_root()}/datasets/lmms-lab__Video-MME-short-v1"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = _env_num_samples(
+        "TRTLLM_VIDEO_AUDIO_MIXED_MOD_NUM_SAMPLES",
+        "TRTLLM_MIXED_MOD_NUM_SAMPLES",
+    )
+
+    MAX_BATCH_SIZE = 64
+    MAX_INPUT_LEN = 32768
+    MAX_OUTPUT_LEN = 256
+
+    EVALUATOR_CLS = MixedModalityEvaluator
+    EVALUATOR_KWARGS = {
+        "modality_dataset_paths": {
+            MODALITY_IMAGE: MMMU_DATASET_DIR,
+            MODALITY_VIDEO: VIDEOMME_DATASET_DIR,
+        },
+        "active_modalities": (MODALITY_IMAGE, MODALITY_VIDEO),
+        "extract_video_audio": True,
+        "random_seed": 0,
+        "num_frames": 8,
+        "pure_baseline_max_accuracy_drop": 5.0,
+        "pure_baseline_max_per_target_accuracy_drop": 10.0,
+    }
+
+
+class QwenVLMixedModality(AccuracyTask):
+    """One-request image+video accuracy task for Qwen-VL-style models.
+
+    Each request carries both an image and a video; the evaluator asks an image
+    question (video is a distractor) on some samples and a video question (image
+    is a distractor) on others. Both `image` and `video` are scored as targets
+    (`target_modalities=(image, video)`), so the inherited
+    `MixedModalityEvaluator` gates the image-target and video-target mixed-vs-pure
+    accuracy deltas independently. This proves the model answers BOTH image and
+    video questions correctly inside a single mixed request, rather than letting
+    one modality dominate.
+    """
+
+    DATASET = "mixed_modality_qwen_vl"
+    MMMU_DATASET_DIR = f"{llm_models_root()}/datasets/MMMU"
+    VIDEOMME_DATASET_DIR = f"{llm_models_root()}/datasets/lmms-lab__Video-MME-short-v1"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = int(
+        os.getenv(
+            "TRTLLM_QWEN_VL_MIXED_MOD_NUM_SAMPLES",
+            os.getenv("TRTLLM_MIXED_MOD_NUM_SAMPLES", "50"),
+        ))
+
+    MAX_BATCH_SIZE = 64
+    MAX_INPUT_LEN = 32768
+    MAX_OUTPUT_LEN = 256
+
+    EVALUATOR_CLS = MixedModalityEvaluator
+    EVALUATOR_KWARGS = {
+        "modality_dataset_paths": {
+            MODALITY_IMAGE: MMMU_DATASET_DIR,
+            MODALITY_VIDEO: VIDEOMME_DATASET_DIR,
+        },
+        "active_modalities": (MODALITY_IMAGE, MODALITY_VIDEO),
+        # Score BOTH image and video as targets so the per-target mixed-vs-pure
+        # gate covers each modality. (This is also the evaluator default when
+        # target_modalities is omitted; stated explicitly here as the contract.)
+        "target_modalities": (MODALITY_IMAGE, MODALITY_VIDEO),
+        "random_seed": 0,
+        "num_frames": 8,
+        "pure_baseline_max_accuracy_drop": 5.0,
+        "pure_baseline_max_per_target_accuracy_drop": 10.0,
     }
 
 

@@ -26,7 +26,34 @@ from ..conftest import (
     skip_pre_blackwell,
     skip_pre_hopper,
 )
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
+from .accuracy_core import (
+    MMMU,
+    LlmapiAccuracyTestHarness,
+    MixedModality,
+    MixedModalityVideoAudio,
+    QwenVLMixedModality,
+    VideoMME,
+    VoxPopuli,
+)
+
+
+@pytest.fixture(scope="session")
+def _ensure_pyav():
+    """Provision PyAV (`av`) for tests that extract audio from video.
+
+    MixedModalityVideoAudio (extract_video_audio=True) decodes a video's audio
+    track via PyAV, an optional dependency intentionally absent from the base CI
+    image. Install it once per session - mirroring the visual-gen sidecar install
+    in tests/integration/defs/examples/test_visual_gen.py - so the audio-in-video
+    path is exercised in CI rather than skipped. Only the decoder is needed (PyAV
+    bundles its own ffmpeg in the wheel), so no system ffmpeg package is required.
+    """
+    import importlib.util
+    import subprocess
+    import sys
+
+    if importlib.util.find_spec("av") is None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "av"])
 
 
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
@@ -247,6 +274,9 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
+            # NVIDIA-Nemotron-Nano-12B-v2-VL ships custom HF code, so the loader
+            # requires trust_remote_code=True (same as the other Nemotron VL tests).
+            trust_remote_code=True,
             max_batch_size=128,
             enable_chunked_prefill=enable_chunked_prefill,
             max_num_tokens=max_num_tokens,
@@ -501,6 +531,54 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
+    # One-request image+video mixed-modality gate. Each request carries an image
+    # and a video; the evaluator asks an image question (video distractor) on
+    # some samples and a video question (image distractor) on others, scoring
+    # BOTH image and video as targets. The inherited MixedModalityEvaluator gates
+    # the image-target and video-target mixed-vs-pure accuracy deltas
+    # independently, proving Qwen3-VL answers both image and video questions
+    # correctly inside a single mixed request.
+    mixed_modality_sampling_params = SamplingParams(
+        max_tokens=QwenVLMixedModality.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=QwenVLMixedModality.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+        temperature=0.0,
+        top_k=1,
+    )
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize(
+        "max_num_tokens",
+        [
+            MAX_NUM_TOKENS,
+            512,
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_mixed_modality(self, max_num_tokens):
+        # Run the SAME image+video mixed-vs-pure gate under two prefill budgets,
+        # keeping `enable_chunked_prefill=True` for both (mirrors
+        # `TestMistralSmall24B::test_auto_dtype`):
+        #   * `full_budget` (`MAX_NUM_TOKENS`): the mixed request fits in a
+        #     single context chunk, so mm embeds are gathered once.
+        #   * `forced_chunked_prefill` (low `max_num_tokens`): the prompt is
+        #     split across prefill chunks, so `get_multimodal_embeddings` must
+        #     reuse the per-item cached mm embeds and `find_input_mm_embeds`
+        #     must window them to the right chunk. The mixed-vs-pure parity gate
+        #     holding under chunking proves no mm-embedding mis-split across
+        #     chunk boundaries (and surfaces runtime errors in the mixed
+        #     image+video path).
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=True,
+            max_num_tokens=max_num_tokens,
+        ) as llm:
+            task = QwenVLMixedModality(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.mixed_modality_sampling_params,
+            )
+
 
 class TestKimiK25(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2.5"
@@ -656,6 +734,31 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         videomme_sampling_params,
         no_thinking_evaluator_kwargs,
     )
+    mixed_modality_sampling_params = SamplingParams(
+        max_tokens=MixedModality.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MixedModality.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    MIXED_MODALITY_TASK_SPEC = (
+        MixedModality,
+        mixed_modality_sampling_params,
+        no_thinking_evaluator_kwargs,
+    )
+    # Image mixed with an audio-bearing video (video's embedded audio track is
+    # extracted), exercising the Nano post-encode video-audio interleave +
+    # ghost-audio plan path end-to-end. Gated against the pure baseline.
+    video_audio_mixed_modality_sampling_params = SamplingParams(
+        max_tokens=MixedModalityVideoAudio.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MixedModalityVideoAudio.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    VIDEO_AUDIO_MIXED_MODALITY_TASK_SPEC = (
+        MixedModalityVideoAudio,
+        video_audio_mixed_modality_sampling_params,
+        no_thinking_evaluator_kwargs,
+    )
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize(
@@ -671,7 +774,11 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 32,
                 None,
-                (MMMU_TASK_SPEC,),
+                (
+                    MMMU_TASK_SPEC,
+                    MIXED_MODALITY_TASK_SPEC,
+                    VIDEO_AUDIO_MIXED_MODALITY_TASK_SPEC,
+                ),
                 id="bf16",
             ),
             pytest.param(
@@ -685,7 +792,12 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 64,
                 QuantAlgo.FP8,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                (
+                    MMMU_TASK_SPEC,
+                    VOXPOPULI_TASK_SPEC,
+                    VIDEOMME_TASK_SPEC,
+                    MIXED_MODALITY_TASK_SPEC,
+                ),
                 marks=skip_pre_hopper,
                 id="fp8",
             ),
@@ -700,7 +812,12 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 128,
                 QuantAlgo.MIXED_PRECISION,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                (
+                    MMMU_TASK_SPEC,
+                    VOXPOPULI_TASK_SPEC,
+                    VIDEOMME_TASK_SPEC,
+                    MIXED_MODALITY_TASK_SPEC,
+                ),
                 marks=(skip_pre_blackwell,),
                 id="nvfp4",
             ),
@@ -710,13 +827,22 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     @pytest.mark.threadleak(enabled=False)
     def test_auto_dtype(
         self,
+        _ensure_pyav,
         model_name: str,
         model_path: str,
         kv_cache_config: KvCacheConfig,
         max_batch_size: int,
         expected_quant_algo: QuantAlgo | None,
         task_specs: tuple[
-            tuple[type[MMMU] | type[VoxPopuli], SamplingParams, dict[str, object]],
+            tuple[
+                type[MMMU]
+                | type[VoxPopuli]
+                | type[VideoMME]
+                | type[MixedModality]
+                | type[MixedModalityVideoAudio],
+                SamplingParams,
+                dict[str, object],
+            ],
             ...,
         ],
     ) -> None:
@@ -737,6 +863,84 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 assert llm.args.quant_config.quant_algo == expected_quant_algo
             for task_cls, sampling_params, extra_evaluator_kwargs in task_specs:
                 task = task_cls(model_name)
+                task.evaluate(
+                    llm,
+                    sampling_params=sampling_params,
+                    extra_evaluator_kwargs=extra_evaluator_kwargs,
+                )
+
+    # Dedicated chunked-prefill parity gate for the Nano-Omni mixed-modality
+    # path. `test_auto_dtype` already runs the mixed specs at a forced-chunking
+    # budget; this adds the matching non-chunked (`full_budget`) control so the
+    # SAME mixed evaluator + SAME pure-baseline references run under BOTH
+    # budgets, keeping `enable_chunked_prefill=True` for each (mirrors
+    # `TestMistralSmall24B::test_auto_dtype`). It runs only on the unquantized
+    # BF16 reference and exercises both mixed tasks:
+    #   * `MixedModality`: image + audio + video in one request.
+    #   * `MixedModalityVideoAudio`: image + an audio-bearing video (the
+    #     post-encode video-audio interleave / ghost-audio plan path).
+    # Under `forced_chunked_prefill` the prompt is split across prefill chunks,
+    # so `get_multimodal_embeddings` must reuse the per-item cached mm embeds and
+    # `find_input_mm_embeds` must window them to the right chunk. The
+    # mixed-vs-pure parity gate holding under chunking proves no mm-embedding
+    # mis-split across chunk boundaries for the interleaved image/audio/video
+    # plan.
+    MIXED_MODALITY_BF16_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+    MIXED_MODALITY_BF16_MODEL_PATH = (
+        f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+    )
+    mixed_modality_kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.8,
+        mamba_ssm_cache_dtype="float32",
+        enable_block_reuse=False,
+    )
+    # `full_budget` keeps the LLM default `max_num_tokens` (8192) so a single
+    # image+audio+video mixed request fits in one context chunk. We deliberately
+    # do not raise it toward the `MixedModality.MAX_INPUT_LEN` (32768) truncation
+    # ceiling: mamba SSM state is pre-allocated proportional to
+    # `max_num_tokens`, so a large budget would blow the CI GPU memory budget.
+    MIXED_MODALITY_FULL_BUDGET_MAX_NUM_TOKENS = 8192
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "video_pruning_rate",
+        [0.0, 0.5],
+        ids=["evs_off", "evs_on"],
+    )
+    @pytest.mark.parametrize(
+        "max_num_tokens",
+        [
+            MIXED_MODALITY_FULL_BUDGET_MAX_NUM_TOKENS,
+            512,
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_mixed_modality(
+        self, _ensure_pyav, max_num_tokens: int, video_pruning_rate: float
+    ) -> None:
+        # The `evs_off` (video_pruning_rate=0.0) arm is the existing baseline.
+        # The `evs_on` (0.5) arm gates the EVS-pruned-video x mixed-modality
+        # path: the audio-bearing video's vision tokens are pruned by Efficient
+        # Video Sampling before the post-encode video-audio interleave + scatter.
+        # Both arms prune identically across the mixed request and its paired
+        # pure baseline, so the evaluator's pruning-symmetric mixed-vs-pure delta
+        # gate (`_assert_pure_baseline_not_degraded`) holds without a new
+        # reference YAML.
+        with LLM(
+            self.MIXED_MODALITY_BF16_MODEL_PATH,
+            trust_remote_code=True,
+            kv_cache_config=self.mixed_modality_kv_cache_config,
+            enable_chunked_prefill=True,
+            max_num_tokens=max_num_tokens,
+            max_batch_size=32,
+            video_pruning_rate=video_pruning_rate,
+        ) as llm:
+            for task_cls, sampling_params, extra_evaluator_kwargs in (
+                self.MIXED_MODALITY_TASK_SPEC,
+                self.VIDEO_AUDIO_MIXED_MODALITY_TASK_SPEC,
+            ):
+                task = task_cls(self.MIXED_MODALITY_BF16_MODEL_NAME)
                 task.evaluate(
                     llm,
                     sampling_params=sampling_params,

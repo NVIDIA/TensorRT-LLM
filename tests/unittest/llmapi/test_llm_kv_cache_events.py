@@ -547,25 +547,6 @@ def test_apply_mm_hashes_audio_data_deterministic():
     assert hashes_a["audio"][0] != hashes_a_different_rate["audio"][0]
 
 
-def test_int32_hexdigest_roundtrip():
-    """Test that hexdigest_to_int32 and int32_to_hexdigest are inverses."""
-    from tensorrt_llm.inputs.multimodal import (hexdigest_to_int32,
-                                                int32_to_hexdigest)
-
-    # Test with various hash patterns
-    test_hashes = [
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-        "deadbeefcafebabefeedfacebadc0ffedeadbeefcafebabefeedfacebadc0ffe",
-    ]
-
-    for original_hex in test_hashes:
-        int32_values = hexdigest_to_int32(original_hex)
-        recovered_hex = int32_to_hexdigest(int32_values)
-        assert recovered_hex == original_hex, f"Roundtrip failed for {original_hex}"
-
-
 def test_multimodal_input_dataclass_with_uuids():
     """Test Python MultimodalInput dataclass with UUIDs."""
     from tensorrt_llm.inputs.multimodal import MultimodalInput

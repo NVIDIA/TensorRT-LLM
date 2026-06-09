@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Target-only randomized query accuracy for the Qwen-VL image+video mixed task.
+# Each request carries an image and a video; the evaluator asks an image
+# question (video distractor) on some samples and a video question (image
+# distractor) on others, scoring BOTH image and video as targets. The
+# image-target and video-target mixed-vs-pure deltas are gated independently by
+# MixedModalityEvaluator; this reference is the absolute mixed target-accuracy
+# floor.
+#
+# This accuracy is an interim ref_accuracy used only to gate the mixed-vs-pure
+# delta, not a measured run; it awaits a B100/B200 run on a node that can build
+# the decode-attention CUDA graph. Qwen3-VL-8B scores 55.11 on pure MMMU
+# (image); the mixed target accuracy averages the (typically harder) video
+# target with the image target, so the floor sits below the pure image number.
+# Replace it with the observed value once the gate runs green.
+Qwen/Qwen3-VL-8B-Instruct:
+  - accuracy: 45.00
+    num_samples: 50

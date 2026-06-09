@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
+"""Unit tests for `tensorrt_llm.inputs.multimodal`.
+
+Covers `MultimodalRuntimeData` cumsum math and the flat-mask producers
+(`maybe_compute_mm_embed_cumsum` and the `_compute_mm_masks` helpers). The
+prompt-order type now lives on `MixedModalItemOrder`; its tests are in
+`test_mixed_modal_encode_context.py`.
+"""
 
 import pytest
 import torch
 
-from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MultimodalRuntimeData,
+    _compute_mm_masks,
+    _find_mm_embedding_lengths_from_masks,
+    compute_mm_embedding_lengths,
+)
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
 
@@ -33,6 +44,103 @@ def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
         torch.tensor([0, 1, 2, 2, 3, 4, 5, 5], dtype=torch.int64),
         rtol=0,
         atol=0,
+    )
+
+
+def test_mixed_image_video_audio_masks_runs_embedding_lengths():
+    image_token = 100
+    video_token = 200
+    audio_token = 300
+    video_start = 201
+    video_end = 202
+    audio_start = 301
+    audio_end = 302
+    # 10 img img 11 | vid_start vid vid vid_end 12 | aud_start aud aud_end 13
+    input_ids = torch.tensor(
+        [
+            10,
+            image_token,
+            image_token,
+            11,
+            video_start,
+            video_token,
+            video_token,
+            video_end,
+            12,
+            audio_start,
+            audio_token,
+            audio_end,
+            13,
+        ]
+    )
+    num_mm_tokens = [2, 4, 3]
+
+    mm_mask, embed_mask, _ = _compute_mm_masks(
+        input_ids,
+        vocab_size=None,
+        mm_token_ids=torch.tensor([image_token, video_token, audio_token]),
+        mm_special_token_ids=torch.tensor([video_start, video_end, audio_start, audio_end]),
+    )
+
+    # Sole coverage of `_find_mm_embedding_lengths_from_masks` on a mixed
+    # request: embed-only tokens per item (specials excluded) are [2, 2, 1].
+    # The start-position / run helpers are covered in test_multimodal_runtime.py
+    # and test_llm_kv_cache_events.py.
+    embedding_lengths = _find_mm_embedding_lengths_from_masks(
+        mm_mask,
+        embed_mask,
+        num_mm_tokens,
+    )
+
+    assert embedding_lengths == [2, 2, 1]
+
+    # The public `compute_mm_embedding_lengths` wraps the same
+    # `_compute_mm_masks` -> `_find_mm_embedding_lengths_from_masks` derivation
+    # behind one entry point (shared by Nano, Qwen3-VL, and the registry). Given
+    # the same predicates it must reproduce the mask-level result, accepting raw
+    # `input_ids` (here a plain Python list) directly.
+    assert compute_mm_embedding_lengths(
+        input_ids.tolist(),
+        num_mm_tokens,
+        vocab_size=None,
+        mm_token_ids=torch.tensor([image_token, video_token, audio_token]),
+        mm_special_token_ids=torch.tensor([video_start, video_end, audio_start, audio_end]),
+    ) == [2, 2, 1]
+
+
+def test_compute_mm_embedding_lengths_vocab_size_path_counts_high_ids():
+    """The vocab_size route (no explicit mm_token_ids) counts ids >= vocab_size.
+
+    This mirrors the Qwen3-VL preprocess path, where placeholder tokens are
+    rewritten to `tllm_multimodal_token_id = vocab_size + 1` and there are no
+    framing specials. Two items (image then video) with embed counts 3 and 2.
+    """
+    vocab_size = 1000
+    mm_id = vocab_size + 1
+    # 10 mm mm mm 11 | 12 mm mm 13
+    input_ids = [10, mm_id, mm_id, mm_id, 11, 12, mm_id, mm_id, 13]
+    num_mm_tokens = [3, 2]
+
+    assert compute_mm_embedding_lengths(
+        input_ids,
+        num_mm_tokens,
+        vocab_size=vocab_size,
+        mm_token_ids=None,
+        mm_special_token_ids=None,
+    ) == [3, 2]
+
+
+def test_compute_mm_embedding_lengths_no_mm_tokens_returns_empty():
+    """No multimodal tokens -> empty per-item lengths (text-only prompt)."""
+    assert (
+        compute_mm_embedding_lengths(
+            [10, 11, 12],
+            [],
+            vocab_size=1000,
+            mm_token_ids=None,
+            mm_special_token_ids=None,
+        )
+        == []
     )
 
 
