@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import json
+import math
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
+from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
@@ -67,8 +69,7 @@ class LogProbsResult(NamedTuple):
 
 
 class ResponseWrapper:
-    """
-    1. Wrapper of runtime response with optional outputs computed post runtime.
+    """1. Wrapper of runtime response with optional outputs computed post runtime.
     2. A workaround to pass around RequestPerfMetrics.
     """
 
@@ -169,7 +170,7 @@ class CompletionOutput:
 
 
 class GenerationResultBase:
-    ''' This holds the core logic of the GenerationResult class. '''
+    """This holds the core logic of the GenerationResult class."""
 
     def __init__(self,
                  id: int,
@@ -183,6 +184,8 @@ class GenerationResultBase:
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
+        self.per_pos_drafted = None
+        self.per_pos_accepted = None
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
@@ -279,8 +282,7 @@ class GenerationResultBase:
                          logprobs_result=None,
                          req_perf_metrics_dict: Optional[dict[str,
                                                               float]] = None):
-        """ Handle a single sequence in the response. """
-
+        """Handle a single sequence in the response."""
         seq_idx = sequence_index
         src_idx = sequence_index if self.sampling_params.use_beam_search else 0
 
@@ -491,6 +493,10 @@ class GenerationResultBase:
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
+            self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
+                                           None)
+            self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
+                                            None)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
@@ -609,10 +615,87 @@ class GenerationResultBase:
             metrics_stats.update(processed_metrics_stat)
         # Record prompt tokens only for the first candidate to avoid
         # double-counting the shared prompt across n candidates.
+        prompt_token_ids = getattr(self, "prompt_token_ids", None)
         if output.finish_reason and sequence_index == 0:
-            prompt_token_ids = getattr(self, "prompt_token_ids", None)
             if prompt_token_ids is not None and len(prompt_token_ids) > 0:
                 metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+
+        # Request-scoped metrics: only record for the first candidate to avoid
+        # double-counting across n candidates.
+        if output.finish_reason and sequence_index == 0:
+            metrics_stats[MetricNames.PROMPT_CACHE_CACHED_TOKENS] = \
+                self.cached_tokens
+
+            spec_dec_logged = False
+            if self.per_pos_drafted is not None and any(
+                    d > 0 for d in self.per_pos_drafted):
+                metrics_stats[MetricNames.SPEC_DEC_ACCEPTED_PER_POS] = \
+                    self.per_pos_accepted
+                metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = \
+                    self.per_pos_drafted
+                spec_dec_logged = True
+            if not spec_dec_logged and output.request_perf_metrics is not None:
+                spec_dec = output.request_perf_metrics.speculative_decoding
+                if spec_dec is not None and spec_dec.total_draft_tokens > 0:
+                    metrics_stats[MetricNames.SPEC_DEC_ACCEPTED_PER_POS] = \
+                        [spec_dec.total_accepted_draft_tokens]
+                    metrics_stats[MetricNames.SPEC_DEC_DRAFTED_PER_POS] = \
+                        [spec_dec.total_draft_tokens]
+
+            if output.prompt_logprobs and prompt_token_ids:
+                try:
+                    prompt_lps = []
+                    for i, entry in enumerate(output.prompt_logprobs):
+                        if i >= len(prompt_token_ids):
+                            break
+                        token_id = prompt_token_ids[i]
+                        if isinstance(entry, dict):
+                            if token_id in entry:
+                                lp_obj = entry[token_id]
+                                lp = lp_obj.logprob if hasattr(
+                                    lp_obj, 'logprob') else float(lp_obj)
+                                prompt_lps.append(lp)
+                        elif isinstance(entry, (int, float)):
+                            prompt_lps.append(float(entry))
+                    if prompt_lps:
+                        mean_lp = sum(prompt_lps) / len(prompt_lps)
+                        ppl = math.exp(-mean_lp)
+                        if math.isfinite(ppl):
+                            metrics_stats[MetricNames.PREFILL_PERPLEXITY] = ppl
+                except (ValueError, TypeError):
+                    logger.debug("Failed to compute prefill perplexity",
+                                 exc_info=True)
+
+        # Candidate-scoped metric: generation perplexity is computed per candidate
+        # from this candidate's logprobs.
+        num_gen_tokens = output.length
+        if output.finish_reason and num_gen_tokens > 0:
+            gen_ppl = None
+            if output.cumulative_logprob is not None:
+                gen_ppl = math.exp(-output.cumulative_logprob / num_gen_tokens)
+            elif output.logprobs:
+                try:
+                    gen_lps = []
+                    for i, entry in enumerate(output.logprobs):
+                        if isinstance(entry, dict):
+                            token_id = output.token_ids[i] if i < len(
+                                output.token_ids) else None
+                            if token_id is not None and token_id in entry:
+                                lp_obj = entry[token_id]
+                                lp = lp_obj.logprob if hasattr(
+                                    lp_obj, 'logprob') else float(lp_obj)
+                                gen_lps.append(lp)
+                        elif isinstance(entry, (int, float)):
+                            gen_lps.append(float(entry))
+                    if gen_lps:
+                        mean_lp = sum(gen_lps) / len(gen_lps)
+                        gen_ppl = math.exp(-mean_lp)
+                except (ValueError, TypeError):
+                    logger.debug("Failed to compute generation perplexity",
+                                 exc_info=True)
+            if gen_ppl is not None and math.isfinite(gen_ppl):
+                metrics_stats[MetricNames.GENERATION_PERPLEXITY] = gen_ppl
+
         self.candidate_metrics.append(metrics_stats)
         self.metrics_dict.update(metrics_stats)
 
@@ -721,7 +804,7 @@ class GenerationResultBase:
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
-    ''' The base class for the generation result with detokenization support. '''
+    """The base class for the generation result with detokenization support."""
     # import once and avoid cyclic import
     from .postproc_worker import PostprocWorker
 
@@ -800,14 +883,13 @@ PostprocWorker = DetokenizedGenerationResultBase.PostprocWorker
 
 
 class GenerationResult(GenerationResultBase):
-    '''
-    The result of a generation request. It can be used to wait for the completion of the request.
+    """The result of a generation request. It can be used to wait for the completion of the request.
 
     Args:
         generation_request (GenerationRequest): The generation request object.
         background_error_handler (Callable, optional): The error handler to process the errors from the background threads/processes. Defaults to None.
         executor (GenerationExecutor, optional): The executor that created this result. Defaults to None.
-    '''
+    """
 
     def __init__(
         self,
@@ -957,8 +1039,7 @@ class GenerationResult(GenerationResultBase):
 
 
 class IterationResult:
-    """
-    Runtime results for all available iterations.
+    """Runtime results for all available iterations.
     """
 
     def __init__(self):
@@ -980,8 +1061,7 @@ class IterationResult:
         self._done = False
 
     def get_results(self) -> List[dict]:
-        """
-        Return all runtime results in the queue.
+        """Return all runtime results in the queue.
         """
         results = []
         while not self._done:
@@ -1019,8 +1099,7 @@ def compute_logprobs(
     simple_prompt_logprobs: bool = False,
     simple_logprobs: bool = False,
 ) -> LogProbsResult:
-    """
-    Compute top-K logprobs from logits when engine doesn't provide them directly.
+    """Compute top-K logprobs from logits when engine doesn't provide them directly.
 
     Used for post-processing logits into logprobs.
     - Prompt logprobs (from context_logits): always used.
