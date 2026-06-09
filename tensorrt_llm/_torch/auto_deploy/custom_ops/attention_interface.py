@@ -2062,6 +2062,10 @@ class StateResourceHandler(ResourceHandler):
         return self.state_shape == other.state_shape and self.dtype == other.dtype
 
 
+class SpeculativeOnly:
+    """Trait mixin marking a resource that is only needed when speculative decoding is enabled."""
+
+
 class SSMResourceHandler(StateResourceHandler):
     """Handler for SSM state resources that maps directly to MambaCacheManager's ssm_states buffer.
 
@@ -2129,7 +2133,7 @@ class CausalConvResourceHandler(StateResourceHandler):
         return (self.conv_dim, self.d_conv - 1)
 
 
-class SpecSSMResourceHandler(StateResourceHandler):
+class IntermediateSSMStateHandler(SpeculativeOnly, StateResourceHandler):
     """Intermediate SSM state cache descriptor for speculative decoding.
 
     Acts as a type marker conveying the per-layer SSM shape to the cache interface.
@@ -2137,8 +2141,8 @@ class SpecSSMResourceHandler(StateResourceHandler):
     by the MambaHybridCacheManager using spec_config, not by this handler.
 
     Inherits from StateResourceHandler (not SSMResourceHandler) so that
-    isinstance(h, SSMResourceHandler) returns False for spec handlers, eliminating
-    the need for exclusion guards throughout the codebase.
+    isinstance(h, SSMResourceHandler) returns False for intermediate handlers, eliminating
+    the need for exclusion guards throughout the codebase. Mixes in SpeculativeOnly.
     """
 
     def __init__(
@@ -2158,8 +2162,10 @@ class SpecSSMResourceHandler(StateResourceHandler):
         return (self.num_heads, self.head_dim, self.d_state)
 
     @classmethod
-    def from_base(cls, base: Optional["SSMResourceHandler"]) -> Optional["SpecSSMResourceHandler"]:
-        """Create a spec handler from a base SSM handler, or return None."""
+    def from_base(
+        cls, base: Optional["SSMResourceHandler"]
+    ) -> Optional["IntermediateSSMStateHandler"]:
+        """Create an intermediate handler from a base SSM handler, or return None."""
         if base is None:
             return None
         return cls(
@@ -2167,7 +2173,7 @@ class SpecSSMResourceHandler(StateResourceHandler):
         )
 
 
-class ReplayOldXHandler(StateResourceHandler):
+class ReplayOldXHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_x cache for the replay SSM kernel (single-buffered, bf16).
 
     Shape: (max_batch, T, num_heads, head_dim) — T is determined by the manager's
@@ -2196,7 +2202,7 @@ class ReplayOldXHandler(StateResourceHandler):
         )
 
 
-class ReplayOldBHandler(StateResourceHandler):
+class ReplayOldBHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_B cache for the replay SSM kernel (double-buffered, bf16).
 
     Shape: (max_batch, 2, T, n_groups, d_state) — T from manager.
@@ -2224,7 +2230,7 @@ class ReplayOldBHandler(StateResourceHandler):
         )
 
 
-class ReplayOldDtHandler(StateResourceHandler):
+class ReplayOldDtHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_dt cache for the replay SSM kernel (double-buffered, fp32).
 
     Shape: (max_batch, 2, num_heads, T) — T from manager.
@@ -2246,7 +2252,7 @@ class ReplayOldDtHandler(StateResourceHandler):
         return isinstance(other, ReplayOldDtHandler) and self.num_heads == other.num_heads
 
 
-class ReplayOldDAcumsumHandler(StateResourceHandler):
+class ReplayOldDAcumsumHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_dA_cumsum cache for the replay SSM kernel (double-buffered, fp32).
 
     Shape: (max_batch, 2, num_heads, T) — T from manager.
@@ -2268,7 +2274,7 @@ class ReplayOldDAcumsumHandler(StateResourceHandler):
         return isinstance(other, ReplayOldDAcumsumHandler) and self.num_heads == other.num_heads
 
 
-class ReplayCacheBufIdxHandler(StateResourceHandler):
+class ReplayCacheBufIdxHandler(SpeculativeOnly, StateResourceHandler):
     """Global cache_buf_idx tensor for the replay SSM kernel (shared across all layers, int32).
 
     Shape: (max_batch,).  Routes to MambaHybridCacheManager.get_replay_cache_buf_idx().
@@ -2290,7 +2296,7 @@ class ReplayCacheBufIdxHandler(StateResourceHandler):
         return isinstance(other, ReplayCacheBufIdxHandler)
 
 
-class ReplayPrevNumAcceptedHandler(StateResourceHandler):
+class ReplayPrevNumAcceptedHandler(SpeculativeOnly, StateResourceHandler):
     """Global prev_num_accepted_tokens tensor for the replay SSM kernel (int32, shared).
 
     Shape: (max_batch,).  Routes to MambaHybridCacheManager.get_replay_prev_num_accepted_tokens().
@@ -2310,7 +2316,7 @@ class ReplayPrevNumAcceptedHandler(StateResourceHandler):
         return isinstance(other, ReplayPrevNumAcceptedHandler)
 
 
-class SpecCausalConvResourceHandler(StateResourceHandler):
+class IntermediateConvStateHandler(SpeculativeOnly, StateResourceHandler):
     """Intermediate conv state cache descriptor for speculative decoding.
 
     Acts as a type marker conveying the per-layer conv shape to the cache interface.
@@ -2318,7 +2324,8 @@ class SpecCausalConvResourceHandler(StateResourceHandler):
     by the MambaHybridCacheManager using spec_config, not by this handler.
 
     Inherits from StateResourceHandler (not CausalConvResourceHandler) so that
-    isinstance(h, CausalConvResourceHandler) returns False for spec handlers.
+    isinstance(h, CausalConvResourceHandler) returns False for intermediate handlers. Mixes in
+    SpeculativeOnly.
     """
 
     def __init__(
@@ -2338,8 +2345,8 @@ class SpecCausalConvResourceHandler(StateResourceHandler):
     @classmethod
     def from_base(
         cls, base: Optional["CausalConvResourceHandler"]
-    ) -> Optional["SpecCausalConvResourceHandler"]:
-        """Create a spec handler from a base conv handler, or return None."""
+    ) -> Optional["IntermediateConvStateHandler"]:
+        """Create an intermediate handler from a base conv handler, or return None."""
         if base is None:
             return None
         return cls(conv_dim=base.conv_dim, d_conv=base.d_conv, dtype=base.dtype)

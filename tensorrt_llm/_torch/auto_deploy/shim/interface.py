@@ -50,6 +50,8 @@ else:
 
 from ..custom_ops.attention_interface import (
     CausalConvResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
     KVPagedResourceHandler,
     ReplayCacheBufIdxHandler,
     ReplayOldBHandler,
@@ -60,8 +62,6 @@ from ..custom_ops.attention_interface import (
     ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
-    SpecCausalConvResourceHandler,
-    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
 )
@@ -460,8 +460,8 @@ class CachedSequenceInterface:
         ssm_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecSSMResourceHandler)
-            and handler == SpecSSMResourceHandler.from_base(ssm_ref)
+            if isinstance(handler, IntermediateSSMStateHandler)
+            and handler == IntermediateSSMStateHandler.from_base(ssm_ref)
         ]
         conv_managed = [
             (name, handler)
@@ -471,8 +471,8 @@ class CachedSequenceInterface:
         conv_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecCausalConvResourceHandler)
-            and handler == SpecCausalConvResourceHandler.from_base(conv_ref)
+            if isinstance(handler, IntermediateConvStateHandler)
+            and handler == IntermediateConvStateHandler.from_base(conv_ref)
         ]
 
         # Replay SSM buffers — per-layer (old_x, old_B, old_dt, old_dA_cumsum)
@@ -1131,16 +1131,14 @@ class CachedSequenceInterface:
             1 for h in self._resource_lookup.values() if isinstance(h, SSMResourceHandler)
         )
         num_ssm_spec_total = sum(
-            1 for h in self._resource_lookup.values() if isinstance(h, SpecSSMResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateSSMStateHandler)
         )
         num_ssm_total = num_ssm_base_total + num_ssm_spec_total
         num_conv_base_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, CausalConvResourceHandler)
         )
         num_conv_spec_total = sum(
-            1
-            for h in self._resource_lookup.values()
-            if isinstance(h, SpecCausalConvResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateConvStateHandler)
         )
         num_conv_total = num_conv_base_total + num_conv_spec_total
         num_state_other = num_state_total - num_ssm_total - num_conv_total
