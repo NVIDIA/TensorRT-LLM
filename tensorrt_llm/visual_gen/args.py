@@ -481,7 +481,7 @@ class VisualGenArgs(StrictBaseModel):
             "Quantization config — accepts either a QuantConfig instance "
             "or a ModelOpt-format dict (e.g. ``{'quant_algo': 'FP8', "
             "'dynamic': True}``). Dict-form parsing happens lazily in "
-            "DiffusionModelConfig.from_pretrained."
+            "DiffusionPipelineConfig.from_pretrained."
         ),
     )
     compilation_config: CompilationConfig = Field(

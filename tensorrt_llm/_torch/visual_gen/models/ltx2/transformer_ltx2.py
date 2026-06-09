@@ -30,6 +30,7 @@ from tqdm import tqdm
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
@@ -928,7 +929,7 @@ class LTXModelType(Enum):
         return self in (LTXModelType.AudioVideo, LTXModelType.AudioOnly)
 
 
-class LTXModel(nn.Module):
+class LTXModel(BaseDiffusionModel):
     """LTX-2 transformer built from TRT-LLM primitives.
 
     Native implementation using optimized TRT-LLM Linear, RMSNorm, MLP, and
@@ -966,8 +967,10 @@ class LTXModel(nn.Module):
         apply_gated_attention: bool = False,
         model_config: Optional["DiffusionModelConfig"] = None,
     ):
-        super().__init__()
-        self.model_config = model_config
+        from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+
+        model_config = model_config or DiffusionModelConfig()
+        super().__init__(model_config)
         self.model_type = model_type
         self.use_middle_indices_grid = use_middle_indices_grid
         self.rope_type = rope_type

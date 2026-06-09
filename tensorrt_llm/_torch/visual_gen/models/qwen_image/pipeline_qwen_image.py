@@ -76,8 +76,8 @@ class QwenImagePipeline(BasePipeline):
     # either version.
     DEFAULT_GENERATION_PARAMS = _DEFAULT_GENERATION_PARAMS
 
-    def __init__(self, model_config):
-        super().__init__(model_config)
+    def __init__(self, pipeline_config):
+        super().__init__(pipeline_config)
         # Qwen-Image uses 8x VAE downsample + 2x2 patch packing. Both
         # scheduler and image-prep assume a latent grid divisible by
         # (vae_scale_factor * 2 == 16). vae_scale_factor is updated by
@@ -87,7 +87,7 @@ class QwenImagePipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -122,12 +122,11 @@ class QwenImagePipeline(BasePipeline):
     # ------------------------------------------------------------------
     def _init_transformer(self) -> None:
         logger.info("Creating Qwen-Image transformer")
-        # ``pretrained_config`` on the DiffusionModelConfig is populated
-        # from ``<ckpt>/transformer/config.json`` as a SimpleNamespace by
-        # ``DiffusionModelConfig.from_pretrained``. Read the fields we
-        # care about with sensible defaults (matching the Qwen-Image 20B
-        # reference model).
-        pretrained = getattr(self.model_config, "pretrained_config", None)
+        model_config = self.pipeline_config.model_configs["transformer"]
+        # ``pretrained_config`` is populated from
+        # ``<ckpt>/transformer/config.json``. Read the fields we care
+        # about with defaults matching the Qwen-Image 20B reference model.
+        pretrained = getattr(model_config, "pretrained_config", None)
 
         def _cfg(name: str, default):
             if pretrained is None:
@@ -137,7 +136,7 @@ class QwenImagePipeline(BasePipeline):
             return getattr(pretrained, name, default)
 
         self.transformer = QwenImageTransformer2DModel(
-            model_config=self.model_config,
+            model_config=model_config,
             patch_size=_cfg("patch_size", 2),
             in_channels=_cfg("in_channels", 64),
             out_channels=_cfg("out_channels", 16),
@@ -200,7 +199,7 @@ class QwenImagePipeline(BasePipeline):
             self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         if PipelineComponent.VAE not in skip_components:
@@ -233,7 +232,7 @@ class QwenImagePipeline(BasePipeline):
             # default. Cast only non-quantized tensors so FP8/NVFP4 weights
             # and FP32 scales keep the dtypes created by Linear.load_weights().
             self.transformer.to_inference_dtype().eval()
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
     # ------------------------------------------------------------------
     # Prompt encoding (Qwen2.5-VL chat template).
