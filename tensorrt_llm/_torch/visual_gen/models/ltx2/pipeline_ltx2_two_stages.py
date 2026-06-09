@@ -662,9 +662,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             **kwargs,
         )
 
-        dtype = self.model_config.torch_dtype
-        spatial_upsampler_path = self.model_config.extra_attrs.get("spatial_upsampler_path", "")
-        distilled_lora_path = self.model_config.extra_attrs.get("distilled_lora_path", "")
+        dtype = self.pipeline_config.torch_dtype
+        spatial_upsampler_path = self.pipeline_config.extra_attrs.get("spatial_upsampler_path", "")
+        distilled_lora_path = self.pipeline_config.extra_attrs.get("distilled_lora_path", "")
 
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
