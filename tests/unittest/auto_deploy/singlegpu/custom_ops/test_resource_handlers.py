@@ -453,7 +453,9 @@ _SPECULATIVE_ONLY_HANDLERS = [
 _NON_SPECULATIVE_HANDLERS = [
     SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
     CausalConvResourceHandler(conv_dim=128, d_conv=4, dtype=torch.float32),
-    KVPagedResourceHandler(num_kv_heads=4, head_dim=64, dtype=torch.bfloat16),
+    KVPagedResourceHandler(
+        num_kv_heads=4, head_dim=64, dtype=torch.bfloat16, attention_type=AttentionType.mha
+    ),
 ]
 
 
