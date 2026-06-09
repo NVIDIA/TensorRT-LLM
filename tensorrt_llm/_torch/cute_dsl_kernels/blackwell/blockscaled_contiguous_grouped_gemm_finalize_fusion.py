@@ -257,9 +257,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 self.meta_load_warp_id,
             )
         )
-        self.num_regs_uniform_warps = 64
-        self.num_regs_sched_warps = 64
-        self.num_regs_epilogue_warps = 216
 
         # Set barrier for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -1192,7 +1189,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Specialized Schedule warp
         #
         if warp_idx == self.sched_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1291,8 +1287,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
-
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -1652,7 +1646,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Specialized metadata loader warp
         #
         if warp_idx == self.meta_load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             meta_lane = tidx % self.threads_per_warp
 
             tile_info_consumer_state = pipeline.make_pipeline_state(
