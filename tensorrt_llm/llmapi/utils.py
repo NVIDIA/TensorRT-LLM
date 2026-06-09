@@ -622,6 +622,49 @@ def get_numa_aware_cpu_affinity(device_id):
     return cpu_affinity
 
 
+def _parse_cpulist(cpulist: str) -> List[int]:
+    cpus: List[int] = []
+    for part in cpulist.split(','):
+        part = part.strip()
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            cpus.extend(range(int(lo), int(hi) + 1))
+        elif part:
+            cpus.append(int(part))
+    return cpus
+
+
+def get_current_numa_cpus() -> List[int]:
+    '''Return the CPU IDs on the same NUMA node as the calling thread.
+
+    Reads the current CPU from the OS scheduler and maps it to its NUMA node
+    via sysfs.  Falls back to all CPUs on non-NUMA systems or on any error.
+    '''
+    cpu_count = psutil.cpu_count()
+    all_cpus = list(range(cpu_count))
+
+    if not os.path.isdir("/sys/devices/system/node/node1"):
+        return all_cpus
+
+    try:
+        current_cpu = psutil.Process().cpu_num()
+        for entry in sorted(os.scandir("/sys/devices/system/node"),
+                            key=lambda e: e.name):
+            if not entry.name.startswith("node"):
+                continue
+            cpulist_path = os.path.join(entry.path, "cpulist")
+            if not os.path.exists(cpulist_path):
+                continue
+            with open(cpulist_path) as f:
+                cpus = _parse_cpulist(f.read().strip())
+            if current_cpu in cpus:
+                return cpus
+    except Exception:
+        pass
+
+    return all_cpus
+
+
 def generate_api_docs_as_docstring(model: Type[BaseModel],
                                    include_annotations=False,
                                    indent="") -> str:

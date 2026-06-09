@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import concurrent.futures
 import json
 import os
 import re
@@ -42,6 +43,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
+from tensorrt_llm.llmapi.utils import get_current_numa_cpus
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.metrics.collector import MetricsCollector
@@ -243,8 +245,29 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self._init_llm(chat_template)
 
+        _preprocessing_numa_cpus = get_current_numa_cpus()
+        _preprocessing_num_workers = min(32, (os.cpu_count() or 1) + 4)
+
         @asynccontextmanager
         async def lifespan(app: FastAPI):
+
+            def _pin_preprocessing_thread():
+                if hasattr(os, 'sched_setaffinity'):
+                    try:
+                        os.sched_setaffinity(0, _preprocessing_numa_cpus)
+                    except OSError:
+                        pass
+
+            preprocessing_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_preprocessing_num_workers,
+                initializer=_pin_preprocessing_thread,
+            )
+            asyncio.get_running_loop().set_default_executor(
+                preprocessing_executor)
+            logger.info(
+                f"Preprocessing threadpool ({_preprocessing_num_workers} workers) "
+                f"pinned to CPUs {_preprocessing_numa_cpus}")
+
             if self.metadata_server is not None:
                 metadata = {
                     "model": self.model,
@@ -316,6 +339,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if self.resource_governor is not None:
                 self.resource_governor.close()
             self.generator.shutdown()
+            preprocessing_executor.shutdown(wait=False)
 
         self.app = FastAPI(lifespan=lifespan)
 
