@@ -111,6 +111,7 @@ def _create_manager(
     num_layers: int = 1,
     max_attention_window: list[int] | None = None,
     enable_block_reuse: bool = True,
+    block_reuse_policy: str = "all_reusable",
     enable_stats: bool = True,
 ) -> KVCacheManagerV2:
     return KVCacheManagerV2(
@@ -120,6 +121,7 @@ def _create_manager(
             max_gpu_total_bytes=gpu_bytes,
             max_util_for_resume=1.0,
             max_attention_window=max_attention_window,
+            block_reuse_policy=block_reuse_policy,
         ),
         CacheType.SELF,
         num_layers=num_layers,
@@ -435,6 +437,50 @@ def test_chunked_context_reports_generation_alloc_only_in_generation(resource_gu
         _metric_call(alloc_total=1, alloc_new=1, missed=1),
         _metric_call(alloc_total=1, alloc_new=1),
     ]
+
+
+def test_all_reusable_policy_commits_each_context_chunk(resource_guard) -> None:
+    request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
+    manager = resource_guard(
+        _create_manager(gpu_bytes=8 << 20, block_reuse_policy="all_reusable"), request
+    )
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    request.context_current_position = 4
+    request.context_remaining_length = 4
+    manager.update_context_resources(_context_batch(request))
+
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.num_committed_tokens == 4
+    assert kv_cache.history_length == 4
+
+
+def test_per_request_policy_delays_commit_until_last_context_chunk(resource_guard) -> None:
+    request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
+    manager = resource_guard(
+        _create_manager(gpu_bytes=8 << 20, block_reuse_policy="per_request"), request
+    )
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    request.context_current_position = 4
+    request.context_remaining_length = 4
+    manager.update_context_resources(_context_batch(request))
+
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.num_committed_tokens == 0
+    assert kv_cache.history_length == 4
+
+    request.is_first_context_chunk = False
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    request.context_current_position = 8
+    request.context_remaining_length = 0
+    manager.update_context_resources(_context_batch(request))
+
+    assert kv_cache.num_committed_tokens == 8
+    assert kv_cache.history_length == 8
 
 
 def test_v2_generation_alloc_updates_request_metrics_unlike_v1(resource_guard) -> None:

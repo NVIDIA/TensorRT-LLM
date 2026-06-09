@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -62,10 +61,6 @@ from .deepseek_v4 import (
     get_token_bytes,
     is_overlap_compressor,
 )
-
-# Keep the env override so per-layer block tables can still be tested
-# without scratch-page remapping when needed.
-DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV = "TRTLLM_DSV4_ENABLE_SWA_SCRATCH_REUSE"
 
 
 def _estimate_non_sliding_attn_size_per_token(
@@ -243,11 +238,6 @@ def _compute_sliding_block_tables_with_scratch_compiled(
     output[:, :, :scratch_capacity, :].copy_(torch.where(mask, scratch_index, scratch_rows))
 
 
-def _enable_swa_scratch_reuse_from_env() -> bool:
-    value = os.environ.get(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
-    return value.strip() == "1"
-
-
 class DeepseekV4CacheManager(KVCacheManagerV2):
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains one virtual attention-op pool per local
@@ -339,7 +329,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             mapping=mapping,
             dtype=dtype,
-            enable_swa_scratch_reuse=_enable_swa_scratch_reuse_from_env(),
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA

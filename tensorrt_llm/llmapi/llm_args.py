@@ -2776,6 +2776,21 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "typical step. If unset, max_seq_len is used. This does not take effect when "
         "pool_ratio is set.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    block_reuse_policy: Literal["all_reusable", "per_request"] = Field(
+        default="all_reusable",
+        status="prototype",
+        description="KV cache manager v2 block reuse policy. "
+        "With SWA scratch reuse and 'all_reusable', only non-scratch "
+        "blocks are saved for reuse.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_swa_scratch_reuse: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Whether KV cache manager v2 uses SWA scratch reuse during prefill.")
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
