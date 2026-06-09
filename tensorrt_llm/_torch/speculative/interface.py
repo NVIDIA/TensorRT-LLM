@@ -1568,9 +1568,11 @@ class SpecWorkerBase(nn.Module, ABC):
             sampled_tokens: [num_tokens] - Sampled token ids
         """
         if not spec_metadata.is_all_greedy_sample:
-            num_gens = batch_size - num_contexts
-            num_tokens = num_contexts + num_gens * (
-                spec_metadata.runtime_draft_len + 1)
+            # Use logits.shape[0] directly: for PARD under CUDA graph capture
+            # runtime_draft_len may reflect the PARD-max while the captured
+            # graph was built for a shorter draft_len, causing a shape mismatch
+            # in sampling_batch_spec_dec_one_model (which is torch.compiled).
+            num_tokens = logits.shape[0]
 
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]
