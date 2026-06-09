@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-adjust_gb200_x4_platform_load_balancing', 'trtllm-jenkins-shared-lib@user/yuanjingx/support_getting_estimate_from_per_cluster_duraiton_files']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
