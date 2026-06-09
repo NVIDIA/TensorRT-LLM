@@ -18,7 +18,7 @@
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -117,7 +117,7 @@ HostMem::HostMem(size_t size)
         return;
     }
     mAddr = hostMmap(size);
-    assert(mAddr % kAlignment == 0);
+    TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
     mSize = size;
     madviseHugepages();
     registerToCuda();
@@ -132,7 +132,7 @@ void HostMem::resize(size_t newSize)
 {
     unregisterFromCuda();
     mAddr = hostMremap(mAddr, mSize, newSize);
-    assert(mAddr % kAlignment == 0);
+    TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
     mSize = newSize;
     madviseHugepages();
     registerToCuda();
@@ -152,14 +152,14 @@ void HostMem::destroy()
 
 void HostMem::madviseHugepages()
 {
-    assert(mAddr && mSize);
+    TLLM_CHECK_DEBUG(mAddr && mSize);
     // Advisory — ignore failures.
     ::madvise(reinterpret_cast<void*>(mAddr), mSize, MADV_HUGEPAGE);
 }
 
 void HostMem::registerToCuda()
 {
-    assert(mNumRegisteredChunks == 0);
+    TLLM_CHECK_DEBUG(mNumRegisteredChunks == 0);
     static bool chunked = shouldUseChunkedRegistration();
 
     size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
@@ -182,7 +182,7 @@ void HostMem::unregisterFromCuda()
         cuMemHostUnregister(reinterpret_cast<void*>(mAddr + offset));
         --mNumRegisteredChunks;
     }
-    assert(mNumRegisteredChunks == 0);
+    TLLM_CHECK_DEBUG(mNumRegisteredChunks == 0);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

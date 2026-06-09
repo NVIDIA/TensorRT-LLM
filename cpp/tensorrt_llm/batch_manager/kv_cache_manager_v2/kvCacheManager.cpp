@@ -22,8 +22,8 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -130,7 +130,7 @@ KvCacheManager::~KvCacheManager()
 void KvCacheManager::shutdown()
 {
     clearReusableBlocks();
-    assert(mStorage);
+    TLLM_CHECK_DEBUG(mStorage);
 
     // Post-condition: after clearing all reusable blocks and with no active KvCaches,
     // no evictable pages should remain.
@@ -138,7 +138,7 @@ void KvCacheManager::shutdown()
     {
         for (PoolGroupIndex pgIdx{0}; pgIdx < lvl.numPoolGroups(); ++pgIdx)
         {
-            assert(lvl.controller.numEvictablePages(pgIdx) == 0);
+            TLLM_CHECK_DEBUG(lvl.controller.numEvictablePages(pgIdx) == 0);
         }
     }
 
@@ -147,7 +147,7 @@ void KvCacheManager::shutdown()
 
 void KvCacheManager::clearReusableBlocks()
 {
-    assert(mRadixTree);
+    TLLM_CHECK_DEBUG(mRadixTree);
     mRadixTree->clear();
 }
 
@@ -420,7 +420,7 @@ std::vector<BufferId> KvCacheManager::allBufferIds() const
 
 int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) const
 {
-    assert(batchSize > 0);
+    TLLM_CHECK_DEBUG(batchSize > 0);
     int tokPerBlock = tokensPerBlock();
     PoolGroupIndex numPg = mStorage->numPoolGroups();
     auto const& lcs = mLifeCycles;
@@ -452,9 +452,9 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
     auto minSlots = getNumSlots(1);
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
     {
-        assert(minSlots[pgIdx] >= 0);
+        TLLM_CHECK_DEBUG(minSlots[pgIdx] >= 0);
         SlotCount const reservedSlots = minSlots[pgIdx] * (batchSize - 1);
-        assert(remainingSlots[pgIdx] >= reservedSlots);
+        TLLM_CHECK_DEBUG(remainingSlots[pgIdx] >= reservedSlots);
         remainingSlots[pgIdx] -= reservedSlots;
     }
 
@@ -463,7 +463,7 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
         auto needed = getNumSlots(numBlocks * tokPerBlock);
         for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
         {
-            assert(needed[pgIdx] >= 0);
+            TLLM_CHECK_DEBUG(needed[pgIdx] >= 0);
             if (needed[pgIdx] > remainingSlots[pgIdx])
             {
                 return false;
@@ -472,7 +472,7 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
         return true;
     };
 
-    assert(isEnough(1));
+    TLLM_CHECK_DEBUG(isEnough(1));
     int lb = 1;
     int ub = divUp(tokenNumUpperBound, tokPerBlock);
     if (isEnough(ub))
@@ -515,7 +515,7 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherPe
 
     for (KvCache* kvc : mLivingKvCaches)
     {
-        assert(kvc->status() == KvCache::Status::SUSPENDED);
+        TLLM_CHECK_DEBUG(kvc->status() == KvCache::Status::SUSPENDED);
         for (auto const& sb : kvc->blocks())
         {
             for (auto const& beamPages : sb.pages)
@@ -527,17 +527,18 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherPe
                     {
                         continue;
                     }
-                    assert(std::holds_alternative<SharedPtr<PageHolder>>(beamPages[lc])
-                        && "Non-null holder must be PageHolder in suspended state");
+                    TLLM_CHECK_DEBUG_WITH_INFO(std::holds_alternative<SharedPtr<PageHolder>>(beamPages[lc]),
+                        "Non-null holder must be PageHolder in suspended state");
                     auto const& pg = blockPageGetPage(beamPages[lc]);
                     if (!pg)
                     {
                         continue;
                     }
                     // Mirrors Python assertions for invariant checking.
-                    assert(pg->status() == PageStatus::HELD && "Page in suspended KvCache must be HELD");
-                    assert((pg->scheduledForEviction() == (pg->cacheLevel != lastLevel))
-                        && "Eviction scheduling invariant violated");
+                    TLLM_CHECK_DEBUG_WITH_INFO(
+                        pg->status() == PageStatus::HELD, "Page in suspended KvCache must be HELD");
+                    TLLM_CHECK_DEBUG_WITH_INFO((pg->scheduledForEviction() == (pg->cacheLevel != lastLevel)),
+                        "Eviction scheduling invariant violated");
                     if (pg->scheduledForEviction())
                     {
                         continue;
@@ -625,7 +626,7 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
     constexpr float kThreshold = 1.25f;
     for (PoolGroupIndex pgIdx{0}; pgIdx < target.size() && pgIdx < current.size(); ++pgIdx)
     {
-        assert(current[pgIdx] > 0.f && target[pgIdx] > 0.f && "ratios must not be zero");
+        TLLM_CHECK_DEBUG_WITH_INFO(current[pgIdx] > 0.f && target[pgIdx] > 0.f, "ratios must not be zero");
         float ratio = target[pgIdx] / current[pgIdx];
         if (ratio < 1.f / kThreshold || ratio > kThreshold)
             return true;
@@ -647,7 +648,7 @@ bool KvCacheManager::needAdjustment() const
 void KvCacheManager::adjust()
 {
     for (KvCache* kvc : mLivingKvCaches)
-        assert(kvc->status() == KvCache::Status::SUSPENDED);
+        TLLM_CHECK_DEBUG(kvc->status() == KvCache::Status::SUSPENDED);
 
     CacheLevel numLevels = mStorage->numCacheLevels();
     for (CacheLevel level{0}; level < numLevels; ++level)

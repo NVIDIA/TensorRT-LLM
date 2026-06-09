@@ -162,7 +162,7 @@ else:
     BAD_PAGE_INDEX = -1
     DEFAULT_BEAM_INDEX = 0
     GPU_LEVEL = 0
-    NDEBUG = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_DEBUG", "") == ""
+    NDEBUG = os.environ.get("TLLM_DEBUG_MODE", "")[0:1] != "1"
 
     class _RawRef:
         def __init__(self, obj=None):

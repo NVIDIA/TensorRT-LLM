@@ -17,8 +17,8 @@
 
 #include "kv_cache_manager_v2/storage/core.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include <algorithm>
-#include <cassert>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -50,15 +50,16 @@ SlotAllocator::SlotAllocator(SlotCount capacity)
 SlotAllocator::~SlotAllocator()
 {
     // Mirrors Python SlotAllocator.__del__ (assert_critical checks).
-    if (!gNdebug)
+    if (TLLM_UNLIKELY(gDebug))
     {
-        assert(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size()
-            && "SlotAllocator destroyed with unfinished events — did you call synchronize()?");
-        assert(mTargetCapacity == mCapacity && mOverflowSlots.empty()
-            && "SlotAllocator destroyed while resize is in progress");
-        assert(mOccupiedMask.numSetBits() == 0 && "SlotAllocator destroyed with occupied slots still in use");
-        assert(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots)
-            && "SlotAllocator destroyed with some slots not recycled");
+        TLLM_CHECK_WITH_INFO(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size(),
+            "SlotAllocator destroyed with unfinished events — did you call synchronize()?");
+        TLLM_CHECK_WITH_INFO(mTargetCapacity == mCapacity && mOverflowSlots.empty(),
+            "SlotAllocator destroyed while resize is in progress");
+        TLLM_CHECK_WITH_INFO(
+            mOccupiedMask.numSetBits() == 0, "SlotAllocator destroyed with occupied slots still in use");
+        TLLM_CHECK_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots),
+            "SlotAllocator destroyed with some slots not recycled");
     }
 }
 
@@ -84,12 +85,12 @@ Slot SlotAllocator::allocate()
     Slot slot;
     if (mNumReadyRecycledSlots > 0)
     {
-        assert(!mRecycledSlots.empty() && "ready recycled slots > 0 but deque is empty");
+        TLLM_CHECK_DEBUG_WITH_INFO(!mRecycledSlots.empty(), "ready recycled slots > 0 but deque is empty");
         slot = std::move(mRecycledSlots.front());
         mRecycledSlots.pop_front();
-        assert(slot.hasValidSlot() && "ready recycled slot has no valid id");
+        TLLM_CHECK_DEBUG_WITH_INFO(slot.hasValidSlot(), "ready recycled slot has no valid id");
         --mNumReadyRecycledSlots;
-        assert(slot.readyEvent.isClosed() && "ready recycled slot has non-null event");
+        TLLM_CHECK_DEBUG_WITH_INFO(slot.readyEvent.isClosed(), "ready recycled slot has non-null event");
     }
     else if (mNumActiveSlots < std::min(mCapacity, mTargetCapacity))
     {
@@ -99,7 +100,7 @@ Slot SlotAllocator::allocate()
     {
         slot = std::move(mRecycledSlots.front());
         mRecycledSlots.pop_front();
-        assert(slot.hasValidSlot() && "non-ready recycled slot has no valid id");
+        TLLM_CHECK_DEBUG_WITH_INFO(slot.hasValidSlot(), "non-ready recycled slot has no valid id");
     }
     mOccupiedMask.set(toSizeT(slot.slotId()));
     return slot;
@@ -145,25 +146,25 @@ void SlotAllocator::release(Slot slot)
         mOverflowSlots.push_back(std::move(slot));
     }
     scrubEvents();
-    assert(check());
+    TLLM_CHECK_DEBUG(check());
 }
 
 void SlotAllocator::expand(SlotCount newNumSlots)
 {
-    assert(gNdebug || check());
-    assert(mTargetCapacity == mCapacity);
-    assert(newNumSlots > mCapacity);
+    TLLM_CHECK_DEBUG(check());
+    TLLM_CHECK_DEBUG(mTargetCapacity == mCapacity);
+    TLLM_CHECK_DEBUG(newNumSlots > mCapacity);
     mOccupiedMask.resize(slotCountToSizeT(newNumSlots));
     mCapacity = newNumSlots;
     mTargetCapacity = newNumSlots;
-    assert(gNdebug || check());
+    TLLM_CHECK_DEBUG(check());
 }
 
 void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
 {
-    assert(gNdebug || check());
-    assert(mTargetCapacity == mCapacity);
-    assert(newNumSlots < mCapacity);
+    TLLM_CHECK_DEBUG(check());
+    TLLM_CHECK_DEBUG(mTargetCapacity == mCapacity);
+    TLLM_CHECK_DEBUG(newNumSlots < mCapacity);
     std::deque<Slot> newRecycled;
     SlotCount newNumReady = 0;
     SlotCount const oldNumReady = mNumReadyRecycledSlots;
@@ -185,12 +186,12 @@ void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
     mRecycledSlots = std::move(newRecycled);
     mNumReadyRecycledSlots = newNumReady;
     mTargetCapacity = newNumSlots;
-    assert(gNdebug || check());
+    TLLM_CHECK_DEBUG(check());
 }
 
 bool SlotAllocator::finishShrink()
 {
-    assert(gNdebug || check());
+    TLLM_CHECK_DEBUG(check());
     // Overflow-range IDs that were ever issued are exactly
     // max(0, _num_active_slots - _target_capacity); the underused case
     // (_num_active_slots <= _target_capacity) collapses to zero.
@@ -198,15 +199,15 @@ bool SlotAllocator::finishShrink()
     if (shrinkInProgress() && slotCountValueFromSize(mOverflowSlots.size()) == expectedOverflow)
     {
         // Validate uniqueness of slot IDs in overflow (debug only).
-        if (!gNdebug)
+        if (TLLM_UNLIKELY(gDebug))
         {
             std::set<SlotId> ids;
             for (auto const& s : mOverflowSlots)
             {
-                assert(s.hasValidSlot());
+                TLLM_CHECK(s.hasValidSlot());
                 ids.insert(s.slotId());
             }
-            assert(ids.size() == mOverflowSlots.size() && "Duplicate slot IDs in overflow slots");
+            TLLM_CHECK_WITH_INFO(ids.size() == mOverflowSlots.size(), "Duplicate slot IDs in overflow slots");
         }
         // Synchronize overflow events (deduplicated — slots often share events).
         {
@@ -222,7 +223,7 @@ bool SlotAllocator::finishShrink()
         mCapacity = mTargetCapacity;
         mNumActiveSlots = std::min(mNumActiveSlots, mCapacity);
         scrubEvents();
-        assert(gNdebug || check());
+        TLLM_CHECK_DEBUG(check());
         return true;
     }
     throw std::runtime_error("SlotAllocator::finishShrink: cannot finish shrink yet");
@@ -294,7 +295,8 @@ GpuSlotPool::GpuSlotPool(size_t slotSize, size_t vmSize, PooledPhysMemAllocator&
     : SlotPoolBase(slotSize)
     , mVirtMem(vmSize, physMemAllocator)
 {
-    assert(vmSize % physMemAllocator.physMemSize() == 0 && "vm_size must be aligned to phys_mem_size");
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        vmSize % physMemAllocator.physMemSize() == 0, "vm_size must be aligned to phys_mem_size");
     resize(numSlots);
 }
 
@@ -333,7 +335,7 @@ SlotCount GpuSlotPool::extendByOnePhysMem()
 
 Address GpuSlotPool::slotAddress(SlotId slot) const
 {
-    assert(slot < numSlots() && "GpuSlotPool::slotAddress: slot index out of bounds");
+    TLLM_CHECK_DEBUG_WITH_INFO(slot < numSlots(), "GpuSlotPool::slotAddress: slot index out of bounds");
     return MemAddress(mVirtMem.address() + mSlotSize * toSizeT(slot));
 }
 
@@ -369,7 +371,7 @@ void HostSlotPool::resize(SlotCount newNumSlots)
 
 Address HostSlotPool::slotAddress(SlotId slot) const
 {
-    assert(slot < numSlots() && "HostSlotPool::slotAddress: slot index out of bounds");
+    TLLM_CHECK_DEBUG_WITH_INFO(slot < numSlots(), "HostSlotPool::slotAddress: slot index out of bounds");
     return MemAddress(mHostMem.address() + mSlotSize * toSizeT(slot));
 }
 
@@ -410,7 +412,7 @@ DiskSlotPool::~DiskSlotPool()
 
 SlotCount DiskSlotPool::numSlots() const noexcept
 {
-    assert(mFd != kBadFileDescriptor);
+    TLLM_CHECK_DEBUG(mFd != kBadFileDescriptor);
     off_t sz = ::lseek(mFd, 0, SEEK_END);
     return (sz < 0 || mSlotSize == 0) ? 0 : slotCountValueFromSize(static_cast<size_t>(sz) / mSlotSize);
 }
@@ -431,10 +433,10 @@ void DiskSlotPool::resize(SlotCount newNumSlots)
 
 Address DiskSlotPool::slotAddress(SlotId slot) const
 {
-    assert(slot < numSlots() && "DiskSlotPool::slotAddress: slot index out of bounds");
+    TLLM_CHECK_DEBUG_WITH_INFO(slot < numSlots(), "DiskSlotPool::slotAddress: slot index out of bounds");
     size_t const byteOffset = toSizeT(slot) * mSlotSize;
-    assert(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max())
-        && "DiskSlotPool::slotAddress: byte offset out of range");
+    TLLM_CHECK_DEBUG_WITH_INFO(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max()),
+        "DiskSlotPool::slotAddress: byte offset out of range");
     return DiskAddress{mFd, static_cast<ssize_t>(byteOffset)};
 }
 
@@ -467,11 +469,11 @@ PoolGroupBase::~PoolGroupBase()
 SlotCount PoolGroupBase::numSlots() const noexcept
 {
     SlotCount n = mSlotAllocator.numSlots();
-    if (!gNdebug)
+    if (TLLM_UNLIKELY(gDebug))
     {
         // Mirrors Python PoolGroupBase.num_slots: assert num_slots <= self._get_num_slots_from_pools()
         [[maybe_unused]] SlotCount poolSlots = getNumSlotsFromPools();
-        assert(n <= poolSlots && "SlotAllocator capacity exceeds pool capacity");
+        TLLM_CHECK_WITH_INFO(n <= poolSlots, "SlotAllocator capacity exceeds pool capacity");
     }
     return n;
 }
@@ -513,9 +515,8 @@ void PoolGroupBase::resizePools(std::optional<SlotCount> newNumSlots)
         p->resize(n);
     // Mirrors Python PoolGroupBase.resize_pools: assert NDEBUG or self._check(True)
     // After resize, allocator capacity must not exceed pool capacity (allow mismatch).
-    assert(gNdebug
-        || (mSlotAllocator.numSlots() <= getNumSlotsFromPools()
-            && "After resizePools: allocator capacity exceeds pool capacity"));
+    TLLM_CHECK_DEBUG_WITH_INFO(mSlotAllocator.numSlots() <= getNumSlotsFromPools(),
+        "After resizePools: allocator capacity exceeds pool capacity");
 }
 
 TypedVec<PoolIndex, Address> PoolGroupBase::slotAddress(SlotId slotId) const
@@ -623,8 +624,8 @@ TypedVec<PoolIndex, Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx
 GpuCacheLevelStorage::GpuCacheLevelStorage(
     StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize)
 {
-    assert(slotCountList.size() == storageCfg.slotDescList.size()
-        && "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
+        "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     mPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(physMemSize);
 
     for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
@@ -641,8 +642,8 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(
 HostCacheLevelStorage::HostCacheLevelStorage(
     StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
 {
-    assert(slotCountList.size() == storageCfg.slotDescList.size()
-        && "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
+        "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
     {
         mPoolGroups.push_back(
@@ -658,8 +659,8 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(
     StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
     : mDirectory(std::move(directory))
 {
-    assert(slotCountList.size() == storageCfg.slotDescList.size()
-        && "DiskCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
+        "DiskCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
     {
         mPoolGroups.push_back(std::make_unique<DiskPoolGroup>(
@@ -747,11 +748,11 @@ std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(
         size_t poolGrains = std::max(minPoolGrains[poolIdx], roundedGrains);
         SlotCount const poolSlots = slotCountValueFromSize(poolGrains * granularity / slotSz);
         numSlots = std::min(numSlots, poolSlots);
-        assert(poolGrains <= remainingPgGrains);
+        TLLM_CHECK_DEBUG(poolGrains <= remainingPgGrains);
         remainingPgGrains -= poolGrains;
     }
-    assert(remainingPgGrains == 0);
-    assert(numSlots > 0);
+    TLLM_CHECK_DEBUG(remainingPgGrains == 0);
+    TLLM_CHECK_DEBUG(numSlots > 0);
 
     auto slotsToGrains = [&](SlotCount slots) { return grainsForSlots(slots, slotSizeList, granularity); };
     SlotCount lo = numSlots;
@@ -776,8 +777,8 @@ std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(
         }
     }
     size_t const used = slotsToGrains(lo);
-    assert(used <= pgGrains);
-    assert(slotsToGrains(lo + 1) > pgGrains);
+    TLLM_CHECK_DEBUG(used <= pgGrains);
+    TLLM_CHECK_DEBUG(slotsToGrains(lo + 1) > pgGrains);
     return {lo, used};
 }
 
@@ -807,23 +808,18 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
     TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
 {
     PoolGroupIndex numPg = sizeLists.size();
-    assert(ratioList.size() == numPg);
-    if (!gNdebug)
-    {
-        for ([[maybe_unused]] auto x : ratioList)
-        {
-            assert(x > 0 && "ratioToSlotCountList: all ratios must be positive");
-        }
-    }
-    assert(quota % granularity == 0);
+    TLLM_CHECK_DEBUG(ratioList.size() == numPg);
+    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(ratioList.begin(), ratioList.end(), [](auto x) { return x > 0; }),
+        "ratioToSlotCountList: all ratios must be positive");
+    TLLM_CHECK_DEBUG(quota % granularity == 0);
     size_t totalGrains = quota / granularity;
-    if (!gNdebug)
+    if (TLLM_UNLIKELY(gDebug))
     {
         [[maybe_unused]] size_t minGrains = 0;
         for (auto const& sizes : sizeLists)
             minGrains += toSizeT(sizes.size());
-        assert(totalGrains >= minGrains
-            && "ratioToSlotCountList: insufficient total grains for at least 1 slot per pool group");
+        TLLM_CHECK_WITH_INFO(totalGrains >= minGrains,
+            "ratioToSlotCountList: insufficient total grains for at least 1 slot per pool group");
     }
 
     TypedVec<PoolGroupIndex, SlotCount> slotCntList(numPg, 0);
@@ -866,7 +862,7 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
                 sizeLists[activePgs[idx]], granularity);
             slotsForActive[idx] = slots;
             grainsForActive[idx] = used;
-            assert(used <= budget);
+            TLLM_CHECK_DEBUG(used <= budget);
             budget -= used;
         }
 
@@ -899,7 +895,7 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
             size_t minGrains = grainsForSlots(minSlotCount, sizeLists[pgIdx], granularity);
             auto [slots, used] = grainsToSlots(minGrains, sizeLists[pgIdx], granularity);
             slotCntList[pgIdx] = slots;
-            assert(used <= remainingGrains);
+            TLLM_CHECK_DEBUG(used <= remainingGrains);
             remainingGrains -= used;
         }
 
@@ -939,7 +935,7 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::computeSlotCountList(
     std::optional<size_t> quota) const
 {
     size_t q = quota.value_or(totalQuota());
-    assert(ratioList.size() == mPoolGroups.size());
+    TLLM_CHECK_DEBUG(ratioList.size() == mPoolGroups.size());
     return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
 }
 

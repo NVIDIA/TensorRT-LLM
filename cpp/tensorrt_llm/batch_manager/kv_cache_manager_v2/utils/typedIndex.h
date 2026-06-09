@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <cstddef>
 #include <functional>
 #include <initializer_list>
@@ -172,7 +172,7 @@ template <typename T, typename Tag, T DefaultValue>
 {
     if constexpr (std::is_signed<T>::value)
     {
-        assert(index.value() >= 0 && "StrongIndex value must be non-negative for size_t conversion");
+        TLLM_CHECK_DEBUG_WITH_INFO(index.value() >= 0, "StrongIndex value must be non-negative for size_t conversion");
     }
     return static_cast<std::size_t>(index.value());
 }

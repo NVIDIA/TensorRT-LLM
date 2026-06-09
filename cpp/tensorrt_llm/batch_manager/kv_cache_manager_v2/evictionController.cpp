@@ -20,7 +20,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <cstddef>
 #include <numeric>
 #include <set>
@@ -35,7 +35,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 NodeRef LRUEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
 {
-    assert(!page->nodeRef.has_value() && "page must not already be scheduled for eviction");
+    TLLM_CHECK_DEBUG_WITH_INFO(!page->nodeRef.has_value(), "page must not already be scheduled for eviction");
     if (evictFirst)
     {
         mQueue.push_front(std::move(page));
@@ -52,7 +52,7 @@ NodeRef LRUEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
 
 SharedPtr<Page> LRUEvictionPolicy::pop()
 {
-    assert(!mQueue.empty());
+    TLLM_CHECK_DEBUG(!mQueue.empty());
     auto page = mQueue.front();
     mQueue.pop_front();
     return page;
@@ -61,7 +61,8 @@ SharedPtr<Page> LRUEvictionPolicy::pop()
 SharedPtr<Page> LRUEvictionPolicy::remove(NodeRef node)
 {
     auto page = *node;
-    assert(page->nodeRef.has_value() && page->nodeRef.value() == node && "node's page must reference this node");
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        page->nodeRef.has_value() && page->nodeRef.value() == node, "node's page must reference this node");
     mQueue.erase(node);
     return page;
 }
@@ -84,7 +85,7 @@ NodeRef PrioritizedEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
 
 SharedPtr<Page> PrioritizedEvictionPolicy::pop()
 {
-    assert(!mPolicies.empty());
+    TLLM_CHECK_DEBUG(!mPolicies.empty());
     // Lowest priority key evicted first (std::map iterates in ascending key order)
     auto it = mPolicies.begin();
     auto page = it->second.pop();
@@ -100,7 +101,7 @@ SharedPtr<Page> PrioritizedEvictionPolicy::remove(NodeRef node)
     auto page = *node;
     Priority p = page->priority;
     auto it = mPolicies.find(p);
-    assert(it != mPolicies.end());
+    TLLM_CHECK_DEBUG(it != mPolicies.end());
     it->second.remove(node);
     if (it->second.empty())
     {
@@ -138,7 +139,7 @@ PerLevelEvictionController::PerLevelEvictionController(
             numPoolGroups = g + 1;
     }
     // Pool group indices must be contiguous 0..N-1.
-    assert(numPoolGroups
+    TLLM_CHECK_DEBUG(numPoolGroups
         == PoolGroupIndex{
             static_cast<int>(std::set<PoolGroupIndex>(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end()).size())});
     mPolicies.resize(numPoolGroups);
@@ -146,19 +147,8 @@ PerLevelEvictionController::PerLevelEvictionController(
 
 PerLevelEvictionController::~PerLevelEvictionController()
 {
-    if (!gNdebug)
-    {
-        bool allEmpty = true;
-        for (auto const& p : mPolicies)
-        {
-            if (!p.empty())
-            {
-                allEmpty = false;
-                break;
-            }
-        }
-        assert(allEmpty && "Eviction controller is not empty on destruction");
-    }
+    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(mPolicies.begin(), mPolicies.end(), [](auto const& p) { return p.empty(); }),
+        "Eviction controller is not empty on destruction");
 }
 
 PrioritizedEvictionPolicy& PerLevelEvictionController::getPolicy(LifeCycleId lcId)
@@ -169,18 +159,18 @@ PrioritizedEvictionPolicy& PerLevelEvictionController::getPolicy(LifeCycleId lcI
 
 void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst)
 {
-    assert(page.nodeRef == std::nullopt);
-    assert(page.cacheLevel == mCacheLevel);
+    TLLM_CHECK_DEBUG(page.nodeRef == std::nullopt);
+    TLLM_CHECK_DEBUG(page.cacheLevel == mCacheLevel);
     auto sharedPage = page.sharedFromThis();
     NodeRef ref = getPolicy(page.lifeCycle).push(sharedPage, evictFirst);
     page.nodeRef = ref;
-    assert(*ref == sharedPage && "stored iterator must dereference to this page");
+    TLLM_CHECK_DEBUG_WITH_INFO(*ref == sharedPage, "stored iterator must dereference to this page");
 }
 
 TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> PerLevelEvictionController::evict(
     TypedVec<PoolGroupIndex, SlotCount> const& minNumPages)
 {
-    assert(minNumPages.size() == numPoolGroups());
+    TLLM_CHECK_DEBUG(minNumPages.size() == numPoolGroups());
 
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> ret(numPoolGroups());
 
@@ -225,16 +215,12 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> PerLevelEvictionControlle
         throw;
     }
 
-    if (!gNdebug)
-    {
-        for (auto const& group : ret)
-        {
-            for (auto const& p : group)
-            {
-                assert(p->cacheLevel == mCacheLevel && "Corrupted eviction controller");
-            }
-        }
-    }
+    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(ret.begin(), ret.end(),
+                                   [this](auto const& group) {
+                                       return std::all_of(group.begin(), group.end(),
+                                           [this](auto const& p) { return p->cacheLevel == mCacheLevel; });
+                                   }),
+        "Corrupted eviction controller");
 
     return ret;
 }
@@ -242,8 +228,8 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> PerLevelEvictionControlle
 void PerLevelEvictionController::remove(NodeRef node)
 {
     auto page = *node;
-    assert(page->nodeRef.has_value() && page->nodeRef.value() == node
-        && "page's nodeRef must match the node being removed");
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        page->nodeRef.has_value() && page->nodeRef.value() == node, "page's nodeRef must match the node being removed");
     getPolicy(page->lifeCycle).remove(node);
     page->nodeRef = std::nullopt;
 }

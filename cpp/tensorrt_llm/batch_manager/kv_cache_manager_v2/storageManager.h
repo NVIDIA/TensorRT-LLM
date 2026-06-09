@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "tensorrt_llm/common/assert.h"
 
 #include <map>
 #include <memory>
@@ -78,8 +79,8 @@ public:
 
     PoolGroupIndex numPoolGroups() const noexcept
     {
-        assert(storage->numPoolGroups() == controller.numPoolGroups()
-            && "Storage and controller disagree on numPoolGroups");
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            storage->numPoolGroups() == controller.numPoolGroups(), "Storage and controller disagree on numPoolGroups");
         return controller.numPoolGroups();
     }
 };

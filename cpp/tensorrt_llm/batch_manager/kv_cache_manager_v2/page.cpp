@@ -21,7 +21,7 @@
 #include "kv_cache_manager_v2/kvCache.h"        // for KvCache
 #include "kv_cache_manager_v2/storageManager.h" // for StorageManager
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <stdexcept>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -42,9 +42,8 @@ Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
 
 Page::~Page()
 {
-    assert(gNdebug
-        || (status() == PageStatus::DROPPABLE && !scheduledForEviction()
-            && "Page destroyed while still held or scheduled for eviction"));
+    TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
+        "Page destroyed while still held or scheduled for eviction");
     if (hasValidSlot())
     {
         Slot s;
@@ -82,7 +81,7 @@ SharedPtr<PageHolder> Page::hold()
         if (!manager->isEvictable(*this))
         {
             manager->excludeFromEviction(*this);
-            assert(!scheduledForEviction());
+            TLLM_CHECK_DEBUG(!scheduledForEviction());
         }
     }
     return h;
@@ -111,7 +110,7 @@ CommittedPage::~CommittedPage()
         // the block pointer via the returned previous-page identity check.
         Block* blk = block;
         [[maybe_unused]] auto* prev = blk->unlinkPage(lifeCycle);
-        assert(prev == this && "unlinkPage returned unexpected page");
+        TLLM_CHECK_DEBUG_WITH_INFO(prev == this, "unlinkPage returned unexpected page");
         LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
         Block::clearStaleBlocksAfterPageUnlink(*blk, lifeCycle, lc);
     }
@@ -138,7 +137,7 @@ UncommittedPage::~UncommittedPage()
     //  - the slot at this position is null, CommittedPage, or this page itself (self-destruction).
     // The "p == this" condition is C++-specific: std::variant destroys the old value before
     // switching to monostate, so during destruction the slot still references this page.
-    if (!gNdebug)
+    if (TLLM_UNLIKELY(gDebug))
     {
         auto ssmLcId = manager->lifeCycles().ssmLifeCycleId();
         bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
@@ -153,8 +152,8 @@ UncommittedPage::~UncommittedPage()
                 pageOk
                     = blockPageIsNull(bp) || page.get() == this || dynamicPointerCast<CommittedPage>(page) != nullptr;
             }
-            assert((blockRemoved || pageOk)
-                && "UncommittedPage destroyed but slot still holds a different uncommitted page");
+            TLLM_CHECK_WITH_INFO(
+                blockRemoved || pageOk, "UncommittedPage destroyed but slot still holds a different uncommitted page");
         }
     }
     // Delegate slot release to Page::~Page().
@@ -162,9 +161,10 @@ UncommittedPage::~UncommittedPage()
 
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(SharedPtr<Block> blk, CachedCudaEvent readyEv)
 {
-    assert(!scheduledForEviction());
-    assert(blk->storage.at(lifeCycle) == nullptr && "Block slot for this lifecycle already has a committed page");
-    assert(status() == PageStatus::DROPPABLE && "Release holder/lock before converting");
+    TLLM_CHECK_DEBUG(!scheduledForEviction());
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        blk->storage.at(lifeCycle) == nullptr, "Block slot for this lifecycle already has a committed page");
+    TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
 
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
     this->readyEvent = std::move(readyEv);
@@ -176,8 +176,8 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(SharedPtr<Block> bl
     resetSlot();
     readyEvent = CachedCudaEvent::makeNull();
 
-    assert(!hasValidSlot() && readyEvent.isClosed());
-    assert(committed->hasValidSlot() && "committed page must have a valid slot after transfer");
+    TLLM_CHECK_DEBUG(!hasValidSlot() && readyEvent.isClosed());
+    TLLM_CHECK_DEBUG_WITH_INFO(committed->hasValidSlot(), "committed page must have a valid slot after transfer");
 
     // Register in block storage.
     blk->storage.at(lifeCycle) = committed.get();
@@ -196,7 +196,7 @@ PageHolder::PageHolder(SharedPtr<Page> p)
 
 PageHolder::~PageHolder()
 {
-    assert(gNdebug || (uniqLock.expired() && "PageHolder destroyed while lock still active"));
+    TLLM_CHECK_DEBUG_WITH_INFO(uniqLock.expired(), "PageHolder destroyed while lock still active");
 
     page->holder.reset(); // clear back-reference
     auto const manager = page->manager;
@@ -238,7 +238,7 @@ SharedPageLock PageHolder::lock(
     if (page->scheduledForEviction())
     {
         page->manager->excludeFromEviction(*page);
-        assert(!page->scheduledForEviction());
+        TLLM_CHECK_DEBUG(!page->scheduledForEviction());
     }
 
     return ul->share(kvCache, beamIndex, ordinal, lc, skipWait);
@@ -258,14 +258,14 @@ UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
 UniqPageLock::~UniqPageLock()
 {
     Page& p = *page();
-    assert(gNdebug || (p.cacheLevel == kGpuLevel && !p.scheduledForEviction()));
+    TLLM_CHECK_DEBUG(p.cacheLevel == kGpuLevel && !p.scheduledForEviction());
     // Set readyEvent to the merged finish events of all readers. For committed (read-only)
     // pages, this means the next reader will wait for prior reads to complete, which is
     // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
     p.readyEvent = mergeEvents(finishEvents);
 
     // Clear the holder's lock reference.
-    assert(holder);
+    TLLM_CHECK_DEBUG(holder);
     holder->uniqLock.reset();
 
     // Optimized path (mirrors Python): set holder=nullptr, then check if still evictable.
@@ -296,7 +296,7 @@ void UniqPageLock::notifyFinish(CachedCudaEvent event)
 
 SharedPtr<Page> const& UniqPageLock::page() const
 {
-    assert(holder && holder->page);
+    TLLM_CHECK_DEBUG(holder && holder->page);
     return holder->page;
 }
 
@@ -347,13 +347,13 @@ SharedPageLock& SharedPageLock::operator=(SharedPageLock&& other) noexcept
 
 SharedPtr<Page> const& SharedPageLock::page() const
 {
-    assert(mUniqLock);
+    TLLM_CHECK_DEBUG(mUniqLock);
     return mUniqLock->page();
 }
 
 SharedPtr<Page> SharedPageLock::unlock()
 {
-    assert(mUniqLock);
+    TLLM_CHECK_DEBUG(mUniqLock);
 
     // Record finish event from the KvCache stream.
     mUniqLock->notifyFinish(mUser.kvCache->finishEvent());
@@ -371,7 +371,8 @@ void SharedPageLock::acquirePageIndex()
     int old = kvc->updateBasePageIndex(
         mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, slotIdToPageIndexValue(pg.slotId()));
     // Mirrors Python assertion: old base index must be BAD (prevents double-locking same slot).
-    assert(old == kBadPageIndex.value() && "Double-lock: page index already acquired for this (beam, ordinal, lc)");
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        old == kBadPageIndex.value(), "Double-lock: page index already acquired for this (beam, ordinal, lc)");
     (void) old;
 }
 
@@ -380,7 +381,7 @@ void SharedPageLock::releasePageIndex()
     int oldBaseIndex
         = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, kBadPageIndex.value());
     // Mirrors Python assertion: old base index must match this page's slot ID.
-    assert(oldBaseIndex == slotIdToPageIndexValue(page()->slotId()));
+    TLLM_CHECK_DEBUG(oldBaseIndex == slotIdToPageIndexValue(page()->slotId()));
     (void) oldBaseIndex;
 }
 
@@ -391,9 +392,9 @@ void SharedPageLock::releasePageIndex()
 std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets)
 {
     auto* storeMgr = kvCache.storageManager();
-    assert(storeMgr);
+    TLLM_CHECK_DEBUG(storeMgr);
     // All pages must belong to the same storage manager.
-    assert(targets.empty()
+    TLLM_CHECK_DEBUG(targets.empty()
         || std::all_of(targets.begin(), targets.end(), [&](auto const& t) { return t.page->manager == storeMgr; }));
 
     // Determine how many GPU slots are needed per pool group.
@@ -510,7 +511,7 @@ ScratchSlotLock& ScratchSlotLock::operator=(ScratchSlotLock&& other) noexcept
 
 Slot ScratchSlotLock::detachSlot()
 {
-    assert(mSlot.hasValidSlot());
+    TLLM_CHECK_DEBUG(mSlot.hasValidSlot());
     Slot result;
     result.setSlot(mSlot);
     return result;
@@ -518,10 +519,10 @@ Slot ScratchSlotLock::detachSlot()
 
 void ScratchSlotLock::unlock()
 {
-    assert(mSlot.hasValidSlot());
+    TLLM_CHECK_DEBUG(mSlot.hasValidSlot());
     mSlot.readyEvent = mOwner->finishEvent();
     mOwner->storageManager()->releaseSlot(mLifeCycle, kGpuLevel, std::move(mSlot));
-    assert(!mSlot.hasValidSlot());
+    TLLM_CHECK_DEBUG(!mSlot.hasValidSlot());
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

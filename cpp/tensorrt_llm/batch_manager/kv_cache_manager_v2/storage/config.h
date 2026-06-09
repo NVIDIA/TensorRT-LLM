@@ -21,7 +21,7 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -47,13 +47,13 @@ using SlotId = StrongIndex<SlotCount, struct SlotIdTag>;
 
 [[nodiscard]] inline SlotCount slotCountValueFromSize(std::size_t count) noexcept
 {
-    assert(count <= static_cast<std::size_t>(std::numeric_limits<SlotCount>::max()));
+    TLLM_CHECK_DEBUG(count <= static_cast<std::size_t>(std::numeric_limits<SlotCount>::max()));
     return static_cast<SlotCount>(count);
 }
 
 [[nodiscard]] inline std::size_t slotCountToSizeT(SlotCount count) noexcept
 {
-    assert(count >= 0 && "Slot count must be non-negative for size_t conversion");
+    TLLM_CHECK_DEBUG_WITH_INFO(count >= 0, "Slot count must be non-negative for size_t conversion");
     return static_cast<std::size_t>(count);
 }
 
@@ -136,7 +136,7 @@ struct SlotDescVariant
         for (auto const& cb : coalescedBuffers)
             out.push_back(cb.size());
         // Coalesced buffers must be sorted in descending size order.
-        assert(std::is_sorted(out.begin(), out.end(), std::greater<>()));
+        TLLM_CHECK_DEBUG(std::is_sorted(out.begin(), out.end(), std::greater<>()));
         return out;
     }
 };

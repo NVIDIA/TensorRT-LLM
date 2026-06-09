@@ -19,8 +19,8 @@
 
 #include "kv_cache_manager_v2/utils/typedIndex.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include <algorithm>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -57,7 +57,7 @@ template <typename T>
 template <typename T>
 [[nodiscard]] inline T exactDiv(T x, T y)
 {
-    assert(x % y == 0);
+    TLLM_CHECK_DEBUG(x % y == 0);
     return x / y;
 }
 
@@ -83,9 +83,9 @@ template <typename Range, typename Func>
 [[nodiscard]] auto getUniformAttribute(Range const& range, Func&& func) -> decltype(func(*range.begin()))
 {
     auto it = range.begin();
-    assert(it != range.end());
+    TLLM_CHECK_DEBUG(it != range.end());
     auto result = func(*it);
-    assert(std::all_of(range.begin(), range.end(), [&](auto const& item) { return func(item) == result; }));
+    TLLM_CHECK_DEBUG(std::all_of(range.begin(), range.end(), [&](auto const& item) { return func(item) == result; }));
     return result;
 }
 
@@ -135,7 +135,7 @@ template <typename T>
 [[nodiscard]] std::vector<float> normalizeToRatio(std::vector<T> const& values)
 {
     auto total = std::accumulate(values.begin(), values.end(), static_cast<T>(0));
-    assert(total > 0);
+    TLLM_CHECK_DEBUG(total > 0);
     std::vector<float> ratio(values.size());
     for (size_t i = 0; i < values.size(); ++i)
         ratio[i] = static_cast<float>(values[i]) / static_cast<float>(total);
@@ -146,7 +146,7 @@ template <typename Index, typename T>
 [[nodiscard]] TypedVec<Index, float> normalizeToRatio(TypedVec<Index, T> const& values)
 {
     auto total = std::accumulate(values.begin(), values.end(), static_cast<T>(0));
-    assert(total > 0);
+    TLLM_CHECK_DEBUG(total > 0);
     TypedVec<Index, float> ratio(values.size());
     for (Index index{0}; index < values.size(); ++index)
     {

@@ -23,8 +23,8 @@
 
 #include "blake3.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include <algorithm>
-#include <cassert>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -153,9 +153,9 @@ BlockKey Hasher::digest() const
 std::vector<TokenIdExt> genMultiModalTokens(
     int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
 {
-    assert(numTokens > 0);
-    assert(tokenOffset >= 0);
-    assert(multiModalDataDigest.size() == kDIGEST_LEN);
+    TLLM_CHECK_DEBUG(numTokens > 0);
+    TLLM_CHECK_DEBUG(tokenOffset >= 0);
+    TLLM_CHECK_DEBUG(multiModalDataDigest.size() == kDIGEST_LEN);
     std::vector<TokenIdExt> result;
     result.reserve(static_cast<size_t>(numTokens));
     for (int i = 0; i < numTokens; ++i)
@@ -319,7 +319,7 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode, LifeC
 
 int Block::tokensPerBlock() const noexcept
 {
-    assert(prev && "Block must have a prev");
+    TLLM_CHECK_DEBUG_WITH_INFO(prev, "Block must have a prev");
     // Mirrors Python: prev.tokens_per_block if isinstance(prev, RootBlock) else len(prev.tokens)
     if (prev->type() == Type::kROOT_BLOCK)
         return prev->tokensPerBlock();
@@ -337,7 +337,7 @@ Block::~Block()
         auto const page = storage[lcIdx];
         if (page != nullptr)
         {
-            assert(page->block == this);
+            TLLM_CHECK_DEBUG(page->block == this);
             unlinkPage(lcIdx);
             if (page->status() == PageStatus::DROPPABLE && page->scheduledForEviction())
             {
@@ -349,7 +349,7 @@ Block::~Block()
 
 bool Block::isOrphan() const noexcept
 {
-    assert(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
+    TLLM_CHECK_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
     return prev == nullptr;
 }
 
@@ -381,7 +381,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     Block& block, LifeCycleId lcIdx, LifeCycle const& lc)
 {
     std::vector<SharedPtr<Block>> detachedBlocks;
-    assert(block.storage.at(lcIdx) == nullptr);
+    TLLM_CHECK_DEBUG(block.storage.at(lcIdx) == nullptr);
     if (block.isOrphan())
     {
         return detachedBlocks;
@@ -413,7 +413,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
         if (prevNode)
         {
             auto detached = prevNode->detachNext(currKey); // may destroy curr
-            assert(detached && detached.get() == curr);
+            TLLM_CHECK_DEBUG(detached && detached.get() == curr);
             detachedBlocks.push_back(std::move(detached));
         }
         // Walk up only through Block nodes; stop at RootBlock.
@@ -429,12 +429,12 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 SharedPtr<Block> addOrGetExistingBlock(
     NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew)
 {
-    assert(prev && "prev must not be null");
+    TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
 
     // Prev must be a full block if it is a Block (mirrors Python: "prev must be a full block").
     if (prev->type() == NodeBase::Type::kBLOCK)
     {
-        assert(static_cast<Block*>(prev)->isFull() && "prev must be a full block");
+        TLLM_CHECK_DEBUG_WITH_INFO(static_cast<Block*>(prev)->isFull(), "prev must be a full block");
     }
 
     auto& prevNext = prev->next;
@@ -467,15 +467,15 @@ SharedPtr<Block> addOrGetExistingBlock(
     {
         if (sibling->tokens.size() < tokens.size() && isPrefix(sibling->tokens, tokens))
         {
-            assert(!sibling->isFull() && sibling->key == k && sibling->next.empty());
+            TLLM_CHECK_DEBUG(!sibling->isFull() && sibling->key == k && sibling->next.empty());
             toRemove.push_back(k);
         }
     }
     for (auto const& k : toRemove)
     {
         auto erasedBlock = prev->detachNext(k);
-        assert(erasedBlock);
-        assert(erasedBlock->isOrphan() && "erased sibling must be orphan after removal");
+        TLLM_CHECK_DEBUG(erasedBlock);
+        TLLM_CHECK_DEBUG_WITH_INFO(erasedBlock->isOrphan(), "erased sibling must be orphan after removal");
         (void) erasedBlock;
     }
 
@@ -516,7 +516,7 @@ SharedPtr<Block> removeSubtree(Block& root)
             NodeBase* parent = current->prev;
             BlockKey const currentKey = current->key;
             auto detached = parent->detachNext(currentKey);
-            assert(detached && detached.get() == current);
+            TLLM_CHECK_DEBUG(detached && detached.get() == current);
             (void) detached;
 
             if (current == &root)
@@ -525,11 +525,11 @@ SharedPtr<Block> removeSubtree(Block& root)
                 break;
             }
 
-            assert(parent->type() == NodeBase::Type::kBLOCK);
+            TLLM_CHECK_DEBUG(parent->type() == NodeBase::Type::kBLOCK);
             current = static_cast<Block*>(parent);
         }
     }
-    assert(detachedRoot);
+    TLLM_CHECK_DEBUG(detachedRoot);
     return detachedRoot;
 }
 
@@ -688,13 +688,10 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
 
 BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> matched) const
 {
-    if (!gNdebug && matched.size() > 1)
-    {
-        for (size_t i = 0; i + 1 < matched.size(); ++i)
-        {
-            assert(matched[i].numMatchedTokens == mTokensPerBlock);
-        }
-    }
+    // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
+    TLLM_CHECK_DEBUG(matched.size() <= 1
+        || std::all_of(matched.begin(), matched.end() - 1,
+            [this](auto const& m) { return m.numMatchedTokens == mTokensPerBlock; }));
 
     auto attnLcs = mLifeCycles.attentionLifeCycles();
 
@@ -750,7 +747,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> m
             {
                 if (hasPage(*matched[static_cast<size_t>(i)].block, *ssmLcId))
                 {
-                    assert(gNdebug || matched[static_cast<size_t>(i)].numMatchedTokens == mTokensPerBlock);
+                    TLLM_CHECK_DEBUG(matched[static_cast<size_t>(i)].numMatchedTokens == mTokensPerBlock);
                     ssmTrunc = i + 1;
                     break;
                 }
@@ -822,7 +819,7 @@ void BlockRadixTree::clear()
             removeSubtree(*root->next.begin()->second);
         }
     }
-    assert(mRoots.size() == mPendingRootErases.size());
+    TLLM_CHECK_DEBUG(mRoots.size() == mPendingRootErases.size());
     mRoots.clear();
     mPendingRootErases.clear();
 }

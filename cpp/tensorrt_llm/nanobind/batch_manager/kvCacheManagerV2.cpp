@@ -208,7 +208,7 @@ static kv::ReuseScope castReuseScope(nb::object reuseScope)
 void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 {
     // Export the C++ debug mode as an immutable Python bool snapshot.
-    m.attr("NDEBUG") = nb::bool_(kv::gNdebug);
+    m.attr("NDEBUG") = nb::bool_(!kv::gDebug);
 
     // ---- Exceptions --------------------------------------------------------
     static nb::object sOutOfMemoryError = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError");

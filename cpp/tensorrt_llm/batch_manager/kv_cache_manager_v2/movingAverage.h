@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -82,7 +82,7 @@ public:
 
     double value() const noexcept
     {
-        assert(mCount > 0);
+        TLLM_CHECK_DEBUG(mCount > 0);
         return mSum / mCount;
     }
 

@@ -17,7 +17,7 @@
 
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <stdexcept>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -53,7 +53,7 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
         LifeCycle lc = makeLifeCycle(layer, config.tokensPerBlock);
         if (mLifeCycleIdMap.find(lc) == mLifeCycleIdMap.end())
         {
-            assert(mLifeCycleList.size() == mLifeCycleIdMap.size() && "corrupted life cycle registry");
+            check();
             LifeCycleId id = mLifeCycleList.size();
             mLifeCycleList.push_back(lc);
             mLifeCycleIdMap[lc] = id;
@@ -61,7 +61,7 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
                 mSsmLifeCycleId = id;
         }
     }
-    assert(mLifeCycleList.size() == mLifeCycleIdMap.size() && "corrupted life cycle registry");
+    check();
 }
 
 LifeCycle const& LifeCycleRegistry::operator[](LifeCycleId id) const
@@ -86,8 +86,14 @@ LifeCycleId LifeCycleRegistry::getId(LifeCycle const& lc) const
 
 LifeCycleId LifeCycleRegistry::size() const noexcept
 {
-    assert(mLifeCycleList.size() == mLifeCycleIdMap.size() && "corrupted life cycle registry");
+    check();
     return mLifeCycleList.size();
+}
+
+inline void LifeCycleRegistry::check() const
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size(), "corrupted life cycle registry");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -23,7 +23,7 @@
 // Reuse existing copy implementations (no Python round-trip).
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <stdexcept>
 #include <variant>
 
@@ -89,17 +89,17 @@ StagingBuffer::StagingBuffer(StagingBufferManager& manager, size_t minSize, size
         mManager.mNext = 0;
         availableGrains = mManager.suggestNextMaxGrains();
     }
-    assert(minGrains <= availableGrains);
+    TLLM_CHECK_DEBUG(minGrains <= availableGrains);
 
     size_t const available = availableGrains * kGranularity;
     size_t actualSize = std::min(maxSize, available);
     actualSize = std::max(actualSize, minSize);
     mNumGrains = divUp(actualSize, kGranularity);
-    assert(mNumGrains <= availableGrains);
+    TLLM_CHECK_DEBUG(mNumGrains <= availableGrains);
     mSize = actualSize;
     mStartGrain = mManager.mNext;
     mManager.mNext += mNumGrains;
-    assert(mManager.mNext <= mManager.numGrains());
+    TLLM_CHECK_DEBUG(mManager.mNext <= mManager.numGrains());
     if (mManager.mNext == mManager.numGrains())
     {
         mManager.mNext = 0;
@@ -144,7 +144,7 @@ StagingBufferManager::StagingBufferManager(size_t size)
     : mBuffer(size)
     , mGrains(size / kGranularity)
 {
-    assert(size % kGranularity == 0);
+    TLLM_CHECK_DEBUG(size % kGranularity == 0);
 }
 
 StagingBuffer StagingBufferManager::acquire(size_t minSize, size_t maxSize, CUstream stream)
@@ -177,7 +177,7 @@ static void twoHopTransfer(
         StagingBuffer buf = manager.acquire(numBytes, numBytes * remaining, stream);
         MemAddress addr = buf.address();
         size_t n = buf.size() / numBytes;
-        assert(n > 0 && n <= remaining);
+        TLLM_CHECK_DEBUG(n > 0 && n <= remaining);
 
         // First hop: src → staging
         {

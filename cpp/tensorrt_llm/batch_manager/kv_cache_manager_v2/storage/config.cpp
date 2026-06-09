@@ -19,8 +19,8 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include <algorithm>
-#include <cassert>
 #include <map>
 #include <stdexcept>
 #include <unordered_set>
@@ -92,7 +92,7 @@ std::unordered_map<LayerId, LifeCycleId> StorageConfig::layerToLifeCycleIds() co
         auto [it, inserted] = map.emplace(bufId.layerId, attr.lifeCycleId);
         if (!inserted)
         {
-            assert(it->second == attr.lifeCycleId);
+            TLLM_CHECK_DEBUG(it->second == attr.lifeCycleId);
         }
     }
     return map;
@@ -129,7 +129,7 @@ std::map<LayerId, LayerAttr> StorageConfig::layerAttributes() const
                         it = ret.emplace(layerId, std::move(attr)).first;
                     }
                     auto& attr = it->second;
-                    assert(attr.lifeCycleId == lcId);
+                    TLLM_CHECK_DEBUG(attr.lifeCycleId == lcId);
                     attr.slotUtil[poolIndex] = count;
                     Rational frac{count, buffersPerSlot};
                     if (frac > attr.slotUtilFracMax)
@@ -228,7 +228,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     // Mirrors Python StorageConfig.__post_init__:
     //   all_life_cycle_ids = [lc_id for variant in self.slot_desc_list for lc_id in variant.life_cycle_ids]
     //   assert len(all_life_cycle_ids) == len(set(all_life_cycle_ids))
-    if (!gNdebug)
+    if (TLLM_UNLIKELY(gDebug))
     {
         std::unordered_set<LifeCycleId> allLcIds;
         for (auto const& sd : out.slotDescList)
@@ -236,7 +236,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
             for (auto const& variant : sd.variants)
             {
                 [[maybe_unused]] bool inserted = allLcIds.insert(variant.lifeCycleId).second;
-                assert(inserted && "Duplicate life_cycle_id across SlotDescVariants");
+                TLLM_CHECK_WITH_INFO(inserted, "Duplicate life_cycle_id across SlotDescVariants");
             }
         }
     }

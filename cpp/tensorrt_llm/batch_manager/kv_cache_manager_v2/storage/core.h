@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "tensorrt_llm/common/assert.h"
 
 #include <deque>
 #include <memory>
@@ -449,7 +450,7 @@ public:
             ret[pgIdx] = sz;
             total += sz;
         }
-        assert(total > 0.f);
+        TLLM_CHECK_DEBUG(total > 0.f);
         for (auto& r : ret)
             r /= total;
         return ret;

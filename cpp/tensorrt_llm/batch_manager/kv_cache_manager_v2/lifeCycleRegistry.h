@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "tensorrt_llm/common/assert.h"
 
 #include <algorithm>
 #include <map>
@@ -64,10 +65,10 @@ struct AttnLifeCycle
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock)
     {
-        assert(tokensPerBlock > 0);
-        assert(!ws.has_value() || *ws > 0);
-        assert(!numSinkTokens.has_value() || *numSinkTokens >= 0);
-        assert((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
+        TLLM_CHECK_DEBUG(tokensPerBlock > 0);
+        TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
+        TLLM_CHECK_DEBUG(!numSinkTokens.has_value() || *numSinkTokens >= 0);
+        TLLM_CHECK_DEBUG((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
         return AttnLifeCycle{ws, sinkBlocks};
     }
@@ -237,6 +238,8 @@ public:
     }
 
 private:
+    void check() const;
+
     TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;
     std::optional<LifeCycleId> mSsmLifeCycleId;

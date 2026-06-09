@@ -24,7 +24,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <functional>
 #include <memory>
 #include <optional>
@@ -82,18 +82,18 @@ struct SeqBlock
     bool isCommitted() const noexcept
     {
         bool ret = treeBlock != nullptr;
-        if (!gNdebug)
+        if (TLLM_UNLIKELY(gDebug))
         {
             // When committed: must have 1 beam, all non-null pages must be CommittedPage.
             if (ret)
             {
-                assert(pages.size() == BeamIndex{1});
+                TLLM_CHECK(pages.size() == BeamIndex{1});
                 for (auto const& beamBlock : pages)
                     for (auto const& bp : beamBlock)
                         if (!blockPageIsNull(bp))
                         {
                             auto pg = blockPageGetPage(bp);
-                            assert(!pg || dynamicPointerCast<CommittedPage>(pg));
+                            TLLM_CHECK(!pg || dynamicPointerCast<CommittedPage>(pg));
                         }
             }
             else
@@ -104,7 +104,7 @@ struct SeqBlock
                         if (!blockPageIsNull(bp))
                         {
                             auto pg = blockPageGetPage(bp);
-                            assert(!pg || dynamicPointerCast<UncommittedPage>(pg));
+                            TLLM_CHECK(!pg || dynamicPointerCast<UncommittedPage>(pg));
                         }
             }
         }
@@ -325,7 +325,7 @@ public:
         }
         else
         {
-            assert(mStatus == Status::SUSPENDED && !mFinishEvent.has_value());
+            TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED && !mFinishEvent.has_value());
         }
         mCudaStream = stream;
     }
@@ -336,7 +336,7 @@ public:
     // Sets mFinishEvent on construction, clears it on destruction (= Python's finally).
     [[nodiscard]] auto recordEventScope()
     {
-        assert(!mFinishEvent.has_value());
+        TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
         // When mCudaStream is nullopt the cache was never resumed — no GPU work
         // was performed, so no CUDA event synchronization is needed.  Blocks only
         // contain PageHolders (not SharedPageLocks) whose destructors do not read

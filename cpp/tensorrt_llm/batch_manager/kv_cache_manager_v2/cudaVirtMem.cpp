@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "tensorrt_llm/common/assert.h"
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -108,7 +109,7 @@ VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t
     : mVmSize(vmSize)
     , mPhysMemAllocator(physMemAllocator)
 {
-    assert(vmSize % physMemAllocator.physMemSize() == 0);
+    TLLM_CHECK_DEBUG(vmSize % physMemAllocator.physMemSize() == 0);
 
     cuCheck(cuMemAddressReserve(&mAddr, vmSize, 0, 0, 0));
 
@@ -136,7 +137,7 @@ void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)
 {
     size_t physSize = mPhysMemAllocator.physMemSize();
     CUdeviceptr offset = mAddr + physSize * static_cast<size_t>(mPhysHandles.size());
-    assert(physSize * (mPhysHandles.size() + 1) <= mVmSize);
+    TLLM_CHECK_DEBUG(physSize * (mPhysHandles.size() + 1) <= mVmSize);
 
     cuCheck(cuMemMap(offset, physSize, 0, handle->handle(), 0));
     cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
@@ -145,7 +146,7 @@ void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)
 
 void VirtMem::pop()
 {
-    assert(!mPhysHandles.empty());
+    TLLM_CHECK_DEBUG(!mPhysHandles.empty());
     size_t physSize = mPhysMemAllocator.physMemSize();
     CUdeviceptr offset = mAddr + physSize * (mPhysHandles.size() - 1);
     cuCheck(cuMemUnmap(offset, physSize));

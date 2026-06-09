@@ -19,7 +19,7 @@
 
 #include "kv_cache_manager_v2/common.h"
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -195,7 +195,7 @@ struct KVCacheDesc
 
     void validate() const
     {
-        assert(0 <= historyLength && historyLength <= capacity);
+        TLLM_CHECK_DEBUG(0 <= historyLength && historyLength <= capacity);
     }
 };
 
@@ -210,7 +210,7 @@ struct BatchDesc
 
     void validate() const
     {
-        assert(systemPromptLength >= 0);
+        TLLM_CHECK_DEBUG(systemPromptLength >= 0);
     }
 };
 

@@ -33,7 +33,7 @@
 
 #pragma once
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
 #include <cstddef>
 #include <memory>
 #include <new>
@@ -494,14 +494,14 @@ public:
     SharedPtr<T> sharedFromThis()
     {
         auto sp = mWeakThis.lock();
-        assert(sp && "sharedFromThis() called on object not owned by SharedPtr");
+        TLLM_CHECK_DEBUG_WITH_INFO(sp, "sharedFromThis() called on object not owned by SharedPtr");
         return sp;
     }
 
     SharedPtr<T const> sharedFromThis() const
     {
         auto sp = mWeakThis.lock();
-        assert(sp && "sharedFromThis() called on object not owned by SharedPtr");
+        TLLM_CHECK_DEBUG_WITH_INFO(sp, "sharedFromThis() called on object not owned by SharedPtr");
         // Convert SharedPtr<T> to SharedPtr<T const> via the converting constructor.
         return sp;
     }

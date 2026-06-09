@@ -24,8 +24,8 @@
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/logger.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <numeric>
@@ -135,15 +135,16 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         }
     }
 
-    assert(std::all_of(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end(),
+    TLLM_CHECK_DEBUG(std::all_of(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end(),
         [this](PoolGroupIndex pg) { return pg < numPoolGroups(); }));
-    assert(numPoolGroups()
+    TLLM_CHECK_DEBUG(numPoolGroups()
         == PoolGroupIndex{
             static_cast<int>(std::set<PoolGroupIndex>(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end()).size())});
 
     // Build one CacheLevelManager per tier.
-    assert(!config.cacheTiers.empty());
-    assert(std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[kGpuLevel]) && "First cache tier must be GPU");
+    TLLM_CHECK_DEBUG(!config.cacheTiers.empty());
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[kGpuLevel]), "First cache tier must be GPU");
 
     // Compute slot size lists for all pool groups.
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizeLists;
@@ -186,7 +187,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         mLevels.emplace_back(mLifeCycleGrouping, level, config.cacheTiers[level], config, slotCountList);
     }
 
-    assert(mLevels.empty()
+    TLLM_CHECK_DEBUG(mLevels.empty()
         || numPoolGroups()
             == getUniformAttribute(mLevels, [](auto const& lvl) { return lvl.storage->numPoolGroups(); }));
 }
@@ -200,7 +201,7 @@ void StorageManager::destroy()
 {
     for (auto& lvl : mLevels)
     {
-        assert(lvl.storage);
+        TLLM_CHECK_DEBUG(lvl.storage);
         lvl.storage->destroy();
     }
     mLevels.clear();
@@ -213,7 +214,7 @@ void StorageManager::destroy()
 TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(
     CacheLevel level, TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc)
 {
-    assert(numSlotsPerLc.size() == numLifeCycles());
+    TLLM_CHECK_DEBUG(numSlotsPerLc.size() == numLifeCycles());
     auto& storage = *mLevels.at(level).storage;
 
     // Aggregate by pool group.
@@ -247,8 +248,8 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(
     // A14: post-condition — free-slot counts satisfy requirements.
     for (PoolGroupIndex pgIdx{0}; pgIdx < pgNumSlots.size(); ++pgIdx)
     {
-        assert(pgNumSlots[pgIdx] <= storage.numFreeSlots(pgIdx)
-            && "Free slot count does not satisfy requirement after prepareFreeSlots");
+        TLLM_CHECK_DEBUG_WITH_INFO(pgNumSlots[pgIdx] <= storage.numFreeSlots(pgIdx),
+            "Free slot count does not satisfy requirement after prepareFreeSlots");
     }
 
     // Allocate.
@@ -293,7 +294,7 @@ std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGro
         requirements.at(pgIdx) = numSlots;
         prepareFreeSlots(level, requirements);
     }
-    assert(numSlots <= storage.numFreeSlots(pgIdx));
+    TLLM_CHECK_DEBUG(numSlots <= storage.numFreeSlots(pgIdx));
     return storage.allocateMultiple(pgIdx, numSlots);
 }
 
@@ -336,7 +337,7 @@ void StorageManager::scheduleForEviction(Page& page)
 
 void StorageManager::excludeFromEviction(Page& page)
 {
-    assert(page.nodeRef.has_value());
+    TLLM_CHECK_DEBUG(page.nodeRef.has_value());
     mLevels.at(page.cacheLevel).controller.remove(*page.nodeRef);
 }
 
@@ -371,7 +372,7 @@ void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotC
         {
             for (auto const& page : pages)
             {
-                assert(page->status() == PageStatus::DROPPABLE && "Corrupted eviction controller");
+                TLLM_CHECK_DEBUG_WITH_INFO(page->status() == PageStatus::DROPPABLE, "Corrupted eviction controller");
             }
         }
         return;
@@ -401,26 +402,21 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     CacheLevel lvlId, TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages)
 {
     // A7: goals dimensions must match [numCacheLevels][numPoolGroups].
-    if (!gNdebug)
+    if (TLLM_UNLIKELY(gDebug))
     {
-        assert(goals.size() == numCacheLevels() && "goals.rows must equal numCacheLevels");
-        for (auto const& row : goals)
-        {
-            assert(row.size() == numPoolGroups() && "goals.cols must equal numPoolGroups");
-        }
+        TLLM_CHECK_WITH_INFO(goals.size() == numCacheLevels(), "goals.rows must equal numCacheLevels");
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            std::all_of(goals.begin(), goals.end(), [this](auto const& row) { return row.size() == numPoolGroups(); }),
+            "goals.cols must equal numPoolGroups");
     }
 
     // A8: all fallen pages must come from upper cache levels (cache_level < lvlId).
-    if (!gNdebug)
-    {
-        for (auto const& pages : fallenPages)
-        {
-            for (auto const& p : pages)
-            {
-                assert(p->cacheLevel < lvlId && "Fallen pages must come from upper cache levels");
-            }
-        }
-    }
+    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(fallenPages.begin(), fallenPages.end(),
+                                   [lvlId](auto const& pages) {
+                                       return std::all_of(pages.begin(), pages.end(),
+                                           [lvlId](auto const& p) { return p->cacheLevel < lvlId; });
+                                   }),
+        "Fallen pages must come from upper cache levels");
 
     auto& lvl = mLevels.at(lvlId);
     auto& storage = *lvl.storage;
@@ -469,21 +465,17 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             SlotCount const oldFree = storage.numFreeSlots(pgIdx);
             SlotCount const numEvicted = slotCountValueFromSize(ev.size());
             // A9: all evicted pages at last level must be DROPPABLE.
-            if (!gNdebug)
-            {
-                for (auto const& p : ev)
-                {
-                    assert(p->status() == PageStatus::DROPPABLE && "Evicted page at last level must be DROPPABLE");
-                }
-            }
+            TLLM_CHECK_DEBUG_WITH_INFO(
+                std::all_of(ev.begin(), ev.end(), [](auto const& p) { return p->status() == PageStatus::DROPPABLE; }),
+                "Evicted page at last level must be DROPPABLE");
             // Drop droppable evicted pages (GC).
             ev.clear();
             SlotCount const newFree = storage.numFreeSlots(pgIdx);
-            assert(newFree >= numEvicted + oldFree);
+            TLLM_CHECK_DEBUG(newFree >= numEvicted + oldFree);
 
             // A10: held_pages count must not exceed new_free.
-            assert(slotCountValueFromSize(heldPages.at(pgIdx).size()) <= newFree
-                && "held_pages count exceeds new free slot count");
+            TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(heldPages.at(pgIdx).size()) <= newFree,
+                "held_pages count exceeds new free slot count");
 
             // Add held pages from upper levels.
             auto& hp = heldPages.at(pgIdx);
@@ -504,13 +496,9 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     else
     {
         // A12: no held pages at non-last level.
-        if (!gNdebug)
-        {
-            for (auto const& hp : heldPages)
-            {
-                assert(hp.empty() && "held_pages must be empty at non-last level");
-            }
-        }
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            std::all_of(heldPages.begin(), heldPages.end(), [](auto const& hp) { return hp.empty(); }),
+            "held_pages must be empty at non-last level");
 
         CacheLevel nextLvl = lvlId + 1;
         for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
@@ -535,13 +523,9 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     }
 
     // A13: all fallen pages must have been consumed.
-    if (!gNdebug)
-    {
-        for (auto const& fp : fallenPages)
-        {
-            assert(fp.empty() && "All fallen pages must be consumed after level loop");
-        }
-    }
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        std::all_of(fallenPages.begin(), fallenPages.end(), [](auto const& fp) { return fp.empty(); }),
+        "All fallen pages must be consumed after level loop");
 
     // Migrate accepted pages into lvlId.
     for (PoolGroupIndex pgIdx{0}; pgIdx < acceptedPages.size(); ++pgIdx)
@@ -569,7 +553,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
 void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
     std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, bool defrag)
 {
-    assert(defrag || dstLevel != srcLevel);
+    TLLM_CHECK_DEBUG(defrag || dstLevel != srcLevel);
     SlotCount const numSlots = slotCountValueFromSize(srcPages.size());
 
     auto& srcPoolGroup = poolGroup(srcLevel, pgIdx);
@@ -580,7 +564,7 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
 
     auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
     // A15: allocated slot count must match the request.
-    assert(slotCountValueFromSize(dstSlots.size()) == numSlots && "dst_slots size mismatch");
+    TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(dstSlots.size()) == numSlots, "dst_slots size mismatch");
     try
     {
         CacheTier dstTier = mLevels.at(dstLevel).cacheTier;
@@ -595,7 +579,7 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
             auto const& src = srcPages.at(i);
             auto const& dst = dstSlots.at(i);
             // Fix #8: assert non-defrag migrations only accept pages not scheduled for eviction.
-            assert(defrag || !src->scheduledForEviction());
+            TLLM_CHECK_DEBUG(defrag || !src->scheduledForEviction());
             for (PoolIndex poolIdx{0}; poolIdx < tasksPerPool.size(); ++poolIdx)
             {
                 Address dstAddr = dstPoolGroup.slotAddress(dst.slotId()).at(poolIdx);
@@ -705,7 +689,7 @@ void StorageManager::prefetch(
         for (CacheLevel level{0}; level < poolGroupPages.size(); ++level)
         {
             auto const& levelPages = poolGroupPages.at(level);
-            assert(level >= dstLevel || levelPages.empty());
+            TLLM_CHECK_DEBUG(level >= dstLevel || levelPages.empty());
             for (auto const& page : levelPages)
             {
                 if (page->scheduledForEviction())
@@ -717,7 +701,7 @@ void StorageManager::prefetch(
                 {
                     scheduled.push_back(page);
                 }
-                assert(level >= dstLevel);
+                TLLM_CHECK_DEBUG(level >= dstLevel);
                 if (level == dstLevel)
                 {
                     continue;
@@ -754,7 +738,7 @@ PoolGroupIndex StorageManager::getPoolGroupIndex(LifeCycleId lc) const
 
 PoolIndex StorageManager::mNumPools(PoolGroupIndex pgIdx) const
 {
-    assert(!mLevels.empty());
+    TLLM_CHECK_DEBUG(!mLevels.empty());
     return getUniformAttribute(mLevels, [pgIdx](auto const& lvl) { return lvl.storage->numPools(pgIdx); });
 }
 
@@ -818,7 +802,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(CacheLevel level)
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
     {
         auto const s = getStatistics(level, pgIdx);
-        assert(s.total > 0);
+        TLLM_CHECK_DEBUG(s.total > 0);
         result.push_back(static_cast<float>(s.unavailable()) / static_cast<float>(s.total));
     }
     return result;
@@ -836,7 +820,7 @@ float StorageManager::getOverallUtilization(CacheLevel level) const
         num += sz * static_cast<float>(s.unavailable());
         den += sz * static_cast<float>(s.total);
     }
-    assert(den > 0.f);
+    TLLM_CHECK_DEBUG(den > 0.f);
     return num / den;
 }
 
@@ -847,7 +831,7 @@ float StorageManager::getOverallUtilization(CacheLevel level) const
 void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots)
 {
     auto& pg = poolGroup(level, pgIdx);
-    assert(newNumSlots > pg.numSlots());
+    TLLM_CHECK_DEBUG(newNumSlots > pg.numSlots());
     pg.resizePools(newNumSlots);
     pg.slotAllocator().expand(newNumSlots);
 }
@@ -862,18 +846,15 @@ void StorageManager::shrinkPoolGroup(
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator();
     auto& ctrl = mLevels.at(level).controller;
-    assert(newNumSlots < pg.numSlots());
+    TLLM_CHECK_DEBUG(newNumSlots < pg.numSlots());
 
     // A16: persistent_pages preconditions.
-    assert(persistentPages.size() <= slotCountToSizeT(newNumSlots) && "Not enough slots to hold all persistent pages");
-    if (!gNdebug)
-    {
-        for (auto const& p : persistentPages)
-        {
-            assert(p->cacheLevel == level && "Persistent page cache level mismatch");
-            assert(mLifeCycleGrouping.at(p->lifeCycle) == pgIdx && "Persistent page pool group mismatch");
-        }
-    }
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        persistentPages.size() <= slotCountToSizeT(newNumSlots), "Not enough slots to hold all persistent pages");
+    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(persistentPages.begin(), persistentPages.end(),
+                                   [this, level, pgIdx](auto const& p)
+                                   { return p->cacheLevel == level && mLifeCycleGrouping.at(p->lifeCycle) == pgIdx; }),
+        "Persistent page cache level or pool group mismatch");
 
     // Fast path: when no slot id has ever been issued in the to-be-removed
     // range [newNumSlots, capacity), there is nothing to migrate.
@@ -950,20 +931,16 @@ void StorageManager::shrinkPoolGroup(
     prepareFreeSlots(level, reqs);
 
     // A17: all overflow pages must be at the expected cache level.
-    if (!gNdebug)
-    {
-        for (auto const& p : overflowPages)
-        {
-            assert(p->cacheLevel == level && "Overflow page cache level mismatch");
-        }
-    }
+    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(overflowPages.begin(), overflowPages.end(),
+                                   [level](auto const& p) { return p->cacheLevel == level; }),
+        "Overflow page cache level mismatch");
 
     // Defragment: migrate overflow pages to free slots within the same level.
     _batchedMigrate(pgIdx, level, level, overflowPages, /*updateSrc=*/true, /*defrag=*/true);
 
     // A18: post-defrag overflow assertion — overflow slot count matches expectations.
-    assert(allocator.numOverflowSlots() == allocator.numActiveSlots() - allocator.targetCapacity()
-        && "Post-defrag overflow slot count mismatch");
+    TLLM_CHECK_DEBUG_WITH_INFO(allocator.numOverflowSlots() == allocator.numActiveSlots() - allocator.targetCapacity(),
+        "Post-defrag overflow slot count mismatch");
 
     // Finalize shrink and resize pools.
     allocator.finishShrink();
@@ -992,7 +969,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, mMinSlots, quota);
 
     if (!isLastLevel(level))
-        assert(persistentPages == nullptr);
+        TLLM_CHECK_DEBUG(persistentPages == nullptr);
 
     // Shrink first.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
