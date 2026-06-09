@@ -29,6 +29,7 @@ LLM_ROOT = "llm"
 
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -2475,7 +2476,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
             try {
-                def artifactUrl = "https://urm.nvidia.com/artifactory/${cbts.cbts_test_db_artifact_path}"
+                def artifactUrl = "${URM_ARTIFACTORY_BASE}/${cbts.cbts_test_db_artifact_path}"
                 sh "wget -q '${artifactUrl}' -O /tmp/cbts_test_db.tar.gz && tar xzf /tmp/cbts_test_db.tar.gz -C ${llmSrc}"
                 echo "CBTS Layer 3: extracted cbts_test_db from artifact"
             } catch (Exception e) {
