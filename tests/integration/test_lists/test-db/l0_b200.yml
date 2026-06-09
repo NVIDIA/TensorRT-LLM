@@ -95,6 +95,8 @@ l0_b200:
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
+  - unittest/_torch/modules/test_fp4_num_tokens_slice.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py

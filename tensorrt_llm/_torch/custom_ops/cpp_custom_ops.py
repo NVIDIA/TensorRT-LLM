@@ -1114,6 +1114,65 @@ def _register_fake():
             (m, n), dtype=input.dtype) if output_hp_norm else None
         return normed_output_fp4, output, sf_out, hp_output
 
+    def _swizzled_sf_size(m: int, n: int, sf_vec_size: int = 16) -> int:
+        # Mirrors tensorrt_llm::computeSwizzledLayoutSFSize: padUp(rows,128) *
+        # padUp(cols,4), with cols = n / sf_vec_size (SFMatrix columns).
+        cols = n // sf_vec_size
+        padded_row = ((m + 127) // 128) * 128
+        padded_col = ((cols + 3) // 4) * 4
+        return padded_row * padded_col
+
+    @torch.library.register_fake("trtllm::fused_add_rmsnorm_fp4_quantize")
+    def _(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        scale_factor: torch.Tensor,
+        eps: float,
+        return_norm_out: bool,
+    ) -> List[torch.Tensor]:
+        # quant_out: packed NVFP4 (E2M1x2) as uint8, last dim halved, leading
+        # dims preserved. scale_out: swizzled E4M3 scale bytes. residual_out:
+        # hidden+residual, a fresh tensor (the op does not mutate hidden_states).
+        # When return_norm_out, the BF16 post-RMSNorm value leads the tuple.
+        m = 1
+        for d in hidden_states.shape[:-1]:
+            m *= d
+        k = hidden_states.shape[-1]
+        quant_shape = (*hidden_states.shape[:-1], k // 2)
+        quant_out = hidden_states.new_empty(quant_shape, dtype=torch.uint8)
+        sf_out = hidden_states.new_empty((_swizzled_sf_size(m, k), ),
+                                         dtype=torch.uint8)
+        residual_out = torch.empty_like(hidden_states)
+        if return_norm_out:
+            norm_out = torch.empty_like(hidden_states)
+            return [norm_out, quant_out, sf_out, residual_out]
+        return [quant_out, sf_out, residual_out]
+
+    @torch.library.register_fake("trtllm::fused_rmsnorm_fp4_quantize")
+    def _(
+        hidden_states: torch.Tensor,
+        norm_weight: torch.Tensor,
+        scale_factor: torch.Tensor,
+        eps: float,
+        return_norm_out: bool,
+    ) -> List[torch.Tensor]:
+        # Residual-less variant. quant_out / sf_out as above; norm_out (packed,
+        # contiguous) leads the tuple when return_norm_out.
+        m = 1
+        for d in hidden_states.shape[:-1]:
+            m *= d
+        k = hidden_states.shape[-1]
+        quant_shape = (*hidden_states.shape[:-1], k // 2)
+        quant_out = hidden_states.new_empty(quant_shape, dtype=torch.uint8)
+        sf_out = hidden_states.new_empty((_swizzled_sf_size(m, k), ),
+                                         dtype=torch.uint8)
+        if return_norm_out:
+            norm_out = hidden_states.new_empty(tuple(hidden_states.shape),
+                                               dtype=hidden_states.dtype)
+            return [norm_out, quant_out, sf_out]
+        return [quant_out, sf_out]
+
     @torch.library.register_fake("trtllm::fused_gated_rmsnorm_quant")
     def _(
         x: torch.Tensor,
