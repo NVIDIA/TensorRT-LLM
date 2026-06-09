@@ -226,7 +226,6 @@ examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
 full:A100/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS] SKIP (https://nvbugs/6273850)
 full:A100/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp[mtp_off] SKIP (https://nvbugs/6273850)
-full:A100/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp[mtp_on] SKIP (https://nvbugs/6239637)
 full:A100X/llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_mtp SKIP (https://nvbugs/6287561)
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugs/5161074)
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugs/5161074)
