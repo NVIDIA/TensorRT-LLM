@@ -261,43 +261,43 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(KernelMeta const& kernelMet
         kernelMeta.mSageBlockSizeV, kernelMeta.mReturnSoftmaxStats, kernelMeta.mEnableSkipSoftmax);
 }
 
-#if defined(TLLM_ENABLE_HALFSPEC_SM120)
-// Halfspec (TMA-load + sync-MMA warp-specialized FMHA for sm_120 / sm_121)
-// launch bridges, defined in the halfspec TU
-// (halfspec_sm120/fused_multihead_flash_attention_ws_sm120.cu). One bridge per
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
+// Skip_softmax (TMA-load + sync-MMA warp-specialized FMHA for sm_120 / sm_121)
+// launch bridges, defined in the skip_softmax TU
+// (skip_softmax_sm120/fused_multihead_flash_attention_ws_sm120.cu). One bridge per
 // supported head dim. Only declared when sm_120 is built, so non-sm_120 builds
 // neither reference nor link the (then-absent) symbols.
-void run_halfspec_bf16_d256_causal_sm120(
+void run_skip_softmax_bf16_d256_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
-void run_halfspec_bf16_d128_causal_sm120(
+void run_skip_softmax_bf16_d128_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
-#endif // TLLM_ENABLE_HALFSPEC_SM120
+#endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
 
 void FusedMultiHeadAttentionXMMAKernelV2::run(
     Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
 {
-#if defined(TLLM_ENABLE_HALFSPEC_SM120)
-    // Halfspec dispatch: route the matching config (sm_120 / sm_121, BF16
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
+    // Skip_softmax dispatch: route the matching config (sm_120 / sm_121, BF16
     // in/out, head_dim == head_dim_v in {128, 256}, causal, PACKED_QKV) to the
     // TMA-load + sync-MMA warp-specialized kernel when the caller opted in.
     // Falls through to the normal cubin/launcher path otherwise.
-    if (launch_params.useHalfspecFmha && (mSM == kSM_120 || mSM == kSM_121) && mInputDataType == DATA_TYPE_BF16
+    if (launch_params.useSkip_softmaxFmha && (mSM == kSM_120 || mSM == kSM_121) && mInputDataType == DATA_TYPE_BF16
         && mOutputDataType == DATA_TYPE_BF16 && params.d == params.dv
         && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
         && launch_params.attention_input_layout == AttentionInputLayout::PACKED_QKV)
     {
         if (params.d == 256)
         {
-            run_halfspec_bf16_d256_causal_sm120(params, launch_params, stream);
+            run_skip_softmax_bf16_d256_causal_sm120(params, launch_params, stream);
             return;
         }
         if (params.d == 128)
         {
-            run_halfspec_bf16_d128_causal_sm120(params, launch_params, stream);
+            run_skip_softmax_bf16_d128_causal_sm120(params, launch_params, stream);
             return;
         }
     }
-#endif // TLLM_ENABLE_HALFSPEC_SM120
+#endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
 
     bool forceUnroll = useForceUnroll(params, launch_params);
     auto const findIter = mFunctions.find(hashFromParams(params, launch_params));

@@ -965,7 +965,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr, bool use_halfspec_fmha)
+    std::optional<int64_t> compressed_kv_cache_pool_ptr, bool use_skip_softmax_fmha)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1089,7 +1089,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = static_cast<float>(skip_softmax_threshold_scale_factor_prefill.value_or(0));
     op->mSkipSoftmaxThresholdScaleFactorDecode
         = static_cast<float>(skip_softmax_threshold_scale_factor_decode.value_or(0));
-    op->mUseHalfspecFmha = use_halfspec_fmha;
+    op->mUseSkip_softmaxFmha = use_skip_softmax_fmha;
 #ifdef SKIP_SOFTMAX_STAT
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
     op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;

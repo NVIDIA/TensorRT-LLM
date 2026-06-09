@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-// Translation unit for the halfspec sm_120 / sm_121 warp-specialized FMHA
+// Translation unit for the skip_softmax sm_120 / sm_121 warp-specialized FMHA
 // (TMA-load + sync-MMA). This kernel is hand-written rather than emitted by
 // fmha_v2/setup.py code-gen, so it is compiled directly into the
 // _context_attention_kernels_120 target (see the sibling CMakeLists.txt). It
@@ -24,7 +24,7 @@
 //
 // Supported shapes: BF16 in/out, head_dim == head_dim_v in {128, 256}, causal
 // mask, PACKED_QKV layout. The runner dispatches here only when those
-// constraints are met and the use_halfspec_fmha flag is set; see
+// constraints are met and the use_skip_softmax_fmha flag is set; see
 // fused_multihead_attention_v2.cpp.
 //
 // The design rationale lives in
@@ -41,7 +41,7 @@
 
 #include "fused_multihead_flash_attention_kernel_ws_sm120.h"
 
-namespace fmha_halfspec
+namespace fmha_skip_softmax
 {
 
 // NOTE: the `S` template arg is the *kv loop step* (per-iter KV tile size),
@@ -56,7 +56,7 @@ namespace fmha_halfspec
 // 128 and 256 both satisfy this; a non-multiple-of-64 head dim would break the
 // swizzle invariant.
 template <int HEAD_DIM>
-using Halfspec_ktraits = fmha::ws_sm120::Kernel_traits_halfspec_sm120<
+using Skip_softmax_ktraits = fmha::ws_sm120::Kernel_traits_skip_softmax_sm120<
     /*Traits_=*/fmha::Ampere_hmma_bf16_traits,
     /*S=*/128,
     /*VALID_D_=*/HEAD_DIM,
@@ -70,13 +70,13 @@ using Halfspec_ktraits = fmha::ws_sm120::Kernel_traits_halfspec_sm120<
     /*ENABLE_SKIP_SOFTMAX_=*/true,
     /*NUM_PRODUCER_WARPS_=*/1>;
 
-} // namespace fmha_halfspec
+} // namespace fmha_skip_softmax
 
 // Templated entry kernel -- one instantiation per head dim (128, 256). THREADS
 // is head-dim-independent (1 producer + WARPS_M*WARPS_N consumer warps), so the
 // launch_bounds value is identical across instantiations.
 template <typename Ktraits>
-__global__ __launch_bounds__(Ktraits::THREADS, 1) void halfspec_kernel(
+__global__ __launch_bounds__(Ktraits::THREADS, 1) void skip_softmax_kernel(
     bert::Fused_multihead_attention_params_v2 const params, __grid_constant__ const CUtensorMap tma_q,
     __grid_constant__ const CUtensorMap tma_k, __grid_constant__ const CUtensorMap tma_v)
 {
@@ -87,7 +87,7 @@ __global__ __launch_bounds__(Ktraits::THREADS, 1) void halfspec_kernel(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Host-side launcher for the halfspec kernel.
+// Host-side launcher for the skip_softmax kernel.
 //
 // Sets up the TMA descriptors via DMA::Host::init_params, sizes shared memory,
 // configures the launch attribute that lets the kernel use >48KB smem, and
@@ -98,7 +98,7 @@ __global__ __launch_bounds__(Ktraits::THREADS, 1) void halfspec_kernel(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Ktraits>
-static cudaError_t launch_halfspec(bert::Fused_multihead_attention_params_v2 params,
+static cudaError_t launch_skip_softmax(bert::Fused_multihead_attention_params_v2 params,
     bert::Fused_multihead_attention_launch_params const& launch_params, cudaStream_t stream)
 {
     // 1. Build the three TMA descriptors host-side (cuTensorMapEncodeTiled).
@@ -113,8 +113,8 @@ static cudaError_t launch_halfspec(bert::Fused_multihead_attention_params_v2 par
     constexpr int smem_bytes = static_cast<int>(Ktraits::BYTES_PER_SMEM);
     if (smem_bytes >= 48 * 1024)
     {
-        cudaError_t err
-            = cudaFuncSetAttribute(halfspec_kernel<Ktraits>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        cudaError_t err = cudaFuncSetAttribute(
+            skip_softmax_kernel<Ktraits>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         if (err != cudaSuccess)
         {
             return err;
@@ -128,7 +128,7 @@ static cudaError_t launch_halfspec(bert::Fused_multihead_attention_params_v2 par
     dim3 const grid(q_tiles, params.h, params.b);
     dim3 const block(Ktraits::THREADS);
 
-    halfspec_kernel<Ktraits><<<grid, block, smem_bytes, stream>>>(params, tma_q, tma_k, tma_v);
+    skip_softmax_kernel<Ktraits><<<grid, block, smem_bytes, stream>>>(params, tma_q, tma_k, tma_v);
     return cudaGetLastError();
 }
 
@@ -140,7 +140,7 @@ static cudaError_t launch_halfspec(bert::Fused_multihead_attention_params_v2 par
 // (defined in contextFusedMultiHeadAttention/fused_multihead_attention_common.h),
 // which is a separate but ABI-compatible struct from the fmha_v2 `bert::` one --
 // the generated kernels bridge them with reinterpret_cast, and we do the same.
-// One bridge per supported head dim; both share the templated launch_halfspec<>
+// One bridge per supported head dim; both share the templated launch_skip_softmax<>
 // path. The bert launch_params is NOT ABI-identical to kernels::Launch_params,
 // so we copy the fields Host::init_params reads rather than reinterpret_cast it.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -153,25 +153,25 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-void run_halfspec_bf16_d256_causal_sm120(
+void run_skip_softmax_bf16_d256_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream)
 {
     bert::Fused_multihead_attention_launch_params blp{};
     blp.total_q_seqlen = launch_params.total_q_seqlen;
     blp.attention_input_layout = fmha::Attention_input_layout::PACKED_QKV;
 
-    ::launch_halfspec<::fmha_halfspec::Halfspec_ktraits<256>>(
+    ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<256>>(
         reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params), blp, stream);
 }
 
-void run_halfspec_bf16_d128_causal_sm120(
+void run_skip_softmax_bf16_d128_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream)
 {
     bert::Fused_multihead_attention_launch_params blp{};
     blp.total_q_seqlen = launch_params.total_q_seqlen;
     blp.attention_input_layout = fmha::Attention_input_layout::PACKED_QKV;
 
-    ::launch_halfspec<::fmha_halfspec::Halfspec_ktraits<128>>(
+    ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<128>>(
         reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params), blp, stream);
 }
 

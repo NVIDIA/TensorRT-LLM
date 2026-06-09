@@ -18,13 +18,14 @@
 #pragma once
 
 // =====================================================================
-// Halfspec: TMA-load + sync-MMA warp-specialized flash-attention prefill
+// Skip_softmax: TMA-load + sync-MMA warp-specialized flash-attention prefill
 // kernel for sm_120 / sm_121.
 // =====================================================================
 //
-// "Halfspec" = half of the Hopper warp-specialization recipe: TMA-driven
-// async loads survive the port to sm_120, but async MMA does not (sm_120 has
-// no wgmma.async equivalent), so the compute warps stay on mma.sync.
+// Named for the per-warp skip-softmax optimization it carries. Only half of the
+// Hopper warp-specialization recipe ports to sm_120: TMA-driven async loads
+// survive, but async MMA does not (sm_120 has no wgmma.async equivalent), so
+// the compute warps stay on mma.sync.
 //
 // Differences from the non-warp-specialized tiled sm_120 path:
 //
@@ -74,7 +75,7 @@ constexpr int COMPUTE_NREG = 232; // consumers: acc_o + softmax + frag_p live
 // (sm_90, sm_100, sm_103). It is NOT supported on *consumer* Blackwell
 // (sm_120 / sm_121) -- ptxas rejects it with a hard error there. So the
 // producer/consumer register-budget split simply does not exist on the
-// halfspec target hardware; these helpers compile to a no-op for sm_120/121.
+// skip_softmax target hardware; these helpers compile to a no-op for sm_120/121.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1200
 #define FMHA_HAS_SETMAXNREG 1
 #else

@@ -1402,8 +1402,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return None
 
     @property
-    def use_halfspec_fmha(self) -> bool:
-        """Opt into the halfspec (TMA-load + sync-MMA warp-specialized) context
+    def use_skip_softmax_fmha(self) -> bool:
+        """Opt into the skip_softmax (TMA-load + sync-MMA warp-specialized) context
         FMHA. It is the sm_120 / sm_121 kernel that implements skip-softmax, so
         it is enabled whenever skip-softmax is configured. The C++ runner
         restricts dispatch to sm_120 / sm_121 with supported shapes (BF16,
@@ -1670,7 +1670,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 skip_softmax_threshold_scale_factor_decode=self.
                 skip_softmax_threshold_scale_factor_decode,
                 skip_softmax_stat=self.skip_softmax_stat,
-                use_halfspec_fmha=self.use_halfspec_fmha,
+                use_skip_softmax_fmha=self.use_skip_softmax_fmha,
 
                 # --- Sparse-specific (AttentionForwardArgs.sparse) ---
                 sparse_kv_indices=forward_args.sparse.sparse_kv_indices,

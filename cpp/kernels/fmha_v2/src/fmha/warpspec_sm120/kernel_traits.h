@@ -17,7 +17,7 @@
 
 #pragma once
 
-// Kernel_traits for the halfspec sm_120 / sm_121 warp-specialized FMHA.
+// Kernel_traits for the skip_softmax sm_120 / sm_121 warp-specialized FMHA.
 //
 // Wraps the existing fmha::Kernel_traits_ template (which already provides
 // LDGSTS-friendly Smem_tile_a/b/v with ldmatrix swizzle and the right
@@ -82,10 +82,10 @@ template <
     bool ENABLE_SKIP_SOFTMAX_ = false,
     // Producer warp count -- single 32-thread warp by default.
     int NUM_PRODUCER_WARPS_ = 1>
-struct Kernel_traits_halfspec_sm120
+struct Kernel_traits_skip_softmax_sm120
 {
 
-    // Compose the existing PACKED_QKV tiled kernel traits with our halfspec
+    // Compose the existing PACKED_QKV tiled kernel traits with our skip_softmax
     // overrides. Kernel_traits_v2 (in fmha/kernel_traits.h) bakes in
     // fmha::v2::Gmem_tile_qkv for Q / K / V, which is the right gmem tile
     // for the PACKED_QKV input layout TRT-LLM passes for Qwen3.5 prefill.
@@ -93,7 +93,7 @@ struct Kernel_traits_halfspec_sm120
     // FLAGS: bit 0x1   = USE_LDGSTS_Q
     //        bit 0x2   = USE_LDGSTS_K
     //        bit 0x4   = USE_LDGSTS_V
-    //                    Halfspec leaves all three LDGSTS bits OFF; the
+    //                    Skip_softmax leaves all three LDGSTS bits OFF; the
     //                    producer warp issues TMA, not LDGSTS. The smem
     //                    layout is governed by BYTES_PER_LDG (=16,
     //                    independent of USE_LDGSTS) and the buffer count
@@ -132,7 +132,7 @@ struct Kernel_traits_halfspec_sm120
     using Mma_tile_p = typename Base::Mma_tile_p;
     using Mma_tile_o = typename Base::Mma_tile_o;
 
-    // Halfspec uses a RING_DEPTH-buffer ring for K, V (and Q -- though Q only
+    // Skip_softmax uses a RING_DEPTH-buffer ring for K, V (and Q -- though Q only
     // loads once per CTA, we still go through the same ring API so the
     // barrier handshake is uniform).
     enum
@@ -294,12 +294,12 @@ struct Kernel_traits_halfspec_sm120
     //
     // The consumer reuses the existing LDGSTS Smem_tile_q/k/v which, with
     // USE_GRANULAR_TILING, stream the contraction dim in chunks through a
-    // BUFFERS_PER_TILE-deep ping-pong (== GRANULAR_DEPTH below). The halfspec
+    // BUFFERS_PER_TILE-deep ping-pong (== GRANULAR_DEPTH below). The skip_softmax
     // TMA producer fills those exact granular buffers chunk by chunk -- it does
     // NOT add a ring on top. So the barrier depth == the granular buffer count.
     static constexpr int GRANULAR_DEPTH = Smem_tile_k::BUFFERS_PER_TILE;
     static_assert(GRANULAR_DEPTH == Smem_tile_q::BUFFERS_PER_TILE && GRANULAR_DEPTH == Smem_tile_v::BUFFERS_PER_TILE,
-        "halfspec assumes Q/K/V share the same granular buffer depth.");
+        "skip_softmax assumes Q/K/V share the same granular buffer depth.");
 
     // Bytes of one granular buffer (one chunk) for Q / K / V.
     static constexpr int BYTES_PER_BUFFER_Q = Smem_tile_q::BYTES_PER_BUFFER;
@@ -381,7 +381,7 @@ struct Kernel_traits_halfspec_sm120
     };
 
     // Pad to align. The non-Hopper kernel allocates BYTES_PER_SMEM in the
-    // extern __shared__ block; the halfspec version uses sizeof(Shared).
+    // extern __shared__ block; the skip_softmax version uses sizeof(Shared).
     enum
     {
         BYTES_PER_SMEM = sizeof(Shared)

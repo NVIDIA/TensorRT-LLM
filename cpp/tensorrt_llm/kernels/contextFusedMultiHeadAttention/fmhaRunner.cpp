@@ -498,9 +498,9 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 
-    // Dispatch to the halfspec (TMA-load + sync-MMA warp-specialized) FMHA on
+    // Dispatch to the skip_softmax (TMA-load + sync-MMA warp-specialized) FMHA on
     // sm_120 / sm_121 when requested by the caller.
-    mLaunchParams.useHalfspecFmha = runnerParams.useHalfspecFmha;
+    mLaunchParams.useSkip_softmaxFmha = runnerParams.useSkip_softmaxFmha;
 
     // Setup launch params for skip softmax attention
     mLaunchParams.enableSkipSoftmax = false;
@@ -508,13 +508,14 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     {
         bool const isSm120f = (mSM == kSM_120 || mSM == kSM_121);
         bool const hopperWarpspec = isSm90 && mLaunchParams.warp_specialization;
-        // The halfspec kernel is the only sm_120 / sm_121 FMHA that implements
-        // skip-softmax, so skip-softmax there is only permitted with halfspec.
-        bool const sm120Halfspec = isSm120f && mLaunchParams.useHalfspecFmha;
-        if (!mLaunchParams.flash_attention || !(hopperWarpspec || sm120Halfspec))
+        // The skip_softmax kernel is the only sm_120 / sm_121 FMHA that implements
+        // skip-softmax, so skip-softmax there is only permitted with skip_softmax.
+        bool const sm120Skip_softmax = isSm120f && mLaunchParams.useSkip_softmaxFmha;
+        if (!mLaunchParams.flash_attention || !(hopperWarpspec || sm120Skip_softmax))
         {
             TLLM_CHECK_WITH_INFO(false,
-                "Skip softmax attention requires Hopper with warp specialization, or sm_120 / sm_121 with the halfspec "
+                "Skip softmax attention requires Hopper with warp specialization, or sm_120 / sm_121 with the "
+                "skip_softmax "
                 "FMHA enabled, together with flash attention.");
         }
         mLaunchParams.enableSkipSoftmax = true;

@@ -542,9 +542,9 @@ public:
     int mSageAttnNumEltsPerBlkK = 0;
     int mSageAttnNumEltsPerBlkV = 0;
     bool mSageAttnQkInt8 = false;
-    // Opt into the halfspec (TMA-load + sync-MMA warp-specialized) context FMHA
+    // Opt into the skip_softmax (TMA-load + sync-MMA warp-specialized) context FMHA
     // on sm_120 / sm_121 for supported shapes.
-    bool mUseHalfspecFmha = false;
+    bool mUseSkip_softmaxFmha = false;
 #ifdef SKIP_SOFTMAX_STAT
     uint32_t* mSkipSoftmaxTotalBlocks;
     uint32_t* mSkipSoftmaxSkippedBlocks;
@@ -568,7 +568,7 @@ public:
             mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
             mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1),
             mSkipSoftmaxThresholdScaleFactorPrefill, mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ,
-            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8, mUseHalfspecFmha);
+            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8, mUseSkip_softmaxFmha);
     };
 
 private:

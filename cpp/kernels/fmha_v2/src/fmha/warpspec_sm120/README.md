@@ -1,10 +1,11 @@
-# halfspec — TMA-load + sync-MMA warp-specialized FMHA for sm_120 / sm_121
+# skip_softmax — TMA-load + sync-MMA warp-specialized FMHA for sm_120 / sm_121
 
-> Codename **halfspec** = half of the Hopper warp-specialization recipe.
-> TMA-driven async loads survive the port to consumer Blackwell; async MMA does
-> not (sm_120 / sm_121 have no `wgmma.async` equivalent). The compute warps
-> therefore stay on `mma.sync`, while a dedicated producer warp drives the
-> loads with TMA.
+> This is the sm_120 / sm_121 warp-specialized context FMHA that carries the
+> per-warp **skip-softmax** optimization (hence the name). Only half of the
+> Hopper warp-specialization recipe ports to consumer Blackwell: TMA-driven
+> async loads survive, but async MMA does not (sm_120 / sm_121 have no
+> `wgmma.async` equivalent), so the compute warps stay on `mma.sync` while a
+> dedicated producer warp drives the loads with TMA.
 
 This directory implements a warp-specialized context FMHA for the sm_120
 family (sm_120 / sm_121). It targets BF16, causal mask, `head_dim ==
@@ -15,27 +16,27 @@ per-warp skip-softmax optimization into the warp-specialized design.
 
 | File | Role |
 |------|------|
-| `kernel_traits.h` | `Kernel_traits_halfspec_sm120`: wraps `fmha::Kernel_traits_v2` for the LDGSTS-friendly `Smem_tile_*` types, then layers on the producer/consumer warp roles, the granular smem buffers, the circular-buffer barriers, and the V re-tile (see below). |
+| `kernel_traits.h` | `Kernel_traits_skip_softmax_sm120`: wraps `fmha::Kernel_traits_v2` for the LDGSTS-friendly `Smem_tile_*` types, then layers on the producer/consumer warp roles, the granular smem buffers, the circular-buffer barriers, and the V re-tile (see below). |
 | `dma_sync_mma.h` | Producer (`DMA::run`). Issues `cp.async.bulk.tensor.3d.shared::cta.global.tile` for Q / K / V into the granular buffers. `DMA::Host::init_params` builds the three `CUtensorMap` descriptors with the driver-API `cuTensorMapEncodeTiled`. |
 | `compute_sync_mma.h` | Consumer (`Compute::run`). The kv-loop body — BMM1 (`fmha::gemm`) + softmax + causal mask + per-warp skip-softmax vote + BMM2 + epilogue — reading the granular `Smem_tile_q/k/v` per ring slot. |
 
 The translation unit and the in-engine dispatch bridges live in
-`cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/halfspec_sm120/fused_multihead_flash_attention_ws_sm120.cu`,
+`cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/skip_softmax_sm120/fused_multihead_flash_attention_ws_sm120.cu`,
 and the entry kernel in
 `cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_ws_sm120.h`.
 
 ## How the runner reaches this kernel
 
-The kernel is opt-in. The PyTorch attention op exposes a `use_halfspec_fmha`
+The kernel is opt-in. The PyTorch attention op exposes a `use_skip_softmax_fmha`
 flag (plumbed `attentionOp` → `MHARunnerParams` → `Launch_params`); when it is
 set and the config matches (sm_120 / sm_121, BF16 in/out, causal, `head_dim ==
 head_dim_v` in `{128, 256}`, PACKED_QKV), `FusedMultiHeadAttentionXMMAKernelV2::run`
-dispatches to the `run_halfspec_*` bridges instead of the cubin path. The flag
+dispatches to the `run_skip_softmax_*` bridges instead of the cubin path. The flag
 is a no-op on every other architecture and shape.
 
 The translation unit is compiled only into the `_context_attention_kernels_120`
 CMake target (sm_120 family). The all-architecture dispatch TU references the
-bridge symbols under `TLLM_ENABLE_HALFSPEC_SM120`, which CMake defines only when
+bridge symbols under `TLLM_ENABLE_SKIP_SOFTMAX_SM120`, which CMake defines only when
 sm_120 is built, so builds that exclude sm_120 neither reference nor link the
 (then-absent) symbols.
 

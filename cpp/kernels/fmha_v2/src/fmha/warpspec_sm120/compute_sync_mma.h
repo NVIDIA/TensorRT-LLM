@@ -17,7 +17,7 @@
 
 #pragma once
 
-// halfspec consumer: BMM1 + softmax + skip-softmax + BMM2 body.
+// skip_softmax consumer: BMM1 + softmax + skip-softmax + BMM2 body.
 //
 // This is a port of fused_multihead_flash_attention_kernel_noloop_tiled.h
 // where:
@@ -132,12 +132,12 @@ struct Compute
         mask.load(q_sequence_start);
         // softmax tail buffer is in shared->smem_v's tail; noloop_tiled
         // gives softmax `smem_[Smem_tile_q::BYTES_PER_TILE]` which is the
-        // K/V smem region. On halfspec we don't share -- softmax does not
+        // K/V smem region. On skip_softmax we don't share -- softmax does not
         // touch the K/V smem ring. If Softmax::USE_SHARED_MEMORY is needed,
         // we'd allocate a separate softmax_scratch buffer in Shared (TODO).
         Softmax softmax(params, /*smem_scratch=*/nullptr, bidb, tidx);
         static_assert(!Softmax::USE_SHARED_MEMORY,
-            "halfspec consumer needs Softmax::USE_SHARED_MEMORY = false; if your "
+            "skip_softmax consumer needs Softmax::USE_SHARED_MEMORY = false; if your "
             "kernel_traits enables it, add a softmax_scratch buffer to Shared.");
 
         // Per-granular-buffer ring readers (Q/K stream the head dim, V streams
@@ -394,7 +394,7 @@ struct Compute
 #endif
 
         // ---- Epilogue: normalize acc_o by global_sum, store O ----
-        // Ported from noloop_tiled.h, with two halfspec adaptations:
+        // Ported from noloop_tiled.h, with two skip_softmax adaptations:
         //   * __syncthreads() -> named_barrier over the CONSUMER_THREADS group
         //     only (the producer warp is not part of the epilogue and must not
         //     be caught in a CTA-wide barrier).

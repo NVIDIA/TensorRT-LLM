@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for the halfspec sm_120 / sm_121 context FMHA.
+"""Correctness tests for the skip_softmax sm_120 / sm_121 context FMHA.
 
-halfspec backs skip-softmax, so it is forced on by attaching a
+skip_softmax backs skip-softmax, so it is forced on by attaching a
 ``SkipSoftmaxAttentionConfig`` with a tiny ``threshold_scale_factor`` (no tile
 is ever skipped, i.e. full softmax). For BF16 / head_dim in {128, 256} / causal
-/ packed QKV the runner dispatches unconditionally to halfspec, so these checks
+/ packed QKV the runner dispatches unconditionally to skip_softmax, so these checks
 target the kernel directly. The multi-request cases guard the per-request TMA
 offset fix (every batch element used to re-read request 0's tokens).
 """
@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 
 pytestmark = pytest.mark.skipif(
     get_sm_version() not in (120, 121),
-    reason=f"halfspec FMHA only dispatches on SM 120 / 121, got SM {get_sm_version()}",
+    reason=f"skip_softmax FMHA only dispatches on SM 120 / 121, got SM {get_sm_version()}",
 )
 
 
@@ -102,7 +102,7 @@ def _run_context(num_heads, num_kv_heads, head_dim, seq_lens, q, k, v, sparse_at
     )
 
 
-# (num_heads, num_kv_heads) -- MHA configs exercised by the halfspec kernel.
+# (num_heads, num_kv_heads) -- MHA configs exercised by the skip_softmax kernel.
 HEADS = [(8, 8)]
 # Single request and several multi-request batches (the regression target:
 # equal- and variable-length batches, and a larger fan-out).
@@ -120,9 +120,9 @@ SEQ_LENS = [
 @pytest.mark.parametrize("head_dim", [128], ids=lambda d: f"head_dim_{d}")
 @pytest.mark.parametrize("num_heads,num_kv_heads", HEADS, ids=lambda x: f"h_{x}")
 @pytest.mark.parametrize("seq_lens", SEQ_LENS, ids=lambda s: f"seqs_{'_'.join(map(str, s))}")
-def test_halfspec_context_matches_reference(num_heads, num_kv_heads, head_dim, seq_lens):
-    """The halfspec context FMHA must match (a) a standard fp32 causal-attention
-    reference and (b) the default (non-halfspec) TRTLLM context kernel on the
+def test_skip_softmax_context_matches_reference(num_heads, num_kv_heads, head_dim, seq_lens):
+    """The skip_softmax context FMHA must match (a) a standard fp32 causal-attention
+    reference and (b) the default (non-skip_softmax) TRTLLM context kernel on the
     same inputs, for both single- and multi-request batches."""
     torch.manual_seed(720)
     device = torch.device("cuda")
@@ -140,8 +140,8 @@ def test_halfspec_context_matches_reference(num_heads, num_kv_heads, head_dim, s
     _, _, out_default = _run_context(
         num_heads, num_kv_heads, head_dim, seq_lens, q, k, v, sparse_attention_config=None
     )
-    # Under test: halfspec, forced on via the skip-softmax cfg.
-    halfspec_layer, _, out_halfspec = _run_context(
+    # Under test: skip_softmax, forced on via the skip-softmax cfg.
+    skip_softmax_layer, _, out_skip_softmax = _run_context(
         num_heads,
         num_kv_heads,
         head_dim,
@@ -153,13 +153,13 @@ def test_halfspec_context_matches_reference(num_heads, num_kv_heads, head_dim, s
     )
     torch.cuda.synchronize()
 
-    assert halfspec_layer.use_halfspec_fmha, "skip-softmax cfg did not enable halfspec"
+    assert skip_softmax_layer.use_skip_softmax_fmha, "skip-softmax cfg did not enable skip_softmax"
 
-    # Baseline sanity, then the regression checks: halfspec must match both the
+    # Baseline sanity, then the regression checks: skip_softmax must match both the
     # reference and the default kernel (pre-fix, batches >1 were off by ~0.2).
     torch.testing.assert_close(out_default.float(), ref.float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(out_halfspec.float(), ref.float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(out_halfspec.float(), out_default.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out_skip_softmax.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out_skip_softmax.float(), out_default.float(), atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

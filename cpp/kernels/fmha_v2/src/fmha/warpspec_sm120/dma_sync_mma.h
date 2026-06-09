@@ -47,7 +47,7 @@ namespace ws_sm120
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// halfspec-local TMA load helper using `shared::cta` (single-CTA) variant.
+// Kernel-local TMA load helper using `shared::cta` (single-CTA) variant.
 //
 // The Hopper fmha::utmaldg<...> uses `shared::cluster` qualifier, which
 // requires cluster launch (cluster_dim > 0) to be valid PTX. sm_120 / sm_121
@@ -330,7 +330,7 @@ struct DMA
                 char const* err = nullptr;
                 cuGetErrorString(res, &err);
                 fprintf(stderr,
-                    "[halfspec] cuTensorMapEncodeTiled failed: %s "
+                    "[skip_softmax] cuTensorMapEncodeTiled failed: %s "
                     "(dim=%u,%u,%u box=%u,%u,%u lead_bytes=%u swizzle=%d)\n",
                     err, tensor_size[0], tensor_size[1], tensor_size[2], box_size[0], box_size[1], box_size[2],
                     lead_bytes, static_cast<int>(swizzle));
@@ -350,7 +350,7 @@ struct DMA
                                                              : static_cast<uint32_t>(launch_params.total_q_seqlen);
 
             static_assert(
-                Kernel_traits::ELEMENT_BYTES == 2, "halfspec v0 only supports BF16 / FP16 (2-byte elements).");
+                Kernel_traits::ELEMENT_BYTES == 2, "skip_softmax v0 only supports BF16 / FP16 (2-byte elements).");
             static_assert(STEP_Q <= 256 && STEP_KV <= 256, "TMA box dimensions are capped at 256 elements per axis.");
 
             char* const q_ptr = reinterpret_cast<char*>(params.qkv_ptr);
