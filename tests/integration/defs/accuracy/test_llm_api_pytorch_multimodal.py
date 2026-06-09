@@ -434,9 +434,9 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend,input_processor",
         [
-            (4, 1, 4, False, True, True, "TRTLLM"),
+            (4, 1, 4, False, True, True, "TRTLLM", "mistral3"),
         ],
         ids=[
             "latency_moe_trtllm",
@@ -451,10 +451,15 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         cuda_graph,
         overlap_scheduler,
         moe_backend,
+        input_processor,
         mocker,
     ):
         mocker.patch.dict(
-            MMMU.EVALUATE_KWARGS, {"model_type": "mistral_large_3", "is_force_single_image": True}
+            MMMU.EVALUATE_KWARGS,
+            {
+                "model_type": "mistral_large_3",
+                "is_force_single_image": input_processor == "mistral_common",
+            },
         )
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -468,6 +473,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
             checkpoint_format="mistral_large_3",
+            input_processor=input_processor,
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
