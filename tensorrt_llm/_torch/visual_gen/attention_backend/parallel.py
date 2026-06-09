@@ -530,20 +530,6 @@ class Attention2DAttention(AttentionBackend):
                 f"inner backend num_kv_heads ({self.num_kv_heads})."
             )
 
-        mesh_size = self.row_group_size * self.col_group_size
-        global_seq_q = shard_seq_q * mesh_size
-        global_seq_kv = shard_seq_kv * mesh_size
-        if global_seq_q % self.row_group_size != 0:
-            raise ValueError(
-                f"Attention2DAttention: global Q sequence length ({global_seq_q}) must be "
-                f"divisible by row_group_size ({self.row_group_size})."
-            )
-        if global_seq_kv % self.col_group_size != 0:
-            raise ValueError(
-                f"Attention2DAttention: global KV sequence length ({global_seq_kv}) must be "
-                f"divisible by col_group_size ({self.col_group_size})."
-            )
-
         if attention_mask is not None and attention_mask != PredefinedAttentionMask.FULL:
             raise ValueError(
                 f"Attention2DAttention only supports FULL attention mask, got {attention_mask}."
