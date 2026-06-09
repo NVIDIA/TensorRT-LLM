@@ -191,11 +191,12 @@ void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
 bool SlotAllocator::finishShrink()
 {
     assert(gNdebug || check());
-    if (shrinkInProgress() && mTargetCapacity + slotCountValueFromSize(mOverflowSlots.size()) == mNumActiveSlots)
+    // Overflow-range IDs that were ever issued are exactly
+    // max(0, _num_active_slots - _target_capacity); the underused case
+    // (_num_active_slots <= _target_capacity) collapses to zero.
+    SlotCount const expectedOverflow = std::max(SlotCount{0}, mNumActiveSlots - mTargetCapacity);
+    if (shrinkInProgress() && slotCountValueFromSize(mOverflowSlots.size()) == expectedOverflow)
     {
-        // Mirrors Python assertions: validate overflow slots before shrinking.
-        assert(slotCountValueFromSize(mOverflowSlots.size()) == mNumActiveSlots - mTargetCapacity
-            && "Overflow slot count mismatch");
         // Validate uniqueness of slot IDs in overflow (debug only).
         if (!gNdebug)
         {

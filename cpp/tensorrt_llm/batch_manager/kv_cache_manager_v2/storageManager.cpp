@@ -875,6 +875,17 @@ void StorageManager::shrinkPoolGroup(
         }
     }
 
+    // Fast path: when no slot id has ever been issued in the to-be-removed
+    // range [newNumSlots, capacity), there is nothing to migrate.
+    // numActiveSlots() is a monotone high-water mark of issued ids.
+    if (allocator.numActiveSlots() <= newNumSlots)
+    {
+        allocator.prepareForShrink(newNumSlots);
+        allocator.finishShrink();
+        pg.resizePools(newNumSlots);
+        return;
+    }
+
     // Find overflow pages: scheduled pages with slot_id >= newNumSlots.
     auto gen = ctrl.pageGenerator(pgIdx);
     std::deque<std::pair<SlotCount, SharedPtr<Page>>> overflowSlots;

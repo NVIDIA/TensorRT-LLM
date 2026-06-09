@@ -128,6 +128,9 @@ Hasher& Hasher::update(TokenIdExt const& tokenExt)
 
 Hasher& Hasher::update(TokenIdExt const* tokens, size_t count)
 {
+    // Python uses array("Q", data).tobytes() to reduce per-token interpreter
+    // overhead.  In C++ the compiler inlines each update() call, so the loop
+    // is already optimal; batching would only add a heap allocation.
     for (size_t i = 0; i < count; ++i)
         update(tokens[i]);
     return *this;
