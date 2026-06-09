@@ -88,6 +88,7 @@ class LTX2Attention(Attention):
         apply_gated_attention: bool = False,
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
         enable_sequence_parallel: bool = False,
         use_ulysses: bool = False,
         async_ulysses: bool = False,
@@ -149,6 +150,7 @@ class LTX2Attention(Attention):
             fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
+            module_name=module_name,
             enable_sequence_parallel=enable_sp,
             async_ulysses=self._use_async_ulysses,
         )
@@ -184,6 +186,7 @@ class LTX2Attention(Attention):
                 dtype=self.dtype,
                 attention_config=config.attention,
                 attention_metadata_state=config.attention_metadata_state,
+                sparse_params=self.sparse_params,
             )
             self._has_dual_attn = True
 
@@ -300,6 +303,7 @@ class LTX2Attention(Attention):
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_padding_mask: torch.Tensor | None = None,
+        step_index=None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -342,7 +346,7 @@ class LTX2Attention(Attention):
             and pre_projected_kv is None
             and hasattr(self.attn, "forward_async")
         ):
-            return self.forward_async(x, freqs=pe)
+            return self.forward_async(x, freqs=pe, step_index=step_index)
 
         # Fused gate: prod uses fused kernels (head_dim ∈ {64, 128}); mini-config
         # tests (head_dim=32) fall to naive ops.
@@ -416,7 +420,7 @@ class LTX2Attention(Attention):
         attn_kwargs = {}
         if key_padding_mask is not None:
             attn_kwargs["key_padding_mask"] = key_padding_mask
-        out = self._attn_impl(q, k, v, **attn_kwargs)
+        out = self._attn_impl(q, k, v, step_index=step_index, **attn_kwargs)
 
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
@@ -432,6 +436,7 @@ class LTX2Attention(Attention):
         self,
         x: torch.Tensor,
         freqs: tuple[torch.Tensor, torch.Tensor] | None = None,
+        step_index=None,
     ) -> torch.Tensor:
         """LTX-2 async-Ulysses self-attn driver. Structurally mirrors base
         ``Attention.forward_async`` (single function, fused/unfused branches)
@@ -500,7 +505,9 @@ class LTX2Attention(Attention):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
+        out_4d = self.attn.forward_async(
+            compute_q, compute_k, compute_v, step_index=step_index
+        )
 
         # LTX-2 gated-attention scaling in 4D before to_out.
         if self.to_gate_logits is not None:
@@ -586,6 +593,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.attn1",
             enable_sequence_parallel=True,
             use_ulysses=True,
             async_ulysses=_async_ulysses,
@@ -600,6 +608,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.attn2",
             enable_sequence_parallel=False,
         )
         self.ff = self._make_mlp(cfg, model_config, idx)
@@ -632,6 +641,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=audio_self_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.audio_attn1",
             enable_sequence_parallel=True,
         )
         self.audio_attn2 = LTX2Attention(
@@ -644,6 +654,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.audio_attn2",
             enable_sequence_parallel=False,
         )
         self.audio_ff = self._make_mlp(cfg, model_config, idx)
@@ -660,6 +671,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=v_cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.audio_to_video_attn",
             enable_sequence_parallel=False,
         )
         self.video_to_audio_attn = LTX2Attention(
@@ -672,6 +684,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=a_cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.video_to_audio_attn",
             enable_sequence_parallel=True,
         )
         self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, a_cfg.dim))
@@ -745,6 +758,7 @@ class BasicAVTransformerBlock(nn.Module):
         perturbations=None,
         text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None,
         text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None,
+        step_index=None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward with optional perturbation masking for STG.
 
@@ -782,7 +796,14 @@ class BasicAVTransformerBlock(nn.Module):
             )
             if not skip_v_self:
                 norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
-                v_self_out = self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa
+                v_self_out = (
+                    self.attn1(
+                        norm_vx,
+                        pe=video.positional_embeddings,
+                        step_index=step_index,
+                    )
+                    * vgate_msa
+                )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
                 ):
@@ -794,6 +815,7 @@ class BasicAVTransformerBlock(nn.Module):
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
                 pre_projected_kv=text_kv_video,
+                step_index=step_index,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -812,6 +834,7 @@ class BasicAVTransformerBlock(nn.Module):
                         norm_ax,
                         pe=audio.positional_embeddings,
                         key_padding_mask=audio.audio_padding_mask,
+                        step_index=step_index,
                     )
                     * agate_msa
                 )
@@ -826,6 +849,7 @@ class BasicAVTransformerBlock(nn.Module):
                 rms_norm(ax, eps=self.norm_eps),
                 context=audio.context,
                 pre_projected_kv=text_kv_audio,
+                step_index=step_index,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -893,6 +917,7 @@ class BasicAVTransformerBlock(nn.Module):
                         pre_projected_kv=(k_a2v, v_a2v),
                         pe=video.cross_positional_embeddings,
                         key_padding_mask=audio.audio_padding_mask,
+                        step_index=step_index,
                     )
                     * gate_out_a2v
                 )
@@ -933,6 +958,7 @@ class BasicAVTransformerBlock(nn.Module):
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
+                        step_index=step_index,
                     )
                     * gate_out_v2a
                 )
@@ -1727,6 +1753,7 @@ class LTXModel(BaseDiffusionModel):
         perturbations=None,
         *,
         text_cache: TextCache,
+        step_index=None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1736,6 +1763,7 @@ class LTXModel(BaseDiffusionModel):
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
             text_cache: Pre-computed step-invariant outputs from ``prepare_text_cache()``.
                 Always required — callers must invoke ``prepare_text_cache()`` first.
+            step_index: Ordinal denoising-loop index.
 
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
@@ -1819,7 +1847,12 @@ class LTXModel(BaseDiffusionModel):
             vx = video_args.x if video_args is not None else None
             ax = audio_args.x if audio_args is not None else None
             for block in self.transformer_blocks:
-                vx, ax = block(vx, ax, perturbations=perturbations)
+                vx, ax = block(
+                    vx,
+                    ax,
+                    perturbations=perturbations,
+                    step_index=step_index,
+                )
                 if video_args is not None and vx is not None:
                     video_args = replace(video_args, x=vx)
                 if audio_args is not None and ax is not None:
@@ -1832,6 +1865,7 @@ class LTXModel(BaseDiffusionModel):
                     perturbations=perturbations,
                     text_kv_video=v_kv[i] if v_kv else None,
                     text_kv_audio=a_kv[i] if a_kv else None,
+                    step_index=step_index,
                 )
 
         # Gather sequences back to full length for output processing.

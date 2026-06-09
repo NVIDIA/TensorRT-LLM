@@ -770,6 +770,9 @@ class AttentionForwardArgs:
 
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
+    # Optional caller step index for step-varying attention behavior.
+    # VisualGen passes the denoising loop index, not the scheduler timestep.
+    step_index: Optional[int] = None
 
     sparse_prediction: SparsePrediction = field(
         default_factory=SparsePrediction)

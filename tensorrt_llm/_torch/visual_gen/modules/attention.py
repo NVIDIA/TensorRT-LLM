@@ -4,12 +4,14 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
+
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
 from ..attention_backend.utils import create_attention
-from ..config import DiffusionModelConfig, SkipSoftmaxAttentionConfig
+from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
 
 
@@ -51,6 +53,7 @@ class Attention(nn.Module):
         fuse_qk_norm_rope: Optional[bool] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
+        module_name: Optional[str] = None,
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
     ):
@@ -103,6 +106,7 @@ class Attention(nn.Module):
         self.qk_norm = qk_norm
         self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
+        self.module_name = self._qualified_module_name(config.component_name, module_name)
         self.eps = eps
 
         self.q_dim = self.num_attention_heads * self.head_dim
@@ -198,7 +202,11 @@ class Attention(nn.Module):
         sparse_params = None
         ss_cfg = config.attention.sparse_attention_config
         if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name == "TRTLLM":
-            sparse_params = ss_cfg.to_sparse_params()
+            sparse_params = ss_cfg.to_sparse_params(
+                module_name=self.module_name,
+                pretrained_config=config.pretrained_config,
+            )
+        self.sparse_params = sparse_params
 
         # Create compute backend
         self.attn = create_attention(
@@ -228,6 +236,18 @@ class Attention(nn.Module):
             enable_sequence_parallel=enable_sequence_parallel,
             async_ulysses=use_ulysses and async_ulysses,
         )
+
+    @staticmethod
+    def _qualified_module_name(
+        component_name: Optional[str],
+        module_name: Optional[str],
+    ) -> Optional[str]:
+        if module_name is None:
+            return None
+        if component_name is None:
+            return module_name
+        prefix = f"{component_name}."
+        return module_name if module_name.startswith(prefix) else f"{prefix}{module_name}"
 
     def _init_qkv_proj(self) -> None:
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
@@ -493,6 +513,7 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        step_index: Optional[int] = None,
     ) -> torch.Tensor:
         assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
         batch_size, seq_len = hidden_states.shape[:2]
@@ -511,7 +532,7 @@ class Attention(nn.Module):
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-            out = self._attn_impl(q, k, v)
+            out = self._attn_impl(q, k, v, step_index=step_index)
             return self.to_out[0](out)
 
         # Unfused path: separate QK norm → separate RoPE → attention
@@ -530,7 +551,7 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v)
+        out = self._attn_impl(q, k, v, step_index=step_index)
         out = self.to_out[0](out)
         return out
 

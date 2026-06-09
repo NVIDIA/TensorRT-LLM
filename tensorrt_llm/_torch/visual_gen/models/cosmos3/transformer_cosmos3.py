@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -215,6 +215,7 @@ class Cosmos3CausalAttention(Attention):
         head_dim: int,
         model_config: DiffusionModelConfig,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -227,6 +228,7 @@ class Cosmos3CausalAttention(Attention):
             bias=False,
             config=model_config,
             layer_idx=layer_idx,
+            module_name=module_name,
             enable_sequence_parallel=False,
         )
         self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
@@ -243,6 +245,7 @@ class Cosmos3CausalAttention(Attention):
         hidden_states: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        step_index=None,
     ) -> torch.Tensor:
         batch_size, seq_len = hidden_states.shape[:2]
 
@@ -260,6 +263,7 @@ class Cosmos3CausalAttention(Attention):
             k,
             v,
             attention_mask=PredefinedAttentionMask.CAUSAL,
+            step_index=step_index,
         )
 
         return self.to_out[0](out), k, v
@@ -289,6 +293,7 @@ class Cosmos3CrossAttention(Attention):
         head_dim: int,
         model_config: DiffusionModelConfig,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
     ):
         original_backend = model_config.attention.backend
         if model_config.attention.backend == "TRTLLM":
@@ -306,6 +311,7 @@ class Cosmos3CrossAttention(Attention):
             bias=False,
             config=model_config,
             layer_idx=layer_idx,
+            module_name=module_name,
             enable_sequence_parallel=True,
         )
         model_config.attention.backend = original_backend
@@ -326,6 +332,7 @@ class Cosmos3CrossAttention(Attention):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        step_index=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -357,6 +364,7 @@ class Cosmos3CrossAttention(Attention):
             k_all,
             v_all,
             attention_mask=PredefinedAttentionMask.FULL,
+            step_index=step_index,
         )
 
         return self.to_out[0](out)
@@ -378,6 +386,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             head_dim=model_config.pretrained_config.head_dim,
             model_config=model_config,
             layer_idx=layer_idx,
+            module_name=f"layers.{layer_idx}.self_attn",
         )
         self.input_layernorm = Qwen3VLTextRMSNorm(
             hidden_size=hidden_size,
@@ -403,6 +412,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
+        step_index=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -413,7 +423,12 @@ class Cosmos3UndDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         cos, sin = freqs
-        attn_out, k, v = self.self_attn.forward_with_kv(hidden_states, cos, sin)
+        attn_out, k, v = self.self_attn.forward_with_kv(
+            hidden_states,
+            cos,
+            sin,
+            step_index=step_index,
+        )
         hidden_states = residual + attn_out
 
         residual = hidden_states
@@ -441,6 +456,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             head_dim=model_config.pretrained_config.head_dim,
             model_config=model_config,
             layer_idx=layer_idx,
+            module_name=f"layers.{layer_idx}.cross_attention",
         )
         self.input_layernorm = Qwen3VLTextRMSNorm(
             hidden_size=hidden_size,
@@ -468,6 +484,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         k_und: torch.Tensor,
         v_und: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
+        step_index=None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -479,6 +496,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             v_und=v_und,
             freqs_cos=cos,
             freqs_sin=sin,
+            step_index=step_index,
         )
         hidden_states = residual + hidden_states
 
@@ -619,6 +637,7 @@ class Cosmos3LanguageModel(nn.Module):
         text_ids: torch.Tensor,
         text_mask: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
+        step_index=None,
     ) -> list[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -636,7 +655,7 @@ class Cosmos3LanguageModel(nn.Module):
         cached_kv: list[Tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers:
             hidden = hidden * mask_3d
-            hidden, k, v = layer(hidden, freqs)
+            hidden, k, v = layer(hidden, freqs, step_index=step_index)
             cached_kv.append((k, v))
 
         return cached_kv
@@ -846,10 +865,11 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-        text_ids: torch.Tensor,
-        text_mask: torch.Tensor,
-        video_shape: Tuple[int, int, int],
+        step_index: Optional[int] = None,
+        timestep: Optional[torch.Tensor] = None,
+        text_ids: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
+        video_shape: Optional[Tuple[int, int, int]] = None,
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         **kwargs,
@@ -859,6 +879,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         Args:
             hidden_states: [B, C, T, H, W] noisy latents
+            step_index: Ordinal denoising-loop index; distinct from scheduler timestep.
             timestep: [B] diffusion timestep per sample
             text_ids: [B, S_text] tokenized text input
             text_mask: [B, S_text] attention mask for text (1=real, 0=pad)
@@ -873,6 +894,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         Returns:
             [B, C, T, H, W] velocity prediction
         """
+        del kwargs  # Kept for diffusers API compatibility.
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()
@@ -907,7 +929,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 hidden_states.device,
                 hidden_states.dtype,
             )
-            cached_kv_full = self.language_model(text_ids, text_mask, freqs_und)
+            cached_kv_full = self.language_model(
+                text_ids,
+                text_mask,
+                freqs_und,
+                step_index=step_index,
+            )
             self.cached_freqs_gen = freqs_gen
 
             if self.sharder.is_active:
@@ -941,7 +968,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             if not self.sharder.is_active:
                 k_und = k_und[:, :max_real_len]
                 v_und = v_und[:, :max_real_len]
-            hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
+            hidden_gen = layer(
+                hidden_gen,
+                k_und,
+                v_und,
+                freqs_gen,
+                step_index=step_index,
+            )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 

@@ -131,11 +131,61 @@ class SkipSoftmaxFormula(StrictBaseModel):
         return cls.parse_from_dict(tsf.get(coefficient_key), formula=tsf.get("formula"))
 
 
+def skip_softmax_disabled_layers_from_checkpoint_config(
+    checkpoint_config: Optional[Dict[str, Any]],
+) -> Optional[list[str]]:
+    """Read checkpoint-provided layer-disable patterns for skip-softmax."""
+    if not isinstance(checkpoint_config, dict):
+        return None
+
+    sparse_cfg = checkpoint_config.get("sparse_attention_config")
+    if sparse_cfg is None and "threshold_scale_factor" in checkpoint_config:
+        sparse_cfg = checkpoint_config
+    if not isinstance(sparse_cfg, dict):
+        return None
+
+    disabled_layers = sparse_cfg.get("disabled_layers")
+    if isinstance(disabled_layers, list):
+        return [str(name) for name in disabled_layers]
+
+    config_groups = sparse_cfg.get("config_groups")
+    if not isinstance(config_groups, dict):
+        return None
+    for group in config_groups.values():
+        if not isinstance(group, dict) or group.get("sparse_algo") != "softmax_skip":
+            continue
+        disabled_layers = group.get("disabled_layers")
+        if isinstance(disabled_layers, list):
+            return [str(name) for name in disabled_layers]
+    return None
+
+
+def skip_softmax_formula_from_checkpoint_config(
+    checkpoint_config: Optional[Dict[str, Any]],
+) -> Optional[SkipSoftmaxFormula]:
+    """Read the scalar skip-softmax calibration formula from checkpoint config."""
+    if not isinstance(checkpoint_config, dict):
+        return None
+
+    formula = SkipSoftmaxFormula.parse_from_ckpt_config(
+        checkpoint_config, coefficient_key="coefficients"
+    )
+    if formula is not None:
+        return formula
+    threshold_config = checkpoint_config.get("threshold_scale_factor")
+    if isinstance(threshold_config, dict):
+        return SkipSoftmaxFormula.parse_from_dict(
+            threshold_config.get("coefficients"),
+            formula=threshold_config.get("formula"),
+        )
+    return None
+
+
 @dataclass
 class SkipSoftmaxKernelParams:
-    """Skip-softmax thresholds for the attention backend.
+    """Skip-softmax thresholds passed to attention backend kernels.
 
-    ``SkipSoftmaxScheduler`` produces this per runtime step.
+    Produced by ``SkipSoftmaxScheduler.get_kernel_params()``.
     """
 
     # The kernel divides this by the context length to get the skip threshold;
@@ -153,11 +203,11 @@ class SkipSoftmaxScheduler:
         self,
         threshold_scale_factor_prefill: float = 0.0,
         threshold_scale_factor_decode: float = 0.0,
-        warmup: Optional[int] = None,
+        initial_disabled_steps: Optional[int] = None,
     ):
         self.threshold_scale_factor_prefill = threshold_scale_factor_prefill
         self.threshold_scale_factor_decode = threshold_scale_factor_decode
-        self.warmup = warmup
+        self.initial_disabled_steps = initial_disabled_steps
 
     @staticmethod
     def _phase(
@@ -188,14 +238,14 @@ class SkipSoftmaxScheduler:
         cls,
         threshold_scale_factor: Optional[Union[float, Dict[str, float]]],
         *,
-        warmup: Optional[int] = None,
+        initial_disabled_steps: Optional[int] = None,
     ) -> "SkipSoftmaxScheduler":
         prefill = cls._phase(threshold_scale_factor, "prefill")
         decode = cls._phase(threshold_scale_factor, "decode")
         return cls(
             threshold_scale_factor_prefill=0.0 if prefill is None else prefill,
             threshold_scale_factor_decode=0.0 if decode is None else decode,
-            warmup=warmup,
+            initial_disabled_steps=initial_disabled_steps,
         )
 
     @classmethod
@@ -204,11 +254,11 @@ class SkipSoftmaxScheduler:
         target_sparsity: Optional[Union[float, Dict[str, float]]],
         *,
         checkpoint_config: Optional[Dict[str, Any]] = None,
-        warmup: Optional[int] = None,
+        initial_disabled_steps: Optional[int] = None,
     ) -> "SkipSoftmaxScheduler":
         """Build a scheduler by resolving target sparsity through checkpoint formula."""
         if target_sparsity is None:
-            return cls(warmup=warmup)
+            return cls(initial_disabled_steps=initial_disabled_steps)
 
         threshold_config = cls._threshold_scale_factor_config(checkpoint_config)
         shared_formula = (
@@ -238,12 +288,31 @@ class SkipSoftmaxScheduler:
         return cls(
             threshold_scale_factor_prefill=0.0 if prefill is None else prefill,
             threshold_scale_factor_decode=0.0 if decode is None else decode,
-            warmup=warmup,
+            initial_disabled_steps=initial_disabled_steps,
         )
 
-    def get_kernel_params(self, *, step: Optional[int] = None):
-        """Return kernel params for the current runtime step."""
-        if self.warmup is not None and step is not None and step < self.warmup:
+    @staticmethod
+    def get_graph_phase_for_step_index(
+        step_index: Optional[int],
+        *,
+        initial_disabled_steps: Optional[int],
+    ) -> Optional[int]:
+        """Return the stable graph-key phase for the initial-disabled boundary."""
+        if step_index is None:
+            return None
+        if initial_disabled_steps is None or initial_disabled_steps <= 0:
+            return None
+        return int(step_index >= initial_disabled_steps)
+
+    def get_kernel_params(self, *, step_index: Optional[int] = None):
+        """Return kernel params, applying step-based disablement when provided."""
+        if (
+            self.get_graph_phase_for_step_index(
+                step_index,
+                initial_disabled_steps=self.initial_disabled_steps,
+            )
+            == 0
+        ):
             return SkipSoftmaxKernelParams()
         return SkipSoftmaxKernelParams(
             threshold_scale_factor_prefill=self.threshold_scale_factor_prefill,

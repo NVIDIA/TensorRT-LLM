@@ -43,6 +43,7 @@ import typing
 from dataclasses import fields
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxKernelParams
 from tensorrt_llm._torch.attention_backend.trtllm import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
@@ -56,6 +57,7 @@ _SOURCE_CLASSES = {
     "self": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
+    "skip_softmax_kernel_params": SkipSoftmaxKernelParams,
 }
 
 # The C++ attention() declaration is the single source of truth for kwarg

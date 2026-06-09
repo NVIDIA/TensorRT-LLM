@@ -57,6 +57,7 @@ class FluxJointAttention(Attention):
         pre_only: bool = False,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -70,6 +71,7 @@ class FluxJointAttention(Attention):
             interleave=True,
             config=config,
             layer_idx=layer_idx,
+            module_name=module_name,
         )
 
         self.pre_only = pre_only
@@ -246,6 +248,7 @@ class FluxJointAttention(Attention):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        step_index: Optional[int] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass of joint attention.
 
@@ -266,7 +269,7 @@ class FluxJointAttention(Attention):
             hidden_states, encoder_hidden_states, image_rotary_emb
         )
 
-        hidden_states = self._attn_impl(query, key, value)
+        hidden_states = self._attn_impl(query, key, value, step_index=step_index)
         hidden_states = hidden_states.to(query.dtype)
 
         if is_dual_stream:
@@ -313,6 +316,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         eps: float = 1e-6,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
     ):
         # self.tp_size is set in super().__init__
         tp_size = config.mapping.tp_size if config and config.mapping else 1
@@ -332,6 +336,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             pre_only=True,  # Deletes base to_out
             config=config,
             layer_idx=layer_idx,
+            module_name=module_name,
         )
 
         # Output projection needs FULL dims (ROW parallel divides internally)
@@ -417,6 +422,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        step_index: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -432,7 +438,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         q, k, v = self._apply_norm_rope(qkv, image_rotary_emb)
 
-        attn_out = self._attn_impl(q, k, v)
+        attn_out = self._attn_impl(q, k, v, step_index=step_index)
         attn_out = attn_out.to(q.dtype)
 
         # Parallel MLP path (reshape to 2D for Triton kernel, then back)

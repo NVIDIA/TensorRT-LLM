@@ -314,6 +314,7 @@ class WanBlock(nn.Module):
             config=model_config,
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,
+            module_name=f"blocks.{_layer_idx}.attn1",
         )
 
         # Cross-attention with separate Q, K, V
@@ -326,6 +327,7 @@ class WanBlock(nn.Module):
             eps=eps,
             config=model_config,
             layer_idx=_layer_idx,
+            module_name=f"blocks.{_layer_idx}.attn2",
             enable_sequence_parallel=False,
         )
 
@@ -402,6 +404,7 @@ class WanBlock(nn.Module):
         temb,
         freqs_cos,
         freqs_sin,
+        step_index=None,
     ):
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, hidden_size
@@ -431,9 +434,11 @@ class WanBlock(nn.Module):
         # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
         # side stream; both paths return 3D [B, S, H*D].
         if self._use_async_ulysses:
-            attn1_out = self.attn1.forward_async(normed, freqs=freqs)
+            attn1_out = self.attn1.forward_async(
+                normed, freqs=freqs, step_index=step_index
+            )
         else:
-            attn1_out = self.attn1(normed, freqs=freqs)
+            attn1_out = self.attn1(normed, freqs=freqs, step_index=step_index)
 
         x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
@@ -458,6 +463,7 @@ class WanBlock(nn.Module):
             batch_size=batch_size,
             seq_len=seq_len,
             kv_seq_len=encoder_hidden_states_text.shape[1],
+            step_index=step_index,
         )
 
         # I2V: image cross-attention
@@ -472,6 +478,7 @@ class WanBlock(nn.Module):
                 batch_size=batch_size,
                 seq_len=seq_len,
                 kv_seq_len=encoder_hidden_states_img.shape[1],
+                step_index=step_index,
             )
             attn2_output = attn2_output + attn_img_output
 
@@ -646,8 +653,9 @@ class WanTransformer3DModel(BaseDiffusionModel):
     def forward(
         self,
         hidden_states,
-        timestep,
-        encoder_hidden_states,
+        step_index=None,
+        timestep=None,
+        encoder_hidden_states=None,
         encoder_hidden_states_image=None,
         **kwargs,
     ):
@@ -660,7 +668,12 @@ class WanTransformer3DModel(BaseDiffusionModel):
             3. All-gather output sequence: [B, S/P] -> [B, S]
 
         When TeaCache is enabled, TeaCacheHook intercepts and replaces this call.
+
+        Args:
+            step_index: Ordinal denoising-loop index; distinct from scheduler timestep.
+            timestep: Scheduler timestep tensor for diffusion conditioning.
         """
+        del kwargs  # Kept for diffusers API compatibility.
         original_shape = hidden_states.shape
         B, C, T, H, W = original_shape
         pt, ph, pw = self.config.patch_size
@@ -726,6 +739,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 temb_proj,
                 freqs_cos,
                 freqs_sin,
+                step_index=step_index,
             )
 
         # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).

@@ -572,7 +572,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 4. Build forward_fn for the denoise loop
         def forward_fn(
-            latent_input, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latent_input,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Cosmos3 forward function for BasePipeline.denoise().
 
@@ -581,6 +586,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             """
             noise_pred = self.transformer(
                 hidden_states=latent_input,
+                step_index=step_index,
                 timestep=timestep,
                 text_ids=extra_tensors["text_ids"],
                 text_mask=extra_tensors["text_mask"],

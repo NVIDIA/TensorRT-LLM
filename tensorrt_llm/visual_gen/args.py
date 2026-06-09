@@ -113,14 +113,6 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description="Sparse attention configuration. Currently supports: skip_softmax.",
     )
-    sparse_config_path: Optional[str] = Field(
-        None,
-        status="prototype",
-        description=(
-            "Path to a ModelOpt sparse attention YAML config file. "
-            "Overrides auto-detection from the checkpoint directory."
-        ),
-    )
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
