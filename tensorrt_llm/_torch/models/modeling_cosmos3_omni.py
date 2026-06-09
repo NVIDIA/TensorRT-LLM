@@ -79,10 +79,14 @@ def _get_cosmos3_model_paths(config: PretrainedConfig) -> Tuple[str, str, str]:
 class Cosmos3OmniModel(Qwen3VLModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         omni_config = model_config.pretrained_config
-        if omni_config is not None:
-            (self._checkpoint_root, self.llm_path, self._vision_encoder_path) = (
-                _get_cosmos3_model_paths(omni_config)
+        if omni_config is None:
+            raise ValueError(
+                "Cosmos3OmniModel requires model_config.pretrained_config to resolve "
+                "the LLM and vision encoder checkpoint paths, but it was None."
             )
+        (self._checkpoint_root, self.llm_path, self._vision_encoder_path) = (
+            _get_cosmos3_model_paths(omni_config)
+        )
 
         super().__init__(model_config, *args, **kwargs)
 
