@@ -866,6 +866,25 @@ def test_openai_kv_cache_contamination(llm_root, llm_venv):
     ])
 
 
+def test_trtllm_serve_profile_example(llm_root, llm_venv):
+    """Wrapper for the CPU-only profile-endpoint smoke tests.
+
+    Runs ``tests/unittest/llmapi/apps/_test_trtllm_serve_profile.py``
+    which binds the ``OpenAIServer.start_profile`` / ``stop_profile``
+    handlers to a mock generator (no GPU, no model) and verifies
+    request parsing, default values, and the asyncio.to_thread
+    event-loop guarantee. Following the existing apps/ wrapper
+    pattern so the file is discovered via
+    ``test_e2e.py::test_trtllm_serve_profile_example`` rather than a
+    direct ``unittest/llmapi/apps/_test_*.py`` entry in the test-db
+    YAML.
+    """
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_profile.py")])
+
+
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_completions_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"

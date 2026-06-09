@@ -374,6 +374,28 @@ class GenerationExecutor(ABC):
     def shutdown(self):
         pass
 
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"start_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
+
+    def stop_profile(self) -> None:
+        """Stop runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"stop_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
+
     @property
     def resource_governor_queue(self):
         """Return the resource governor queue if this executor supports it."""

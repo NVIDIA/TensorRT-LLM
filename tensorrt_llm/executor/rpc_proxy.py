@@ -244,6 +244,20 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
 
+    def start_profile(self,
+                      output_dir=None,
+                      num_steps=None,
+                      start_step: int = 0,
+                      activities=None) -> None:
+        return self.rpc_client.start_profile(
+            output_dir=output_dir,
+            num_steps=num_steps,
+            start_step=start_step,
+            activities=activities).remote(need_response=True)
+
+    def stop_profile(self) -> None:
+        return self.rpc_client.stop_profile().remote(need_response=True)
+
     def shutdown(self):
         if self._shutdown_event.is_set():
             return

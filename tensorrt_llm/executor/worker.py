@@ -24,7 +24,8 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
+                      StopProfileRequest)
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
@@ -236,6 +237,14 @@ def worker_main(
             is_server=False,
             name="worker_resource_governor_queue"
         ) if worker_queues.resource_governor_queue_addr else None
+        # Synchronous ack channel back to the proxy for control requests
+        # (start_profile / stop_profile). Created on the proxy side; the
+        # leader is the sole producer.
+        profile_ack_queue = IpcQueue(
+            worker_queues.profile_ack_queue_addr,
+            is_server=False,
+            name="worker_profile_ack_queue"
+        ) if worker_queues.profile_ack_queue_addr else None
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -351,6 +360,39 @@ def worker_main(
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
+                    elif isinstance(req, StartProfileRequest):
+                        # ``PyExecutor.start_profile`` raises
+                        # ``RequestError`` on the double-start path.
+                        # Capture it and propagate back to the proxy via
+                        # ``profile_ack_queue`` so the HTTP /start_profile
+                        # handler can return 409 in the IPC-proxy
+                        # deployment too.
+                        ack_err: Optional[str] = None
+                        try:
+                            worker.start_profile(output_dir=req.output_dir,
+                                                 num_steps=req.num_steps,
+                                                 start_step=req.start_step,
+                                                 activities=req.activities)
+                        except RequestError as e:
+                            logger.warning(f"start_profile rejected: {e}")
+                            ack_err = str(e)
+                        if profile_ack_queue is not None:
+                            profile_ack_queue.put(("start", ack_err))
+                    elif isinstance(req, StopProfileRequest):
+                        # ``worker.stop_profile`` blocks until
+                        # ``PyExecutor.stop_profile`` has actually fired
+                        # the in-loop stop and exported the chrome trace
+                        # (or its 30s timeout elapsed). Acking only after
+                        # that return is what gives the proxy its
+                        # synchronous "trace is on disk" guarantee.
+                        ack_err = None
+                        try:
+                            worker.stop_profile()
+                        except RequestError as e:
+                            logger.warning(f"stop_profile rejected: {e}")
+                            ack_err = str(e)
+                        if profile_ack_queue is not None:
+                            profile_ack_queue.put(("stop", ack_err))
                     elif isinstance(req, GenerationRequest):
                         try:
                             worker.submit(req)
