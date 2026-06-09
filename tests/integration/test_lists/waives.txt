@@ -326,7 +326,6 @@ perf/test_perf.py::test_perf[whisper_large_v3-bench-float16-input_output_len:128
 perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_dep8_mtp1_8k1k] SKIP (https://nvbugs/6280721)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_tep8_mtp3_8k1k] SKIP (https://nvbugs/6280721)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_grace_blackwell-v32_fp4_tep4_mtp3_8k1k] SKIP (https://nvbugs/6280721)
-perf/test_perf_sanity.py::test_e2e[aggr_upload-llama3_1_8b_fp8_ad_hopper-llama3_1_8b_ad_ws1_1k1k] SKIP (https://nvbugs/6281573)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] SKIP (https://nvbugs/6153575)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6215844)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_deepseek-v32-fp4_1k1k_con2048_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6280649)
