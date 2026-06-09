@@ -2733,6 +2733,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used."
     )
+    disk_cache_size: Optional[NonNegativeInt] = Field(
+        default=None,
+        description=
+        "Size of the disk cache in bytes. Only used by KV cache manager v2 in the PyTorch backend."
+    )
+    disk_cache_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
+    )
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -2893,6 +2903,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.max_gpu_total_bytes must be non-negative")
         return v
+
+    @model_validator(mode='after')
+    def validate_disk_cache_config(self):
+        if self.disk_cache_size is not None and self.disk_cache_size > 0:
+            if not self.disk_cache_path:
+                raise ValueError(
+                    "kv_cache_config.disk_cache_path must be set when disk_cache_size is positive"
+                )
+            if not os.path.isdir(self.disk_cache_path):
+                raise ValueError(
+                    f"kv_cache_config.disk_cache_path {self.disk_cache_path} does not exist or is not a directory"
+                )
+        return self
 
     @field_validator('max_attention_window')
     @classmethod

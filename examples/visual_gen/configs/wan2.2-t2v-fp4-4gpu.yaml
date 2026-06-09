@@ -23,6 +23,7 @@ attention_config:
 parallel_config:
   cfg_size: 2
   ulysses_size: 2
+  async_ulysses: true
   parallel_vae_size: 4
 cuda_graph_config:
   enable: false

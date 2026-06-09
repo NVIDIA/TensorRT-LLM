@@ -2417,11 +2417,14 @@ class Fp4QuantTactic(enum.IntEnum):
 
 
 def _fp4_quantize_dispatch(input: torch.Tensor, input_scale: torch.Tensor,
-                           scaling_vector_size: int,
+                           scaling_vector_size: int, sf_use_ue8m0: bool,
                            is_sf_swizzled_layout: bool,
                            tactic: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dispatch FP4 quantization to TRTLLM or FlashInfer kernel."""
     if tactic == Fp4QuantTactic.FLASHINFER and IS_FLASHINFER_AVAILABLE:
+        assert not sf_use_ue8m0, (
+            "FlashInfer FP4 tactic does not support sf_use_ue8m0=True; "
+            "force the TRTLLM tactic.")
         act_fp4, act_sf = _flashinfer_nvfp4_quantize(
             input,
             input_scale,
@@ -2439,7 +2442,7 @@ def _fp4_quantize_dispatch(input: torch.Tensor, input_scale: torch.Tensor,
         return act_fp4, act_sf
     else:
         return torch.ops.trtllm.fp4_quantize(input, input_scale,
-                                             scaling_vector_size,
+                                             scaling_vector_size, sf_use_ue8m0,
                                              is_sf_swizzled_layout)
 
 
@@ -2461,12 +2464,15 @@ class Fp4QuantKernelRunner(TunableRunner):
 
     def __init__(self,
                  scaling_vector_size: int = 16,
-                 is_sf_swizzled_layout: bool = False):
+                 sf_use_ue8m0: bool = False,
+                 is_sf_swizzled_layout: bool = True):
         self.scaling_vector_size = scaling_vector_size
+        self.sf_use_ue8m0 = sf_use_ue8m0
         self.is_sf_swizzled_layout = is_sf_swizzled_layout
 
     def unique_id(self):
-        return (self.scaling_vector_size, self.is_sf_swizzled_layout)
+        return (self.scaling_vector_size, self.sf_use_ue8m0,
+                self.is_sf_swizzled_layout)
 
     def get_valid_tactics(
         self,
@@ -2474,7 +2480,8 @@ class Fp4QuantKernelRunner(TunableRunner):
         profile: OptimizationProfile,
     ) -> List[int]:
         tactics = [Fp4QuantTactic.TRTLLM]
-        if IS_FLASHINFER_AVAILABLE:
+        # FlashInfer FP4 kernel has no UE8M0 / MXFP4 mode.
+        if IS_FLASHINFER_AVAILABLE and not self.sf_use_ue8m0:
             tactics.append(Fp4QuantTactic.FLASHINFER)
         return tactics
 
@@ -2486,6 +2493,7 @@ class Fp4QuantKernelRunner(TunableRunner):
         input, input_scale = inputs
         act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
                                                  self.scaling_vector_size,
+                                                 self.sf_use_ue8m0,
                                                  self.is_sf_swizzled_layout,
                                                  tactic)
         return act_fp4
@@ -2496,7 +2504,8 @@ def tunable_fp4_quantize(
     input: torch.Tensor,
     input_scale: torch.Tensor,
     scaling_vector_size: int = 16,
-    is_sf_swizzled_layout: bool = False,
+    sf_use_ue8m0: bool = False,
+    is_sf_swizzled_layout: bool = True,
 ) -> List[torch.Tensor]:
     """FP4 quantization with autotuning between TRTLLM and FlashInfer kernels.
 
@@ -2508,14 +2517,17 @@ def tunable_fp4_quantize(
         input: Activation tensor [M, K] in bf16/fp16
         input_scale: Global scale factor tensor
         scaling_vector_size: Block size for scale factors (default: 16)
-        is_sf_swizzled_layout: Whether to use swizzled layout for scales
+        sf_use_ue8m0: MXFP4 (UE8M0 SF) when True; NVFP4 (UE4M3 SF) when
+            False. FlashInfer tactic does not support True.
+        is_sf_swizzled_layout: Emit SWIZZLED 128x4 FP8 e4m3 SF layout when
+            True (default).
 
     Returns:
         List of [act_fp4, act_sf] - quantized activation and scale factors
     """
     tuner = AutoTuner.get()
 
-    quant_runner = Fp4QuantKernelRunner(scaling_vector_size,
+    quant_runner = Fp4QuantKernelRunner(scaling_vector_size, sf_use_ue8m0,
                                         is_sf_swizzled_layout)
 
     _, best_tactic = tuner.choose_one(
@@ -2528,6 +2540,7 @@ def tunable_fp4_quantize(
     try:
         act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
                                                  scaling_vector_size,
+                                                 sf_use_ue8m0,
                                                  is_sf_swizzled_layout,
                                                  best_tactic)
     except Exception:
@@ -2536,6 +2549,7 @@ def tunable_fp4_quantize(
                            f"{input.shape}, falling back to TRTLLM kernel.")
             act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
                                                      scaling_vector_size,
+                                                     sf_use_ue8m0,
                                                      is_sf_swizzled_layout,
                                                      Fp4QuantTactic.TRTLLM)
         else:
@@ -2548,7 +2562,8 @@ def _(
     input: torch.Tensor,
     input_scale: torch.Tensor,
     scaling_vector_size: int = 16,
-    is_sf_swizzled_layout: bool = False,
+    sf_use_ue8m0: bool = False,
+    is_sf_swizzled_layout: bool = True,
 ) -> List[torch.Tensor]:
     """Fake implementation for torch.compile support.
 
@@ -2557,6 +2572,7 @@ def _(
     swizzled_layout=True in get_fp4_shape to match the actual output size.
     We also reshape FlashInfer's output to match in _fp4_quantize_dispatch.
     """
+    del sf_use_ue8m0, is_sf_swizzled_layout
     output_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape,
                                                         scaling_vector_size,
                                                         True)
