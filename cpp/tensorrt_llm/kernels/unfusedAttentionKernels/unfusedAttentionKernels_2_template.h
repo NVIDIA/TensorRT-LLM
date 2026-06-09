@@ -1028,10 +1028,14 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                     if constexpr (ENABLE_8BITS_CACHE)
                     {
                         inBlockIdx = inBlockIdx * ELTS_PER_VEC;
-                        // Cast float scale to dst data type.
+                        // Cast float scale to dst data type. Default to 1.0
+                        // when the scale pointer is nullptr; the surrounding
+                        // peer reads in this file already follow this pattern
+                        // (e.g. lines 579, 989).
                         using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
                         TScale scaleOrigQuant;
-                        mmha::convert_from_float(&scaleOrigQuant, params.qkv_scale_orig_quant[0]);
+                        mmha::convert_from_float(&scaleOrigQuant,
+                            params.qkv_scale_orig_quant != nullptr ? params.qkv_scale_orig_quant[0] : 1.0f);
                         // Store 8bits kv cache.
                         mmha::store_8bits_vec(kDst, k, inBlockIdx, scaleOrigQuant);
                         mmha::store_8bits_vec(vDst, v, inBlockIdx, scaleOrigQuant);

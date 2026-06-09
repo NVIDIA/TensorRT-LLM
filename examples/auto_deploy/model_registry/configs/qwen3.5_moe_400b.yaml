@@ -29,33 +29,10 @@ transforms:
     enabled: true
   fuse_nvfp4_moe:
     backend: trtllm_gen
-  detect_sharding:
-    # for long input, tp8ep1 gives better performance
-    # dist_mapping: {moe_tp: 8, moe_ep: 1}
+  apply_sharding_hints:
     allreduce_strategy: SYMM_MEM
-    shard_all_unprocessed: true
-    simple_shard_filter: "lm_head"
-    sharding_dims: ['tp','ep', 'bmm']
-    # use only manual config for TP sharding
-    sharding_source: ['manual']
-    manual_config:
-      tp_plan:
-        # GDN layer
-        "in_proj_qkv": "delta"
-        # attention layer
-        "q_proj": "colwise"
-        "k_proj": "colwise"
-        "v_proj": "colwise"
-        "o_proj": "rowwise"
-        # lm_head: "gather" = column split + all_gather (not "colwise" which
-        # requires a LayerSubgraph and crashes for standalone unprocessed nodes)
-        "lm_head": "gather"
-        # replicating shared experts (keep them commented out)
-        # "shared_expert_gate_proj": "colwise"
-        # "shared_expert_up_proj": "colwise"
-        # "shared_expert_down_proj": "rowwise"
-        # gating layer should be replicated as well
-        # "gate": "gather"
+    # Shared expert is excluded from sharding for performance purpose
+    shard_layers: ["moe", "delta", "mha"]
   multi_stream_moe:
     stage: compile
     enabled: true

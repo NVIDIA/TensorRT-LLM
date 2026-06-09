@@ -45,7 +45,7 @@ except ModuleNotFoundError:
         yield  # no-op in standalone mode
 
 
-from ...utils.cuda_graph import CudaGraphWarmUpPhase
+from ...utils.cuda_graph import CudaGraphWarmUpPhase, cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.multi_stream_utils import disable_multi_stream
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
@@ -350,6 +350,11 @@ class CapturedGraph(nn.Module):
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
+        # Bypass replay (attn-DP mixed-mode); see BypassCapturedGraphs() in
+        # tensorrt_llm/_torch/auto_deploy/utils/cuda_graph.py for rationale.
+        if cuda_graph_state.in_bypass():
+            return self.model(*args, **kwargs)
+
         args, kwargs = self._normalize_args_kwargs(args, kwargs)
         assert self.num_batched_inputs is not None, "Graphs must be captured before replay."
 
@@ -814,6 +819,10 @@ class PiecewiseCapturedGraph(nn.Module):
         **kwargs,
     ) -> Any:
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
+        # Bypass replay (attn-DP mixed-mode); see BypassCapturedGraphs() in
+        # tensorrt_llm/_torch/auto_deploy/utils/cuda_graph.py for rationale.
+        if cuda_graph_state.in_bypass():
+            return self.original_model(*args, **kwargs)
         if self.split_gm is not None:
             self._copy_to_static_buffers(kwargs)
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
@@ -962,6 +971,11 @@ class DualModeCapturedGraph(nn.Module):
 
     def forward(self, *args, **kwargs) -> Any:
         # NOTE: AD calls model(**named_args) so everything is in kwargs, args is empty
+        # Bypass replay (attn-DP mixed-mode); see BypassCapturedGraphs() in
+        # tensorrt_llm/_torch/auto_deploy/utils/cuda_graph.py for rationale.
+        if cuda_graph_state.in_bypass():
+            ADPiecewiseRunner.set_current_num_tokens(None)
+            return self.piecewise.original_model(*args, **kwargs)
         if self._is_decode_only(**kwargs):
             ADPiecewiseRunner.set_current_num_tokens(None)
             return self.monolithic(*args, **kwargs)
@@ -1043,8 +1057,8 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
         input_ids=input_ids_flat,
         cu_seqlen=cu_seqlen,
         input_pos=0,
-        cache_loc=cache_loc,
-        cu_num_pages=cu_num_pages,
+        cache_loc_per_pool=[cache_loc],
+        cu_num_pages_per_pool=[cu_num_pages],
         slot_idx=slot_idx,
     )
 

@@ -41,6 +41,8 @@ class EncoderExecutor:
             "are bypassed. Use llm.encode() for inference."
         )
 
+        self.model_engine.warmup_encoder()
+
     def batch_forward(self, inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """Execute a pre-formed batch in one forward pass.
 

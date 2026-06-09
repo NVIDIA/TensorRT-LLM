@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -39,6 +39,116 @@ def _get_cached_f32_scale(scale: torch.Tensor) -> torch.Tensor:
     return f32
 
 
+# =============================================================================
+# Module-level cache for MoeAlltoAll state
+# =============================================================================
+#
+# Custom ops are stateless functions, but `MoeAlltoAll` is fundamentally
+# stateful: base TensorRT-LLM constructs it once per fused-MoE module and
+# reuses `self.moe_a2a` across forward steps. Auto-deploy previously
+# re-instantiated it on every layer call and re-parsed the serialized
+# `DistConfig` JSON, paying that overhead per-layer per-step.
+#
+# This module-level cache mirrors the `_GlobalTrtllmPlanner` pattern in
+# `trtllm_attention.py` (and `_GlobalFlashInferPlanner` in
+# `flashinfer_attention.py`): a Python-level singleton that lives across
+# custom-op invocations, lazily constructed on first use, keyed by
+# parameters that determine workspace identity. The class-level
+# `MoeAlltoAll._WORKSPACE` already deduplicates the GPU workspace and the
+# C++ `moe_a2a_initialize` call across instances; this cache additionally
+# eliminates the redundant Python ctor and JSON deserialization.
+
+
+class _MoeAll2AllCache:
+    """Per-process singleton cache for `MoeAlltoAll` instances and parsed `DistConfig` mappings.
+
+    A separate cache instance lives in each MPI worker process — there is no
+    cross-rank shared state here (that lives in `MoeAlltoAll._WORKSPACE`, which is
+    initialized via the C++ `moe_a2a_initialize` collective). Within a rank, all
+    fused-MoE layers share this cache so the Python `MoeAlltoAll` ctor and
+    `DistConfig` JSON deserialization run at most once per (workspace) configuration
+    per process, regardless of how many MoE-DP layers the model has.
+
+    Note: EPLB (Expert Parallelism Load Balancing — `MoeAlltoAll(num_experts=…)`
+    selects an EPLB-aware codepath) is not used by auto-deploy today;
+    `eplb_num_experts` is always `None` from the call sites. The cache still keys
+    on it explicitly so the helper composes correctly if EPLB is wired later.
+    """
+
+    def __init__(self) -> None:
+        self._all2all: dict[tuple, MoeAlltoAll] = {}
+        self._mapping: dict[str, Tuple[Optional[Mapping], bool]] = {}
+
+    def get_mapping(self, mapping_config: str) -> Tuple[Optional[Mapping], bool]:
+        """Return cached `(Mapping, enable_alltoall)` parsed from `mapping_config`.
+
+        All-to-all is used when attention-DP is enabled and experts are sharded
+        (EP > 1). The returned `mapping` is `None` when `mapping_config` is empty.
+
+        Note: `max_num_tokens` is a per-call argument and is therefore not part
+        of the cache key. Callers must validate it themselves (see `_check_moe_alltoall`).
+        """
+        cached = self._mapping.get(mapping_config)
+        if cached is not None:
+            return cached
+        if not mapping_config:
+            cached = (None, False)
+        else:
+            dc = DistConfig.deserialize(mapping_config)
+            mapping = dc.to_mapping()
+            enable = dc.enable_attention_dp and dc.moe_ep_size > 1
+            cached = (mapping, enable)
+        self._mapping[mapping_config] = cached
+        return cached
+
+    def get_alltoall(
+        self,
+        mapping: Mapping,
+        max_num_tokens: int,
+        top_k: int,
+        num_slots: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        eplb_num_experts: Optional[int] = None,
+    ) -> MoeAlltoAll:
+        """Return a `MoeAlltoAll` instance, constructing on first use.
+
+        Keyed on the tuple of ctor parameters that determine workspace identity.
+        In practice `MoeAlltoAll._WORKSPACE` is process-wide and only one
+        configuration is valid per process, but a tuple key keeps semantics
+        correct if the runner ever changes shapes between calls.
+        """
+        workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+            mapping.moe_ep_size, top_k, max_num_tokens, hidden_size, dtype, eplb_num_experts
+        )
+        key = (
+            mapping.moe_ep_size,
+            mapping.moe_ep_rank,
+            top_k,
+            num_slots,
+            max_num_tokens,
+            workspace_size,
+            eplb_num_experts,
+        )
+        inst = self._all2all.get(key)
+        if inst is None:
+            inst = MoeAlltoAll(
+                mapping=mapping,
+                max_num_tokens=max_num_tokens,
+                top_k=top_k,
+                num_slots=num_slots,
+                workspace_size_per_rank=workspace_size,
+                num_experts=eplb_num_experts,
+            )
+            self._all2all[key] = inst
+        return inst
+
+
+# Per-process singleton: instantiated once at module import; each MPI rank
+# has its own instance because each rank is a separate Python process.
+_GlobalMoeAll2AllCache = _MoeAll2AllCache()
+
+
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
     """Check if MoE all-to-all mode should be used and validate parameters.
 
@@ -47,11 +157,7 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     Returns:
         (mapping, enable_alltoall) — mapping is None when mapping_config is empty.
     """
-    if not mapping_config:
-        return None, False
-    dc = DistConfig.deserialize(mapping_config)
-    mapping = dc.to_mapping()
-    enable_alltoall = dc.enable_attention_dp and dc.moe_ep_size > 1
+    mapping, enable_alltoall = _GlobalMoeAll2AllCache.get_mapping(mapping_config)
     if enable_alltoall and max_num_tokens <= 0:
         raise ValueError("max_num_tokens must be > 0 when enable_alltoall is True")
     return mapping, enable_alltoall
@@ -74,6 +180,7 @@ def _run_moe_with_alltoall(
     use_deepseek_fp8_block_scale: bool = False,
     finegrained_fp8_block_scales: Tuple[torch.Tensor, torch.Tensor] | None = None,
     is_gated_mlp: bool = True,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Execute MoE with all-to-all dispatch/combine pattern.
@@ -117,6 +224,11 @@ def _run_moe_with_alltoall(
             ``use_deepseek_fp8_block_scale`` internally.
         is_gated_mlp: Whether gated MLP is used. Needed by the Blackwell finegrained
             FP8 path to compute ``intermediate_size``.
+        batch_info_host: Pinned-host int tensor managed by ``BatchInfo``. When
+            provided, slot 14 (``max_dp_num_tokens``) is read at capture time as
+            ``runtime_max_tokens_per_rank`` (the cross-rank max of
+            ``total_num_tokens``, computed pre-forward by the AD shim via
+            ``tp_allgather``). When ``None``, falls back to ``max_num_tokens``.
 
     Returns:
         2-D output tensor ``(num_tokens, hidden_size)`` — the caller reshapes to the
@@ -129,28 +241,32 @@ def _run_moe_with_alltoall(
     local_num_experts = fc1_expert_weights.shape[0]
     global_num_experts = local_num_experts * mapping.moe_ep_size
 
+    # runtime_max_tokens_per_rank: max(total_num_tokens) across DP ranks.
+    # Mirrors base TRT-LLM's `runtime_max_tokens_per_rank = max(all_rank_num_tokens)`
+    # in fused_moe_cutlass.py / fused_moe_trtllm_gen.py. AD's shim writes slot 14
+    # pre-forward via `tp_allgather` of `total_num_tokens` (when attention-DP is on);
+    # nest_sequences seeds slot 14 with the local total as a safe default. See
+    # ``BatchInfo`` in attention_interface.py for the full slot layout.
+    if batch_info_host is not None:
+        runtime_max_tokens_per_rank = int(batch_info_host[14].item())
+        if runtime_max_tokens_per_rank <= 0:
+            runtime_max_tokens_per_rank = max_num_tokens
+    else:
+        runtime_max_tokens_per_rank = max_num_tokens
+
     # Workspace must be sized for the LARGEST element type used by dispatch or combine.
     # The input x may be quantized (fp8/fp4), but combine outputs in the model dtype
     # (bf16/fp16). We always pass the model dtype so the combine buffer is large enough.
-    workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-        mapping.moe_ep_size, top_k, max_num_tokens, hidden_size, output_dtype
-    )
-
-    # We need runtime_max_tokens_per_rank = max(tokens across all EP ranks).
-    # An NCCL all_reduce cannot run inside CUDA-graph capture, so we conservatively
-    # use max_num_tokens (the config-level upper bound) as an over-approximation.
-    # This causes the dispatch to allocate larger recv buffers (padded with invalid
-    # tokens that are skipped by the kernel), trading memory for correctness.
-    runtime_max_tokens_per_rank = max_num_tokens
-
-    # Build MoeAlltoAll (num_slots = num_experts without EPLB load balancing)
-    moe_a2a = MoeAlltoAll(
+    # The instance is cached across calls (see `_MoeAll2AllCache`), so the Python ctor and
+    # workspace-size computation happen once per (workspace) configuration per process.
+    moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
-        num_slots=global_num_experts,  # No EPLB: num_slots == num_experts
-        workspace_size_per_rank=workspace_size,
-        num_experts=None,  # None = EPLB disabled
+        num_slots=global_num_experts,
+        hidden_size=hidden_size,
+        dtype=output_dtype,
+        eplb_num_experts=None,
     )
 
     invalid_expert_id = global_num_experts
@@ -299,6 +415,7 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     mapping: Mapping,
     max_num_tokens: int,
     act_type: int,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run TRTLLM-Gen NVFP4 MoE through the all-to-all dispatch/combine path."""
 
@@ -306,18 +423,22 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     hidden_size = x.shape[-1]
     local_num_experts = int(fc1_expert_weights_fp4.shape[0])
     global_num_experts = local_num_experts * mapping.moe_ep_size
-    workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-        mapping.moe_ep_size, top_k, max_num_tokens, hidden_size, x.dtype
-    )
-    runtime_max_tokens_per_rank = max_num_tokens
+    # See _run_moe_with_alltoall above for the slot-14 contract.
+    if batch_info_host is not None:
+        runtime_max_tokens_per_rank = int(batch_info_host[14].item())
+        if runtime_max_tokens_per_rank <= 0:
+            runtime_max_tokens_per_rank = max_num_tokens
+    else:
+        runtime_max_tokens_per_rank = max_num_tokens
 
-    moe_a2a = MoeAlltoAll(
+    moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
         num_slots=global_num_experts,
-        workspace_size_per_rank=workspace_size,
-        num_experts=None,
+        hidden_size=hidden_size,
+        dtype=x.dtype,
+        eplb_num_experts=None,
     )
 
     invalid_expert_id = global_num_experts
@@ -400,6 +521,7 @@ def trtllm_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
@@ -445,6 +567,7 @@ def trtllm_moe_fused(
             activation_type=activation_type,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
+            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -475,6 +598,7 @@ def trtllm_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -514,6 +638,7 @@ def trtllm_quant_fp8_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 (W8A8) MoE for gated and non-gated MLP.
 
@@ -591,6 +716,7 @@ def trtllm_quant_fp8_moe_fused(
             activation_type=act_fn,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
+            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -628,6 +754,7 @@ def trtllm_quant_fp8_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -651,6 +778,7 @@ def trtllm_quant_nvfp4_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
 
@@ -720,6 +848,7 @@ def trtllm_quant_nvfp4_moe_fused(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             nvfp4_act_global_scale=fc1_act_global_scale,
+            batch_info_host=batch_info_host,
         ).view(x.shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -766,6 +895,7 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -784,6 +914,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 Block Scale MoE for FineGrainedFP8 format.
 
@@ -846,6 +977,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             max_num_tokens=max_num_tokens,
             finegrained_fp8_block_scales=(fc1_weight_scale, fc2_weight_scale),
             is_gated_mlp=is_gated_mlp,
+            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -932,6 +1064,7 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -960,6 +1093,7 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     if act_fn in (ActivationType.Gelu, ActivationType.Geglu):
@@ -1036,6 +1170,7 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             act_type=act_type,
+            batch_info_host=batch_info_host,
         )
         if final_hidden_states.shape[1] > x_shape[-1]:
             final_hidden_states = final_hidden_states[:, : x_shape[-1]].contiguous()
@@ -1108,6 +1243,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _trtllm_nvfp4_trtllm_gen_moe_impl(
         x,
@@ -1132,6 +1268,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
         mapping_config=mapping_config,
         max_num_tokens=max_num_tokens,
         apply_routing_on_input=apply_routing_on_input,
+        batch_info_host=batch_info_host,
     )
 
 
@@ -1159,5 +1296,6 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)

@@ -7,6 +7,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
@@ -392,18 +393,8 @@ class KvCacheCreator:
                 multimodal_input = extra_processed_inputs.get(
                     'multimodal_input')
                 multimodal_data = extra_processed_inputs.get('multimodal_data')
-                req_mm_input = trtllm.MultimodalInput(
-                    multimodal_hashes=multimodal_input.multimodal_hashes,
-                    multimodal_positions=multimodal_input.multimodal_positions,
-                    multimodal_lengths=multimodal_input.multimodal_lengths,
-                    multimodal_uuids=multimodal_input.multimodal_uuids,
-                    multimodal_item_run_cu_offsets=multimodal_input.
-                    multimodal_item_run_cu_offsets,
-                    multimodal_run_positions=multimodal_input.
-                    multimodal_run_positions,
-                    multimodal_run_lengths=multimodal_input.
-                    multimodal_run_lengths,
-                ) if multimodal_input else None
+                req_mm_input = multimodal_input.to_binding(
+                    trtllm) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
                                          max_tokens=1,
@@ -445,9 +436,12 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(self._model_engine.model,
-                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                       self._model_engine.model.original_arch, None):
+        # Disaggregated workers receive multimodal embeddings instead of raw
+        # pixel inputs, so capacity probing must use the text-only fallback.
+        if (not _is_mm_disagg()
+                and hasattr(self._model_engine.model, "original_arch")
+                and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                    self._model_engine.model.original_arch, None)):
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case
@@ -1308,14 +1302,14 @@ def _create_kv_cache_manager(
         # Flashinfer has a SW fallback at any SM.
         if (stochastic_rounding
                 and mamba_params.mamba_ssm_cache_dtype == torch.float16
-                and sm < 100 or sm in (120, 121)):
+                and (sm < 100 or sm in (120, 121))):
             logger.info("Replay kernel Philox requires 100 <= sm < 120; "
                         "using legacy MTP path for stochastic rounding support")
             use_replay = False
 
-        # Use replay algorithm for mamba (default is off).
+        # Use replay algorithm for mamba (default is on).
         enforce_disable_replay = os.environ.get('TRTLLM_USE_MAMBA_REPLAY',
-                                                '0') == '0'
+                                                '1') == '0'
         if enforce_disable_replay:
             logger.info(
                 "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
@@ -1324,6 +1318,14 @@ def _create_kv_cache_manager(
             logger.info(
                 "Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
 
+        # Stochastic-rounding seeds must live on the cache manager (not be
+        # re-created with torch.randint per forward) whenever SR can fire
+        # on the fp16 SSM cache.  This mirrors the predicate the mixer uses
+        # internally (`_stochastic_rounding_for_flashinfer` /
+        # `_stochastic_rounding_for_replay`) so allocation matches consumption.
+        mamba_ssm_stochastic_rounding = (stochastic_rounding
+                                         and mamba_params.mamba_ssm_cache_dtype
+                                         == torch.float16)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -1353,6 +1355,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             model_type="nemotron_hybrid",
             use_replay_state_update=use_replay,
+            mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1752,6 +1755,8 @@ def create_py_executor_instance(
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
         dwdp_manager=dwdp_manager,
+        enable_kv_pool_rebalance=llm_args.kv_cache_config.
+        enable_kv_pool_rebalance,
     )
 
 

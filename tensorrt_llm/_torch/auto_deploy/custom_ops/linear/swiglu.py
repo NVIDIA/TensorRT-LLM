@@ -51,6 +51,7 @@ def torch_swiglu_mlp(
     gate_bias: Optional[torch.Tensor],
     up_bias: Optional[torch.Tensor],
     down_bias: Optional[torch.Tensor],
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Standardized SwiGLU MLP operation.
 
@@ -67,6 +68,9 @@ def torch_swiglu_mlp(
         gate_bias: Optional gate projection bias of shape [intermediate_size].
         up_bias: Optional up projection bias of shape [intermediate_size].
         down_bias: Optional down projection bias of shape [hidden_size].
+        layer_type: Layer-classification sharding hint (e.g. "mlp"/"moe"/"shared_expert"),
+            propagated from the matched linears by the pattern matcher and consumed by
+            ``apply_sharding_hints`` (``shard_layers``). Does not affect the numeric result.
 
     Returns:
         Output tensor of shape [..., hidden_size].
@@ -86,6 +90,7 @@ def _(
     gate_bias: Optional[torch.Tensor],
     up_bias: Optional[torch.Tensor],
     down_bias: Optional[torch.Tensor],
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for tracing."""
     # Output shape is [..., hidden_size] where hidden_size = down_weight.shape[0]
@@ -159,6 +164,7 @@ def torch_nvfp4_swiglu_mlp(
     down_input_scale: torch.Tensor,
     down_weight_scale: torch.Tensor,
     down_alpha: torch.Tensor,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """NVFP4 quantized SwiGLU MLP operation (intermediate representation).
 
@@ -181,6 +187,9 @@ def torch_nvfp4_swiglu_mlp(
         down_input_scale: Input scale for down projection.
         down_weight_scale: Per-block weight scale for down projection.
         down_alpha: Alpha (combined scale) for down projection.
+        layer_type: Layer-classification sharding hint (e.g. "mlp"/"moe"/"shared_expert"),
+            propagated from the matched linears by the pattern matcher and consumed by
+            ``apply_sharding_hints`` (``shard_layers``). Does not affect the numeric result.
 
     Returns:
         Output tensor of shape [..., hidden_size].
@@ -230,6 +239,7 @@ def _(
     down_input_scale: torch.Tensor,
     down_weight_scale: torch.Tensor,
     down_alpha: torch.Tensor,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for tracing."""
     # Output shape: [..., hidden_size] where hidden_size = down_weight.shape[0]
@@ -323,6 +333,7 @@ def torch_finegrained_fp8_swiglu_mlp(
     gate_weight_scale: torch.Tensor,
     up_weight_scale: torch.Tensor,
     down_weight_scale: torch.Tensor,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FineGrained FP8 quantized SwiGLU MLP operation (intermediate representation).
 
@@ -339,6 +350,9 @@ def torch_finegrained_fp8_swiglu_mlp(
         gate_weight_scale: Per-block weight scale for gate [N/128, K/128] float32.
         up_weight_scale: Per-block weight scale for up [N/128, K/128] float32.
         down_weight_scale: Per-block weight scale for down [N/128, K/128] float32.
+        layer_type: Layer-classification sharding hint (e.g. "mlp"/"moe"/"shared_expert"),
+            propagated from the matched linears by the pattern matcher and consumed by
+            ``apply_sharding_hints`` (``shard_layers``). Does not affect the numeric result.
 
     Returns:
         Output tensor of shape [..., hidden_size].
@@ -382,6 +396,7 @@ def _(
     gate_weight_scale: torch.Tensor,
     up_weight_scale: torch.Tensor,
     down_weight_scale: torch.Tensor,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for tracing."""
     # Output shape: [..., hidden_size] where hidden_size = down_weight.shape[0]

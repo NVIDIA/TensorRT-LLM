@@ -43,7 +43,8 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.sampling_params import check_logprobs_limit
+from tensorrt_llm.sampling_params import (check_logprobs_limit,
+                                          validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
 
 _LOGIT_BIAS_MIN = -100.0
@@ -157,6 +158,10 @@ class DisaggregatedParams(OpenAIBaseModel):
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
     ctx_usage: Optional[UsageInfo] = None
+    # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
+    # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
+    # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
+    # before routing MM encoder -> context -> generation through OpenAI protocol.
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -394,6 +399,7 @@ class CompletionRequest(OpenAIBaseModel):
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
     return_context_logits: bool = False
     detokenize: bool = True
+    thinking_token_budget: Optional[int] = None
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -467,6 +473,7 @@ class CompletionRequest(OpenAIBaseModel):
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
             detokenize=self.detokenize,
+            thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -484,6 +491,11 @@ class CompletionRequest(OpenAIBaseModel):
     def check_logprobs(cls, data):
         check_logprobs_limit("logprobs", data.get("logprobs"))
         return data
+
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -702,6 +714,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "reasoning is shown in the model's response. Options: "
                 "'low', 'medium', 'high'."),
         )
+    thinking_token_budget: Optional[int] = None
     prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-chat-completion-sampling-params
@@ -848,6 +861,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format, reasoning_parser=reasoning_parser),
+            thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -888,6 +902,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")
         return data
+
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -949,6 +968,7 @@ class ResponsesRequest(OpenAIBaseModel):
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
     reasoning: Optional[Reasoning] = None
+    thinking_token_budget: Optional[int] = None
     service_tier: Literal["auto", "default", "flex", "scale",
                           "priority"] = "auto"
     store: Optional[bool] = True
@@ -1006,6 +1026,7 @@ class ResponsesRequest(OpenAIBaseModel):
             logprobs=self.top_logprobs,
             stop_token_ids=stop_token_ids,
             guided_decoding=guided_decoding,
+            thinking_token_budget=self.thinking_token_budget,
         )
 
     @model_validator(mode="before")
@@ -1023,6 +1044,11 @@ class ResponsesRequest(OpenAIBaseModel):
         if data.get("prompt") is not None:
             raise ValueError("prompt template is not supported")
         return data
+
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
 
 
 class InputTokensDetails(OpenAIBaseModel):
@@ -1161,36 +1187,54 @@ def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
 
 
 def _serialize_first_gen_log_probs(
-    first_gen_log_probs: Optional[list], ) -> Optional[List]:
-    """Serialize list[dict[int, Logprob]] to JSON-safe list[list[dict]]."""
+        first_gen_log_probs: Optional[list]) -> Optional[List]:
+    """Serialize ``list[dict[int, Logprob]] | list[float]`` to a JSON-safe form.
+
+    - Default (verbose) format: each position is a ``dict[int, Logprob]`` and is
+      serialized as a list of ``{token_id, logprob, rank}`` dicts.
+    - Simple format: each position is a ``float``; passed through verbatim.
+    """
     if first_gen_log_probs is None:
         return None
     if not isinstance(first_gen_log_probs, list):
         raise ValueError("first_gen_log_probs must be a list")
     result = []
     for i, pos in enumerate(first_gen_log_probs):
-        if not isinstance(pos, dict):
+        if isinstance(pos, dict):
+            result.append([{
+                "token_id": tid,
+                "logprob": lp.logprob,
+                "rank": lp.rank
+            } for tid, lp in pos.items()])
+        elif isinstance(pos, (float, int)):
+            # Simple format: per-token sampled logprob.
+            result.append(float(pos))
+        else:
             raise ValueError(
-                f"first_gen_log_probs[{i}] must be a dict, got {type(pos)}")
-        result.append([{
-            "token_id": tid,
-            "logprob": lp.logprob,
-            "rank": lp.rank
-        } for tid, lp in pos.items()])
+                f"first_gen_log_probs[{i}] must be a dict or float, got {type(pos)}"
+            )
     return result
 
 
 def _deserialize_first_gen_log_probs(
     serialized: Optional[List], ) -> Optional[list]:
-    """Deserialize JSON list[list[dict]] back to list[dict[int, Logprob]]."""
+    """Inverse of :func:`_serialize_first_gen_log_probs`.
+
+    Returns either ``list[dict[int, Logprob]]`` (default format) or
+    ``list[float]`` (simple format) depending on the serialized payload.
+    """
     if serialized is None:
         return None
     from tensorrt_llm.executor.result import Logprob
     result = []
     for i, pos in enumerate(serialized):
+        if isinstance(pos, (float, int)):
+            result.append(float(pos))
+            continue
         if not isinstance(pos, list):
             raise ValueError(
-                f"first_gen_log_probs[{i}] must be a list, got {type(pos)}")
+                f"first_gen_log_probs[{i}] must be a list or float, got {type(pos)}"
+            )
         token_map = {}
         for j, item in enumerate(pos):
             if not isinstance(item, dict):
