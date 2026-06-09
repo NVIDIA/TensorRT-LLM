@@ -954,7 +954,7 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
-    def shutdown(self):
+    def shutdown(self, is_terminal: bool = True):
         """
         Signals the server to shutdown.
         """
@@ -990,16 +990,15 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
-        # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
-        # also invoked mid-init by configure_kv_cache_capacity() in
-        # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
-        # shutdown() and then immediately reads model_engine.model.model_config
-        # to compute kv_cache_max_memory. cleanup() would set
-        # model_engine.model = None, breaking that read with
-        # `'NoneType' object has no attribute 'model_config'`.
-        # The engine's __del__ still calls cleanup() at terminal teardown
-        # (when the executor's reference is dropped), which is sufficient for
-        # the GMS daemon registry eviction the cleanup hook was added for.
+        # Terminal teardown: deterministically release engine-owned GPU memory
+        # (model weights, CUDA graphs, userbuffers) back to the driver. cleanup()
+        # is idempotent (_cleanup_done guard) and ends in release_gc()
+        # (gc.collect + empty_cache + ipc_collect). Skipped during KV-cache
+        # estimation, which reuses model_engine.model in py_executor_creator.
+        if is_terminal:
+            for engine in (self.model_engine, self.draft_model_engine):
+                if engine is not None:
+                    engine.cleanup()
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
