@@ -125,7 +125,6 @@ def test_domain_values_cover_literal_and_enum():
 
 def _small_models():
     from enum import Enum
-    from typing import List, Optional, Union
 
     from pydantic import BaseModel
 
@@ -143,7 +142,7 @@ def _small_models():
     class Root(BaseModel):
         flag: bool = True
         mode: Mode = Mode.A
-        sizes: List[int] = []
+        sizes: list[int] = Field(default_factory=list)
         path_like: str = "x"  # bare str -> OUT
         allow: str = Field(
             default="a",
@@ -153,8 +152,8 @@ def _small_models():
                 "allowed_values": ["a", "b"],
             },
         )
-        nested: Optional[Nested] = None
-        loose: Optional[Union[object, str]] = None  # no BaseModel arm -> not recursed
+        nested: Nested | None = None
+        loose: object | str | None = None  # no BaseModel arm -> not recursed
 
     return Root
 

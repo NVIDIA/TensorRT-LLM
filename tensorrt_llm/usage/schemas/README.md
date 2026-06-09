@@ -252,7 +252,7 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
 6. **Regenerate the manifest golden** from `build_capture_manifest`:
    `python -c "import json; from tensorrt_llm.usage.llmapi_config import golden_manifest; open('tensorrt_llm/usage/llm_args_golden_manifest.json','w').write(json.dumps(golden_manifest(), indent=2, sort_keys=True)+'\n')"`
    Review the golden diff — **it is the privacy review.** A newly captured field
-   requires sign-off from the telemetry/privacy CODEOWNER (`.github/CODEOWNERS`).
+   requires sign-off from the GitHub telemetry/privacy CODEOWNER (`.github/CODEOWNERS`).
 7. **`docs/source/developer-guide/telemetry.md` is generated** from the committed
    golden at docs-build time; do not hand-edit it.
 8. **Update this README** — Add a common-key row above when the field is

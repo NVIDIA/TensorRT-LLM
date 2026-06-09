@@ -203,6 +203,7 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
     Precompiled wheels own native bits. Source owns telemetry schema JSON.
     Skip those wheel files so Python-only schema edits layer over old wheels.
     """
+    filename = filename.replace("\\", "/")
     source_owned_package_data_prefixes = ("tensorrt_llm/usage/schemas/", )
     return filename.endswith(".json") and filename.startswith(
         source_owned_package_data_prefixes)

@@ -84,6 +84,7 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
+_TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.virtual_memory import \
@@ -116,29 +117,18 @@ def Field(default: Any = ...,
         A Pydantic FieldInfo object with extra metadata added to
         json_schema_extra if provided.
     """
-
     telemetry_explicit_exclude = telemetry is False
     telemetry_requested = telemetry is not None and not telemetry_explicit_exclude
 
     if status is not None or telemetry_requested or telemetry_explicit_exclude:
+        trtllm_schema_extra: dict[str, Any] = {}
         json_schema_extra = kwargs.get('json_schema_extra', {})
-        if isinstance(json_schema_extra, dict):
-            json_schema_extra = dict(json_schema_extra)
-        elif callable(json_schema_extra):
-            # A callable json_schema_extra cannot carry our dict telemetry/status
-            # metadata (the collector reads it as a dict). Fail loudly rather than
-            # silently drop the user's callable.
-            raise TypeError(
-                "status=/telemetry= require a dict json_schema_extra; a callable "
-                "json_schema_extra is unsupported")
-        else:
-            json_schema_extra = {}
         if status is not None:
-            json_schema_extra['status'] = status
+            trtllm_schema_extra['status'] = status
         if telemetry_explicit_exclude:
             # Honored opt-out sentinel: excludes a type-safe-but-sensitive field
             # from capture. Consumed by build_capture_manifest's selection rule.
-            json_schema_extra['telemetry'] = {"exclude": True}
+            trtllm_schema_extra['telemetry'] = {"exclude": True}
         elif telemetry_requested:
             if isinstance(telemetry, TelemetryField):
                 telemetry_metadata = telemetry.as_json_schema_extra()
@@ -149,10 +139,36 @@ def Field(default: Any = ...,
             else:
                 raise TypeError(
                     "telemetry must be bool, dict, or TelemetryField")
-            json_schema_extra['telemetry'] = telemetry_metadata
+            trtllm_schema_extra['telemetry'] = telemetry_metadata
+        if isinstance(json_schema_extra, dict):
+            json_schema_extra = {**json_schema_extra, **trtllm_schema_extra}
+        elif callable(json_schema_extra):
+            original_json_schema_extra = json_schema_extra
+
+            def merged_json_schema_extra(schema: dict[str, Any]) -> None:
+                original_extra = original_json_schema_extra(schema)
+                if isinstance(original_extra, dict):
+                    schema.update(original_extra)
+                schema.update(trtllm_schema_extra)
+
+            setattr(merged_json_schema_extra, _TRTLLM_JSON_SCHEMA_EXTRA_ATTR,
+                    trtllm_schema_extra)
+            json_schema_extra = merged_json_schema_extra
+        else:
+            json_schema_extra = trtllm_schema_extra
         kwargs['json_schema_extra'] = json_schema_extra
 
     return PydanticField(default, **kwargs)
+
+
+def _get_trtllm_json_schema_extra(field_info: Any) -> dict[str, Any]:
+    json_schema_extra = getattr(field_info, "json_schema_extra", None)
+    if callable(json_schema_extra):
+        json_schema_extra = getattr(json_schema_extra,
+                                    _TRTLLM_JSON_SCHEMA_EXTRA_ATTR, None)
+    if isinstance(json_schema_extra, dict):
+        return json_schema_extra
+    return {}
 
 
 class BaseCudaGraphConfig(StrictBaseModel):
@@ -4799,10 +4815,11 @@ class TorchLlmArgs(BaseLlmArgs):
         for field_name in set_fields:
             field_info = self.model_fields.get(field_name)
 
-            if not field_info or not field_info.json_schema_extra:
+            if not field_info:
                 continue
 
-            status = field_info.json_schema_extra.get('status', None)
+            status = _get_trtllm_json_schema_extra(field_info).get(
+                'status', None)
 
             if status in ('beta', 'prototype'):
                 logger.warning(

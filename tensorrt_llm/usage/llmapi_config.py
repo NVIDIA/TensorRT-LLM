@@ -42,6 +42,7 @@ CAPTURE_SOURCE = "effective_validated_llm_args"
 MAX_CONFIG_BYTES = 16384
 
 _TELEMETRY_EXTRA_KEY = "telemetry"
+_TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 _APPROVED_CONVERTERS = {"allowlist"}
 
 # Per-sequence cap, applied recursively so each inner list of a nested
@@ -172,6 +173,8 @@ def _normalize_metadata(metadata: Any) -> dict[str, Any] | None:
 
 def _get_telemetry_metadata(field_info: Any) -> dict[str, Any] | None:
     json_schema_extra = getattr(field_info, "json_schema_extra", None)
+    if callable(json_schema_extra):
+        json_schema_extra = getattr(json_schema_extra, _TRTLLM_JSON_SCHEMA_EXTRA_ATTR, None)
     if not isinstance(json_schema_extra, dict):
         return None
     return _normalize_metadata(json_schema_extra.get(_TELEMETRY_EXTRA_KEY))
@@ -330,7 +333,7 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
                 )
             if not _is_explicit_exclude(meta):
                 for sub in _nested_models(ann):
-                    walk(sub, key, stack + (cls,))
+                    walk(sub, key, (*stack, cls))
 
     walk(model_cls, "", ())
 

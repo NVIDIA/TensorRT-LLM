@@ -17,12 +17,29 @@
 
 import os
 import sys
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from tensorrt_llm.commands import serve
+
+
+def _mock_llmapi_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    split_mpi_env: Callable[[], tuple[dict[str, str], dict[str, str]]],
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm.llmapi.mgmn_leader_node",
+        SimpleNamespace(launch_server_main=lambda sub_comm: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm.llmapi.mpi_session",
+        SimpleNamespace(split_mpi_env=split_mpi_env),
+    )
 
 
 def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
@@ -98,16 +115,7 @@ def test_launch_disaggregated_leader_propagates_deployment_id(monkeypatch) -> No
     monkeypatch.setattr(serve, "find_free_ipc_addr", lambda: "ipc://fake-proxy")
     monkeypatch.setattr(serve.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(serve.sys, "argv", ["trtllm-serve"])
-    monkeypatch.setitem(
-        sys.modules,
-        "tensorrt_llm.llmapi.mgmn_leader_node",
-        SimpleNamespace(launch_server_main=lambda sub_comm: None),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "tensorrt_llm.llmapi.mpi_session",
-        SimpleNamespace(split_mpi_env=_fake_split_mpi_env),
-    )
+    _mock_llmapi_modules(monkeypatch, _fake_split_mpi_env)
 
     serve._launch_disaggregated_leader(_FakeComm(), 2, "disagg.yaml", "info")
 
