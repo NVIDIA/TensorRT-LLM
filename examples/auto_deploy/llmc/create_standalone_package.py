@@ -153,6 +153,8 @@ EXCLUDE_TEST_FILES = {
     "test_torch_gated_delta_rule_cache.py",
     "test_gated_delta_rule_cache.py",
     "test_kv_cache_transformers.py",
+    # trtllm attention backend (insert_cached_attention backend=trtllm) not available standalone
+    "test_kv_cache_trtllm_multipool.py",
     # Require TRT-LLM CUDA causal conv / mamba kernels (ops not registered standalone)
     "test_cuda_causal_conv_cached_op.py",
     "test_triton_causal_conv_cached_op.py",

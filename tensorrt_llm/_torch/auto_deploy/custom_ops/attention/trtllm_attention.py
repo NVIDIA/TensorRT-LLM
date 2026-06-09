@@ -94,7 +94,19 @@ class _TrtllmPlanner:
         self.context_lengths_gpu: Optional[torch.Tensor] = None  # [max_batch] int32 device
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
+        # ``self.block_offsets`` is the group-0 buffer (kept for the spec-dec
+        # scratch path and backward compatibility); additional KV window groups
+        # (VSWA / non-uniform sliding window, e.g. gpt-oss) get their own
+        # persistent buffer keyed by the group's ``cache_loc`` input pointer in
+        # ``_block_offsets_by_cache_loc``. The transform invokes
+        # ``prepare_trtllm_metadata`` once per group with that group's
+        # ``cache_loc_g{i}`` / ``cu_num_pages_g{i}`` inputs, so without per-group
+        # buffers the groups would clobber a single shared buffer.
         self.block_offsets: Optional[torch.Tensor] = None
+        self._block_offsets_by_cache_loc: dict[int, torch.Tensor] = {}
+        # Shapes for lazy per-group buffer allocation (set in ``reset``).
+        self._max_batch: int = 0
+        self._max_blocks_per_seq: int = 0
         # Per-layer cache for tensors that must survive CUDA graph replay.
         # Keyed by kv_cache.data_ptr() (stable and unique per layer).
         self._layer_cache: dict[
@@ -148,9 +160,13 @@ class _TrtllmPlanner:
         self.host_request_types = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
+        self._max_batch = max_batch
+        self._max_blocks_per_seq = max_blocks_per_seq
         self.block_offsets = torch.zeros(
             1, max_batch, 2, max_blocks_per_seq, dtype=torch.int32, device=device
         )
+        # Group 0 reuses ``self.block_offsets``; it is registered under its
+        # ``cache_loc`` pointer on first use in ``_get_block_offsets_buffer``.
         self.host_past_kv_lengths = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
@@ -290,23 +306,71 @@ class _TrtllmPlanner:
         self.num_contexts = num_prefill
         self.num_ctx_tokens = batch_info.get_num_tokens()[0]
 
+    def _get_block_offsets_buffer(self, cache_loc: torch.Tensor) -> torch.Tensor:
+        """Return the persistent block_offsets buffer for this KV window group.
+
+        Each KV window group is driven by its own ``cache_loc`` input tensor
+        (group 0 uses ``cache_loc``; groups 1..N-1 use ``cache_loc_g{i}``), which
+        are persistent buffers with stable ``data_ptr()`` across CUDA-graph
+        replays. Keying by that pointer (same pattern as ``_layer_cache`` keyed
+        by ``kv_cache.data_ptr()``) gives each group an independent, address-stable
+        block_offsets buffer so per-group ``prepare_trtllm_metadata`` invocations
+        do not clobber each other.
+
+        Lazily allocates a buffer on first sight of a group's ``cache_loc``. This
+        must happen during warm-up (never mid-capture) so the tensor address is
+        stable for graph replay; group 0's buffer reuses the one already
+        allocated in ``reset``.
+        """
+        key = cache_loc.data_ptr()
+        buf = self._block_offsets_by_cache_loc.get(key)
+        if buf is None:
+            assert self.block_offsets is not None, (
+                "planner.reset() must run before _get_block_offsets_buffer()"
+            )
+            if not self._block_offsets_by_cache_loc:
+                # First group seen this run is group 0: reuse the reset() buffer.
+                buf = self.block_offsets
+            else:
+                assert (
+                    not torch.cuda.is_current_stream_capturing()
+                ) or cuda_graph_state.in_warm_up(), (
+                    "block_offsets buffer for a new KV window group must be "
+                    "allocated during warm-up, not during CUDA graph capture. "
+                    "Ensure warm-up exercises every KV pool."
+                )
+                buf = torch.zeros(
+                    1,
+                    self._max_batch,
+                    2,
+                    self._max_blocks_per_seq,
+                    dtype=torch.int32,
+                    device=self.block_offsets.device,
+                )
+            self._block_offsets_by_cache_loc[key] = buf
+        return buf
+
     def plan_device(
         self,
         num_seq: int,
         block_offset_multiplier: int,
         cu_num_pages: torch.Tensor,
         cache_loc: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         """Per-forward DEVICE metadata: block_offsets via Triton kernel (pure GPU).
 
         Called from the ``prepare_trtllm_metadata`` custom op (in the graph).
+        Returns the per-group block_offsets buffer that was populated, so the op
+        can flow it through the graph to that group's attention layers.
         """
-        k_slice = self.block_offsets[0, :, 0, :]  # [max_batch, M], stride [2*M, 1]
+        block_offsets = self._get_block_offsets_buffer(cache_loc)
+        k_slice = block_offsets[0, :, 0, :]  # [max_batch, M], stride [2*M, 1]
         torch.ops.auto_deploy.ragged_to_block_table_triton(
             cache_loc, cu_num_pages, k_slice, num_seq
         )
-        self.block_offsets[0, :num_seq, 0, :].mul_(block_offset_multiplier)
-        self.block_offsets[0, :num_seq, 1, :] = self.block_offsets[0, :num_seq, 0, :] + 1
+        block_offsets[0, :num_seq, 0, :].mul_(block_offset_multiplier)
+        block_offsets[0, :num_seq, 1, :] = block_offsets[0, :num_seq, 0, :] + 1
+        return block_offsets
 
 
 _GlobalTrtllmPlanner = _TrtllmPlanner()
@@ -479,14 +543,16 @@ def prepare_trtllm_metadata(
             _GlobalTrtllmPlanner.use_spec_decoding = batch_info.get_num_sequences()[2] == 0
     block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
-    _GlobalTrtllmPlanner.plan_device(
+    block_offsets = _GlobalTrtllmPlanner.plan_device(
         num_seq=batch_info.get_total_num_sequences(),
         block_offset_multiplier=block_offset_multiplier,
         cu_num_pages=cu_num_pages,
         cache_loc=cache_loc,
     )
 
-    return [_GlobalTrtllmPlanner.block_offsets]
+    # Return this group's buffer (keyed by ``cache_loc``) so multi-pool
+    # (VSWA) deployments flow the correct block_offsets to each group's layers.
+    return [block_offsets]
 
 
 @prepare_trtllm_metadata.register_fake
@@ -569,9 +635,13 @@ def trtllm_mha_with_cache(
     batch_info = BatchInfo(batch_info_host)
     num_seq = batch_info.get_total_num_sequences()
     num_tokens = batch_info.get_total_num_tokens()
+    max_seq_len = batch_info.get_max_seq_len()
     max_context_length = batch_info.get_max_context_length()
     max_num_requests = batch_info.get_max_batch_size()
-    # Use sliding_window for attention_window_size if provided, else full context length
+    # Use sliding_window for attention_window_size if provided, else full context length.
+    # The mask stays ``causal`` (matching the PyTorch backend, which never uses
+    # sliding_window_causal): the kernel honors the window via the cyclic
+    # attention-window handling driven by ``attention_window_size``.
     attention_window_size = (
         sliding_window
         if isinstance(sliding_window, int) and sliding_window > 0
@@ -679,6 +749,7 @@ def trtllm_mha_with_cache(
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         attention_window_size,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
@@ -799,6 +870,13 @@ class TrtllmAttention(AttentionDescriptor):
 
     Follows the same stateless descriptor pattern as ``FlashInferAttention``.
     """
+
+    @classmethod
+    def kernel_handles_cyclic_swa(cls) -> bool:
+        """thop.attention applies the sliding-window mask internally via cyclic
+        KV indexing, so the executor passes the full per-window block table and
+        global KV lengths (no host-side window slicing). See base class."""
+        return True
 
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
