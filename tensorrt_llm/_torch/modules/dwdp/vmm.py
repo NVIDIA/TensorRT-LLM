@@ -112,8 +112,14 @@ def get_allocation_prop(device_id: int, fabric_only: bool = True) -> cuda.CUmemA
 
     Args:
         device_id: CUDA device ordinal.
-        fabric_only: If True, only return fabric handle type (required for GB200).
-                    If False, fall back to POSIX_FILE_DESCRIPTOR on x86_64.
+        fabric_only: If True, force the fabric handle type (used internally
+            for granularity queries — the value isn't consumed by an actual
+            export, so the choice is arbitrary as long as it's non-zero).
+            If False, pick the peer-shareable handle type appropriate for
+            the current arch via :func:`peer_handle_type` so that the
+            ``cuMemCreate`` call matches what ``transport.py`` will later
+            export — see the docstring of :func:`peer_handle_type` for the
+            arch table.
 
     Returns:
         CUmemAllocationProp configured for the device.
@@ -131,17 +137,11 @@ def get_allocation_prop(device_id: int, fabric_only: bool = True) -> cuda.CUmemA
             cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         )
     else:
-        # Differentiate based on architecture
-        arch = platform.machine().lower()
-        is_on_aarch64 = "aarch64" in arch
-        if is_on_aarch64:
-            allocation_prop.requestedHandleTypes = (
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            )
-        else:
-            allocation_prop.requestedHandleTypes = (
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-            )
+        # Single source of truth for the arch -> handle-type mapping.
+        # ``transport.py`` independently calls ``peer_handle_type()`` to
+        # decide the export/import side; routing the create side through
+        # the same helper guarantees the two cannot drift.
+        allocation_prop.requestedHandleTypes = peer_handle_type()
 
     return allocation_prop
 
