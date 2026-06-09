@@ -896,9 +896,10 @@ class DeepseekV3Gate(nn.Module):
 
         self.weight.copy_(weights[0]["weight"][:])
 
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(
-                self.e_score_correction_bias.dtype))
+        if "e_score_correction_bias" in weights[0]:
+            self.e_score_correction_bias.copy_(
+                weights[0]["e_score_correction_bias"][:].to(
+                    self.e_score_correction_bias.dtype))
 
     @property
     def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
