@@ -683,6 +683,26 @@ class BasePipeline(nn.Module):
         noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
         return guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
 
+    @staticmethod
+    def _resolve_step_guidance_scale(
+        t: torch.Tensor,
+        guidance_scale: float,
+        guidance_interval: Optional[Tuple[float, float]] = None,
+        guidance_scale_2: Optional[float] = None,
+        boundary_timestep: Optional[float] = None,
+    ) -> float:
+        """Per-step CFG scale, including two-stage and guidance-interval gating."""
+        current = guidance_scale
+        t_scalar = t.item() if t.dim() == 0 else t[0].item()
+        if guidance_scale_2 is not None and boundary_timestep is not None:
+            if t_scalar < boundary_timestep:
+                current = guidance_scale_2
+        if guidance_interval is not None:
+            interval_lo, interval_hi = guidance_interval
+            if not (interval_lo <= t_scalar <= interval_hi):
+                current = 1.0
+        return current
+
     def _setup_cfg_config(
         self, guidance_scale, prompt_embeds, neg_prompt_embeds, extra_cfg_tensors=None
     ):
@@ -832,9 +852,10 @@ class BasePipeline(nn.Module):
         guidance_scale,
         guidance_rescale,
         local_extras,
+        do_cfg: bool = False,
     ):
         """Execute single denoising step without CFG parallel."""
-        if guidance_scale > 1.0:
+        if do_cfg:
             latent_input = torch.cat([latents] * 2)
             # Duplicate extra stream latents for CFG
             extra_stream_input = {
@@ -862,7 +883,7 @@ class BasePipeline(nn.Module):
         t_transformer = time.time() - t_start
 
         c_start = time.time()
-        if guidance_scale > 1.0:
+        if do_cfg:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
@@ -927,6 +948,7 @@ class BasePipeline(nn.Module):
         extra_streams: Optional[Dict[str, Tuple[torch.Tensor, Any]]] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_timestep: Optional[float] = None,
+        guidance_interval: Optional[Tuple[float, float]] = None,
         post_step_fn: Optional[Callable] = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
@@ -954,6 +976,9 @@ class BasePipeline(nn.Module):
                              to guidance_scale_2 when timestep < boundary_timestep.
             boundary_timestep: Optional timestep boundary for two-stage denoising.
                               Switches guidance scale when crossing this threshold.
+            guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
+                              is active. Outside the interval the effective scale is 1.0
+                              (conditional prediction only); both branches still run.
             post_step_fn: Optional callable applied to latents after each scheduler step.
                          Signature: post_step_fn(latents) -> latents
                          Use for constraints that must hold throughout denoising.
@@ -992,6 +1017,7 @@ class BasePipeline(nn.Module):
         cfg_config = self._setup_cfg_config(
             guidance_scale, prompt_embeds, neg_prompt_embeds, extra_cfg_tensors
         )
+        do_cfg = guidance_scale > 1.0
         do_cfg_parallel = cfg_config["enabled"]
         prompt_embeds = cfg_config["prompt_embeds"]
         local_extras = cfg_config["local_extras"]
@@ -1025,12 +1051,13 @@ class BasePipeline(nn.Module):
 
             step_start = time.time()
 
-            # Two-stage denoising: switch guidance scale at boundary
-            current_guidance_scale = guidance_scale
-            if guidance_scale_2 is not None and boundary_timestep is not None:
-                t_scalar = t.item() if t.dim() == 0 else t[0].item()
-                if t_scalar < boundary_timestep:
-                    current_guidance_scale = guidance_scale_2
+            current_guidance_scale = self._resolve_step_guidance_scale(
+                t,
+                guidance_scale,
+                guidance_interval,
+                guidance_scale_2,
+                boundary_timestep,
+            )
 
             # Denoise
             with nvtx_range(f"denoise_step {i}"):
@@ -1057,6 +1084,7 @@ class BasePipeline(nn.Module):
                         current_guidance_scale,
                         guidance_rescale,
                         local_extras,
+                        do_cfg=do_cfg,
                     )
 
             # Scheduler step for all streams
