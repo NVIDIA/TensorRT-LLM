@@ -182,6 +182,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
     enable_pdl: bool,
     kv_scale_pool: Optional[torch.Tensor],
     uses_shared_paged_kv_idx: bool,
+    causal: bool,
 ) -> None:
     bmm1_scale_arg = (
         _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
@@ -217,7 +218,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
         kv_scale_pool,  # value_block_scales
         None,  # skip_softmax_threshold_scale_factor
         uses_shared_paged_kv_idx,
-        True,  # causal
+        causal,  # causal
         None,  # lse
         0,  # lse_stride_tokens
         0,  # lse_stride_heads
@@ -377,6 +378,7 @@ class FmhaParams:
     num_requests: int = 0
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    cross_attention: bool = False
 
 
 class FlashInferTrtllmGenAttention:
@@ -597,8 +599,13 @@ class FlashInferTrtllmGenAttention:
             attn.skip_softmax_threshold_scale_factor_prefill is not None
             or attn.skip_softmax_threshold_scale_factor_decode is not None
         )
-        if meta.is_cross:
-            return False, "trtllm-gen does not support cross attention."
+        if meta.is_cross and is_mla_enable:
+            return False, "Cross attention with MLA is not supported by trtllm-gen backend."
+        if meta.is_cross and (meta.is_spec_decoding_enabled or meta.use_spec_decoding):
+            return (
+                False,
+                "Cross attention with speculative decoding is not supported by trtllm-gen backend.",
+            )
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
@@ -617,6 +624,8 @@ class FlashInferTrtllmGenAttention:
             return False, "trtllm-gen does not support sparse attention."
         if has_skip_softmax:
             return False, "trtllm-gen does not support skip-softmax attention."
+        if fwd.relative_attention_bias is not None:
+            return False, "Relative attention bias is not supported by trtllm-gen backend."
         if meta.use_spec_decoding and meta.is_spec_dec_tree:
             return (
                 False,
@@ -655,6 +664,11 @@ class FlashInferTrtllmGenAttention:
         kv_cache_dtype, _ = self._get_kv_cache_dtype_and_total_blocks(meta, is_mla_enable)
         if kv_cache_dtype is None:
             kv_cache_dtype = torch_dtype_to_binding(q_dtype)
+        if meta.is_cross and kv_cache_dtype == DataType.NVFP4:
+            return (
+                False,
+                "Cross attention with NVFP4 KV cache is not supported by trtllm-gen backend.",
+            )
 
         is_fp8_out = output.dtype == torch.float8_e4m3fn
         is_fp4_out = output.dtype == torch.uint8
@@ -701,10 +715,10 @@ class FlashInferTrtllmGenAttention:
                 )
 
         if has_generation_phase:
-            if meta.beam_width != 1:
+            if meta.effective_beam_width != 1:
                 return (
                     False,
-                    f"[Generation] Beam search (beam_width={meta.beam_width}) "
+                    f"[Generation] Beam search (beam_width={meta.effective_beam_width}) "
                     "is not supported. Must be 1.",
                 )
             sink_token_length = 0
@@ -804,7 +818,7 @@ class FlashInferTrtllmGenAttention:
         max_num_requests = meta.max_num_requests
         max_context_length = meta.max_context_length
         attention_window_size = fwd.attention_window_size
-        beam_width = meta.beam_width
+        beam_width = meta.effective_beam_width
 
         num_tokens = q.size(0)
         attn_input_type = fwd.attention_input_type
@@ -912,6 +926,7 @@ class FlashInferTrtllmGenAttention:
             params.seq_offset = seq_offset
             params.input_seq_length = max_context_q_len
             params.batch_size = num_seqs
+            params.cross_attention = meta.is_cross
             self.run_context(params)
 
         if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
@@ -945,6 +960,7 @@ class FlashInferTrtllmGenAttention:
             params.num_requests = num_seqs // beam_width
             params.spec_decoding_generation_lengths = spec_gen_lengths
             params.spec_decoding_position_offsets = spec_pos_offsets
+            params.cross_attention = meta.is_cross
             if is_mla_enable:
                 self.run_mla_generation(params)
             else:
@@ -994,6 +1010,10 @@ class FlashInferTrtllmGenAttention:
         rope_params = attn.rope_params
         bmm1_scale_static = self._get_bmm1_scale(attn)
         attention_chunk_size = self._get_attention_chunk_size(attn)
+        if params.cross_attention and fwd.update_kv_cache and fwd.cross_kv is None:
+            raise RuntimeError(
+                "trtllm-gen cross attention requires cross_kv when update_kv_cache=True."
+            )
 
         (
             q_processed,
@@ -1051,6 +1071,8 @@ class FlashInferTrtllmGenAttention:
             params.total_num_blocks,  # total_num_blocks
             params.kv_factor,  # kv_factor
             True,  # need_build_kv_cache_metadata
+            fwd.cross_kv if params.cross_attention and fwd.update_kv_cache else None,
+            params.cross_attention,  # cross_attention
         )
 
         has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
@@ -1087,7 +1109,15 @@ class FlashInferTrtllmGenAttention:
             self._enable_pdl,  # enable_pdl
             kv_scale_pool,  # kv_scale_pool
             self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
+            (
+                False
+                if params.cross_attention
+                else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
+            ),  # causal
         )
+
+        if params.cross_attention:
+            return
 
         thop.trtllm_gen_context_postprocess(
             params.qkv_input,  # qkv_input
@@ -1139,7 +1169,7 @@ class FlashInferTrtllmGenAttention:
         rope_params = attn.rope_params
         bmm1_scale_static = self._get_bmm1_scale(attn)
         attention_chunk_size = self._get_attention_chunk_size(attn)
-        batch_beam = params.num_requests * meta.beam_width
+        batch_beam = params.num_requests * meta.effective_beam_width
         (
             q_processed,
             kv_pool,
@@ -1195,6 +1225,7 @@ class FlashInferTrtllmGenAttention:
             params.total_num_blocks,  # total_num_blocks
             params.kv_factor,  # kv_factor
             True,  # need_build_kv_cache_metadata
+            params.cross_attention,  # cross_attention
         )
 
         # FIXME: Flashinfer trtllm-gen API doesn't support a separate
@@ -1267,7 +1298,7 @@ class FlashInferTrtllmGenAttention:
         if self._get_attention_chunk_size(attn) != 0:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
-        batch_beam = params.num_requests * meta.beam_width
+        batch_beam = params.num_requests * meta.effective_beam_width
         if params.attention_input is None:
             raise RuntimeError("MLA generation requires attention_input.")
         kv_cache, block_tables = thop.build_trtllm_gen_kv_cache_metadata(

@@ -27,7 +27,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig,
 )
 
-from ..conftest import llm_models_root
+from ..conftest import llm_models_root, skip_pre_blackwell
 
 _SOURCE_TEXT = (
     "Summarize: NVIDIA builds fast inference software for large language models. "
@@ -63,6 +63,7 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
+    marks=(),
 ):
     expected_output_token_ids = [_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS] if num_beams == 1 else None
     assert not exact_match or expected_output_token_ids is not None
@@ -76,6 +77,7 @@ def _test_case(
         num_return_sequences,
         exact_match,
         id=f"{feature_id}-{_MODEL_NAME}",
+        marks=marks,
     )
 
 
@@ -115,6 +117,19 @@ _TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="bf16-kv-v2-cuda-graph-off-greedy",
+    ),
+]
+
+_TRTLLM_GEN_TEST_CASES = [
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="trtllm-gen-bf16-kv-v1-cuda-graph-off-greedy",
+        marks=skip_pre_blackwell,
     ),
 ]
 
@@ -195,6 +210,14 @@ def _cuda_graph_config(
     return CudaGraphConfig(batch_sizes=batch_sizes or [1]) if enabled else None
 
 
+def _enable_trtllm_gen_attention(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1")
+
+    from tensorrt_llm._torch.attention_backend import trtllm
+
+    monkeypatch.setattr(trtllm, "_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", True)
+
+
 def _assert_bart_response(
     response: RequestOutput,
     num_return_sequences: int,
@@ -245,12 +268,7 @@ def _assert_expected_generation(
     assert token_ids_by_output == expected_token_ids_by_output
 
 
-@pytest.mark.parametrize(
-    "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
-    _TEST_CASES,
-)
-def test_bart_pytorch_generate_encoder_decoder_end_to_end(
+def _run_bart_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
     expected_output_token_ids_by_output: list[list[int]] | None,
     torch_dtype: str,
@@ -310,6 +328,61 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
             exact_match,
             expected_output_token_ids_by_output,
         )
+
+
+@pytest.mark.parametrize(
+    "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
+    _TEST_CASES,
+)
+def test_bart_pytorch_generate_encoder_decoder_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    expected_output_token_ids_by_output: list[list[int]] | None,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    enable_cuda_graph: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    exact_match: bool,
+) -> None:
+    _run_bart_pytorch_generate_encoder_decoder(
+        monkeypatch,
+        expected_output_token_ids_by_output,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        enable_cuda_graph,
+        num_beams,
+        num_return_sequences,
+        exact_match,
+    )
+
+
+@pytest.mark.parametrize(
+    "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
+    _TRTLLM_GEN_TEST_CASES,
+)
+def test_bart_pytorch_generate_encoder_decoder_trtllm_gen_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    expected_output_token_ids_by_output: list[list[int]] | None,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    enable_cuda_graph: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    exact_match: bool,
+) -> None:
+    _enable_trtllm_gen_attention(monkeypatch)
+    _run_bart_pytorch_generate_encoder_decoder(
+        monkeypatch,
+        expected_output_token_ids_by_output,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        enable_cuda_graph,
+        num_beams,
+        num_return_sequences,
+        exact_match,
+    )
 
 
 @pytest.mark.parametrize(

@@ -42,10 +42,11 @@ class CrossAttention(nn.Module):
     re-projection.
 
     The cross-attention sub-layer honors ``ModelConfig.attn_backend``: when
-    set to ``"TRTLLM"`` it dispatches through the production C++ attention op
-    on every supported architecture. Cross-attention currently uses the THOP
-    attention path because the ``trtllm_gen`` backend API does not yet carry
-    encoder K/V tensors.
+    set to ``"TRTLLM"`` it dispatches through the production attention backend
+    on every supported architecture. If the internal ``trtllm_gen`` fast path
+    is enabled and supports the current shape, cross-attention writes encoder
+    K/V to the cross-KV pool and uses the trtllm-gen kernels; otherwise it
+    falls back to the standard THOP attention path.
 
     Encoder and decoder self-attention are unaffected and continue to use
     whatever backend ``ModelConfig.attn_backend`` selects.
