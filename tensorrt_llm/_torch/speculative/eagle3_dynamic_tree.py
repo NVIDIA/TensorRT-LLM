@@ -978,10 +978,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         """
         # Skip rejection sampling when the whole batch is greedy: argmax is
         # equivalent and avoids the rejection kernel cost.
+        # Also skip during CUDA graph capture/replay: the rejection ops use
+        # dynamic memory allocation (full-sort fallback) which is incompatible
+        # with stream capture.
         return (
             spec_metadata.use_rejection_sampling
             and self._draft_depth_logits_cat is not None
             and not spec_metadata.is_all_greedy_sample
+            and not spec_metadata.is_cuda_graph
         )
 
     def _finalize_dynamic_tree_verify_outputs(
