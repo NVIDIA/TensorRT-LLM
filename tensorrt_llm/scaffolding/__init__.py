@@ -5,11 +5,8 @@ from .controller import (BestOfNController, ChatWithMCPController, Controller,
                          NativeGenerationController, NativeRewardController,
                          ParallelProcess, PRMController)
 from .execution_scope import ExecutionScope, current_scope
-from .execution_trace import ExecutionTrace, TraceEvent
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
-from .replay import (QueueExecutor, QueueManager, ReplayEngine,
-                     ReplayGenerationStats)
 from .scaffolding_llm import ScaffoldingLlm
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    MCPCallTask, OpenAIToolDescription, RewardTask,
@@ -22,6 +19,9 @@ from .task_collection import (ChatTokenCounter, DropKVCacheWorkerTag,
                               TokenizeWorkerTag, drop_kv_cache_scope,
                               sub_request_node, tokenize_trace_scope,
                               with_execution_tracing, with_task_collection)
+from .trace_replay.execution_trace import ExecutionTrace, TraceEvent
+from .trace_replay.replay import (QueueExecutor, QueueManager, ReplayEngine,
+                                  ReplayGenerationStats)
 from .utils import system_prompt
 from .worker import (ApiaryMCPWorker, MCPWorker, OpenaiWorker, TRTLLMWorker,
                      TRTOpenaiWorker, Worker)

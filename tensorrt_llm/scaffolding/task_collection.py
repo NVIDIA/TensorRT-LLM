@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 from .controller import Controller, ParallelProcess
 from .execution_scope import current_scope
-from .execution_trace import ExecutionTrace, TraceEvent
 from .task import (ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask, Task,
                    TokenizeTask)
+from .trace_replay.execution_trace import ExecutionTrace, TraceEvent
 
 
 class TaskCollection:

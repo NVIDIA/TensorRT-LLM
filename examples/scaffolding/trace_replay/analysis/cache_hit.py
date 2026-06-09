@@ -23,7 +23,7 @@ Algorithm:
    guaranteed cache hit on first request.
 
 2. **Scoring phase.** Walk events in order, mirroring
-   :class:`tensorrt_llm.scaffolding.replay.QueueExecutor`: per
+   :class:`tensorrt_llm.scaffolding.trace_replay.replay.QueueExecutor`: per
    ``(branch_path, conversation_id)`` keep a list of segments indexed by
    ``message_index``. System segments draw tokens from the shared registry
    (cross-conversation reuse exact). User/tool/assistant-content segments
@@ -71,7 +71,7 @@ def compute_cache_hit_upper_bound(
     The result is a strict upper bound on every per-request
     ``optimal_cache_block_hit_rate`` an in-line TRT-LLM engine can achieve
     when replaying the trace via
-    ``tensorrt_llm.scaffolding.replay.QueueExecutor`` against
+    ``tensorrt_llm.scaffolding.trace_replay.replay.QueueExecutor`` against
     ``/v1/completions``.
 
     Args:

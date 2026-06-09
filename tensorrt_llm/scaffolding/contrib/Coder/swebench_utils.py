@@ -1,22 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""SWE-bench variant of the Coder agent.
+"""SWE-bench helpers for extracting and normalizing the final patch.
 
-Provides a system prompt, controller, and factory function tailored for
-SWE-bench evaluation tasks where the agent must fix a bug described in a
-GitHub pull-request / issue within a pre-configured ``/testbed`` sandbox.
+These utilities turn the agent's ``complete_task`` tool call into the
+``preds.json`` fields SWE-bench expects (a normalized ``model_patch`` plus a
+``summary``). They are used by :class:`SWEBenchCoder` in ``coder.py`` and kept
+separate so the controller/factory code there stays focused on orchestration.
 """
 
 # ruff: noqa: E501
@@ -25,33 +12,7 @@ import json
 import re
 from typing import Any, List, Optional
 
-from tensorrt_llm.scaffolding.controller import (
-    ChatWithMCPController,
-    Controller,
-    NativeGenerationController,
-)
-from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
-from tensorrt_llm.scaffolding.task import (
-    AssistantMessage,
-    ChatTask,
-    MCPCallTask,
-    SystemMessage,
-    Task,
-    ToolMessage,
-)
-from tensorrt_llm.scaffolding.task_collection import (
-    DropKVCacheWorkerTag,
-    TaskMetricsCollector,
-    TokenizeWorkerTag,
-    sub_request_node,
-    tokenize_trace_scope,
-    with_execution_tracing,
-    with_task_collection,
-)
-from tensorrt_llm.scaffolding.worker import Worker
-
-from .prompts import SWEBENCH_SYSTEM_PROMPT
-from .tools import ALL_CODER_TOOLS
+from tensorrt_llm.scaffolding.task import AssistantMessage, ChatTask, ToolMessage
 
 # ---------------------------------------------------------------------------
 # preds.json extraction (complete_task tool result ``answer_patch``)
@@ -271,123 +232,3 @@ def extract_swebench_model_patch_for_preds(chat_task: ChatTask) -> str:
             return _SWEBENCH_PREDS_UNFINISHED
         return normalize_swebench_pred_patch(patch)
     return _SWEBENCH_PREDS_UNFINISHED
-
-
-# ---------------------------------------------------------------------------
-# SWE-bench controller
-# ---------------------------------------------------------------------------
-
-
-@sub_request_node("agent_swebench_coder", is_top_level=True)
-# @drop_kv_cache_scope()
-class SWEBenchCoder(Controller):
-    """SWE-bench variant of the Coder controller.
-
-    Uses :data:`SWEBENCH_SYSTEM_PROMPT` instead of the generic Coder prompt.
-    """
-
-    tools = ALL_CODER_TOOLS
-
-    def __init__(self, chat_with_tools_controller: Controller):
-        super().__init__()
-        self.chat_with_tools_controller = chat_with_tools_controller
-
-    def clone(self):
-        cloned_ctrl = self.chat_with_tools_controller.clone()
-        return SWEBenchCoder(chat_with_tools_controller=cloned_ctrl)
-
-    def process(self, tasks: List[Task], **kwargs):
-        task = tasks[0]
-        user_prompt = task.input_str
-
-        chat_task = ChatTask.create_from_prompt(
-            user_prompt,
-            [SystemMessage(content=SWEBENCH_SYSTEM_PROMPT)],
-            tools=self.tools,
-        )
-
-        yield from self.chat_with_tools_controller.process([chat_task])
-
-        task.output_str = chat_task.last_assistant_content()
-        complete_task_result = extract_swebench_complete_task_for_preds(chat_task)
-        task.customized_result_fields["swebench_model_patch"] = complete_task_result["model_patch"]
-        task.customized_result_fields["swebench_summary"] = complete_task_result["summary"]
-        return
-
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
-
-
-def create_swebench_coder_scaffolding_llm(
-    generation_worker: Worker,
-    mcp_worker: Worker,
-    max_tokens: int = 131072,
-    max_iterations: int = 100,
-    max_parallel_requests: int = 16,
-    enable_statistics: bool = False,
-    enable_tracing: bool = False,
-) -> ScaffoldingLlm:
-    """Create a :class:`ScaffoldingLlm` configured for SWE-bench evaluation.
-
-    Mirrors :func:`create_coder_scaffolding_llm` but uses
-    :class:`SWEBenchCoder` with the SWE-bench-specific system prompt.
-    """
-    sampling_params = {
-        "temperature": 0.7,
-        "max_tokens": max_tokens,
-    }
-
-    generation_controller = NativeGenerationController(sampling_params=sampling_params)
-
-    chat_with_mcp_controller_type = ChatWithMCPController
-    coder_type = SWEBenchCoder
-
-    if enable_statistics:
-
-        def wrap_with_detailed_profiler(controller_type, controller_name):
-            return with_task_collection(
-                f"{controller_name}TaskCollection",
-                TaskMetricsCollector,
-                controller_name=controller_name,
-                task_types=[ChatTask, MCPCallTask],
-                enable_print=True,
-                capture_messages=True,
-            )(controller_type)
-
-        chat_with_mcp_controller_type = wrap_with_detailed_profiler(
-            ChatWithMCPController, "ChatWithMCP"
-        )
-        coder_type = wrap_with_detailed_profiler(SWEBenchCoder, "SWEBenchCoder")
-
-    if enable_tracing:
-        coder_type = with_execution_tracing("SWEBenchCoder")(coder_type)
-        coder_type = tokenize_trace_scope()(coder_type)
-
-    chat_with_tools_controller = chat_with_mcp_controller_type(
-        generation_controller, max_iterations=max_iterations
-    )
-
-    coder_controller = coder_type(
-        chat_with_tools_controller=chat_with_tools_controller,
-    )
-
-    workers = {
-        NativeGenerationController.WorkerTag.GENERATION: generation_worker,
-        ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
-        DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
-    }
-    if enable_tracing:
-        workers[TokenizeWorkerTag.TOKENIZE] = generation_worker
-
-    scaffolding_llm = ScaffoldingLlm(
-        coder_controller,
-        workers,
-        max_parallel_requests=max_parallel_requests,
-    )
-
-    if enable_tracing:
-        scaffolding_llm.enable_output_task_collection()
-
-    return scaffolding_llm

@@ -8,7 +8,7 @@ prefix-cache hit rate we synthesize deterministic token IDs:
   see the same IDs (so they hit each other's blocks). Untagged system events
   fall back to a per-conversation key.
 * :class:`ConversationSegments` mirrors
-  :class:`tensorrt_llm.scaffolding.replay.QueueExecutor`: it stores one token
+  :class:`tensorrt_llm.scaffolding.trace_replay.replay.QueueExecutor`: it stores one token
   segment per ``message_index`` per ``(branch_path, conversation_id)``, and
   builds an assistant request's prompt by concatenating those segments.
 """
@@ -68,7 +68,7 @@ class SystemPromptRegistry:
 class ConversationSegments:
     """Per-(branch_path, conversation_id) message-segment store.
 
-    Mirrors :class:`tensorrt_llm.scaffolding.replay.QueueExecutor`: each
+    Mirrors :class:`tensorrt_llm.scaffolding.trace_replay.replay.QueueExecutor`: each
     conversation in each branch holds a list of token-ID segments indexed by
     ``message_index``. Assistant requests are scored by concatenating these
     segments to form the prompt. Branch inheritance: when a child branch
@@ -195,7 +195,7 @@ class ConversationSegments:
     ) -> List[int]:
         """Return the concatenation of all stored segments for this conv.
 
-        This is what ``tensorrt_llm.scaffolding.replay.QueueExecutor`` sends
+        This is what ``tensorrt_llm.scaffolding.trace_replay.replay.QueueExecutor`` sends
         to the engine as ``prompt=List[int]`` on ``/v1/completions`` — i.e.,
         the actual ``usage_prompt_tokens`` the engine sees.
         """

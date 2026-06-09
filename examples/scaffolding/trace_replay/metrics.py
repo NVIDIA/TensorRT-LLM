@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from tensorrt_llm.scaffolding.execution_trace import ExecutionTrace, TraceEvent
+from tensorrt_llm.scaffolding.trace_replay.execution_trace import ExecutionTrace, TraceEvent
 
 Point3 = Tuple[float, float, Union[int, str]]
 

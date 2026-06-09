@@ -136,26 +136,21 @@ class ModelList(OpenAIBaseModel):
 class TokenizeRequest(OpenAIBaseModel):
     """Request body for the ``POST /v1/tokenize`` endpoint.
 
-    Returns the token-id sequence (and its length) that the server would
-    produce for the given text under its loaded tokenizer, without
-    submitting any generation work to the executor.  Useful for clients
-    that need to size prompts against ``max_input_len`` or correlate
-    prompt boundaries with subsequent ``/v1/completions`` token ids,
-    notably the scaffolding trace-replay client which works in raw
-    token-id space.
+    Asks the server to encode some text into the token-id sequence its
+    loaded tokenizer would produce, without running any generation. The
+    caller must supply exactly one of ``prompt`` or ``messages``; providing
+    both, or neither, is rejected with a 400 by the validator below.
 
-    The caller supplies exactly one of:
-
-    * ``prompt`` -- a plain string; tokenized directly via
-      ``tokenizer.encode``.
-    * ``messages`` -- a list of OpenAI chat-completion messages;
-      rendered through the server's chat template (mirroring the
-      ``/v1/chat/completions`` prefill path) before being encoded.
-
-    Supplying both, or neither, is rejected with a 400 by the validator
-    below.  ``model`` is accepted for compatibility with multi-model
-    routers but is otherwise ignored -- the server tokenizes against
-    its own loaded model.
+    Fields:
+        model: Target model name. Accepted for compatibility with
+            multi-model routers but ignored -- the server always tokenizes
+            against its own loaded model.
+        prompt: Plain text to tokenize directly via ``tokenizer.encode``.
+            Mutually exclusive with ``messages``.
+        messages: OpenAI chat-completion messages rendered through the
+            server's chat template (mirroring the ``/v1/chat/completions``
+            prefill path) before being encoded. Mutually exclusive with
+            ``prompt``.
     """
 
     model: Optional[str] = None
@@ -175,12 +170,12 @@ class TokenizeRequest(OpenAIBaseModel):
 class TokenizeResponse(OpenAIBaseModel):
     """Response body for the ``POST /v1/tokenize`` endpoint.
 
-    ``count`` is the length of the encoded sequence (always populated);
-    ``tokens`` is the full id list (populated for both prompt and
-    messages paths).  Clients that only need the length can ignore
-    ``tokens`` -- the field is kept ``Optional`` so future read-only
-    callers may request a count-only variant without breaking the
-    schema.
+    Fields:
+        count: Number of tokens in the encoded sequence. Always populated;
+            clients needing only the length can ignore ``tokens``.
+        tokens: The encoded token ids. Populated for both the ``prompt``
+            and ``messages`` paths. Kept ``Optional`` so future count-only
+            variants can omit it without breaking the schema.
     """
 
     count: int
@@ -977,23 +972,26 @@ class KVCacheTruncateRequest(OpenAIBaseModel):
 class KVCacheTruncateTokensRequest(OpenAIBaseModel):
     """Token-level analog of :class:`KVCacheTruncateRequest`.
 
-    Bypasses the chat-template tokenization path: ``prefixes`` is a batch
-    of full token-id sequences and ``num_tokens_to_keep`` is the parallel
-    list of prefix lengths to retain in the radix tree.  Posted to the
-    ``/_control/kv_cache/truncate_tokens`` endpoint by callers (e.g. trace
-    replay) that already operate on raw token ids and do not want
-    ``apply_chat_template`` to re-tokenize anything.
+    Posted to the ``/_control/kv_cache/truncate_tokens`` endpoint. Bypasses
+    the chat-template tokenization path entirely: callers (e.g.
+    trace replay) that already operate on raw token ids hand the server a
+    batch of full token-id sequences plus the prefix length to retain for
+    each, and the server trims the corresponding KV-cache blocks in the
+    radix tree. Each ``prefixes[i]`` becomes one
+    :class:`tensorrt_llm.executor.request.TruncateKVCacheRequest` on the
+    executor's KV-cache control queue, so one batched HTTP request fans out
+    into N atomic per-prefix radix-tree mutations while paying a single
+    network round-trip.
 
-    Each ``prefixes[i]`` produces one
-    :class:`tensorrt_llm.executor.request.TruncateKVCacheRequest` sent on
-    the executor's KV cache control queue, with the request's
-    ``messages = prefixes[i]`` and the ``num_tokens_to_keep[i]`` consumed
-    via ``messages_to_retain = prefixes[i][:num_tokens_to_keep[i]]``
-    (only the length is used downstream by
-    ``KVCacheManager.truncate_blocks``).  Splitting one batched HTTP
-    request into N control-queue requests keeps the radix-tree mutation
-    atomic per (prefix, keep) pair while the network hop pays one TLS /
-    request handshake for the whole drop event.
+    Fields:
+        model: Target model name. Accepted for router compatibility but
+            ignored -- the server uses its own loaded model.
+        prefixes: Batch of full token-id sequences. Each entry is one
+            cached prefix whose KV-cache blocks should be truncated.
+        num_tokens_to_keep: Per-prefix number of leading tokens to retain,
+            parallel to ``prefixes`` (``num_tokens_to_keep[i]`` applies to
+            ``prefixes[i]``). Blocks beyond this length are dropped from the
+            radix tree.
     """
 
     model: Optional[str] = None

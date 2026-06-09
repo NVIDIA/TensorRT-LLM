@@ -6,9 +6,9 @@ import uuid
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ..task import GenerationTask, TaskStatus
+from ..worker import Worker
 from .execution_trace import ExecutionTrace, TraceEvent
-from .task import GenerationTask, TaskStatus
-from .worker import Worker
 
 # ---------------------------------------------------------------------------
 # Deterministic per-branch RNG

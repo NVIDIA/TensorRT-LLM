@@ -24,8 +24,8 @@ from typing import Any, Dict
 
 import openai
 
-from tensorrt_llm.scaffolding.execution_trace import ExecutionTrace
-from tensorrt_llm.scaffolding.replay import ReplayEngine, ReplayGenerationStats
+from tensorrt_llm.scaffolding.trace_replay.execution_trace import ExecutionTrace
+from tensorrt_llm.scaffolding.trace_replay.replay import ReplayEngine, ReplayGenerationStats
 from tensorrt_llm.scaffolding.worker import TRTOpenaiWorker
 
 LOGGER = logging.getLogger(__name__)

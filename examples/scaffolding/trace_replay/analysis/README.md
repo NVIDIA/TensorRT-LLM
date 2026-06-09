@@ -46,7 +46,7 @@ All flags use `argparse.BooleanOptionalAction`, so `--flag` enables and
 
 1. **Pre-warm.** Sweep the trace once to find every distinct `system_prompt_id` UUID. Allocate a synthetic token stream per UUID (longest length seen) and insert its full blocks into the radix tree. Every cross-conversation reuse of the same system prompt is then a guaranteed hit.
 
-2. **Walk events in order**, mirroring `tensorrt_llm.scaffolding.replay.QueueExecutor`:
+2. **Walk events in order**, mirroring `tensorrt_llm.scaffolding.trace_replay.replay.QueueExecutor`:
 
    - **system** → segment built from the UUID-shared token stream.
    - **user / tool** → segment built from fresh allocator tokens (no cross-conversation collisions).

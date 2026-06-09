@@ -34,9 +34,14 @@ Example usage:
     ```
 """
 
-from .coder import Coder, CoderTask, create_coder_scaffolding_llm
+from .coder import (
+    Coder,
+    CoderTask,
+    SWEBenchCoder,
+    create_coder_scaffolding_llm,
+    create_swebench_coder_scaffolding_llm,
+)
 from .prompts import SWEBENCH_SYSTEM_PROMPT
-from .swebench import SWEBenchCoder, create_swebench_coder_scaffolding_llm
 from .tools import (
     ALL_CODER_TOOLS,
     FILE_TOOLS,

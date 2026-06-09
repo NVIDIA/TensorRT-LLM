@@ -13,7 +13,7 @@ from tensorrt_llm.executor.result import TokenLogprobs
 from .result import ScaffoldingOutput
 
 if TYPE_CHECKING:
-    from .execution_trace import TraceEvent
+    from .trace_replay.execution_trace import TraceEvent
 
 
 @dataclass
