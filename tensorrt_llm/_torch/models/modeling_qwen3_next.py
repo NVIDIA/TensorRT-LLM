@@ -60,6 +60,47 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
 
+def _fused_norm_weight(norm: RMSNorm) -> torch.Tensor:
+    """Weight to feed the fused AllReduce+RMSNorm op for ``norm``.
+
+    Gemma RMSNorm scales by ``(1 + weight)`` (see RMSNorm.forward), but the
+    fused AR+RMSNorm kernels (and the NCCL / NCCL_SYMMETRIC fallbacks the
+    AUTO strategy may pick) only apply ``weight``. Baking the ``+1`` into the
+    weight makes EVERY allreduce backend produce the correct gemma result
+    without any backend-specific flag.
+
+    For gemma norms the ``(1 + weight)`` tensor is precomputed once in
+    :meth:`Qwen3NextForCausalLM.post_load_weights` and cached on the module as
+    ``_fused_norm_weight`` (it never changes after load). Computing it inline
+    here would re-run a cast+add elementwise kernel every forward (inside the
+    CUDA graph) -- measurably slower than the rmsnorm kernel the fusion saves.
+    The inline path below is only a correctness fallback if the cache is absent.
+    """
+    cached = getattr(norm, "_fused_norm_weight", None)
+    if cached is not None:
+        return cached
+    w = norm.weight
+    if getattr(norm, "use_gemma", False):
+        return (w.float() + 1.0).to(w.dtype)
+    return w
+
+
+def _precompute_fused_norm_weights(module: nn.Module) -> None:
+    """Bake ``(1 + weight)`` once for every gemma RMSNorm under ``module``.
+
+    Caches the result on each norm as ``_fused_norm_weight`` so the fused
+    AllReduce+RMSNorm path reads a ready tensor instead of recomputing the
+    cast+add every forward. Non-gemma norms are left untouched (the fused op
+    uses their ``weight`` directly). Must run after weights are loaded onto the
+    device; the cached tensor is a plain attribute, not a registered buffer, so
+    it stays out of the state dict.
+    """
+    for norm in module.modules():
+        if isinstance(norm, RMSNorm) and getattr(norm, "use_gemma", False):
+            w = norm.weight
+            norm._fused_norm_weight = (w.float() + 1.0).to(w.dtype)
+
+
 class Qwen3NextGate(nn.Module):
 
     def __init__(
@@ -431,7 +472,8 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                         residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
+                        norm_weight=_fused_norm_weight(
+                            self.next_layer_layernorm),
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:
@@ -524,8 +566,19 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
 
         self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
 
-        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp and self.enable_attention_dp
-        self.disable_attn_allreduce = (self.mapping.tp_size == 1
+        # POST_MOE_FUSION fuses the MoE-output all-reduce with the next layer's
+        # RMSNorm. It is a tensor-parallel (TEP) optimization: it is only valid
+        # when ranks share the same tokens (not attention_dp, where each rank holds
+        # different tokens and the MoE block does no cross-rank all-reduce). This
+        # mirrors the DeepSeek-V3 pattern (POST == PRE in the non-attention_dp path).
+        # NOTE: the prior `and self.enable_attention_dp` made this always False
+        # (PRE already implies not-attention_dp), silently disabling the fusion.
+        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
+        # When PRE_MOE_FUSION is on, the attention all-reduce is deferred to the
+        # fused PRE all-reduce+RMSNorm, so disable the in-attention all-reduce to
+        # avoid reducing twice.
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
@@ -558,13 +611,14 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             **kwargs,
         )
 
-        if self.fusion_config.PRE_MOE_FUSION and self.enable_attention_dp:
+        if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
                     fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                     residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
+                    norm_weight=_fused_norm_weight(
+                        self.post_attention_layernorm),
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
         else:
@@ -572,12 +626,12 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        # The fully-fused do_finalize=False MoE path (MoEAllReduce on the
+        # unfinalized expert output) is not implemented by Qwen3NextSparseMoeBlock
+        # (it raises NotImplementedError). Keep do_finalize=True so POST_MOE_FUSION
+        # still fuses the *finalized* MoE all-reduce with the next layer's RMSNorm
+        # via the do_finalize branch below, without hitting the unimplemented path.
+        do_finalize = True
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
@@ -595,7 +649,8 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                         residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
+                        norm_weight=_fused_norm_weight(
+                            self.next_layer_layernorm),
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:
@@ -988,3 +1043,6 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+        # Bake (1 + weight) once for every gemma RMSNorm so the fused
+        # AllReduce+RMSNorm path doesn't recompute the cast+add every forward.
+        _precompute_fused_norm_weights(self)

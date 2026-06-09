@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/common/ncclUtils.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
@@ -684,6 +685,10 @@ private:
         allreduce_fusion_params.residual_out = nullptr;
         allreduce_fusion_params.norm_out = nullptr;
         allreduce_fusion_params.trigger_completion_at_end = trigger_completion_at_end;
+        // Opt-in gemma-style RMSNorm (scale by 1+gamma) inside the fused AR+RMSNorm
+        // kernel. Off by default so behavior is identical to baseline for all other
+        // models; enabled for Qwen3-Next/Qwen3.5 (all-gemma norms) via env var.
+        allreduce_fusion_params.use_gemma = tensorrt_llm::common::getBoolEnv("TLLM_QWEN3_AR_FUSION_GEMMA_NORM");
 
         // Determine if using oneshot or twoshot allreduce kernel in case using MIN_LATENCY strategy.
         if (strategy == AllReduceStrategyType::MIN_LATENCY)
