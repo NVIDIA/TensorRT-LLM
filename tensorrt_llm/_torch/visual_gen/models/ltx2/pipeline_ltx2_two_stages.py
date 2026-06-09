@@ -924,6 +924,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         if not self.model_config.cuda_graph.enable:
             return
 
+        if not _persistent_lora_weights_enabled():
+            raise RuntimeError(
+                "LTX-2 two-stage CUDA graph requires "
+                f"{_LTX2_PERSISTENT_LORA_WEIGHTS_ENV}=1. "
+                "Disable CUDA graph or enable persistent LoRA weights."
+            )
+
         runner = _LTX2TwoStageCUDAGraphRunner(
             CUDAGraphRunnerConfig(use_cuda_graph=True),
             self._current_lora_cuda_graph_state,

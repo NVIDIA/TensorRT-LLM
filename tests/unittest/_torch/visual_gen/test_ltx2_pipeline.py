@@ -16,6 +16,7 @@ Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 import gc
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -1173,6 +1174,18 @@ class TestLTX2TwoStageLoRAHelpers:
         assert original_key != merged_key
         assert original_key[-1] == ("ltx2_two_stage_lora_state", "original")
         assert merged_key[-1] == ("ltx2_two_stage_lora_state", "merged")
+
+    def test_two_stage_cuda_graph_requires_persistent_lora_env(self, monkeypatch):
+        """Two-stage CUDA graph must fail fast unless persistent LoRA is enabled."""
+        monkeypatch.delenv(ltx2_two_stages._LTX2_PERSISTENT_LORA_WEIGHTS_ENV, raising=False)
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.model_config = SimpleNamespace(
+            cuda_graph=SimpleNamespace(enable=True),
+            torch_compile=SimpleNamespace(enable=False),
+        )
+
+        with pytest.raises(RuntimeError, match="TRTLLM_LTX2_PERSISTENT_LORA_WEIGHTS=1"):
+            pipeline._setup_cuda_graphs()
 
     def test_persistent_bf16_cache_reuses_weight_storage(self):
         """Persistent BF16 cache swaps between the same original and merged tensors."""
