@@ -1179,7 +1179,7 @@ class TestLTX2TwoStageLoRAHelpers:
         """Two-stage CUDA graph must fail fast unless persistent LoRA is enabled."""
         monkeypatch.delenv(ltx2_two_stages._LTX2_PERSISTENT_LORA_WEIGHTS_ENV, raising=False)
         pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
-        pipeline.model_config = SimpleNamespace(
+        pipeline.pipeline_config = SimpleNamespace(
             cuda_graph=SimpleNamespace(enable=True),
             torch_compile=SimpleNamespace(enable=False),
         )

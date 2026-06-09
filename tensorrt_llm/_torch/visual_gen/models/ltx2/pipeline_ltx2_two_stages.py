@@ -921,7 +921,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
     def _setup_cuda_graphs(self):
         """Wrap transformer.forward with a LoRA-state-aware CUDA graph key."""
-        if not self.model_config.cuda_graph.enable:
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
         if not _persistent_lora_weights_enabled():
@@ -935,7 +935,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             CUDAGraphRunnerConfig(use_cuda_graph=True),
             self._current_lora_cuda_graph_state,
         )
-        compile_note = " (with torch.compile)" if self.model_config.torch_compile.enable else ""
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
             "CUDA graph runner: wrapping LTX-2 two-stage transformer.forward "
             f"with LoRA state key{compile_note}"
