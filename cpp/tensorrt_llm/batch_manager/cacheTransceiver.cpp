@@ -806,9 +806,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else
                 {
-                    TLLM_LOG_ERROR("Future returned unexpected status for request %ld. Marking as error", requestId);
+                    TLLM_LOG_ERROR(
+                        "Future returned unexpected status for request %ld. Recording as failed.", requestId);
 
-                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
                         mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
                     it = mSenderFutures.erase(it);
@@ -817,7 +817,6 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR("Error occurred during context transfer for request %ld: %s", requestId, e.what());
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                 recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
                     mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
                 it = mSenderFutures.erase(it);
@@ -1007,13 +1006,18 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             {
                 it->second.get();
                 bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                if (failed)
+                {
+                    // The receiver uses the error state as a local transfer-failed signal.
+                    // Keep that signal local until the consensus outcome commits it globally.
+                    request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+                }
                 recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
                     mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
             }
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR("Error occurred during generation transfer for request %ld: %s", requestId, e.what());
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                 recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedRequesterRequestIds,
                     mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
             }
