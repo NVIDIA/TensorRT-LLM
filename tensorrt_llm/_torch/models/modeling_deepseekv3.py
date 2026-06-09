@@ -898,11 +898,16 @@ class DeepseekV3Gate(nn.Module):
         w = weights[0].get("weight")
         bias = weights[0].get("e_score_correction_bias")
         if not allow_partial_loading:
-            assert w is not None and bias is not None, (
-                "DeepseekV3Gate expects 'weight' and 'e_score_correction_bias' "
-                "when partial loading is disabled")
+            assert w is not None, (
+                "DeepseekV3Gate expects 'weight' when partial loading is "
+                "disabled")
         if w is not None:
             self.weight.copy_(w[:])
+        # e_score_correction_bias is specific to V3's sigmoid routing with
+        # auxiliary-loss-free load balancing; DeepSeek-V2-Lite checkpoints
+        # (scoring_func=softmax) legitimately omit it, so it stays optional
+        # even when partial loading is disabled (the parameter is
+        # zero-initialized).
         if bias is not None:
             self.e_score_correction_bias.copy_(bias[:].to(
                 self.e_score_correction_bias.dtype))
