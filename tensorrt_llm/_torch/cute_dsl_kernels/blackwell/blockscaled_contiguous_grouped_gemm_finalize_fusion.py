@@ -1756,8 +1756,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 pipeline.PipelineUserType.Consumer, self.num_meta_stage
             )
 
-            token_idx = cutlass.Int32(0)
-
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
 
@@ -1773,15 +1771,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
-                mma_tile_coord_mnl = (
-                    tile_info[0] // cute.size(tiled_mma.thr_id.shape),
-                    tile_info[1],
-                    tile_info[2],
-                )
-                #
-                # Get alpha for current group
-                #
-
                 tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                 permuted_row = tile_m_start + epi_tidx
                 is_valid_row = permuted_row < tile_info[4]
@@ -1866,7 +1855,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                 # Whole-row async bulk reduce (smem -> global scatter-add).
                 if is_valid_row:
-                    coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
+                    coord_n = tile_info[1] * self.cta_tile_shape_mnk[1]
                     scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), out)
                     if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
                         blk_reduce_bf16(
