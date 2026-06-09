@@ -36,6 +36,7 @@
 #include <nanobind/stl/vector.h>
 #include <sstream>
 
+#include <cstring>
 #include <optional>
 #include <vector>
 
@@ -591,7 +592,15 @@ void initRequestBindings(nb::module_& m)
 
     auto requestGetstate = [](tle::Request const& self)
     {
-        return nb::make_tuple(self.getInputTokenIds(), self.getMaxTokens(), self.getStreaming(),
+        // Serialize input_token_ids as a raw int32 byte buffer instead of a Python
+        // list[int]: nanobind casts VecTokens element-by-element (a PyLong storm,
+        // ISL-proportional) on every Request pickle -- the request broadcast and the
+        // RPC IPC submit. A bytes blob is a memcpy, ~order-of-magnitude cheaper.
+        // Paired with requestSetstate.
+        auto const& inputTokenIds = self.getInputTokenIds();
+        auto inputTokenIdsBytes = nb::bytes(
+            reinterpret_cast<char const*>(inputTokenIds.data()), inputTokenIds.size() * sizeof(VecTokens::value_type));
+        return nb::make_tuple(std::move(inputTokenIdsBytes), self.getMaxTokens(), self.getStreaming(),
             self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
             self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getExternalDraftTokensConfig(),
             self.getPromptTuningConfig(), self.getMultimodalInput(), self.getMultimodalEmbedding(),
@@ -608,8 +617,12 @@ void initRequestBindings(nb::module_& m)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        new (&self) tle::Request(nb::cast<VecTokens>(state[0]), nb::cast<SizeType32>(state[1]),
-            nb::cast<bool>(state[2]), nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
+        // input_token_ids is a raw int32 byte buffer (see requestGetstate).
+        auto const inputTokenIdsBytes = nb::cast<nb::bytes>(state[0]);
+        VecTokens inputTokenIds(inputTokenIdsBytes.size() / sizeof(VecTokens::value_type));
+        std::memcpy(inputTokenIds.data(), inputTokenIdsBytes.c_str(), inputTokenIdsBytes.size());
+        new (&self) tle::Request(std::move(inputTokenIds), nb::cast<SizeType32>(state[1]), nb::cast<bool>(state[2]),
+            nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
             nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<SizeType32>>(state[6]),
             nb::cast<std::optional<std::vector<SizeType32>>>(state[7]),
             nb::cast<std::optional<std::list<VecTokens>>>(state[8]),
