@@ -104,11 +104,18 @@ features are ready:
 
 ## How to run
 
-### Automatic QA stress run
+### Scheduled QA stress run
 
 The C++/V1 DeepSeek marathon is registered in
-`tests/integration/test_lists/qa/llm_function_stress.txt` for scheduled
-QA stress runs. The registered entry is:
+`tests/integration/test_lists/qa/llm_function_stress.txt`, which makes
+it eligible for the QA/Jenkins job that consumes that stress list. This
+PR does not create or modify the scheduler for that job; the exact
+cadence and wall-clock start time are owned by QA CI configuration
+outside this directory. The in-repo QA README describes QA lists as
+regular daily/release and weekly/release/on-demand coverage, but does
+not define a file-specific cadence for `llm_function_stress.txt`.
+
+The registered entry is:
 
 ```text
 stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_cpp_v1_deepseek.yaml] TIMEOUT (45)
@@ -123,7 +130,7 @@ pytest --test-list=../test_lists/qa/llm_function_stress.txt \
   -s -v
 ```
 
-The automatic runner must use the normal TRT-LLM integration container
+The scheduled runner must use the normal TRT-LLM integration container
 or virtual environment with GPU access, `trtllm-serve` on `PATH`, and
 `LLM_MODELS_ROOT` set so `DeepSeek-V3-Lite/bf16` resolves to local
 model weights. The current registered run is `log_only`: setup can
