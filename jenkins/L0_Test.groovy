@@ -1539,6 +1539,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
   while (true) {
     attempt++
+    long attemptStartMs = System.currentTimeMillis()
     try {
       if (attempt > 1) {
         echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${SLURM_INFRA_RETRY_MAX + 1}"
@@ -1592,6 +1593,21 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.SLURM, c, attempt, effectiveMax, 60L * 1000L, true)) {
         echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
              "but remaining CI timeout budget is too small for another SLURM attempt. Failing without retry."
+        throw e
+      }
+
+      // CI-budget gate: a retry costs roughly as long as the attempt that just
+      // failed, plus the cooldown. If the build deadline (env.CI_DEADLINE_MS,
+      // set by initializeCiBudget) can't cover that, don't start an attempt
+      // that will only be killed by the pipeline timeout. No-op when no
+      // deadline is configured (canSpendCiBudget returns true).
+      long lastAttemptMs = System.currentTimeMillis() - attemptStartMs
+      if (!trtllm_utils.canSpendCiBudget(pipeline, [
+              estimateMs: lastAttemptMs, backoffMs: 60000L, safetyMs: 5L * 60L * 1000L,
+              label: "${stageName} SLURM retry", logDecision: true])) {
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}), but " +
+             "insufficient CI budget remaining for another ~${Math.floorDiv(lastAttemptMs, 60000L)}min " +
+             "attempt + cooldown. Not retrying."
         throw e
       }
 
@@ -3879,6 +3895,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     def lastSeverity = null
     while (true) {
         attempt++
+        long attemptStartMs = System.currentTimeMillis()
         try {
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${K8S_INFRA_RETRY_MAX + 1}"
@@ -3937,6 +3954,20 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, attempt, effectiveMax, 60L * 1000L, true)) {
                 echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
                      "but remaining CI timeout budget is too small for another K8s attempt. Failing without retry."
+                throw e
+            }
+
+            // CI-budget gate: estimate the next attempt's cost from the one
+            // that just failed plus the cooldown; skip the retry if the build
+            // deadline (env.CI_DEADLINE_MS, set by initializeCiBudget) can't
+            // cover it. No-op when no deadline is configured.
+            long lastAttemptMs = System.currentTimeMillis() - attemptStartMs
+            if (!trtllm_utils.canSpendCiBudget(pipeline, [
+                    estimateMs: lastAttemptMs, backoffMs: 60000L, safetyMs: 5L * 60L * 1000L,
+                    label: "${stageName} K8s retry", logDecision: true])) {
+                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}), but " +
+                     "insufficient CI budget remaining for another ~${Math.floorDiv(lastAttemptMs, 60000L)}min " +
+                     "attempt + cooldown. Not retrying."
                 throw e
             }
 
@@ -4966,6 +4997,12 @@ pipeline {
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    // Establish the CI time budget from the pipeline-level
+                    // timeout (24h, see options{} above). This sets
+                    // env.CI_DEADLINE_MS, which the infra-retry loops read via
+                    // trtllm_utils.canSpendCiBudget to avoid starting a retry
+                    // that cannot finish before the build deadline.
+                    globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                 }
             }
         }
