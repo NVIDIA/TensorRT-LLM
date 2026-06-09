@@ -1329,6 +1329,20 @@ def getCommonParameters()
     ]
 }
 
+// Strip cbts_input_json_b64 before passing testFilter as a Jenkins parameter.
+// The b64 payload can be up to 256 KB; combined with other env vars it can
+// exceed ARG_MAX and cause "git: error=7, Argument list too long" on agents.
+// Layer 2 stage filtering survives; Layer 3 test-db regeneration falls back
+// to the source test-db on agents that don't receive the piggyback.
+def _testFilterForDownstream(testFilter) {
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts == null || !cbts.containsKey('cbts_input_json_b64')) {
+        return testFilter
+    }
+    def cbtsStripped = cbts.findAll { k, v -> k != 'cbts_input_json_b64' }
+    return testFilter + [(CBTS_RESULT): cbtsStripped]
+}
+
 def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
@@ -1427,7 +1441,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String testFilterJson = writeJSON returnText: true, json: _testFilterForDownstream(testFilter)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
@@ -1483,7 +1497,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def testFilterJson = writeJSON returnText: true, json: _testFilterForDownstream(testFilter)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
@@ -1539,7 +1553,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String testFilterJson = writeJSON returnText: true, json: _testFilterForDownstream(testFilter)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
@@ -1594,7 +1608,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def testFilterJson = writeJSON returnText: true, json: _testFilterForDownstream(testFilter)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
