@@ -16,6 +16,16 @@ speculative_config:
   decoding_type: MTP
   num_nextn_predict_layers: 6
   mtp_eagle_one_model: true
+# Attention-DP request balancer (PyExecutor._balance_adp_requests). Active because
+# enable_attention_dp is set below. Balances per-rank decode load so the busiest rank
+# does not gate every MoE all-to-all collective step (the collective syncs all ranks),
+# which otherwise inflates inter-token latency. Measured +64-111% output-token throughput
+# at concurrency 128/256 on SuperV3-MTP NVFP4 attention-DP serving. Trade-off: defers
+# prefill, raising TTFT at high concurrency; tune the wait iters if TTFT is the priority.
+attention_dp_config:
+  enable_balance: true
+  batching_wait_iters: 10
+  timeout_iters: 16
 transforms:
   detect_sharding:
     allreduce_strategy: NCCL
