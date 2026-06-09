@@ -17,11 +17,7 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
-from auto_deploy._utils_test._torch_test_utils import (
-    fp4_compatible,
-    fp8_compatible,
-    trtllm_ops_available,
-)
+from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
 from tensorrt_llm._torch.auto_deploy.utils.fp8_dequant import (  # noqa: E402

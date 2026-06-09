@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# DeepSeek V4 Flash PR1 registry smoke config: 5 layers with monolithic decode CUDA graph.
+# DeepSeek V4 Flash full-layer config for generation quality validation with monolithic decode CUDA graph.
 attn_backend: deepseek_v4_sparse
 compile_backend: torch-cudagraph
 model_factory: DeepseekV4AutoModelForCausalLM
@@ -26,11 +26,12 @@ cuda_graph_config:
   max_batch_size: 2
   batch_sizes: [1, 2]
 model_kwargs:
-  num_hidden_layers: 5
   skip_mtp: true
   ad_rope_cache_len: 512
   ad_compress_max_seq_len: 512
 transforms:
+  load_weights:
+    disable_preload: true
   fuse_rmsnorm:
     rmsnorm_backend: torch
   detect_sharding:

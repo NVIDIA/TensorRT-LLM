@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from auto_deploy._utils_test._model_test_utils import assert_rmse_close
+from _model_test_utils import assert_rmse_close
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.export import Dim
 from torch.fx import Graph
