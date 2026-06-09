@@ -32,6 +32,30 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Select the RoPE position id for a given rotary half-dim under interleaved mRoPE.
+// Mirrors MRotaryEmbedding.apply_interleaved_rope: section 1 (height) drives
+// dims {1,4,7,...} up to mrope_section1*3, section 2 (width) drives {2,5,8,...}
+// up to mrope_section2*3, everything else uses section 0 (temporal).
+// position_ids is [num_tokens] for the non-mRoPE case (sec is always 0) and
+// [3, num_tokens] (row-major: sec*num_tokens + tokenIdx) for mRoPE.
+__device__ __forceinline__ float selectMRopePosId(int const* position_ids, int tokenIdx, int num_tokens, int half_dim,
+    bool use_mrope, int mrope_section1, int mrope_section2)
+{
+    int sec = 0;
+    if (use_mrope)
+    {
+        if (half_dim % 3 == 1 && half_dim < mrope_section1 * 3)
+        {
+            sec = 1;
+        }
+        else if (half_dim % 3 == 2 && half_dim < mrope_section2 * 3)
+        {
+            sec = 2;
+        }
+    }
+    return static_cast<float>(position_ids[sec * num_tokens + tokenIdx]);
+}
+
 // Perform per-head QK Norm and RoPE in a single kernel.
 // head_dim: the dimension of each head
 // interleave: interleave=!is_neox.
@@ -54,7 +78,12 @@ __global__ void fusedQKNormRopeKernel(
     float high,   // threshold for low frequency
     float attention_factor, // attention_factor applied on cos and sin
     // stop of parameters for yarn
-    bool is_qk_norm // Whether to apply QK norm
+    bool is_qk_norm, // Whether to apply QK norm
+    bool use_gemma,  // Whether QK norm uses Gemma-style RMSNorm (scale by (1 + weight))
+    // parameters for interleaved mRoPE (use_mrope=false -> plain RoPE, single position per token)
+    bool use_mrope,     // Whether to use interleaved mRoPE position selection
+    int mrope_section1, // mrope_section[1] (height); section 0 (temporal) is implied
+    int mrope_section2  // mrope_section[2] (width)
 )
 {
     int const warpsPerBlock = blockDim.x / 32;
@@ -133,7 +162,8 @@ __global__ void fusedQKNormRopeKernel(
         {
             int dim = laneId * numElemsPerThread + i;
             float weight = isQ ? __bfloat162float(q_weight[dim]) : __bfloat162float(k_weight[dim]);
-            elements[i] *= rms_rcp * weight;
+            // Gemma RMSNorm scales by (1 + weight); standard RMSNorm scales by weight.
+            elements[i] *= rms_rcp * (use_gemma ? (1.0f + weight) : weight);
         }
     }
     // Apply RoPE to normalized elements
@@ -141,7 +171,8 @@ __global__ void fusedQKNormRopeKernel(
     float cos_vals[numElemsPerThread];
     float sin_vals[numElemsPerThread];
 
-    float pos_id = static_cast<float>(position_ids[tokenIdx]);
+    // pos_id is selected per rotary half-dim (interleaved mRoPE); for plain RoPE
+    // selectMRopePosId always returns position_ids[tokenIdx].
 
     // TODO: cos sin calculation could be halved.
     if constexpr (interleave)
@@ -180,6 +211,8 @@ __global__ void fusedQKNormRopeKernel(
                     + inv_freq_extrapolation * inv_freq_extrapolation_factor;
             }
 
+            float pos_id = selectMRopePosId(
+                position_ids, tokenIdx, num_tokens, half_dim, use_mrope, mrope_section1, mrope_section2);
             float theta = pos_id * freq;
             __sincosf(theta, &sin_vals[i], &cos_vals[i]);
         }
@@ -221,6 +254,8 @@ __global__ void fusedQKNormRopeKernel(
                     + inv_freq_extrapolation * inv_freq_extrapolation_factor;
             }
 
+            float pos_id = selectMRopePosId(
+                position_ids, tokenIdx, num_tokens, half_dim, use_mrope, mrope_section1, mrope_section2);
             float theta = pos_id * freq;
             __sincosf(theta, &sin_vals[i], &cos_vals[i]);
         }
@@ -279,7 +314,8 @@ __global__ void fusedQKNormRopeKernel(
 void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_q, int const num_heads_k,
     int const num_heads_v, int const head_dim, int const rotary_dim, float const eps, void const* q_weight,
     void const* k_weight, float const base, bool const interleave, int const* position_ids, float factor, float low,
-    float high, float attention_factor, cudaStream_t stream, bool is_qk_norm)
+    float high, float attention_factor, cudaStream_t stream, bool is_qk_norm, bool use_gemma, bool use_mrope,
+    int mrope_section1, int mrope_section2)
 {
     if (factor == 1.0f)
     {
@@ -310,26 +346,29 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     {
     case 64:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeKernel<64, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, rotary_dim, eps,
-                reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
-                base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
+            fusedQKNormRopeKernel<64, INTERLEAVE>
+                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
+                    num_heads_v, rotary_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
+                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens, factor, low, high,
+                    attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
         });
         break;
     case 128:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeKernel<128, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, rotary_dim, eps,
-                reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
-                base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
+            fusedQKNormRopeKernel<128, INTERLEAVE>
+                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
+                    num_heads_v, rotary_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
+                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens, factor, low, high,
+                    attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
         });
         break;
     case 256:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeKernel<256, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, rotary_dim, eps,
-                reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
-                base, position_ids, num_tokens, factor, low, high, attention_factor, is_qk_norm);
+            fusedQKNormRopeKernel<256, INTERLEAVE>
+                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
+                    num_heads_v, rotary_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
+                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens, factor, low, high,
+                    attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
         });
         break;
     default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);

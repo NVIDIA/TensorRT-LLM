@@ -1,6 +1,5 @@
 import copy
 import dataclasses
-import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -23,16 +22,10 @@ from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from .modeling_gemma3 import Gemma3ForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (_MULTIMODAL_ENV_NAME, _is_mm_disagg,
+                                        fuse_input_embeds)
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
-
-_MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
-
-
-# Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
-    return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
 class Gemma3InputProcessor(BaseMultimodalInputProcessor,
@@ -185,7 +178,7 @@ class Gemma3MultiModalProjector(torch.nn.Module):
 class Gemma3VLM(PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig[Gemma3Config]):
-        if _is_disagg():
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Gemma3VLM does not support disaggregated inference yet. Please unset "
                 f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."

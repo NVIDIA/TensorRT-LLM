@@ -39,7 +39,7 @@ static constexpr int WARP_SIZE = 32;
 // Default block size for kernels with small MaxNumExperts (<=128).
 // Large-expert variants (256/384/512) use a smaller block (see pickBlockSize)
 // to reduce register-file pressure and permit higher SM occupancy.
-static constexpr int DEFAULT_BLOCK_SIZE = 1024;
+static constexpr int DEFAULT_BLOCK_SIZE = 128;
 static constexpr int LARGE_BLOCK_SIZE = 256;
 
 template <int MaxNumExperts>
@@ -240,7 +240,7 @@ void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream)
 {
 
-    const uint32_t maxNumBlocks = 1024;
+    const uint32_t maxNumBlocks = 8192;
 
     uint32_t maxNumExperts = nextPowerOfTwo(numExperts) < 32 ? 32 : nextPowerOfTwo(numExperts);
     uint32_t maxNumTopExperts = nextPowerOfTwo(topK);
