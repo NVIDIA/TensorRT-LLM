@@ -123,6 +123,8 @@ def test_single_node_transfer(tmp_path):
             "UCX_PROTO_INFO": "used",
         }
     )
+    sweep_env = cfg["ucx_env_sweep"][0].get("env") or {}
+    env.update({k: str(v) for k, v in sweep_env.items()})
 
     mpi_args = [
         mpirun,
