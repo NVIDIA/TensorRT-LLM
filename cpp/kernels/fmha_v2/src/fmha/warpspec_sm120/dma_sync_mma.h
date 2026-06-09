@@ -182,6 +182,21 @@ struct DMA
         int const bidh_kv = bidh / static_cast<int>(params.h_q_per_kv);
         int const q_row = static_cast<int>(blockIdx.x) * STEP_Q;
 
+        // Per-request token offset into the packed [total_tokens, H, D] buffer.
+        // The Q/K/V TMA descriptors span the whole packed buffer (seq dim =
+        // total_q_seqlen) with a single base pointer, so the seq coordinate must
+        // be the *global* row = cumulative token offset of this batch element
+        // (binfo.sum_s == cu_q_seqlens[bidb]) plus the request-local position.
+        // Without it, every batch element re-reads request 0's tokens.
+        //
+        // halfspec is PACKED_QKV-only, so K and V share each request's token
+        // range with Q -- the KV offset is the same cumulative Q offset. We
+        // deliberately do NOT read binfo.sum_s_kv: cu_kv_seqlens is null on the
+        // self-attention path (only cu_q_seqlens is populated), and sum_s_kv
+        // dereferences it unconditionally in the Single_cta ctor.
+        int const q_seq_offset = binfo.sum_s;
+        int const kv_seq_offset = binfo.sum_s;
+
         // kv-loop range -- MUST match the consumer's exactly (else the
         // consumed-barrier handshake deadlocks). Mirror compute_sync_mma.h.
         int const q_sequence_start = q_row + (binfo.actual_kv_seqlen - binfo.actual_q_seqlen);
@@ -204,13 +219,13 @@ struct DMA
                 int const k_slot = cbw_k.tmaReserve(elect_one_, TX_BYTES_K);
                 uint32_t const k_smem = __nvvm_get_smem_pointer(shared->k_buf(k_slot));
                 uint32_t const k_bar = __nvvm_get_smem_pointer(cbw_k.barrier_ptr(k_slot));
-                int32_t const k_coord[3] = {head_off, bidh_kv, kv_loop};
+                int32_t const k_coord[3] = {head_off, bidh_kv, kv_seq_offset + kv_loop};
                 utmaldg_3d_cta(desc_k, k_smem, k_bar, k_coord, elect_one_);
 
                 int const q_slot = cbw_q.tmaReserve(elect_one_, TX_BYTES_Q);
                 uint32_t const q_smem = __nvvm_get_smem_pointer(shared->q_buf(q_slot));
                 uint32_t const q_bar = __nvvm_get_smem_pointer(cbw_q.barrier_ptr(q_slot));
-                int32_t const q_coord[3] = {head_off, bidh, q_row};
+                int32_t const q_coord[3] = {head_off, bidh, q_seq_offset + q_row};
                 utmaldg_3d_cta(desc_q, q_smem, q_bar, q_coord, elect_one_);
             }
 
@@ -230,7 +245,7 @@ struct DMA
                     int const v_slot = cbw_v.tmaReserve(elect_one_, TX_BYTES_V);
                     uint32_t const v_smem = __nvvm_get_smem_pointer(shared->v_buf(v_slot));
                     uint32_t const v_bar = __nvvm_get_smem_pointer(cbw_v.barrier_ptr(v_slot));
-                    int32_t const v_coord[3] = {dv_off, bidh_kv, kv_off};
+                    int32_t const v_coord[3] = {dv_off, bidh_kv, kv_seq_offset + kv_off};
                     utmaldg_3d_cta(desc_v, v_smem, v_bar, v_coord, elect_one_);
                 }
             }
