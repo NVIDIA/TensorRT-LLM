@@ -3,7 +3,7 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -17,6 +17,11 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
+_MULTIMODAL_RUN_METADATA_KEYS = (
+    "multimodal_item_run_cu_offsets",
+    "multimodal_run_positions",
+    "multimodal_run_lengths",
+)
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
@@ -40,6 +45,79 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     mm_data.clear()
     if mrope_deltas is not None:
         mm_data['mrope_config'] = {'mrope_position_deltas': mrope_deltas}
+
+
+def scan_prompt_order(
+    text: str,
+    placeholder_by_modality: Dict[str, Union[str, Iterable[str]]],
+    expected_counts: Dict[str, int],
+) -> List[Tuple[str, int]]:
+    """Walk a decoded prompt left-to-right and return its multimodal item order.
+
+    Shared scanner behind the per-model `_get_mm_item_order_from_text` hooks
+    (Nano and Qwen3VL): both compute item order from placeholder positions in the
+    decoded prompt; only the placeholder strings differ.
+
+    From a moving cursor, repeatedly pick the nearest next placeholder among
+    modalities still below `expected_counts`, append `(modality, running_index)`,
+    and advance the cursor past that placeholder. A modality may register several
+    placeholder spellings (e.g. a fused long form and a bare short form); on a
+    position tie the longer placeholder wins so the cursor clears the whole long
+    form rather than re-matching its short substring. Falsy placeholder strings
+    are skipped. At the end, raise `ValueError` if any modality's observed count
+    differs from its expected count.
+
+    Args:
+        text: The decoded prompt string to scan.
+        placeholder_by_modality: Maps each modality to one placeholder string or
+            an iterable of placeholder strings.
+        expected_counts: Maps each modality to the number of items expected.
+
+    Returns:
+        The `(modality, item_index)` entries in prompt placeholder order.
+    """
+    placeholders_by_modality: Dict[str, Tuple[str, ...]] = {}
+    for modality, placeholders in placeholder_by_modality.items():
+        if isinstance(placeholders, str):
+            placeholders = (placeholders, )
+        placeholders_by_modality[modality] = tuple(p for p in placeholders if p)
+
+    actual_counts = {modality: 0 for modality in expected_counts}
+    item_order: List[Tuple[str, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        # Best match so far as (position, placeholder_len, modality); a smaller
+        # position wins, and a longer placeholder breaks a position tie.
+        next_match: Optional[Tuple[int, int, str]] = None
+        for modality, placeholders in placeholders_by_modality.items():
+            # A modality may appear in placeholder_by_modality without an entry
+            # in expected_counts (e.g. a model's full placeholder map paired with
+            # a per-request count subset). Treat its expected/actual counts as 0
+            # via `.get` so it is simply skipped rather than raising a KeyError.
+            if actual_counts.get(modality,
+                                 0) >= expected_counts.get(modality, 0):
+                continue
+            for placeholder in placeholders:
+                position = text.find(placeholder, cursor)
+                if position < 0:
+                    continue
+                if (next_match is None or position < next_match[0]
+                        or (position == next_match[0]
+                            and len(placeholder) > next_match[1])):
+                    next_match = (position, len(placeholder), modality)
+        if next_match is None:
+            break
+        position, placeholder_len, modality = next_match
+        item_order.append((modality, actual_counts[modality]))
+        actual_counts[modality] += 1
+        cursor = position + placeholder_len
+
+    for modality, expected in expected_counts.items():
+        if actual_counts[modality] != expected:
+            raise ValueError(
+                f"Expected {expected} {modality} placeholder(s), found "
+                f"{actual_counts[modality]} while resolving prompt order.")
+    return item_order
 
 
 @dataclass
@@ -259,13 +337,233 @@ class MultimodalInput:
                    multimodal_run_positions=mm_run_positions,
                    multimodal_run_lengths=mm_run_lengths)
 
-    def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert data to tensors"""
-        return (
-            # int32 to match the type in TRTLLM SizeType32
-            torch.tensor(self.multimodal_hashes, dtype=torch.int32),
-            torch.tensor(self.multimodal_positions, dtype=torch.int32),
-            torch.tensor(self.multimodal_lengths, dtype=torch.int32))
+
+_SUPPORTED_HASHING_MODALITIES = ("image", "video", "audio")
+
+
+@dataclass(frozen=True)
+class MixedModalItemOrder:
+    """Per-request mixed-modality encode bookkeeping (Python-only).
+
+    Holds the prompt-order spine and each item's encoder-output footprint, and
+    owns the full order lifecycle: parse (`order_from_metadata` /
+    `from_raw_entries`), resolve (`resolve_order`), validate
+    (`validate_order` + the order-only `__post_init__` checks), normalize
+    payload shape (`_normalize`), and project per-modality collections into
+    prompt order (`project_by_order` / `project_uuids_by_order`).
+
+    `MultimodalInput` owns the token-space layout that crosses to C++; this
+    owns the encode-space layout that stays in Python. Not a general bag:
+    exactly `order` + `embedding_lengths` belong on the instance. The prompt
+    position of item i is its index in `order`. Producers that only have the
+    bare prompt order (no per-item lengths yet) call the classmethods/
+    staticmethods directly and never build an instance.
+
+    Named for its discriminator 'prompt'-order spine: this subsystem has three
+    distinct orders (prompt, modality-grouped encode, per-request cache); the
+    `order` field is the prompt one.
+    """
+
+    order: Tuple[Tuple[str, int], ...]
+    embedding_lengths: Tuple[int, ...]
+
+    def __post_init__(self):
+        if len(self.order) != len(self.embedding_lengths):
+            raise ValueError(
+                f"order length ({len(self.order)}) != embedding_lengths length "
+                f"({len(self.embedding_lengths)})")
+        seen: set = set()
+        for modality, idx in self.order:
+            if (modality, idx) in seen:
+                raise ValueError(
+                    f"order references {modality}[{idx}] more than once; each "
+                    "item must be referenced exactly once")
+            seen.add((modality, idx))
+
+    # ---- Payload normalization ----
+
+    @staticmethod
+    def _normalize(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
+        """Return modality payloads in list form for item-order validation.
+
+        `multi_modal_data` accepts both a single item and a list of items for a
+        modality, while ordering logic needs item counts and stable indexing.
+        This is not only defensive: it is the canonical boundary between
+        flexible user payload shape and the internal `(modality, item_index)`
+        ordering contract. Non-modality metadata entries are intentionally
+        ignored.
+        """
+        return {
+            modality: items if isinstance(items, list) else [items]
+            for modality, items in mm_data.items()
+            if modality in _SUPPORTED_HASHING_MODALITIES and items is not None
+        }
+
+    # ---- Order constructors (bare prompt-order tuples) ----
+
+    @staticmethod
+    def default_order(
+            mm_items: Dict[str, List[Any]]) -> Tuple[Tuple[str, int], ...]:
+        """Return deterministic modality-major order when no explicit order exists."""
+        return tuple((modality, idx) for modality, items in mm_items.items()
+                     for idx in range(len(items)))
+
+    @staticmethod
+    def from_raw_entries(entries: Iterable[Any], *,
+                         source: str) -> Tuple[Tuple[str, int], ...]:
+        """Normalize order metadata to `(modality, item_index)` pairs.
+
+        Accepted metadata shapes are `(modality, index)` pairs and dicts.
+        """
+        counters: Dict[str, int] = {}
+        item_order: List[Tuple[str, int]] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                modality = entry.get("modality", entry.get("type"))
+                item_index = entry.get("index", entry.get("item_index"))
+                if item_index is None:
+                    item_index = counters.get(modality, 0)
+            else:
+                try:
+                    modality, item_index = entry
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{source} entries must be (modality, index) pairs "
+                        "or dicts") from exc
+            if not isinstance(modality, str):
+                raise ValueError(
+                    f"{source} entry has non-string modality: {entry!r}")
+            item_index = int(item_index)
+            item_order.append((modality, item_index))
+            counters[modality] = max(counters.get(modality, 0), item_index + 1)
+        return tuple(item_order)
+
+    @classmethod
+    def order_from_metadata(
+        cls, multimodal_data: Optional[Dict[str, Any]]
+    ) -> Optional[Tuple[Tuple[str, int], ...]]:
+        """Extract the explicit prompt order from processed metadata.
+
+        Returns `None` when no ordering key is present, so callers can
+        distinguish 'absent' from 'empty'.
+        """
+        if not multimodal_data:
+            return None
+        if "multimodal_item_order" in multimodal_data:
+            return cls.from_raw_entries(
+                multimodal_data["multimodal_item_order"],
+                source="multimodal_item_order")
+        return None
+
+    @classmethod
+    def resolve_order(
+        cls,
+        mm_data: Dict[str, Any],
+        *,
+        multimodal_data: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Tuple[str, int], ...]:
+        """Resolve the prompt order for every multimodal item in a request.
+
+        Every mixed preprocess path bakes an explicit `multimodal_item_order`
+        into the processed metadata (the text paths always did; the token-id
+        fast path does after expanding from the real prompt token IDs), so this
+        is purely `metadata | default_order`: the baked order wins when present,
+        otherwise the deterministic modality-major default applies. Returns a
+        bare `(modality, index)` tuple; the producer pairs it with per-item
+        lengths separately (Option Y: the dict keys remain the wire format and a
+        full context is built only at the point of use).
+        """
+        mm_items = cls._normalize(mm_data)
+        order = cls.order_from_metadata(multimodal_data)
+        if order is None:
+            order = cls.default_order(mm_items)
+        cls.validate_order(order, mm_items)
+        return order
+
+    @classmethod
+    def from_metadata(
+        cls, multimodal_data: Optional[Dict[str, Any]],
+        embedding_lengths: Optional[Iterable[int]]
+    ) -> Optional["MixedModalItemOrder"]:
+        """Pair the explicit prompt order (if any) with per-item lengths.
+
+        Returns `None` when no `multimodal_item_order` key is present, so the
+        per-item extractors can fall back to a synthesized default order.
+
+        Raises `ValueError` when an order IS present but `embedding_lengths` is
+        `None`: the two are baked together for a mixed-modality request, so a
+        present-order/missing-lengths metadata state is inconsistent. We surface
+        it explicitly here instead of letting `tuple(int(x) for x in None)` raise
+        an opaque `TypeError`.
+        """
+        order = cls.order_from_metadata(multimodal_data)
+        if order is None:
+            return None
+        if embedding_lengths is None:
+            raise ValueError(
+                "multimodal_item_order is present but multimodal_embedding_lengths "
+                "is missing; a mixed-modality request must bake both together.")
+        return cls(order=order,
+                   embedding_lengths=tuple(int(x) for x in embedding_lengths))
+
+    # ---- Validation ----
+
+    @staticmethod
+    def validate_order(order: Tuple[Tuple[str, int], ...],
+                       mm_items: Dict[str, List[Any]]) -> None:
+        """Verify `order` references every multimodal item exactly once."""
+        # Track the distinct indices seen per modality (a set, not a count) so a
+        # repeated reference cannot masquerade as full coverage.
+        seen: Dict[str, set] = {modality: set() for modality in mm_items}
+        for modality, idx in order:
+            if modality not in mm_items:
+                raise ValueError(
+                    f"Multimodal item order references modality '{modality}', "
+                    f"but multi_modal_data only has {list(mm_items)}")
+            if idx < 0 or idx >= len(mm_items[modality]):
+                raise ValueError(
+                    f"Multimodal item order references {modality}[{idx}], "
+                    f"but that modality has {len(mm_items[modality])} item(s)")
+            if idx in seen[modality]:
+                raise ValueError(
+                    f"Multimodal item order references {modality}[{idx}] more "
+                    f"than once; each item must be referenced exactly once")
+            seen[modality].add(idx)
+        # With the range check above and per-modality uniqueness, matching the
+        # distinct-index count to len(items) guarantees exactly-once coverage by
+        # pigeonhole.
+        for modality, items in mm_items.items():
+            if len(seen[modality]) != len(items):
+                raise ValueError(
+                    f"Multimodal item order covers {len(seen[modality])} "
+                    f"{modality} item(s), expected {len(items)}")
+
+    # ---- Projections ----
+
+    @staticmethod
+    def project_by_order(order: Tuple[Tuple[str, int], ...],
+                         values_by_key: Dict[str, List[Any]]) -> List[Any]:
+        """Project per-modality values into prompt order (bare-order form)."""
+        return [values_by_key[modality][idx] for modality, idx in order]
+
+    @staticmethod
+    def project_uuids_by_order(
+        order: Tuple[Tuple[str, int], ...],
+        mm_uuids: Optional[Dict[str, List[Optional[str]]]],
+    ) -> Optional[List[Optional[str]]]:
+        """Project optional per-modality UUIDs into prompt order (bare-order form)."""
+        if mm_uuids is None:
+            return None
+        ordered: List[Optional[str]] = []
+        for modality, idx in order:
+            modality_uuids = mm_uuids.get(modality)
+            if modality_uuids is None:
+                ordered.append(None)
+                continue
+            if not isinstance(modality_uuids, list):
+                modality_uuids = [modality_uuids]
+            ordered.append(modality_uuids[idx])
+        return ordered
 
 
 @dataclass
@@ -329,6 +627,9 @@ class MultimodalRuntimeData:
 # Extend only after auditing each key's consumers.
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_lengths",
+    "multimodal_item_order",
+    *_MULTIMODAL_RUN_METADATA_KEYS,
 })
 
 
@@ -365,7 +666,8 @@ class MultimodalParams:
                 "video_height": torch.Tensor | List[int],
                 "video_width": torch.Tensor | List[int],
             },
-            "special_token_offsets": List[int],          # List of starting positions of special tokens in the union of all multimodal token chunks, if available
+            # List of starting positions of special tokens in the union of all multimodal token chunks, if available
+            "special_token_offsets": List[int],
             # ... other modalities
         }
     """
@@ -831,8 +1133,9 @@ def find_mm_token_lengths(
     for modality, items in mm_items.items():
         if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
             raise AttributeError(
-                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
-            )
+                f"Input processor {type(input_processor).__name__} does not have "
+                f"'get_num_tokens_per_{modality}' method required for "
+                "multimodal hashing.")
 
         video_grid_thw_for_items = None
         if modality == "video" and video_grid_thw is not None:
@@ -896,6 +1199,9 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_lengths",
+    "multimodal_item_order",
+    *_MULTIMODAL_RUN_METADATA_KEYS,
     "special_token_offsets",
     "layout_metadata",
 })
@@ -1130,6 +1436,80 @@ def _find_mm_token_runs_from_mask(
         item_run_cu_offsets.append(len(run_positions))
 
     return item_run_cu_offsets, run_positions, run_lengths
+
+
+def _find_mm_embedding_lengths_from_masks(
+    mm_mask: torch.Tensor,
+    embed_mask: torch.Tensor,
+    num_mm_tokens: List[int],
+) -> List[int]:
+    """Compute per-item embedding-token counts from multimodal masks."""
+    if not torch.any(mm_mask):
+        return []
+
+    mm_positions = torch.where(mm_mask)[0]
+    lengths_t = torch.tensor(num_mm_tokens)
+    if mm_positions.numel() != lengths_t.sum().item():
+        raise ValueError(
+            f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
+            f"sum of per-unit lengths ({lengths_t.sum().item()}): "
+            f"num_mm_tokens={num_mm_tokens}")
+
+    embedding_lengths: List[int] = []
+    offset = 0
+    for item_length in num_mm_tokens:
+        item_positions = mm_positions[offset:offset + item_length]
+        offset += item_length
+        embedding_lengths.append(int(embed_mask[item_positions].sum().item()))
+    return embedding_lengths
+
+
+def compute_mm_embedding_lengths(
+    input_ids: Union[torch.Tensor, List[int], np.ndarray],
+    num_mm_tokens: List[int],
+    *,
+    vocab_size: Optional[int],
+    mm_token_ids: Optional[torch.Tensor],
+    mm_special_token_ids: Optional[torch.Tensor],
+) -> List[int]:
+    """Compute per-item multimodal embedding-token counts for one prompt.
+
+    Derives the embed mask from the provided vocab size / multimodal token id
+    predicates, then counts embed-slot tokens per logical item described by
+    `num_mm_tokens`. This is the single source of truth for the mask -> per-item
+    embedding-length derivation shared by the Nano and Qwen3-VL preprocess paths
+    and the registry hashing path.
+
+    Invariant: `num_mm_tokens` MUST be ordered to match the PHYSICAL left-to-right
+    prompt positions of the multimodal items. The mask helpers extract MM token
+    positions via `torch.where(mm_mask)[0]` (left-to-right) and slice them
+    sequentially by `num_mm_tokens`; any other ordering (e.g. modality-major)
+    silently mis-attributes token spans across items. Producers must project the
+    per-item counts through the resolved prompt-item order (see
+    `MixedModalItemOrder`) before calling this.
+
+    Args:
+        input_ids: Prompt token ids (CPU-resident); coerced to a tensor.
+        num_mm_tokens: Per-item multimodal token counts in PHYSICAL left-to-right
+            prompt order (see Invariant above).
+        vocab_size: Tokenizer/model vocab size; positions >= this are embed
+            slots when `mm_token_ids` is not provided.
+        mm_token_ids: Optional explicit embed-slot token ids (takes precedence
+            over `vocab_size`).
+        mm_special_token_ids: Optional in-prompt framing token ids excluded from
+            the embed mask.
+
+    Returns:
+        Per-item embedding-token counts aligned with `num_mm_tokens`.
+    """
+    mm_mask, embed_mask, _ = _compute_mm_masks(
+        _as_cpu_tensor(input_ids),
+        vocab_size=vocab_size,
+        mm_token_ids=mm_token_ids,
+        mm_special_token_ids=mm_special_token_ids,
+    )
+    return _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask,
+                                                 num_mm_tokens)
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
