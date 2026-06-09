@@ -35,8 +35,8 @@ from ..attention_interface import (
     BatchInfo,
     Constant,
     MHACallable,
+    PagedResourceHandler,
     ResourceHandlerDict,
-    UnpagedResourceHandler,
 )
 
 __all__ = [
@@ -338,37 +338,92 @@ def _to_host_long(name: str, tensor: torch.Tensor, length: int) -> torch.Tensor:
     return flat[:length]
 
 
-def _write_swa_cache(
-    kv_seq: torch.Tensor,
-    swa_cache: torch.Tensor,
-    slot_idx: int,
+def _host_page_id_and_offset(
+    cache: torch.Tensor,
+    seq_idx: int,
+    logical_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
+) -> tuple[int, int]:
+    if logical_pos < 0:
+        raise ValueError(f"logical_pos must be non-negative, got {logical_pos}")
+    tokens_per_block = int(cache.shape[1])
+    page_ordinal = logical_pos // tokens_per_block
+    page_offset = logical_pos % tokens_per_block
+    page_start = int(cu_num_pages_host[seq_idx].item())
+    page_end = int(cu_num_pages_host[seq_idx + 1].item())
+    page_table_idx = page_start + page_ordinal
+    if page_table_idx >= page_end:
+        raise ValueError(
+            f"Sequence {seq_idx} logical position {logical_pos} needs page ordinal "
+            f"{page_ordinal}, but only {page_end - page_start} page(s) are active"
+        )
+    return int(cache_loc_host[page_table_idx].item()), page_offset
+
+
+def _host_position_is_valid(
+    cache: torch.Tensor,
+    seq_idx: int,
+    logical_pos: int,
+    cu_num_pages_host: torch.Tensor,
+) -> bool:
+    if logical_pos < 0:
+        return False
+    tokens_per_block = int(cache.shape[1])
+    page_ordinal = logical_pos // tokens_per_block
+    page_start = int(cu_num_pages_host[seq_idx].item())
+    page_end = int(cu_num_pages_host[seq_idx + 1].item())
+    return page_start + page_ordinal < page_end
+
+
+def _write_paged_cache_rows(
+    values: torch.Tensor,
+    cache: torch.Tensor,
+    seq_idx: int,
     input_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
 ) -> None:
     if input_pos < 0:
         raise ValueError(f"input_pos must be non-negative, got {input_pos}")
-    end_pos = input_pos + kv_seq.shape[0]
-    if end_pos > swa_cache.shape[1]:
-        raise ValueError(
-            f"Sequence write [{input_pos}, {end_pos}) exceeds SWA cache length {swa_cache.shape[1]}"
+    if values.numel() == 0:
+        return
+
+    cursor = 0
+    logical_pos = input_pos
+    tokens_per_block = int(cache.shape[1])
+    while cursor < values.shape[0]:
+        page_id, page_offset = _host_page_id_and_offset(
+            cache, seq_idx, logical_pos, cu_num_pages_host, cache_loc_host
         )
-    swa_cache[slot_idx, input_pos:end_pos].copy_(kv_seq.to(swa_cache.dtype))
+        write_len = min(values.shape[0] - cursor, tokens_per_block - page_offset)
+        cache[page_id, page_offset : page_offset + write_len].copy_(
+            values[cursor : cursor + write_len].to(cache.dtype)
+        )
+        cursor += write_len
+        logical_pos += write_len
 
 
-def _write_mhc_cache(
-    kv_seq: torch.Tensor,
-    mhc_cache: torch.Tensor,
-    slot_idx: int,
-    row_idx: int,
+def _write_paged_cache_rows_at_positions(
+    values: torch.Tensor,
+    cache: torch.Tensor,
+    seq_idx: int,
+    logical_positions: torch.Tensor,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
 ) -> None:
-    if row_idx < 0:
-        raise ValueError(f"row_idx must be non-negative, got {row_idx}")
-    end_pos = row_idx + kv_seq.shape[0]
-    if end_pos > mhc_cache.shape[1]:
-        raise ValueError(
-            f"Compressed row write [{row_idx}, {end_pos}) exceeds MHC cache length "
-            f"{mhc_cache.shape[1]}"
+    if values.numel() == 0:
+        return
+    positions_host = logical_positions.detach().cpu().to(torch.long).flatten()
+    for row_idx, logical_pos_tensor in enumerate(positions_host):
+        page_id, page_offset = _host_page_id_and_offset(
+            cache,
+            seq_idx,
+            int(logical_pos_tensor.item()),
+            cu_num_pages_host,
+            cache_loc_host,
         )
-    mhc_cache[slot_idx, row_idx:end_pos].copy_(kv_seq.to(mhc_cache.dtype))
+        cache[page_id, page_offset].copy_(values[row_idx].to(cache.dtype))
 
 
 def _slice_sequence_tokens(
@@ -432,17 +487,25 @@ def _cached_sparse_attention_from_positions(
     q_token: torch.Tensor,
     attn_sink: torch.Tensor,
     swa_cache: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
     positions: torch.Tensor,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    positions_long = positions.to(torch.long)
-    gather_positions = positions_long.clamp(min=0)
-    selected_kv = swa_cache[slot_idx, gather_positions].to(q_token.dtype).unsqueeze(0)
-    local_topk = torch.arange(positions_long.numel(), dtype=torch.long, device=q_token.device).view(
+    selected_kv, valid_rows = _gather_paged_rows_from_positions(
+        swa_cache,
+        seq_idx,
+        positions,
+        cu_num_pages_host,
+        cache_loc_host,
+        q_token.dtype,
+    )
+    selected_kv = selected_kv.unsqueeze(0)
+    local_topk = torch.arange(positions.numel(), dtype=torch.long, device=q_token.device).view(
         1, 1, -1
     )
-    local_topk = torch.where(positions_long.view(1, 1, -1) < 0, -1, local_topk)
+    local_topk = torch.where(valid_rows.view(1, 1, -1), local_topk, torch.full_like(local_topk, -1))
     return _deepseek_v4_sparse_attention(
         q_token.view(1, 1, *q_token.shape),
         selected_kv,
@@ -456,8 +519,10 @@ def _cached_local_window_attention(
     q_seq: torch.Tensor,
     attn_sink: torch.Tensor,
     swa_cache: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
     input_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
     window_size: int,
     softmax_scale: float,
 ) -> torch.Tensor:
@@ -471,8 +536,10 @@ def _cached_local_window_attention(
                 q_seq[token_offset],
                 attn_sink,
                 swa_cache,
-                slot_idx,
+                seq_idx,
                 positions,
+                cu_num_pages_host,
+                cache_loc_host,
                 softmax_scale,
             )
         )
@@ -481,32 +548,70 @@ def _cached_local_window_attention(
     return torch.stack(outputs, dim=0)
 
 
-def _gather_unpaged_rows(
+def _gather_paged_rows_from_positions(
     cache: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
+    positions: torch.Tensor,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
+    dtype: torch.dtype,
+    width: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    positions_host = positions.detach().cpu().to(torch.long).flatten()
+    rows = []
+    valid_rows = []
+    row_width = cache.shape[-1] if width is None else width
+    zero = cache.new_zeros(row_width)
+    for logical_pos_tensor in positions_host:
+        logical_pos = int(logical_pos_tensor.item())
+        is_valid = _host_position_is_valid(cache, seq_idx, logical_pos, cu_num_pages_host)
+        valid_rows.append(is_valid)
+        if is_valid:
+            page_id, page_offset = _host_page_id_and_offset(
+                cache, seq_idx, logical_pos, cu_num_pages_host, cache_loc_host
+            )
+            row = cache[page_id, page_offset]
+            if width is not None:
+                row = row[..., :width]
+            rows.append(row.to(dtype))
+        else:
+            rows.append(zero.to(dtype))
+
+    if rows:
+        gathered = torch.stack(rows, dim=0)
+    else:
+        gathered = cache.new_empty(0, row_width, dtype=dtype)
+    valid = torch.tensor(valid_rows, dtype=torch.bool, device=positions.device)
+    return gathered.view(*positions.shape, row_width), valid.view(positions.shape)
+
+
+def _gather_paged_rows(
+    cache: torch.Tensor,
+    seq_idx: int,
     start_pos: int,
     end_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
     dtype: torch.dtype,
     width: Optional[int] = None,
 ) -> torch.Tensor:
     if start_pos < 0 or end_pos < start_pos:
         raise ValueError(f"Invalid cache slice [{start_pos}, {end_pos})")
-    if end_pos > cache.shape[1]:
-        raise ValueError(
-            f"Cache slice [{start_pos}, {end_pos}) exceeds cache length {cache.shape[1]}"
-        )
-    rows = cache[slot_idx, start_pos:end_pos]
-    if width is not None:
-        rows = rows[..., :width]
-    return rows.to(dtype)
+    positions = torch.arange(start_pos, end_pos, dtype=torch.long, device=cache.device)
+    rows, _ = _gather_paged_rows_from_positions(
+        cache, seq_idx, positions, cu_num_pages_host, cache_loc_host, dtype, width=width
+    )
+    return rows
 
 
-def _compressed_row_from_unpaged_state(
+def _compressed_row_from_paged_state(
     compressor_kv_cache: torch.Tensor,
     compressor_gate_cache: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
     row_idx: int,
     row_position_id: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
     compressor_ape: torch.Tensor,
     compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
@@ -539,15 +644,47 @@ def _compressed_row_from_unpaged_state(
                     )
                 )
                 continue
-            kv_state = compressor_kv_cache[slot_idx, position].to(dtype)
-            gate_state = compressor_gate_cache[slot_idx, position].to(dtype)
+            kv_state = _gather_paged_rows(
+                compressor_kv_cache,
+                seq_idx,
+                position,
+                position + 1,
+                cu_num_pages_host,
+                cache_loc_host,
+                dtype,
+            ).squeeze(0)
+            gate_state = _gather_paged_rows(
+                compressor_gate_cache,
+                seq_idx,
+                position,
+                position + 1,
+                cu_num_pages_host,
+                cache_loc_host,
+                dtype,
+            ).squeeze(0)
             kv_rows.append(kv_state[:head_dim])
             gate_rows.append(gate_state[:head_dim] + compressor_ape[offset, :head_dim].to(dtype))
 
         for offset in range(compress_ratio):
             position = anchor + offset
-            kv_state = compressor_kv_cache[slot_idx, position].to(dtype)
-            gate_state = compressor_gate_cache[slot_idx, position].to(dtype)
+            kv_state = _gather_paged_rows(
+                compressor_kv_cache,
+                seq_idx,
+                position,
+                position + 1,
+                cu_num_pages_host,
+                cache_loc_host,
+                dtype,
+            ).squeeze(0)
+            gate_state = _gather_paged_rows(
+                compressor_gate_cache,
+                seq_idx,
+                position,
+                position + 1,
+                cu_num_pages_host,
+                cache_loc_host,
+                dtype,
+            ).squeeze(0)
             kv_rows.append(kv_state[head_dim : 2 * head_dim])
             gate_rows.append(
                 gate_state[head_dim : 2 * head_dim]
@@ -556,8 +693,24 @@ def _compressed_row_from_unpaged_state(
     else:
         for offset in range(compress_ratio):
             position = anchor + offset
-            kv_state = compressor_kv_cache[slot_idx, position].to(dtype)
-            gate_state = compressor_gate_cache[slot_idx, position].to(dtype)
+            kv_state = _gather_paged_rows(
+                compressor_kv_cache,
+                seq_idx,
+                position,
+                position + 1,
+                cu_num_pages_host,
+                cache_loc_host,
+                dtype,
+            ).squeeze(0)
+            gate_state = _gather_paged_rows(
+                compressor_gate_cache,
+                seq_idx,
+                position,
+                position + 1,
+                cu_num_pages_host,
+                cache_loc_host,
+                dtype,
+            ).squeeze(0)
             kv_rows.append(kv_state[:head_dim])
             gate_rows.append(gate_state[:head_dim] + compressor_ape[offset, :head_dim].to(dtype))
 
@@ -578,7 +731,7 @@ def _compressed_row_from_unpaged_state(
     ).squeeze(0)
 
 
-def _update_compressed_unpaged_caches(
+def _update_compressed_paged_caches(
     compressor_kv_seq: torch.Tensor,
     compressor_gate_seq: torch.Tensor,
     position_ids_seq: torch.Tensor,
@@ -586,8 +739,10 @@ def _update_compressed_unpaged_caches(
     compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
     sin_table: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
     input_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
     compressor_gate_cache: torch.Tensor,
@@ -607,8 +762,22 @@ def _update_compressed_unpaged_caches(
         )
     state_dim = int(compressor_kv_seq.shape[-1])
     head_dim = state_dim // mode.channels
-    _write_swa_cache(compressor_kv_seq, compressor_kv_cache, slot_idx, input_pos)
-    _write_swa_cache(compressor_gate_seq, compressor_gate_cache, slot_idx, input_pos)
+    _write_paged_cache_rows(
+        compressor_kv_seq,
+        compressor_kv_cache,
+        seq_idx,
+        input_pos,
+        cu_num_pages_host,
+        cache_loc_host,
+    )
+    _write_paged_cache_rows(
+        compressor_gate_seq,
+        compressor_gate_cache,
+        seq_idx,
+        input_pos,
+        cu_num_pages_host,
+        cache_loc_host,
+    )
 
     old_completed = min(input_pos // compress_ratio, max_compressed_len)
     new_completed = min(
@@ -624,12 +793,14 @@ def _update_compressed_unpaged_caches(
         else:
             row_position_id = first_position_id + row_token_offset
         compressed_rows.append(
-            _compressed_row_from_unpaged_state(
+            _compressed_row_from_paged_state(
                 compressor_kv_cache,
                 compressor_gate_cache,
-                slot_idx,
+                seq_idx,
                 row_idx,
                 row_position_id,
+                cu_num_pages_host,
+                cache_loc_host,
                 compressor_ape,
                 compressor_norm_weight,
                 cos_table,
@@ -643,21 +814,32 @@ def _update_compressed_unpaged_caches(
             )
         )
     if compressed_rows:
-        _write_mhc_cache(
+        logical_positions = torch.arange(
+            old_completed,
+            old_completed + len(compressed_rows),
+            dtype=torch.long,
+            device=mhc_cache.device,
+        )
+        logical_positions = logical_positions * compress_ratio
+        _write_paged_cache_rows_at_positions(
             torch.stack(compressed_rows, dim=0),
             mhc_cache,
-            slot_idx,
-            old_completed,
+            seq_idx,
+            logical_positions,
+            cu_num_pages_host,
+            cache_loc_host,
         )
 
 
-def _update_raw_unpaged_caches(
+def _update_raw_paged_caches(
     compressor_kv_seq: torch.Tensor,
     compressor_gate_seq: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
     compressor_gate_cache: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
     input_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
 ) -> None:
     if compressor_kv_seq.numel() == 0:
         return
@@ -666,8 +848,22 @@ def _update_raw_unpaged_caches(
             "compressor_kv and compressor_gate sequence slices must have matching shapes, "
             f"got {tuple(compressor_kv_seq.shape)} and {tuple(compressor_gate_seq.shape)}"
         )
-    _write_swa_cache(compressor_kv_seq, compressor_kv_cache, slot_idx, input_pos)
-    _write_swa_cache(compressor_gate_seq, compressor_gate_cache, slot_idx, input_pos)
+    _write_paged_cache_rows(
+        compressor_kv_seq,
+        compressor_kv_cache,
+        seq_idx,
+        input_pos,
+        cu_num_pages_host,
+        cache_loc_host,
+    )
+    _write_paged_cache_rows(
+        compressor_gate_seq,
+        compressor_gate_cache,
+        seq_idx,
+        input_pos,
+        cu_num_pages_host,
+        cache_loc_host,
+    )
 
 
 def _select_ratio4_indexer_rows(
@@ -675,10 +871,12 @@ def _select_ratio4_indexer_rows(
     indexer_weights: torch.Tensor,
     indexer_compressor_kv_cache: torch.Tensor,
     indexer_compressor_gate_cache: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
     query_pos: int,
     query_position_id: int,
     index_topk: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
     indexer_compressor_ape: torch.Tensor,
     indexer_compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
@@ -698,12 +896,14 @@ def _select_ratio4_indexer_rows(
     state_dim = int(indexer_compressor_kv_cache.shape[-1])
     index_k = torch.stack(
         [
-            _compressed_row_from_unpaged_state(
+            _compressed_row_from_paged_state(
                 indexer_compressor_kv_cache,
                 indexer_compressor_gate_cache,
-                slot_idx,
+                seq_idx,
                 row_idx,
                 query_position_id - (query_pos - row_idx * 4),
+                cu_num_pages_host,
+                cache_loc_host,
                 indexer_compressor_ape,
                 indexer_compressor_norm_weight,
                 cos_table,
@@ -743,8 +943,10 @@ def _cached_compressed_attention(
     attn_sink: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
     input_pos: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
     position_ids_seq: torch.Tensor,
     window_size: int,
     compress_ratio: int,
@@ -768,11 +970,13 @@ def _cached_compressed_attention(
         query_pos = input_pos + token_offset
         query_position_id = int(flat_position_ids[token_offset].item())
         local_start = max(0, query_pos - window_size + 1)
-        local_kv = _gather_unpaged_rows(
+        local_kv = _gather_paged_rows(
             swa_cache,
-            slot_idx,
+            seq_idx,
             local_start,
             query_pos + 1,
+            cu_num_pages_host,
+            cache_loc_host,
             q_seq.dtype,
         )
         local_idxs = torch.arange(local_kv.shape[0], dtype=torch.int64, device=q_seq.device)
@@ -799,10 +1003,12 @@ def _cached_compressed_attention(
                 indexer_weights_seq[token_offset],
                 indexer_compressor_kv_cache,
                 indexer_compressor_gate_cache,
-                slot_idx,
+                seq_idx,
                 query_pos,
                 query_position_id,
                 index_topk,
+                cu_num_pages_host,
+                cache_loc_host,
                 indexer_compressor_ape,
                 indexer_compressor_norm_weight,
                 cos_table,
@@ -811,27 +1017,44 @@ def _cached_compressed_attention(
                 rope_dim,
                 max_compressed_len,
             )
-            gather_rows = selected_rows.clamp(min=0)
-            compressed_kv = mhc_cache[slot_idx, gather_rows].to(q_seq.dtype)
+            compressed_positions = selected_rows.clamp(min=0) * compress_ratio
+            compressed_kv, compressed_valid = _gather_paged_rows_from_positions(
+                mhc_cache,
+                seq_idx,
+                compressed_positions,
+                cu_num_pages_host,
+                cache_loc_host,
+                q_seq.dtype,
+            )
+            compressed_valid = compressed_valid & (selected_rows >= 0)
             compressed_idxs = torch.where(
-                selected_rows < 0,
-                selected_rows,
+                compressed_valid,
                 torch.arange(selected_rows.numel(), dtype=torch.int64, device=q_seq.device)
                 + local_kv.shape[0],
+                torch.full_like(selected_rows, -1),
             )
         else:
             compressed_len = min((query_pos + 1) // compress_ratio, max_compressed_len)
-            compressed_kv = _gather_unpaged_rows(
+            compressed_positions = (
+                torch.arange(compressed_len, dtype=torch.long, device=q_seq.device) * compress_ratio
+            )
+            compressed_kv, compressed_valid = _gather_paged_rows_from_positions(
                 mhc_cache,
-                slot_idx,
-                0,
-                compressed_len,
+                seq_idx,
+                compressed_positions,
+                cu_num_pages_host,
+                cache_loc_host,
                 q_seq.dtype,
             )
             compressed_idxs = torch.arange(
                 compressed_kv.shape[0], dtype=torch.int64, device=q_seq.device
             )
             compressed_idxs = compressed_idxs + local_kv.shape[0]
+            compressed_idxs = torch.where(
+                compressed_valid,
+                compressed_idxs,
+                torch.full_like(compressed_idxs, -1),
+            )
         topk = torch.cat((local_idxs, compressed_idxs), dim=0).view(1, 1, -1)
         kv = torch.cat((local_kv, compressed_kv), dim=0)
         out = _deepseek_v4_sparse_attention(
@@ -852,7 +1075,9 @@ def _cached_topk_attention(
     attn_sink: torch.Tensor,
     topk_seq: torch.Tensor,
     swa_cache: torch.Tensor,
-    slot_idx: int,
+    seq_idx: int,
+    cu_num_pages_host: torch.Tensor,
+    cache_loc_host: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
     outputs = []
@@ -862,8 +1087,10 @@ def _cached_topk_attention(
                 q_seq[token_offset],
                 attn_sink,
                 swa_cache,
-                slot_idx,
+                seq_idx,
                 topk_seq[token_offset],
+                cu_num_pages_host,
+                cache_loc_host,
                 softmax_scale,
             )
         )
@@ -878,25 +1105,63 @@ def _flatten_decode_tokens(tensor: torch.Tensor, num_decode: int) -> torch.Tenso
     return tensor.reshape(-1, *tensor.shape[2:])[:num_decode]
 
 
+def _decode_page_ids_and_offsets(
+    cache: torch.Tensor,
+    seq_idx: torch.Tensor,
+    positions: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if cache_loc.numel() == 0:
+        raise ValueError("cache_loc must contain at least one page id")
+
+    positions_long = positions.to(torch.long)
+    safe_positions = positions_long.clamp(min=0)
+    tokens_per_block = int(cache.shape[1])
+    page_ordinals = safe_positions // tokens_per_block
+    page_offsets = safe_positions % tokens_per_block
+
+    seq_idx_long = seq_idx.to(torch.long)
+    while seq_idx_long.dim() < positions_long.dim():
+        seq_idx_long = seq_idx_long.unsqueeze(-1)
+    page_start = cu_num_pages[seq_idx_long].to(torch.long)
+    page_end = cu_num_pages[seq_idx_long + 1].to(torch.long)
+    page_table_idx = page_start + page_ordinals
+    valid = (positions_long >= 0) & (page_table_idx < page_end)
+    safe_page_table_idx = torch.where(valid, page_table_idx, page_start)
+    safe_page_table_idx = safe_page_table_idx.clamp(min=0, max=cache_loc.numel() - 1)
+    page_ids = cache_loc[safe_page_table_idx].to(torch.long)
+    return page_ids, page_offsets, valid
+
+
 def _write_decode_cache_rows(
     cache: torch.Tensor,
     values: torch.Tensor,
-    slot_idx: torch.Tensor,
+    seq_idx: torch.Tensor,
     input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
 ) -> None:
     if values.numel() == 0:
         return
-    cache[slot_idx, input_pos] = values.to(cache.dtype)
+    page_ids, page_offsets, _ = _decode_page_ids_and_offsets(
+        cache, seq_idx, input_pos, cu_num_pages, cache_loc
+    )
+    cache[page_ids, page_offsets] = values.to(cache.dtype)
 
 
 def _decode_cache_rows_from_positions(
     cache: torch.Tensor,
-    slot_idx: torch.Tensor,
+    seq_idx: torch.Tensor,
     positions: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
     dtype: torch.dtype,
-) -> torch.Tensor:
-    safe_positions = positions.to(torch.long).clamp(min=0, max=cache.shape[1] - 1)
-    return cache[slot_idx.unsqueeze(1), safe_positions].to(dtype)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    page_ids, page_offsets, valid = _decode_page_ids_and_offsets(
+        cache, seq_idx, positions, cu_num_pages, cache_loc
+    )
+    return cache[page_ids, page_offsets].to(dtype), valid
 
 
 def _decode_attention_from_rows(
@@ -921,16 +1186,20 @@ def _decode_attention_from_rows(
 
 def _decode_local_cache_rows(
     swa_cache: torch.Tensor,
-    slot_idx: torch.Tensor,
+    seq_idx: torch.Tensor,
     input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
     window_size: int,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     offsets = torch.arange(window_size, dtype=torch.long, device=input_pos.device)
     positions = input_pos.unsqueeze(1) - window_size + 1 + offsets.view(1, -1)
     valid = (positions >= 0) & (positions <= input_pos.unsqueeze(1))
-    valid = valid & (positions < swa_cache.shape[1])
-    rows = _decode_cache_rows_from_positions(swa_cache, slot_idx, positions, dtype)
+    rows, page_valid = _decode_cache_rows_from_positions(
+        swa_cache, seq_idx, positions, cu_num_pages, cache_loc, dtype
+    )
+    valid = valid & page_valid
     return rows, valid
 
 
@@ -939,16 +1208,20 @@ def _decode_topk_cache_attention(
     attn_sink: torch.Tensor,
     topk_decode: torch.Tensor,
     swa_cache: torch.Tensor,
-    slot_idx: torch.Tensor,
+    seq_idx: torch.Tensor,
     input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
     softmax_scale: float,
     window_size: Optional[int],
 ) -> torch.Tensor:
     if window_size is not None:
         selected_kv, valid_rows = _decode_local_cache_rows(
             swa_cache,
-            slot_idx,
+            seq_idx,
             input_pos,
+            cu_num_pages,
+            cache_loc,
             window_size,
             q_decode.dtype,
         )
@@ -961,8 +1234,10 @@ def _decode_topk_cache_attention(
         )
 
     positions = topk_decode.to(torch.long)
-    valid_rows = (positions >= 0) & (positions < swa_cache.shape[1])
-    selected_kv = _decode_cache_rows_from_positions(swa_cache, slot_idx, positions, q_decode.dtype)
+    selected_kv, page_valid = _decode_cache_rows_from_positions(
+        swa_cache, seq_idx, positions, cu_num_pages, cache_loc, q_decode.dtype
+    )
+    valid_rows = (positions >= 0) & page_valid
     return _decode_attention_from_rows(
         q_decode,
         selected_kv,
@@ -972,12 +1247,14 @@ def _decode_topk_cache_attention(
     )
 
 
-def _batched_compressed_rows_from_unpaged_state(
+def _batched_compressed_rows_from_paged_state(
     compressor_kv_cache: torch.Tensor,
     compressor_gate_cache: torch.Tensor,
-    slot_idx: torch.Tensor,
+    seq_idx: torch.Tensor,
     row_idx: torch.Tensor,
     row_position_id: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
     compressor_ape: torch.Tensor,
     compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
@@ -991,7 +1268,6 @@ def _batched_compressed_rows_from_unpaged_state(
 ) -> torch.Tensor:
     offsets = torch.arange(compress_ratio, dtype=torch.long, device=row_idx.device)
     anchor = row_idx.to(torch.long) * compress_ratio
-    max_pos = compressor_kv_cache.shape[1] - 1
 
     mode = _compression_mode(compress_ratio)
     if mode.overlap:
@@ -999,12 +1275,39 @@ def _batched_compressed_rows_from_unpaged_state(
         current_positions = anchor.unsqueeze(1) + offsets.view(1, -1)
         previous_valid = previous_positions >= 0
 
-        safe_previous = previous_positions.clamp(min=0, max=max_pos)
-        safe_current = current_positions.clamp(min=0, max=max_pos)
-        previous_kv_state = compressor_kv_cache[slot_idx.unsqueeze(1), safe_previous].to(dtype)
-        previous_gate_state = compressor_gate_cache[slot_idx.unsqueeze(1), safe_previous].to(dtype)
-        current_kv_state = compressor_kv_cache[slot_idx.unsqueeze(1), safe_current].to(dtype)
-        current_gate_state = compressor_gate_cache[slot_idx.unsqueeze(1), safe_current].to(dtype)
+        previous_kv_state, previous_page_valid = _decode_cache_rows_from_positions(
+            compressor_kv_cache,
+            seq_idx,
+            previous_positions,
+            cu_num_pages,
+            cache_loc,
+            dtype,
+        )
+        previous_gate_state, _ = _decode_cache_rows_from_positions(
+            compressor_gate_cache,
+            seq_idx,
+            previous_positions,
+            cu_num_pages,
+            cache_loc,
+            dtype,
+        )
+        current_kv_state, _ = _decode_cache_rows_from_positions(
+            compressor_kv_cache,
+            seq_idx,
+            current_positions,
+            cu_num_pages,
+            cache_loc,
+            dtype,
+        )
+        current_gate_state, _ = _decode_cache_rows_from_positions(
+            compressor_gate_cache,
+            seq_idx,
+            current_positions,
+            cu_num_pages,
+            cache_loc,
+            dtype,
+        )
+        previous_valid = previous_valid & previous_page_valid
 
         previous_kv = previous_kv_state[..., :head_dim]
         previous_gate = previous_gate_state[..., :head_dim]
@@ -1029,9 +1332,22 @@ def _batched_compressed_rows_from_unpaged_state(
         gate = torch.cat((previous_gate, current_gate), dim=1)
     else:
         positions = anchor.unsqueeze(1) + offsets.view(1, -1)
-        safe_positions = positions.clamp(min=0, max=max_pos)
-        kv_state = compressor_kv_cache[slot_idx.unsqueeze(1), safe_positions].to(dtype)
-        gate_state = compressor_gate_cache[slot_idx.unsqueeze(1), safe_positions].to(dtype)
+        kv_state, _ = _decode_cache_rows_from_positions(
+            compressor_kv_cache,
+            seq_idx,
+            positions,
+            cu_num_pages,
+            cache_loc,
+            dtype,
+        )
+        gate_state, _ = _decode_cache_rows_from_positions(
+            compressor_gate_cache,
+            seq_idx,
+            positions,
+            cu_num_pages,
+            cache_loc,
+            dtype,
+        )
         kv = kv_state[..., :head_dim]
         gate = gate_state[..., :head_dim]
         gate = gate + compressor_ape[:, :head_dim].to(device=gate.device, dtype=dtype)
@@ -1058,8 +1374,10 @@ def _update_decode_compressed_caches(
     compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
     sin_table: torch.Tensor,
-    slot_idx: torch.Tensor,
+    seq_idx: torch.Tensor,
     input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
     compressor_gate_cache: torch.Tensor,
@@ -1074,20 +1392,26 @@ def _update_decode_compressed_caches(
 
     state_dim = int(compressor_kv_decode.shape[-1])
     head_dim = state_dim // mode.channels
-    _write_decode_cache_rows(compressor_kv_cache, compressor_kv_decode, slot_idx, input_pos)
-    _write_decode_cache_rows(compressor_gate_cache, compressor_gate_decode, slot_idx, input_pos)
+    _write_decode_cache_rows(
+        compressor_kv_cache, compressor_kv_decode, seq_idx, input_pos, cu_num_pages, cache_loc
+    )
+    _write_decode_cache_rows(
+        compressor_gate_cache, compressor_gate_decode, seq_idx, input_pos, cu_num_pages, cache_loc
+    )
 
     old_completed = input_pos // compress_ratio
     new_completed = (input_pos + 1) // compress_ratio
     row_valid = (new_completed > old_completed) & (old_completed < max_compressed_len)
     row_idx = old_completed.clamp(min=0, max=max_compressed_len - 1)
     row_position_id = position_ids_decode.to(torch.long) - (input_pos - row_idx * compress_ratio)
-    compressed_rows = _batched_compressed_rows_from_unpaged_state(
+    compressed_rows = _batched_compressed_rows_from_paged_state(
         compressor_kv_cache,
         compressor_gate_cache,
-        slot_idx,
+        seq_idx,
         row_idx,
         row_position_id,
+        cu_num_pages,
+        cache_loc,
         compressor_ape,
         compressor_norm_weight,
         cos_table,
@@ -1098,13 +1422,18 @@ def _update_decode_compressed_caches(
         head_dim,
         compressor_kv_decode.dtype,
     )
-    previous_rows = mhc_cache[slot_idx, row_idx]
+    row_logical_pos = row_idx * compress_ratio
+    previous_rows, _ = _decode_cache_rows_from_positions(
+        mhc_cache, seq_idx, row_logical_pos, cu_num_pages, cache_loc, mhc_cache.dtype
+    )
     rows_to_write = torch.where(
         row_valid.unsqueeze(-1),
         compressed_rows.to(mhc_cache.dtype),
         previous_rows,
     )
-    mhc_cache[slot_idx, row_idx] = rows_to_write
+    _write_decode_cache_rows(
+        mhc_cache, rows_to_write, seq_idx, row_logical_pos, cu_num_pages, cache_loc
+    )
 
 
 def _select_decode_ratio4_indexer_rows(
@@ -1112,10 +1441,12 @@ def _select_decode_ratio4_indexer_rows(
     indexer_weights: torch.Tensor,
     indexer_compressor_kv_cache: torch.Tensor,
     indexer_compressor_gate_cache: torch.Tensor,
-    slot_idx: torch.Tensor,
+    seq_idx: torch.Tensor,
     input_pos: torch.Tensor,
     position_ids_decode: torch.Tensor,
     index_topk: int,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
     indexer_compressor_ape: torch.Tensor,
     indexer_compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
@@ -1131,19 +1462,21 @@ def _select_decode_ratio4_indexer_rows(
 
     candidate_rows = torch.arange(max_compressed_len, dtype=torch.long, device=q_index.device)
     candidate_rows = candidate_rows.view(1, -1).expand(q_index.shape[0], -1)
-    flat_slot_idx = slot_idx.unsqueeze(1).expand_as(candidate_rows).reshape(-1)
+    flat_seq_idx = seq_idx.unsqueeze(1).expand_as(candidate_rows).reshape(-1)
     flat_rows = candidate_rows.reshape(-1)
     row_position_id = position_ids_decode.unsqueeze(1) - (
         input_pos.unsqueeze(1) - candidate_rows * 4
     )
     flat_row_position_id = row_position_id.reshape(-1)
     index_head_dim = int(q_index.shape[-1])
-    index_k = _batched_compressed_rows_from_unpaged_state(
+    index_k = _batched_compressed_rows_from_paged_state(
         indexer_compressor_kv_cache,
         indexer_compressor_gate_cache,
-        flat_slot_idx,
+        flat_seq_idx,
         flat_rows,
         flat_row_position_id,
+        cu_num_pages,
+        cache_loc,
         indexer_compressor_ape,
         indexer_compressor_norm_weight,
         cos_table,
@@ -1191,8 +1524,10 @@ def _decode_compressed_cache_attention(
     indexer_compressor_norm_weight: torch.Tensor,
     cos_table: torch.Tensor,
     sin_table: torch.Tensor,
-    slot_idx: torch.Tensor,
+    seq_idx: torch.Tensor,
     input_pos: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
     position_ids_decode: torch.Tensor,
     window_size: int,
     compress_ratio: int,
@@ -1203,8 +1538,10 @@ def _decode_compressed_cache_attention(
 ) -> torch.Tensor:
     local_kv, local_valid = _decode_local_cache_rows(
         swa_cache,
-        slot_idx,
+        seq_idx,
         input_pos,
+        cu_num_pages,
+        cache_loc,
         window_size,
         q_decode.dtype,
     )
@@ -1216,10 +1553,12 @@ def _decode_compressed_cache_attention(
             indexer_weights_decode,
             indexer_compressor_kv_cache,
             indexer_compressor_gate_cache,
-            slot_idx,
+            seq_idx,
             input_pos,
             position_ids_decode,
             index_topk,
+            cu_num_pages,
+            cache_loc,
             indexer_compressor_ape,
             indexer_compressor_norm_weight,
             cos_table,
@@ -1228,12 +1567,16 @@ def _decode_compressed_cache_attention(
             rope_dim,
             max_compressed_len,
         )
-        compressed_kv = _decode_cache_rows_from_positions(
+        compressed_positions = selected_rows.clamp(min=0) * compress_ratio
+        compressed_kv, page_valid = _decode_cache_rows_from_positions(
             mhc_cache,
-            slot_idx,
-            selected_rows.clamp(min=0),
+            seq_idx,
+            compressed_positions,
+            cu_num_pages,
+            cache_loc,
             q_decode.dtype,
         )
+        compressed_valid = compressed_valid & page_valid & (selected_rows >= 0)
     else:
         candidate_rows = torch.arange(
             max_compressed_len,
@@ -1243,12 +1586,16 @@ def _decode_compressed_cache_attention(
         selected_rows = candidate_rows.view(1, -1).expand(q_decode.shape[0], -1)
         compressed_len = ((input_pos + 1) // compress_ratio).clamp(max=max_compressed_len)
         compressed_valid = selected_rows < compressed_len.unsqueeze(1)
-        compressed_kv = _decode_cache_rows_from_positions(
+        compressed_positions = selected_rows * compress_ratio
+        compressed_kv, page_valid = _decode_cache_rows_from_positions(
             mhc_cache,
-            slot_idx,
-            selected_rows,
+            seq_idx,
+            compressed_positions,
+            cu_num_pages,
+            cache_loc,
             q_decode.dtype,
         )
+        compressed_valid = compressed_valid & page_valid
 
     selected_kv = torch.cat((local_kv, compressed_kv), dim=1)
     valid_rows = torch.cat((local_valid, compressed_valid), dim=1)
@@ -1281,6 +1628,8 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     position_ids: torch.Tensor,
     input_pos: torch.Tensor,
     slot_idx: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -1300,11 +1649,14 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
     q_decode = q_flat[:num_decode]
     kv_decode = _flatten_decode_tokens(kv, num_decode)
     topk_decode = _flatten_decode_tokens(topk_idxs, num_decode)
-    slot_idx_decode = slot_idx.reshape(-1)[:num_decode].to(torch.long)
+    del slot_idx
+    seq_idx_decode = torch.arange(num_decode, dtype=torch.long, device=input_pos.device)
     input_pos_decode = input_pos.reshape(-1)[:num_decode].to(torch.long)
     position_ids_decode = position_ids.reshape(-1)[:num_decode].to(torch.long)
 
-    _write_decode_cache_rows(swa_cache, kv_decode, slot_idx_decode, input_pos_decode)
+    _write_decode_cache_rows(
+        swa_cache, kv_decode, seq_idx_decode, input_pos_decode, cu_num_pages, cache_loc
+    )
     if compress_ratio:
         assert window_size is not None
         assert max_compressed_len is not None
@@ -1319,8 +1671,10 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             compressor_norm_weight,
             cos_table,
             sin_table,
-            slot_idx_decode,
+            seq_idx_decode,
             input_pos_decode,
+            cu_num_pages,
+            cache_loc,
             mhc_cache,
             compressor_kv_cache,
             compressor_gate_cache,
@@ -1338,14 +1692,18 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             _write_decode_cache_rows(
                 indexer_compressor_kv_cache,
                 indexer_compressor_kv_decode,
-                slot_idx_decode,
+                seq_idx_decode,
                 input_pos_decode,
+                cu_num_pages,
+                cache_loc,
             )
             _write_decode_cache_rows(
                 indexer_compressor_gate_cache,
                 indexer_compressor_gate_decode,
-                slot_idx_decode,
+                seq_idx_decode,
                 input_pos_decode,
+                cu_num_pages,
+                cache_loc,
             )
         indexer_q_decode = _flatten_decode_tokens(indexer_q, num_decode)
         indexer_weights_decode = _flatten_decode_tokens(indexer_weights, num_decode)
@@ -1363,8 +1721,10 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             indexer_compressor_norm_weight,
             cos_table,
             sin_table,
-            slot_idx_decode,
+            seq_idx_decode,
             input_pos_decode,
+            cu_num_pages,
+            cache_loc,
             position_ids_decode,
             window_size,
             compress_ratio,
@@ -1379,8 +1739,10 @@ def _deepseek_v4_sparse_attention_decode_with_cache(
             attn_sink,
             topk_decode,
             swa_cache,
-            slot_idx_decode,
+            seq_idx_decode,
             input_pos_decode,
+            cu_num_pages,
+            cache_loc,
             softmax_scale,
             window_size,
         )
@@ -1674,6 +2036,9 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     input_pos: torch.Tensor,
     slot_idx: torch.Tensor,
     cu_seqlen: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    last_page_len: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -1688,7 +2053,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
     rope_dim: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Reference unpaged cached DeepSeek V4 sparse attention with compressor state."""
+    """Reference paged cached DeepSeek V4 sparse attention with compressor state."""
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
     _validate_swa_cache_inputs(q, kv, swa_cache)
     _validate_swa_cache_inputs(q, kv, mhc_cache)
@@ -1746,6 +2111,8 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             position_ids,
             input_pos,
             slot_idx,
+            cu_num_pages,
+            cache_loc,
             swa_cache,
             mhc_cache,
             compressor_kv_cache,
@@ -1764,8 +2131,11 @@ def torch_deepseek_v4_sparse_attention_with_cache(
 
     seq_len_host = _to_host_long("seq_len", seq_len, num_seq)
     input_pos_host = _to_host_long("input_pos", input_pos, num_seq)
-    slot_idx_host = _to_host_long("slot_idx", slot_idx, num_seq)
     cu_seqlen_host = _to_host_long("cu_seqlen", cu_seqlen, num_seq + 1)
+    cu_num_pages_host = _to_host_long("cu_num_pages", cu_num_pages, num_seq + 1)
+    num_page_entries = int(cu_num_pages_host[-1].item())
+    cache_loc_host = _to_host_long("cache_loc", cache_loc, num_page_entries)
+    del slot_idx, last_page_len
 
     output_flat = torch.zeros_like(q_flat)
     compressed_capacity = int(max_compressed_len) if compress_ratio else 0
@@ -1776,9 +2146,6 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             continue
         flat_start = int(cu_seqlen_host[seq_idx].item())
         input_pos_i = int(input_pos_host[seq_idx].item())
-        slot_idx_i = int(slot_idx_host[seq_idx].item())
-        if slot_idx_i < 0 or slot_idx_i >= swa_cache.shape[0]:
-            raise ValueError(f"slot_idx must be in [0, {swa_cache.shape[0]}), got {slot_idx_i}")
 
         q_seq = q_flat[flat_start : flat_start + seq_len_i]
         kv_seq = _slice_sequence_tokens(kv, seq_idx, flat_start, seq_len_i)
@@ -1802,7 +2169,9 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 f"expected {seq_len_i}"
             )
 
-        _write_swa_cache(kv_seq, swa_cache, slot_idx_i, input_pos_i)
+        _write_paged_cache_rows(
+            kv_seq, swa_cache, seq_idx, input_pos_i, cu_num_pages_host, cache_loc_host
+        )
 
         if compress_ratio:
             compressor_kv_seq = _slice_sequence_tokens(
@@ -1817,7 +2186,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             indexer_compressor_gate_seq = _slice_sequence_tokens(
                 indexer_compressor_gate, seq_idx, flat_start, seq_len_i
             )
-            _update_compressed_unpaged_caches(
+            _update_compressed_paged_caches(
                 compressor_kv_seq,
                 compressor_gate_seq,
                 position_ids_seq,
@@ -1825,8 +2194,10 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 compressor_norm_weight,
                 cos_table,
                 sin_table,
-                slot_idx_i,
+                seq_idx,
                 input_pos_i,
+                cu_num_pages_host,
+                cache_loc_host,
                 mhc_cache,
                 compressor_kv_cache,
                 compressor_gate_cache,
@@ -1837,13 +2208,15 @@ def torch_deepseek_v4_sparse_attention_with_cache(
             )
             mode = _compression_mode(compress_ratio)
             if mode.uses_indexer:
-                _update_raw_unpaged_caches(
+                _update_raw_paged_caches(
                     indexer_compressor_kv_seq,
                     indexer_compressor_gate_seq,
                     indexer_compressor_kv_cache,
                     indexer_compressor_gate_cache,
-                    slot_idx_i,
+                    seq_idx,
                     input_pos_i,
+                    cu_num_pages_host,
+                    cache_loc_host,
                 )
 
             if input_pos_i == 0:
@@ -1880,8 +2253,10 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                     attn_sink,
                     swa_cache,
                     mhc_cache,
-                    slot_idx_i,
+                    seq_idx,
                     input_pos_i,
+                    cu_num_pages_host,
+                    cache_loc_host,
                     position_ids_seq,
                     window_size,
                     compress_ratio,
@@ -1913,8 +2288,10 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 q_seq,
                 attn_sink,
                 swa_cache,
-                slot_idx_i,
+                seq_idx,
                 input_pos_i,
+                cu_num_pages_host,
+                cache_loc_host,
                 window_size,
                 softmax_scale,
             )
@@ -1924,7 +2301,9 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 attn_sink,
                 topk_seq,
                 swa_cache,
-                slot_idx_i,
+                seq_idx,
+                cu_num_pages_host,
+                cache_loc_host,
                 softmax_scale,
             )
 
@@ -1961,6 +2340,9 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
     input_pos: torch.Tensor,
     slot_idx: torch.Tensor,
     cu_seqlen: torch.Tensor,
+    cu_num_pages: torch.Tensor,
+    cache_loc: torch.Tensor,
+    last_page_len: torch.Tensor,
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -2023,6 +2405,9 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
         input_pos,
         slot_idx,
         cu_seqlen,
+        cu_num_pages,
+        cache_loc,
+        last_page_len,
         swa_cache,
         mhc_cache,
         compressor_kv_cache,
@@ -2062,7 +2447,16 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> list[str]:
-        return ["batch_info_host", "seq_len", "input_pos", "slot_idx", "cu_seqlen"]
+        return [
+            "batch_info_host",
+            "seq_len",
+            "input_pos",
+            "slot_idx",
+            "cu_seqlen",
+            "cu_num_pages",
+            "cache_loc",
+            "last_page_len",
+        ]
 
     @classmethod
     def get_cache_initializers(
@@ -2084,24 +2478,24 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
         indexer_compressor_state_dim = int(indexer_compressor_kv_fake.shape[-1])
         dtype = cls.resolve_cache_dtype(cache_config.dtype, kv_fake.dtype)
         return {
-            "swa_cache": UnpagedResourceHandler(
+            "swa_cache": PagedResourceHandler(
                 head_dim,
                 dtype=dtype,
             ),
-            "mhc_cache": UnpagedResourceHandler(head_dim, dtype=dtype),
-            "compressor_kv_cache": UnpagedResourceHandler(
+            "mhc_cache": PagedResourceHandler(head_dim, dtype=dtype),
+            "compressor_kv_cache": PagedResourceHandler(
                 compressor_state_dim,
                 dtype=torch.float32,
             ),
-            "compressor_gate_cache": UnpagedResourceHandler(
+            "compressor_gate_cache": PagedResourceHandler(
                 compressor_state_dim,
                 dtype=torch.float32,
             ),
-            "indexer_compressor_kv_cache": UnpagedResourceHandler(
+            "indexer_compressor_kv_cache": PagedResourceHandler(
                 indexer_compressor_state_dim,
                 dtype=torch.float32,
             ),
-            "indexer_compressor_gate_cache": UnpagedResourceHandler(
+            "indexer_compressor_gate_cache": PagedResourceHandler(
                 indexer_compressor_state_dim,
                 dtype=torch.float32,
             ),

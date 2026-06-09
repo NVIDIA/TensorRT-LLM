@@ -32,7 +32,10 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention import (  # noqa: E402
     DeepSeekV4SparseAttention,
 )
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo  # noqa: E402
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (  # noqa: E402
+    BatchInfo,
+    PagedResourceHandler,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (  # noqa: E402
     DeepseekV4Compressor,
@@ -48,19 +51,54 @@ from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (  # noqa:
 )
 
 
-def _context_meta(seq_len: int):
+def _page_meta(
+    seq_lens: list[int],
+    input_positions: list[int],
+    slot_indices: list[int],
+    tokens_per_block: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cu_num_pages = [0]
+    cache_loc = []
+    last_page_len = []
+    next_page_id = 0
+    for seq_len, input_pos, slot_idx in zip(seq_lens, input_positions, slot_indices, strict=True):
+        total_len = input_pos + seq_len
+        if tokens_per_block is None:
+            seq_pages = [slot_idx]
+            lpl = max(total_len, 1)
+        else:
+            num_pages = max((max(total_len, 1) + tokens_per_block - 1) // tokens_per_block, 1)
+            seq_pages = list(range(next_page_id, next_page_id + num_pages))
+            next_page_id += num_pages
+            lpl = ((max(total_len, 1) - 1) % tokens_per_block) + 1
+        cache_loc.extend(seq_pages)
+        cu_num_pages.append(cu_num_pages[-1] + len(seq_pages))
+        last_page_len.append(lpl)
+
+    return (
+        torch.tensor(cu_num_pages, dtype=torch.int32),
+        torch.tensor(cache_loc, dtype=torch.int32),
+        torch.tensor(last_page_len, dtype=torch.int32),
+    )
+
+
+def _context_meta(seq_len: int, tokens_per_block: int | None = None):
     batch_info_host = BatchInfo()
     batch_info_host.update([1, seq_len, 0, 0, 0, 0])
+    cu_num_pages, cache_loc, last_page_len = _page_meta([seq_len], [0], [0], tokens_per_block)
     return (
         batch_info_host.serialize(),
         torch.tensor([seq_len], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int64),
         torch.tensor([0, seq_len], dtype=torch.int32),
+        cu_num_pages,
+        cache_loc,
+        last_page_len,
     )
 
 
-def _multi_context_meta(seq_lens: list[int]):
+def _multi_context_meta(seq_lens: list[int], tokens_per_block: int | None = None):
     total_tokens = sum(seq_lens)
     cu_seqlen = [0]
     for seq_len in seq_lens:
@@ -68,51 +106,83 @@ def _multi_context_meta(seq_lens: list[int]):
 
     batch_info_host = BatchInfo()
     batch_info_host.update([len(seq_lens), total_tokens, 0, 0, 0, 0])
+    slot_indices = list(range(len(seq_lens)))
+    cu_num_pages, cache_loc, last_page_len = _page_meta(
+        seq_lens, [0] * len(seq_lens), slot_indices, tokens_per_block
+    )
     return (
         batch_info_host.serialize(),
         torch.tensor(seq_lens, dtype=torch.int32),
         torch.zeros(len(seq_lens), dtype=torch.int32),
-        torch.arange(len(seq_lens), dtype=torch.int64),
+        torch.tensor(slot_indices, dtype=torch.int64),
         torch.tensor(cu_seqlen, dtype=torch.int32),
+        cu_num_pages,
+        cache_loc,
+        last_page_len,
     )
 
 
-def _decode_meta(input_pos: int):
+def _decode_meta(input_pos: int, tokens_per_block: int | None = None):
     batch_info_host = BatchInfo()
     batch_info_host.update([0, 0, 0, 0, 1, 1])
+    cu_num_pages, cache_loc, last_page_len = _page_meta([1], [input_pos], [0], tokens_per_block)
     return (
         batch_info_host.serialize(),
         torch.tensor([1], dtype=torch.int32),
         torch.tensor([input_pos], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int64),
         torch.tensor([0, 1], dtype=torch.int32),
+        cu_num_pages,
+        cache_loc,
+        last_page_len,
     )
 
 
-def _multi_decode_meta(input_positions: list[int]):
+def _multi_decode_meta(input_positions: list[int], tokens_per_block: int | None = None):
     seq_lens = [1] * len(input_positions)
     cu_seqlen = list(range(len(input_positions) + 1))
     batch_info_host = BatchInfo()
     batch_info_host.update([0, 0, 0, 0, len(input_positions), len(input_positions)])
+    slot_indices = list(range(len(input_positions)))
+    cu_num_pages, cache_loc, last_page_len = _page_meta(
+        seq_lens, input_positions, slot_indices, tokens_per_block
+    )
     return (
         batch_info_host.serialize(),
         torch.tensor(seq_lens, dtype=torch.int32),
         torch.tensor(input_positions, dtype=torch.int32),
-        torch.arange(len(input_positions), dtype=torch.int64),
+        torch.tensor(slot_indices, dtype=torch.int64),
         torch.tensor(cu_seqlen, dtype=torch.int32),
+        cu_num_pages,
+        cache_loc,
+        last_page_len,
     )
 
 
-def _cuda_decode_meta(input_pos: int, slot_idx: int = 0):
-    batch_info_host, seq_len, input_pos_tensor, slot_idx_tensor, cu_seqlen = _decode_meta(input_pos)
+def _cuda_decode_meta(input_pos: int, slot_idx: int = 0, tokens_per_block: int | None = None):
+    (
+        batch_info_host,
+        seq_len,
+        input_pos_tensor,
+        slot_idx_tensor,
+        cu_seqlen,
+        cu_num_pages,
+        cache_loc,
+        last_page_len,
+    ) = _decode_meta(input_pos, tokens_per_block=tokens_per_block)
     input_pos_tensor.fill_(input_pos)
     slot_idx_tensor.fill_(slot_idx)
+    if tokens_per_block is None:
+        cache_loc.fill_(slot_idx)
     return (
         batch_info_host,
         seq_len.cuda(),
         input_pos_tensor.cuda(),
         slot_idx_tensor.cuda(),
         cu_seqlen.cuda(),
+        cu_num_pages.cuda(),
+        cache_loc.cuda(),
+        last_page_len.cuda(),
     )
 
 
@@ -183,7 +253,7 @@ def _run_cached_sparse_attention(
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
-    metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    metadata: tuple[torch.Tensor, ...],
     swa_cache: torch.Tensor,
     softmax_scale: float = 1.0,
     window_size: int | None = None,
@@ -303,7 +373,7 @@ def _run_cached_sparse_attention_with_compressor(
     cos_table: torch.Tensor,
     sin_table: torch.Tensor,
     position_ids: torch.Tensor,
-    metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    metadata: tuple[torch.Tensor, ...],
     swa_cache: torch.Tensor,
     mhc_cache: torch.Tensor,
     compressor_kv_cache: torch.Tensor,
@@ -480,6 +550,30 @@ def _make_sparse_attention_caches(
     )
 
 
+def _make_paged_sparse_attention_caches(
+    max_seq_len: int,
+    tokens_per_block: int,
+    head_dim: int,
+    compressor_state_dim: int,
+    fill_value: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_pages = max((max_seq_len + tokens_per_block - 1) // tokens_per_block, 1)
+    return (
+        torch.full((num_pages, tokens_per_block, head_dim), fill_value),
+        torch.full((num_pages, tokens_per_block, head_dim), fill_value),
+        torch.full((num_pages, tokens_per_block, compressor_state_dim), fill_value),
+        torch.full((num_pages, tokens_per_block, compressor_state_dim), fill_value),
+    )
+
+
+def _paged_cache_row(
+    cache: torch.Tensor,
+    logical_pos: int,
+    tokens_per_block: int,
+) -> torch.Tensor:
+    return cache[logical_pos // tokens_per_block, logical_pos % tokens_per_block]
+
+
 def _has_resource_with_suffix(resource_names: list[str], suffix: str) -> bool:
     return any(name.endswith(suffix) for name in resource_names)
 
@@ -590,6 +684,45 @@ def test_cached_ratio0_local_window_reads_past_kv_from_swa_cache() -> None:
 
     torch.testing.assert_close(swa_cache[0, :4], expected_kv[0])
     assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="cached local window: ")
+
+
+def test_cached_ratio0_decode_reads_and_writes_across_paged_boundary() -> None:
+    tokens_per_block = 2
+    q_prefill = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]]])
+    kv_prefill = torch.tensor([[[1.0, 0.0], [0.0, 1.0], [2.0, 2.0]]])
+    attn_sink = torch.tensor([-20.0])
+    topk_prefill = torch.zeros(1, 3, 1, dtype=torch.int64)
+    swa_cache, _, _, _ = _make_paged_sparse_attention_caches(4, tokens_per_block, 2, 0)
+
+    _run_cached_sparse_attention(
+        q_prefill,
+        kv_prefill,
+        attn_sink,
+        topk_prefill,
+        _context_meta(seq_len=3, tokens_per_block=tokens_per_block),
+        swa_cache,
+        window_size=4,
+    )
+
+    q_decode = torch.tensor([[[[1.0, 0.5]]]])
+    kv_decode = torch.tensor([[[3.0, -1.0]]])
+    output = _run_cached_sparse_attention(
+        q_decode,
+        kv_decode,
+        attn_sink,
+        torch.zeros(1, 1, 1, dtype=torch.int64),
+        _decode_meta(input_pos=3, tokens_per_block=tokens_per_block),
+        swa_cache,
+        window_size=4,
+    )
+
+    expected_kv = torch.cat([kv_prefill, kv_decode], dim=1)
+    expected_topk = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int64)
+    expected = _sparse_attention_reference(q_decode, expected_kv, attn_sink, expected_topk, 1.0)
+
+    torch.testing.assert_close(swa_cache[0], expected_kv[0, :2])
+    torch.testing.assert_close(swa_cache[1], expected_kv[0, 2:4])
+    assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="paged cached local window: ")
 
 
 def test_cached_ratio0_flattened_prefill_uses_per_sequence_kv_slice() -> None:
@@ -747,6 +880,7 @@ def test_cached_ratio0_decode_cuda_graph_replay_uses_runtime_slot_and_input_pos(
     topk_idxs.copy_(torch.tensor([[[3]]], dtype=torch.int64, device="cuda"))
     metadata[2].copy_(torch.tensor([3], dtype=torch.int32, device="cuda"))
     metadata[3].copy_(torch.tensor([1], dtype=torch.int64, device="cuda"))
+    metadata[6].copy_(torch.tensor([1], dtype=torch.int32, device="cuda"))
     swa_cache[1, 3].fill_(-11.0)
 
     graph.replay()
@@ -1386,8 +1520,8 @@ def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots()
         torch.testing.assert_close(swa_cache[slot_idx, :total_len], kv[slot_idx])
         torch.testing.assert_close(mhc_cache[slot_idx, 0], compressed_kv[slot_idx, 0])
         torch.testing.assert_close(
-            mhc_cache[slot_idx, 1],
-            torch.full_like(mhc_cache[slot_idx, 1], 777.0),
+            mhc_cache[slot_idx, compress_ratio],
+            torch.full_like(mhc_cache[slot_idx, compress_ratio], 777.0),
         )
     assert_rmse_close(
         output,
@@ -1590,7 +1724,7 @@ def test_cached_ratio4_decode_matches_source_with_learned_indexer_topk() -> None
         compress_ratio=compress_ratio,
     )
 
-    torch.testing.assert_close(mhc_cache[0, 1], compressed_kv[0, 1])
+    torch.testing.assert_close(mhc_cache[0, compress_ratio], compressed_kv[0, 1])
     assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="cached ratio-4 indexer: ")
     assert not torch.allclose(output, all_visible, rtol=1e-6, atol=1e-6)
 
@@ -1634,7 +1768,7 @@ def test_cached_ratio4_indexer_runtime_all_reduce_flips_selected_row(
         )
     )
     mhc_cache[0, 0, 0] = 4.0
-    mhc_cache[0, 1, 1] = 4.0
+    mhc_cache[0, compress_ratio, 1] = 4.0
 
     indexer_q = torch.tensor([[[[0.0, 1.0]]]])
     indexer_weights = torch.ones(1, 1, 1)
@@ -1699,7 +1833,7 @@ def test_cached_ratio4_indexer_runtime_all_reduce_flips_selected_row(
     local_window = swa_cache[:, input_pos - window_size + 1 : input_pos + 1]
     expected = _run_sparse_attention(
         q,
-        torch.cat((local_window, mhc_cache[:, 1:2]), dim=1),
+        torch.cat((local_window, mhc_cache[:, compress_ratio : compress_ratio + 1]), dim=1),
         attn_sink,
         expected_topk,
     )
@@ -1817,8 +1951,131 @@ def test_cached_ratio128_emits_boundary_row_and_hides_future_rows() -> None:
     )
 
     torch.testing.assert_close(mhc_cache[0, 0], compressed_kv[0, 0])
-    torch.testing.assert_close(mhc_cache[0, 1], torch.full_like(mhc_cache[0, 1], 777.0))
+    torch.testing.assert_close(
+        mhc_cache[0, compress_ratio],
+        torch.full_like(mhc_cache[0, compress_ratio], 777.0),
+    )
     assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="cached ratio-128 boundary: ")
+
+
+def test_cached_ratio128_mhc_cache_uses_token_domain_paged_positions() -> None:
+    torch.manual_seed(129)
+    compress_ratio = 128
+    tokens_per_block = 64
+    total_len = 256
+    prefill_len = total_len - 1
+    window_size = 4
+    q = torch.randn(1, total_len, 1, 8)
+    kv = torch.randn(1, total_len, 8)
+    attn_sink = torch.tensor([-0.25])
+    (
+        compressor_kv,
+        compressor_gate,
+        compressed_kv,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+    ) = _compressor_case(
+        compress_ratio,
+        total_len,
+        compressed_capacity_tokens=total_len,
+    )
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _make_paged_sparse_attention_caches(
+            total_len,
+            tokens_per_block,
+            kv.shape[-1],
+            compressor_kv.shape[-1],
+            fill_value=777.0,
+        )
+    )
+
+    topk_prefill = _visible_source_topk(
+        prefill_len,
+        0,
+        prefill_len,
+        window_size,
+        compress_ratio,
+        compressor.max_compressed_len,
+        q.device,
+    )
+    _run_cached_sparse_attention_with_compressor(
+        q[:, :prefill_len],
+        kv[:, :prefill_len],
+        attn_sink,
+        topk_prefill,
+        compressor_kv[:, :prefill_len],
+        compressor_gate[:, :prefill_len],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, :prefill_len],
+        _context_meta(seq_len=prefill_len, tokens_per_block=tokens_per_block),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+    torch.testing.assert_close(
+        _paged_cache_row(mhc_cache, 0, tokens_per_block), compressed_kv[0, 0]
+    )
+
+    output = _run_cached_sparse_attention_with_compressor(
+        q[:, prefill_len:],
+        kv[:, prefill_len:],
+        attn_sink,
+        torch.zeros(1, 1, 1, dtype=torch.int64),
+        compressor_kv[:, prefill_len:],
+        compressor_gate[:, prefill_len:],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, prefill_len:],
+        _decode_meta(input_pos=prefill_len, tokens_per_block=tokens_per_block),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+    expected_topk = _visible_source_topk(
+        1,
+        prefill_len,
+        total_len,
+        window_size,
+        compress_ratio,
+        compressor.max_compressed_len,
+        q.device,
+    )
+    expected = _run_sparse_attention_with_compressor(
+        q[:, prefill_len:],
+        kv,
+        attn_sink,
+        expected_topk,
+        compressor_kv,
+        compressor_gate,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+
+    row1_pos = compress_ratio
+    torch.testing.assert_close(
+        _paged_cache_row(mhc_cache, row1_pos, tokens_per_block),
+        compressed_kv[0, 1],
+    )
+    torch.testing.assert_close(
+        _paged_cache_row(swa_cache, prefill_len, tokens_per_block),
+        kv[0, prefill_len],
+    )
+    assert_rmse_close(output, expected, rmse_ratio_tol=1e-6, msg="paged ratio-128 mhc: ")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
@@ -1858,7 +2115,7 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
     position_ids = torch.tensor([[capture_pos]], dtype=torch.int64, device="cuda")
 
     swa_cache = torch.zeros(2, max_seq_len, head_dim, device="cuda")
-    mhc_cache = torch.full((2, max_compressed_len, head_dim), -77.0, device="cuda")
+    mhc_cache = torch.full((2, max_seq_len, head_dim), -77.0, device="cuda")
     compressor_kv_cache = torch.zeros(2, max_seq_len, state_dim, device="cuda")
     compressor_gate_cache = torch.zeros_like(compressor_kv_cache)
     compressor_kv_cache[0, :capture_pos] = compressor_kv_values[0, :capture_pos]
@@ -1935,18 +2192,22 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
     compressor_gate.copy_(compressor_gate_values[1:2, replay_pos : replay_pos + 1])
     metadata[2].copy_(torch.tensor([replay_pos], dtype=torch.int32, device="cuda"))
     metadata[3].copy_(torch.tensor([1], dtype=torch.int64, device="cuda"))
+    metadata[6].copy_(torch.tensor([1], dtype=torch.int32, device="cuda"))
     position_ids.copy_(torch.tensor([[replay_pos]], dtype=torch.int64, device="cuda"))
-    mhc_cache[1, 1].fill_(-33.0)
+    row_logical_pos = compress_ratio
+    mhc_cache[1, row_logical_pos].fill_(-33.0)
 
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_row = dsv4_sparse._compressed_row_from_unpaged_state(
+    expected_row = dsv4_sparse._compressed_row_from_paged_state(
         compressor_kv_cache,
         compressor_gate_cache,
-        1,
+        0,
         1,
         compress_ratio,
+        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int64),
         compressor_ape,
         compressor_norm_weight,
         cos_table,
@@ -1958,7 +2219,7 @@ def test_cached_compressed_decode_cuda_graph_replay_updates_runtime_compressed_r
         state_dim,
         compressor_kv.dtype,
     )
-    torch.testing.assert_close(mhc_cache[1, 1], expected_row, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(mhc_cache[1, row_logical_pos], expected_row, rtol=1e-5, atol=1e-5)
 
 
 def test_cached_sparse_attention_rejects_unsupported_compress_ratio() -> None:
@@ -1987,12 +2248,16 @@ def test_cached_sparse_attention_rejects_short_metadata() -> None:
     topk_idxs = torch.zeros(1, 1, 1, dtype=torch.int64)
     batch_info_host = BatchInfo()
     batch_info_host.update([1, 1, 0, 0, 0, 0])
+    cu_num_pages, cache_loc, last_page_len = _page_meta([1], [0], [0])
     metadata = (
         batch_info_host.serialize(),
         torch.tensor([1], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int32),
         torch.tensor([0], dtype=torch.int64),
         torch.tensor([0], dtype=torch.int32),
+        cu_num_pages,
+        cache_loc,
+        last_page_len,
     )
 
     with pytest.raises(ValueError, match="cu_seqlen must have at least 2 elements"):
@@ -2224,6 +2489,7 @@ def test_deepseek_sparse_cache_initializers_use_schema_names_for_source_args() -
     handlers = DeepSeekV4SparseAttention.get_cache_initializers(source_node, KvCacheConfig())
 
     assert DeepSeekV4SparseAttention.get_num_qkv_args() == len(dsv4_sparse._SOURCE_TENSOR_ARG_NAMES)
+    assert isinstance(handlers["swa_cache"], PagedResourceHandler)
     assert handlers["swa_cache"].token_shape == (4,)
     assert handlers["swa_cache"].dtype == torch.float16
     assert handlers["compressor_kv_cache"].token_shape == (8,)
