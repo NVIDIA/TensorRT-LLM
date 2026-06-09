@@ -165,6 +165,7 @@ class StatsKeeper:
         num_accepted_draft_tokens = []
         draft_acceptance_rate = []
         acceptance_length = []
+        decoding_iterations = []
 
         for entry in self.requests.values():
             start_time = min(entry.start_timestamp, start_time)
@@ -193,6 +194,7 @@ class StatsKeeper:
                     float(num_draft_tokens[-1]))
                 acceptance_length.append(entry.num_total_output_tokens /
                                          (entry.decode_iteration + 1))
+                decoding_iterations.append(entry.decode_iteration + 1)
 
         global_acceptance_length = sum(
             output_tokens) / total_decoding_iterations
@@ -203,17 +205,21 @@ class StatsKeeper:
         num_accepted_draft_tokens_percentiles = PercentileStats.from_iterable(
             num_accepted_draft_tokens) if num_accepted_draft_tokens else None
         # Weight the per-request acceptance rate (AR) and acceptance length
-        # (AL) averages by output length. An equally-weighted mean would bias
-        # the result toward short requests, which run fewer decoding
-        # iterations; output-length weighting makes the .average a token-level
-        # mean so longer requests contribute proportionally. Percentiles are
-        # unaffected.
+        # (AL) averages by the number of decoding iterations the request ran.
+        # An equally-weighted mean would bias the result toward short requests,
+        # which run fewer decoding iterations; iteration weighting makes the
+        # .average a token-level mean so longer requests contribute
+        # proportionally. This also makes acceptance_length_percentiles.average
+        # equal the globally-computed acceptance_length
+        # (sum(output_tokens) / total_decoding_iterations), since AL_i =
+        # output_tokens_i / iterations_i and the weights cancel the per-request
+        # iterations. Percentiles are unaffected.
         draft_acceptance_rate_percentiles = PercentileStats.from_iterable(
             draft_acceptance_rate,
-            weights=output_tokens) if draft_acceptance_rate else None
+            weights=decoding_iterations) if draft_acceptance_rate else None
         acceptance_length_percentiles = PercentileStats.from_iterable(
             acceptance_length,
-            weights=output_tokens) if acceptance_length else None
+            weights=decoding_iterations) if acceptance_length else None
 
         requests = list(self.requests.values())
         stats = BenchmarkStatistics(

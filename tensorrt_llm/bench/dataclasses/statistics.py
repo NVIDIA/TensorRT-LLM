@@ -108,9 +108,10 @@ class PercentileStats(BaseModel):
         When ``weights`` is provided, ``average`` is computed as a weighted
         mean (``sum(w * v) / sum(w)``) instead of an equally-weighted mean.
         This is used to weight per-request metrics (e.g. speculative decoding
-        acceptance rate / acceptance length) by output length so that longer
-        requests, which run more decoding iterations, contribute
-        proportionally. Percentiles, minimum and maximum are unaffected.
+        acceptance rate / acceptance length) by the number of decoding
+        iterations so that longer requests, which run more decoding iterations,
+        contribute proportionally. Percentiles, minimum and maximum are
+        unaffected.
         """
         length = len(values)
         sorted_values = sorted(values)
