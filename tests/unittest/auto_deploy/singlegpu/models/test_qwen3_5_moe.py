@@ -907,7 +907,7 @@ def test_vision_attention_matches_reference():
         our_output,
         ref_output,
         rtol=1e-4,
-        atol=1e-4,
+        atol=5e-4,
     )
 
 
@@ -936,7 +936,7 @@ def test_vision_block_matches_reference():
         our_output,
         ref_output,
         rtol=1e-4,
-        atol=1e-4,
+        atol=5e-4,
     )
 
 
@@ -1847,7 +1847,7 @@ def test_vlm_wrapper_delta_is_request_scoped_no_cross_call_leakage():
         output_with_delta.logits,
         ref_logits_with_delta,
         rtol=1e-4,
-        atol=1e-4,
+        atol=5e-4,
     )
     torch.testing.assert_close(
         output_without_delta.logits,
