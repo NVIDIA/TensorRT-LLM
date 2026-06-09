@@ -12,14 +12,9 @@ kv_cache_config:
   # tunable mamba cache dtype
   # --> use float32 for accuracy and default (auto) for speed
   mamba_ssm_cache_dtype: auto
-attention_dp_config:
-  enable_balance: true
-  batching_wait_iters: 10
-  timeout_iters: 16
 transforms:
   detect_sharding:
     allreduce_strategy: SYMM_MEM
-    enable_attention_dp: true
     # NOTE: add 'tp' to sharding dims only for high-throughput runs
     # For low-latency, keep mamba and attention replicated
     sharding_dims: ['ep', 'bmm']
