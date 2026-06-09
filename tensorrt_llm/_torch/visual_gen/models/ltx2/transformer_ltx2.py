@@ -699,51 +699,47 @@ class BasicAVTransformerBlock(nn.Module):
     # -- AdaLN helpers -------------------------------------------------------
 
     @staticmethod
-    def _get_all_ada_values(
+    def _get_ada_values(
         scale_shift_table: torch.Tensor,
         batch_size: int,
         timestep: torch.Tensor,
+        indices: slice,
     ) -> tuple[torch.Tensor, ...]:
-        """Compute all ``scale_shift_table.shape[0]`` (=6 for LTX-2) AdaLN modulation
-        tensors in one fused broadcast-add. Returns
-        ``(shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)``.
-        Each tensor has shape ``[batch_size, T, D]`` where T = ``timestep.shape[1]``.
+        """Combined-form AdaLN values for the slots in ``indices``. Returns one bf16
+        ``[batch_size, T, D]`` tensor per slot (broadcast-add of ``scale_shift_table``
+        cast to bf16 + ``timestep`` reshaped to per-slot views, then unbound on the
+        slot axis).
         """
         num_ada_params = scale_shift_table.shape[0]
         return (
-            scale_shift_table.unsqueeze(0)
+            scale_shift_table[indices]
+            .unsqueeze(0)
             .unsqueeze(0)
             .to(device=timestep.device, dtype=timestep.dtype)
-            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)
+            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
         ).unbind(dim=2)
 
     @staticmethod
-    def _get_ada_value_pair(
+    def _get_ada_table_ts_pairs(
         scale_shift_table: torch.Tensor,
         batch_size: int,
         timestep: torch.Tensor,
-        slot_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(table_slice, ts_slice)`` for one AdaLN modulator slot, WITHOUT
-        materializing the broadcast-add. The fused C++ op consumes the pair
-        directly and does the add in Phase 0b of its kernel; this folds away
-        the Inductor leaf POI prep kernel that the combined form generates.
+        indices: slice,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Pair-form companion to ``_get_ada_values``: returns one ``(table_slice, ts_slice)``
+        pair per slot in ``indices`` without materializing the broadcast-add. Consumers that
+        fuse the add into a downstream kernel (Phase 0b of the fused C++ ops) accept the pair
+        directly; the broadcast-add then becomes dead code and is DCE'd by Inductor when no
+        combined-form slot from the same range is consumed elsewhere.
 
-        Companion helper to ``_get_all_ada_values``: combined-form slots used by
-        non-pair-aware sites (gate mul, KC, KB) stay on ``_get_all_ada_values``;
-        pair-aware sites (KA) use this helper. Inductor DCEs the combined-form
-        slot when only its pair-form counterpart is consumed.
-
-        Returns:
-            table_slice: fp32 [D]          (broadcast over batch and seq)
-            ts_slice:    bf16 [B, T, D]    (unbind view; inner stride 1)
+        Returns a tuple of (table_slice fp32 [D], ts_slice bf16 [B, T, D]) per slot.
         """
         num_ada_params = scale_shift_table.shape[0]
-        table_slice = scale_shift_table[slot_idx]
-        ts_slice = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[
-            :, :, slot_idx, :
-        ]
-        return table_slice, ts_slice
+        ts_reshaped = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)
+        return tuple(
+            (scale_shift_table[i], ts_reshaped[:, :, i, :])
+            for i in range(*indices.indices(num_ada_params))
+        )
 
     @staticmethod
     def _get_av_ca_ada_values(
@@ -838,31 +834,14 @@ class BasicAVTransformerBlock(nn.Module):
             skip_v_self = has_perturbations and perturbations.all_in_batch(
                 PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
             )
-            # Compute all 6 AdaLN values (self-attn + FFN). When the outer
-            # LTXModel.forward has precomputed them (block_ada_values populated),
-            # this is a zero-cost view -- no broadcast-add inside the compiled
-            # scope. Otherwise fall back to inline computation.
-            # Compute all 6 AdaLN values (self-attn + FFN) in one broadcast-add.
-            (
-                vshift_msa,
-                vscale_msa,
-                vgate_msa,
-                vshift_mlp,
-                vscale_mlp,
-                vgate_mlp,
-            ) = self._get_all_ada_values(self.scale_shift_table, vx.shape[0], video.timesteps)
             if not skip_v_self:
-                # KA fuses RMSNorm + AdaLN modulate; with fp4_input_scale the kernel
-                # also emits packed FP4 + 128x4 SWIZZLED SF so the downstream NVFP4
-                # qkv_proj can skip its internal tunable_fp4_quantize.
-                # Pair form (table, ts) avoids the upstream broadcast-add Triton
-                # prep kernel that would otherwise materialize vscale_msa/vshift_msa
-                # ahead of the call -- the C++ op does the add in Phase 0b.
-                vscale_msa_table, vscale_msa_ts = self._get_ada_value_pair(
-                    self.scale_shift_table, vx.shape[0], video.timesteps, slot_idx=1
-                )
-                vshift_msa_table, vshift_msa_ts = self._get_ada_value_pair(
-                    self.scale_shift_table, vx.shape[0], video.timesteps, slot_idx=0
+                # MSA modulators in pair form: slot 0 = shift_msa, 1 = scale_msa, 2 = gate_msa.
+                (
+                    (vshift_msa_table, vshift_msa_ts),
+                    (vscale_msa_table, vscale_msa_ts),
+                    (vgate_msa_table, vgate_msa_ts),
+                ) = self._get_ada_table_ts_pairs(
+                    self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
                 )
                 norm_vx = apply_fused_adaln_modulate(
                     vx,
@@ -873,11 +852,6 @@ class BasicAVTransformerBlock(nn.Module):
                     self.norm_eps,
                     self._fuse_adaln,
                     fp4_input_scale=get_nvfp4_input_scale(self.attn1.qkv_proj),
-                )
-                # vgate_msa slot=2 is now fed into KD as a (table, ts) pair so
-                # the broadcast-add + gate_mul + KD chain fuses into one kernel.
-                vgate_msa_table, vgate_msa_ts = self._get_ada_value_pair(
-                    self.scale_shift_table, vx.shape[0], video.timesteps, slot_idx=2
                 )
                 v_attn_raw = self.attn1(norm_vx, pe=video.positional_embeddings)
                 if has_perturbations and perturbations.any_in_batch(
@@ -914,22 +888,14 @@ class BasicAVTransformerBlock(nn.Module):
             skip_a_self = has_perturbations and perturbations.all_in_batch(
                 PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
             )
-            (
-                ashift_msa,
-                ascale_msa,
-                agate_msa,
-                ashift_mlp,
-                ascale_mlp,
-                agate_mlp,
-            ) = self._get_all_ada_values(self.audio_scale_shift_table, ax.shape[0], audio.timesteps)
             if not skip_a_self:
-                # KA fuses RMSNorm + AdaLN modulate (with optional FP4 quant for the
-                # downstream NVFP4 qkv_proj -- see video MSA above). Pair form.
-                ascale_msa_table, ascale_msa_ts = self._get_ada_value_pair(
-                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slot_idx=1
-                )
-                ashift_msa_table, ashift_msa_ts = self._get_ada_value_pair(
-                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slot_idx=0
+                # MSA modulators in pair form: slot 0 = shift_msa, 1 = scale_msa, 2 = gate_msa.
+                (
+                    (ashift_msa_table, ashift_msa_ts),
+                    (ascale_msa_table, ascale_msa_ts),
+                    (agate_msa_table, agate_msa_ts),
+                ) = self._get_ada_table_ts_pairs(
+                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
                 )
                 norm_ax = apply_fused_adaln_modulate(
                     ax,
@@ -940,10 +906,6 @@ class BasicAVTransformerBlock(nn.Module):
                     self.norm_eps,
                     self._fuse_adaln,
                     fp4_input_scale=get_nvfp4_input_scale(self.audio_attn1.qkv_proj),
-                )
-                # agate_msa slot=2 → pair form, fed into KD.
-                agate_msa_table, agate_msa_ts = self._get_ada_value_pair(
-                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slot_idx=2
                 )
                 a_attn_raw = self.audio_attn1(
                     norm_ax,
@@ -1024,17 +986,13 @@ class BasicAVTransformerBlock(nn.Module):
                 # Pair form for the 4 ss modulators: AV CA video table[:4]
                 # paired with cross_scale_shift_timestep (4 slots in last dim).
                 v_ss_table = self.scale_shift_table_a2v_ca_video[:4]
-                v_scale_a2v_table, v_scale_a2v_ts = self._get_ada_value_pair(
-                    v_ss_table, vx.shape[0], video.cross_scale_shift_timestep, slot_idx=0
-                )
-                v_shift_a2v_table, v_shift_a2v_ts = self._get_ada_value_pair(
-                    v_ss_table, vx.shape[0], video.cross_scale_shift_timestep, slot_idx=1
-                )
-                v_scale_v2a_table, v_scale_v2a_ts = self._get_ada_value_pair(
-                    v_ss_table, vx.shape[0], video.cross_scale_shift_timestep, slot_idx=2
-                )
-                v_shift_v2a_table, v_shift_v2a_ts = self._get_ada_value_pair(
-                    v_ss_table, vx.shape[0], video.cross_scale_shift_timestep, slot_idx=3
+                (
+                    (v_scale_a2v_table, v_scale_a2v_ts),
+                    (v_shift_a2v_table, v_shift_a2v_ts),
+                    (v_scale_v2a_table, v_scale_v2a_ts),
+                    (v_shift_v2a_table, v_shift_v2a_ts),
+                ) = self._get_ada_table_ts_pairs(
+                    v_ss_table, vx.shape[0], video.cross_scale_shift_timestep, slice(0, 4)
                 )
                 vx, vx_scaled_a2v, vx_scaled_v2a = apply_fused_resid_rms_dual_shift_scale(
                     vx,
@@ -1067,17 +1025,13 @@ class BasicAVTransformerBlock(nn.Module):
                 # Pair form for the 4 ss modulators: AV CA audio table[:4]
                 # paired with cross_scale_shift_timestep.
                 a_ss_table = self.scale_shift_table_a2v_ca_audio[:4]
-                a_scale_a2v_table, a_scale_a2v_ts = self._get_ada_value_pair(
-                    a_ss_table, ax.shape[0], audio.cross_scale_shift_timestep, slot_idx=0
-                )
-                a_shift_a2v_table, a_shift_a2v_ts = self._get_ada_value_pair(
-                    a_ss_table, ax.shape[0], audio.cross_scale_shift_timestep, slot_idx=1
-                )
-                a_scale_v2a_table, a_scale_v2a_ts = self._get_ada_value_pair(
-                    a_ss_table, ax.shape[0], audio.cross_scale_shift_timestep, slot_idx=2
-                )
-                a_shift_v2a_table, a_shift_v2a_ts = self._get_ada_value_pair(
-                    a_ss_table, ax.shape[0], audio.cross_scale_shift_timestep, slot_idx=3
+                (
+                    (a_scale_a2v_table, a_scale_a2v_ts),
+                    (a_shift_a2v_table, a_shift_a2v_ts),
+                    (a_scale_v2a_table, a_scale_v2a_ts),
+                    (a_shift_v2a_table, a_shift_v2a_ts),
+                ) = self._get_ada_table_ts_pairs(
+                    a_ss_table, ax.shape[0], audio.cross_scale_shift_timestep, slice(0, 4)
                 )
                 ax, ax_scaled_a2v, ax_scaled_v2a = apply_fused_resid_rms_dual_shift_scale(
                     ax,
@@ -1205,20 +1159,24 @@ class BasicAVTransformerBlock(nn.Module):
                     ax = ax + v2a_out
 
         # --- Video FFN ---
-        # mlp values were computed alongside msa values in the self-attn block above.
         if run_vx:
+            # MLP modulators: slot 3 (shift_mlp), 4 (scale_mlp) feed the fused kernel as
+            # pair form; slot 5 (gate_mlp) is consumed as a bf16 tensor by the elementwise
+            # gate-mul below.
+            (
+                (vshift_mlp_table, vshift_mlp_ts),
+                (vscale_mlp_table, vscale_mlp_ts),
+            ) = self._get_ada_table_ts_pairs(
+                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 5)
+            )
+            (vgate_mlp,) = self._get_ada_values(
+                self.scale_shift_table, vx.shape[0], video.timesteps, slice(5, 6)
+            )
             if a2v_attn_raw is not None:
-                # KC fuses: vx <- vx + a2v_attn_raw*gate; rms_norm; (1+scale)*normed+shift;
-                # with fp4_input_scale also emits FP4 + SF. Pair form for all 3 modulators:
-                # gate from AV CA table[4]+cross_gate_timestep, scale/shift from MSA slots 4/3.
+                # KC: vx <- vx + a2v_attn_raw*gate; rms_norm; (1+scale)*normed+shift.
+                # Gate comes from AV CA table[4]+cross_gate_timestep.
                 v_gate_a2v_table = self.scale_shift_table_a2v_ca_video[4]
                 v_gate_a2v_ts = video.cross_gate_timestep
-                vscale_mlp_table, vscale_mlp_ts = self._get_ada_value_pair(
-                    self.scale_shift_table, vx.shape[0], video.timesteps, slot_idx=4
-                )
-                vshift_mlp_table, vshift_mlp_ts = self._get_ada_value_pair(
-                    self.scale_shift_table, vx.shape[0], video.timesteps, slot_idx=3
-                )
                 vx, vx_scaled = apply_fused_gate_resid_rms_modulate(
                     vx,
                     a2v_attn_raw,
@@ -1234,14 +1192,7 @@ class BasicAVTransformerBlock(nn.Module):
                 )
                 a2v_attn_raw = None
             else:
-                # Fallback (no media cross-attn residual to consume): pure modulate
-                # via KA. Same fp4_input_scale dispatch. Pair form.
-                vscale_mlp_table, vscale_mlp_ts = self._get_ada_value_pair(
-                    self.scale_shift_table, vx.shape[0], video.timesteps, slot_idx=4
-                )
-                vshift_mlp_table, vshift_mlp_ts = self._get_ada_value_pair(
-                    self.scale_shift_table, vx.shape[0], video.timesteps, slot_idx=3
-                )
+                # No media cross-attn residual to consume: pure RMSNorm + modulate via KA.
                 vx_scaled = apply_fused_adaln_modulate(
                     vx,
                     vscale_mlp_table,
@@ -1256,17 +1207,20 @@ class BasicAVTransformerBlock(nn.Module):
 
         # --- Audio FFN ---
         if run_ax:
+            (
+                (ashift_mlp_table, ashift_mlp_ts),
+                (ascale_mlp_table, ascale_mlp_ts),
+            ) = self._get_ada_table_ts_pairs(
+                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 5)
+            )
+            (agate_mlp,) = self._get_ada_values(
+                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(5, 6)
+            )
             if v2a_attn_raw is not None:
-                # KC fuses: ax <- ax + v2a_attn_raw*gate; rms_norm; (1+scale)*normed+shift;
-                # gate from AV CA audio table[4]+cross_gate_timestep, scale/shift from MSA audio.
+                # KC: ax <- ax + v2a_attn_raw*gate; rms_norm; (1+scale)*normed+shift.
+                # Gate comes from AV CA audio table[4]+cross_gate_timestep.
                 a_gate_v2a_table = self.scale_shift_table_a2v_ca_audio[4]
                 a_gate_v2a_ts = audio.cross_gate_timestep
-                ascale_mlp_table, ascale_mlp_ts = self._get_ada_value_pair(
-                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slot_idx=4
-                )
-                ashift_mlp_table, ashift_mlp_ts = self._get_ada_value_pair(
-                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slot_idx=3
-                )
                 ax, ax_scaled = apply_fused_gate_resid_rms_modulate(
                     ax,
                     v2a_attn_raw,
@@ -1282,12 +1236,6 @@ class BasicAVTransformerBlock(nn.Module):
                 )
                 v2a_attn_raw = None
             else:
-                ascale_mlp_table, ascale_mlp_ts = self._get_ada_value_pair(
-                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slot_idx=4
-                )
-                ashift_mlp_table, ashift_mlp_ts = self._get_ada_value_pair(
-                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slot_idx=3
-                )
                 ax_scaled = apply_fused_adaln_modulate(
                     ax,
                     ascale_mlp_table,

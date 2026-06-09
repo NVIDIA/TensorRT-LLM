@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_pipeline.h>
@@ -30,7 +31,54 @@ namespace kernels
 namespace
 {
 
-// Phase 0b helper: combine 8 bf16 ts + 8 fp32 table into 8 bf16 (one uint4).
+__device__ __forceinline__ uint32_t cvta_to_smem(void const* ptr)
+{
+    return static_cast<uint32_t>(__cvta_generic_to_shared(const_cast<void*>(ptr)));
+}
+
+__device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count)
+{
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" : : "r"(cvta_to_smem(bar)), "r"(count));
+}
+
+__device__ __forceinline__ void mbar_arrive(uint64_t* bar)
+{
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" : : "r"(cvta_to_smem(bar)));
+}
+
+__device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* bar, uint32_t tx_bytes)
+{
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" : : "r"(cvta_to_smem(bar)), "r"(tx_bytes));
+}
+
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t phase)
+{
+    asm volatile(
+        "{ .reg .pred P;                                                   \n"
+        "  WAIT: mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;     \n"
+        "  @P bra DONE;                                                    \n"
+        "  bra WAIT;                                                       \n"
+        "  DONE: }"
+        :
+        : "r"(cvta_to_smem(bar)), "r"(phase));
+}
+
+__device__ __forceinline__ void cp_async_bulk(void* smem_dst, void const* global_src, uint32_t bytes, uint64_t* bar)
+{
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+        :
+        : "r"(cvta_to_smem(smem_dst)), "l"(reinterpret_cast<uint64_t>(global_src)), "r"(bytes), "r"(cvta_to_smem(bar))
+        : "memory");
+}
+
+// Sync only the consumer warpgroup on named barrier 1; producer warp must not participate.
+__device__ __forceinline__ void bar_sync_consumer(int count)
+{
+    asm volatile("bar.sync 1, %0;" : : "r"(count));
+}
+
+// combine_modulator_chunk: combine 8 bf16 ts + 8 fp32 table into 8 bf16 (one uint4).
 // Matches PyTorch eager `_get_all_ada_values` semantics: narrow fp32 table to
 // bf16 FIRST, then bf16 hw add. Used for gate / scale / shift modulators alike.
 __device__ __forceinline__ uint4 combine_modulator_chunk(uint4 const& ts_v, float4 const& tbl_lo, float4 const& tbl_hi)
@@ -487,6 +535,424 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Pipelined variant: multi-row CTA + circular SMEM stages + 1 producer warp / 8 consumer warps.
+//
+// Pipeline:
+//   - Per-stage SMEM: [X (D bf16) | attn (D bf16) if HAS_RESIDUAL].
+//   - full_bar[NUM_STAGES]:  producer signals "TMA done".
+//   - empty_bar[NUM_STAGES]: consumers signal "slot reusable" (init=CONSUMER_WARPS arrives).
+//   - Producer warp (lane 0 active): wait empty_bar, issue cp.async.bulk for X (and attn when
+//     HAS_RESIDUAL), arrive full_bar with the expected tx-bytes.
+//   - Consumer warps: wait full_bar, compute x_new + sum^2, normalize + modulate + write,
+//     arrive empty_bar.
+//
+// Caller contract: tokens_per_batch >= R_CTA && tokens_per_batch % R_CTA == 0 so all R_CTA
+// rows in a CTA share batchIdx and modulator load amortizes once per CTA.
+template <int D, int R_CTA, int NUM_STAGES, bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_MODULATE, int NUM_OUT,
+    bool HAS_QUANT>
+__global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormParams p)
+{
+    static_assert(D == 4096, "Pipelined variant requires D=4096");
+    static_assert(R_CTA == 4, "Pipelined variant requires R_CTA=4");
+    static_assert(NUM_STAGES == 2 || NUM_STAGES == 3, "NUM_STAGES must be 2 or 3");
+    static_assert(NUM_OUT == 1 || NUM_OUT == 2, "NUM_OUT must be 1 or 2");
+    static_assert(!HAS_GATE || HAS_RESIDUAL, "HAS_GATE requires HAS_RESIDUAL");
+
+    constexpr int CONSUMER_WARPS = 8;
+    constexpr int CONSUMER_THREADS = CONSUMER_WARPS * 32;              // 256
+    constexpr int VEC_ELEMS = 8;                                       // bf16 per uint4
+    constexpr int VEC_PER_THREAD = D / (CONSUMER_THREADS * VEC_ELEMS); // 2 for D=4096
+    constexpr int SF_VEC_SIZE = 16;
+    constexpr int SF_PER_ROW = D / SF_VEC_SIZE;
+    static_assert(D % (CONSUMER_THREADS * VEC_ELEMS) == 0, "D must split evenly across 256 threads x 8 bf16");
+
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.wait;");
+#endif
+
+    int const tid = threadIdx.x;
+    int const warp_id = tid / 32;
+    int const lane_id = tid % 32;
+    bool const is_producer = (warp_id == 0);
+    int const consumer_id = tid - 32;      // valid for warp_id >= 1
+    int const consumer_warp = warp_id - 1; // 0..7
+
+    int const base_token = blockIdx.x * R_CTA;
+    int const batchIdx = base_token / p.tokens_per_batch;
+
+    constexpr int kStageElems = HAS_RESIDUAL ? (2 * D) : D;
+    constexpr size_t kStageBytes = static_cast<size_t>(kStageElems) * sizeof(__nv_bfloat16);
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16* smem_x_stage[NUM_STAGES];
+    __nv_bfloat16* smem_attn_stage[NUM_STAGES];
+#pragma unroll
+    for (int s = 0; s < NUM_STAGES; s++)
+    {
+        smem_x_stage[s] = reinterpret_cast<__nv_bfloat16*>(smem_raw + s * kStageBytes);
+        smem_attn_stage[s] = HAS_RESIDUAL ? (smem_x_stage[s] + D) : nullptr;
+    }
+    uint64_t* full_bar = reinterpret_cast<uint64_t*>(smem_raw + NUM_STAGES * kStageBytes);
+    uint64_t* empty_bar = full_bar + NUM_STAGES;
+    float* warp_sums = reinterpret_cast<float*>(empty_bar + NUM_STAGES);
+
+    if (tid == 0)
+    {
+#pragma unroll
+        for (int s = 0; s < NUM_STAGES; s++)
+        {
+            mbar_init(&full_bar[s], 1);
+            mbar_init(&empty_bar[s], CONSUMER_WARPS);
+        }
+    }
+
+    // Pre-load modulator caches into REGs once per CTA. All R_CTA rows share batchIdx.
+    constexpr int kScaleCacheSize = HAS_MODULATE ? (NUM_OUT * VEC_PER_THREAD) : 1;
+    constexpr int kGateCacheSize = HAS_GATE ? VEC_PER_THREAD : 1;
+    uint4 scale_cache[kScaleCacheSize];
+    uint4 shift_cache[kScaleCacheSize];
+    uint4 gate_cache[kGateCacheSize];
+
+    if (!is_producer)
+    {
+        if constexpr (HAS_MODULATE)
+        {
+#pragma unroll
+            for (int k = 0; k < NUM_OUT; k++)
+            {
+                int64_t const scaleBase = static_cast<int64_t>(batchIdx) * p.scale_ts_stride[k];
+                int64_t const shiftBase = static_cast<int64_t>(batchIdx) * p.shift_ts_stride[k];
+#pragma unroll
+                for (int v = 0; v < VEC_PER_THREAD; v++)
+                {
+                    int const elem = (v * CONSUMER_THREADS + consumer_id) * VEC_ELEMS;
+                    uint4 const s_ts = *reinterpret_cast<uint4 const*>(&p.scale_ts[k][scaleBase + elem]);
+                    float4 const s_tbl_lo = *reinterpret_cast<float4 const*>(&p.scale_table[k][elem + 0]);
+                    float4 const s_tbl_hi = *reinterpret_cast<float4 const*>(&p.scale_table[k][elem + 4]);
+                    scale_cache[k * VEC_PER_THREAD + v] = combine_modulator_chunk(s_ts, s_tbl_lo, s_tbl_hi);
+
+                    uint4 const h_ts = *reinterpret_cast<uint4 const*>(&p.shift_ts[k][shiftBase + elem]);
+                    float4 const h_tbl_lo = *reinterpret_cast<float4 const*>(&p.shift_table[k][elem + 0]);
+                    float4 const h_tbl_hi = *reinterpret_cast<float4 const*>(&p.shift_table[k][elem + 4]);
+                    shift_cache[k * VEC_PER_THREAD + v] = combine_modulator_chunk(h_ts, h_tbl_lo, h_tbl_hi);
+                }
+            }
+        }
+        if constexpr (HAS_GATE)
+        {
+            int64_t const gateBase = static_cast<int64_t>(batchIdx) * p.gate_ts_stride;
+#pragma unroll
+            for (int v = 0; v < VEC_PER_THREAD; v++)
+            {
+                int const elem = (v * CONSUMER_THREADS + consumer_id) * VEC_ELEMS;
+                uint4 const g_ts = *reinterpret_cast<uint4 const*>(&p.gate_ts[gateBase + elem]);
+                float4 const g_tbl_lo = *reinterpret_cast<float4 const*>(&p.gate_table[elem + 0]);
+                float4 const g_tbl_hi = *reinterpret_cast<float4 const*>(&p.gate_table[elem + 4]);
+                gate_cache[v] = combine_modulator_chunk(g_ts, g_tbl_lo, g_tbl_hi);
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // Pre-fill empty_bar so producer's first iteration doesn't block.
+    if (!is_producer && lane_id == 0)
+    {
+#pragma unroll
+        for (int s = 0; s < NUM_STAGES; s++)
+            mbar_arrive(&empty_bar[s]);
+    }
+    __syncthreads();
+
+    uint32_t stage = 0;
+    uint32_t phase_full = 0;
+    uint32_t phase_empty = 0;
+    constexpr uint32_t kXBytes = D * sizeof(__nv_bfloat16);
+    constexpr uint32_t kAttnBytes = HAS_RESIDUAL ? kXBytes : 0;
+    constexpr uint32_t kTotalBytes = kXBytes + kAttnBytes;
+
+    if (is_producer)
+    {
+        if (lane_id == 0)
+        {
+#pragma unroll
+            for (int sub = 0; sub < R_CTA; sub++)
+            {
+                int const token = base_token + sub;
+                if (token >= p.num_tokens)
+                    break;
+                int64_t const tokenBase = static_cast<int64_t>(token) * D;
+                mbar_wait(&empty_bar[stage], phase_empty);
+                mbar_arrive_expect_tx(&full_bar[stage], kTotalBytes);
+                cp_async_bulk(smem_x_stage[stage], p.x + tokenBase, kXBytes, &full_bar[stage]);
+                if constexpr (HAS_RESIDUAL)
+                {
+                    cp_async_bulk(smem_attn_stage[stage], p.attn + tokenBase, kAttnBytes, &full_bar[stage]);
+                }
+                stage = stage + 1;
+                if (stage == NUM_STAGES)
+                {
+                    stage = 0;
+                    phase_empty ^= 1u;
+                }
+            }
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int sub = 0; sub < R_CTA; sub++)
+        {
+            int const token = base_token + sub;
+            bool const valid = (token < p.num_tokens);
+            int const safeToken = valid ? token : 0;
+            int64_t const tokenBase = static_cast<int64_t>(safeToken) * D;
+
+            mbar_wait(&full_bar[stage], phase_full);
+
+            // Phase 1: x_new = x [+ attn [* gate]]; cache x_new in regs, accumulate sum^2.
+            uint4 xnew_cache[VEC_PER_THREAD];
+            float sum2 = 0.0f;
+#pragma unroll
+            for (int v = 0; v < VEC_PER_THREAD; v++)
+            {
+                int const elem = (v * CONSUMER_THREADS + consumer_id) * VEC_ELEMS;
+                uint4 const xv = *reinterpret_cast<uint4 const*>(&smem_x_stage[stage][elem]);
+                uint const* xu = reinterpret_cast<uint const*>(&xv);
+                uint4 new_vec;
+                uint* nu = reinterpret_cast<uint*>(&new_vec);
+
+                if constexpr (HAS_RESIDUAL)
+                {
+                    uint4 const av = *reinterpret_cast<uint4 const*>(&smem_attn_stage[stage][elem]);
+                    uint const* au = reinterpret_cast<uint const*>(&av);
+                    if constexpr (HAS_GATE)
+                    {
+                        uint4 const gv = gate_cache[v];
+                        uint const* gu = reinterpret_cast<uint const*>(&gv);
+#pragma unroll
+                        for (int i = 0; i < 4; i++)
+                        {
+                            float2 xf = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&xu[i]));
+                            float2 af = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&au[i]));
+                            float2 gf = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&gu[i]));
+                            float2 nf;
+                            nf.x = xf.x + af.x * gf.x;
+                            nf.y = xf.y + af.y * gf.y;
+                            sum2 += nf.x * nf.x + nf.y * nf.y;
+                            reinterpret_cast<__nv_bfloat162&>(nu[i]) = __float22bfloat162_rn(nf);
+                        }
+                    }
+                    else
+                    {
+#pragma unroll
+                        for (int i = 0; i < 4; i++)
+                        {
+                            float2 xf = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&xu[i]));
+                            float2 af = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&au[i]));
+                            float2 nf;
+                            nf.x = xf.x + af.x;
+                            nf.y = xf.y + af.y;
+                            sum2 += nf.x * nf.x + nf.y * nf.y;
+                            reinterpret_cast<__nv_bfloat162&>(nu[i]) = __float22bfloat162_rn(nf);
+                        }
+                    }
+                }
+                else
+                {
+#pragma unroll
+                    for (int i = 0; i < 4; i++)
+                    {
+                        float2 xf = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&xu[i]));
+                        sum2 += xf.x * xf.x + xf.y * xf.y;
+                        reinterpret_cast<uint&>(nu[i]) = xu[i];
+                    }
+                }
+                xnew_cache[v] = new_vec;
+                // Write x_new back to p.x in-place when HAS_RESIDUAL (downstream chain reads updated x).
+                if constexpr (HAS_RESIDUAL)
+                {
+                    if (valid)
+                        *reinterpret_cast<uint4*>(&p.x[tokenBase + elem]) = new_vec;
+                }
+            }
+
+            sum2 = tensorrt_llm::common::warpReduceSum(sum2);
+            if (lane_id == 0)
+                warp_sums[consumer_warp] = sum2;
+            bar_sync_consumer(CONSUMER_THREADS);
+
+            float total = 0.0f;
+#pragma unroll
+            for (int w = 0; w < CONSUMER_WARPS; w++)
+                total += warp_sums[w];
+            float const rms_rcp = rsqrtf(total / static_cast<float>(D) + p.eps);
+
+            // ---- Phase 2: normalize + (optional modulate) + write NUM_OUT outputs ----
+            float sf_scale_val[NUM_OUT];
+            if constexpr (HAS_QUANT)
+            {
+#pragma unroll
+                for (int k = 0; k < NUM_OUT; k++)
+                    sf_scale_val[k] = (p.sf_scale[k] != nullptr) ? *p.sf_scale[k] : 1.0f;
+            }
+
+            __nv_bfloat162 const one_b2 = __float2bfloat162_rn(1.0f);
+#pragma unroll
+            for (int v = 0; v < VEC_PER_THREAD; v++)
+            {
+                int const elem = (v * CONSUMER_THREADS + consumer_id) * VEC_ELEMS;
+                uint4 const in_vec = xnew_cache[v];
+                uint const* xu = reinterpret_cast<uint const*>(&in_vec);
+
+                if constexpr (HAS_QUANT)
+                {
+                    // Per-v NVFP4 path: fp32 modulate + max-abs scan + e2m1 pack.
+                    // Each thread covers 8 bf16 (one uint4) per v, half SF block.
+                    // Pair of adjacent lanes (lane ^ 1) shares one 16-element SF block.
+                    float vals[NUM_OUT][8];
+                    float localMax[NUM_OUT];
+#pragma unroll
+                    for (int k = 0; k < NUM_OUT; k++)
+                        localMax[k] = 0.0f;
+
+#pragma unroll
+                    for (int i = 0; i < 4; i++)
+                    {
+                        float2 xf = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&xu[i]));
+                        float const nx = xf.x * rms_rcp;
+                        float const ny = xf.y * rms_rcp;
+#pragma unroll
+                        for (int k = 0; k < NUM_OUT; k++)
+                        {
+                            float yx, yy;
+                            if constexpr (HAS_MODULATE)
+                            {
+                                uint4 const sv = scale_cache[k * VEC_PER_THREAD + v];
+                                uint4 const hv = shift_cache[k * VEC_PER_THREAD + v];
+                                uint const* su = reinterpret_cast<uint const*>(&sv);
+                                uint const* hu = reinterpret_cast<uint const*>(&hv);
+                                float2 sf = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&su[i]));
+                                float2 hf = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&hu[i]));
+                                yx = nx * (1.0f + sf.x) + hf.x;
+                                yy = ny * (1.0f + sf.y) + hf.y;
+                            }
+                            else
+                            {
+                                yx = nx;
+                                yy = ny;
+                            }
+                            vals[k][2 * i + 0] = yx;
+                            vals[k][2 * i + 1] = yy;
+                            localMax[k] = fmaxf(localMax[k], fmaxf(fabsf(yx), fabsf(yy)));
+                        }
+                    }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+                    uint32_t fp4_packed[NUM_OUT];
+                    uint8_t sfBytes[NUM_OUT];
+#pragma unroll
+                    for (int k = 0; k < NUM_OUT; k++)
+                    {
+                        // Pair-lane max-abs across 16 elements (one SF block).
+                        float const blockMax = fmaxf(__shfl_xor_sync(0xffffffff, localMax[k], 1), localMax[k]);
+                        constexpr float kE2M1MaxRcp = 1.0f / 6.0f;
+                        float const sfValue = sf_scale_val[k] * (blockMax * kE2M1MaxRcp);
+                        __nv_fp8_e4m3 const sfFp8 = __nv_fp8_e4m3(sfValue);
+                        sfBytes[k] = sfFp8.__x;
+                        float const sfQuant = static_cast<float>(sfFp8);
+                        float const outScale = (blockMax != 0.0f) ? (sf_scale_val[k] / sfQuant) : 0.0f;
+#pragma unroll
+                        for (int i = 0; i < 8; i++)
+                            vals[k][i] *= outScale;
+                        fp4_packed[k] = fp32_vec_to_e2m1(vals[k]);
+                    }
+
+                    // colVecIdx: one uint32 of packed FP4 per (v, thread). Pair of adjacent
+                    // lanes (lane ^ 1) shares one 16-element SF block (CVT_NUM_THREADS_PER_SF=2).
+                    int const colVecIdx = v * CONSUMER_THREADS + consumer_id;
+                    uint8_t* first_sf_ptr = cvt_quant_get_sf_out_offset<uint32_t, /*CVT_NUM_THREADS_PER_SF=*/2>(
+                        std::nullopt, safeToken, colVecIdx, std::optional<int>(p.num_tokens), SF_PER_ROW, p.out_sf[0],
+                        QuantizationSFLayout::SWIZZLED);
+                    if (valid && first_sf_ptr != nullptr)
+                    {
+                        *first_sf_ptr = sfBytes[0];
+                        if constexpr (NUM_OUT == 2)
+                        {
+                            uint8_t* second_sf_ptr
+                                = cvt_quant_get_sf_out_offset<uint32_t, /*CVT_NUM_THREADS_PER_SF=*/2>(std::nullopt,
+                                    safeToken, colVecIdx, std::optional<int>(p.num_tokens), SF_PER_ROW, p.out_sf[1],
+                                    QuantizationSFLayout::SWIZZLED);
+                            *second_sf_ptr = sfBytes[1];
+                        }
+                    }
+                    if (valid)
+                    {
+                        int64_t const fp4_row_off = static_cast<int64_t>(safeToken) * (D / 8);
+#pragma unroll
+                        for (int k = 0; k < NUM_OUT; k++)
+                            p.out_fp4[k][fp4_row_off + colVecIdx] = fp4_packed[k];
+                    }
+#endif
+                }
+                else
+                {
+                    uint4 out_vecs[NUM_OUT];
+#pragma unroll
+                    for (int i = 0; i < 4; i++)
+                    {
+                        __nv_bfloat162 x_b2 = *reinterpret_cast<__nv_bfloat162 const*>(&xu[i]);
+                        float2 xf = __bfloat1622float2(x_b2);
+                        __nv_bfloat162 normed = __float22bfloat162_rn(make_float2(xf.x * rms_rcp, xf.y * rms_rcp));
+#pragma unroll
+                        for (int k = 0; k < NUM_OUT; k++)
+                        {
+                            uint* o_u = reinterpret_cast<uint*>(&out_vecs[k]);
+                            if constexpr (HAS_MODULATE)
+                            {
+                                uint4 const sv = scale_cache[k * VEC_PER_THREAD + v];
+                                uint4 const hv = shift_cache[k * VEC_PER_THREAD + v];
+                                uint const* su = reinterpret_cast<uint const*>(&sv);
+                                uint const* hu = reinterpret_cast<uint const*>(&hv);
+                                __nv_bfloat162 s_b2 = *reinterpret_cast<__nv_bfloat162 const*>(&su[i]);
+                                __nv_bfloat162 h_b2 = *reinterpret_cast<__nv_bfloat162 const*>(&hu[i]);
+                                __nv_bfloat162 one_p_s = __hadd2(one_b2, s_b2);
+                                __nv_bfloat162 y_b2 = __hadd2(__hmul2(normed, one_p_s), h_b2);
+                                reinterpret_cast<__nv_bfloat162&>(o_u[i]) = y_b2;
+                            }
+                            else
+                            {
+                                reinterpret_cast<__nv_bfloat162&>(o_u[i]) = normed;
+                            }
+                        }
+                    }
+                    if (valid)
+                    {
+#pragma unroll
+                        for (int k = 0; k < NUM_OUT; k++)
+                            *reinterpret_cast<uint4*>(&p.out_bf16[k][tokenBase + elem]) = out_vecs[k];
+                    }
+                }
+            }
+
+            bar_sync_consumer(CONSUMER_THREADS);
+            if (lane_id == 0)
+                mbar_arrive(&empty_bar[stage]);
+
+            stage = stage + 1;
+            if (stage == NUM_STAGES)
+            {
+                stage = 0;
+                phase_full ^= 1u;
+            }
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // Host launcher template + KABCD specializations.
 
 template <bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_MODULATE, int NUM_OUT, bool HAS_QUANT>
@@ -498,31 +964,8 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
     TLLM_CHECK_WITH_INFO(params.num_tokens % params.tokens_per_batch == 0,
         "num_tokens (%d) must be divisible by tokens_per_batch (%d)", params.num_tokens, params.tokens_per_batch);
 
-    // Hardcoded production tile. {2r256, 1r256, 1r512} all tied in the per-call
-    // microbench (<0.5% spread). 1r256 chosen because at D=4096 it halves
-    // CHUNKS_PER_ROW vs 2r256 (4 -> 2), which halves the per-thread modulator
-    // cache register footprint. NCU showed 2r256 KB-bf16 at 142 regs/thread -
-    // only 12.5% theoretical occupancy; switching to 1r256 puts that under the
-    // 64K-regs/SM budget for 2 CTAs (25% occupancy).
-    // Hardcoded production tile: 1-row/CTA, 256 threads/CTA.
-    //
-    // NCU sweep of {2r256, 1r256, 1r512} on B200 ran at the V1 production shape
-    // (D=4096, B=1, T=15360):
-    //   - 2r256: KB-bf16 142 regs/thread, 12.5% theoretical occupancy, sm_sol 23%
-    //   - 1r256: KB-bf16  72 regs/thread, 37.5% occupancy, sm_sol 38%
-    //   - 1r512: KB-bf16  44 regs/thread, 50%   occupancy, sm_sol 40%
-    //
-    // 1r512 wins on NCU metrics but LOSES on wall-time bench (KB +12% slower vs
-    // 1r256). Per-wave analysis: 1r512 has more CTAs resident but each CTA has
-    // 16 warps -- only 4 warp schedulers/SM can issue at once, so most warps
-    // sit ready but unissued. The 512-thread __syncthreads() barrier is also
-    // heavier than the 256-thread one. The net per-element rate is ~5% slower.
-    //
-    // 1r256 is the sweet spot: register pressure low enough for 2 CTAs/SM
-    // (37.5%+ occupancy on all KABCD families), scheduler stays busy across
-    // independent CTAs, and the per-element bench rate is the highest of the
-    // three. Microbench shows cpp beating torch.compile on every V1/V2 shape
-    // (KA -10%, KB -5%, KC tied, KD-bf16 tied, KD-quant -42%).
+    // Production tile selected via NCU sweep at D=4096, B=1, T=15360: 1-row/CTA, 256 threads/CTA
+    // gives 2 CTAs/SM (regs <= 80) and the highest per-element bench rate among {2r256, 1r256, 1r512}.
     constexpr int ROWS_PER_BLOCK = 1;
     constexpr int BLOCK_SIZE = 256;
     constexpr int WARPS_PER_ROW = (BLOCK_SIZE / ROWS_PER_BLOCK) / 32;
@@ -534,6 +977,49 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attrs;
     cfg.numAttrs = 1;
+
+    // Optional pipelined dispatch (multi-row CTA + circular TMA stages + warp specialization).
+    // Enabled by env var TLLM_DIT_NORM_PIPELINED=1. Fires only when:
+    //   - hidden_dim == 4096 (video path; audio D=2048 has too small a grid to amortize the
+    //     warp-specialization overhead and bench-regresses)
+    //   - variant is KA/KB/KC (KD's HAS_GATE && !HAS_MODULATE is HBM-bound and bench-regresses)
+    //   - tokens_per_batch >= 4 && % 4 == 0 (R_CTA=4 rows share batchIdx for per-CTA mod cache)
+    // Otherwise falls through to the default path below.
+    static bool const pipelined_enabled = []()
+    {
+        char const* env = std::getenv("TLLM_DIT_NORM_PIPELINED");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    constexpr bool kPipelinedVariantOK = HAS_MODULATE || !HAS_GATE;
+    if constexpr (kPipelinedVariantOK)
+    {
+        // NUM_STAGES chosen per HAS_QUANT: bf16 path is HBM-latency-bound so deeper pipeline
+        // (3 stages) helps; quant Phase 2 is compute-heavy and extra stages just add SMEM
+        // pressure without commensurate latency hiding.
+        constexpr int PIPE_NUM_STAGES = HAS_QUANT ? 2 : 3;
+        constexpr int PIPE_BLOCK_SIZE = 288;
+        constexpr int PIPE_D = 4096;
+        constexpr int PIPE_R_CTA = 4;
+        if (pipelined_enabled && hidden_dim == PIPE_D && (params.num_tokens % PIPE_R_CTA == 0)
+            && (params.tokens_per_batch >= PIPE_R_CTA) && (params.tokens_per_batch % PIPE_R_CTA == 0))
+        {
+            constexpr int pipe_stage_elems = HAS_RESIDUAL ? (2 * PIPE_D) : PIPE_D;
+            size_t const pipe_smem_bytes
+                = static_cast<size_t>(PIPE_NUM_STAGES) * pipe_stage_elems * sizeof(__nv_bfloat16)
+                + 2 * PIPE_NUM_STAGES * sizeof(uint64_t) + 8 * sizeof(float) + 16;
+            cudaLaunchConfig_t pipe_cfg = cfg;
+            pipe_cfg.gridDim = dim3((params.num_tokens + PIPE_R_CTA - 1) / PIPE_R_CTA);
+            pipe_cfg.blockDim = dim3(PIPE_BLOCK_SIZE);
+            pipe_cfg.dynamicSmemBytes = static_cast<int>(pipe_smem_bytes);
+            auto* pipe_kp = fusedDiTNormKernelPipelined<PIPE_D, PIPE_R_CTA, PIPE_NUM_STAGES, HAS_RESIDUAL, HAS_GATE,
+                HAS_MODULATE, NUM_OUT, HAS_QUANT>;
+            cudaFuncSetAttribute(
+                pipe_kp, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(pipe_smem_bytes));
+            cudaLaunchKernelEx(&pipe_cfg, pipe_kp, params);
+            return;
+        }
+    }
+    (void) pipelined_enabled;
 
 #define LAUNCH(D_VAL)                                                                                                  \
     do                                                                                                                 \

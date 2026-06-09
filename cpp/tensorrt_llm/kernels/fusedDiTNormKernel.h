@@ -54,12 +54,10 @@ namespace kernels
 // Modulator combine matches PyTorch eager `_get_all_ada_values` semantics:
 // narrow fp32 table to bf16 first, then bf16 hw add (`__hadd2`).
 //
-// Tile: production hardcoded to (ROWS_PER_BLOCK=1, BLOCK_SIZE=256). NCU sweep
-// over {2r256, 1r256, 1r512} on B200 at the V1 production shape showed 1r256
-// gives the highest per-element bench rate. 2r256 has too much per-thread
-// register pressure (KB-bf16 at 12.5% occupancy); 1r512 hits higher occupancy
-// but its 16-warp CTAs starve the SM warp schedulers + pay a heavier
-// __syncthreads() barrier. 1r256 is the sweet spot.
+// Tile: production hardcoded to (ROWS_PER_BLOCK=1, BLOCK_SIZE=256). NCU sweep on B200 at
+// the production shape found 1r256 the best balance: 2r256 has too much per-thread register
+// pressure (12.5% theoretical occupancy on KB-bf16); 1r512 reaches higher occupancy but its
+// 16-warp CTAs starve the SM warp schedulers and pay a heavier __syncthreads() barrier.
 //
 // Supported hidden_dim: 2048 (LTX-2 audio) and 4096 (LTX-2 video).
 
