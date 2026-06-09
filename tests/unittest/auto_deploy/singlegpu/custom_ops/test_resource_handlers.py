@@ -27,6 +27,7 @@ from _model_test_utils import default_max_num_tokens
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     AttentionDescriptor,
+    AttentionType,
     CausalConvResourceHandler,
     IntermediateConvStateHandler,
     IntermediateSSMStateHandler,
@@ -52,7 +53,9 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
 
 def test_paged_handler_with_nhd_layout():
     """Test KVPagedResourceHandler with NHD layout."""
-    handler = KVPagedResourceHandler(8, 64, dtype=torch.bfloat16, kv_layout="NHD")
+    handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.bfloat16, kv_layout="NHD", attention_type=AttentionType.mha
+    )
     assert handler.num_kv_heads == 8
     assert handler.head_dim == 64
     assert handler.dtype == torch.bfloat16
@@ -61,7 +64,9 @@ def test_paged_handler_with_nhd_layout():
 
 def test_paged_handler_with_hnd_layout():
     """Test KVPagedResourceHandler with explicit HND layout."""
-    handler = KVPagedResourceHandler(4, 128, dtype=torch.float32, kv_layout="HND")
+    handler = KVPagedResourceHandler(
+        4, 128, dtype=torch.float32, kv_layout="HND", attention_type=AttentionType.mha
+    )
     assert handler.num_kv_heads == 4
     assert handler.head_dim == 128
     assert handler.dtype == torch.float32
@@ -71,7 +76,9 @@ def test_paged_handler_with_hnd_layout():
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 def test_paged_handler_allocate_with_blocks(kv_layout):
     """Verify KVPagedResourceHandler.allocate() returns correct shape."""
-    handler = KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout=kv_layout)
+    handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_layout=kv_layout, attention_type=AttentionType.mha
+    )
     tokens_per_block = 32
     seq_info = SequenceInfo(
         max_seq_len=128,
@@ -109,7 +116,7 @@ def test_paged_handler_allocate_with_blocks(kv_layout):
 
 def test_paged_handler_is_resource_handler():
     """Verify KVPagedResourceHandler is a ResourceHandler subclass."""
-    handler = KVPagedResourceHandler(8, 64, dtype=torch.float16)
+    handler = KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
     assert isinstance(handler, ResourceHandler)
 
 
@@ -292,9 +299,13 @@ def test_resolve_cache_dtype_explicit_fp8():
 
 def test_kv_paged_handler_eq_same_head_dim_dtype():
     """Verify KVPagedResourceHandler __eq__ checks head_dim and dtype."""
-    h1 = KVPagedResourceHandler(8, 64, dtype=torch.float16)
-    h2 = KVPagedResourceHandler(4, 64, dtype=torch.float16)  # Different num_kv_heads
-    h3 = KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout="NHD")  # Different layout
+    h1 = KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    h2 = KVPagedResourceHandler(
+        4, 64, dtype=torch.float16, attention_type=AttentionType.mha
+    )  # Different num_kv_heads
+    h3 = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_layout="NHD", attention_type=AttentionType.mha
+    )  # Different layout
 
     # head_dim, kv_factor, dtype, kv_layout -> equal (num_kv_heads doesn't matter for compatibility)
     assert h1 == h2
@@ -303,12 +314,30 @@ def test_kv_paged_handler_eq_same_head_dim_dtype():
 
 def test_kv_paged_handler_eq_different_head_dim_or_dtype():
     """Verify KVPagedResourceHandler __eq__ returns False for different head_dim or dtype."""
-    h1 = KVPagedResourceHandler(8, 64, dtype=torch.float16)
-    h2 = KVPagedResourceHandler(8, 128, dtype=torch.float16)  # Different head_dim
-    h3 = KVPagedResourceHandler(8, 64, dtype=torch.bfloat16)  # Different dtype
+    h1 = KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    h2 = KVPagedResourceHandler(
+        8, 128, dtype=torch.float16, attention_type=AttentionType.mha
+    )  # Different head_dim
+    h3 = KVPagedResourceHandler(
+        8, 64, dtype=torch.bfloat16, attention_type=AttentionType.mha
+    )  # Different dtype
 
     assert h1 != h2
     assert h1 != h3
+
+
+def test_kv_paged_handler_eq_different_attention_type():
+    """Verify KVPagedResourceHandler __eq__ rejects different attention semantics."""
+    default_handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_factor=1, attention_type=AttentionType.mha
+    )
+    mla_handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_factor=1, attention_type=AttentionType.mla
+    )
+
+    assert default_handler.attention_type == AttentionType.mha
+    assert mla_handler.attention_type == AttentionType.mla
+    assert default_handler != mla_handler
 
 
 def test_ssm_handler_eq_same_params():
