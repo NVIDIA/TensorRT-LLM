@@ -1293,6 +1293,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = {
             "enable_block_reuse": False,
             "use_kv_cache_manager_v2": True,
+            "free_gpu_memory_fraction": 0.3,
+            "host_cache_size": 4 * 1024 * 1024 * 1024,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
