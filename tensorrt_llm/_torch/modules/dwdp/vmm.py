@@ -192,8 +192,29 @@ def get_access_desc(device_id: int) -> cuda.CUmemAccessDesc:
     return madesc
 
 
+def peer_handle_type() -> cuda.CUmemAllocationHandleType:
+    """Return the appropriate peer-shareable handle type for the current arch.
+
+    On aarch64 (GB200) we use ``CU_MEM_HANDLE_TYPE_FABRIC`` which routes
+    through the IMEX channel.  On x86_64 (B200/H100/H200 single-node hosts
+    with no IMEX) ``CU_MEM_HANDLE_TYPE_FABRIC`` is denied with
+    ``CUDA_ERROR_NOT_PERMITTED`` (800), so we use
+    ``CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`` and exchange the FDs
+    between sibling MPI workers via ``pidfd_open`` / ``pidfd_getfd``
+    (mirrors ``MnnvlMemory.get_allocation_prop`` in ``_mnnvl_utils.py``).
+    """
+    arch = platform.machine().lower()
+    if "aarch64" in arch:
+        return cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    return cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+
+
 def create_fabric_handle(size: int, device_id: int) -> int:
-    """Create a fabric memory handle.
+    """Create a peer-shareable memory handle.
+
+    The handle type is selected by ``peer_handle_type()``: FABRIC on
+    aarch64 (GB200), POSIX_FILE_DESCRIPTOR on x86_64.  The function name
+    is preserved for backward compatibility.
 
     Args:
         size: Size in bytes (must be aligned to granularity).
@@ -205,7 +226,7 @@ def create_fabric_handle(size: int, device_id: int) -> int:
     Raises:
         RuntimeError: If creation fails.
     """
-    allocation_prop = get_allocation_prop(device_id, fabric_only=True)
+    allocation_prop = get_allocation_prop(device_id, fabric_only=False)
     handle = check_cu_result(cuda.cuMemCreate(size, allocation_prop, flags=0))
     return int(handle)
 
