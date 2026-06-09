@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
@@ -36,6 +36,7 @@ class RuntimeConfig(BaseModel):
     backend: Literal["pytorch", "_autodeploy", None] = None
     extra_llm_api_options: Optional[str] = None
     iteration_log: Optional[Path] = None
+    explicit_cli_keys: Optional[Set[str]] = None
 
     def get_llm_args(self) -> Dict:
         model = self.engine_dir or self.model_path or self.model
@@ -86,7 +87,9 @@ class RuntimeConfig(BaseModel):
         llm_args["kv_cache_config"] = backend_cache_config | kv_cache_config
 
         updated_llm_args = update_llm_args_with_extra_options(
-            llm_args, self.extra_llm_api_options)
+            llm_args,
+            self.extra_llm_api_options,
+            explicit_cli_keys=self.explicit_cli_keys)
 
         if self.backend == "pytorch":
             cuda_graph_config = updated_llm_args.pop(

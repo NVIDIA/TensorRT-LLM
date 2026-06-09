@@ -26,7 +26,8 @@
       "display_name": "deep_ep",
       "git_repository": "${github_base_url}/deepseek-ai/DeepEP",
       "git_tag": "5be51b228a7c82dbdb213ea58e77bffd12b38af8",
-      "use_url": true
+      "use_url": true,
+      "patch_file": "patches/deep_ep_intranode_combine_fix.patch"
     },
     {
       "name": "deepgemm",

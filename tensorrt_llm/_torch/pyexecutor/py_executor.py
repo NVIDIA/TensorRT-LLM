@@ -37,6 +37,7 @@ from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
@@ -60,8 +61,9 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
-from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, get_draft_token_length)
+from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
+                          LlmRequest, LlmRequestState, LlmResponse,
+                          get_draft_token_length)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -312,7 +314,8 @@ class PyExecutor:
             execution_stream: Optional[torch.cuda.Stream] = None,
             waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
             adp_router: Optional[ADPRouter] = None,
-            dwdp_manager: Optional[DwdpManager] = None):
+            dwdp_manager: Optional[DwdpManager] = None,
+            enable_kv_pool_rebalance: bool = False):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -345,6 +348,7 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
 
@@ -2701,6 +2705,9 @@ class PyExecutor:
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
 
+                if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
+                    self._maybe_rebalance_kv_pools()
+
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
 
@@ -2935,6 +2942,88 @@ class PyExecutor:
             else:
                 raise ValueError(f"Invalid request type: {type(request)}.")
 
+    def _can_pause_for_rebalance(self) -> bool:
+        """Gate KV pool rebalance to the cases the v1 hook supports.
+
+        MVP scope: single-GPU aggregated, no in-flight disagg transfer,
+        no beam search, no drafter, not during warmup or shutdown.
+        Honors the ``enable_kv_pool_rebalance`` opt-in flag (default off).
+        """
+        if not self.enable_kv_pool_rebalance:
+            return False
+        if self.dist.pp_size > 1:
+            return False
+        if self.kv_cache_transceiver is not None:
+            return False
+        if self.is_warmup:
+            return False
+        if self.is_shutdown:
+            return False
+        if self.kv_cache_manager.max_beam_width > 1:
+            return False
+        if self.drafter is not None:
+            return False
+        return True
+
+    def _consume_previous_batch_for_rebalance(self) -> None:
+        """Drain ``previous_batch`` so its _KVCache instances are quiescent.
+
+        No-op when ``previous_batch is None`` -- i.e., always a no-op in
+        the non-overlap loop, since that loop never sets previous_batch.
+        In the overlap loop this fires when the rebalance hook catches a
+        pending in-flight iteration; we consume it inline so suspend can
+        safely run.
+
+        Mirrors the inline sequence in ``_executor_loop_overlap`` that
+        handles ``previous_batch``.  Unlike the inline code we are not
+        guarded by ``should_process_previous_batch``: the rebalance gate
+        already excludes the multi-rank-divergence cases that flag exists
+        to handle.
+        """
+        if self.previous_batch is None:
+            return
+        self._update_requests(self.previous_batch.sample_state)
+        self._send_kv_async(
+            self.previous_batch.scheduled_requests.all_requests())
+        self._flush_pending_transfer_responses()
+        self._process_previous_batch()
+        self.perf_manager.compute_batch_gpu_times(
+            self.previous_batch.scheduled_requests.all_requests())
+        self.previous_batch = None
+
+    def _maybe_rebalance_kv_pools(self) -> None:
+        """Rebalance KV pool ratios when the V2 auto-tuner asks for it.
+
+        Fast path: ``need_adjustment`` checks the sample counter and the
+        120s cooldown before doing any real work.  On the slow path we
+        drain pending GPU work, consume any in-flight ``previous_batch``
+        (overlap loop only), suspend every active request, call
+        ``adjust()``, and resume.  Resume failures stay suspended; the
+        scheduler reactivates them through prepare_context /
+        try_allocate_generation on the next iteration, the same path it
+        uses today after eviction.
+        """
+        mgr = self.kv_cache_manager
+        if not mgr.impl.need_adjustment:
+            return
+
+        torch.cuda.current_stream().synchronize()
+        self._consume_previous_batch_for_rebalance()
+
+        paused: List[LlmRequest] = []
+        for req in self.active_requests:
+            if mgr.is_request_active(req.py_request_id):
+                mgr.suspend_request(req)
+                paused.append(req)
+
+        try:
+            mgr.impl.adjust()
+        except OutOfPagesError as e:
+            logger.warning(f"KV pool adjust() failed: {e!r}")
+
+        for req in paused:
+            mgr.resume_request(req)
+
     @contextmanager
     def control_action(self):
         """
@@ -2980,6 +3069,9 @@ class PyExecutor:
 
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
+
+                if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
+                    self._maybe_rebalance_kv_pools()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
@@ -3891,8 +3983,9 @@ class PyExecutor:
         # Other ranks have work but this rank is idle — insert a dummy so
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
+            dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
             llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=[0],
+                request_ids=dummy_request_ids,
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
@@ -3901,7 +3994,7 @@ class PyExecutor:
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests([0])
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
             self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")

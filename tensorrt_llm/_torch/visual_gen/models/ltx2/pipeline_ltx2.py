@@ -8,7 +8,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import safetensors.torch
 import torch
@@ -17,6 +17,7 @@ from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
+from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
@@ -151,6 +152,23 @@ def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -
         )
 
 
+_LTX2_PREFETCHED_SAFETENSORS: Set[str] = set()
+
+
+def _prefetch_ltx2_safetensors_files(file_names: List[str]) -> bool:
+    """Warm LTX-2 safetensors files in the host page cache.
+
+    For distributed runs, local ranks split the file list and synchronize before
+    weight loading so ranks do not duplicate the prefetch work on the same node.
+    """
+    return prefetch_files_to_host_cache(
+        file_names,
+        description="LTX-2 checkpoint",
+        prefetched_paths=_LTX2_PREFETCHED_SAFETENSORS,
+        ignore_errors=True,
+    )
+
+
 def _load_ltx2_transformer_weights(
     checkpoint_dir: str,
     prefix: str,
@@ -177,6 +195,8 @@ def _load_ltx2_transformer_weights(
 
     if not sft_paths:
         raise ValueError(f"No safetensors files found in {checkpoint_dir}")
+
+    _prefetch_ltx2_safetensors_files(sft_paths)
 
     exclude_prefixes = tuple(exclude_prefixes) if exclude_prefixes else ()
 
@@ -860,6 +880,7 @@ class LTX2Pipeline(BasePipeline):
         # --- Resolve native config ----------------------------------------
         native_config = self.model_config.extra_attrs.get("monolithic_safetensors_config")
         sft_paths = _find_safetensors_files(checkpoint_dir)
+        _prefetch_ltx2_safetensors_files(sft_paths)
 
         if native_config is None and sft_paths:
             native_config = _read_safetensors_config(sft_paths[0])
@@ -1447,8 +1468,7 @@ class LTX2Pipeline(BasePipeline):
         # STG/modality passes run on every GPU before the guidance formula.
         vgm = self.model_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
-        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else (vgm.ulysses_size if vgm else 1)
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
         if do_cfg_parallel_mm and cfg_size != 2:
             raise ValueError(
