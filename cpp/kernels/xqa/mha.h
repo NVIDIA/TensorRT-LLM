@@ -159,7 +159,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if USE_INPUT_KV
     InputHead const* qkv,
 #if ROPE_STYLE != 0
-    Vec<float, validElemsPerHead> const* ropeCosSin,
+    Vec<float, validRopeElemsPerHead> const* ropeCosSin,
 #endif
 #else
     InputHead const* q,
