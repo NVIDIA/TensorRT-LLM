@@ -2360,17 +2360,32 @@ class TestSkipSoftmaxAttentionConfig:
     See docs/source/features/sparse-attention.md — Skip Softmax Attention.
     """
 
-    # The checkpoint calibration block documented under
-    # ``sparse_attention_config.threshold_scale_factor``.
-    THRESHOLD_SCALE_FACTOR_CONFIG: ClassVar[dict] = {
-        "formula": "a * exp(b * target_sparsity)",
-        "prefill": {
-            "a": 100.0,
-            "b": 5.0
-        },
-        "decode": {
-            "a": 0.05,
-            "b": 10.0
+    # Checkpoint calibration metadata lives under sparse_attention_config
+    # config groups. The runtime searches the groups instead of assuming a
+    # fixed group name.
+    CHECKPOINT_CONFIG: ClassVar[dict] = {
+        "sparse_attention_config": {
+            "config_groups": {
+                "group_0": {
+                    "algorithm": "skip_softmax",
+                    "targets": ["Attention"],
+                    "threshold_scale_factor": {
+                        "formula": "a * exp(b * target_sparsity)",
+                        "prefill": {
+                            "a": 100.0,
+                            "b": 5.0
+                        },
+                        "decode": {
+                            "a": 0.05,
+                            "b": 10.0
+                        },
+                    },
+                    "target_sparsity": {
+                        "prefill": 0.5,
+                        "decode": 0.5
+                    },
+                },
+            },
         },
     }
 
@@ -2407,9 +2422,8 @@ class TestSkipSoftmaxAttentionConfig:
             "prefill": 0.5,
             "decode": 0.5
         })
-        params = cfg.to_sparse_params(
-            checkpoint_config=self.THRESHOLD_SCALE_FACTOR_CONFIG
-        ).scheduler.get_kernel_params()
+        params = cfg.to_sparse_params(checkpoint_config=self.CHECKPOINT_CONFIG
+                                      ).scheduler.get_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.5))
         assert params.threshold_scale_factor_decode == pytest.approx(
@@ -2421,9 +2435,8 @@ class TestSkipSoftmaxAttentionConfig:
         from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
         cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
-        params = cfg.to_sparse_params(
-            checkpoint_config=self.THRESHOLD_SCALE_FACTOR_CONFIG
-        ).scheduler.get_kernel_params()
+        params = cfg.to_sparse_params(checkpoint_config=self.CHECKPOINT_CONFIG
+                                      ).scheduler.get_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.3))
         assert params.threshold_scale_factor_decode == pytest.approx(
@@ -2435,10 +2448,23 @@ class TestSkipSoftmaxAttentionConfig:
 
         cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0,
                                          target_sparsity=0.5)
-        params = cfg.to_sparse_params(
-            checkpoint_config=self.THRESHOLD_SCALE_FACTOR_CONFIG
-        ).scheduler.get_kernel_params()
+        params = cfg.to_sparse_params(checkpoint_config=self.CHECKPOINT_CONFIG
+                                      ).scheduler.get_kernel_params()
         assert params.threshold_scale_factor_prefill == 1000.0
+
+    def test_resolve_checkpoint_target_sparsity(self):
+        # Doc: checkpoint metadata may carry target_sparsity with the formula.
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig()
+        params = cfg.to_sparse_params(checkpoint_config=self.CHECKPOINT_CONFIG
+                                      ).scheduler.get_kernel_params()
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.5))
 
     def test_resolve_without_formula_raises(self):
         # Doc: target_sparsity is unusable if the checkpoint ships no formula.

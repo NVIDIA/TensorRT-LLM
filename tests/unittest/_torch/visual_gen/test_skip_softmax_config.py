@@ -17,15 +17,36 @@ from tensorrt_llm.visual_gen.args import AttentionConfig, VisualGenArgs
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 
-def _checkpoint_config(*, log_a: float = -10.0, b: float = 2.0) -> dict:
+def _checkpoint_config(
+    *,
+    log_a: float = -10.0,
+    b: float = 2.0,
+    target_sparsity: float = 0.5,
+    disabled_layers: Optional[list[str]] = None,
+    initial_disabled_steps: Optional[int] = None,
+) -> dict:
+    group = {
+        "algorithm": "skip_softmax",
+        "targets": ["WanAttention"],
+        "threshold_scale_factor": {
+            "formula": "exp(log_a + b * target_sparsity)",
+            "prefill": {
+                "log_a": log_a,
+                "b": b,
+            },
+        },
+        "target_sparsity": {
+            "prefill": target_sparsity,
+        },
+    }
+    if disabled_layers is not None:
+        group["ignore"] = disabled_layers
+    if initial_disabled_steps is not None:
+        group["initial_disabled_steps"] = initial_disabled_steps
     return {
         "sparse_attention_config": {
-            "threshold_scale_factor": {
-                "formula": "exp(log_a + b * target_sparsity)",
-                "coefficients": {
-                    "log_a": log_a,
-                    "b": b,
-                },
+            "config_groups": {
+                "group_0": group,
             },
         },
     }
@@ -37,9 +58,11 @@ def _checkpoint_config_with_disabled_layers(
     log_a: float = -10.0,
     b: float = 2.0,
 ) -> dict:
-    checkpoint_config = _checkpoint_config(log_a=log_a, b=b)
-    checkpoint_config["sparse_attention_config"]["disabled_layers"] = disabled_layers
-    return checkpoint_config
+    return _checkpoint_config(
+        log_a=log_a,
+        b=b,
+        disabled_layers=disabled_layers,
+    )
 
 
 def _prefill_threshold(
@@ -101,6 +124,17 @@ class TestPublicApi:
 
         sparse_params = config.to_sparse_params(
             checkpoint_config=_checkpoint_config(log_a=math.log(7e-5), b=7.929109)
+        )
+
+        assert _prefill_threshold(sparse_params) == pytest.approx(7e-5 * math.exp(7.929109 * 0.5))
+
+    def test_checkpoint_target_sparsity_lowers_through_checkpoint_formula(self):
+        config = SkipSoftmaxAttentionConfig()
+
+        sparse_params = config.to_sparse_params(
+            checkpoint_config=_checkpoint_config(
+                log_a=math.log(7e-5), b=7.929109, target_sparsity=0.5
+            )
         )
 
         assert _prefill_threshold(sparse_params) == pytest.approx(7e-5 * math.exp(7.929109 * 0.5))
@@ -167,6 +201,16 @@ class TestPublicApi:
         assert _prefill_threshold(sparse_params, step_index=1) == 0.0
         assert _prefill_threshold(sparse_params, step_index=2) == 5000.0
 
+    def test_checkpoint_initial_disabled_steps_use_explicit_step_index(self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
+        sparse_params = config.to_sparse_params(
+            checkpoint_config=_checkpoint_config(initial_disabled_steps=2)
+        )
+
+        assert _prefill_threshold(sparse_params, step_index=0) == 0.0
+        assert _prefill_threshold(sparse_params, step_index=1) == 0.0
+        assert _prefill_threshold(sparse_params, step_index=2) == 5000.0
+
     def test_graph_phase_tracks_initial_disabled_step_boundary(self):
         config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor=5000.0,
@@ -201,15 +245,19 @@ class TestCheckpointMetadata:
         "sparse_attention_config": {
             "config_groups": {
                 "group_0": {
-                    "sparse_algo": "softmax_skip",
-                    "disabled_layers": ["blocks.0.attn1"],
-                },
-            },
-            "threshold_scale_factor": {
-                "formula": "exp(log_a + b * target_sparsity)",
-                "coefficients": {
-                    "log_a": -10.0,
-                    "b": 2.0,
+                    "algorithm": "skip_softmax",
+                    "targets": ["WanAttention"],
+                    "ignore": ["blocks.0.attn1"],
+                    "threshold_scale_factor": {
+                        "formula": "exp(log_a + b * target_sparsity)",
+                        "prefill": {
+                            "log_a": -10.0,
+                            "b": 2.0,
+                        },
+                    },
+                    "target_sparsity": {
+                        "prefill": 0.5,
+                    },
                 },
             },
         },

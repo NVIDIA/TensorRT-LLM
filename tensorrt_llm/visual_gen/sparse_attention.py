@@ -75,6 +75,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
+            skip_softmax_initial_disabled_steps_from_checkpoint_config,
+            skip_softmax_target_sparsity_from_checkpoint_config,
         )
 
         module_name = kwargs.get("module_name", None)
@@ -83,12 +85,35 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if module_name is not None and self._is_disabled(module_name, checkpoint_config):
             return None
 
-        threshold = self.resolve_threshold_scale_factor(checkpoint_config)
-        if threshold is None or threshold <= 0:
+        initial_disabled_steps = self.initial_disabled_steps
+        if initial_disabled_steps is None:
+            initial_disabled_steps = skip_softmax_initial_disabled_steps_from_checkpoint_config(
+                checkpoint_config
+            )
+
+        if self.threshold_scale_factor is not None:
+            scheduler = SkipSoftmaxScheduler.from_threshold_scale_factor(
+                self.threshold_scale_factor, initial_disabled_steps=initial_disabled_steps
+            )
+        else:
+            target_sparsity = self.target_sparsity
+            if target_sparsity is None:
+                target_sparsity = skip_softmax_target_sparsity_from_checkpoint_config(
+                    checkpoint_config
+                )
+            if target_sparsity is None:
+                return None
+            scheduler = SkipSoftmaxScheduler.from_target_sparsity(
+                target_sparsity,
+                checkpoint_config=checkpoint_config,
+                initial_disabled_steps=initial_disabled_steps,
+            )
+
+        if (
+            scheduler.threshold_scale_factor_prefill <= 0
+            and scheduler.threshold_scale_factor_decode <= 0
+        ):
             return None
-        scheduler = SkipSoftmaxScheduler.from_threshold_scale_factor(
-            threshold, initial_disabled_steps=self.initial_disabled_steps
-        )
         return SkipSoftmaxParams(scheduler=scheduler)
 
     def _is_disabled(
@@ -135,6 +160,18 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             return self.threshold_scale_factor
 
         sparsity = self.target_sparsity
+        if sparsity is None:
+            from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+                skip_softmax_target_sparsity_from_checkpoint_config,
+            )
+
+            checkpoint_sparsity = skip_softmax_target_sparsity_from_checkpoint_config(
+                checkpoint_config
+            )
+            if isinstance(checkpoint_sparsity, dict):
+                sparsity = checkpoint_sparsity.get("prefill")
+            else:
+                sparsity = checkpoint_sparsity
         if sparsity is None:
             return None
 

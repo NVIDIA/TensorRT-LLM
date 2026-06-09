@@ -62,7 +62,8 @@ attention_config:
 takes precedence over `target_sparsity`.
 
 `target_sparsity` is a semantic target in `[0, 1]`. It requires a calibration
-formula from checkpoint `config.json`.
+formula from checkpoint `config.json`. If checkpoint metadata also provides
+`target_sparsity`, the user config value wins.
 
 `disabled_layers` is a list of fnmatch patterns. A matching attention module
 gets no skip-softmax `SparseParams`. Patterns match both full module names and
@@ -71,30 +72,49 @@ component-relative names, so `blocks.0.attn1` matches
 
 `initial_disabled_steps` disables skip-softmax for the first N denoising steps of
 each request, then enables the configured threshold. It is based on the ordinal
-denoising step, not the scheduler timestep value.
+denoising step, not the scheduler timestep value. A checkpoint can provide this
+default; the user config value wins when set.
 
 ### Checkpoint Metadata
 
-VisualGen auto-detects skip-softmax calibration from `sparse_attention_config` in
-checkpoint `config.json`. Diffusers checkpoints with multiple transformer
-components read each component's own `config.json`.
+VisualGen auto-detects skip-softmax calibration from the ModelOpt-generated
+`sparse_attention_config` in checkpoint `config.json`. Diffusers checkpoints
+with multiple transformer components read each component's own `config.json`.
 
 Single-model `config.json`:
 
 ```json
 {
   "sparse_attention_config": {
-    "threshold_scale_factor": {
-      "formula": "exp(log_a + b * target_sparsity)",
-      "coefficients": {
-        "log_a": -14.14,
-        "b": 36.64
+    "config_groups": {
+      "group_0": {
+        "algorithm": "skip_softmax",
+        "ignore": [
+          "blocks.0.attn1",
+          "blocks.0.attn2"
+        ],
+        "initial_disabled_steps": 5,
+        "threshold_scale_factor": {
+          "formula": "a * exp(b * target_sparsity)",
+          "prefill": {
+            "a": 1443.4853294366435,
+            "b": 4.303654042880227
+          }
+        },
+        "target_sparsity": {
+          "prefill": 0.5
+        }
       }
-    },
-    "disabled_layers": ["blocks.0.attn1"]
+    }
   }
 }
 ```
+
+The ModelOpt-generated `config_groups` block can contain many groups.
+Skip-softmax scans groups whose `algorithm` is `"skip_softmax"`. `ignore`
+carries checkpoint-provided fnmatch patterns for layers that should not receive
+skip-softmax `SparseParams`; calibration defaults come from the first matching
+group with `threshold_scale_factor`.
 
 Multi-model diffusers checkpoints keep calibration per component:
 
@@ -106,9 +126,10 @@ checkpoint/
 ```
 
 When both user config and checkpoint metadata are present, checkpoint metadata
-supplies formulas per model component. The public config supplies runtime knobs
-such as `target_sparsity`, `disabled_layers`, and `initial_disabled_steps`. The
-public config object does not store formulas or component sub-configs.
+supplies formulas per model component. The public config can override runtime
+knobs such as `target_sparsity`, `disabled_layers`, and
+`initial_disabled_steps`. The public config object does not store formulas or
+component sub-configs.
 
 ### CUDA Graphs
 
