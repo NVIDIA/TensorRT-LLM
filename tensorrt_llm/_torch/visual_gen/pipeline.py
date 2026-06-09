@@ -216,7 +216,7 @@ class BasePipeline(nn.Module):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):

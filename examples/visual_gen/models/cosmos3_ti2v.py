@@ -189,7 +189,12 @@ def main():
     params.extra_params["use_guardrails"] = not args.disable_guardrails
     params.extra_params["output_type"] = args.output_type
 
-    params.negative_prompt = json.dumps(negative_prompt)
+    if negative_prompt is None:
+        params.negative_prompt = None
+    elif isinstance(negative_prompt, str):
+        params.negative_prompt = negative_prompt
+    else:
+        params.negative_prompt = json.dumps(negative_prompt)
 
     output = visual_gen.generate(
         inputs=args.prompt,
