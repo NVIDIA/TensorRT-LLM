@@ -66,13 +66,13 @@ class DeepseekV4CausalLMOutput(ModelOutput):
 
 _TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
 _TOKENIZER_FILE = "tokenizer.json"
-_BOS_TOKEN = "<｜begin▁of▁sentence｜>"
-_EOS_TOKEN = "<｜end▁of▁sentence｜>"
-_THINKING_START_TOKEN = "<think>"
-_THINKING_END_TOKEN = "</think>"
-_USER_TOKEN = "<｜User｜>"
-_ASSISTANT_TOKEN = "<｜Assistant｜>"
-_LATEST_REMINDER_TOKEN = "<｜latest_reminder｜>"
+_BOS_MARKER = "<｜begin▁of▁sentence｜>"
+_EOS_MARKER = "<｜end▁of▁sentence｜>"
+_THINKING_START_MARKER = "<think>"
+_THINKING_END_MARKER = "</think>"
+_USER_MARKER = "<｜User｜>"
+_ASSISTANT_MARKER = "<｜Assistant｜>"
+_LATEST_REMINDER_MARKER = "<｜latest_reminder｜>"
 _DSV4_CHAT_TEMPLATE_MARKER = "deepseek_v4_chat"
 
 
@@ -98,7 +98,7 @@ def _message_content_text(message: Mapping[str, Any]) -> str:
 def _format_deepseek_v4_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
     """Render the official DeepSeek V4 chat prompt for text messages."""
 
-    rendered = _BOS_TOKEN
+    rendered = _BOS_MARKER
     last_user_idx = -1
     for idx in range(len(messages) - 1, -1, -1):
         if messages[idx].get("role") in ("user", "developer"):
@@ -111,13 +111,13 @@ def _format_deepseek_v4_chat_messages(messages: Sequence[Mapping[str, Any]]) -> 
         if role == "system":
             rendered += content
         elif role in ("user", "developer"):
-            rendered += _USER_TOKEN + content
+            rendered += _USER_MARKER + content
         elif role == "latest_reminder":
-            rendered += _LATEST_REMINDER_TOKEN + content
+            rendered += _LATEST_REMINDER_MARKER + content
         elif role == "assistant":
             rendered += content
             if not message.get("wo_eos", False):
-                rendered += _EOS_TOKEN
+                rendered += _EOS_MARKER
         else:
             raise NotImplementedError(f"Unsupported DeepSeek V4 chat role: {role}")
 
@@ -125,11 +125,11 @@ def _format_deepseek_v4_chat_messages(messages: Sequence[Mapping[str, Any]]) -> 
         if has_next and messages[idx + 1].get("role") not in ("assistant", "latest_reminder"):
             continue
         if role in ("user", "developer"):
-            rendered += _ASSISTANT_TOKEN
+            rendered += _ASSISTANT_MARKER
             if idx >= last_user_idx and message.get("thinking_mode") == "thinking":
-                rendered += _THINKING_START_TOKEN
+                rendered += _THINKING_START_MARKER
             else:
-                rendered += _THINKING_END_TOKEN
+                rendered += _THINKING_END_MARKER
 
     return rendered
 
