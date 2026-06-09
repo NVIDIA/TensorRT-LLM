@@ -5039,13 +5039,16 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     }
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+    skip_no_trtllm_gen_moe_support = pytest.mark.skipif(
+        get_sm_version() not in (100, 103),
+        reason="TRTLLM Gen MoE supports SM100 and SM103 only")
 
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=[skip_no_hopper, skip_no_mxfp4_swizzle])
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5165,7 +5168,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=[skip_no_hopper, skip_no_mxfp4_swizzle])
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5283,7 +5286,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5329,7 +5332,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5395,7 +5398,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              ids=["one_model", "two_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5592,7 +5595,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              ids=["one_model", "two_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
