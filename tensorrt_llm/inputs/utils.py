@@ -18,6 +18,8 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
+from tensorrt_llm._torch.models.modeling_mistral import \
+    MistralCommonImageProcessor
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
@@ -662,6 +664,10 @@ def apply_chat_template(
         if enable_tokenize:
             return tokenizer.encode(prompt)
         return prompt
+
+    # Special handling of Mistral native processor
+    if isinstance(processor, MistralCommonImageProcessor):
+        model_type = "mistral_common"
 
     # Check for PASSTHROUGH early — before we need tokenizer/processor/template.
     # The registry may already know this model skips chat templates entirely.
