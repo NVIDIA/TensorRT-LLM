@@ -781,6 +781,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                 trtllm_utils.uploadArtifacts("/tmp/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
                 result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
                 pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
+            } catch (InterruptedException e) {
+                throw e
             } catch (Exception e) {
                 pipeline.echo("CBTS Layer 3: artifact upload failed (${e.message}); " +
                               "agents will fall back to source test-db")
