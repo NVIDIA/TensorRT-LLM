@@ -478,6 +478,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
         # Resolve enable_attention_dp from the same source `init_dist_config`
         # uses so the factory sees the same value the runtime will see.
+        # TODO remove it once this is fixed: https://github.com/NVIDIA/TensorRT-LLM/issues/13134
         ash = self.transforms.get("apply_sharding_hints", {})
         sharding_config = (
             ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})

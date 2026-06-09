@@ -52,7 +52,7 @@ def _hybrid_runtime_max_tokens_per_rank(
       path only sees the uniform decode shape. The tight budget is taken only while the
       resulting MoE-GEMM row count (``budget * ep_size``) stays in the fast small-M
       ``bmm_E2m1`` tactic region; above the gate the trtllm-gen autotuner picks a
-      launch-latency-bound tactic (the c=32 regression), so fall back to the big-M
+      launch-latency-bound tactic, so fall back to the big-M
       ``max_num_tokens`` budget.
 
     - **Eager path** (prefill, or any step the bypass forced eager): use ``max_num_tokens``.
@@ -63,8 +63,11 @@ def _hybrid_runtime_max_tokens_per_rank(
         budget = local_num_tokens
         # Only take the tight budget while the MoE-GEMM row count (budget * ep_size) stays in
         # the fast small-M trtllm-gen tactic region; above it the autotuner switches to a
-        # launch-latency-bound tactic (the c=32 regression). See
-        # https://nvbugspro.nvidia.com/bug/6247543.
+        # launch-latency-bound tactic.
+        # The threshold is on the FC1 grouped-GEMM's row dimension M, because that's what the
+        # trtllm-gen autotuner selects the kernel tactic from — and that M is budget × ep_size
+        # TODO: remove this WAR https://github.com/NVIDIA/TensorRT-LLM/issues/15167
+        # See: https://nvbugspro.nvidia.com/bug/6247543
         if budget > 0 and budget * ep_size * 4 <= max_num_tokens:
             return budget
     return max_num_tokens

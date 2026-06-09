@@ -1242,6 +1242,7 @@ class Sharding(BaseTransform):
                 # is small enough that the 4x weight memory is negligible,
                 # and each rank computes its local-batch slice locally with no
                 # cross-rank communication needed.
+                # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/15168
                 if (
                     _is_draft
                     and config.dist_config.enable_attention_dp
