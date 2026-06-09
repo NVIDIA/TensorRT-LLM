@@ -117,6 +117,7 @@ def sampling_batch_spec_dec_one_model(
     return random_sampled
 
 
+@torch.compile(options={"max-autotune": True})
 def compute_probs_from_logits(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
