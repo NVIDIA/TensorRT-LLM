@@ -464,12 +464,10 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
         return self
 
 
+# TODO(TRTLLM-13352): migrate `TorchLlmArgs.mm_encoder_only` and
+# `TorchLlmArgs.video_pruning_rate` into this class in a follow-up change.
 class MultimodalConfig(StrictBaseModel):
-    """Multimodal model configuration.
-
-    TODO: migrate `TorchLlmArgs.mm_encoder_only` and
-    `TorchLlmArgs.video_pruning_rate` into this class in a follow-up change.
-    """
+    """Multimodal model configuration."""
 
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,

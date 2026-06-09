@@ -20,8 +20,8 @@ import torch
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     _MM_SIDE_STREAM_ENV,
     EncoderGraphKey,
+    EncoderGraphTensorSpec,
     MultimodalEncoderGraphRunner,
-    TensorSpec,
     _CapturedGraph,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
@@ -169,7 +169,7 @@ def _make_logic_runner(
     return MultimodalEncoderGraphRunner(
         encoder_fn=encoder_fn,
         metadata_provider=_NoopMetadataProvider(),
-        input_specs={"x": TensorSpec(shape=(4,), dtype=torch.float32)},
+        input_specs={"x": EncoderGraphTensorSpec(shape=(4,), dtype=torch.float32)},
         output_specs={"y": 0},
         config=config,
     )
@@ -192,7 +192,7 @@ def construct_with_env():
         return MultimodalEncoderGraphRunner(
             encoder_fn=_NeverInvokedEncoder(),
             metadata_provider=_NoopMetadataProvider(),
-            input_specs={"x": TensorSpec(shape=(4,), dtype=torch.float32)},
+            input_specs={"x": EncoderGraphTensorSpec(shape=(4,), dtype=torch.float32)},
             output_specs={"y": 0},
             config=config,
         )
@@ -325,7 +325,7 @@ def test_empty_buckets_rejected():
         MultimodalEncoderGraphRunner(
             encoder_fn=_NeverInvokedEncoder(),
             metadata_provider=_NoopMetadataProvider(),
-            input_specs={"x": TensorSpec(shape=(4,), dtype=torch.float32)},
+            input_specs={"x": EncoderGraphTensorSpec(shape=(4,), dtype=torch.float32)},
             output_specs={"y": 0},
             config=config,
         )
@@ -408,9 +408,9 @@ def test_metadata_buffer_stability_detects_type_change():
         pytest.param(1, (3, 128, 16), id="middle"),
     ],
 )
-def test_tensor_spec_materialize(token_dim, expected_shape):
+def test_encoder_graph_tensor_spec_materialize(token_dim, expected_shape):
     base_shape = (16,) if token_dim == 0 else (3, 16)
-    spec = TensorSpec(shape=base_shape, dtype=torch.float32, token_dim=token_dim)
+    spec = EncoderGraphTensorSpec(shape=base_shape, dtype=torch.float32, token_dim=token_dim)
     t = spec.materialize(total_tokens=128, device=torch.device("cpu"))
     assert tuple(t.shape) == expected_shape
 
@@ -445,13 +445,88 @@ def make_cuda_runner(cuda_device):
             encoder_fn=_make_toy_encoder_fn(SCALE),
             metadata_provider=_ToyMetadataProvider(cuda_device),
             input_specs={
-                "x": TensorSpec(shape=(HIDDEN,), dtype=torch.float32, token_dim=0),
+                "x": EncoderGraphTensorSpec(shape=(HIDDEN,), dtype=torch.float32, token_dim=0),
             },
             output_specs={"y": 0},
             config=config,
         )
 
     return _factory
+
+
+@dataclass
+class _PlanRunMetadata:
+    """Metadata that models FlashInfer's plan/run split."""
+
+    plan_cuda: torch.Tensor
+    max_work_items: int = 0
+
+
+class _PlanRunMetadataProvider:
+    """Updates a graph-read plan in place and a Python launch extent."""
+
+    graph_critical_attrs: Sequence[str] = ("plan_cuda",)
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+
+    def build(self, key: EncoderGraphKey) -> _PlanRunMetadata:
+        return _PlanRunMetadata(
+            plan_cuda=torch.zeros(key.total_tokens, dtype=torch.float32, device=self._device),
+        )
+
+    def refresh_in_place(
+        self,
+        metadata: _PlanRunMetadata,
+        padded_seq_lengths: Sequence[int],
+    ) -> None:
+        metadata.max_work_items = max(padded_seq_lengths)
+        metadata.plan_cuda.zero_()
+        metadata.plan_cuda[: metadata.max_work_items].fill_(1)
+
+
+@pytestmark_cuda
+class TestNoPaddingSkewedPlanRunReplay:
+    """Regression tests for capture layouts that freeze a plan/run work extent."""
+
+    @staticmethod
+    def _encoder_fn(
+        inputs: Dict[str, torch.Tensor],
+        metadata: _PlanRunMetadata,
+    ) -> Dict[str, torch.Tensor]:
+        x = inputs["x"]
+        y = torch.zeros_like(x)
+        work_items = metadata.max_work_items
+        y[:work_items].copy_(x[:work_items] * metadata.plan_cuda[:work_items].unsqueeze(-1))
+        return {"y": y}
+
+    def test_skewed_replay_matches_eager_plan_run(self, cuda_device):
+        bucket = EncoderGraphKey(num_contexts=2, total_tokens=100)
+        seq_lengths = [99, 1]
+        real_tokens = sum(seq_lengths)
+        config = MultimodalEncoderCudaGraphConfig(
+            buckets=[(bucket.total_tokens, bucket.num_contexts)],
+            enable_padding=False,
+        )
+        runner = MultimodalEncoderGraphRunner(
+            encoder_fn=self._encoder_fn,
+            metadata_provider=_PlanRunMetadataProvider(cuda_device),
+            input_specs={
+                "x": EncoderGraphTensorSpec(shape=(HIDDEN,), dtype=torch.float32, token_dim=0),
+            },
+            output_specs={"y": 0},
+            config=config,
+        )
+        runner.capture_all(cuda_device)
+
+        torch.manual_seed(4)
+        x = torch.randn(real_tokens, HIDDEN, device=cuda_device, dtype=torch.float32)
+        out = runner.maybe_run(seq_lengths=seq_lengths, inputs={"x": x})
+        assert out is not None
+
+        expected = torch.zeros_like(x)
+        expected[: max(seq_lengths)].copy_(x[: max(seq_lengths)])
+        torch.testing.assert_close(out["y"], expected, rtol=0, atol=0)
 
 
 @pytestmark_cuda
@@ -512,6 +587,41 @@ def test_replay_matches_eager_across_sizes(cuda_device, make_cuda_runner, real_t
     torch.testing.assert_close(out["y"], expected, rtol=0, atol=0)
 
 
+@pytestmark_cuda
+def test_capture_uses_inference_mode_when_grad_enabled(cuda_device):
+    bucket = EncoderGraphKey(num_contexts=1, total_tokens=128)
+    grad_enabled_states = []
+
+    def encoder_fn(
+        inputs: Dict[str, torch.Tensor], metadata: _ToyMetadata
+    ) -> Dict[str, torch.Tensor]:
+        grad_enabled_states.append(torch.is_grad_enabled())
+        x = inputs["x"]
+        bias = metadata.seq_lens_cuda.sum().to(x.dtype)
+        return {"y": x + bias}
+
+    config = MultimodalEncoderCudaGraphConfig(
+        buckets=[(bucket.total_tokens, bucket.num_contexts)],
+        enable_padding=True,
+        warmup_steps=2,
+    )
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=encoder_fn,
+        metadata_provider=_ToyMetadataProvider(cuda_device),
+        input_specs={
+            "x": EncoderGraphTensorSpec(shape=(HIDDEN,), dtype=torch.float32, token_dim=0),
+        },
+        output_specs={"y": 0},
+        config=config,
+    )
+
+    with torch.enable_grad():
+        assert torch.is_grad_enabled()
+        runner.capture_all(cuda_device)
+
+    assert grad_enabled_states == [False, False, False]
+
+
 class _ReallocatingProvider:
     graph_critical_attrs: Sequence[str] = ("seq_lens_cuda",)
 
@@ -546,7 +656,9 @@ def test_runner_rejects_provider_that_reallocates_metadata_tensor(cuda_device):
     runner = MultimodalEncoderGraphRunner(
         encoder_fn=_make_toy_encoder_fn(SCALE),
         metadata_provider=_ReallocatingProvider(cuda_device),
-        input_specs={"x": TensorSpec(shape=(HIDDEN,), dtype=torch.float32, token_dim=0)},
+        input_specs={
+            "x": EncoderGraphTensorSpec(shape=(HIDDEN,), dtype=torch.float32, token_dim=0)
+        },
         output_specs={"y": 0},
         config=config,
     )

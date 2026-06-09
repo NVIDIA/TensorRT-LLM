@@ -156,6 +156,7 @@ def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config):
     )
     model.eval()
     _init_finite_weights(model)
+    assert model.model_config.attn_backend == "FLASHINFER"
 
     with torch.no_grad():
         eager_out = model.forward(pixel_values).clone()

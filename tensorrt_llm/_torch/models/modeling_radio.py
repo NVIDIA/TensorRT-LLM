@@ -22,12 +22,11 @@ from tensorrt_llm._torch.attention_backend import \
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
-    EncoderGraphKey, EncoderMetadataProvider, MultimodalEncoderGraphRunner,
-    TensorSpec)
+    EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
+    MultimodalEncoderGraphRunner)
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 if TYPE_CHECKING:
@@ -786,11 +785,6 @@ class VisionTransformer(nn.Module):
         if self._blocks_graph_runner is not None:
             return
 
-        if self.model_config.attn_backend != "TRTLLM":
-            raise RuntimeError(
-                "RADIO encoder CUDA graph capture requires the TRTLLM vision attention backend, "
-                f"but got {self.model_config.attn_backend}.")
-
         graph_runner = self._build_blocks_graph_runner(config)
         if device is None:
             device = next(self.parameters()).device
@@ -882,9 +876,9 @@ class VisionTransformer(nn.Module):
     ) -> MultimodalEncoderGraphRunner:
         input_specs = {
             "x":
-            TensorSpec(shape=(self.embed_dim, ),
-                       dtype=self.model_config.torch_dtype,
-                       token_dim=0),
+            EncoderGraphTensorSpec(shape=(self.embed_dim, ),
+                                   dtype=self.model_config.torch_dtype,
+                                   token_dim=0),
         }
         output_specs = {"x": 0}
         return MultimodalEncoderGraphRunner(
@@ -935,11 +929,18 @@ class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
 
     # `_seq_lens_cuda` is the on-device buffer the captured attention kernels read sequence lengths
     # from; the `seq_lens` setter copies into it in place when `is_cuda_graph=True`.
-    # List any other tensor attributes here if new backends store kernel-read buffers elsewhere.
-    graph_critical_attrs: Sequence[str] = ("_seq_lens_cuda", )
+    # FlashInfer also owns a persistent workspace buffer that backs its captured ragged-prefill run.
+    graph_critical_attrs: Sequence[str]
 
     def __init__(self, vit: VisionTransformer) -> None:
         self._vit = vit
+        self.graph_critical_attrs = ("_seq_lens_cuda", )
+        if vit.model_config.attn_backend == "FLASHINFER":
+            self.graph_critical_attrs += (
+                "workspace_buffer",
+                "_ragged_qo_indptr_buf",
+                "_ragged_kv_indptr_buf",
+            )
 
     def build(self, key: EncoderGraphKey) -> AttentionMetadata:
         vit = self._vit
@@ -950,6 +951,8 @@ class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
                                key.total_tokens),
             kv_cache_manager=None,
         )
+        if vit.model_config.attn_backend == "FLASHINFER":
+            metadata_kwargs["kv_layout"] = "NHD"
         md = vit.metadata_cls(**metadata_kwargs)
         md.is_cuda_graph = True
         return md
@@ -1156,8 +1159,6 @@ class RADIOVisionModel(PreTrainedModel):
             disable_quantization: Disable quantization for RADIO model.
                 Since the radio model is for vision only, we can disable quantization for it by default.
             vision_attn_backend: Attention backend to use for the vision tower. Defaults to "FLASHINFER".
-                Note: if `encoder_cuda_graph_config` is provided, this will be overridden to "TRTLLM" as
-                    "FLASHINFER" is not compatible with cuda graph capture.
             encoder_cuda_graph_config: Optional CUDA graph capture configuration for the vision tower.
         """
         config = model_config.pretrained_config
@@ -1173,16 +1174,6 @@ class RADIOVisionModel(PreTrainedModel):
                 # that specify FP8 KV Cache.
                 self.model_config.quant_config = QuantConfig()
 
-        # Encoder CUDA graph capture requires the TRTLLM vision attention backend; FlashInfer's
-        # no-KV-cache plan path is not graph-capture compatible.
-        if self._encoder_cuda_graph_config is not None:
-            if vision_attn_backend != "TRTLLM":
-                logger.warning(
-                    "Overriding RADIO vision_attn_backend=%s to TRTLLM because encoder CUDA graph "
-                    "capture requires the TRTLLM vision attention backend.",
-                    vision_attn_backend,
-                )
-            vision_attn_backend = "TRTLLM"
         self.model_config = dataclasses.replace(
             self.model_config, attn_backend=vision_attn_backend)
 

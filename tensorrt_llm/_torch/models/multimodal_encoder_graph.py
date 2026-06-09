@@ -76,12 +76,12 @@ class EncoderGraphKey(NamedTuple):
     num_contexts: int
 
 
-class TensorSpec(NamedTuple):
+class EncoderGraphTensorSpec(NamedTuple):
     """Static shape and dtype for a graph-owned input or output tensor.
 
     `shape` describes the non-token dimensions only. The token-axis size is filled in from the
     bucket and inserted at position `token_dim`. So for a ragged `(total_tokens, hidden_size)`
-    input, the spec is `TensorSpec(shape=(hidden_size,), token_dim=0)`.
+    input, the spec is `EncoderGraphTensorSpec(shape=(hidden_size,), token_dim=0)`.
     """
 
     shape: Tuple[int, ...]
@@ -106,7 +106,7 @@ class _CapturedGraph(NamedTuple):
     # `data_ptr()` of each provider-declared graph-critical tensor on `metadata` after capture. The
     # runner asserts these stay stable across replays; the captured kernels bake these addresses in,
     # so a reallocation would silently read stale memory.
-    # See `EncoderMetdataProvider.graph_critical_attrs` for more detail.
+    # See `EncoderMetadataProvider.graph_critical_attrs` for more detail.
     metadata_tensor_ptrs: Mapping[str, int]
 
 
@@ -176,13 +176,13 @@ class MultimodalEncoderGraphRunner:
             [Mapping[str, torch.Tensor], AttentionMetadata], Mapping[str, torch.Tensor]
         ],
         metadata_provider: EncoderMetadataProvider,
-        input_specs: Mapping[str, TensorSpec],
+        input_specs: Mapping[str, EncoderGraphTensorSpec],
         output_specs: Mapping[str, int],
         config: MultimodalEncoderCudaGraphConfig,
     ) -> None:
         self._encoder_fn = encoder_fn
         self._metadata_provider = metadata_provider
-        self._input_specs: Dict[str, TensorSpec] = dict(input_specs)
+        self._input_specs: Dict[str, EncoderGraphTensorSpec] = dict(input_specs)
         self._output_specs: Dict[str, int] = dict(output_specs)
         self._config = config
         # Adopted from the first captured graph so subsequent bucket captures share the pool.
@@ -238,6 +238,10 @@ class MultimodalEncoderGraphRunner:
         Returns the per-output tensors sliced back to the real token extent when replay happened;
         returns `None` when no captured graph applies, in which case the caller is expected to fall
         back to eager.
+
+        Returned tensors are borrowed views into graph-owned static output buffers. A later replay
+        of the same graph may overwrite those buffers, so callers must consume the tensors before
+        the next replay or explicitly clone values they need to keep.
 
         Misses happen when:
         (a) no configured bucket can host the request shape or
@@ -339,18 +343,16 @@ class MultimodalEncoderGraphRunner:
     def _dummy_padded_seq_lengths(self, bucket: EncoderGraphKey, key: EncoderGraphKey) -> List[int]:
         """Representative padded seq_lengths used during capture only.
 
-        The capture-time values do not affect replay correctness because the graph reads values out
-        of the metadata buffers at replay time, but we still pick a layout that matches the runtime
-        contract.
+        Backends may derive a graph-captured work shape from metadata built with these lengths, so
+        the layout must cover every replay shape that can select the same bucket.
         """
         if key.num_contexts == bucket.num_contexts:
-            # No padding context. Spread tokens evenly across real contexts.
-            base = bucket.total_tokens // bucket.num_contexts
-            rem = bucket.total_tokens - base * bucket.num_contexts
-            lengths = [base] * bucket.num_contexts
-            for i in range(rem):
-                lengths[i] += 1
-            return lengths
+            # No padding context. Capture the worst-case skew so plan/run attention backends whose
+            # launch shape depends on max_token_per_sequence cover every exact-fit replay for this
+            # bucket.
+            return [bucket.total_tokens - (bucket.num_contexts - 1)] + [1] * (
+                bucket.num_contexts - 1
+            )
         # One dummy padding context: give each real context a single token and put the rest in the
         # dummy. The captured buffers are sized to `key.total_tokens`
         # (== bucket.total_tokens + _PADDING_TOKEN_RESERVE),
@@ -384,17 +386,18 @@ class MultimodalEncoderGraphRunner:
         metadata = self._metadata_provider.build(key)
         self._metadata_provider.refresh_in_place(metadata, padded_seq_lengths)
 
-        graph = torch.cuda.CUDAGraph()
-        for _ in range(self._config.warmup_steps):
-            self._encoder_fn(static_inputs, metadata)
-        torch.cuda.synchronize()
-
         capture_kwargs: Dict[str, Any] = {}
         if self._memory_pool is not None:
             capture_kwargs["pool"] = self._memory_pool
 
-        with torch.cuda.graph(graph, **capture_kwargs):
-            outputs = self._encoder_fn(static_inputs, metadata)
+        graph = torch.cuda.CUDAGraph()
+        with torch.inference_mode():
+            for _ in range(self._config.warmup_steps):
+                self._encoder_fn(static_inputs, metadata)
+            torch.cuda.synchronize()
+
+            with torch.cuda.graph(graph, **capture_kwargs):
+                outputs = self._encoder_fn(static_inputs, metadata)
 
         captured_outputs = {name: make_weak_ref(tensor) for name, tensor in outputs.items()}
         self._captured[key] = _CapturedGraph(
