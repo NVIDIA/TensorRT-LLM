@@ -162,7 +162,13 @@ def test_super_mtp_ssm_replay_smoke():
 
 @skip_pre_blackwell
 def test_ultra_mtp_smoke():
-    """Test one-model MTP/Eagle runtime with a tiny Ultra V3 target."""
+    """Test one-model MTP/Eagle runtime with a tiny Ultra V3 target.
+
+    Uses flashinfer_ssm + ssm_replay=True, matching the super MTP replay config and the
+    ultra_v3_mtp.yaml deployment config. The small-model SSM dims that satisfy the
+    FlashInfer decode-path constraints (mamba_head_dim=64, ssm_state_size=64) are set in
+    the registry config.
+    """
     test_prompt = "What is the capital of France?"
     model_hub_id = "nvidia/Nemotron-Ultra-V3-NVFP4"
     model_path = hf_id_to_local_model_dir(model_hub_id)
@@ -171,7 +177,7 @@ def test_ultra_mtp_smoke():
         model_hub_id,
         transforms={
             "insert_cached_causal_conv": {"backend": "triton_causal_conv"},
-            "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+            "insert_cached_ssm_attention": {"backend": "flashinfer_ssm", "ssm_replay": True},
         },
     )
     experiment_config["args"]["model"] = model_path

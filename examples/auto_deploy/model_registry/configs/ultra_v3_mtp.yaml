@@ -64,6 +64,10 @@ transforms:
   # Triton causal conv is required for MTP speculative Mamba state caching.
   insert_cached_causal_conv:
     backend: triton_causal_conv
+  # FlashInfer SSM with the replay kernel for the MTP extend path (matches super).
+  insert_cached_ssm_attention:
+    backend: flashinfer_ssm
+    ssm_replay: true
   fuse_fp8_moe:
     allow_different_input_scales: true
   fuse_nvfp4_moe:

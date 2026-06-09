@@ -612,7 +612,9 @@ _SMALL_MODEL_CONFIGS = {
             # n_groups=1 keeps the gated-RMSNorm group_size (= mamba d_inner / n_groups
             # = 256 / 1 = 256) at the NVFP4 fused_gated_rmsnorm_quant minimum of 256.
             "n_groups": 1,
-            "ssm_state_size": 8,
+            # ssm_state_size=64 satisfies the FlashInfer SSM decode-path constraint used by
+            # the flashinfer_ssm + ssm_replay smoke test.
+            "ssm_state_size": 64,
             "conv_kernel": 4,
             "n_routed_experts": 4,
             "n_shared_experts": 1,
