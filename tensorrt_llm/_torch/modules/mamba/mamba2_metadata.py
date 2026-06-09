@@ -316,8 +316,11 @@ class Mamba2Metadata:
                 and hasattr(kv_cache_manager, 'get_state_indices')
                 and request_ids is not None):
             batch_request_ids = request_ids[:batch_size]
+            max_draft_len = getattr(kv_cache_manager,
+                                    "speculative_num_draft_tokens", 0) or 0
             is_padding = [
-                req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+                CUDA_GRAPH_DUMMY_REQUEST_ID - max_draft_len <= req_id <=
+                CUDA_GRAPH_DUMMY_REQUEST_ID
                 for req_id in batch_request_ids
             ]
             indices = kv_cache_manager.get_state_indices(
