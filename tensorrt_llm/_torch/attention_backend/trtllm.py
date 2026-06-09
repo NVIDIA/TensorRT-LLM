@@ -1417,28 +1417,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def rope_original_max_positions(self) -> int:
         return self.rope_params.original_max_positions
 
-    def get_skip_softmax_kernel_params(
-            self) -> Optional[SkipSoftmaxKernelParams]:
-        """Skip-softmax kernel params from the layer scheduler."""
-        params = self.sparse_params
-        if not isinstance(params, SkipSoftmaxParams):
-            return None
-        return params.scheduler.get_kernel_params()
-
-    @property
-    def skip_softmax_threshold_scale_factor_prefill(self) -> float:
-        params = self.get_skip_softmax_kernel_params()
-        if params is None:
-            return 0.0
-        return params.threshold_scale_factor_prefill
-
-    @property
-    def skip_softmax_threshold_scale_factor_decode(self) -> float:
-        params = self.get_skip_softmax_kernel_params()
-        if params is None:
-            return 0.0
-        return params.threshold_scale_factor_decode
-
     def _get_trtllm_gen_backend(
             self) -> trtllm_gen.FlashInferTrtllmGenAttention:
         backend = getattr(self, "_trtllm_gen_backend", None)
@@ -1595,11 +1573,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 fwd=forward_args,
             )
         else:
+            sparse_params = self.sparse_params
+            skip_softmax_kernel_params = (
+                sparse_params.scheduler.get_kernel_params(
+                    step_index=forward_args.step_index) if isinstance(
+                        sparse_params,
+                        SkipSoftmaxParams) else SkipSoftmaxKernelParams())
+
             # Every kwarg sources from ``self`` / ``metadata`` /
             # ``forward_args`` (with ``forward_args.sparse_prediction`` for
-            # sparse-attn inputs) or a literal allowlisted in
-            # ``_THOP_LITERALS``. ``test_attention_op_sync.py`` enforces this
-            # statically.
+            # sparse-attn inputs), ``skip_softmax_kernel_params``, or a literal
+            # allowlisted in ``_THOP_LITERALS``. ``test_attention_op_sync.py``
+            # enforces this statically.
             thop.attention(
                 q=q,
                 k=k,
@@ -1715,10 +1700,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 v_head_dim=self.v_head_dim,
                 rope_append=self.rope_append,
                 attention_chunk_size=self.attention_chunk_size,
-                skip_softmax_threshold_scale_factor_prefill=self.
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode=self.
-                skip_softmax_threshold_scale_factor_decode,
+                skip_softmax_threshold_scale_factor_prefill=
+                skip_softmax_kernel_params.threshold_scale_factor_prefill,
+                skip_softmax_threshold_scale_factor_decode=
+                skip_softmax_kernel_params.threshold_scale_factor_decode,
                 skip_softmax_stat=self.skip_softmax_stat,
 
                 # --- Sparse-specific (AttentionForwardArgs.sparse_prediction) ---

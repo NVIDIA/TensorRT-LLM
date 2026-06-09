@@ -490,6 +490,7 @@ class QwenImagePipeline(BasePipeline):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             noise_pred = self.transformer(
                 hidden_states=latents,
+                step_index=i,
                 timestep=timestep / 1000,
                 encoder_hidden_states_mask=prompt_embeds_mask,
                 encoder_hidden_states=prompt_embeds,
@@ -500,6 +501,7 @@ class QwenImagePipeline(BasePipeline):
             if do_true_cfg:
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
+                    step_index=i,
                     timestep=timestep / 1000,
                     encoder_hidden_states_mask=neg_prompt_embeds_mask,
                     encoder_hidden_states=neg_prompt_embeds,

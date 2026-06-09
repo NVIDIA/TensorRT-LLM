@@ -288,6 +288,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         """
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
+        step_index = kwargs.pop("step_index", None)
 
         if self.quant_attention_config is not None:
             assert k is not None and v is not None, (
@@ -303,6 +304,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 v=v,
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
+                step_index=step_index,
                 sage_attn_num_elts_per_blk_q=quant_cfg.q_block_size,
                 sage_attn_num_elts_per_blk_k=quant_cfg.k_block_size,
                 sage_attn_num_elts_per_blk_v=quant_cfg.v_block_size,
@@ -319,6 +321,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 v=None,
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
+                step_index=step_index,
             )
         output = output.view(batch_size, seq_len, -1)
         return output

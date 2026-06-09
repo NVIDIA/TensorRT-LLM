@@ -349,13 +349,19 @@ class FluxPipeline(BasePipeline):
 
         # Denoising loop
         def forward_fn(
-            latents, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for FLUX transformer."""
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=encoder_hidden_states,
                 pooled_projections=pooled_prompt_embeds,
+                step_index=step_index,
                 timestep=timestep / 1000,  # FLUX expects normalized timesteps
                 img_ids=latent_ids,
                 txt_ids=text_ids,

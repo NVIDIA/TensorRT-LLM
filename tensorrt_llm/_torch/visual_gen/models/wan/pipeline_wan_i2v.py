@@ -550,7 +550,12 @@ class WanImageToVideoPipeline(BasePipeline):
         last_model_used = [None]
 
         def forward_fn(
-            latents_input, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents_input,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for WAN I2V transformer with two-stage support.
 
@@ -602,6 +607,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
             return current_model(
                 hidden_states=latent_model_input,
+                step_index=step_index,
                 timestep=timestep_input,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds_to_use,
