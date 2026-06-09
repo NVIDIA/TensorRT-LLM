@@ -904,6 +904,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                         offset=self.offset,
                         d2t=self._d2t,
                         skip_all_sampling_params=skip_all_sampling_params,
+                        # During CUDA graph capture bake top_k_max=0 so the
+                        # full-sort (always-correct) path is captured. Outside
+                        # capture, pass the pre-computed value for the fast
+                        # topk(kMax) path.
+                        top_k_max=(
+                            0
+                            if torch.cuda.is_current_stream_capturing()
+                            else getattr(spec_metadata, "top_k_max", None)
+                        ),
                     )
                 )
 
