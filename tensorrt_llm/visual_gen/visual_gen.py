@@ -683,13 +683,12 @@ class VisualGen:
         The returned list is a *subset* of the variants each pipeline can
         actually run. It typically contains the original official upstream
         checkpoints and well-known optimized checkpoints (e.g. NVIDIA NVFP4 /
-        FP8 quantizations published on HuggingFace). Other variants —
-        community fine-tunes and quantizations not enumerated here — inherit
-        the parent's Diffusers ``_class_name`` and dispatch automatically
-        without needing to appear in this list.
+        FP8 quantizations published on HuggingFace) that have been tested.
+        Other variants — community fine-tunes and quantizations not
+        enumerated here while some of them may run if no model architecture
+        changes.
 
-        IDs are returned sorted alphabetically for stable, easy-to-scan
-        output.
+        IDs are returned sorted alphabetically for stable.
         """
         return sorted(hf_id for entry in PIPELINE_REGISTRY.values() for hf_id in entry.hf_ids)
 
