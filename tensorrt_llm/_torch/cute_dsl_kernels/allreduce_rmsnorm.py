@@ -49,6 +49,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     )
 
 _DEFAULT_TPC_VALUES = (64, 128, 256, 512, 1024)
+# Keep the two-kernel path opt-in until benchmarks show a size where it wins.
+_DEFAULT_AUTO_TWOSHOT_MIN_ELEMENTS = 1 << 30
 _SYNC_MODE_INTERNAL = "internal"
 _SYNC_MODE_CALLER = "caller"
 _SYNC_MODES = (_SYNC_MODE_INTERNAL, _SYNC_MODE_CALLER)
@@ -111,6 +113,18 @@ def _select_implementation(rows: int, hidden_size: int) -> str:
     if implementation not in ("single", "twoshot", "auto"):
         raise NotImplementedError(f"unknown CuTe AR RMSNorm implementation: {implementation}")
     if implementation == "auto":
+        min_elements = int(
+            os.environ.get(
+                "TRTLLM_CUTE_AR_RMSNORM_TWOSHOT_MIN_ELEMENTS",
+                str(_DEFAULT_AUTO_TWOSHOT_MIN_ELEMENTS),
+            )
+        )
+        if min_elements < 0:
+            raise NotImplementedError(
+                "TRTLLM_CUTE_AR_RMSNORM_TWOSHOT_MIN_ELEMENTS must be non-negative"
+            )
+        if rows * hidden_size >= min_elements:
+            return "twoshot"
         return "single"
     return implementation
 
