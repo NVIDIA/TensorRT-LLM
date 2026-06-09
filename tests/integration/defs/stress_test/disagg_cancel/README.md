@@ -26,8 +26,9 @@ land incrementally:
 
 Component-level coverage: `test_log_scanner.py`, `test_metrics_thread.py`,
 `test_injector.py`, `test_canary.py`, `test_load_thread.py`. The
-parametrized marathon pytest still runs a lifecycle smoke until
-`setup()` launches a real cluster.
+parametrized C++/V1 DeepSeek marathon is registered in the QA stress
+test list; it still runs a lifecycle smoke until `setup()` launches a
+real cluster.
 
 ## File layout
 
@@ -59,10 +60,33 @@ Future additions:
 
 ## How to run
 
-The marathons are **not** registered in pre-merge CI. They are run
-nightly / weekly via
-`tests/integration/test_lists/qa/llm_function_stress.txt` (wiring
-lands with the explicit CI-registration change).
+### Automatic QA stress run
+
+The C++/V1 DeepSeek marathon is registered in
+`tests/integration/test_lists/qa/llm_function_stress.txt` for scheduled
+QA stress runs. The registered entry is:
+
+```text
+stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_cpp_v1_deepseek.yaml] TIMEOUT (150)
+```
+
+The integration test-list parser interprets `TIMEOUT (150)` in
+minutes. CI should run the list from `tests/integration/defs` with:
+
+```bash
+pytest --test-list=../test_lists/qa/llm_function_stress.txt \
+  --output-dir=<ci-output-dir> \
+  -s -v
+```
+
+The automatic runner must use the normal TRT-LLM integration container
+or virtual environment. Once `setup()` launches the real disaggregated
+cluster, it also needs `LLM_MODELS_ROOT` set so
+`DeepSeek-V3-Lite/bf16` resolves to local model weights. At this stage
+the entry still completes as a lifecycle smoke because `setup()` has
+not launched a real disaggregated cluster yet; once cluster setup
+lands, the same test-list entry runs the configured 120-minute
+marathon.
 
 ### Unit tests (no GPU, no cluster)
 
@@ -120,16 +144,57 @@ the same tests also run under the normal integration pytest path:
 pytest -sv tests/integration/defs/stress_test/disagg_cancel/test_injector.py
 ```
 
-### Lifecycle smoke (injector not exercised on real workers)
+### Direct lifecycle smoke (no GPU, no cluster)
 
 ```bash
-pytest -sv tests/integration/defs/stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon
+PYTHONPATH=tests/integration/defs:tests/integration/defs/disaggregated \
+python3 -m pytest -c /dev/null -o addopts= \
+  -p no:cacheprovider \
+  --confcutdir=tests/integration/defs/stress_test \
+  tests/integration/defs/stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon -sv
 ```
 
 `setup()` is still a stub, so this only checks harness lifecycle
 (`setup` → `start` → `wait` → `stop`). The injector thread exits
 immediately because no workers are registered via
 `bind_tracked_workers()`.
+
+### Manual QA stress-list selection
+
+From a full TRT-LLM integration environment:
+
+```bash
+cd /path/to/TensorRT-LLM/tests/integration/defs
+export LLM_MODELS_ROOT=/path/to/model/root  # required once real setup() lands
+
+pytest stress_test/disagg_cancel/test_disagg_cancel_stress.py \
+  --test-list=../test_lists/qa/llm_function_stress.txt \
+  --output-dir=/tmp/trtllm-disagg-cancel-stress \
+  -s -v
+```
+
+To collect without running:
+
+```bash
+pytest stress_test/disagg_cancel/test_disagg_cancel_stress.py \
+  --test-list=../test_lists/qa/llm_function_stress.txt \
+  --output-dir=/tmp/trtllm-disagg-cancel-stress \
+  -s --co -q
+```
+
+### Manual CI trigger
+
+On a GitHub pull request, ask the CI bot which stress stages are
+available, then trigger the QA stress stage that consumes
+`tests/integration/test_lists/qa/llm_function_stress.txt`:
+
+```text
+/bot help
+/bot run --extra-stage "<QA stress stage that runs llm_function_stress.txt>"
+```
+
+The bot stage name is owned by CI/Jenkins configuration and is not
+declared in this directory.
 
 ### Local marathon (after `setup()` lands)
 
