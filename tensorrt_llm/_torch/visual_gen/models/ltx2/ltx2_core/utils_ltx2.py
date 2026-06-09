@@ -99,43 +99,26 @@ def apply_fused_adaln_modulate(
         shift[b, t, d] = shift_table[d] + shift_ts[b, t, d]
         out            = rms_norm(x) * (1 + scale) + shift
 
-    The (table, ts) pair replaces the previously pre-added bf16 modulator
-    tensor. The broadcast-add was previously emitted by Inductor as a leaf
-    POI prep kernel per call site; folding it into Phase 0b of the C++ op
-    eliminates that launch.
-
     Returns bf16 when ``fp4_input_scale is None``, else an ``Fp4QuantizedTensor``
-    holding the packed FP4 + 128x4 SWIZZLED SF (byte-identical to the equivalent
-    bf16 -> tunable_fp4_quantize split path).
+    holding the packed FP4 + 128x4 SWIZZLED SF.
 
-    ``fuse`` is the only top-level dispatch knob: when False, the eager torch
-    expression runs (also covers the FP4 path via tunable_fp4_quantize). Resolve
-    ``fuse`` once at module construction.
+    ``fuse`` is the top-level dispatch knob: when False, runs the eager torch
+    expression (always bf16 output; Linear handles its own quant -- see the
+    autotuner-bug note below). Resolve ``fuse`` once at module construction.
     """
     D = x.size(-1)
 
     if not fuse:
-        # Eager: compose combined modulator with PyTorch eager semantics
-        # (narrow fp32 table to bf16 FIRST, then bf16 add) -- matches
-        # `_get_all_ada_values` behaviour byte-for-byte. ALWAYS return bf16 so
-        # the downstream NVFP4 Linear handles its own quantize internally
-        # (debug fallback path).
-        #
-        # Note: we deliberately do NOT call tunable_fp4_quantize here even when
-        # fp4_input_scale is provided. tunable_fp4_quantize goes through the
-        # autotuner and on the audio CFG-doubled shape (252, 2048) hits a known
-        # FP4 tactic bug ("sfVecSize can only be 32, when sfUseUE8M0 is true")
-        # that crashes pipeline load. Linear's internal quantize path doesn't
-        # use the autotuner and works on this shape, so we route through it.
+        # Eager fallback returns bf16 even when fp4_input_scale is provided: routing
+        # through tunable_fp4_quantize hits a known FP4 tactic bug on the audio
+        # CFG-doubled shape (252, 2048) -- "sfVecSize can only be 32, when sfUseUE8M0
+        # is true" -- that crashes pipeline load. Linear's internal quantize path
+        # bypasses the autotuner and works.
         del fp4_input_scale
         scale = scale_table.to(scale_ts.dtype) + scale_ts
         shift = shift_table.to(shift_ts.dtype) + shift_ts
         return rms_norm(x, eps=eps) * (1 + scale) + shift
 
-    # x is the residual stream / hidden state (always contiguous in LTX-2). scale_ts /
-    # shift_ts come from `_get_ada_value_pair` as a 3D [B, T_t, D] unbind view over a
-    # [B, T_t, K, D] timestep tensor; the C++ op handles arbitrary rank with inner
-    # stride 1 directly. scale_table / shift_table are 1-D [D] fp32 Parameter slices.
     assert x.is_contiguous(), "x must be contiguous (fused kernel assumes flat row layout)"
 
     if fp4_input_scale is None:
@@ -182,15 +165,13 @@ def apply_fused_gate_resid_rms_modulate(
     *,
     fp4_input_scale: Optional[torch.Tensor] = None,
 ) -> "tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, Fp4QuantizedTensor]":
-    """Fused: ``x_new = x + attn * gate``; ``normed = rms_norm(x_new)``;
-    ``out = (1+scale)*normed + shift`` (KC).
+    """Fused KC: ``x_new = x + attn * gate``; ``normed = rms_norm(x_new)``;
+    ``out = (1+scale)*normed + shift``.
 
     Each modulator is built inline by the C++ op:
         gate[b,t,d]  = gate_table[d]  + gate_ts[b,t,d]
         scale[b,t,d] = scale_table[d] + scale_ts[b,t,d]
         shift[b,t,d] = shift_table[d] + shift_ts[b,t,d]
-    The (table, ts) pairs replace the previously pre-added bf16 modulators so the
-    upstream Inductor leaf POI prep kernel disappears.
 
     Returns ``(x_new, out_modulated)``. When ``fuse=True``, ``x`` is mutated
     in place by the CUDA kernel and returned as ``x_new`` (same object).
@@ -201,10 +182,7 @@ def apply_fused_gate_resid_rms_modulate(
     D = x.size(-1)
 
     if not fuse:
-        # Eager fallback: compose combined modulators with PyTorch eager
-        # semantics (bf16 narrow first, then bf16 add) -- byte-for-byte match
-        # with `_get_all_ada_values + _get_av_ca_ada_values` combined outputs.
-        # ALWAYS bf16 (Linear handles its own quant). See apply_fused_adaln_modulate.
+        # Eager fallback: bf16 output (see apply_fused_adaln_modulate autotuner-bug note).
         del fp4_input_scale
         gate = gate_table.to(gate_ts.dtype) + gate_ts
         scale = scale_table.to(scale_ts.dtype) + scale_ts
@@ -256,21 +234,15 @@ def apply_fused_resid_gate_rms_quant(
     *,
     fp4_input_scale: Optional[torch.Tensor] = None,
 ) -> "tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, Fp4QuantizedTensor]":
-    """Fused: ``x_new = x + attn_out * gate``; ``normed = rms_norm(x_new)``; optional
-    NVFP4 quant of ``normed`` (KD).
+    """Fused KD: ``x_new = x + attn_out * gate``; ``normed = rms_norm(x_new)``; optional
+    NVFP4 quant of ``normed``.
 
     Gate modulator is composed inline by the C++ op from a (table, ts) pair:
         gate[b, t, d] = gate_table[d].to(bf16) + gate_ts[b, t, d]
-    This folds both the broadcast-add prep AND the `attn * gate` mul into the
-    KD Phase 0b. Matches PyTorch eager `_get_all_ada_values[2]` byte-for-byte.
+    The kernel folds the broadcast-add prep AND the ``attn * gate`` mul into Phase 0b.
 
-    Used between MSA self-attn and text cross-attn (gate is the MSA `gate_msa`
-    slot). Any perturbation mask is applied to ``attn_out`` BEFORE this call
-    (mask is commutative with the gate multiply).
-
-    fuse=True + fp4_input_scale provided -> NVFP4 quant variant.
-    fuse=True + no fp4_input_scale -> bf16 variant (rare; bf16-quantization-
-    excluded blocks like LTX-2 ckpt blocks 0/1/2/45/46/47).
+    Used between MSA self-attn and text cross-attn. Any perturbation mask is applied
+    to ``attn_out`` BEFORE this call (mask is commutative with the gate multiply).
 
     Returns ``(x_new, normed)`` (or ``(x_new, Fp4QuantizedTensor)`` when
     ``fp4_input_scale`` is provided). ``x`` is mutated in place by the kernel
@@ -279,9 +251,7 @@ def apply_fused_resid_gate_rms_quant(
     D = x.size(-1)
 
     if not fuse:
-        # Eager fallback: compose gate with PyTorch eager semantics (bf16 narrow
-        # first, then bf16 add). ALWAYS bf16 (Linear handles its own quant).
-        # See apply_fused_adaln_modulate for the autotuner-bug reason.
+        # Eager fallback: bf16 output (see apply_fused_adaln_modulate autotuner-bug note).
         del fp4_input_scale
         gate = gate_table.to(gate_ts.dtype) + gate_ts
         x_new = x + attn_out * gate
@@ -307,10 +277,6 @@ def apply_fused_resid_gate_rms_quant(
     return x, out.view_as(x)
 
 
-# Backward-compat alias for the renamed helper (KD historically had no gate).
-apply_fused_resid_rms_quant = apply_fused_resid_gate_rms_quant
-
-
 def apply_fused_resid_rms_dual_shift_scale(
     x: torch.Tensor,
     attn2_out: torch.Tensor,
@@ -331,12 +297,11 @@ def apply_fused_resid_rms_dual_shift_scale(
     "tuple[torch.Tensor, torch.Tensor, torch.Tensor] "
     "| tuple[torch.Tensor, Fp4QuantizedTensor, Fp4QuantizedTensor]"
 ):
-    """Fused: ``x_new = x + attn2_out``; ``normed = rms_norm(x_new)``;
-    ``out1 = (1+scale1)*normed + shift1``; ``out2 = (1+scale2)*normed + shift2`` (KB).
+    """Fused KB: ``x_new = x + attn2_out``; ``normed = rms_norm(x_new)``;
+    ``out1 = (1+scale1)*normed + shift1``; ``out2 = (1+scale2)*normed + shift2``.
 
     Each modulator is built inline by the C++ op:
         m[b,t,d] = m_table[d].to(bf16) + m_ts[b,t,d]    (bf16 narrow first, bf16 add)
-    Folds the upstream broadcast-add Triton prep kernel into Phase 0b.
 
     Returns ``(x_new, out1, out2)``. When ``fuse=True``, ``x`` is mutated in
     place by the CUDA kernel and returned as ``x_new`` (same object).
@@ -348,10 +313,7 @@ def apply_fused_resid_rms_dual_shift_scale(
     D = x.size(-1)
 
     if not fuse:
-        # Eager fallback: compose combined modulators with PyTorch eager
-        # semantics (bf16 narrow first, then bf16 add) -- byte-for-byte match
-        # with `_get_av_ca_ada_values` output. ALWAYS bf16 outputs.
-        # See apply_fused_adaln_modulate for the autotuner-bug reason.
+        # Eager fallback: bf16 outputs (see apply_fused_adaln_modulate autotuner-bug note).
         del fp4_input_scale1, fp4_input_scale2
         scale1 = scale1_table.to(scale1_ts.dtype) + scale1_ts
         shift1 = shift1_table.to(shift1_ts.dtype) + shift1_ts
