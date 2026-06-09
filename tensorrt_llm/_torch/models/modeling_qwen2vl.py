@@ -476,6 +476,83 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             'cpu').to(torch.int32).clone()
         return mrope_config
 
+    @staticmethod
+    def _infer_image_grid_thw(num_tokens: int,
+                              spatial_merge_size: int) -> List[int]:
+        if num_tokens <= 0:
+            raise ValueError(
+                f"Image embedding must contain at least one token, got {num_tokens}"
+            )
+        llm_grid_h = int(num_tokens**0.5)
+        while llm_grid_h > 1 and num_tokens % llm_grid_h != 0:
+            llm_grid_h -= 1
+        llm_grid_w = num_tokens // llm_grid_h
+        return [
+            1,
+            llm_grid_h * spatial_merge_size,
+            llm_grid_w * spatial_merge_size,
+        ]
+
+    def _attach_multimodal_embeddings_impl(
+        self,
+        inputs: TextPrompt,
+        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        sampling_params: SamplingParams,
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        if not isinstance(multimodal_embedding, dict):
+            raise ValueError("multimodal_embedding must be a dictionary")
+        if set(multimodal_embedding) != {"image"}:
+            raise ValueError(
+                "Only image modality is supported for external multimodal embedding"
+            )
+
+        image_embeddings = multimodal_embedding["image"]
+        if isinstance(image_embeddings, torch.Tensor):
+            image_embeddings = [image_embeddings]
+        if not image_embeddings:
+            raise ValueError("At least one image embedding is required")
+        for index, image_embedding in enumerate(image_embeddings):
+            if image_embedding.dim() != 2:
+                raise ValueError(
+                    f"Image embedding {index} must be rank 2, got shape {tuple(image_embedding.shape)}"
+                )
+
+        get_prompt_token_ids = getattr(self, "get_prompt_token_ids", None)
+        if not callable(get_prompt_token_ids):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support external multimodal embeddings"
+            )
+
+        mm_handles = [{
+            "tensor_size": tuple(image_embedding.shape)
+        } for image_embedding in image_embeddings]
+        prompt_token_ids, _, _ = get_prompt_token_ids(inputs, mm_handles)
+
+        mrope_input_ids = torch.tensor(prompt_token_ids,
+                                       dtype=torch.long).unsqueeze(0)
+        mrope_input_ids = mrope_input_ids.clone()
+        multimodal_token_id = self.tllm_multimodal_token_id
+        mrope_input_ids[mrope_input_ids ==
+                        multimodal_token_id] = self.config.image_token_id
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+        image_grid_thw = torch.tensor(
+            [
+                self._infer_image_grid_thw(image_embedding.shape[0],
+                                           spatial_merge_size)
+                for image_embedding in image_embeddings
+            ],
+            dtype=torch.long,
+        )
+        attention_mask = torch.ones_like(mrope_input_ids)
+        mrope_config = self.get_mrope_config(mrope_input_ids, image_grid_thw,
+                                             None, attention_mask, None)
+
+        multimodal_data = {
+            "multimodal_embedding": image_embeddings,
+            "mrope_config": mrope_config,
+        }
+        return prompt_token_ids, {"multimodal_data": multimodal_data}
+
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
     @torch.inference_mode()
     def call_with_text_prompt(
