@@ -98,6 +98,7 @@ Usage:
 
 import argparse
 import json
+import os
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 
@@ -122,6 +123,12 @@ def main():
         type=str,
         required=True,
         help="Text prompt for generation",
+    )
+    parser.add_argument(
+        "--negative_prompt",
+        type=str,
+        default="cosmos3_negative_prompt.json",
+        help="Text prompt or path to JSON file for negative prompt",
     )
     parser.add_argument(
         "--image_path",
@@ -167,7 +174,13 @@ def main():
     if args.image_path is not None:
         params.image = args.image_path
 
-    negative_prompt = json.load(open("neg_prompt.json"))
+    if args.negative_prompt is not None:
+        if os.path.isfile(args.negative_prompt) and args.negative_prompt.endswith(".json"):
+            negative_prompt = json.load(open(args.negative_prompt))
+        else:
+            negative_prompt = args.negative_prompt
+    else:
+        negative_prompt = None
 
     params.extra_params["use_duration_template"] = args.enable_duration_template
     params.extra_params["use_resolution_template"] = args.enable_resolution_template
