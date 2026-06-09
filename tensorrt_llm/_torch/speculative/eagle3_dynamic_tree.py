@@ -943,6 +943,22 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 )
             )
 
+            if self.force_num_accepted_tokens != 0.0:
+                # Fill accept_token positions 1..max_path_len-1 with draft tokens so
+                # that when _apply_force_accepted_tokens inflates num_accepted_tokens
+                # the decoder reads valid tokens instead of zeros.  Finalize copies
+                # accept_token into accepted_tokens.
+                # accept_token shape: [num_gens, max_path_len] (max_path_len = max_draft_len+1)
+                # draft_tokens shape: [num_gens * (N-1)] where N-1 = max_total_draft_tokens
+                # We fill at most max_path_len-1 positions, taking the first ones from draft.
+                # All shapes are static Python ints: CUDA-graph-safe.
+                n_fill = accept_token.shape[1] - 1  # max_path_len - 1
+                accept_token[:, 1 : n_fill + 1].copy_(
+                    spec_metadata.draft_tokens.reshape(num_gens, N - 1)[:, :n_fill].to(
+                        accept_token.dtype
+                    )
+                )
+
             self._finalize_dynamic_tree_verify_outputs(
                 accept_index=accept_index,
                 accept_token_num=accept_token_num,

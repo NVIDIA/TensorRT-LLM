@@ -1324,6 +1324,14 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=self.offset,
             )
 
+            if self.force_num_accepted_tokens != 0.0:
+                # Fill gen_accepted positions 1..runtime_draft_len with all draft tokens
+                # so that when _apply_force_accepted_tokens inflates num_accepted_tokens
+                # the decoder reads valid draft tokens instead of zeros.
+                # Slice bounds are Python ints (static at CUDA-graph capture time).
+                gen_accepted[:,
+                             1:runtime_draft_len + 1].copy_(full_draft_tokens)
+
             accepted_tokens[num_contexts:] = gen_accepted
             num_accepted_tokens[num_contexts:] = gen_num_accepted
 
