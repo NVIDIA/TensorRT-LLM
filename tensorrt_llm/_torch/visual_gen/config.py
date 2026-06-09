@@ -15,6 +15,7 @@
 """Internal VisualGen pipeline and model configuration helpers."""
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -83,6 +84,17 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 def create_attention_metadata_state() -> Dict[str, Any]:
     """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
     return {"metadata": None, "capacity": (0, 0)}
+
+
+def _model_config_value(value: Any, *, deep_copy: bool = True) -> Any:
+    """Return a value for a per-component DiffusionModelConfig."""
+    if value is None:
+        return None
+    if not deep_copy:
+        return value
+    if isinstance(value, BaseModel):
+        return value.model_copy(deep=True)
+    return deepcopy(value)
 
 
 class _VisualGenConfigBase(BaseModel):
@@ -228,25 +240,27 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         model_pretrained_config: Any,
     ) -> DiffusionModelConfig:
         return DiffusionModelConfig(
-            component_name=component_name,
-            pretrained_config=model_pretrained_config,
-            mapping=self.mapping,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            allreduce_strategy=self.allreduce_strategy,
-            extra_attrs=self.extra_attrs,
-            visual_gen_mapping=self.visual_gen_mapping,
-            dynamic_weight_quant=self.dynamic_weight_quant,
-            quant_config=self.quant_config,
-            quant_config_dict=self.quant_config_dict,
-            compilation=self.compilation,
-            torch_compile=self.torch_compile,
-            cuda_graph=self.cuda_graph,
-            attention=self.attention,
-            attention_metadata_state=self.attention_metadata_state,
-            parallel=self.parallel,
-            cache=self.cache,
-            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
+            component_name=_model_config_value(component_name),
+            pretrained_config=_model_config_value(model_pretrained_config),
+            # Topology mappings carry distributed process-group handles.
+            mapping=_model_config_value(self.mapping, deep_copy=False),
+            skip_create_weights_in_init=_model_config_value(self.skip_create_weights_in_init),
+            force_dynamic_quantization=_model_config_value(self.force_dynamic_quantization),
+            allreduce_strategy=_model_config_value(self.allreduce_strategy),
+            extra_attrs=_model_config_value(self.extra_attrs),
+            # Topology mappings carry distributed process-group handles.
+            visual_gen_mapping=_model_config_value(self.visual_gen_mapping, deep_copy=False),
+            dynamic_weight_quant=_model_config_value(self.dynamic_weight_quant),
+            quant_config=_model_config_value(self.quant_config),
+            quant_config_dict=_model_config_value(self.quant_config_dict),
+            compilation=_model_config_value(self.compilation),
+            torch_compile=_model_config_value(self.torch_compile),
+            cuda_graph=_model_config_value(self.cuda_graph),
+            attention=_model_config_value(self.attention),
+            attention_metadata_state=_model_config_value(self.attention_metadata_state),
+            parallel=_model_config_value(self.parallel),
+            cache=_model_config_value(self.cache),
+            enable_layerwise_nvtx_marker=_model_config_value(self.enable_layerwise_nvtx_marker),
         )
 
     @staticmethod
