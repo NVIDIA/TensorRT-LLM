@@ -91,7 +91,7 @@ template <typename T, typename CTA_M, typename CTA_N, typename CTA_K, typename C
 size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
     void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
-    int* occupancy)
+    int* occupancy, void const* bias = nullptr)
 {
     throw std::runtime_error(
         "[TensorRT LLM Error][FP4 gemm Runner] TensorRT LLM is not compiled with support for this Architecture.");
@@ -114,7 +114,7 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
     using ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
     using LayoutB = cutlass::layout::ColumnMajor;
     static constexpr int AlignmentB = 128;
-    /* // Input C */
+    /* // Input C: ElementC=void; per-N bias via LinCombPerColBias EVT. */
     using ElementC = void;
     using LayoutC = cutlass::layout::RowMajor;
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;
@@ -131,7 +131,7 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<Arch, OperatorClass,
         MmaTileShape, ClusterShape, EpilogueTileType, ElementAccumulator, ElementCompute, ElementC, LayoutC, AlignmentC,
         OutElementType, LayoutC, AlignmentC, EpilogueSchedule,
-        cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void, float>>::CollectiveOp;
+        cutlass::epilogue::fusion::LinCombPerColBias<OutElementType, float, OutElementType, void, float>>::CollectiveOp;
 
     using CollectiveMainloop =
         typename cutlass::gemm::collective::CollectiveBuilder<Arch, cutlass::arch::OpClassBlockScaledTensorOp, ElementA,
@@ -171,7 +171,8 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
 
 template <typename Gemm>
 typename Gemm::Arguments prepareGemmArgsSm100(void* D, void const* A, void const* B, void const* input_sf,
-    void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count, dim3 prefered_cga, int XSM)
+    void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count, dim3 prefered_cga, int XSM,
+    void const* bias = nullptr)
 {
     using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
     using ElementA = typename Gemm::ElementA;
@@ -186,6 +187,7 @@ typename Gemm::Arguments prepareGemmArgsSm100(void* D, void const* A, void const
     operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
     auto& fusion_args = operator_args.epilogue.thread;
     fusion_args.alpha_ptr = static_cast<ElementCompute const*>(global_sf);
+    fusion_args.bias_ptr = static_cast<ElementD const*>(bias);
 
     operator_args.problem_shape = cute::make_shape(m, n, k, batch_count);
 
@@ -228,7 +230,7 @@ template <typename T, typename CTA_M, typename CTA_N, typename CTA_K, typename C
 size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
     void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
-    int* occupancy)
+    int* occupancy, void const* bias = nullptr)
 {
     using ElementOutput__ =
         typename cutlass::platform::conditional<cutlass::platform::is_same<T, half>::value, cutlass::half_t, T>::type;
@@ -243,7 +245,7 @@ size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* 
         typename DeviceGemmMXFP8xMXFP4GemmSm100<T, CTA_M, CTA_N, CTA_K, CGA_M, CGA_N, CGA_K, XSM_>::Gemm;
     MXFP8xMXFP4GemmOperator gemm;
     auto args = prepareGemmArgsSm100<MXFP8xMXFP4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
-        batch_count, dim3(CGA_M{}, CGA_N{}, CGA_K{}), MXSMTypeAdapter<XSM_>::Scale);
+        batch_count, dim3(CGA_M{}, CGA_N{}, CGA_K{}), MXSMTypeAdapter<XSM_>::Scale, bias);
     /* // Check shared memory size; throw when SMEM exceeds */
     int smem_size = int(sizeof(typename MXFP8xMXFP4GemmOperator::GemmKernel::SharedStorage));
     static int mMaxSmemSize = tk::getMaxSharedMemoryPerBlockOptin();
