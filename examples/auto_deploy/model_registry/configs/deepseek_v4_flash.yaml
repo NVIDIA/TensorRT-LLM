@@ -17,18 +17,12 @@
 attn_backend: deepseek_v4_sparse
 compile_backend: torch-cudagraph
 model_factory: DeepseekV4AutoModelForCausalLM
-skip_loading_weights: false
 max_batch_size: 2
-max_seq_len: 512
 max_num_tokens: 512
 enable_chunked_prefill: true
 cuda_graph_config:
   max_batch_size: 2
   batch_sizes: [1, 2]
-model_kwargs:
-  skip_mtp: true
-  ad_rope_cache_len: 512
-  ad_compress_max_seq_len: 512
 transforms:
   load_weights:
     disable_preload: true
@@ -47,18 +41,11 @@ transforms:
       moe_cluster: 1
     enable_attention_dp: false
     shard_layers: ["mla", "moe"]
-  insert_cached_attention:
-    backend: deepseek_v4_sparse
-  export_to_gm:
-    num_moe_experts_for_export: null
-  quantize_finegrained_fp8_linear_from_config:
-    enabled: true
   fuse_finegrained_fp8_linear:
     enabled: false
   quantize_mxfp4_moe:
     enabled: true
   compile_model:
-    backend: torch-cudagraph
     piecewise_enabled: false
   multi_stream_moe:
     enabled: false
