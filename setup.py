@@ -15,7 +15,6 @@
 import os
 import platform
 from pathlib import Path
-from typing import List
 
 from setuptools import find_packages, setup
 from setuptools.dist import Distribution
@@ -198,7 +197,18 @@ def download_precompiled(workspace: str, version: str) -> str:
         return wheel_path
 
 
-def extract_from_precompiled(precompiled_location: str, package_data: List[str],
+def should_skip_precompiled_package_data(filename: str) -> bool:
+    """Return True for source-owned package data kept from local checkout.
+
+    Precompiled wheels own native bits. Source owns telemetry schema JSON.
+    Skip those wheel files so Python-only schema edits layer over old wheels.
+    """
+    source_owned_package_data_prefixes = ("tensorrt_llm/usage/schemas/", )
+    return filename.endswith(".json") and filename.startswith(
+        source_owned_package_data_prefixes)
+
+
+def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                              workspace: str) -> None:
     """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
     This allows skipping the compilation, and repackaging the binaries and Python files in the working directory to a new wheel.
@@ -238,6 +248,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
                 # Skip yaml files
                 if dst_file.endswith(".yaml"):
+                    continue
+
+                # Keep source-owned package data local so Python-only schema edits
+                # layer over precompiled wheels.
+                if should_skip_precompiled_package_data(dst_file):
                     continue
 
                 # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -300,6 +315,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):
+                continue
+
+            # Keep source-owned package data local so Python-only schema edits
+            # layer over precompiled wheels.
+            if should_skip_precompiled_package_data(file.filename):
                 continue
 
             # Skip .py files EXCEPT for generated C++ extension wrappers

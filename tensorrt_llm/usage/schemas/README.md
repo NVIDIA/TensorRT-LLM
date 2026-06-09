@@ -1,12 +1,13 @@
 # TRT-LLM Telemetry Schema Reference
 
-Schema version: **0.1** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
+Schema version: **0.2** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
 
 ## Overview
 
 TRT-LLM collects anonymous, session-level deployment telemetry to understand
 how the library is used in production (GPU types, parallelism configs, model
-architectures). No PII, model weights, prompts, or outputs are collected.
+architectures). No PII, model weights, prompts, outputs, model paths, tokenizer
+paths, or raw free-form configuration strings are collected.
 
 **Opt-out** (any one of these disables telemetry):
 - `TRTLLM_NO_USAGE_STATS=1`
@@ -30,7 +31,7 @@ these top-level fields in Kibana alongside the event parameters.
 | `clientType` | string | Always `"Native"`. |
 | `clientVer` | string | TRT-LLM version, e.g. `"1.3.0rc9"`. |
 | `eventProtocol` | string | Always `"1.6"`. |
-| `eventSchemaVer` | string | Schema version, currently `"0.1"`. |
+| `eventSchemaVer` | string | Schema version, currently `"0.2"`. |
 | `eventSysVer` | string | Always `"trtllm-telemetry/1.0"`. |
 | `sessionId` | string | Unique hex UUID per server lifetime. Use this to correlate initial report with heartbeats. |
 | `sentTs` | string | ISO 8601 UTC timestamp of when the payload was sent. |
@@ -89,7 +90,9 @@ Sent once at server startup. Contains system info and serving configuration.
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `ingressPoint` | ShortString | How TRT-LLM was invoked. See [Ingress point values](#ingress-point-values). | `"cli_serve"` |
-| `featuresJson` | string | JSON-serialized dict of feature flags. See [featuresJson keys](#featuresjson-keys). | `'{"lora":false,...}'` |
+| `featuresJson` | string | Legacy JSON-serialized summary of feature flags. See [featuresJson keys](#featuresjson-keys). | `'{"lora":false,...}'` |
+| `llmApiConfigJson` | string | JSON-serialized sanitized, type-driven effective LLM API configuration. See [LLM API config capture](#llm-api-config-capture). | `'{"tensor_parallel_size":2,...}'` |
+| `llmApiConfigMetaJson` | string | JSON-serialized metadata for LLM API configuration capture. | `'{"capture_succeeded":true,...}'` |
 | `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"` |
 | `deploymentId` | ShortString | Shared ID across disaggregated workers. Empty if not disaggregated. | `""`, `"dep-abc123"` |
 
@@ -127,6 +130,9 @@ The `ingressPoint` field identifies which TRT-LLM entry point started the sessio
 The `featuresJson` field is a JSON-serialized dict. All keys are always present
 with safe defaults. This list may evolve as features are added.
 
+TODO: Deduplicate `featuresJson` with `llmApiConfigJson` after derived-only
+flags such as LoRA/speculative decoding have explicit safe config fields.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `lora` | bool | `false` | LoRA adapter enabled (`enable_lora=True` or `lora_config` provided). |
@@ -135,6 +141,65 @@ with safe defaults. This list may evolve as features are added.
 | `cuda_graphs` | bool | `false` | CUDA graphs enabled for reduced launch overhead. |
 | `chunked_context` | bool | `false` | Chunked prefill enabled (`enable_chunked_prefill=True`). |
 | `data_parallel_size` | int | `1` | Data parallel degree. `1` = no data parallelism. Derived from `tp_size` when attention DP is enabled. |
+
+## LLM API Config Capture
+
+The `llmApiConfigJson` field is a JSON-serialized dict containing a type-driven
+subset of the validated, effective LLM API configuration. Capture is
+**type-driven**: a field is captured automatically when its type is categorical
+(`Literal`/`Enum`/`bool`) or numeric (`int`/`float`), or a safe collection of
+those. Free-form `str`/`Any`/`Path`/`dict`/`Callable` are not captured unless the
+field carries an explicit allowlist (`TelemetryField.categorical(...)`). Any field
+can opt out with `telemetry=False`.
+
+Captured values must be safe primitives. Raw strings are excluded unless the
+field is a `Literal[...]` or uses an explicit `allowlist` converter. Paths,
+tokenizer locations, dicts, objects, callables, raw `Any` values, non-finite
+floats (`nan`/`inf`), and unsafe or heterogeneous sequences are excluded.
+Captured sequences are capped at a fixed length and any clipping is reported in
+`llmApiConfigMetaJson`. Exclusion is fail-closed: the value is omitted instead
+of being serialized, and `llmApiConfigMetaJson` reports whether any resolved field
+was excluded as unsafe.
+
+The table below is a non-exhaustive set of examples for readers building
+dashboards. The exhaustive source of truth is
+`tensorrt_llm/usage/llm_args_golden_manifest.json` (regenerated from
+`build_capture_manifest`), after the safety sanitizer has excluded unsafe values.
+Use `llmApiConfigMetaJson` digests and field counts to track the exact capture
+manifest for a given release. The rendered documentation generates the
+exhaustive field table at docs build time under **Developer Guide > Telemetry**.
+
+| Key | Description |
+|-----|-------------|
+| `tensor_parallel_size` | Tensor parallelism degree from the effective LLM args. |
+| `pipeline_parallel_size` | Pipeline parallelism degree from the effective LLM args. |
+| `context_parallel_size` | Context parallelism degree from the effective LLM args. |
+| `moe_expert_parallel_size` | MoE expert parallelism degree (None/unset when runtime decides). |
+| `moe_tensor_parallel_size` | MoE tensor parallelism degree (None/unset when runtime decides). |
+| `moe_cluster_parallel_size` | MoE cluster parallelism degree (None/unset when runtime decides). |
+| `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args, and through an explicit allowlist (`pytorch`, `tensorrt`, `_autodeploy`) on the base/TRT args. |
+| `dtype` | Model dtype, captured through an explicit allowlist. |
+| `load_format` | Weight load format, captured as a low-cardinality enum/string value. |
+| `quant_config.quant_algo` | Quantization algorithm, captured as a closed `QuantAlgo` enum value (TRT args only). Empty/absent when unquantized. |
+| `kv_cache_config.dtype` | KV cache dtype, captured through an explicit allowlist. |
+| `kv_cache_config.enable_block_reuse` | Whether KV cache block reuse/prefix caching is enabled. |
+| `cuda_graph_config.batch_sizes` | CUDA graph batch sizes when configured. |
+| `scheduler_config.capacity_scheduler_policy` | Scheduler capacity policy. |
+| `torch_compile_config.enable_inductor` | Whether Torch Inductor compilation is enabled. |
+| `moe_config.backend` | MoE backend selection (`AUTO`, `CUTLASS`, `TRTLLM`, ...), an annotation-derived categorical. |
+| `speculative_config.decoding_type` | Speculative decoding mode discriminator (e.g. `User_Provided`); other arms expose their own numeric/boolean knobs under `speculative_config.*`. |
+| `sparse_attention_config.algorithm` | Sparse attention algorithm discriminator; arm-specific knobs appear under `sparse_attention_config.*`. |
+| `reasoning_parser` | Reasoning parser selection, captured through an allowlist mirroring the `ReasoningParserFactory` registry. |
+| `sampler_type` | Sampler selection, captured through an allowlist mirroring the `SamplerType` enum. |
+
+`llmApiConfigMetaJson` describes the capture process itself. It includes
+contract/version fields, schema and manifest digests, source args class, field
+counts (`capturable_field_count`, `captured_field_count`, `excluded_field_count`), capture
+success, unsafe-exclusion status, a `sequence_truncated` flag set when any captured
+sequence was clipped to the length cap, and a `payload_truncated` flag set when the
+total serialized config exceeded the size budget and fields were dropped. The metadata
+is intended to make dashboards robust when the safe capture manifest changes
+over time.
 
 ## Environment Variables
 
@@ -162,6 +227,42 @@ Checklist for adding a telemetry field:
 7. **SMS schema upload** — Upload the updated JSON schema to the NvTelemetry Schema Management Service and toggle "on stage" / "on prod".
 8. **Update this README** — Add the field to the appropriate table above.
 
+Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
+
+1. **Add the field with its natural type.** If it is categorical
+   (`Literal`/`Enum`/`bool`) or numeric (`int`/`float`) — or a safe collection of
+   those — it is captured automatically; no marker is needed.
+2. **Bounded bare-string fields opt in via an allowlist.** If a free-form
+   `str`/`Any` field should be captured, mark it
+   `telemetry=TelemetryField.categorical(<allowed_values>)`, mirroring its real
+   recognized domain. **Prefer tightening the type (e.g. `str` -> `Literal`) over
+   an allowlist** when the API contract allows it; the allowlist is the fallback
+   when the annotation cannot be narrowed without a breaking validation change.
+3. **Type-safe but sensitive? Opt out with `telemetry=False`.** This honored
+   exclusion sentinel keeps a categorical/numeric field out of capture.
+4. **Do not capture unsafe data.** No model/tokenizer/file paths, prompts,
+   outputs, secrets/tokens/URLs/hostnames, free-form user strings, raw
+   dict/object payloads, or callables. The sanitizer fails closed regardless:
+   bare `str`, `Any`, `object`, `Path`, `dict`, callables, permissive unions, and
+   non-finite floats are dropped unless an approved `allowlist` converter applies.
+5. **`tests/unittest/usage/test_llmapi_config_capture.py`** — Add behavior
+   coverage: assert the value is captured, and for a categorical bare-string
+   field assert that an out-of-allowlist value is redacted (dropped) while an
+   in-allowlist value is captured.
+6. **Regenerate the manifest golden** from `build_capture_manifest`:
+   `python -c "import json; from tensorrt_llm.usage.llmapi_config import golden_manifest; open('tensorrt_llm/usage/llm_args_golden_manifest.json','w').write(json.dumps(golden_manifest(), indent=2, sort_keys=True)+'\n')"`
+   Review the golden diff — **it is the privacy review.** A newly captured field
+   requires sign-off from the telemetry/privacy CODEOWNER (`.github/CODEOWNERS`).
+7. **`docs/source/developer-guide/telemetry.md` is generated** from the committed
+   golden at docs-build time; do not hand-edit it.
+8. **Update this README** — Add a common-key row above when the field is
+   important enough for dashboard users to know by name.
+
+Dashboard note: payloads carry `capture_version` and `field_policy_version` in
+`llmApiConfigMetaJson`. During release adoption, v1 (opt-in) and v2 (type-driven)
+payloads coexist in the same index — **bucket by these before aggregating**
+`captured_field_count` or any `llmApiConfigJson.<field>`.
+
 ### Conventions
 
 - Use **camelCase** aliases for JSON wire format (Pydantic `alias=`).
@@ -170,5 +271,11 @@ Checklist for adding a telemetry field:
 - Integer fields: use `PositiveInt` (0–4B). Use `0` for "auto/unset" semantics.
 - All fields must be **required** in the JSON schema (no optional fields).
 - Empty string `""` is the sentinel for "not applicable" string fields.
-- The telemetry code is **fail-silent** — exceptions are caught and swallowed.
-- No PII. No model weights. No prompts. No outputs. Architecture class names only.
+- The telemetry code is **fail-silent in two layers.** The LLM API config
+  collector catches only the expected sanitizer/walk error family
+  (`AttributeError`, `TypeError`, `ValueError`, `KeyError`) and emits an empty
+  config plus `capture_succeeded=false`; unexpected exceptions are left to
+  propagate so genuine collector bugs are not masked. They are then caught by
+  the outer daemon-thread reporter guard in `usage_lib.py`, which keeps the
+  reporting thread from ever taking down the host process.
+- No PII. No model weights. No prompts. No outputs. No model/tokenizer paths.
