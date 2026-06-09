@@ -430,4 +430,9 @@ pipeline {
             }
         }
     } // stages
+    post {
+        always {
+            archiveArtifacts artifacts: 'scan_report/**/*', allowEmptyArchive: true
+        }
+    }
 } // pipeline
