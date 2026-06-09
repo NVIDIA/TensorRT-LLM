@@ -85,20 +85,78 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
     int const batchIdx = safeTokenIdx / p.tokens_per_batch;
     int64_t const tokenBase = static_cast<int64_t>(safeTokenIdx) * D;
 
+    // Hybrid TMA / cp.async gating, picked empirically from paired bench on B200:
+    //   USE_TMA       : single-instruction cp.async.bulk for the X load. Wins on D=4096
+    //                   except when (HAS_QUANT && HAS_MODULATE && NUM_OUT==1) where the
+    //                   kernel is HBM-light and the mbarrier setup cost exceeds the LSU
+    //                   saving. Disabled on D=2048 (audio path, 2-4us kernels).
+    //   USE_TMA_ATTN  : also TMA-bulk the residual `attn` tensor into smem. Only enabled
+    //                   on (USE_TMA && HAS_RESIDUAL && HAS_QUANT) -- bf16 paths regress
+    //                   because the per-thread LDG for attn was already overlapping
+    //                   the TMA-X load via different LSU pipes, while quant's heavy
+    //                   Phase 2 hides the extra mbarrier wait.
+    constexpr bool USE_TMA = (D >= 4096) && !(HAS_QUANT && HAS_MODULATE && NUM_OUT == 1);
+    constexpr bool USE_TMA_ATTN = USE_TMA && HAS_RESIDUAL && HAS_QUANT;
+    constexpr int kAttnSmemBytes = USE_TMA_ATTN ? (ROWS_PER_BLOCK * D * static_cast<int>(sizeof(__nv_bfloat16))) : 0;
+
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __nv_bfloat16* smem_x = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    float* warp_sums = reinterpret_cast<float*>(smem_raw + ROWS_PER_BLOCK * D * sizeof(__nv_bfloat16));
+    __nv_bfloat16* smem_attn = reinterpret_cast<__nv_bfloat16*>(smem_raw + ROWS_PER_BLOCK * D * sizeof(__nv_bfloat16));
+    float* warp_sums = reinterpret_cast<float*>(smem_raw + ROWS_PER_BLOCK * D * sizeof(__nv_bfloat16) + kAttnSmemBytes);
 
-    // Phase 0a: cp.async x -> SMEM (always).
-#pragma unroll
-    for (int chunk = 0; chunk < CHUNKS_PER_ROW; chunk++)
+    // mbarrier in static SMEM (8B), only used when USE_TMA. Compiler elides when unused.
+    __shared__ alignas(8) uint64_t mbar;
+
+    // Phase 0a: load X -> SMEM. Either TMA bulk (1 instruction, mbarrier-synced) or
+    // cp.async (32 per-thread issues, __pipeline_commit/wait_prior synced).
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+    if constexpr (USE_TMA)
     {
-        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
-        if (elemBase >= D)
-            continue;
-        __pipeline_memcpy_async(smem_x + row_in_block * D + elemBase, p.x + tokenBase + elemBase, 16);
+        constexpr uint32_t kXBytes = ROWS_PER_BLOCK * D * static_cast<uint32_t>(sizeof(__nv_bfloat16));
+        constexpr uint32_t kAttnBytes = USE_TMA_ATTN ? kXBytes : 0;
+        constexpr uint32_t kTotalBytes = kXBytes + kAttnBytes;
+        static_assert(kXBytes % 16 == 0, "cp.async.bulk requires nbBytes multiple of 16");
+        if (tid == 0)
+        {
+            asm volatile(
+                "mbarrier.init.shared.b64 [%0], 1;\n" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(&mbar)))
+                : "memory");
+            asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n" ::"r"(
+                             static_cast<uint32_t>(__cvta_generic_to_shared(&mbar))),
+                         "r"(kTotalBytes)
+                         : "memory");
+            // Bulk load X.
+            asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"l"(
+                             __cvta_generic_to_shared(smem_x + row_in_block * D)),
+                         "l"(reinterpret_cast<uint64_t>(p.x + tokenBase)), "r"(kXBytes),
+                         "l"(__cvta_generic_to_shared(&mbar))
+                         : "memory");
+            // Bulk load attn (only when USE_TMA_ATTN), into smem_attn slot.
+            if constexpr (USE_TMA_ATTN)
+            {
+                asm volatile(
+                    "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"l"(
+                        __cvta_generic_to_shared(smem_attn + row_in_block * D)),
+                    "l"(reinterpret_cast<uint64_t>(p.attn + tokenBase)), "r"(kAttnBytes),
+                    "l"(__cvta_generic_to_shared(&mbar))
+                    : "memory");
+            }
+        }
+        __syncthreads();
     }
-    __pipeline_commit();
+    else
+#endif
+    {
+#pragma unroll
+        for (int chunk = 0; chunk < CHUNKS_PER_ROW; chunk++)
+        {
+            int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
+            if (elemBase >= D)
+                continue;
+            __pipeline_memcpy_async(smem_x + row_in_block * D + elemBase, p.x + tokenBase + elemBase, 16);
+        }
+        __pipeline_commit();
+    }
 
     // Phase 0b: load gate / scale / shift modulators into register caches.
     // Per-thread storage scaled by HAS_GATE / HAS_MODULATE flags; compiler elides
@@ -153,9 +211,11 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
         }
     }
 
-    // Phase 0c: load attn directly from GMEM into regs (HAS_RESIDUAL only).
+    // Phase 0c: load attn into regs (HAS_RESIDUAL only). Either from smem (USE_TMA_ATTN —
+    // attn was bulk-loaded into smem_attn in Phase 0a) or directly from GMEM (cp.async path).
+    // The smem read happens AFTER the mbarrier wait, so smem_attn is guaranteed populated.
     uint4 attn_reg[HAS_RESIDUAL ? CHUNKS_PER_ROW : 1];
-    if constexpr (HAS_RESIDUAL)
+    if constexpr (HAS_RESIDUAL && !USE_TMA_ATTN)
     {
 #pragma unroll
         for (int chunk = 0; chunk < CHUNKS_PER_ROW; chunk++)
@@ -167,8 +227,29 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
         }
     }
 
-    __pipeline_wait_prior(0);
-    __syncthreads();
+    // Wait on Phase 0a load completion (TMA mbarrier OR cp.async pipeline, gated by USE_TMA).
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+    if constexpr (USE_TMA)
+    {
+        uint32_t const mbar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&mbar));
+        asm volatile(
+            "{\n"
+            ".reg .pred P1;\n"
+            "WAIT_LOOP:\n"
+            "mbarrier.try_wait.parity.shared.b64 P1, [%0], 0;\n"
+            "@P1 bra DONE;\n"
+            "bra     WAIT_LOOP;\n"
+            "DONE:\n"
+            "}\n" ::"r"(mbar_smem)
+            : "memory");
+        __syncthreads();
+    }
+    else
+#endif
+    {
+        __pipeline_wait_prior(0);
+        __syncthreads();
+    }
 
     // Phase 1: compute x_new and sum^2.
     //   HAS_RESIDUAL=false:        x_new = x
@@ -186,6 +267,12 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
         if (elemBase >= D)
             continue;
         uint4 const xv = *reinterpret_cast<uint4 const*>(&smem_x[row_in_block * D + elemBase]);
+        // USE_TMA_ATTN path: attn was TMA-bulk-loaded into smem_attn in Phase 0a;
+        // populate attn_reg from smem here (post-mbarrier-wait, data is valid).
+        if constexpr (USE_TMA_ATTN)
+        {
+            attn_reg[chunk] = *reinterpret_cast<uint4 const*>(&smem_attn[row_in_block * D + elemBase]);
+        }
         uint const* xu = reinterpret_cast<uint const*>(&xv);
         uint4 new_vec;
         uint* nu = reinterpret_cast<uint*>(&new_vec);
@@ -451,9 +538,13 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
 #define LAUNCH(D_VAL)                                                                                                  \
     do                                                                                                                 \
     {                                                                                                                  \
+        constexpr bool USE_TMA_HOST = (D_VAL >= 4096) && !(HAS_QUANT && HAS_MODULATE && NUM_OUT == 1);                 \
+        constexpr bool USE_TMA_ATTN_HOST = USE_TMA_HOST && HAS_RESIDUAL && HAS_QUANT;                                  \
+        int const attn_extra_bytes                                                                                     \
+            = USE_TMA_ATTN_HOST ? (ROWS_PER_BLOCK * D_VAL * static_cast<int>(sizeof(__nv_bfloat16))) : 0;              \
         cfg.gridDim = dim3((params.num_tokens + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);                                 \
         cfg.blockDim = dim3(BLOCK_SIZE);                                                                               \
-        cfg.dynamicSmemBytes = ROWS_PER_BLOCK * D_VAL * static_cast<int>(sizeof(__nv_bfloat16))                        \
+        cfg.dynamicSmemBytes = ROWS_PER_BLOCK * D_VAL * static_cast<int>(sizeof(__nv_bfloat16)) + attn_extra_bytes     \
             + ROWS_PER_BLOCK * WARPS_PER_ROW * static_cast<int>(sizeof(float));                                        \
         cudaLaunchKernelEx(&cfg,                                                                                       \
             fusedDiTNormKernel<D_VAL, ROWS_PER_BLOCK, BLOCK_SIZE, HAS_RESIDUAL, HAS_GATE, HAS_MODULATE, NUM_OUT,       \
