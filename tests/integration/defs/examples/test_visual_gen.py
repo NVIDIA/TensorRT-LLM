@@ -1380,8 +1380,8 @@ def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     ``--text_encoder_path`` because the shared YAML intentionally omits it to keep
     the config model-path-agnostic.
     """
-    model_path = _lpips_model_path("LTX-2")
-    _skip_if_missing(model_path, "LTX-2 model directory", is_dir=True)
+    model_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
+    _skip_if_missing(model_path, "LTX-2 checkpoint")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
     _skip_if_missing(text_encoder_path, "LTX-2 text encoder (gemma-3-12b-it)", is_dir=True)
 
@@ -1488,5 +1488,6 @@ def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
             "--output_path",
             output_path,
         ],
+        env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
