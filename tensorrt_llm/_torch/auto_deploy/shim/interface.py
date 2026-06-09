@@ -50,6 +50,8 @@ else:
 
 from ..custom_ops.attention_interface import (
     CausalConvResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
     KVPagedResourceHandler,
     ReplayCacheBufIdxHandler,
     ReplayOldBHandler,
@@ -60,8 +62,6 @@ from ..custom_ops.attention_interface import (
     ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
-    SpecCausalConvResourceHandler,
-    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
 )
@@ -147,6 +147,12 @@ class CachedSequenceInterface:
         # same order as the C++ manager's internal pool ordering (i.e. the
         # insertion order of the per-window shape map keys).
         self._kv_group_windows: List[int] = []
+        # Whether the attention backend's kernel applies the sliding-window mask
+        # itself via cyclic KV indexing (trtllm). When True the executor passes
+        # the full per-window block table and global KV lengths instead of
+        # host-slicing to the live window. Set by the kvcache transform from the
+        # attention descriptor's ``kernel_handles_cyclic_swa()``.
+        self._kernel_handles_cyclic_swa: bool = False
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
@@ -454,8 +460,8 @@ class CachedSequenceInterface:
         ssm_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecSSMResourceHandler)
-            and handler == SpecSSMResourceHandler.from_base(ssm_ref)
+            if isinstance(handler, IntermediateSSMStateHandler)
+            and handler == IntermediateSSMStateHandler.from_base(ssm_ref)
         ]
         conv_managed = [
             (name, handler)
@@ -465,8 +471,8 @@ class CachedSequenceInterface:
         conv_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecCausalConvResourceHandler)
-            and handler == SpecCausalConvResourceHandler.from_base(conv_ref)
+            if isinstance(handler, IntermediateConvStateHandler)
+            and handler == IntermediateConvStateHandler.from_base(conv_ref)
         ]
 
         # Replay SSM buffers — per-layer (old_x, old_B, old_dt, old_dA_cumsum)
@@ -1125,16 +1131,14 @@ class CachedSequenceInterface:
             1 for h in self._resource_lookup.values() if isinstance(h, SSMResourceHandler)
         )
         num_ssm_spec_total = sum(
-            1 for h in self._resource_lookup.values() if isinstance(h, SpecSSMResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateSSMStateHandler)
         )
         num_ssm_total = num_ssm_base_total + num_ssm_spec_total
         num_conv_base_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, CausalConvResourceHandler)
         )
         num_conv_spec_total = sum(
-            1
-            for h in self._resource_lookup.values()
-            if isinstance(h, SpecCausalConvResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateConvStateHandler)
         )
         num_conv_total = num_conv_base_total + num_conv_spec_total
         num_state_other = num_state_total - num_ssm_total - num_conv_total
@@ -1306,6 +1310,21 @@ class CachedSequenceInterface:
         insertion order of the per-window keys).
         """
         self._kv_group_windows = list(group_windows)
+
+    @property
+    def kernel_handles_cyclic_swa(self) -> bool:
+        """Whether the attention kernel applies the sliding-window mask itself.
+
+        When True (trtllm), the executor passes the full per-window block table
+        and global KV lengths; when False (triton/flashinfer), it host-slices to
+        the live sliding window.
+        """
+        return self._kernel_handles_cyclic_swa
+
+    def set_kernel_handles_cyclic_swa(self, value: bool) -> None:
+        """Record the attention backend's cyclic-SWA capability (called by the
+        kvcache transform from ``AttentionDescriptor.kernel_handles_cyclic_swa``)."""
+        self._kernel_handles_cyclic_swa = bool(value)
 
     @property
     def kv_cache_manager(self) -> Optional[KVCacheManager]:

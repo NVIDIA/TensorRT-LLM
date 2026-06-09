@@ -34,6 +34,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -554,7 +555,7 @@ class FluxSingleTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class FluxTransformer2DModel(nn.Module):
+class FluxTransformer2DModel(BaseDiffusionModel):
     """FLUX Transformer model for text-to-image generation.
 
     This is the native TRT-LLM implementation of FLUX transformer.
@@ -572,8 +573,7 @@ class FluxTransformer2DModel(nn.Module):
     """
 
     def __init__(self, model_config: DiffusionModelConfig):
-        super().__init__()
-        self.model_config = model_config
+        super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 24)

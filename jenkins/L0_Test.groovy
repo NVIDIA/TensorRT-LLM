@@ -29,6 +29,7 @@ LLM_ROOT = "llm"
 
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -651,46 +652,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
         stage('Check If Node Is Online') {
             CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
-                def counter = 0
-                // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
-                // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
-                while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
-                    // Wait 10 minutes to check status of the node again
-                    sleep(time: 10, unit: 'MINUTES')
-                    // Avoid the node being stuck in the held state.
-                    if (counter % 3 == 0) {
-                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""), numRetries: 3)
-                    }
-                    counter++
-                    // If entrypoint script fails to start, do not poll for agent connection
+                // Check the SLURM job once; if it is no longer active, raise a typed
+                // InfraFailure(SLURM) so the retry layer routes it via instanceof (scope=SLURM).
+                def checkSlurmJobActive = {
                     try {
                         SlurmConfig.checkJobStatus(pipeline, cluster, slurmJobID, remote)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // If the exception is about job being inactive, throw a typed
-                        // InfraFailure(SLURM) so downstream consumers route via instanceof
-                        // rather than substring matching the catalog. The "<typed:..."
-                        // marker keeps the [INFRA-RETRY] log line distinguishable from
-                        // catalog-matched fallbacks.
-                        //
-                        // Critical for nested-retry correctness: the SLURM-scoped typed
-                        // throw is rejected by classify() at the OUTER K8s pod-launch
-                        // retry's scope guard (see classify() scope-mismatch branch).
-                        // That prevents the K8s outer from re-running a budget that the
-                        // inner SLURM retry already exhausted. End-to-end trace:
-                        //   1. SLURM job goes inactive while running.
-                        //   2. SlurmConfig.checkJobStatus() throws plain Exception with
-                        //      message "...is no longer active...".
-                        //   3. This catch wraps it as InfraFailure(TRANSIENT, SLURM).
-                        //   4. Inner runLLMTestlistOnSlurm retry catches, classifies via
-                        //      classify(scope=SLURM): instanceof InfraFailure with scope=SLURM
-                        //      passes through; consumer retries up to SLURM_INFRA_RETRY_MAX.
-                        //   5. If exhausted, the typed InfraFailure(SLURM) bubbles out of
-                        //      the inner SLURM retry into the outer K8s pod-launch retry.
-                        //   6. Outer classify(scope=K8S) sees typed InfraFailure with
-                        //      scope=SLURM != K8S, wraps as UserFailure -> outer rethrows
-                        //      without retry. No double-budget consumption.
                         if (e.message?.contains("is no longer active")) {
                             throw new InfraFailure(
                                 "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
@@ -698,6 +667,66 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
+                    }
+                }
+
+                // Phase 1: wait for the job to leave the queue (PENDING -> RUNNING), polling
+                // every 3 min. The whole loop runs in a SINGLE shell step so a long queue wait
+                // only adds one flow-node to the Blue Ocean graph (instead of one per iteration,
+                // which overflowed the per-stage step cap). Release the held job every 10
+                // iterations (~30 min). 300 iterations * 3 min = 15h budget.
+                // Exit codes: 0 = job RUNNING, 3 = job no longer active, 4 = timed out.
+                def sacctStateCmd = Utils.sshUserCmd(remote, "\"sacct -j ${slurmJobID} --format=State -Pn --allocations\"")
+                def releaseCmd = Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\"")
+                def waitRc = pipeline.sh(returnStatus: true, script: """
+                    set +e
+                    counter=0
+                    while [ \$counter -lt 300 ]; do
+                        # Avoid the job being stuck in the held state. Release every 10 iterations (~30 min).
+                        if [ \$(( counter % 10 )) -eq 0 ]; then
+                            ${releaseCmd} || true
+                        fi
+                        STATE=\$(${sacctStateCmd} | head -1 | cut -d'|' -f1 | awk '{print \$1}')
+                        echo "[node-wait] iteration \$counter: SLURM job ${slurmJobID} state='\$STATE'"
+                        case "\$STATE" in
+                            RUNNING|COMPLETING)
+                                echo "[node-wait] SLURM job ${slurmJobID} is running."
+                                exit 0
+                                ;;
+                            PENDING|CONFIGURING|REQUEUED|RESIZING|SUSPENDED|SIGNALING|STOPPED|"")
+                                # Still queued, or a transient sacct/ssh hiccup (empty state): keep waiting.
+                                ;;
+                            *)
+                                echo "[node-wait] SLURM job ${slurmJobID} is no longer active (state='\$STATE')."
+                                exit 3
+                                ;;
+                        esac
+                        counter=\$(( counter + 1 ))
+                        # Wait 3 minutes before checking the job state again.
+                        sleep 180
+                    done
+                    echo "[node-wait] Timed out waiting for SLURM job ${slurmJobID} to start."
+                    exit 4
+                """)
+
+                // If the job reached a terminal state while queued, confirm via the canonical
+                // status check so the exact typed InfraFailure(SLURM) is raised.
+                if (waitRc == 3) {
+                    checkSlurmJobActive()
+                }
+
+                // Phase 2: job is RUNNING; wait for the Jenkins agent to come online. isNodeOnline()
+                // and Thread.sleep() emit no flow-nodes, so poll every 30s without bloating Blue
+                // Ocean, and probe job status every ~3 min (every 6th iter) to fail fast if the
+                // job dies during bring-up. 120 * 30s = 1h.
+                if (waitRc == 0) {
+                    def onlineCounter = 0
+                    while (!CloudManager.isNodeOnline(nodeName) && onlineCounter < 120) {
+                        Thread.sleep(30L * 1000L)
+                        if (onlineCounter % 6 == 0) {
+                            checkSlurmJobActive()
+                        }
+                        onlineCounter++
                     }
                 }
 
@@ -2462,28 +2491,24 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
-    // CBTS Layer 3: regenerate cbts_test_db/ on this stage agent from the
-    // piggybacked input JSON if not already present. The piggyback payload is
-    // base64-encoded on the orchestrator (see getCbtsResult in
-    // L0_MergeRequest.groovy) to keep tokenmacro from interpreting ${...} or
-    // {...} fragments inside the PR diff when globalVars is serialized. If
-    // decoding or regeneration throws (truncated/malformed payload), we
-    // swallow the error: the override directory will be absent below, the
-    // overrideYaml check will fail, and renderTestDB falls back to the
-    // source test-db.
+    // CBTS Layer 3: download the pre-built cbts_test_db/ tarball that the
+    // orchestrator uploaded to Artifactory (see getCbtsResult in
+    // L0_MergeRequest.groovy). This avoids re-running main.py locally and
+    // avoids passing large PR-diff payloads as Jenkins parameters (env vars).
+    // If the download or extraction fails we swallow the error: the override
+    // directory will be absent below, the overrideYaml check will fail, and
+    // renderTestDB falls back to the source test-db.
     def cbts = testFilter[(CBTS_RESULT)]
-    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json_b64) {
+    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_test_db_artifact_path) {
         def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
             try {
-                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64())
-                def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
-                pipeline.writeFile(file: cbtsInputLocal, text: cbtsInputJson)
-                sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
-                sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+                def artifactUrl = "${URM_ARTIFACTORY_BASE}/${cbts.cbts_test_db_artifact_path}"
+                sh "wget -q '${artifactUrl}' -O /tmp/cbts_test_db.tar.gz && tar xzf /tmp/cbts_test_db.tar.gz -C ${llmSrc}"
+                echo "CBTS Layer 3: extracted cbts_test_db from artifact"
             } catch (Exception e) {
-                echo "CBTS Layer 3: failed to materialize piggyback payload " +
+                echo "CBTS Layer 3: artifact download failed " +
                      "(${e.class.simpleName}: ${e.message}); falling back to source test-db"
             }
         }
