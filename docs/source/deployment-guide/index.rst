@@ -28,12 +28,12 @@ The deployment guides below provide more detailed instructions for serving speci
    :maxdepth: 1
    :name: Deployment Guides
 
-   deployment-guide-for-nemotron-3-super-on-trtllm.md
+   deployment-guide-for-nemotron-3-on-trtllm.md
    deployment-guide-for-deepseek-r1-on-trtllm.md
    deployment-guide-for-llama3.3-70b-on-trtllm.md
    deployment-guide-for-llama4-scout-on-trtllm.md
    deployment-guide-for-gpt-oss-on-trtllm.md
    deployment-guide-for-qwen3-on-trtllm.md
-   deployment-guide-for-qwen3-next-on-trtllm.md
+   deployment-guide-for-qwen3.5-on-trtllm.md
    deployment-guide-for-kimi-k2-thinking-on-trtllm.md
    deployment-guide-for-glm-5-on-trtllm.md

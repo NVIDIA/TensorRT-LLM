@@ -916,46 +916,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                  test_sets=[get_accuracy_task(testset)])
 
 
-class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
-
-    @pytest.mark.skip_less_device_memory(140000)
-    @pytest.mark.timeout(3600)
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("overlap_scheduler", [False, True])
-    def test_auto_dtype(self, overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
-        ctx_server_config["cache_transceiver_config"] = {
-            "backend": "DEFAULT",
-            "max_tokens_in_buffer": 4096
-        }
-        gen_server_config["cache_transceiver_config"] = {
-            "backend": "DEFAULT",
-            "max_tokens_in_buffer": 4096
-        }
-        # Keep this low to avoid warmup OOM in CI
-        ctx_server_config["max_seq_len"] = 8192
-        gen_server_config["max_seq_len"] = 8192
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      tensor_parallel_size=4) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
-
-
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):

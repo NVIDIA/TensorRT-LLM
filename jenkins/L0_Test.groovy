@@ -651,46 +651,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
         stage('Check If Node Is Online') {
             CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
-                def counter = 0
-                // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
-                // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
-                while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
-                    // Wait 10 minutes to check status of the node again
-                    sleep(time: 10, unit: 'MINUTES')
-                    // Avoid the node being stuck in the held state.
-                    if (counter % 3 == 0) {
-                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\""), numRetries: 3)
-                    }
-                    counter++
-                    // If entrypoint script fails to start, do not poll for agent connection
+                // Check the SLURM job once; if it is no longer active, raise a typed
+                // InfraFailure(SLURM) so the retry layer routes it via instanceof (scope=SLURM).
+                def checkSlurmJobActive = {
                     try {
                         SlurmConfig.checkJobStatus(pipeline, cluster, slurmJobID, remote)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // If the exception is about job being inactive, throw a typed
-                        // InfraFailure(SLURM) so downstream consumers route via instanceof
-                        // rather than substring matching the catalog. The "<typed:..."
-                        // marker keeps the [INFRA-RETRY] log line distinguishable from
-                        // catalog-matched fallbacks.
-                        //
-                        // Critical for nested-retry correctness: the SLURM-scoped typed
-                        // throw is rejected by classify() at the OUTER K8s pod-launch
-                        // retry's scope guard (see classify() scope-mismatch branch).
-                        // That prevents the K8s outer from re-running a budget that the
-                        // inner SLURM retry already exhausted. End-to-end trace:
-                        //   1. SLURM job goes inactive while running.
-                        //   2. SlurmConfig.checkJobStatus() throws plain Exception with
-                        //      message "...is no longer active...".
-                        //   3. This catch wraps it as InfraFailure(TRANSIENT, SLURM).
-                        //   4. Inner runLLMTestlistOnSlurm retry catches, classifies via
-                        //      classify(scope=SLURM): instanceof InfraFailure with scope=SLURM
-                        //      passes through; consumer retries up to SLURM_INFRA_RETRY_MAX.
-                        //   5. If exhausted, the typed InfraFailure(SLURM) bubbles out of
-                        //      the inner SLURM retry into the outer K8s pod-launch retry.
-                        //   6. Outer classify(scope=K8S) sees typed InfraFailure with
-                        //      scope=SLURM != K8S, wraps as UserFailure -> outer rethrows
-                        //      without retry. No double-budget consumption.
                         if (e.message?.contains("is no longer active")) {
                             throw new InfraFailure(
                                 "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
@@ -698,6 +666,66 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
+                    }
+                }
+
+                // Phase 1: wait for the job to leave the queue (PENDING -> RUNNING), polling
+                // every 3 min. The whole loop runs in a SINGLE shell step so a long queue wait
+                // only adds one flow-node to the Blue Ocean graph (instead of one per iteration,
+                // which overflowed the per-stage step cap). Release the held job every 10
+                // iterations (~30 min). 300 iterations * 3 min = 15h budget.
+                // Exit codes: 0 = job RUNNING, 3 = job no longer active, 4 = timed out.
+                def sacctStateCmd = Utils.sshUserCmd(remote, "\"sacct -j ${slurmJobID} --format=State -Pn --allocations\"")
+                def releaseCmd = Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\"")
+                def waitRc = pipeline.sh(returnStatus: true, script: """
+                    set +e
+                    counter=0
+                    while [ \$counter -lt 300 ]; do
+                        # Avoid the job being stuck in the held state. Release every 10 iterations (~30 min).
+                        if [ \$(( counter % 10 )) -eq 0 ]; then
+                            ${releaseCmd} || true
+                        fi
+                        STATE=\$(${sacctStateCmd} | head -1 | cut -d'|' -f1 | awk '{print \$1}')
+                        echo "[node-wait] iteration \$counter: SLURM job ${slurmJobID} state='\$STATE'"
+                        case "\$STATE" in
+                            RUNNING|COMPLETING)
+                                echo "[node-wait] SLURM job ${slurmJobID} is running."
+                                exit 0
+                                ;;
+                            PENDING|CONFIGURING|REQUEUED|RESIZING|SUSPENDED|SIGNALING|STOPPED|"")
+                                # Still queued, or a transient sacct/ssh hiccup (empty state): keep waiting.
+                                ;;
+                            *)
+                                echo "[node-wait] SLURM job ${slurmJobID} is no longer active (state='\$STATE')."
+                                exit 3
+                                ;;
+                        esac
+                        counter=\$(( counter + 1 ))
+                        # Wait 3 minutes before checking the job state again.
+                        sleep 180
+                    done
+                    echo "[node-wait] Timed out waiting for SLURM job ${slurmJobID} to start."
+                    exit 4
+                """)
+
+                // If the job reached a terminal state while queued, confirm via the canonical
+                // status check so the exact typed InfraFailure(SLURM) is raised.
+                if (waitRc == 3) {
+                    checkSlurmJobActive()
+                }
+
+                // Phase 2: job is RUNNING; wait for the Jenkins agent to come online. isNodeOnline()
+                // and Thread.sleep() emit no flow-nodes, so poll every 30s without bloating Blue
+                // Ocean, and probe job status every ~3 min (every 6th iter) to fail fast if the
+                // job dies during bring-up. 120 * 30s = 1h.
+                if (waitRc == 0) {
+                    def onlineCounter = 0
+                    while (!CloudManager.isNodeOnline(nodeName) && onlineCounter < 120) {
+                        Thread.sleep(30L * 1000L)
+                        if (onlineCounter % 6 == 0) {
+                            checkSlurmJobActive()
+                        }
+                        onlineCounter++
                     }
                 }
 
@@ -3970,9 +3998,6 @@ def launchTestJobs(pipeline, testFilter)
         // "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
         // "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
         // "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
-        "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
-        "A100X-FMHA-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
         // "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
         // "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
         // "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
@@ -4029,13 +4054,14 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-PyTorch-6": ["auto:dgx-h100-x1", "l0_h100", 6, 6],
         "DGX_H100-PyTorch-Post-Merge-1": ["auto:dgx-h100-x1", "l0_h100", 1, 2],
         "DGX_H100-PyTorch-Post-Merge-2": ["auto:dgx-h100-x1", "l0_h100", 2, 2],
+        "DGX_A100-Triton-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 2],
+        "DGX_A100-Triton-Post-Merge-2": ["auto:dgx-a100-x1", "l0_a100", 2, 2],
+        "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
-        "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
-        "DGX_H100-2_GPUs-PyTorch-GptOss-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
+        "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-2_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -4053,6 +4079,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-Triton-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200", 2, 2, 1, 1, true],
+        "DGX_B200-2_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 2, 1, true],
         "DGX_B200-4_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 3, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 3, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 3, 4, 1, true],
@@ -4127,8 +4154,10 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 2, 4],
-        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 2, 4],
+        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 4, 4],
+        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 4, 4],
+        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4", "l0_gb200_multi_gpus", 3, 4, 4],
+        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4", "l0_gb200_multi_gpus", 4, 4, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1],

@@ -295,7 +295,7 @@ class InputBuffer:
                     trunc_h_buf = self._trunc_host_bufs[name][:copy_bytes]
                     trunc_d_buf.copy_(trunc_h_buf, non_blocking=True)
 
-    def copy_to_host(self) -> None:
+    def copy_to_host(self, non_blocking: bool = False) -> None:
         """Copy from device buffer to host buffer.
 
         Mirrors ``copy_to_device``: uses the current length of the truncatable tensor
@@ -306,7 +306,7 @@ class InputBuffer:
             if self._total_bytes > 0:
                 h_buffer = self._host_buffer[: self._total_bytes]
                 d_buffer = self._device_buffer[: self._total_bytes]
-                h_buffer.copy_(d_buffer, non_blocking=True)
+                h_buffer.copy_(d_buffer, non_blocking=non_blocking)
 
             # Copy each truncatable tensor independently, truncated to current length
             for name in self._truncatable_names:
@@ -316,7 +316,7 @@ class InputBuffer:
                     copy_bytes = length * dtype.itemsize
                     trunc_d_buf = self._trunc_device_bufs[name][:copy_bytes]
                     trunc_h_buf = self._trunc_host_bufs[name][:copy_bytes]
-                    trunc_h_buf.copy_(trunc_d_buf, non_blocking=True)
+                    trunc_h_buf.copy_(trunc_d_buf, non_blocking=non_blocking)
 
     def resize(self, name: str, new_capacity: int) -> None:
         """Resize a truncatable tensor's capacity.
@@ -402,7 +402,7 @@ class BatchInfo:
     Args:
         batch_info_host: The batch info tensor on the host.
 
-    The information is stored in a 14-element batch_info_host tensor as follows:
+    The information is stored in a 15-element batch_info_host tensor as follows:
 
     Slots 0-5 (batch composition):
     - [0] num_prefill: number of prefill requests
@@ -428,10 +428,17 @@ class BatchInfo:
     Slot 13 (replay mode flag, set once at runtime init):
     - [13] use_replay: 1 if SSM replay state-update path is active, 0 otherwise
 
+    Slot 14 (DP-aware token info, updated per forward when attention-DP is on):
+    - [14] max_dp_num_tokens: max(total_num_tokens) across all DP ranks for this
+      forward step. Equals local total_num_tokens when attention-DP is off.
+      Used by MoE all-to-all to size dispatch padding without over-padding to the
+      static config max_num_tokens. Mirrors base TRT-LLM's
+      ``runtime_max_tokens_per_rank`` from ``model_engine._get_all_rank_num_tokens``.
+
     All fields can be accessed and updated with the convenience functions below.
     """
 
-    _NUM_ELEMENTS = 14
+    _NUM_ELEMENTS = 15
 
     def __init__(self, batch_info_host: Optional[torch.Tensor] = None):
         if batch_info_host is None:
@@ -519,6 +526,9 @@ class BatchInfo:
     def get_max_context_length(self) -> int:
         return int(self._batch_info[6])
 
+    def get_max_seq_len(self) -> int:
+        return self.get_max_context_length()
+
     def get_max_blocks_per_seq(self) -> int:
         return int(self._batch_info[7])
 
@@ -564,6 +574,21 @@ class BatchInfo:
     def is_use_replay(self) -> bool:
         return bool(self._batch_info[13])
 
+    # --- DP-aware token info (slot 14) writer ---
+
+    def update_max_dp_num_tokens(self, max_dp_num_tokens: int) -> None:
+        """Set the max-across-DP-ranks total token count for this forward.
+
+        When attention-DP is off, callers should write the local total_num_tokens
+        so consumers can read this slot uniformly without checking attn-DP state.
+        """
+        self._batch_info[14] = max_dp_num_tokens
+
+    # --- DP-aware token info (slot 14) reader ---
+
+    def get_max_dp_num_tokens(self) -> int:
+        return int(self._batch_info[14])
+
 
 class SequenceInfo:
     """An interface to hold information about how the sequence is laid out and stored in cache.
@@ -607,7 +632,8 @@ class SequenceInfo:
 
     ### BATCH INFO OBJECT ########################################################################
     - batch_info_host: a single host tensor managed by the ``BatchInfo`` class. It consolidates
-      batch composition, max sequence info, and tokens gather info into one 12-element int tensor.
+      batch composition, max sequence info, tokens gather info, spec-dec info, and DP-aware
+      token info into one 14-element int tensor.
       See the ``BatchInfo`` docstring for the full layout. Custom ops receive this tensor as a
       graph input and should wrap it via ``BatchInfo(batch_info_host)`` to extract fields.
 
@@ -1175,6 +1201,27 @@ class SequenceInfo:
         """
         return self._is_active(name, check_both) or self._is_active_host_prep(name, check_both)
 
+    def _active_host_update_args(
+        self, arg_names: Set[str], active_args_override: Optional[Set[str]] = None
+    ) -> List[str]:
+        """Return host args that need mirroring after an in-graph metadata update.
+
+        ``active_args_override`` lets a caller narrow host mirroring to the graph inputs the next
+        consumer actually reads. It is treated as a filter: only active host args whose names appear
+        in the override are mirrored. The override may contain names that are not active graph args
+        (e.g. a submodule's full placeholder set, which also includes inter-module tensors such as
+        ``inputs_embeds``/``hidden_states``); such entries are simply ignored. The caller is
+        responsible for including every host argument the next consumer may read.
+        """
+        needs_d2h_sync = [
+            k + self._host_suffix
+            for k in arg_names
+            if self._is_active(k + self._host_suffix, check_both=False)
+        ]
+        if active_args_override is None:
+            return needs_d2h_sync
+        return [arg_name for arg_name in needs_d2h_sync if arg_name in active_args_override]
+
     def _stage_arg(
         self,
         name: str,
@@ -1325,6 +1372,10 @@ class SequenceInfo:
             num_prefill_tokens = int(sl_host.sum()) - num_decode
             batch_info = [num_prefill, num_prefill_tokens, 0, 0, num_decode, num_decode]
         self.batch_info.update(batch_info)
+        # Default slot 14 (max_dp_num_tokens) to local total tokens; the executor
+        # overrides this with the cross-rank max via update_max_dp_num_tokens()
+        # when attention-DP is enabled.
+        self.batch_info.update_max_dp_num_tokens(self.batch_info.get_total_num_tokens())
 
         # check for updated input_pos (i.e. cache start position)
         if isinstance(input_pos, int):
@@ -1583,11 +1634,16 @@ class SequenceInfo:
             host_function(**{arg: self.get_arg(arg) for arg in args})
 
     @nvtx_range("ad_offset_pos_and_cache_")
-    def offset_pos_and_cache_(self, offset: torch.Tensor) -> None:
+    def offset_pos_and_cache_(
+        self, offset: torch.Tensor, active_args_override: Optional[Set[str]] = None
+    ) -> None:
         """Offset position and cache-related metadata for active arguments.
 
         Args:
             offset: 1D tensor [batch_size] with per-sequence position offsets.
+            active_args_override: Optional graph-input names for the next in-forward consumer. When
+                provided, host mirroring is limited to those active host args. The caller is
+                responsible for including every host argument the next consumer may read.
         """
         # check if we need a d2h sync
         _REQUIRES_UPDATE = {
@@ -1599,11 +1655,7 @@ class SequenceInfo:
             "seq_len_with_cache",
             "use_initial_states",
         }
-        needs_d2h_sync = [
-            k + self._host_suffix
-            for k in _REQUIRES_UPDATE
-            if self._is_active(k + self._host_suffix, check_both=False)
-        ]
+        needs_d2h_sync = self._active_host_update_args(_REQUIRES_UPDATE, active_args_override)
         sync_to_host = any(needs_d2h_sync)
         if sync_to_host:
             ad_logger.debug(f"d2h sync required in offset_pos_and_cache_ for {needs_d2h_sync}")
@@ -1694,7 +1746,7 @@ class SequenceInfo:
         # TODO: May need to dissect what fields are needed in the forward pass to reduce
         # data movement.
         if sync_to_host:
-            self._input_buffer.copy_to_host()
+            self._input_buffer.copy_to_host(non_blocking=False)
 
     @nvtx_range("ad_offset_with_new_lens_")
     def offset_with_new_lens_(self, new_lens_ungathered: torch.Tensor) -> None:
@@ -1718,12 +1770,17 @@ class SequenceInfo:
         self.offset_pos_and_cache_(increment)
 
     @nvtx_range("ad_switch_to_generate_")
-    def switch_to_generate_(self) -> None:
+    def switch_to_generate_(self, active_args_override: Optional[Set[str]] = None) -> None:
         """Switch all sequences metadata to generate (decode) mode.
 
         Transitions the batch from any layout (prefill/extend/decode or mixed) to
         an all-decode layout where each sequence has exactly 1 token. We assume that we just take
         the last position of each sequence for the metadata.
+
+        Args:
+            active_args_override: Optional graph-input names for the next in-forward consumer. When
+                provided, host mirroring is limited to those active host args. The caller is
+                responsible for including every host argument the next consumer may read.
 
         NOTE: update device tensors first and mirror back to host only when an updated host-side
         argument is active.
@@ -1747,6 +1804,9 @@ class SequenceInfo:
         # update batch_info
         self.batch_info.update([0, 0, 0, 0, num_seq, num_seq])
         self.batch_info.update_tokens_gather_info(num_seq, False)
+        # Default slot 14 (max_dp_num_tokens) to local total tokens; the executor
+        # overrides this when attention-DP is on.
+        self.batch_info.update_max_dp_num_tokens(num_seq)
 
         # check if we need a d2h sync
         _REQUIRES_UPDATE = {
@@ -1757,11 +1817,7 @@ class SequenceInfo:
             "position_ids",
             "use_initial_states",
         }
-        needs_d2h_sync = [
-            k + self._host_suffix
-            for k in _REQUIRES_UPDATE
-            if self._is_active(k + self._host_suffix, check_both=False)
-        ]
+        needs_d2h_sync = self._active_host_update_args(_REQUIRES_UPDATE, active_args_override)
         sync_to_host = any(needs_d2h_sync)
 
         # --- input_ids (device) ---
@@ -1790,7 +1846,7 @@ class SequenceInfo:
         # TODO: May need to dissect what fields are needed in the forward pass to reduce
         # data movement.
         if sync_to_host:
-            self._input_buffer.copy_to_host()
+            self._input_buffer.copy_to_host(non_blocking=False)
 
     def copy_(self, name: str, src: torch.Tensor, strict: bool = True) -> None:
         """Copy a tensor into the buffer. USE WITH CAUTION!
@@ -2006,6 +2062,10 @@ class StateResourceHandler(ResourceHandler):
         return self.state_shape == other.state_shape and self.dtype == other.dtype
 
 
+class SpeculativeOnly:
+    """Trait mixin marking a resource that is only needed when speculative decoding is enabled."""
+
+
 class SSMResourceHandler(StateResourceHandler):
     """Handler for SSM state resources that maps directly to MambaCacheManager's ssm_states buffer.
 
@@ -2073,7 +2133,7 @@ class CausalConvResourceHandler(StateResourceHandler):
         return (self.conv_dim, self.d_conv - 1)
 
 
-class SpecSSMResourceHandler(StateResourceHandler):
+class IntermediateSSMStateHandler(SpeculativeOnly, StateResourceHandler):
     """Intermediate SSM state cache descriptor for speculative decoding.
 
     Acts as a type marker conveying the per-layer SSM shape to the cache interface.
@@ -2081,8 +2141,8 @@ class SpecSSMResourceHandler(StateResourceHandler):
     by the MambaHybridCacheManager using spec_config, not by this handler.
 
     Inherits from StateResourceHandler (not SSMResourceHandler) so that
-    isinstance(h, SSMResourceHandler) returns False for spec handlers, eliminating
-    the need for exclusion guards throughout the codebase.
+    isinstance(h, SSMResourceHandler) returns False for intermediate handlers, eliminating
+    the need for exclusion guards throughout the codebase. Mixes in SpeculativeOnly.
     """
 
     def __init__(
@@ -2102,8 +2162,10 @@ class SpecSSMResourceHandler(StateResourceHandler):
         return (self.num_heads, self.head_dim, self.d_state)
 
     @classmethod
-    def from_base(cls, base: Optional["SSMResourceHandler"]) -> Optional["SpecSSMResourceHandler"]:
-        """Create a spec handler from a base SSM handler, or return None."""
+    def from_base(
+        cls, base: Optional["SSMResourceHandler"]
+    ) -> Optional["IntermediateSSMStateHandler"]:
+        """Create an intermediate handler from a base SSM handler, or return None."""
         if base is None:
             return None
         return cls(
@@ -2111,7 +2173,7 @@ class SpecSSMResourceHandler(StateResourceHandler):
         )
 
 
-class ReplayOldXHandler(StateResourceHandler):
+class ReplayOldXHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_x cache for the replay SSM kernel (single-buffered, bf16).
 
     Shape: (max_batch, T, num_heads, head_dim) — T is determined by the manager's
@@ -2140,7 +2202,7 @@ class ReplayOldXHandler(StateResourceHandler):
         )
 
 
-class ReplayOldBHandler(StateResourceHandler):
+class ReplayOldBHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_B cache for the replay SSM kernel (double-buffered, bf16).
 
     Shape: (max_batch, 2, T, n_groups, d_state) — T from manager.
@@ -2168,7 +2230,7 @@ class ReplayOldBHandler(StateResourceHandler):
         )
 
 
-class ReplayOldDtHandler(StateResourceHandler):
+class ReplayOldDtHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_dt cache for the replay SSM kernel (double-buffered, fp32).
 
     Shape: (max_batch, 2, num_heads, T) — T from manager.
@@ -2190,7 +2252,7 @@ class ReplayOldDtHandler(StateResourceHandler):
         return isinstance(other, ReplayOldDtHandler) and self.num_heads == other.num_heads
 
 
-class ReplayOldDAcumsumHandler(StateResourceHandler):
+class ReplayOldDAcumsumHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_dA_cumsum cache for the replay SSM kernel (double-buffered, fp32).
 
     Shape: (max_batch, 2, num_heads, T) — T from manager.
@@ -2212,7 +2274,7 @@ class ReplayOldDAcumsumHandler(StateResourceHandler):
         return isinstance(other, ReplayOldDAcumsumHandler) and self.num_heads == other.num_heads
 
 
-class ReplayCacheBufIdxHandler(StateResourceHandler):
+class ReplayCacheBufIdxHandler(SpeculativeOnly, StateResourceHandler):
     """Global cache_buf_idx tensor for the replay SSM kernel (shared across all layers, int32).
 
     Shape: (max_batch,).  Routes to MambaHybridCacheManager.get_replay_cache_buf_idx().
@@ -2234,7 +2296,7 @@ class ReplayCacheBufIdxHandler(StateResourceHandler):
         return isinstance(other, ReplayCacheBufIdxHandler)
 
 
-class ReplayPrevNumAcceptedHandler(StateResourceHandler):
+class ReplayPrevNumAcceptedHandler(SpeculativeOnly, StateResourceHandler):
     """Global prev_num_accepted_tokens tensor for the replay SSM kernel (int32, shared).
 
     Shape: (max_batch,).  Routes to MambaHybridCacheManager.get_replay_prev_num_accepted_tokens().
@@ -2254,7 +2316,7 @@ class ReplayPrevNumAcceptedHandler(StateResourceHandler):
         return isinstance(other, ReplayPrevNumAcceptedHandler)
 
 
-class SpecCausalConvResourceHandler(StateResourceHandler):
+class IntermediateConvStateHandler(SpeculativeOnly, StateResourceHandler):
     """Intermediate conv state cache descriptor for speculative decoding.
 
     Acts as a type marker conveying the per-layer conv shape to the cache interface.
@@ -2262,7 +2324,8 @@ class SpecCausalConvResourceHandler(StateResourceHandler):
     by the MambaHybridCacheManager using spec_config, not by this handler.
 
     Inherits from StateResourceHandler (not CausalConvResourceHandler) so that
-    isinstance(h, CausalConvResourceHandler) returns False for spec handlers.
+    isinstance(h, CausalConvResourceHandler) returns False for intermediate handlers. Mixes in
+    SpeculativeOnly.
     """
 
     def __init__(
@@ -2282,8 +2345,8 @@ class SpecCausalConvResourceHandler(StateResourceHandler):
     @classmethod
     def from_base(
         cls, base: Optional["CausalConvResourceHandler"]
-    ) -> Optional["SpecCausalConvResourceHandler"]:
-        """Create a spec handler from a base conv handler, or return None."""
+    ) -> Optional["IntermediateConvStateHandler"]:
+        """Create an intermediate handler from a base conv handler, or return None."""
         if base is None:
             return None
         return cls(conv_dim=base.conv_dim, d_conv=base.d_conv, dtype=base.dtype)
@@ -2387,6 +2450,22 @@ class AttentionDescriptor(ABC):
     @classmethod
     def supports_shared_kv(cls) -> bool:
         """Whether this backend supports shared-KV cache aliasing."""
+        return False
+
+    @classmethod
+    def kernel_handles_cyclic_swa(cls) -> bool:
+        """Whether the backend's kernel applies the sliding-window mask itself.
+
+        When ``True`` (e.g. the trtllm ``thop.attention`` kernel), the kernel
+        cyclically indexes the KV cache internally using the per-layer attention
+        window, so the executor must hand it the *full* per-window block table
+        and a *global* (un-window-capped) KV length -- the same contract as the
+        PyTorch backend.
+
+        When ``False`` (default; e.g. triton / flashinfer), the kernel does not
+        cyclic-index, so the executor must host-slice the block table down to the
+        live sliding-window view (see ``ad_executor._compute_window_local_view``).
+        """
         return False
 
     @classmethod

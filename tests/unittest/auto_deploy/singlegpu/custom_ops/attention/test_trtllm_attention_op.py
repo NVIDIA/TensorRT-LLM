@@ -881,3 +881,89 @@ class TestTrtllmAttentionMetadata:
         assert metadata["host_total_kv_lens"][0] == 300
         if "context_lengths_gpu" in metadata:
             assert metadata["context_lengths_gpu"] == [100, 200]
+
+
+# ---------------------------------------------------------------------------
+# Multi-pool (VSWA / non-uniform sliding window) block_offsets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+class TestTrtllmMultiPoolBlockOffsets:
+    """Per-KV-window-group block_offsets buffers must not clobber one another.
+
+    The trtllm planner keeps a separate, address-stable block_offsets buffer
+    per KV window group (keyed by the group's ``cache_loc`` input ptr), so that
+    per-group ``prepare_trtllm_metadata`` invocations -- as emitted by the
+    kvcache transform for non-uniform sliding-window models like gpt-oss -- do
+    not clobber one another.
+    """
+
+    @staticmethod
+    def _host_prepare(num_seq, max_seq_len, tokens_per_block, max_batch_size, device):
+        max_blocks_per_seq = math.ceil(max_seq_len / tokens_per_block)
+        _bi = BatchInfo()
+        _bi.update([num_seq, num_seq, 0, 0, 0, 0])  # all-prefill, 1 token/seq
+        _bi.update_max_seq_info(max_seq_len, max_blocks_per_seq, 2, max_batch_size)
+        batch_info_host = _bi.serialize()
+        ones = torch.ones(num_seq, dtype=torch.int32)
+        zeros = torch.zeros(num_seq, dtype=torch.int32)
+        prepare_trtllm_metadata_host(
+            batch_info_host,
+            ones.clone().pin_memory(),  # seq_len_with_cache_host
+            zeros.clone().pin_memory(),  # input_pos_host
+            ones.clone().pin_memory(),  # seq_len_host
+            ones.clone().pin_memory(),  # prompt_lens_host
+            ones.clone().to(device),  # prompt_lens
+        )
+        return batch_info_host
+
+    def test_per_group_buffers_are_distinct_and_not_clobbered(self, device):
+        _reset_trtllm_planner()
+        batch_info_host = self._host_prepare(
+            num_seq=2, max_seq_len=2048, tokens_per_block=32, max_batch_size=4, device=device
+        )
+
+        # Two groups, each with its own (distinct-ptr) cache_loc / cu_num_pages.
+        cache_loc_a = torch.tensor([10, 11, 12, 13], dtype=torch.int32, device=device)
+        cache_loc_b = torch.tensor([20, 21, 22, 23], dtype=torch.int32, device=device)
+        cu_num_pages = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+        assert cache_loc_a.data_ptr() != cache_loc_b.data_ptr()
+
+        (buf_a,) = torch.ops.auto_deploy.trtllm_attention_prepare_metadata(
+            batch_info_host, cu_num_pages, cache_loc_a
+        )
+        # group 0 reuses the pre-allocated reset() buffer
+        assert buf_a.data_ptr() == _GlobalTrtllmPlanner.block_offsets.data_ptr()
+        a_after_a = buf_a[0, :2, 0, :].clone()
+
+        (buf_b,) = torch.ops.auto_deploy.trtllm_attention_prepare_metadata(
+            batch_info_host, cu_num_pages, cache_loc_b
+        )
+        # second group gets its own, distinct buffer
+        assert buf_b.data_ptr() != buf_a.data_ptr()
+        assert len(_GlobalTrtllmPlanner._block_offsets_by_cache_loc) == 2
+
+        # group 0's buffer must be untouched by group 1's prepare
+        torch.testing.assert_close(buf_a[0, :2, 0, :], a_after_a)
+        # block_offsets reflect each group's own cache_loc (× multiplier 2)
+        assert buf_a[0, 0, 0, 0].item() == 10 * 2
+        assert buf_b[0, 0, 0, 0].item() == 20 * 2
+
+    def test_same_cache_loc_returns_stable_buffer(self, device):
+        _reset_trtllm_planner()
+        batch_info_host = self._host_prepare(
+            num_seq=1, max_seq_len=1024, tokens_per_block=32, max_batch_size=2, device=device
+        )
+        cache_loc = torch.tensor([5, 6], dtype=torch.int32, device=device)
+        cu_num_pages = torch.tensor([0, 2], dtype=torch.int32, device=device)
+
+        (buf1,) = torch.ops.auto_deploy.trtllm_attention_prepare_metadata(
+            batch_info_host, cu_num_pages, cache_loc
+        )
+        (buf2,) = torch.ops.auto_deploy.trtllm_attention_prepare_metadata(
+            batch_info_host, cu_num_pages, cache_loc
+        )
+        # Same cache_loc ptr -> identical (address-stable) buffer across replays.
+        assert buf1.data_ptr() == buf2.data_ptr()
+        assert len(_GlobalTrtllmPlanner._block_offsets_by_cache_loc) == 1

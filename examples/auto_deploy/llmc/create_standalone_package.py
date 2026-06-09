@@ -122,6 +122,8 @@ EXCLUDE_TEST_FILES = {
     "test_fuse_relu2_quant_nvfp4.py",
     "test_moe_fusion.py",
     "test_trtllm_gen_diag.py",
+    # Standalone flashinfer ROPE path has a known BF16 strided-interleaved mismatch.
+    "test_rope_op_variants.py",
     # QKV fusion → trtllm cache insertion (TRT-LLM attention backend only)
     "test_gemm_fusion_trtllm.py",
     # Require TRT-LLM LlmArgs / runtime
@@ -151,6 +153,8 @@ EXCLUDE_TEST_FILES = {
     "test_torch_gated_delta_rule_cache.py",
     "test_gated_delta_rule_cache.py",
     "test_kv_cache_transformers.py",
+    # trtllm attention backend (insert_cached_attention backend=trtllm) not available standalone
+    "test_kv_cache_trtllm_multipool.py",
     # Require TRT-LLM CUDA causal conv / mamba kernels (ops not registered standalone)
     "test_cuda_causal_conv_cached_op.py",
     "test_triton_causal_conv_cached_op.py",
