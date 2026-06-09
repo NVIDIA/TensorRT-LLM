@@ -15,7 +15,6 @@
 
 import enum
 import threading
-from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
@@ -2015,10 +2014,11 @@ class AllReduceRunner(TunableRunner):
             return input
         if tactic == -1:
             # tactic == -1 means the autotuner cache missed for this shape;
-            # fall back to NCCL_SYMMETRIC. Asymmetric ncclMemAlloc failures are
-            # handled by a cross-rank barrier in NCCLWindowAllocator, which
-            # falls back to plain NCCL if allocation fails on any rank.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # fall back to plain NCCL. NCCL_SYMMETRIC has a hidden cost when
+            # the input is not already in the NCCL window (an extra
+            # cudaMemcpyAsync into the window inside the C++ kernel), which
+            # makes it a poor blind default for unmeasured shapes.
+            tactic = AllReduceStrategy.NCCL.value
 
         return torch.ops.trtllm.allreduce(
             input,
@@ -2069,26 +2069,12 @@ def tunable_allreduce(
         trigger_completion_at_end,
     )
 
-    def _inputs_pre_hook_register_nccl_symmetric_memory_window(
-            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        if not inputs:
-            return inputs
-        input_tensor = inputs[0]
-        if not isinstance(input_tensor,
-                          torch.Tensor) or not input_tensor.is_cuda:
-            return inputs
-        nccl_symmetric_memory_window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
-            input_tensor, int(BufferKind.NCCL_WINDOW), list(group))
-        if actual_kind != int(BufferKind.NCCL_WINDOW):
-            return inputs
-        nccl_symmetric_memory_window_tensor.copy_(input_tensor)
-        new_inputs = list(inputs)
-        new_inputs[0] = nccl_symmetric_memory_window_tensor
-        return new_inputs
-
-    tuning_config = replace(
-        AllReduceRunner.tuning_config,
-        inputs_pre_hook=_inputs_pre_hook_register_nccl_symmetric_memory_window)
+    # The autotuner benchmarks each tactic with the real production input
+    # path so NCCL_SYMMETRIC is measured WITH its in-kernel cudaMemcpyAsync
+    # into the window. The previous inputs_pre_hook that pre-copied the
+    # input into the NCCL window made NCCL_SYMMETRIC look artificially fast
+    # and led the tuner to pick it for shapes where ONESHOT/TWOSHOT win.
+    tuning_config = AllReduceRunner.tuning_config
 
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",

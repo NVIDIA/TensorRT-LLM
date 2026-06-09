@@ -22,12 +22,15 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 # Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
-# the window buffer so the allreduce needs no extra copy).  On by default
-# (1); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=0 to disable.
+# the window buffer so the allreduce needs no extra copy).  Off by default
+# (0) on this build because making the GEMM output window-resident interacts
+# poorly with the AutoTuner allreduce path (the tuner can pick
+# NCCL_SYMMETRIC for shapes where the Lamport one-shot fused kernel is
+# faster); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 to opt in.
 # Evaluated once at import — O(1) module-global lookup on every call,
 # equivalent to a C++ static-bool cached env var.
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
-    "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
+    "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "0") == "1")
 
 _thread_local = threading.local()
 
