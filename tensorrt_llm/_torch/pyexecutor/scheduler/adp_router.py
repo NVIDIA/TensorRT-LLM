@@ -448,17 +448,17 @@ class DefaultADPRouter(ADPRouter):
 
         heapq.heapify(all_ranks_new_requests_heap)
 
-        new_requests = sorted(
-            new_requests,
-            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
-            reverse=True,
-        )
+        # input_token_ids is a C++ getter that copies the whole token list on every
+        # access, so read it once per request instead of in both the sort key and
+        # the loop below.
+        counted = [
+            (len(req.input_token_ids) if (req := item.request) is not None else 0, item)
+            for item in new_requests
+        ]
+        counted.sort(key=lambda item: item[0], reverse=True)
 
-        for req_item in new_requests:
+        for token_count, req_item in counted:
             val = heapq.heappop(all_ranks_new_requests_heap)
-            token_count = (
-                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
-            )
             val = val._replace(
                 num_tokens=val.num_tokens + token_count,
                 num_requests=val.num_requests + 1,
