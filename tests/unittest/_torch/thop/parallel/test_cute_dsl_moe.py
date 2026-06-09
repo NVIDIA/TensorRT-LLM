@@ -86,10 +86,16 @@ def test_prioritization_uses_global_index():
         1, approx_max_load=True)
     result = helper.generate_token_selected_experts(1, num_tokens_per_expert)
 
-    for val in result[result >= 0].tolist():
-        assert local_expert_offset <= val < local_expert_offset + num_local_experts, (
-            f"Expert {val} outside local range [{local_expert_offset}, "
-            f"{local_expert_offset + num_local_experts})")
+    assigned = set(result[result >= 0].tolist())
+    expected = {
+        local_expert_offset + j
+        for j, count in enumerate(num_tokens_per_expert)
+        if int(count) > 0
+    }
+    assert assigned.issubset(expected), (
+        f"Assigned experts {sorted(assigned)} are not a subset of expected "
+        f"global experts {sorted(expected)}"
+    )
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
