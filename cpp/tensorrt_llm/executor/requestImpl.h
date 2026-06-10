@@ -120,6 +120,11 @@ public:
         return mInputTokenIds;
     }
 
+    [[nodiscard]] SizeType32 getNumInputTokens() const
+    {
+        return static_cast<SizeType32>(mInputTokenIds.size());
+    }
+
     [[nodiscard]] SizeType32 getMaxNewTokens() const
     {
         return mMaxNewTokens;
