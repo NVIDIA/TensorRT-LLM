@@ -178,7 +178,6 @@ VSA reduces the compute cost of self-attention in video diffusion models by sele
 - VSA-fine-tuned checkpoint: [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not have the learned VSA gates.
 - Blackwell GPU (sm_100+) for the CuTe JIT kernel. Falls back to dense SDPA on older hardware with no accuracy loss.
 - `CUTEDSL` attention backend.
-- BF16 or FP16 dtype; `head_dim = 128`; multi-head attention (MHA) — GQA/MQA models are not supported.
 - Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.
 
 **`vsa_sparsity`** controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.
@@ -208,18 +207,6 @@ attention_config:
     vsa_sparsity: 0.90
 ```
 
-Ready-to-use configs are provided in [`examples/visual_gen/configs/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/configs):
-- `wan-vsa-1gpu.yaml` — single-GPU VSA with NVFP4 quantization
-- `wan-vsa-4gpu.yaml` — 4-GPU VSA with Ulysses parallelism
-- `wan-vsa-8gpu.yaml` — 8-GPU VSA with Ulysses parallelism
-
-Run with the existing Wan example script:
-
-```bash
-python examples/visual_gen/models/wan_t2v.py \
-    --model FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers \
-    --visual_gen_args examples/visual_gen/configs/wan-vsa-1gpu.yaml
-```
 
 ### Multi-GPU Parallelism
 
