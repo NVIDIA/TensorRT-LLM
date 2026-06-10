@@ -6,8 +6,6 @@ from typing import Dict, Tuple
 
 import safetensors.torch
 import torch
-from huggingface_hub import repo_exists, snapshot_download
-from huggingface_hub.utils import HFValidationError
 from transformers import PretrainedConfig
 
 from ...inputs import (
@@ -35,20 +33,7 @@ def _get_cosmos3_model_paths(config: PretrainedConfig) -> Tuple[str, str, str]:
     Unified Cosmos3 checkpoints use `transformer/` for LLM weights and
     `vision_encoder/` for the vision tower.
     """
-    root_path = None
-    if hasattr(config, "_name_or_path") and len(config._name_or_path) >= 2:
-        root_path = config._name_or_path
-
-    if root_path is not None and not os.path.exists(root_path):
-        try:
-            valid_hf_repo = repo_exists(root_path)
-        except HFValidationError:
-            valid_hf_repo = False
-        if valid_hf_repo:
-            root_path = snapshot_download(root_path)
-
-    if root_path is None:
-        raise ValueError("Cannot resolve Cosmos3 checkpoint root from config._name_or_path.")
+    root_path = config._name_or_path
 
     root_path = os.fspath(root_path)
     llm_path = os.path.join(root_path, "transformer")
@@ -84,6 +69,12 @@ class Cosmos3Model(Qwen3VLModel):
                 "Cosmos3Model requires model_config.pretrained_config to resolve "
                 "the LLM and vision encoder checkpoint paths, but it was None."
             )
+        if not getattr(omni_config, "_name_or_path", None):
+            raise ValueError(
+                "Cosmos3Model requires model_config.pretrained_config._name_or_path to resolve "
+                "the LLM and vision encoder checkpoint paths, but it was None or empty."
+            )
+
         (self._checkpoint_root, self.llm_path, self._vision_encoder_path) = (
             _get_cosmos3_model_paths(omni_config)
         )
@@ -97,8 +88,11 @@ class Cosmos3Model(Qwen3VLModel):
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
         vision_weights_file = os.path.join(self._vision_encoder_path, "model.safetensors")
-        if os.path.isfile(vision_weights_file):
-            weights.update(safetensors.torch.load_file(vision_weights_file))
+        if not os.path.isfile(vision_weights_file):
+            raise FileNotFoundError(
+                f"Cosmos3 vision encoder weights not found at {vision_weights_file}."
+            )
+        weights.update(safetensors.torch.load_file(vision_weights_file))
 
         if not isinstance(weight_mapper, Cosmos3HfWeightMapper):
             weight_mapper = Cosmos3HfWeightMapper()

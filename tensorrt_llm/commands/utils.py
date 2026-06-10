@@ -88,11 +88,8 @@ def is_registered_trtllm_model_path(model_path: str) -> bool:
     if not os.path.exists(config_path):
         return False
 
-    try:
-        with open(config_path) as f:
-            architectures = json.load(f).get("architectures") or []
-    except (json.JSONDecodeError, OSError):
-        return False
+    with open(config_path) as f:
+        architectures = json.load(f).get("architectures") or []
 
     # Importing the models package runs the @register_auto_model decorators
     # that populate MODEL_CLASS_MAPPING. Done lazily to avoid a heavy import at

@@ -5,20 +5,19 @@ import copy
 import os
 
 import pytest
+import test_modeling_qwen3vl as _qwen3vl
 import torch
-from test_modeling_qwen3vl import QWEN3_VL_8B_CONFIG, TestQwen3VL, TestQwen3VLScenario
+from test_modeling_qwen3vl import QWEN3_VL_8B_CONFIG
+from test_modeling_qwen3vl import TestQwen3VLScenario as _TestQwen3VLScenario
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.configs import Cosmos3Config
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.modeling_cosmos3 import Cosmos3Model
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-
-# Imported for inheritance only; pytest would otherwise collect TestQwen3VL
-# again from this module and run the Qwen3-VL scenarios a second time.
-TestQwen3VL.__test__ = False
 
 COSMOS3_NANO_PATH = os.path.join(llm_models_root(), "nvidia", "Cosmos3-Nano")
 
@@ -32,9 +31,10 @@ COSMOS3_TEST_CONFIG.update(
 )
 
 
-class TestCosmos3(TestQwen3VL):
-    __test__ = True
-
+# TestQwen3VL is a unittest.TestCase subclass, which pytest collects
+# regardless of the ``Test*`` name filter. To prevent that we reference it only via
+# through _qwen3vl module.
+class TestCosmos3(_qwen3vl.TestQwen3VL):
     def setUp(self):
         if not os.path.isdir(os.path.join(COSMOS3_NANO_PATH, "transformer")):
             self.skipTest(f"Cosmos3-Nano checkpoint not found at {COSMOS3_NANO_PATH}")
@@ -42,8 +42,6 @@ class TestCosmos3(TestQwen3VL):
         self._load_trtllm_checkpoint_weights(self.trtllm_model)
 
     def _load_trtllm_checkpoint_weights(self, model: Cosmos3Model) -> None:
-        from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
-
         weight_mapper = Cosmos3HfWeightMapper()
         weight_mapper.init_model_and_config(model, self.hf_config)
         weights = HfWeightLoader().load_weights(
@@ -51,16 +49,11 @@ class TestCosmos3(TestQwen3VL):
             model.model_config.mapping,
         )
         model.load_weights(weights, weight_mapper)
-        for module in model.modules():
-            if hasattr(module, "post_load_weights") and not getattr(
-                module, "_weights_removed", False
-            ):
-                module.post_load_weights()
 
-    def setup_scenario(self, scenario: TestQwen3VLScenario):
+    def setup_scenario(self, scenario: _TestQwen3VLScenario):
         # Bypass TestQwen3VL.setup_scenario: with skip_hf_inference the dummy
         # HF module has no weights, so disable_fuse_rope must not reload them.
-        super(TestQwen3VL, self).setup_scenario(scenario)
+        super(_qwen3vl.TestQwen3VL, self).setup_scenario(scenario)
         if scenario.disable_fuse_rope:
             self.trtllm_model, self.model_config = self.create_trtllm_model(
                 load_weights=False,
@@ -109,9 +102,6 @@ class TestCosmos3(TestQwen3VL):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cosmos3_init_preserves_caller_quant_config():
     """Building Cosmos3Model must not mutate the caller's quant_config."""
-    if not os.path.isdir(os.path.join(COSMOS3_NANO_PATH, "transformer")):
-        pytest.skip(f"Cosmos3-Nano checkpoint not found at {COSMOS3_NANO_PATH}")
-
     hf_config = Cosmos3Config.from_dict(copy.deepcopy(COSMOS3_TEST_CONFIG))
     quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
     model_config = ModelConfig(

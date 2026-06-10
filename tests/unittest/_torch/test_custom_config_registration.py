@@ -15,6 +15,7 @@ regressions.
 import json
 
 import pytest
+from transformers import AutoConfig
 
 import tensorrt_llm  # noqa: F401  triggers AutoConfig registration
 from tensorrt_llm._torch.configs import Cosmos3Config, DeepseekV3Config
@@ -99,8 +100,6 @@ def test_autoconfig_from_pretrained_resolves_to_local_config(
     # the registration this fails through to a bare PreTrainedConfig that
     # lacks expected fields (e.g. `max_position_embeddings`, nested
     # `text_config` for Cosmos3).
-    from transformers import AutoConfig
-
     model_dir = tmp_path / model_type
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps(config_dict))
@@ -114,8 +113,6 @@ def test_autoconfig_from_pretrained_resolves_to_local_config(
 def test_legacy_cosmos3_omni_model_type_still_resolves(tmp_path):
     # "cosmos3_omni" is the pre-rename model_type. Checkpoints created before
     # the rename to "cosmos3" must keep loading via the backward-compat alias.
-    from transformers import AutoConfig
-
     legacy_config = {**_COSMOS3_MIN_CONFIG, "model_type": "cosmos3_omni"}
     model_dir = tmp_path / "cosmos3_omni_legacy"
     model_dir.mkdir()
