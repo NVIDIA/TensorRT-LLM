@@ -59,6 +59,9 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import (
     TransformRegistry,
 )
 from tensorrt_llm._torch.auto_deploy.transform.library.fusion import _insert_fused_gemm
+from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
+    DetectHiddenStatesForCaptureConfig,
+)
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     ParameterUpdateInfo,
     ShardingTransformConfig,
@@ -72,6 +75,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import (
     _split_fp8_block_scale,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.common import hash_payload
 from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.hooks import (
     collect_hook_specs,
     reattach_hooks,
@@ -480,6 +484,28 @@ def test_pipeline_cache_config_rejects_unsupported_transform_options(
             root=str(tmp_path),
             **{field_name: field_value},
         )
+
+
+def test_hash_payload_handles_set_valued_config():
+    """Set-valued config fields hash deterministically regardless of iteration order.
+
+    Regression for an MTP/Eagle crash where DetectHiddenStatesForCaptureConfig's
+    Set[int] field reached hash_payload via model_dump and broke json.dumps with
+    'Object of type set is not JSON serializable'.
+    """
+    config = DetectHiddenStatesForCaptureConfig(
+        stage=Stages.PATTERN_MATCHER, eagle3_layers_to_capture={1, 27, 60}
+    )
+    payload = {"transforms": [{"config": config.model_dump(mode="python")}]}
+
+    # Must not raise (the original failure was a TypeError during json.dumps).
+    digest = hash_payload(payload)
+    assert isinstance(digest, str)
+
+    # Sets are unordered: differently-ordered equal sets must hash identically.
+    assert hash_payload({"k": {3, 1, 2}}) == hash_payload({"k": {2, 1, 3}})
+    # Distinct sets must hash differently.
+    assert hash_payload({"k": {1, 2}}) != hash_payload({"k": {1, 2, 3}})
 
 
 def test_pipeline_cache_transform_restores_and_skips_prefix(monkeypatch, tmp_path):

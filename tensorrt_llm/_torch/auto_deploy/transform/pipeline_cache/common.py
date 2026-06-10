@@ -33,6 +33,15 @@ def _canonicalize_for_hash(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [_canonicalize_for_hash(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        # Sets are unordered, so canonicalize each element and sort by its JSON
+        # encoding to produce a deterministic, hashable representation (e.g.
+        # DetectHiddenStatesForCaptureConfig.eagle3_layers_to_capture is a Set[int]).
+        canonical_items = [_canonicalize_for_hash(item) for item in value]
+        return sorted(
+            canonical_items,
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+        )
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Enum):
