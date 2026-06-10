@@ -67,6 +67,7 @@ from .sharding import (
     _get_dist_ops,
     _load_hook,
     _shard_fp4_weight_scale,
+    _tp_shard_moe_scale,
     shard_weight_tensor,
     validate_allreduce_strategy,
 )
@@ -776,6 +777,10 @@ class MoEShardableNode(ShardableNode):
         nodes_to_remove = w1_removed + w2_removed + w3_removed
 
         if tp_size > 1:
+            # Capture original (pre-shard) uint8 weight shapes for NVFP4 scale sharding.
+            w1_orig = [gm.get_parameter(w.target).shape for w in w1_sharded]
+            w2_orig = [gm.get_parameter(w.target).shape for w in w2_sharded]
+            w3_orig = [gm.get_parameter(w.target).shape for w in w3_sharded]
             for w in w1_sharded + w3_sharded:
                 shard_weight_tensor(
                     gm=gm,
@@ -794,6 +799,28 @@ class MoEShardableNode(ShardableNode):
                     rank=tp_rank,
                     world_size=tp_size,
                 )
+            # NVFP4 per-block weight scales must follow the weight TP-split (w1/w3 COLUMN,
+            # w2 ROW), else the fused MoE kernel sees mismatched gemm scale dims. Reuse the
+            # proven legacy MoE scale splitter (2D modelopt-format output, not cutlass).
+            w1_ws, w2_ws, w3_ws = extract_op_args(
+                self.node, "w1_weight_scale", "w2_weight_scale", "w3_weight_scale"
+            )
+            if w1_ws is not None:
+                w1_ws_local, _ = get_partition(w1_ws, ep_size, ep_rank)
+                w2_ws_local, _ = get_partition(w2_ws, ep_size, ep_rank)
+                w3_ws_local, _ = get_partition(w3_ws, ep_size, ep_rank)
+                for sn, osh in zip(w1_ws_local, w1_orig):
+                    _tp_shard_moe_scale(
+                        gm, sn, "weight_scale", SplitDimension.COLUMN, tp_rank, tp_size, osh
+                    )
+                for sn, osh in zip(w3_ws_local, w3_orig):
+                    _tp_shard_moe_scale(
+                        gm, sn, "weight_scale", SplitDimension.COLUMN, tp_rank, tp_size, osh
+                    )
+                for sn, osh in zip(w2_ws_local, w2_orig):
+                    _tp_shard_moe_scale(
+                        gm, sn, "weight_scale", SplitDimension.ROW, tp_rank, tp_size, osh
+                    )
 
         set_op_args(self.node, w1_weight=w1_sharded, w2_weight=w2_sharded, w3_weight=w3_sharded)
 
