@@ -1710,6 +1710,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # Context MLA uses separate qkv instead of paged_context_fmha
             metadata.use_paged_context_fmha = False
 
+        # SM120/121 only ships E4M3-input paged-kv FMHA cubins for
+        # head_size in {128, 192, 576}; fall back to BF16 paged-kv (cache
+        # dequantized before attention) for other head sizes.
+        # (https://nvbugs/6273845).
+        if (get_sm_version() in (120, 121) and self.has_fp8_kv_cache
+                and self.head_dim not in (128, 192, 576)):
+            metadata.use_paged_context_fmha = False
+
         if forward_args.output is None:
             is_gen_only = (forward_args.attention_input_type ==
                            AttentionInputType.generation_only)
