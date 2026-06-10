@@ -2056,6 +2056,37 @@ TEST_F(ForceChunkTest, ExpectedChunkingPoints)
     expectPositions(reqs, {30}, "iter 3");
 }
 
+TEST_F(ForceChunkTest, PrepopulatedPromptLenRespectsExpectedChunkingPoints)
+{
+    auto reqs = initRequests({160});
+    reqs[0]->setContextChunkSize(128);
+    reqs[0]->setExpectChunkingPoints(std::vector<SizeType32>{96, 128, 160});
+
+    reqs[0]->setPrepopulatedPromptLen(64, /*kvTokensPerBlock=*/32);
+
+    EXPECT_EQ(reqs[0]->getPrepopulatedPromptLen(), 64);
+    EXPECT_EQ(reqs[0]->getContextCurrentPosition(), 64);
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 32);
+
+    reqs[0]->moveToNextContextChunk();
+    EXPECT_EQ(reqs[0]->getContextCurrentPosition(), 96);
+}
+
+TEST_F(ForceChunkTest, PrepopulatedPromptLenDoesNotRoundDownExpectedChunkingPoint)
+{
+    auto reqs = initRequests({128});
+    reqs[0]->setContextChunkSize(64);
+    reqs[0]->setExpectChunkingPoints(std::vector<SizeType32>{75, 128});
+
+    reqs[0]->setPrepopulatedPromptLen(64, /*kvTokensPerBlock=*/32);
+
+    EXPECT_EQ(reqs[0]->getContextCurrentPosition(), 64);
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 11);
+
+    reqs[0]->moveToNextContextChunk();
+    EXPECT_EQ(reqs[0]->getContextCurrentPosition(), 75);
+}
+
 TEST_F(ForceChunkTest, CapacityRoundsExpectedChunkDownToUnit)
 {
     auto reqs = initRequests({50});

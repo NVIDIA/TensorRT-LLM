@@ -252,6 +252,66 @@ def test_calc_context_stop_positions_save_last_snapshot():
     ) == [64, 70]
     assert calc_context_stop_positions(70, 32, 256, False) == [70]
     assert calc_context_stop_positions(16, 32, 256, True) == [16]
+    assert calc_context_stop_positions(70, 32, 0, True) == [64, 70]
+    assert calc_context_stop_positions(70, 32, None, True) == [64, 70]
+
+
+def test_cpp_hybrid_prepare_expect_chunking_points():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=256)
+    mgr.tokens_per_block = 32
+    mgr.linear_attention_metadata = SimpleNamespace(
+        states_snapshot_interval=256, save_last_snapshot=True
+    )
+    request = SimpleNamespace(prompt_len=300, expect_chunking_points=None)
+
+    mgr.prepare_expect_chunking_points([request])
+
+    assert request.expect_chunking_points == [256, 288, 300]
+
+
+def test_cpp_hybrid_prepare_expect_chunking_points_save_last_only():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=0)
+    mgr.tokens_per_block = 32
+    mgr.linear_attention_metadata = SimpleNamespace(
+        states_snapshot_interval=0, save_last_snapshot=True
+    )
+    request = SimpleNamespace(prompt_len=70, expect_chunking_points=None)
+
+    mgr.prepare_expect_chunking_points([request])
+
+    assert request.expect_chunking_points == [64, 70]
+
+
+def test_cpp_hybrid_next_state_step_uses_expected_chunking_points():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    request = SimpleNamespace(
+        is_context_finished=False,
+        context_current_position=0,
+        context_chunk_size=128,
+        expect_chunking_points=[256, 288, 300],
+        prompt_len=300,
+    )
+
+    assert mgr._get_next_recurrent_state_step(request) == 255
+
+
+def test_cpp_hybrid_next_state_step_falls_back_to_actual_chunk_end():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    request = SimpleNamespace(
+        is_context_finished=False,
+        context_current_position=0,
+        context_chunk_size=128,
+        expect_chunking_points=None,
+        prompt_len=300,
+    )
+
+    assert mgr._get_next_recurrent_state_step(request) == 127
 
 
 @skip_no_cuda
@@ -498,16 +558,30 @@ def test_validate_hybrid_cache_config_accepts_valid_interval():
     validate_hybrid_cache_config(cfg, tokens_per_block=32)
 
 
-def test_validate_hybrid_cache_config_rejects_unset_interval():
+def test_validate_hybrid_cache_config_accepts_save_last_without_interval():
     cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=None)
+    validate_hybrid_cache_config(cfg, tokens_per_block=32)
+    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=0)
+    validate_hybrid_cache_config(cfg, tokens_per_block=32)
+
+
+def test_validate_hybrid_cache_config_rejects_unset_interval_without_save_last():
+    cfg = KvCacheConfig(
+        enable_block_reuse=True, mamba_state_cache_interval=None, mamba_save_last_snapshot=False
+    )
+    with pytest.raises(ValueError, match="must be specified"):
+        validate_hybrid_cache_config(cfg, tokens_per_block=32)
+    cfg = KvCacheConfig(
+        enable_block_reuse=True, mamba_state_cache_interval=0, mamba_save_last_snapshot=False
+    )
     with pytest.raises(ValueError, match="must be specified"):
         validate_hybrid_cache_config(cfg, tokens_per_block=32)
 
 
-@pytest.mark.parametrize("interval", [0, -1, -256])
-def test_validate_hybrid_cache_config_rejects_non_positive_interval(interval):
+@pytest.mark.parametrize("interval", [-1, -256])
+def test_validate_hybrid_cache_config_rejects_negative_interval(interval):
     cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=interval)
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match="non-negative"):
         validate_hybrid_cache_config(cfg, tokens_per_block=32)
 
 

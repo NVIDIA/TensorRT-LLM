@@ -7011,19 +7011,19 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp, save_last",
         [
-            (1, 1, 256, False, False),
-            (4, 1, 256, False, True),
-            (4, 4, 256, False, False),
-            (4, 4, 256, True, False),
-            (4, 4, 512, True, True),
+            (1, 1, 0, False, False, True),
+            (4, 1, 256, False, True, False),
+            (4, 4, 256, False, False, False),
+            (4, 4, 512, True, False, False),
+            (4, 4, 0, True, True, True),
         ],
         ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp,
-                                     use_mtp):
+                                     use_mtp, save_last):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
             pytest.skip(
@@ -7039,6 +7039,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     enable_block_reuse=True,
                     mamba_ssm_cache_dtype="float16",
                     mamba_state_cache_interval=mamba_state_cache_interval,
+                    mamba_save_last_snapshot=save_last,
                     free_gpu_memory_fraction=0.8,
                 ),
                 max_batch_size=32,
@@ -7078,11 +7079,12 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
         ) as llm:
-            print("LLM init finished")
             first_turn = (
                 "User: I'm preparing a production rollout for a TensorRT-LLM "
                 "service that will handle repeated troubleshooting questions. "
-                "What checks should I run before enabling KV cache reuse?")
+                "The service runs on NVIDIA B200 GPUs and uses the Nemotron 3 "
+                "Super 120B model with NVFP4 quantization. What checks should "
+                "I run before enabling KV cache reuse?")
             first_prompt = f"{first_turn}\nAI Agent:"
             first_prompt_ids = llm.tokenizer.encode(first_prompt)
             # Exercise reuse from a saved last snapshot, not only from a full
@@ -7094,12 +7096,14 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     "deterministic generation check.")
                 first_prompt = f"{first_turn}\nAI Agent:"
                 first_prompt_ids = llm.tokenizer.encode(first_prompt)
-            print(f"first turn: {first_prompt}")
 
+            agent_reply = (
+                " Check model loading, verify GPU memory headroom, run one "
+                "deterministic prompt, and compare latency before and after "
+                "reuse is enabled.")
             suffix_ids = llm.tokenizer.encode(
-                "\n\nUser: Thanks. Now turn that into a two-step validation "
-                "plan for a second request whose prompt contains the first "
-                "conversation.\nAI Agent:",
+                f"{agent_reply}\n\nUser: Thanks. Turn that into a concise "
+                "two-step validation plan for the on-call runbook.\nAI Agent:",
                 add_special_tokens=False)
             second_prompt_ids = first_prompt_ids + suffix_ids
             assert second_prompt_ids[:len(first_prompt_ids)] == first_prompt_ids
@@ -7113,8 +7117,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             second_outputs = llm.generate([second_prompt_ids],
                                           sampling_params=sampling_params)
 
-            print(first_outputs[0].outputs[0].text)
-            print(second_outputs[0].outputs[0].text)
             assert len(first_outputs) == 1
             assert len(second_outputs) == 1
             assert len(first_outputs[0].outputs[0].token_ids) > 0

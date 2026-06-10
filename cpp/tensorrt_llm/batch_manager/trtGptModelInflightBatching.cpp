@@ -87,6 +87,101 @@ using tensorrt_llm::batch_manager::CacheTransceiverFactory;
 namespace tensorrt_llm::batch_manager
 {
 
+namespace
+{
+
+std::vector<SizeType32> calcContextStopPositions(
+    SizeType32 promptLen, SizeType32 tokensPerBlock, SizeType32 statesSnapshotInterval, bool saveLastSnapshot)
+{
+    std::vector<SizeType32> stopPositions;
+    if (statesSnapshotInterval > 0)
+    {
+        for (SizeType32 position = statesSnapshotInterval; position < promptLen; position += statesSnapshotInterval)
+        {
+            stopPositions.push_back(position);
+        }
+    }
+
+    if (saveLastSnapshot && tokensPerBlock > 0)
+    {
+        auto const lastCheckpoint = promptLen / tokensPerBlock * tokensPerBlock;
+        if (lastCheckpoint > 0)
+        {
+            stopPositions.push_back(lastCheckpoint);
+        }
+    }
+    stopPositions.push_back(promptLen);
+
+    stopPositions.erase(std::remove_if(stopPositions.begin(), stopPositions.end(),
+                            [promptLen](SizeType32 point) { return point <= 0 || point > promptLen; }),
+        stopPositions.end());
+    std::sort(stopPositions.begin(), stopPositions.end());
+    stopPositions.erase(std::unique(stopPositions.begin(), stopPositions.end()), stopPositions.end());
+    return stopPositions;
+}
+
+std::optional<SizeType32> getMambaForceChunkUnitSize(
+    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& kvCacheManager)
+{
+    if (!kvCacheManager || !kvCacheManager->isEnableBlockReuse())
+    {
+        return std::nullopt;
+    }
+
+    auto const& linearAttentionMetadata = kvCacheManager->getBlockManager().getLinearAttentionMetadata();
+    if (!linearAttentionMetadata
+        || linearAttentionMetadata->cacheType != kv_cache_manager::LinearAttentionMetadata::kRecurrentStates)
+    {
+        return std::nullopt;
+    }
+
+    if (linearAttentionMetadata->statesSnapshotInterval > 0)
+    {
+        return linearAttentionMetadata->statesSnapshotInterval;
+    }
+    if (linearAttentionMetadata->saveLastSnapshot)
+    {
+        return kvCacheManager->getTokensPerBlock();
+    }
+    return std::nullopt;
+}
+
+void prepareExpectChunkingPoints(
+    RequestVector& requests, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& kvCacheManager)
+{
+    if (!kvCacheManager || !kvCacheManager->isEnableBlockReuse())
+    {
+        return;
+    }
+
+    auto const& linearAttentionMetadata = kvCacheManager->getBlockManager().getLinearAttentionMetadata();
+    if (!linearAttentionMetadata
+        || linearAttentionMetadata->cacheType != kv_cache_manager::LinearAttentionMetadata::kRecurrentStates)
+    {
+        return;
+    }
+
+    auto const statesSnapshotInterval = linearAttentionMetadata->statesSnapshotInterval;
+    auto const saveLastSnapshot = linearAttentionMetadata->saveLastSnapshot;
+    if (statesSnapshotInterval <= 0 && !saveLastSnapshot)
+    {
+        return;
+    }
+
+    auto const tokensPerBlock = kvCacheManager->getTokensPerBlock();
+    for (auto& llmReq : requests)
+    {
+        if (llmReq->getContextRemainingLength() <= 0)
+        {
+            continue;
+        }
+        llmReq->setExpectChunkingPoints(
+            calcContextStopPositions(llmReq->getPromptLen(), tokensPerBlock, statesSnapshotInterval, saveLastSnapshot));
+    }
+}
+
+} // namespace
+
 std::map<SizeType32, SizeType32> TrtGptModelInflightBatching::calculateCacheSizePerTokenForDisagg(
     ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     std::vector<SizeType32> const& maxAttentionWindowVec, bool isCrossAttention, SizeType32 kvFactor)
@@ -415,6 +510,12 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             executorConfig.getSchedulerConfig().getContextChunkingPolicy().value_or(
                 executor::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED),
             chunkUnitSize};
+    }
+
+    if (auto const mambaForceChunkUnitSize = getMambaForceChunkUnitSize(mKvCacheManager))
+    {
+        ctxChunkConfig = batch_scheduler::ContextChunkingConfig{
+            executor::ContextChunkingPolicy::kFORCE_CHUNK, mambaForceChunkUnitSize.value()};
     }
 
     auto maxNumTokens = getMaxNumTokens();
@@ -1035,6 +1136,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 // will free kvCache in next iteration.
             }
         }
+        prepareExpectChunkingPoints(fittingRequests, mKvCacheManager);
         std::tie(currRequests.contextRequests, currRequests.generationRequests)
             = (*mMicroBatchScheduler)(fittingRequests, mInflightReqIds, mMaxBatchSizeRuntime, mMaxNumTokensRuntime);
         TLLM_CHECK(currRequests.size() <= static_cast<size_t>(getMaxBatchSize()));
