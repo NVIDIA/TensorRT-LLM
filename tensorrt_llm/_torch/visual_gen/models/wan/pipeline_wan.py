@@ -78,6 +78,16 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     "fused fingers, motionless image, cluttered background, three legs, many people in the background, walking backward"
 )
 
+_WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES = (
+    ("text_encoder",),
+    ("denoising_transformer",),
+)
+_WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
+    ("text_encoder",),
+    ("denoising_transformer",),
+    ("denoising_transformer_2",),
+)
+
 
 @register_pipeline(
     "WanPipeline",
@@ -148,10 +158,10 @@ class WanPipeline(BasePipeline):
 
     @property
     def device(self):
-        return self.transformer.device
+        return super().device
 
     @property
-    def transformer_components(self) -> list:
+    def transformer_components(self) -> list[str]:
         """Return list of transformer components this pipeline needs."""
         if self.transformer_2 is not None:
             return ["transformer", "transformer_2"]
@@ -199,6 +209,28 @@ class WanPipeline(BasePipeline):
                 model_config=self.pipeline_config.model_configs["transformer_2"]
             )
 
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        """Return WAN offload stages for the loaded transformer topology.
+
+        Only invoked when ``cpu_offload_config.enable`` is true (the base
+        class short-circuits before calling this). Defaults are CPU-staged
+        today; non-CPU offload devices skip the defaults and require
+        explicit ``cpu_offload_config.stages`` from the user.
+        """
+        cpu_offload_config = self.pipeline_config.cpu_offload_config
+        if cpu_offload_config.device != "cpu":
+            logger.warning(
+                "Wan default offload stages are CPU-only; "
+                f"cpu_offload_config.device='{cpu_offload_config.device}' has no "
+                "default stages. Set cpu_offload_config.stages explicitly to "
+                "stage components on a non-CPU device."
+            )
+            return ()
+
+        if self.transformer_2 is not None:
+            return _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES
+        return _WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -235,19 +267,29 @@ class WanPipeline(BasePipeline):
 
         if PipelineComponent.TEXT_ENCODER not in skip_components:
             logger.info("Loading text encoder...")
+            text_encoder_device = (
+                torch.device("cpu")
+                if PipelineComponent.TEXT_ENCODER.value in self.offloader.requested_components()
+                else device
+            )
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
                 torch_dtype=self.pipeline_config.torch_dtype,
-            ).to(device)
+            ).to(text_encoder_device)
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
+            vae_device = (
+                torch.device("cpu")
+                if PipelineComponent.VAE.value in self.offloader.requested_components()
+                else device
+            )
             self.vae = AutoencoderKLWan.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.VAE,
                 torch_dtype=torch.bfloat16,  # load VAE in BF16 for memory saving
-            ).to(device)
+            ).to(vae_device)
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
             self.vae_scale_factor_spatial = getattr(
@@ -541,6 +583,7 @@ class WanPipeline(BasePipeline):
             current_t = timestep if timestep.dim() == 0 else timestep[0]
 
             # Select model based on timestep (if two-stage denoising is enabled)
+            offload_stage = "denoising_transformer"
             if boundary_timestep is not None and self.transformer_2 is not None:
                 if current_t >= boundary_timestep:
                     current_model = self.transformer
@@ -548,6 +591,7 @@ class WanPipeline(BasePipeline):
                 else:
                     current_model = self.transformer_2
                     model_name = "transformer_2 (low-noise)"
+                    offload_stage = "denoising_transformer_2"
 
                 # Log when switching models
                 if last_model_used[0] != model_name:
@@ -571,11 +615,12 @@ class WanPipeline(BasePipeline):
                     # T2V: current_t for all frames
                     timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
 
-            return current_model(
-                hidden_states=latents,
-                timestep=timestep / self.scheduler.config.num_train_timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-            )
+            with self.offloader.context_if_requested(offload_stage):
+                return current_model(
+                    hidden_states=latents,
+                    timestep=timestep / self.scheduler.config.num_train_timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                )
 
         # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only)
         def _pin_i2v_first_frame(x):
@@ -631,7 +676,10 @@ class WanPipeline(BasePipeline):
             input_ids = text_inputs.input_ids.to(self.device)
             attention_mask = text_inputs.attention_mask.to(self.device)
 
-            embeds = self.text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state
+            with self.offloader.context_if_requested(PipelineComponent.TEXT_ENCODER.value):
+                embeds = self.text_encoder(
+                    input_ids, attention_mask=attention_mask
+                ).last_hidden_state
             embeds = embeds.to(self.dtype)
 
             # Zero-out padded tokens based on mask
@@ -722,9 +770,10 @@ class WanPipeline(BasePipeline):
         )
 
         # Encode video condition through VAE
-        latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax").to(
-            self.dtype
-        )
+        with self.offloader.context_if_requested(PipelineComponent.VAE.value):
+            latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax").to(
+                self.dtype
+            )
         if batch_size > 1:
             latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
@@ -780,7 +829,8 @@ class WanPipeline(BasePipeline):
             latents = latents / scaling_factor
 
         # VAE decode: returns (B, C, T, H, W)
-        video = self.vae.decode(latents, return_dict=False)[0]
+        with self.offloader.context_if_requested(PipelineComponent.VAE.value):
+            video = self.vae.decode(latents, return_dict=False)[0]
 
         # Post-process video tensor: (B, C, T, H, W) -> (B, T, H, W, C)
         video = postprocess_video_tensor(video)
