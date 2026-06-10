@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Slimmed down PyTorch DeepSeekV2 model implementation for auto_deploy export.
+"""DeepSeekV2 model (sharding IR).
 
 Source:
 https://huggingface.co/deepseek-ai/DeepSeek-Coder-V2-Instruct
@@ -191,10 +191,25 @@ class DeepSeekV2YarnRotaryEmbedding(DeepSeekV2RotaryEmbedding):
 
 
 class DeepSeekV2MLP(nn.Module):
-    """MLP layer for DeepSeekV2 (SwiGLU activation)."""
+    """MLP layer for DeepSeekV2 (SwiGLU activation).
+
+    When used as a shared expert inside MoE, ``add_all_reduce=False`` and
+    ``layer_type="moe"`` so the closing all_reduce is deferred to the merge
+    point and combined with the routed expert output.
+
+    Sharding strategy:
+      ``gate_proj`` / ``up_proj`` -> ``tp_mode="colwise"``.
+      ``down_proj`` -> ``tp_mode="rowwise"`` + ``all_reduce`` (deferred when
+      used as a shared expert).
+    """
 
     def __init__(
-        self, config, hidden_size: Optional[int] = None, intermediate_size: Optional[int] = None
+        self,
+        config,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        add_all_reduce: bool = True,
+        layer_type: str = "mlp",
     ):
         super().__init__()
         self.config = config
@@ -205,9 +220,34 @@ class DeepSeekV2MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.add_all_reduce = add_all_reduce
+        self.layer_type = layer_type
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias,
+            tp_mode="colwise",
+            layer_type=self.layer_type,
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.up_proj.weight,
+            self.up_proj.bias,
+            tp_mode="colwise",
+            layer_type=self.layer_type,
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type=self.layer_type,
+        )
+        if self.add_all_reduce:
+            down = torch.ops.auto_deploy.all_reduce(down, layer_type=self.layer_type)
+        return down
 
 
 class DeepSeekV2MoEGate(nn.Module):
@@ -280,7 +320,14 @@ class DeepSeekV2MoEGate(nn.Module):
 
 
 class DeepSeekV2MoE(nn.Module):
-    """Mixture of Experts layer for DeepSeekV2."""
+    """Mixture of Experts layer for DeepSeekV2.
+
+    Routed experts are dispatched via ``torch_moe`` (sharded by
+    ``apply_sharding_hints`` using ``layer_type="moe"``). The shared expert is a
+    TP-sharded MLP whose closing all_reduce is deferred so the routed and
+    shared partial sums can be combined with a single
+    ``all_reduce(layer_type="moe")`` at the merge point.
+    """
 
     def __init__(self, config):
         super().__init__()
@@ -302,7 +349,12 @@ class DeepSeekV2MoE(nn.Module):
         # Shared experts (if configured)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepSeekV2MLP(config, intermediate_size=intermediate_size)
+            self.shared_experts = DeepSeekV2MLP(
+                config,
+                intermediate_size=intermediate_size,
+                add_all_reduce=False,
+                layer_type="moe",
+            )
         else:
             self.shared_experts = None
 
@@ -325,6 +377,7 @@ class DeepSeekV2MoE(nn.Module):
             w3_weight=[expert.up_proj.weight for expert in self.experts],
             is_gated_mlp=True,
             act_fn=int(ActivationType.Silu),
+            layer_type="moe",
         )
 
         final_hidden_states = final_hidden_states.view(*orig_shape)
@@ -333,6 +386,11 @@ class DeepSeekV2MoE(nn.Module):
         if self.shared_experts is not None:
             final_hidden_states = final_hidden_states + self.shared_experts(identity)
 
+        # Single merge-point all_reduce for routed + shared partial sums.
+        final_hidden_states = torch.ops.auto_deploy.all_reduce(
+            final_hidden_states, layer_type="moe"
+        )
+
         return final_hidden_states.to(hidden_states.dtype)
 
 
@@ -340,6 +398,18 @@ class DeepSeekV2Attention(nn.Module):
     """Multi-head Latent Attention (MLA) for DeepSeekV2.
 
     Uses compressed KV representation with latent projections.
+
+    Sharding strategy:
+      ``q_a_proj`` / ``kv_a_proj_with_mqa`` -> ``tp_mode="none"`` (replicated
+      latent projections).
+      ``q_b_proj`` / ``q_proj`` (when ``q_lora_rank`` is None) ->
+      ``tp_mode="colwise"`` (sharded by ``num_heads``).
+      Q reshape -> ``auto_deploy.view`` with ``tp_scaled_dim=2``.
+      ``torch_mla`` -> ``enable_sharding=True, layer_type="mla"``. Do NOT
+      decompose ``torch_mla`` into separate linears + ``torch_attention`` --
+      ``_apply_hint_mla`` shards ``kv_b_proj.weight`` column-wise per head.
+      Post-attention reshape -> ``auto_deploy.view`` with ``tp_scaled_dim=2``.
+      ``o_proj`` -> ``tp_mode="rowwise"`` + ``all_reduce(layer_type="mla")``.
     """
 
     def __init__(self, config, layer_idx: Optional[int] = None):
@@ -449,18 +519,49 @@ class DeepSeekV2Attention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        # Q projection
+        # Q projection: latent projections replicated, q_b_proj colwise.
         if self.q_lora_rank is None:
-            q = self.q_proj(hidden_states)
+            q = torch.ops.auto_deploy.torch_linear_simple(
+                hidden_states,
+                self.q_proj.weight,
+                self.q_proj.bias,
+                tp_mode="colwise",
+                layer_type="mla",
+            )
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            q = torch.ops.auto_deploy.torch_linear_simple(
+                hidden_states,
+                self.q_a_proj.weight,
+                self.q_a_proj.bias,
+                tp_mode="none",
+                layer_type="mla",
+            )
+            q = self.q_a_layernorm(q)
+            q = torch.ops.auto_deploy.torch_linear_simple(
+                q,
+                self.q_b_proj.weight,
+                self.q_b_proj.bias,
+                tp_mode="colwise",
+                layer_type="mla",
+            )
 
-        # Shape: [B, S, N, q_head_dim] (BSND layout)
-        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim)
+        # Shape: [B, S, N, q_head_dim] (BSND layout); num_heads (dim 2) scales with TP.
+        q = torch.ops.auto_deploy.view(
+            q,
+            [bsz, q_len, self.num_heads, self.q_head_dim],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # KV projection - keep compressed form
-        kv_a_output = self.kv_a_proj_with_mqa(hidden_states)
+        # KV projection - keep compressed form. Latent compression is replicated.
+        kv_a_output = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.kv_a_proj_with_mqa.weight,
+            self.kv_a_proj_with_mqa.bias,
+            tp_mode="none",
+            layer_type="mla",
+        )
         compressed_kv, k_pe = torch.split(
             kv_a_output, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -469,6 +570,7 @@ class DeepSeekV2Attention(nn.Module):
         compressed_kv = self.kv_a_layernorm(compressed_kv)
 
         # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
+        # dim 2 is fixed at 1 and never scales with TP, so plain `.view` is correct.
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
 
         cos, sin = self.rotary_emb(hidden_states, position_ids)
@@ -482,7 +584,10 @@ class DeepSeekV2Attention(nn.Module):
             2,  # unsqueeze_dim=2 for BSND layout
         )
 
-        # Call MLA with compressed KV
+        # Call MLA with compressed KV. enable_sharding=True lets _apply_hint_mla
+        # shard kv_b_proj_weight column-wise along the head dimension. Do NOT
+        # decompose torch_mla into separate linears + torch_attention -- that
+        # introduces concrete-shape view/expand that break under TP.
         attn_output = torch.ops.auto_deploy.torch_mla(
             q_nope,  # [B, S, N, qk_nope_head_dim]
             q_pe_rotated,  # [B, S, N, qk_rope_head_dim]
@@ -492,11 +597,26 @@ class DeepSeekV2Attention(nn.Module):
             True,  # is_causal
             self.softmax_scale,
             "bsnd",  # layout
+            enable_sharding=True,
+            layer_type="mla",
         )
 
-        # Output: [B, S, N, v_head_dim] -> [B, S, N * v_head_dim]
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-        attn_output = self.o_proj(attn_output)
+        # Output: [B, S, N, v_head_dim] -> [B, S, N * v_head_dim].
+        # Collapsed dim scales with TP via num_heads.
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_heads * self.v_head_dim],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mla",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mla")
 
         return attn_output
 

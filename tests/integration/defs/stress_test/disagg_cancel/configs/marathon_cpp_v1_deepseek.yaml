@@ -2,7 +2,7 @@
 #
 # Exercises the C++-backed disagg path (BindKvCacheTransceiver + V1
 # KVCacheManager + NIXL backend) — the configuration NVBug 6104831
-# was filed against and that PR #13713 stabilizes. Schema
+# was filed against and that the in-flight cancellation fix stabilizes. Schema
 # documentation lives in ../README.md.
 
 hostname: localhost

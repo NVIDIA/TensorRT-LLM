@@ -2652,26 +2652,25 @@ class DSACacheManager(KVCacheManager):
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
+        # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
         mem_per_token *= num_attention_layers * head_dim
 
-        # 1 for K, others for indexer K cache
-        head_dim_factor = (indexer_data_dim +
-                           index_head_dim // quant_block_size * 4) / head_dim
-        kv_factor = 1 + head_dim_factor
-        mem_per_token *= kv_factor
+        # Indexer K cache: physically allocated as raw UINT8 in
+        # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
+        # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
+        # the latent above). The data-portion byte count already reflects fp8 vs
+        # fp4 via indexer_data_dim.
+        indexer_bytes_per_token = num_attention_layers * (
+            indexer_data_dim + index_head_dim // quant_block_size * 4)
+        mem_per_token += indexer_bytes_per_token
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
         """Compute actual cache bytes per token from instance configuration."""
-        # self.kv_factor for K, others for indexer K cache.
-        # Under FP4 the indexer data portion is halved (two E2M1 codes per
-        # byte); scale bytes are unchanged.
-        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
-        head_dim_factor = (indexer_data_dim + self.index_head_dim //
-                           self.quant_block_size * 4) / self.head_dim
-        kv_factor = self.kv_factor + head_dim_factor
+        # MLA latent K cache: stored at the KV cache dtype (self.dtype). The
+        # indexer K cache is added separately below.
         cache_size_per_token = math.ceil(
-            kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
+            self.kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
                               DataType.FLOAT, DataType.NVFP4):
@@ -2684,4 +2683,15 @@ class DSACacheManager(KVCacheManager):
                 cache_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
+
+        # Indexer K cache: physically allocated as raw UINT8 in
+        # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
+        # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
+        # the latent above). Under FP4 the indexer data portion is halved (two
+        # E2M1 codes per byte); the scale bytes are unchanged.
+        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+        indexer_bytes_per_token = sum(self.num_kv_heads_per_layer) * (
+            indexer_data_dim + self.index_head_dim // self.quant_block_size * 4)
+        cache_size_bytes_per_token += indexer_bytes_per_token
+
         return cache_size_bytes_per_token
