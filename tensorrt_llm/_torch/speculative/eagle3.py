@@ -867,6 +867,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                      spec_metadata,
                                                      batch_size,
                                                      draft_step=i)
+                # When ADP+LM-head-TP pads logits to max_num_requests, the
+                # sampler returns max_num_requests tokens; trim back to the
+                # actual token_count so next_draft_tokens has the right shape.
+                if use_lm_head_tp_in_adp:
+                    new_draft_token = new_draft_token[:token_count]
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
