@@ -817,6 +817,11 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4 TIMEOUT (12
 accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
 unittest/disaggregated/test_openai_disagg_server.py
+disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff
+disaggregated/test_ad_disagg.py::test_async_generation_matches_aggregate
+disaggregated/test_ad_disagg.py::test_async_generation_no_overlap_matches_aggregate
+disaggregated/test_ad_disagg.py::test_async_sharded_generation_handoff
+disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
 disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin]
