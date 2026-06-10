@@ -56,6 +56,7 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
   # llmapi
   - unittest/llmapi/test_mpi_session.py::test_llmapi_launch_multiple_tasks
+  - unittest/executor/test_llm_gpu_memory_cleanup.py::test_llm_shutdown_releases_gpu_memory_mpi_reuse
 - condition:
     ranges:
       system_gpu_count:

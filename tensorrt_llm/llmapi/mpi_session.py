@@ -27,6 +27,28 @@ if ENABLE_MULTI_DEVICE:
 T = TypeVar("T")
 
 
+def terminate_orphan_mpi_pool_workers() -> None:
+    """Terminate leftover mpi4py.futures.server processes after pool shutdown."""
+    try:
+        import psutil
+    except ImportError:
+        return
+
+    try:
+        current = psutil.Process()
+        for child in current.children(recursive=True):
+            try:
+                cmdline = ' '.join(child.cmdline())
+                if 'mpi4py.futures.server' in cmdline:
+                    logger.warning(
+                        f"Terminating orphan MPI pool worker (pid={child.pid})")
+                    child.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except psutil.Error as e:
+        logger.warning(f"Failed to scan for orphan MPI pool workers: {e}")
+
+
 class MPINodeState:
     ''' MPINodeState acts as a central global state shares between tasks on MPI node.
 
@@ -138,6 +160,7 @@ class MpiPoolSession(MpiSession):
     def __init__(self, n_workers: int):
         self.n_workers = n_workers
         self.mpi_pool: Optional[MPIPoolExecutor] = None
+        self._shutdown_done = False
         self._start_mpi_pool()
         if ENABLE_MULTI_DEVICE:
             self.comm = mpi4py.MPI.COMM_WORLD
@@ -160,9 +183,13 @@ class MpiPoolSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
+        if self._shutdown_done:
+            return
         if self.mpi_pool is not None:
             self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
+            terminate_orphan_mpi_pool_workers()
+        self._shutdown_done = True
 
     def abort(self):
         self.get_comm().Abort(1)
@@ -192,6 +219,7 @@ class MpiCommSession(MpiSession):
         self.comm = comm
         self.n_workers = n_workers
         self.thread_pool: Optional[ThreadPoolExecutor] = None
+        self._shutdown_done = False
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self.owns_mpi_pool = False  # Track if this instance owns the mpi_pool
 
@@ -241,6 +269,8 @@ class MpiCommSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
+        if self._shutdown_done:
+            return
         # Only shutdown the mpi_pool if this instance created it
         # For shared global mpi_pool, we don't shut it down
         if self.mpi_pool is not None and self.owns_mpi_pool:
@@ -249,6 +279,7 @@ class MpiCommSession(MpiSession):
         if self.thread_pool is not None:
             self.thread_pool.shutdown(wait=wait)
             self.thread_pool = None
+        self._shutdown_done = True
 
     def abort(self):
         self.get_comm().Abort(1)
