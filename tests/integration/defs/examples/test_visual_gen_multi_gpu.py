@@ -58,7 +58,6 @@ WAN22_LPIPS_MULTI_GPU_VARIANTS = [
     ("attn2d_2x2_ulysses2", {"attn2d_size": (2, 2), "ulysses_size": 2}),
 ]
 
-# Tensor Parallel variants (tp_size is counted in n_workers, the launcher world size).
 WAN22_LPIPS_TP_VARIANTS = [
     ("tp2", {"tp_size": 2}),
     ("cfg2_tp2", {"cfg_size": 2, "tp_size": 2}),
@@ -119,8 +118,6 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
 
 
 def _skip_if_insufficient_gpus_for_parallel(parallel):
-    # Use n_workers (the actual VisualGen launcher world size); total_parallel_size omits
-    # tp_size and would under-count TP configs.
     parallel_cfg = ParallelConfig(**parallel)
     required = parallel_cfg.n_workers
     available = torch.cuda.device_count()
@@ -163,10 +160,6 @@ def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> Non
 
 
 def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
-    """Shared body: run the real Wan 2.2 T2V pipeline under `parallel` and compare the
-    generated video against the golden via LPIPS. World size is n_workers (the launcher
-    world size), so it covers TP, CFG, Ulysses, Ring and Attention2D uniformly.
-    """
     _skip_if_insufficient_gpus_for_parallel(parallel)
     parallel_cfg = ParallelConfig(**parallel)
     generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}.mp4"
@@ -220,9 +213,4 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
     ids=[name for name, _ in WAN22_LPIPS_TP_VARIANTS],
 )
 def test_wan22_t2v_lpips_against_golden_tp(tmp_path, variant_name, parallel):
-    """End-to-end Tensor Parallel quality check: exercises the real VisualGenArgs ->
-    PipelineLoader -> checkpoint load -> generate path with tp_size > 1 (alone and
-    combined with CFG / Ulysses), which the synthetic module-parity unit tests
-    (test_*_tp.py) do not cover.
-    """
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
