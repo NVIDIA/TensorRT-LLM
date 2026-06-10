@@ -230,6 +230,20 @@ class BaseLLM:
                      "yellow")
         self.mpi_session = self.args.mpi_session
 
+        # Record the configured post-processing hook (TRTLLM-12622) for this
+        # (LLM/proxy) process. When postproc workers are disabled, the detok
+        # chokepoint runs here on RequestOutput; when enabled, each worker
+        # process records it separately via postproc_worker_main.
+        from ..executor.postprocessor_hook import (
+            get_post_processor_hook, set_configured_post_processor_hook)
+        _post_processor_hook = getattr(self.args, "post_processor", None)
+        set_configured_post_processor_hook(_post_processor_hook)
+        if _post_processor_hook:
+            # Resolve eagerly so a bad import path fails fast at startup (and
+            # primes the per-process build-once cache) rather than erroring on
+            # the first request.
+            get_post_processor_hook(_post_processor_hook)
+
         if self.args.parallel_config.is_multi_gpu:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
@@ -1417,6 +1431,7 @@ class _TrtLLM(BaseLLM):
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
+                post_processor_hook=self.args.post_processor,
             ),
             is_llm_executor=True)
 
@@ -1565,6 +1580,7 @@ class _TorchLLM(BaseLLM):
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
+                post_processor_hook=self.args.post_processor,
             ),
             is_llm_executor=True,
             hf_model_dir=self._hf_model_dir,

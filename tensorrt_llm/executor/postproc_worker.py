@@ -46,6 +46,11 @@ class PostprocWorkerConfig:
     ''' The config for the postprocess worker. '''
     num_postprocess_workers: int = 0
     postprocess_tokenizer_dir: Optional[str] = None
+    # Dotted import path of the user post-processing hook (TRTLLM-12622), or
+    # None. Propagated into each postproc worker process so the detok chokepoint
+    # can apply it. NOTE: distinct from ``PostprocParams.post_processor`` above,
+    # which is the per-endpoint response *formatter* (a Callable), not this hook.
+    post_processor_hook: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
@@ -202,6 +207,12 @@ class PostprocWorker:
                 res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                     inp)
                 record = self._records.get(client_id)
+                # A post-processing hook that returned `terminate` forces the
+                # record done (TRTLLM-12622); honor it so the stream stops
+                # promptly and the record is popped, instead of waiting for the
+                # engine's own is_final.
+                if record is not None and record._done:
+                    is_final = True
                 should_abort = record._aborted if record else False
                 finish_reason = record.outputs[0].finish_reason if (
                     record and record.outputs
@@ -268,7 +279,14 @@ class PostprocWorker:
 @print_traceback_on_error
 def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
                          feedout_ipc_addr: tuple[str, Optional[bytes]],
-                         tokenizer_dir: str, record_creator: Callable):
+                         tokenizer_dir: str,
+                         record_creator: Callable,
+                         post_processor_hook: Optional[str] = None):
+    # Record the configured post-processing hook (TRTLLM-12622) for this worker
+    # process so the detok chokepoint in DetokenizedGenerationResultBase can
+    # apply it.
+    from .postprocessor_hook import set_configured_post_processor_hook
+    set_configured_post_processor_hook(post_processor_hook)
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addr,
                             tokenizer_dir=tokenizer_dir,
