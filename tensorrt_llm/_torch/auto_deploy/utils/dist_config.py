@@ -137,6 +137,7 @@ class DistConfig(BaseModel):
         dist_mapping: dict,
         enable_attention_dp: bool = False,
         allreduce_strategy: str = "NCCL",
+        dist_backend: Literal["auto", "torch", "trtllm"] = "auto",
     ) -> "DistConfig":
         """Build ``DistConfig`` from sharding-transform YAML inputs + runtime MPI info.
 
@@ -154,6 +155,7 @@ class DistConfig(BaseModel):
             moe_cluster_size=dist_mapping.get("moe_cluster", 1),
             enable_attention_dp=enable_attention_dp,
             allreduce_strategy=allreduce_strategy,
+            dist_backend=dist_backend,
         )
 
     def to_mapping(self) -> Any:

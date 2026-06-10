@@ -480,8 +480,8 @@ def _make_list_moe_graph():
     return gm
 
 
-def test_list_moe_ir_contract_inserts_all_reduce_for_ep():
-    """List-based MoE EP sharding localizes experts and adds a graph collective."""
+def test_list_moe_ir_contract_leaves_ep_reduction_to_modeling():
+    """List-based MoE EP sharding localizes experts without choosing a reduction site."""
     gm = _make_list_moe_graph()
     gm_out = _make_optimizer(world_size=2)(None, gm)
     moe_nodes = _call_nodes(gm_out, torch.ops.auto_deploy.torch_moe)
@@ -492,7 +492,7 @@ def test_list_moe_ir_contract_inserts_all_reduce_for_ep():
     assert len(w1_weight) == 2
     assert len(w2_weight) == 2
     assert len(w3_weight) == 2
-    assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce)) == 1
+    assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce)) == 0
 
 
 def _optional_auto_deploy_default(name):

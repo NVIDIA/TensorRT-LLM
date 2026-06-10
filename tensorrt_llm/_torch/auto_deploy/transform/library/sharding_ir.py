@@ -1198,14 +1198,6 @@ class MoEShardableNode(ShardableNode):
             self._localize_expert_indices(
                 gm, selected_experts, routing_weights, experts_per_rank, ep_rank, ep_size
             )
-            _, all_reduce_op = _get_dist_ops(dc.dist_backend)
-            with gm.graph.inserting_after(self.node):
-                red = gm.graph.call_function(
-                    all_reduce_op,
-                    args=(self.node, dc.allreduce_strategy),
-                )
-                self.node.replace_all_uses_with(red)
-                red.replace_input_with(red, self.node)
 
         ad_logger.debug(
             f"  sharded MoE: {num_experts} experts, ep={ep_size}, ep_rank={ep_rank}, "
