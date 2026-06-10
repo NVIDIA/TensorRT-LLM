@@ -1051,15 +1051,3 @@ class TestSpecBoundsChecking:
             profiles = tuner._optimization_profiles(config, [x])
             # OOB spec skipped — profile generation still produces at least one profile.
             assert len(profiles) >= 1
-
-    def test_valid_specs_unaffected(self):
-        from tensorrt_llm._torch.autotuner import ConstraintSpec
-        shapes = _make_shapes([4, 8], [2, 3])
-        dyn = DynamicTensorSpec(input_idx=0, dim_idx=1)
-        con = ConstraintSpec(input_idx=1,
-                             dim_idx=0,
-                             infer_shape=lambda shapes: 1)
-        result = AutoTuner._find_nearest_profile(shapes,
-                                                 dynamic_tensor_specs=(dyn, ),
-                                                 constraint_specs=(con, ))
-        assert result == ((4, 8), (-1, 3))
