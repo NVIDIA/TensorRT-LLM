@@ -80,6 +80,14 @@ if [[ "$containerLDLibPath" != *"$containerPipLLMLibPath"* ]]; then
   containerLDLibPath="${containerLDLibPath%:}"
 fi
 export LD_LIBRARY_PATH=$containerLDLibPath
+
+# Slurm ENROOT/pyxis may inject UCX_TLS=tcp from the host MPI stack (intended for
+# host-only MPI jobs). That disables CUDA transports and breaks NIXL GPU memory
+# registration. Unset it so UCX can auto-select.
+if [ "${UCX_TLS:-}" = "tcp" ]; then
+    unset UCX_TLS
+    echo "Unset UCX_TLS (cluster injected UCX_TLS=tcp)"
+fi
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -146,7 +146,7 @@ class DeepGemmMoEOp(MoEOp):
         """
 
         # Import necessary functions for DeepGemm
-        from ..fused_moe_deepgemm import (masked_index_copy_group_quant_fp8,
+        from ..fused_moe_deepgemm import (fused_expand_group_quant_fp8,
                                           preprocess_after_permute, set_strides,
                                           triton_masked_index_gather)
 
@@ -169,13 +169,17 @@ class DeepGemmMoEOp(MoEOp):
         intermediate_size = module.intermediate_size
         hidden_size = x.shape[1]
 
-        # Permute the data for expert-parallel processing
+        # Permute the data for expert-parallel processing.
+        # Unlike DeepGemmFusedMoE (which fuses gather+finalize and never touches
+        # permuted_data_tensor), this op reuses permuted_data_tensor as a
+        # write-before-read scratch buffer in the gather+finalize tail below, so
+        # it is kept; only the genuinely unused outputs are discarded with `_`.
         (
             permuted_row_to_unpermuted_row_tensor,
-            permuted_token_selected_experts_tensor,
+            _,  # permuted_token_selected_experts_tensor (unused)
             permuted_data_tensor,
             expert_first_token_offset_tensor,
-            permuted_token_final_scales_tensor,
+            _,  # permuted_token_final_scales_tensor (uninitialized under skip_data_expand)
             unpermuted_row_to_permuted_row_tensor,
         ) = torch.ops.trtllm.moe_permute_op(
             x,
@@ -194,14 +198,18 @@ class DeepGemmMoEOp(MoEOp):
             cluster_rank=cluster_rank,
             min_latency_mode=min_latency_mode,
             use_fp8_block_scaling=True,  # Always use block scaling for DeepGemm
+            skip_data_expand=True,
         )
 
-        if permuted_data_tensor.numel() == 0:
+        # Take the expanded-token count from the populated permutation map (one
+        # entry per permuted token) rather than the uninitialized data tensor.
+        num_permuted_tokens = permuted_row_to_unpermuted_row_tensor.shape[0]
+        if num_permuted_tokens == 0:
             return torch.zeros_like(x)
 
         # Preprocess for masked operations
         masked_m, token_to_expert_map = preprocess_after_permute(
-            expert_first_token_offset_tensor, permuted_data_tensor)
+            expert_first_token_offset_tensor, num_permuted_tokens)
 
         expected_m = (token_selected_slots.numel() + expert_size_per_partition -
                       1) // expert_size_per_partition
@@ -222,13 +230,15 @@ class DeepGemmMoEOp(MoEOp):
                                    expert_size_per_partition,
                                    scale_k_padded // 4, m_padded)
 
-        # Quantize and copy input with masking
-        act_input_sf = masked_index_copy_group_quant_fp8(
+        # Fused expand + quantize (reads from original input via perm map)
+        act_input_sf = fused_expand_group_quant_fp8(
             act_input_fp8,
             act_input_sf,
-            permuted_data_tensor,
+            x,
+            permuted_row_to_unpermuted_row_tensor,
             expert_first_token_offset_tensor,
             token_to_expert_map,
+            experts_per_token=token_selected_slots.shape[1],
             group_size=128)
 
         # First grouped GEMM (w3 and w1)

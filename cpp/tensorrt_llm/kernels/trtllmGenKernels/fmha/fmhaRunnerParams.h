@@ -298,6 +298,13 @@ struct TllmGenFmhaRunnerParams
     int mMaxSeqLenQ;
     // The max kv sequence length.
     int mMaxSeqLenKv;
+    // Optional JIT warmup shape.
+    bool mJITWarmup = false;
+    int mJITWarmupMaxNumRequests = 0;
+    int mJITWarmupMaxSeqLenQ = 0;
+    int mJITWarmupMaxSeqLenKv = 0;
+    // True when a prefill/context path intentionally uses a generation kernel.
+    bool mUseGenKernelForPrefill = false;
     // The attention window size for sliding window attention (sliding-window-attention is enabled when seqLenKv >
     // mAttentionWindowSize).
     int mAttentionWindowSize;

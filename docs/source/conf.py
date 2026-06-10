@@ -67,6 +67,7 @@ extensions = [
     'sphinxcontrib.autodoc_pydantic',
     'sphinx_togglebutton',
     'sphinxcontrib.mermaid',
+    'trtllm_auto_deploy',
     'trtllm_config_selector',
 ]
 

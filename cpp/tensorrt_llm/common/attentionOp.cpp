@@ -265,17 +265,6 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
         = mAttentionChunkSize && !tc::getEnvDisableChunkedAttentionInGenPhase() ? *mAttentionChunkSize : INT_MAX;
     xqaParams.max_attention_window_size = generationsParams.max_attention_window_size;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
-    // Treat the layer as sliding-window-causal only for explicit SWA masks or
-    // in-attention positional encodings whose max position exceeds the layer window.
-    // Exclude sparse attention and chunked attention
-    bool const has_in_attention_pos_encoding = mPositionEmbeddingType != PositionEmbeddingType::kLEARNED_ABSOLUTE;
-    // chunked_attention_size is set to INT_MAX above as the "disabled" sentinel.
-    bool const chunked_attention_enabled
-        = xqaParams.chunked_attention_size > 0 && xqaParams.chunked_attention_size != INT_MAX;
-    xqaParams.is_sliding_window = !mUseSparseAttention && !chunked_attention_enabled
-        && ((mMaskType == AttentionMaskType::SLIDING_WINDOW_CAUSAL)
-            || (has_in_attention_pos_encoding && generationsParams.max_attention_window_size > 0
-                && generationsParams.max_attention_window_size < mRotaryEmbeddingMaxPositions));
     xqaParams.max_blocks_per_sequence = generationsParams.max_blocks_per_sequence;
     xqaParams.sink_token_length = generationsParams.sink_token_length;
     xqaParams.max_past_kv_length = generationsParams.max_past_kv_length;
@@ -305,6 +294,10 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.helix_position_offsets = generationsParams.helix_position_offsets;
     xqaParams.helix_is_inactive_rank = generationsParams.helix_is_inactive_rank;
     xqaParams.softmax_stats = generationsParams.softmax_stats;
+    xqaParams.trtllm_gen_jit_warmup = generationsParams.trtllm_gen_jit_warmup;
+    xqaParams.trtllm_gen_jit_warmup_max_num_requests = mMaxNumRequests;
+    xqaParams.trtllm_gen_jit_warmup_max_seq_len_q = mMaxContextLength;
+    xqaParams.trtllm_gen_jit_warmup_max_seq_len_kv = mMaxSeqLen;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
@@ -1136,13 +1129,11 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
-        // Override mMaxSeqLenKv with the max cache capacity so FMHA picks the same kernel as
-        // CUDA graph warmup and avoids the eager-mode JIT miss/recompile. This is safe for
-        // PagedKv on this path because the strides do not depend on mMaxSeqLenKv, and extra
-        // KV CTAs exit early through seqLensKvPtr.
-        // TODO: mirror the is_swa + W+1 logic from xqaDispatcher.cpp when MLA gains SWA
-        // support (also requires adding Sliding cubins to the MLA gen kernel set).
-        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_attention_window_size;
+        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
+        tllmRunnerParams.mJITWarmup = generation_params.trtllm_gen_jit_warmup;
+        tllmRunnerParams.mJITWarmupMaxNumRequests = mMaxNumRequests;
+        tllmRunnerParams.mJITWarmupMaxSeqLenQ = mMaxContextLength;
+        tllmRunnerParams.mJITWarmupMaxSeqLenKv = mMaxSeqLen;
         tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
@@ -1993,6 +1984,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
         fmhaParams.softmaxStatsPtr = params.softmax_stats;
+        fmhaParams.trtllmGenJITWarmup = params.trtllm_gen_jit_warmup;
+        fmhaParams.trtllmGenJITWarmupMaxNumRequests = mMaxNumRequests;
+        fmhaParams.trtllmGenJITWarmupMaxSeqLenQ = mMaxContextLength;
+        fmhaParams.trtllmGenJITWarmupMaxSeqLenKv = mMaxSeqLen;
 
         // Sparse attention parameters
         if (useTllmGenSparseAttention())
