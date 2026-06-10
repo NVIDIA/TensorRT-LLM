@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +37,8 @@ from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
+from multi_instance_disagg_helper import (setup_multi_instance_disagg_cluster,
+                                          should_use_multi_instance_path)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
@@ -255,6 +257,12 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml",
         "deepseek_r1_v2_fp4_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
+        "deepseek_v4_pro_tep8_gen_only":
+        f"{test_configs_root}/disagg_config_deepseek_v4_pro_tep8_gen_only.yaml",
+        "deepseek_v4_pro_dep16_gen_only":
+        f"{test_configs_root}/disagg_config_deepseek_v4_pro_dep16_gen_only.yaml",
+        "deepseek_v4_pro_ctx2dep4_gen1dep16":
+        f"{test_configs_root}/disagg_config_deepseek_v4_pro_ctx2dep4_gen1dep16.yaml",
         "gpt_oss_120b_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "gpt_oss_120b_harmony":
@@ -489,6 +497,17 @@ def setup_disagg_cluster(
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Multi-instance multi-node disagg requires partitioning the MPI pool via
+    # split_world_comm; see multi_instance_disagg_helper for details.
+    if should_use_multi_instance_path(config):
+        return setup_multi_instance_disagg_cluster(
+            config_file=config_file,
+            model_name=model_name,
+            env=env,
+            cwd=cwd,
+            server_start_timeout=server_start_timeout,
+        )
 
     disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
@@ -2160,6 +2179,100 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              accuracy_test=True,
                              threshold=test_config.accuracy_threshold,
                              env=llm_venv._new_env,
+                             cwd=llm_venv.get_working_directory())
+
+
+def get_deepseek_v4_pro_disagg_env(llm_venv, gen_only: bool):
+    env = llm_venv._new_env.copy()
+    env.update({
+        "TLLM_LOG_LEVEL": "INFO",
+        "TRTLLM_SERVER_DISABLE_GC": "1",
+        "TRTLLM_WORKER_DISABLE_GC": "1",
+        "TRTLLM_ENABLE_PDL": "1",
+        "NCCL_GRAPH_MIXING_SUPPORT": "0",
+        "MIMALLOC_PURGE_DELAY": "0",
+        "TRTLLM_DISABLE_KV_CACHE_RATIO_UPDATE": "1",
+        "TRTLLM_MLA_EXTRA_OVERLAP": "1",
+        "TRTLLM_FUSED_FP8_QUANT_PACK": "1",
+    })
+    if gen_only:
+        env["TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"] = "1"
+    return env
+
+
+@pytest.mark.timeout(12600)
+@pytest.mark.parametrize("test_desc,input_tokens,output_tokens,concurrency", [
+    pytest.param(
+        "deepseek_v4_pro_tep8_gen_only",
+        8192,
+        1024,
+        1,
+        marks=pytest.mark.skip_less_mpi_world_size(8),
+    ),
+    pytest.param(
+        "deepseek_v4_pro_dep16_gen_only",
+        1024,
+        1024,
+        16384,
+        marks=pytest.mark.skip_less_mpi_world_size(16),
+    ),
+],
+                         ids=lambda x: str(x))
+@skip_pre_blackwell
+def test_disaggregated_deepseek_v4_pro_gen_only(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv, test_desc,
+                                                input_tokens, output_tokens,
+                                                concurrency):
+    model_dir = f"{llm_models_root()}/DeepSeek-V4-Pro"
+    config_file = get_test_config(test_desc, disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=model_dir,
+                             server_start_timeout=7200,
+                             input_tokens=input_tokens,
+                             output_tokens=output_tokens,
+                             concurrency=concurrency,
+                             endpoint_type='completions',
+                             request_count=concurrency,
+                             warmup_request_count=1,
+                             streaming=False,
+                             env=get_deepseek_v4_pro_disagg_env(llm_venv,
+                                                                gen_only=True),
+                             cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.timeout(12600)
+@pytest.mark.skip_less_mpi_world_size(24)
+@skip_pre_blackwell
+# Keep the request count small (request_count == concurrency): each request
+# prefills 8192 tokens through the 2-ctx (TP4) instances, transfers its KV
+# cache, then decodes 1024 tokens on the gen (TP16) instance. At concurrency
+# 256 this 24-GPU, 6-node run did not finish inside the gb300-flex Slurm
+# wall-time; 16 still exercises ctx->gen routing, KV transfer and multi-node
+# decode while fitting the budget.
+@pytest.mark.parametrize("concurrency", [16], ids=lambda x: f"conc{x}")
+def test_disaggregated_deepseek_v4_pro_ctx2dep4_gen1dep16(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        concurrency):
+    model_dir = f"{llm_models_root()}/DeepSeek-V4-Pro"
+    config_file = get_test_config("deepseek_v4_pro_ctx2dep4_gen1dep16",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=model_dir,
+                             server_start_timeout=7200,
+                             input_tokens=8192,
+                             output_tokens=1024,
+                             concurrency=concurrency,
+                             endpoint_type='completions',
+                             request_count=concurrency,
+                             warmup_request_count=1,
+                             streaming=True,
+                             env=get_deepseek_v4_pro_disagg_env(llm_venv,
+                                                                gen_only=False),
                              cwd=llm_venv.get_working_directory())
 
 

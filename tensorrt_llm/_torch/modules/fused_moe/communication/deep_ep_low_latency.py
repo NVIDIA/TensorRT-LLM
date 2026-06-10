@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
+from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -59,6 +60,20 @@ class DeepEPLowLatency(Communication):
         moe_max_num_tokens: Optional[int] = None,
     ):
         super().__init__(mapping)
+
+        # Bail out on configurations where the underlying NVSHMEM-backed
+        # buffer pool is known not to work — these manifest as a CUDA
+        # illegal-memory-access inside ``nvshmem_barrier`` during
+        # ``deep_ep_buffer.reserve``, which crashes the whole worker rather
+        # than letting the factory fall through to AllGatherReduceScatter.
+        # The constraint mirrors the regular DeepEP path: internode needs
+        # 8 ranks/node, while intranode needs all ranks on one node.
+        if not self._is_feasible(mapping.moe_ep_size):
+            raise RuntimeError(
+                f"DeepEPLowLatency is not feasible for moe_ep_size="
+                f"{mapping.moe_ep_size} with local_mpi_size={local_mpi_size()}: "
+                f"internode mode requires 8 ranks per node."
+            )
 
         # Validate hidden_size against kernel constraints
         if hidden_size not in self.SUPPORTED_HIDDEN_SIZES:
@@ -114,6 +129,25 @@ class DeepEPLowLatency(Communication):
         if not deep_ep_installed:
             return False
         return True
+
+    @staticmethod
+    def _is_feasible(num_ranks: int) -> bool:
+        """
+        Same topology constraints as DeepEP: single-node {2,4,8} ranks or
+        internode N x 8 ranks/node. Configs outside this set crash NVSHMEM
+        during buffer reservation on GB300-class 4-GPU/node systems.
+        """
+        NUM_INTRANODE_SUPPORTED_RANKS = {2, 4, 8}
+        REQUIRED_LOCAL_MPI_SIZE = 8
+        NUM_INTERNODE_SUPPORTED_RDMA_RANKS = {2, 4, 8, 16}
+        mpi_size = local_mpi_size()
+
+        if num_ranks == mpi_size and num_ranks in NUM_INTRANODE_SUPPORTED_RANKS:
+            return True
+        if mpi_size != REQUIRED_LOCAL_MPI_SIZE:
+            return False
+        num_rdma_nodes = num_ranks // mpi_size
+        return num_rdma_nodes in NUM_INTERNODE_SUPPORTED_RDMA_RANKS
 
     def supports_post_quant_dispatch(self) -> bool:
         """

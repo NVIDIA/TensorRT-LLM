@@ -1286,20 +1286,62 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
-@click.command("disaggregated_mpi_worker")
-@click.option("-c",
-              "--config",
-              "--config_file",
-              "config_file",
-              type=str,
-              default=None,
-              help="Path to the disaggregated serving configuration YAML file.")
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
-def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
-    """Launching disaggregated MPI worker"""
+def disaggregated_mpi_worker_inline_main(
+        config_yaml: str,
+        log_level: str = "info",
+        stop_file: Optional[str] = None) -> None:
+    """Ship the disagg YAML inline; optionally plumb a stop-file to leader ranks.
+
+    Each rank materialises ``config_yaml`` to its own ``/tmp`` so the dispatcher
+    needs no cross-node shared FS for the config. ``stop_file`` (when set) is
+    exported as ``TLLM_DISAGG_WORKER_STOP_FILE`` for the inner mgmn server.
+    """
+    import tempfile
+
+    if stop_file:
+        os.environ["TLLM_DISAGG_WORKER_STOP_FILE"] = stop_file
+
+    # ``delete=False`` keeps the path live across the leader's Popen child.
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="disagg_mpi_worker_",
+        suffix=".yaml",
+        delete=False,
+    )
+    try:
+        tmp.write(config_yaml)
+        tmp.flush()
+        tmp.close()
+        disaggregated_mpi_worker_main(tmp.name, log_level)
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            # Stray /tmp file is non-fatal if rank was killed mid-shutdown.
+            pass
+
+
+def disaggregated_mpi_worker_main(config_file: Optional[str],
+                                  log_level: str = "info"):
+    """Body of the ``disaggregated_mpi_worker`` CLI command.
+
+    Exposed as a plain Python function so it can also be dispatched as a task
+    to an existing MPI pool (e.g. by integration tests that need to reuse the
+    mgmn proxy set up by ``trtllm-llmapi-launch``). When the caller cannot
+    place the config on a shared filesystem that is visible from every rank,
+    use :func:`disaggregated_mpi_worker_inline_main` instead.
+    """
+    # `_launch_disaggregated_leader` re-Popens ``python3 sys.argv[0]
+    # disaggregated_mpi_worker -c <cfg>``. The CLI entrypoint sets
+    # sys.argv[0] = /usr/local/bin/trtllm-serve, but when this function is
+    # called from a non-CLI context (e.g. dispatched into an MPI worker via
+    # MPIPoolExecutor) sys.argv[0] points at the worker bootstrap script.
+    # Repoint it at the real trtllm-serve console script so the child Popen
+    # succeeds in both cases.
+    import shutil as _shutil
+    _bin = _shutil.which("trtllm-serve")
+    if _bin and sys.argv and sys.argv[0] != _bin:
+        sys.argv[0] = _bin
 
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
@@ -1358,6 +1400,23 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             if not is_leader and executor is not None:
                 raise RuntimeError(
                     f"rank{global_mpi_rank()} should not have executor")
+
+
+@click.command("disaggregated_mpi_worker")
+@click.option("-c",
+              "--config",
+              "--config_file",
+              "config_file",
+              type=str,
+              default=None,
+              help="Path to the disaggregated serving configuration YAML file.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
+    """Launching disaggregated MPI worker"""
+    disaggregated_mpi_worker_main(config_file, log_level)
 
 
 class DisaggLauncherEnvs(StrEnum):
@@ -1434,13 +1493,20 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     logger.info(
         f"rank {mpi_rank()} step1: preparing to launch command: {command}")
 
-    # Store original signal handlers
-    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
-    original_sigint_handler = signal.getsignal(signal.SIGINT)
-
-    # Register new signal handlers
-    signal.signal(signal.SIGTERM, _signal_handler_cleanup_child)
-    signal.signal(signal.SIGINT, _signal_handler_cleanup_child)
+    # signal.signal() only works from the main thread. When this function runs
+    # as an MPI task dispatched into rank 0's thread_pool (via
+    # ``MpiCommSession.submit``), we're not on the main thread and Python
+    # raises ValueError. Skipping is safe: the child cleanup is also handled
+    # by the ``finally`` block below.
+    import threading
+    install_handlers = threading.current_thread() is threading.main_thread()
+    original_sigterm_handler = None
+    original_sigint_handler = None
+    if install_handlers:
+        original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+        original_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, _signal_handler_cleanup_child)
+        signal.signal(signal.SIGINT, _signal_handler_cleanup_child)
 
     try:
         _child_p_global = subprocess.Popen(
@@ -1462,9 +1528,9 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         launch_remote_mpi_session_server(sub_comm)
 
     finally:
-        # Restore original signal handlers
-        signal.signal(signal.SIGTERM, original_sigterm_handler)
-        signal.signal(signal.SIGINT, original_sigint_handler)
+        if install_handlers:
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+            signal.signal(signal.SIGINT, original_sigint_handler)
 
         if _child_p_global:  # If Popen was successful and object exists
             logger.info(

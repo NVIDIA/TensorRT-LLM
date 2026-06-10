@@ -2,6 +2,7 @@
 This script is used to start the MPICommSession in the rank0 and wait for the
 MPI Proxy process to connect and get the MPI task to run.
 '''
+import os
 from typing import Literal
 
 import click
@@ -26,7 +27,8 @@ def launch_server_main(sub_comm=None):
         n_workers=num_ranks,
         addr=get_spawn_proxy_process_ipc_addr_env(),
         hmac_key=get_spawn_proxy_process_ipc_hmac_key_env(),
-        is_comm=True)
+        is_comm=True,
+        stop_file=os.environ.get("TLLM_DISAGG_WORKER_STOP_FILE"))
     logger_debug(
         f"MPI Comm Server started at {get_spawn_proxy_process_ipc_addr_env()}")
     server.serve()
