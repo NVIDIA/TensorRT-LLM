@@ -133,6 +133,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     # so set kv_layout as "HND" here
     kv_layout: Literal["NHD", "HND"] = "HND"
 
+    # Speculative-decoding placeholders used by shared one-model drafting
+    # code. FlashInfer does not consume TRTLLM XQA-style packed masks, so
+    # update_spec_dec_param intentionally leaves these tensors unset.
+    is_spec_decoding_enabled: bool = False
+    use_spec_decoding: bool = False
+    is_spec_dec_tree: bool = False
+    is_spec_dec_dynamic_tree: bool = False
+    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
+    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
+
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
     _paged_kv_indices: torch.Tensor = field(init=False, repr=False)
@@ -855,7 +870,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                            seq_lens,
                                            output_size=self.num_tokens)
         if self.kv_lens_cuda_runtime is not None:
-            cached_token_lens = self.kv_lens_cuda_runtime[:num_seqs] - seq_lens
+            # Subtract the prompt_lens alias (the per-step append count that
+            # kv_lens was built from), not the live seq_lens. Under CUDA graph /
+            # one-engine MTP both kv_lens and prompt_lens aliases can lag at the
+            # decode anchor while seq_lens is the real 1 + draft_len; only the
+            # mutually-consistent aliases recover the true cached length. They are
+            # equal on the non-stale path, so this is a no-op there.
+            append_lens = (self.prompt_lens_cuda_runtime[:num_seqs]
+                           if self.prompt_lens_cuda_runtime is not None else
+                           seq_lens)
+            cached_token_lens = self.kv_lens_cuda_runtime[:num_seqs] - append_lens
         else:
             cached_token_lens = self.cached_token_lens[:num_seqs].to(
                 torch.int32)
@@ -882,9 +906,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._prompt_lens_cuda_buf[:num_seqs].copy_(prompt_lens,
                                                     non_blocking=True)
         self.prompt_lens_cuda_runtime = self._prompt_lens_cuda_buf[:num_seqs]
-        self._prompt_lens_cpu_buf[:num_seqs].copy_(prompt_lens.cpu(),
-                                                   non_blocking=False)
-        self.prompt_lens_cpu_runtime = self._prompt_lens_cpu_buf[:num_seqs]
+        # Refreshing the host mirror needs a D2H copy, which is illegal while a
+        # CUDA graph is capturing (e.g. the captured spec-dec draft loop). The
+        # captured kernels read only the device aliases, and host-side consumers
+        # short-circuit during capture, so update the mirror only when not
+        # capturing; it keeps its prior value during capture/replay.
+        if not torch.cuda.is_current_stream_capturing():
+            self._prompt_lens_cpu_buf[:num_seqs].copy_(prompt_lens.cpu(),
+                                                       non_blocking=False)
+            self.prompt_lens_cpu_runtime = self._prompt_lens_cpu_buf[:num_seqs]
 
         if self.num_tokens > 0:
             self._populate_fp4_mla_batch_indices_positions()

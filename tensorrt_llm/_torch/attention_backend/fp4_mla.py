@@ -315,6 +315,34 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     )
 
 
+def _fp4_mla_uniform_generation_lengths(
+    metadata: Any, num_gen_tokens: int, num_gen: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-sequence ``(kv_len, gen_len)`` tensors for the generation segment.
+
+    The no-dequant FP4 MLA generation kernels need the true number of tokens each
+    sequence appends this step (``1 + draft_len`` for linear MTP). Under CUDA-graph
+    / one-engine MTP the ``prompt_lens``/``kv_lens`` runtime aliases can lag at the
+    decode anchor (``seq_lens == 1``) while the real per-step query length is
+    ``1 + draft_len`` (the extra tokens are carried in ``num_tokens``). The two
+    aliases are populated together from the same ``seq_lens``
+    (``kv_lens == cached + seq_lens``), so ``cached = kv_len - prompt_len`` is
+    representation independent and the corrected total is ``cached + per_seq``.
+    For uniform linear MTP ``per_seq == num_gen_tokens // num_gen``. When the
+    aliases already match (e.g. the chunked-context path) the returned tensors
+    equal the metadata slices, i.e. this is a no-op.
+    """
+    num_contexts = metadata.num_contexts
+    num_seqs = metadata.num_seqs
+    kv_lens_gen = metadata.kv_lens_cuda_runtime[num_contexts:num_seqs]
+    prompt_lens_gen = metadata.prompt_lens_cuda_runtime[num_contexts:num_seqs]
+    if num_gen <= 0 or num_gen_tokens % num_gen != 0:
+        return kv_lens_gen, prompt_lens_gen
+    per_seq = num_gen_tokens // num_gen
+    cached = kv_lens_gen - prompt_lens_gen
+    return cached + per_seq, torch.full_like(prompt_lens_gen, per_seq)
+
+
 def _scatter_fp4_mla_kv_cache_2d_generation(
     metadata: Any,
     latent_cache: torch.Tensor,
@@ -336,32 +364,22 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     num_gen = num_seqs - num_contexts
     if num_gen <= 0:
         return
-    gen_token_lens = _host_int_list_during_forward(
-        getattr(metadata, "prompt_lens_cpu_runtime", None), num_contexts, num_seqs
-    )
-    if gen_token_lens is not None:
-        expected_num_tokens = sum(gen_token_lens)
-        if num_tokens != expected_num_tokens:
-            raise RuntimeError(
-                "FP4 MLA 2D generation scatter token count mismatch: "
-                f"expected {expected_num_tokens} generation tokens from "
-                f"per-sequence lengths {gen_token_lens}, got {num_tokens}."
-            )
-        if min(gen_token_lens) != max(gen_token_lens):
-            raise NotImplementedError(
-                "FP4 MLA no-dequant generation scatter currently supports "
-                f"uniform linear MTP lengths only, got {gen_token_lens}."
-            )
-    elif num_tokens < num_gen:
+    if num_tokens < num_gen:
         raise RuntimeError(
             f"FP4 MLA 2D generation scatter needs at least {num_gen} generation "
             f"tokens, got {num_tokens}."
         )
-    elif num_tokens % num_gen != 0:
+    if num_tokens % num_gen != 0:
         raise NotImplementedError(
-            "FP4 MLA no-dequant generation scatter requires a uniform "
+            "FP4 MLA no-dequant generation scatter requires a uniform linear MTP "
             f"generation length, got {num_tokens} tokens for {num_gen} sequences."
         )
+    # The prompt_lens/kv_lens runtime aliases can lag at the decode anchor
+    # (seq_lens == 1) under CUDA graph / one-engine MTP while each generation
+    # sequence really appends num_tokens // num_gen tokens this step. Recover the
+    # true per-sequence lengths for the no-dequant kernel below (a no-op when the
+    # aliases already match).
+    kv_lens_gen, gen_lens_gen = _fp4_mla_uniform_generation_lengths(metadata, num_tokens, num_gen)
 
     pool = getattr(metadata, "high_precision_kv_pool", None)
     if pool is None:
@@ -373,7 +391,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             f"{hp_head_dim}."
         )
 
-    max_gen_len = max(gen_token_lens) if gen_token_lens is not None else num_tokens // num_gen
+    max_gen_len = num_tokens // num_gen
     max_gen_tiles = _ceil_div(max_gen_len + HP_BLOCK_SIZE - 1, HP_BLOCK_SIZE)
     page_ids = metadata.paged_kv_indices[metadata.num_context_blocks :]
     _fp4_mla_v_scale_store_generation_tiles_kernel[
@@ -390,8 +408,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         latent_cache,
         global_scale,
         metadata.seq_slots[num_contexts:num_seqs],
-        metadata.kv_lens_cuda_runtime[num_contexts:num_seqs],
-        metadata.prompt_lens_cuda_runtime[num_contexts:num_seqs],
+        kv_lens_gen,
+        gen_lens_gen,
         page_ids,
         metadata.paged_kv_indptr_decode,
         page_ids.shape[0],
@@ -1456,9 +1474,21 @@ def _get_linear_mtp_query_len_per_seq(
     num_queries: int,
     num_gen_seqs: int,
 ) -> int:
-    """Return the uniform generation query length required by linear MTP."""
+    """Return the uniform generation query length required by linear MTP.
+
+    Derives the length from the real query-token count (``num_queries``, taken
+    from the q shape) and the generation sequence count, which are reliable in
+    every representation. The host ``prompt_lens``/``seq_lens`` mirror can lag at
+    the decode anchor (== 1) under CUDA graph / one-engine MTP, so it is only
+    consulted to produce a precise diagnostic when the counts do not divide
+    evenly (a genuinely non-uniform batch, which the no-dequant path does not
+    support).
+    """
     if num_gen_seqs <= 0:
         return 1
+
+    if num_queries % num_gen_seqs == 0:
+        return num_queries // num_gen_seqs
 
     start = metadata.num_contexts
     end = metadata.num_seqs
@@ -1467,33 +1497,11 @@ def _get_linear_mtp_query_len_per_seq(
     )
     if query_lens is None:
         query_lens = _host_int_list_during_forward(getattr(metadata, "seq_lens", None), start, end)
-
-    if query_lens is None:
-        if num_queries % num_gen_seqs != 0:
-            raise NotImplementedError(
-                "FP4 MLA linear MTP requires a uniform generation query length; "
-                f"got {num_queries} query tokens for {num_gen_seqs} sequences."
-            )
-        return num_queries // num_gen_seqs
-
-    if sum(query_lens) != num_queries and num_queries == num_gen_seqs:
-        return 1
-    if sum(query_lens) != num_queries:
-        raise RuntimeError(
-            "FP4 MLA generation query metadata does not match q shape: "
-            f"query_lens={query_lens}, total={sum(query_lens)}, "
-            f"q_tokens={num_queries}."
-        )
-    if not query_lens:
-        return 1
-    if min(query_lens) <= 0:
-        raise RuntimeError(f"FP4 MLA generation query lengths must be positive, got {query_lens}.")
-    if min(query_lens) != max(query_lens):
-        raise NotImplementedError(
-            "FP4 MLA no-dequant attention currently supports linear MTP with "
-            f"a uniform generation length per sequence, got {query_lens}."
-        )
-    return query_lens[0]
+    raise NotImplementedError(
+        "FP4 MLA no-dequant attention requires a uniform linear MTP generation "
+        f"query length; got {num_queries} query tokens for {num_gen_seqs} "
+        f"sequences (per-sequence lengths {query_lens})."
+    )
 
 
 def _run_triton_attention_decode(
@@ -1917,6 +1925,27 @@ def _run_triton_attention_decode(
     target_l1_ctas = 3 * sm_count
     num_reduce_groups = _ceil_div(target_l1_ctas, max(seqhead_ctas, 1))
     num_reduce_groups = max(1, min(num_reduce_groups, max_pages, 64))
+    # The grouped (two-level) reduce needs an auxiliary workspace, and
+    # _ensure_workspace_tensor can only (re)allocate it outside CUDA graph
+    # capture. If a warmup forward did not already size that workspace (e.g. the
+    # warmup batch took the single-level path), fall back to the single-level
+    # reduce during capture so we never allocate mid-capture. The single-level
+    # reduce is numerically identical (it just launches fewer CTAs).
+    if num_reduce_groups > 1 and torch.cuda.is_current_stream_capturing():
+        gmax = getattr(metadata, "_fp4_mla_attention_group_max_buf", None)
+        gsum = getattr(metadata, "_fp4_mla_attention_group_sum_buf", None)
+        groups_ready = (
+            gmax is not None
+            and gsum is not None
+            and gmax.shape[0] >= num_queries
+            and gmax.shape[1] >= num_reduce_groups
+            and gmax.shape[2] >= num_heads
+            and gsum.shape[0] >= num_queries
+            and gsum.shape[1] >= num_reduce_groups
+            and gsum.shape[2] >= num_heads
+        )
+        if not groups_ready:
+            num_reduce_groups = 1
     if num_reduce_groups <= 1:
         _attn_reduce_stats_kernel[(num_queries, num_head_blocks)](
             max_scores,
@@ -2049,6 +2078,21 @@ def _run_triton_attention_decode(
             if max_pages % p == 0 and max_pages // p >= 16 and base_grid * p <= 148 * 4:
                 page_split = p
                 break
+    # The page-split PV path needs a partial-output workspace, which
+    # _ensure_workspace_tensor can only (re)allocate outside CUDA graph capture.
+    # Fall back to the unsplit PV (numerically identical) during capture unless a
+    # warmup forward already sized that workspace, so capture never allocates.
+    if page_split > 1 and torch.cuda.is_current_stream_capturing():
+        pbuf = getattr(metadata, "_fp4_mla_attention_pv_partial_buf", None)
+        partial_ready = (
+            pbuf is not None
+            and pbuf.shape[0] >= num_queries
+            and pbuf.shape[1] >= page_split
+            and pbuf.shape[2] >= num_heads
+            and pbuf.shape[3] >= kv_lora_rank
+        )
+        if not partial_ready:
+            page_split = 1
     if page_split > 1:
         pages_per_split = max_pages // page_split
         partial_out = _ensure_workspace_tensor(
@@ -2372,7 +2416,11 @@ def run_fp4_mla_attention_decode(
     src_page_ids = metadata.paged_kv_indices[
         metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
     ]
-    kv_lens = metadata.kv_lens_cuda_runtime[metadata.num_contexts : metadata.num_seqs]
+    # The kv_lens runtime alias can lag at the decode anchor (seq_lens == 1) under
+    # CUDA graph / one-engine MTP; recover the true total per sequence so the
+    # per-query causal masking sees the full 1 + draft_len window (no-op when the
+    # alias already matches).
+    kv_lens, _ = _fp4_mla_uniform_generation_lengths(metadata, num_queries, num_gen_seqs)
     max_pages = _max_generation_pages(metadata)
     if max_pages == 0:
         return
@@ -2915,12 +2963,10 @@ def update_hp_kv_for_fp4_mla(
         if num_gen_tokens == 0:
             return
 
-        gen_token_lens = _host_int_list_during_forward(
-            getattr(metadata, "prompt_lens_cpu_runtime", None), num_contexts, num_seqs
-        )
-        if gen_token_lens is not None:
-            max_gen_len = max(gen_token_lens)
-        elif num_gen_tokens % num_gen == 0:
+        # Linear MTP is uniform, so derive the per-sequence generation length from
+        # the real token count rather than the prompt_lens host mirror, which can
+        # lag at the decode anchor (== 1) under CUDA graph / one-engine MTP.
+        if num_gen_tokens % num_gen == 0:
             max_gen_len = num_gen_tokens // num_gen
         else:
             max_gen_len = num_gen_tokens
