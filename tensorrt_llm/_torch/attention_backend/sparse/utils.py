@@ -1,4 +1,3 @@
-import functools
 from typing import TYPE_CHECKING, Optional
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
@@ -14,25 +13,16 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
-
-@functools.lru_cache(maxsize=1)
-def _known_algorithms() -> frozenset:
-    """Algorithm names from the ``SparseAttentionConfig`` union (derived so it
-    can't drift)."""
-    from typing import get_args
-
-    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
-    algos = set()
-    for member in get_args(get_args(SparseAttentionConfig)[0]):
-        algos.update(get_args(member.model_fields["algorithm"].annotation))
-    return frozenset(algos)
+# Hardcoded (not derived from the config union) so adding a new algorithm
+# without registering it in the dispatch below trips the warning.
+_KNOWN_ALGORITHMS = frozenset({"rocket", "dsa", "skip_softmax"})
 
 
 def _warn_if_unregistered(sparse_attn_config: "SparseAttentionConfig",
                           fallback: str) -> None:
     """Warn when a configured algorithm isn't registered in this dispatch;
     ``fallback`` is what is used instead."""
-    if sparse_attn_config.algorithm not in _known_algorithms():
+    if sparse_attn_config.algorithm not in _KNOWN_ALGORITHMS:
         logger.warning(
             f"Sparse-attention algorithm '{sparse_attn_config.algorithm}' is not "
             f"registered here; {fallback}.")
