@@ -61,7 +61,8 @@ def test_disagg_cancellation_marathon(config_filename: str) -> None:
 
     Current scope: only what the already-implemented thread bodies
     can contribute. The marathon entry point exists; the marathon
-    *content* lands incrementally as each thread body is wired up:
+    *content* lands incrementally as setup / pass-criteria wiring is
+    completed:
 
     - lifecycle plumbing (setup -> start -> wait -> stop ->
       collect_results, fail-fast event propagation, dict-shape
@@ -71,7 +72,7 @@ def test_disagg_cancellation_marathon(config_filename: str) -> None:
       (component-level coverage in ``test_log_scanner.py``).
 
     Marathon pass criteria not yet enforced here (will land alongside
-    their owning thread bodies in follow-up changes): canary error
+    their owning result aggregation in follow-up changes): canary error
     rate, recovery time after each injection, KV-cache utilization
     growth bound, injection-schedule completeness, sustained load
     throughput. Until those land, this test passes trivially after
@@ -89,13 +90,12 @@ def test_disagg_cancellation_marathon(config_filename: str) -> None:
     try:
         harness.setup()
         harness.start()
-        # Skeleton stage: stub threads exit immediately; the
-        # load-thread stub signals ``stop_event`` on exit so this
-        # returns cleanly (True) almost instantly. Once the
-        # duration-bounded load thread is wired up, the timeout
-        # becomes ``stress_config.duration_min`` plus a safety
-        # margin, and ``clean`` reports whether the marathon ran to
-        # completion without tripping fail-fast.
+        # setup() is still a stub, so no server endpoint is bound.
+        # The load thread exits and signals ``stop_event`` on that
+        # no-endpoint path, which lets this lifecycle smoke complete
+        # almost instantly. Once setup launches a real cluster, the
+        # timeout becomes ``stress_config.duration_min`` plus a safety
+        # margin.
         clean = harness.wait_until_done(timeout_s=10.0)
         assert clean is True, (
             f"wait_until_done did not return cleanly; failure_reason={harness.failure_reason!r}"
@@ -108,6 +108,7 @@ def test_disagg_cancellation_marathon(config_filename: str) -> None:
     # collector returns the expected shape so future commits can
     # extend in place.
     assert "canary_records" in results
+    assert "load_records" in results
     assert "kv_utilization_samples" in results
     assert "injection_events" in results
     assert results["failure_reason"] is None, (

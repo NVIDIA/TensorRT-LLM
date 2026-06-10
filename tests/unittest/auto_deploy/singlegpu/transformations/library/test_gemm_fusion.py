@@ -133,13 +133,17 @@ class FusableModel2_FP8(FusableModel2):
 
 
 class FusableModel3(FusableModel):
-    """Same as FusableModel1 except one GEMM is not fusable due to missing bias support."""
+    """Same as FusableModel1 plus a bias=True sibling.
+
+    Bias / no-bias linears are bucketed separately by ``FuseGemms``, so fc1+fc2
+    fuse while fc3 stays alone (single in its bias=True bucket).
+    """
 
     def __init__(self, cls=nn.Linear, **kwargs):
         super().__init__(**kwargs)
         self.fc1 = cls(self.in_features, self.out_features, bias=False)
         self.fc2 = cls(self.in_features, self.out_features, bias=False)
-        self.fc3 = cls(self.in_features, self.out_features, bias=True)  # no bias support yet
+        self.fc3 = cls(self.in_features, self.out_features, bias=True)
 
     def forward(self, x):
         y1 = self.fc1(x)
@@ -188,6 +192,49 @@ class FusableModel4_FP8(FusableModel4):
         super().__init__(**{"cls": FakeFP8Linear, **kwargs})
 
 
+class FusableModelAllBias(FusableModel):
+    """Three GEMMs sharing the same input, *all* with bias=True.
+
+    FuseGemms should fuse weight + bias into one stacked GEMM with concat(bias)
+    along dim=0.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.fc1 = nn.Linear(self.in_features, self.out_features, bias=True)
+        self.fc2 = nn.Linear(self.in_features, self.out_features, bias=True)
+        self.fc3 = nn.Linear(self.in_features, self.out_features, bias=True)
+
+    def forward(self, x):
+        return self.fc1(x) * self.fc2(x) + self.fc3(x)
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 1
+
+
+class FusableModelSplitByBias(FusableModel):
+    """Two bias=True and two bias=False linears sharing the same input.
+
+    FuseGemms must bucket them separately and emit one fused bias group + one
+    fused no-bias group (= 2 GEMMs total).
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.fc1 = nn.Linear(self.in_features, self.out_features, bias=False)
+        self.fc2 = nn.Linear(self.in_features, self.out_features, bias=False)
+        self.fc3 = nn.Linear(self.in_features, self.out_features, bias=True)
+        self.fc4 = nn.Linear(self.in_features, self.out_features, bias=True)
+
+    def forward(self, x):
+        return self.fc1(x) * self.fc2(x) + self.fc3(x) + self.fc4(x)
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 2
+
+
 # TODO: consider adding test cases for classic GQA and MLP layers
 @pytest.mark.parametrize(
     "get_model,dtype",
@@ -218,6 +265,12 @@ class FusableModel4_FP8(FusableModel4):
         (FusableModel2, "bfloat16"),
         (FusableModel3, "bfloat16"),
         (FusableModel4, "bfloat16"),
+        # Bias-fusion (all siblings share bias state) + split bucketing (bias /
+        # no-bias go into separate fusion groups).
+        (FusableModelAllBias, "float16"),
+        (FusableModelAllBias, "bfloat16"),
+        (FusableModelSplitByBias, "float16"),
+        (FusableModelSplitByBias, "bfloat16"),
         pytest.param(
             FusableModel1_M_FP8,
             "fp8",
@@ -310,6 +363,80 @@ def test_fusion(get_model: Callable[[], TestModel], dtype: str):
     reset_parameters(gm_transformed)
     y_random = gm_transformed(x)
     assert not all_close(y_model, y_random)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@torch.inference_mode()
+def test_fuse_gemms_bias_fusion_structure(dtype: str):
+    """All-bias siblings: verify the fused linear has a non-None bias.
+
+    Also checks the stacked bias tensor matches dim=0 concat of the originals.
+    """
+    torch_dtype = getattr(torch, dtype)
+    model = FusableModelAllBias().to(device="cuda", dtype=torch_dtype)
+    x = model.get_input(device="cuda", dtype=torch_dtype)
+    y_ref = model(x)
+
+    # Capture original biases (per-fc) before export.
+    orig_biases = [
+        model.fc1.bias.detach().clone(),
+        model.fc2.bias.detach().clone(),
+        model.fc3.bias.detach().clone(),
+    ]
+    expected_fused_bias = torch.cat(orig_biases, dim=0)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(None, {"fuse_gemms": {"stage": "post_load_fusion"}})(
+        None, gm
+    )
+
+    linear_nodes = [n for n in gm_transformed.graph.nodes if is_linear_op(n)]
+    assert len(linear_nodes) == 1, f"expected 1 fused linear, got {len(linear_nodes)}"
+
+    # bias arg of the fused linear must be a get_attr node (not None).
+    bias_node = linear_nodes[0].args[2]
+    assert bias_node is not None, "fused linear has None bias — bias fusion did not run"
+    assert bias_node.op == "get_attr", f"bias arg is not get_attr: {bias_node.op}"
+
+    fused_bias = gm_transformed.get_parameter(bias_node.target).detach().cpu()
+    assert fused_bias.dim() == 1, f"fused bias must be 1D, got shape {fused_bias.shape}"
+    assert fused_bias.numel() == sum(b.numel() for b in orig_biases), (
+        f"fused bias numel {fused_bias.numel()} != sum of original biases"
+    )
+    # Concat preserves values bit-for-bit.
+    torch.testing.assert_close(fused_bias, expected_fused_bias.cpu(), atol=0.0, rtol=0.0)
+
+    # Sanity: forward still matches.
+    y_fused = gm_transformed.to("cuda")(x)
+    torch.testing.assert_close(y_ref, y_fused, atol=1e-3, rtol=1e-3)
+
+
+@torch.inference_mode()
+def test_fuse_gemms_split_by_bias_bucketing():
+    """Mixed bias / no-bias siblings on the same parent.
+
+    FuseGemms must keep them in separate buckets, producing one fused linear
+    *with* bias and one *without* bias (= 2 GEMMs total).
+    """
+    model = FusableModelSplitByBias().to(device="cuda", dtype=torch.float16)
+    x = model.get_input(device="cuda", dtype=torch.float16)
+    y_ref = model(x)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(None, {"fuse_gemms": {"stage": "post_load_fusion"}})(
+        None, gm
+    )
+
+    linear_nodes = [n for n in gm_transformed.graph.nodes if is_linear_op(n)]
+    assert len(linear_nodes) == 2, f"expected 2 fused linears, got {len(linear_nodes)}"
+
+    bias_states = {n.args[2] is not None for n in linear_nodes}
+    assert bias_states == {True, False}, (
+        f"expected one bias=True and one bias=False fused linear, got {bias_states}"
+    )
+
+    y_fused = gm_transformed.to("cuda")(x)
+    torch.testing.assert_close(y_ref, y_fused, atol=1e-3, rtol=1e-3)
 
 
 # ===========================================================================
