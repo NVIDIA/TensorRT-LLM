@@ -108,13 +108,14 @@ Single-model `config.json`:
 }
 ```
 
-The ModelOpt-generated `config_groups` block can contain many groups.
-Skip-softmax scans groups whose `algorithm` is `"skip_softmax"`. `ignore`
+The ModelOpt-generated `config_groups` block can contain many groups for
+different sparse algorithms, but at most one group may configure skip-softmax.
+Multiple groups whose `algorithm` is `"skip_softmax"` are invalid. `ignore`
 carries checkpoint-provided fnmatch patterns for layers that should not receive
 skip-softmax `SparseParams`. Patterns match both full module names and
 component-relative names, so `blocks.0.attn1` matches
 `transformer.blocks.0.attn1` and `transformer_2.blocks.0.attn1`. Calibration
-defaults come from the first matching group with `threshold_scale_factor`.
+defaults come from that single skip-softmax group.
 
 Multi-model diffusers checkpoints keep calibration per component:
 

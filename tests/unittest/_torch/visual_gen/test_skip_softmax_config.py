@@ -137,6 +137,15 @@ class TestPublicApi:
 
         assert _prefill_threshold(sparse_params) == pytest.approx(7e-5 * math.exp(7.929109 * 0.5))
 
+    def test_multiple_checkpoint_skip_softmax_groups_raise(self):
+        checkpoint_config = _checkpoint_config(log_a=math.log(7e-5), b=7.929109)
+        groups = checkpoint_config["sparse_attention_config"]["config_groups"]
+        groups["group_1"] = dict(groups["group_0"])
+
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+        with pytest.raises(ValueError, match="multiple skip-softmax"):
+            config.to_sparse_params(checkpoint_config=checkpoint_config)
+
     def test_target_sparsity_without_checkpoint_formula_raises(self):
         config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
 
