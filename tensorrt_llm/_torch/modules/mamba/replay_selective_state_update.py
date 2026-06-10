@@ -255,7 +255,6 @@ def _replay_precompute_impl(
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
-    HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
@@ -273,11 +272,7 @@ def _replay_precompute_impl(
     pid_hg = tl.program_id(axis=1)  # head-group index
     first_head = pid_hg * HEADS_PER_BLOCK
 
-    # Resolve cache index for writes
-    if HAS_CACHE_BATCH_INDICES:
-        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-    else:
-        cache_batch_idx = pid_b.to(tl.int64)
+    cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
 
     # --- Cache write semantics ---
     # cache_buf_idx names this step's "active" buffer — the one with the
@@ -520,7 +515,6 @@ def _rectangle_precompute_impl(
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
-    HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -532,10 +526,7 @@ def _rectangle_precompute_impl(
     pid_hg = tl.program_id(axis=1)
     first_head = pid_hg * HEADS_PER_BLOCK
 
-    if HAS_CACHE_BATCH_INDICES:
-        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-    else:
-        cache_batch_idx = pid_b.to(tl.int64)
+    cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
 
     # Nowrite-only: write_buf = active, write_offset = PNAT.  No flip after.
     buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
@@ -887,7 +878,6 @@ def _dynamic_precompute_kernel(
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
-    HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -903,10 +893,7 @@ def _dynamic_precompute_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
     pid_b = tl.program_id(axis=0)
-    if HAS_CACHE_BATCH_INDICES:
-        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-    else:
-        cache_batch_idx = pid_b.to(tl.int64)
+    cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
 
     pnat_local = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
     needs_write_runtime = pnat_local + T > MAX_REPLAY_BUFFER_LENGTH
@@ -965,7 +952,6 @@ def _dynamic_precompute_kernel(
             stride_old_dA_cumsum_T,
             DT_SOFTPLUS,
             HAS_DT_BIAS,
-            HAS_CACHE_BATCH_INDICES,
             BLOCK_SIZE_DSTATE,
             BLOCK_SIZE_T,
             LAUNCH_WITH_PDL,
@@ -1026,7 +1012,6 @@ def _dynamic_precompute_kernel(
             stride_old_dA_cumsum_T,
             DT_SOFTPLUS,
             HAS_DT_BIAS,
-            HAS_CACHE_BATCH_INDICES,
             BLOCK_SIZE_DSTATE,
             BLOCK_SIZE_T,
             BLOCK_SIZE_K,
@@ -1143,7 +1128,6 @@ def _persistent_main_impl(
     BLOCK_SIZE_M: tl.constexpr,
     HAS_D: tl.constexpr,
     HAS_Z: tl.constexpr,
-    HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_WINDOW: tl.constexpr,
@@ -1612,7 +1596,6 @@ def _persistent_rectangle_impl(
     BLOCK_SIZE_M: tl.constexpr,
     HAS_D: tl.constexpr,
     HAS_Z: tl.constexpr,
-    HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -1780,9 +1763,6 @@ def _persistent_rectangle_impl(
 # Heuristics mirror those of the replay main kernel.
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
-@triton.heuristics(
-    {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
-)
 @triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.heuristics(
@@ -1920,7 +1900,6 @@ def _persistent_main_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     HAS_D: tl.constexpr,
     HAS_Z: tl.constexpr,
-    HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_WINDOW: tl.constexpr,
@@ -1952,7 +1931,6 @@ def _persistent_main_kernel(
     USE_TMA_LOAD_WRITE: tl.constexpr = False,
     USE_TMA_LOAD_NOWRITE: tl.constexpr = False,
     USE_TMA_STORE: tl.constexpr = False,
-    USE_REPLAY_CACHE_SLOT: tl.constexpr = True,
 ):
     # PDL signal: fire once at kernel entry (not per work unit).
     if LAUNCH_DEPENDENT_KERNELS:
@@ -2015,26 +1993,16 @@ def _persistent_main_kernel(
         pid_h = tile_id // (NUM_PID_M_BLOCKS * n_slots_local)
         work_item_idx = pid_b_local + slot_lo
         if IS_DYNAMIC:
-            if HAS_CACHE_BATCH_INDICES:
-                pid_b = work_item_idx
-                cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-            else:
-                pid_b = work_item_idx
-                cache_batch_idx = pid_b.to(tl.int64)
+            pid_b = work_item_idx
+            cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
             active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
             pnat = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
         else:
             work_item_base = replay_work_items_ptr + work_item_idx * _REPLAY_WORK_ITEM_WIDTH
-            if USE_REPLAY_CACHE_SLOT:
-                pid_b = tl.load(work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH)
-                cache_batch_idx = tl.load(work_item_base + _REPLAY_WORK_CACHE_SLOT).to(tl.int64)
-                pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
-                active_buf = tl.load(work_item_base + _REPLAY_WORK_CACHE_BUF_IDX).to(tl.int32)
-            else:
-                pid_b = tl.load(work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH)
-                cache_batch_idx = work_item_idx.to(tl.int64)
-                pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
-                active_buf = tl.load(work_item_base + _REPLAY_WORK_CACHE_BUF_IDX).to(tl.int32)
+            pid_b = tl.load(work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH)
+            cache_batch_idx = tl.load(work_item_base + _REPLAY_WORK_CACHE_SLOT).to(tl.int64)
+            pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
+            active_buf = tl.load(work_item_base + _REPLAY_WORK_CACHE_BUF_IDX).to(tl.int32)
         # Dispatch: when RECTANGLE is set, send nowrite slots to the rectangle
         # impl.  `replay_work_items` carries the cache slot, PNAT and active
         # buffer for persistent_main; persistent_dynamic resolves those once
@@ -2137,7 +2105,6 @@ def _persistent_main_kernel(
                     BLOCK_SIZE_M,
                     HAS_D,
                     HAS_Z,
-                    HAS_CACHE_BATCH_INDICES,
                     BLOCK_SIZE_DSTATE,
                     BLOCK_SIZE_T,
                     BLOCK_SIZE_WINDOW,
@@ -2216,7 +2183,6 @@ def _persistent_main_kernel(
                     BLOCK_SIZE_M,
                     HAS_D,
                     HAS_Z,
-                    HAS_CACHE_BATCH_INDICES,
                     BLOCK_SIZE_DSTATE,
                     BLOCK_SIZE_T,
                     BLOCK_SIZE_K,
@@ -2305,7 +2271,6 @@ def _persistent_main_kernel(
                 BLOCK_SIZE_M,
                 HAS_D,
                 HAS_Z,
-                HAS_CACHE_BATCH_INDICES,
                 BLOCK_SIZE_DSTATE,
                 BLOCK_SIZE_T,
                 BLOCK_SIZE_WINDOW,
@@ -3494,11 +3459,11 @@ def replay_selective_state_update(
     #               pd ignores it (per-slot runtime PNAT check).
     n_writes: torch.Tensor,
     replay_work_items: torch.Tensor,
+    state_batch_indices: torch.Tensor,
     D: torch.Tensor | None = None,
     z: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     dt_softplus: bool = False,
-    state_batch_indices: torch.Tensor | None = None,
     rand_seed: torch.Tensor | None = None,
     philox_rounds: int = 10,
     state_scales: torch.Tensor | None = None,
@@ -3540,7 +3505,6 @@ def replay_selective_state_update(
     _use_tma_replay_write_load: bool | None = None,  # SSM state load when WRITE_CHECKPOINT=True
     _use_tma_replay_write_store: bool | None = None,  # SSM state store when WRITE_CHECKPOINT=True
     _use_tma_replay_nowrite_load: bool | None = None,  # SSM state load when WRITE_CHECKPOINT=False
-    _use_replay_cache_slot: bool = True,
     # Persistent-mode tuning kwargs (consulted for both pd and pm; pd uses
     # _cta_per_sm / _num_loop_stages, pm uses the _write/_nowrite splits):
     # _cta_per_sm : int — CTAs per SM in the 1D persistent grid.  Internally
@@ -3605,7 +3569,7 @@ def replay_selective_state_update(
         D: (nheads, dim) optional feed-through parameter.
         z: (batch, T, nheads, dim) optional silu gate.
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
-        state_batch_indices: (batch,) optional cache slot mapping.
+        state_batch_indices: (batch,) int32 cache slot mapping.
         rand_seed: optional (cache_size,) int64 CUDA tensor of per-cache-slot
             Philox PRNG seeds.  The caller bumps this tensor in-place for each
             replay invocation so CUDA graph replay still gets fresh draws.  The
@@ -3726,6 +3690,7 @@ def replay_selective_state_update(
 
     cache_size, nheads, dim, dstate = state.shape
     batch, T, _, _ = x.shape
+    device = x.device
     ngroups = B.shape[2]
     assert nheads % ngroups == 0
 
@@ -3921,6 +3886,21 @@ def replay_selective_state_update(
     assert prev_num_accepted_tokens.dtype == torch.int32, (
         f"prev_num_accepted_tokens must be int32, got {prev_num_accepted_tokens.dtype}"
     )
+    assert isinstance(state_batch_indices, torch.Tensor), (
+        f"state_batch_indices must be a torch.Tensor, "
+        f"got {type(state_batch_indices).__name__}"
+    )
+    assert state_batch_indices.device == device, (
+        f"state_batch_indices must be on device {device}, got {state_batch_indices.device}"
+    )
+    assert state_batch_indices.dtype == torch.int32, (
+        f"state_batch_indices must be int32, got {state_batch_indices.dtype}"
+    )
+    assert state_batch_indices.shape == (batch,), (
+        f"state_batch_indices must have shape (batch={batch},), "
+        f"got {tuple(state_batch_indices.shape)}"
+    )
+    assert state_batch_indices.is_contiguous(), "state_batch_indices must be contiguous"
     if rand_seed is not None:
         assert rand_seed.dtype == torch.int64, (
             f"rand_seed dtype must be int64, got {rand_seed.dtype}"
@@ -3943,7 +3923,6 @@ def replay_selective_state_update(
     )
     assert tie_hdim
 
-    device = x.device
     BLOCK_SIZE_T = max(triton.next_power_of_2(T), MIN_REPLAY_TILE_SIZE)
     # Rectangle window bound = max_window.  Computed unconditionally
     # so the launch sites can refer to it; only used on the rectangle path.
@@ -4028,8 +4007,6 @@ def replay_selective_state_update(
     NUM_LOOP_STAGES_NOWRITE = (
         _num_loop_stages_nowrite if _num_loop_stages_nowrite is not None else _num_loop_stages
     )
-
-    HAS_CACHE_BATCH_INDICES = state_batch_indices is not None
 
     assert nheads % heads_per_block == 0, (
         f"nheads ({nheads}) must be divisible by heads_per_block ({heads_per_block})"
@@ -4182,7 +4159,6 @@ def replay_selective_state_update(
             old_dA_cumsum.stride(2),
             old_dA_cumsum.stride(3),
             dt_softplus,
-            HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
             LAUNCH_WITH_PDL=launch_with_pdl,
             LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
             HEADS_PER_BLOCK=heads_per_block,
@@ -4346,7 +4322,6 @@ def replay_selective_state_update(
                 and not write_checkpoint
             ),
             USE_TMA_STORE=bool(_use_tma_replay_write_store and write_checkpoint),
-            USE_REPLAY_CACHE_SLOT=bool(_use_replay_cache_slot),
             num_warps=launch_num_warps,
             **({"num_stages": launch_num_stages} if launch_num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
@@ -4475,7 +4450,6 @@ def replay_selective_state_update(
                 _use_tma_rect_load if rectangle else _use_tma_replay_nowrite_load
             ),
             USE_TMA_STORE=bool(_use_tma_replay_write_store),
-            USE_REPLAY_CACHE_SLOT=bool(_use_replay_cache_slot),
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),

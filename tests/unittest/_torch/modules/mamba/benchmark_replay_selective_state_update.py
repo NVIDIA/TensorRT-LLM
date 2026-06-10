@@ -3071,7 +3071,7 @@ def _bench_config(
                     D=D,
                     dt_bias=dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=(state_batch_indices if args.use_cache_slot else None),
+                    state_batch_indices=state_batch_indices,
                     state_scale=state_scales_work,
                     rand_seed=rand_seed,
                     philox_rounds=args.philox_rounds,
@@ -3365,7 +3365,6 @@ def _bench_config(
                     extra_kwargs["_flatten"] = bool(flatten)
                 if warp_specialize is not None:
                     extra_kwargs["_warp_specialize"] = bool(warp_specialize)
-                extra_kwargs["_use_replay_cache_slot"] = bool(args.use_cache_slot)
 
                 replay_selective_state_update(
                     state_work,
@@ -3384,7 +3383,7 @@ def _bench_config(
                     D=D,
                     dt_bias=dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=None,
+                    state_batch_indices=state_batch_indices,
                     rand_seed=rand_seed,
                     philox_rounds=args.philox_rounds,
                     use_internal_pdl=args.internal_pdl,
@@ -3477,8 +3476,6 @@ def _bench_config(
             hsort_in_cell_list = "HSORT" in getattr(args, "_cell_list_keys", ())
             if hardcode_sort or len(hsort_list_for_tags) > 1 or hsort_in_cell_list:
                 parts.append(f"HSORT={1 if hardcode_sort else 0}")
-            if not args.use_cache_slot:
-                parts.append("CSLOT=0")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
@@ -3550,7 +3547,6 @@ def _bench_config(
                     bool(rectangle_for_nowrite),
                     bool(nowrite_first),
                     bool(hardcode_sort),
-                    bool(args.use_cache_slot),
                     scenario_pre_iter is not None,
                     expected_K,
                 )
@@ -4776,14 +4772,6 @@ def _parse_args() -> argparse.Namespace:
         "Only relevant with --with-conv1d. --no-external-pdl disables.",
     )
     parser.add_argument(
-        "--use-cache-slot",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use the cache-slot field from replay_work_items in persistent_main. "
-        "--no-use-cache-slot keeps the old identity-cache-slot shortcut for "
-        "diagnostic comparisons only and requires --hardcode-sort 1.",
-    )
-    parser.add_argument(
         "--heads-per-block",
         type=str,
         default=None,
@@ -5115,8 +5103,6 @@ def _parse_args() -> argparse.Namespace:
         hsort_list.append(v == "1")
     if not hsort_list:
         hsort_list = [False]
-    if not args.use_cache_slot and not all(hsort_list):
-        parser.error("--no-use-cache-slot is a diagnostic shortcut and requires --hardcode-sort 1")
     args.hardcode_sort_list = hsort_list
 
     # mode=None means "let the wrapper resolve from _DEFAULT_TUNING".  Same

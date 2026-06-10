@@ -50,10 +50,7 @@ def _make_replay_work_items(
 ):
     """Build the replay metadata consumed by persistent_main."""
     position_in_decode_batch = torch.arange(batch, device=device, dtype=torch.int32)
-    if state_batch_indices is not None:
-        cache_slot = state_batch_indices[:batch].to(torch.int32)
-    else:
-        cache_slot = position_in_decode_batch
+    cache_slot = state_batch_indices[:batch].to(torch.int32)
     cache_slot_long = cache_slot.to(torch.long)
     pnat = prev_tokens[cache_slot_long].to(torch.int32)
     active_cache_buf_idx = cache_buf_idx[cache_slot_long].to(torch.int32)
@@ -207,7 +204,7 @@ def test_replay_selective_state_update(
         state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
     else:
         cache_size = batch
-        state_batch_indices = None
+        state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
 
     torch.manual_seed(42)
 
@@ -356,7 +353,7 @@ def test_replay_selective_state_update(
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=(state_batch_indices if paged_cache else None),
+            state_batch_indices=state_batch_indices,
             out=ref_out,
         )
 
@@ -721,6 +718,7 @@ def test_replay_selective_state_update_scenarios(
     batch = 4
     device = "cuda"
     dtype = torch.bfloat16
+    state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
 
     pnat_per_slot = torch.tensor(pnat_per_slot_list, device=device, dtype=torch.int32)
     pnat_means_write = (pnat_per_slot + T > max_window).tolist()
@@ -805,7 +803,7 @@ def test_replay_selective_state_update_scenarios(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=None,
+        state_batch_indices=state_batch_indices,
         out=ref_out,
     )
 
@@ -817,7 +815,7 @@ def test_replay_selective_state_update_scenarios(
         T,
         max_window,
         batch,
-        None,
+        state_batch_indices,
         device,
         explicit_order=explicit_order,
     )
@@ -840,7 +838,7 @@ def test_replay_selective_state_update_scenarios(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=None,
+        state_batch_indices=state_batch_indices,
         mode=mode,
         rectangle_for_nowrite=rectangle_for_nowrite,
     )
@@ -914,6 +912,7 @@ def test_replay_selective_state_update_persistent_main_device_n_writes(
     batch = 4
     device = "cuda"
     dtype = torch.bfloat16
+    state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
 
     pnat_per_slot = torch.tensor(pnat_per_slot_list, device=device, dtype=torch.int32)
     pnat_means_write = (pnat_per_slot + T > max_window).tolist()
@@ -1017,7 +1016,7 @@ def test_replay_selective_state_update_persistent_main_device_n_writes(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=None,
+        state_batch_indices=state_batch_indices,
         out=ref_out,
     )
 
@@ -1042,7 +1041,7 @@ def test_replay_selective_state_update_persistent_main_device_n_writes(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=None,
+        state_batch_indices=state_batch_indices,
         mode=mode,
         rectangle_for_nowrite=rectangle_for_nowrite,
     )
@@ -1118,7 +1117,7 @@ def test_replay_selective_state_update_philox(
         state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
     else:
         cache_size = batch
-        state_batch_indices = None
+        state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
 
     torch.manual_seed(42)
 
@@ -1342,6 +1341,7 @@ def test_philox_rounding_unbiased(state_dtype):
     C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
 
     prev_tokens = torch.full((batch,), T, device=device, dtype=torch.int32)
+    state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
 
     # max_window = old_x.shape[2] = T (after dbuf at axis 1)
     _n_writes_unb, _replay_work_items_unb = _make_replay_work_items(
@@ -1350,7 +1350,7 @@ def test_philox_rounding_unbiased(state_dtype):
         T,
         T,
         batch,
-        None,
+        state_batch_indices,
         device,
     )
     common_kwargs = dict(
@@ -1362,6 +1362,7 @@ def test_philox_rounding_unbiased(state_dtype):
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
+        state_batch_indices=state_batch_indices,
         n_writes=_n_writes_unb,
         replay_work_items=_replay_work_items_unb,
     )
@@ -1614,6 +1615,7 @@ def test_replay_heads_per_block(
             ref_state_f32[slot] = states_buffer_f32[slot, pnat_list[slot] - 1]
     ref_state_after_replay = ref_state_f32.clone()
     ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
     selective_state_update(
         ref_state_f32,
         x2,
@@ -1624,7 +1626,7 @@ def test_replay_heads_per_block(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=None,
+        state_batch_indices=state_batch_indices,
         out=ref_out,
     )
 
@@ -1651,7 +1653,7 @@ def test_replay_heads_per_block(
         T,
         max_window,
         batch,
-        None,
+        state_batch_indices,
         device,
     )
 
@@ -1674,7 +1676,7 @@ def test_replay_heads_per_block(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=None,
+        state_batch_indices=state_batch_indices,
         mode=mode,
         rectangle_for_nowrite=rectangle_nowrite,
         _heads_per_block=heads_per_block,
@@ -1880,7 +1882,7 @@ def test_replay_heads_per_block_multistep(
         state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
     else:
         cache_size = batch
-        state_batch_indices = None
+        state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
 
     all_x = []
     all_dt = []
@@ -1925,9 +1927,7 @@ def test_replay_heads_per_block_multistep(
             acc = accepted_per_slot[s_local]
             if acc == 0:
                 continue
-            c_idx = (
-                state_batch_indices[s_local].item() if state_batch_indices is not None else s_local
-            )
+            c_idx = state_batch_indices[s_local].item()
             s_state = ref_state[c_idx : c_idx + 1].clone()
             s_x = all_x[step][s_local : s_local + 1, :acc].contiguous()
             s_dt = all_dt[step][s_local : s_local + 1, :acc].contiguous()
@@ -1965,10 +1965,7 @@ def test_replay_heads_per_block_multistep(
 
     for step in range(n_steps):
         prev_tokens = torch.zeros(cache_size, device=device, dtype=torch.int32)
-        if state_batch_indices is not None:
-            prev_tokens[state_batch_indices.long()] = pnat_active
-        else:
-            prev_tokens[:] = pnat_active
+        prev_tokens[state_batch_indices.long()] = pnat_active
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         n_writes_t, replay_work_items_t = _make_replay_work_items(
             prev_tokens,
@@ -2015,11 +2012,7 @@ def test_replay_heads_per_block_multistep(
             pnat_active + accepted_tensor,
         )
         pnat_active = new_pnat_active
-        cache_active_idx = (
-            state_batch_indices.long()
-            if state_batch_indices is not None
-            else torch.arange(batch, device=device)
-        )
+        cache_active_idx = state_batch_indices.long()
         write_slots = cache_active_idx[write_mask]
         cache_buf_idx[write_slots] = 1 - cache_buf_idx[write_slots]
 
