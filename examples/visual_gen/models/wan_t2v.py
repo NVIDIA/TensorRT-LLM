@@ -18,11 +18,22 @@
 Usage:
     python wan_t2v.py
     python wan_t2v.py --visual_gen_args ../configs/wan2.2-t2v-fp4-1gpu.yaml
+    python wan_t2v.py --enable_offloading \
+        --offload_stages text_encoder,denoising_transformer,denoising_transformer_2,vae
 """
 
 import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+
+
+def _parse_offload_stages(offload_stages: str | None) -> list[str] | None:
+    if offload_stages is None:
+        return None
+    stages = [stage.strip() for stage in offload_stages.split(",") if stage.strip()]
+    if not stages:
+        raise ValueError("--offload_stages must contain at least one stage name")
+    return stages
 
 
 def main():
@@ -42,6 +53,21 @@ def main():
         help="Path to YAML config (same as trtllm-serve --visual_gen_args)",
     )
     parser.add_argument(
+        "--enable_offloading",
+        action="store_true",
+        help="Enable Wan T2V text-encoder/transformer-block CPU offloading.",
+    )
+    parser.add_argument(
+        "--offload_stages",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated offload stage names, e.g. "
+            "text_encoder,denoising_transformer,denoising_transformer_2,vae. "
+            "Implies --enable_offloading."
+        ),
+    )
+    parser.add_argument(
         "--output_path",
         type=str,
         default="wan_t2v_output.avi",
@@ -50,8 +76,18 @@ def main():
     args = parser.parse_args()
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
-    extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
-    visual_gen = VisualGen(model=args.model, args=extra_args)
+    if args.visual_gen_args:
+        visual_gen_args = VisualGenArgs.from_yaml(args.visual_gen_args)
+    else:
+        visual_gen_args = VisualGenArgs()
+
+    offload_stages = _parse_offload_stages(args.offload_stages)
+    if args.enable_offloading or offload_stages is not None:
+        visual_gen_args.cpu_offload_config.enable = True
+        if offload_stages is not None:
+            visual_gen_args.cpu_offload_config.stages = offload_stages
+
+    visual_gen = VisualGen(model=args.model, args=visual_gen_args)
 
     # --- Model-specific: T2V request construction ---
     # Start from per-model defaults (steps, guidance, seed, etc.) and override resolution/frames.

@@ -18,6 +18,7 @@ from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
+from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -122,7 +123,9 @@ class BasePipeline(nn.Module):
         self.pipeline_config = pipeline_config
         self.config = pipeline_config.primary_pretrained_config
         self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
+        self._device = torch.device(getattr(pipeline_config, "device", "cuda"))
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self.offloader = PipelineOffloader(self)
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
 
@@ -180,6 +183,12 @@ class BasePipeline(nn.Module):
             )
             return
 
+        if self.offloader.stages():
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph_config.enable or cpu_offload_config.enable."
+            )
+
         if len(self.transformer_components) > 1:
             logger.info(
                 "CUDA graph runner: multiple transformer components, using shared graph pool"
@@ -214,12 +223,12 @@ class BasePipeline(nn.Module):
 
     @property
     def device(self):
-        return self.transformer.device
+        return self._device
 
     @property
-    def transformer_components(self) -> list:
-        """Return list of transformer components this pipeline needs."""
-        return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
+    def transformer_components(self) -> list[str]:
+        """Return names of transformer components this pipeline needs."""
+        return [PipelineComponent.TRANSFORMER.value] if self.transformer is not None else []
 
     def warmup_cache_key(self, height: int, width: int, num_frames: int) -> tuple:
         """Return the cache key for a given warmup shape.
@@ -395,6 +404,59 @@ class BasePipeline(nn.Module):
     def post_load_weights(self) -> None:
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
+
+    def default_offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
+        """Return model-specific offload stages requested by shorthand config.
+
+        Each stage is a tuple of component names from ``offload_pipeline_components``.
+        Components in the same stage are brought onto the GPU together.
+        """
+        return ()
+
+    def extra_offload_component_names(self) -> set[str]:
+        """Return component names that are valid in configured stages but may be absent.
+
+        These are accepted during stage validation even when missing from
+        ``offload_pipeline_components`` (e.g. rank-0-only components that other ranks
+        drop later). Defaults to an empty set; models override as needed.
+        """
+        return set()
+
+    def offload_pipeline_components(self) -> dict[str, nn.Module]:
+        """Expose standard component subtrees for offloading.
+
+        This default assumes the common diffusers-style layout: a ``text_encoder``,
+        a ``vae``, and one or more transformers each exposing their decoder layers
+        as ``.blocks``. Models that deviate from this naming/structure (e.g. Cosmos3,
+        whose towers live inside a single ``transformer`` module) must override this
+        to expose their own offloadable components.
+
+        NOTE: this attribute-name based detection is convenient but brittle; if we
+        extend offloading to more model families it may be worth replacing with an
+        explicit per-model declaration instead of relying on these conventions.
+        """
+        components: dict[str, nn.Module] = {}
+        text_encoder = getattr(self, PipelineComponent.TEXT_ENCODER.value, None)
+        if text_encoder is not None:
+            components[PipelineComponent.TEXT_ENCODER.value] = text_encoder
+
+        vae = getattr(self, PipelineComponent.VAE.value, None)
+        if vae is not None:
+            components[PipelineComponent.VAE.value] = vae
+
+        for component_name in self.transformer_components:
+            transformer = getattr(self, component_name, None)
+            blocks = getattr(transformer, "blocks", None) if transformer is not None else None
+            if blocks is not None:
+                public_name = transformer_component_offload_name(
+                    component_name, PipelineComponent.TRANSFORMER.value
+                )
+                components[public_name] = blocks
+        return components
+
+    def initialize_offload_pipeline(self) -> None:
+        """Create and initialize the offload pipeline after weights are loaded."""
+        self.offloader.initialize()
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
         """Pick TeaCache coefficients from checkpoint path; updates pipeline config in place."""
@@ -1121,6 +1183,7 @@ class BasePipeline(nn.Module):
         """Call before dist.destroy_process_group()."""
         self._cuda_profiler_stop()
 
+        self.offloader.cleanup()
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()
