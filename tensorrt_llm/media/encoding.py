@@ -141,45 +141,47 @@ class _FfmpegCliEncoder(_VideoEncoder):
                 audio_output_args = ["-c:a", "aac", "-shortest"]
 
             ffmpeg_path = _get_ffmpeg_path()
-            cmd = [
-                ffmpeg_path,
-                "-y",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgb24",
-                "-s",
-                f"{width}x{height}",
-                "-r",
-                str(frame_rate),
-                "-i",
-                "-",
-                *audio_input_args,
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
-                *audio_output_args,
-                output_path,
-            ]
+            # Prototype: TRTLLM_VIDEO_NVENC=1 attempts the NVENC H.264 hardware
+            # encoder (-cq + named presets p1..p7), then falls back to CPU libx264
+            # if NVENC can't open a session. NB: datacenter GPUs (A100/H100, and
+            # GB200/GB300 Blackwell) have NO usable NVENC engine -> the attempt
+            # fails with "unsupported device" and we fall back. Kept for GPUs that
+            # do have NVENC; on GB300 this is effectively libx264.
+            libx264_args = ["-c:v", "libx264", "-pix_fmt", "yuv420p",
+                            "-preset", "medium", "-crf", "23"]
+            nvenc_args = ["-c:v", "h264_nvenc", "-pix_fmt", "yuv420p",
+                          "-preset", "p4", "-cq", "23"]
+            want_nvenc = os.environ.get("TRTLLM_VIDEO_NVENC", "0") == "1"
+            raw_frames = video_np.tobytes()
 
-            try:
-                process = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                raw_frames = video_np.tobytes()
-                _, stderr = process.communicate(input=raw_frames)
-                if process.returncode != 0:
-                    raise RuntimeError(f"ffmpeg encoding failed: {stderr.decode()}")
-            except FileNotFoundError:
-                raise RuntimeError("ffmpeg not found. Install ffmpeg for video encoding.")
+            def _run_ffmpeg(codec_args: list) -> Tuple[int, bytes]:
+                cmd = [
+                    ffmpeg_path, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                    "-s", f"{width}x{height}", "-r", str(frame_rate), "-i", "-",
+                    *audio_input_args, *codec_args, *audio_output_args, output_path,
+                ]
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    _, err = proc.communicate(input=raw_frames)
+                    return proc.returncode, err
+                except FileNotFoundError:
+                    raise RuntimeError("ffmpeg not found. Install ffmpeg for video encoding.")
+
+            if want_nvenc:
+                rc, stderr = _run_ffmpeg(nvenc_args)
+                if rc != 0:
+                    logger.warning(
+                        "h264_nvenc encode failed (rc=%s); falling back to libx264. "
+                        "ffmpeg: %s", rc, stderr.decode(errors="replace")[-300:]
+                    )
+                    rc, stderr = _run_ffmpeg(libx264_args)
+            else:
+                rc, stderr = _run_ffmpeg(libx264_args)
+            if rc != 0:
+                raise RuntimeError(f"ffmpeg encoding failed: {stderr.decode(errors='replace')}")
 
         logger.info(f"Saved video{' with audio' if audio is not None else ''} to {output_path}")
         return output_path
@@ -385,6 +387,8 @@ def resolve_video_format(output_format) -> Tuple[str, str]:
         )
     elif output_format == "avi":
         return "avi", ".avi"
+    elif output_format == "raw":
+        return "raw", ".rgb.bin"
     elif output_format == "auto":
         if _check_ffmpeg_available():
             return "mp4", ".mp4"
@@ -559,6 +563,22 @@ def save_video(
 
     if format in ("mp4", "avi"):
         return _save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate)
+    if format == "raw":
+        # No encoding: dump uint8 RGB bytes directly (T*H*W*3 layout).
+        # Audio is dropped — raw mode only carries video pixel data.
+        tensor = video
+        if hasattr(tensor, "detach"):
+            tensor = tensor.detach()
+        if hasattr(tensor, "cpu"):
+            tensor = tensor.cpu()
+        if getattr(tensor, "dtype", None) is not None and tensor.dtype != torch.uint8:
+            if tensor.dtype.is_floating_point:
+                tensor = (tensor.clamp(0, 1) * 255.0).to(torch.uint8)
+            else:
+                tensor = tensor.to(torch.uint8)
+        with open(output_path, "wb") as f:
+            f.write(tensor.contiguous().numpy().tobytes())
+        return output_path
     logger.warning(f"Unsupported video format: {format}, defaulting to mp4")
     output_path = output_path.rsplit(".", 1)[0] + ".mp4"
     return _save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate)
