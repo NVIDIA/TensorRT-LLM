@@ -181,14 +181,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
             # Extra blocks from num_extra_kv_tokens (speculative decoding) have
             # uninitialized KV data and must not be transferred.
-            prompt_blocks = (req.prompt_len + tpb - 1) // tpb
-            if block_ids.size > prompt_blocks:
-                block_ids = block_ids[:prompt_blocks]
+            total_blocks = (req.prompt_len + tpb - 1) // tpb
+            if block_ids.size > total_blocks:
+                block_ids = block_ids[:total_blocks]
             window_size = lg.sliding_window_size
 
             if window_size is not None:
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                total_blocks = (req.prompt_len + tpb - 1) // tpb
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, total_blocks - stale_end)
                 if block_ids.size > expected_valid:
