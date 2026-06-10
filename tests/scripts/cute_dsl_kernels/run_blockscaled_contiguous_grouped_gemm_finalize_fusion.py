@@ -680,7 +680,6 @@ def run(
         current_stream,
         permuted_idx_to_expanded_idx,
         token_final_scales,
-        options="--opt-level 2",
     )
 
     # Compute reference result
