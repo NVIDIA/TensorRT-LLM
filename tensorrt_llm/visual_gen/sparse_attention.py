@@ -121,18 +121,12 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     ) -> bool:
         """Return whether skip-softmax should be disabled for this layer."""
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-            skip_softmax_ignore_patterns_from_checkpoint_config,
+            skip_softmax_ignore_from_checkpoint_config,
         )
 
         candidate_names = self._layer_pattern_match_names(module_name)
-        ignore_patterns = (
-            skip_softmax_ignore_patterns_from_checkpoint_config(checkpoint_config) or ()
-        )
-        return any(
-            fnmatch.fnmatch(name, pattern)
-            for pattern in ignore_patterns
-            for name in candidate_names
-        )
+        ignore = skip_softmax_ignore_from_checkpoint_config(checkpoint_config) or ()
+        return any(fnmatch.fnmatch(name, pattern) for pattern in ignore for name in candidate_names)
 
     @staticmethod
     def _layer_pattern_match_names(module_name: str) -> tuple[str, ...]:
