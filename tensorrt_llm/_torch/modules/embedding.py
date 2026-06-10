@@ -161,18 +161,25 @@ def pre_comm_embedding_ops(
     padding_size: int,
 ):
     # Generate the mask for the input if needed.
+    input_mask = None
     if tp_mode == TensorParallelMode.COLUMN:
         input_, input_mask = get_masked_input_and_mask(
             input_,
             vocab_start_index,
             vocab_end_index,
         )
+    elif tp_mode is None:
+        input_, input_mask = get_masked_input_and_mask(
+            input_,
+            0,
+            weight.shape[0],
+        )
 
     # Get the embeddings.
     output = F.embedding(input_, weight)
 
     # Mask or pad the output if needed.
-    if tp_mode == TensorParallelMode.COLUMN:
+    if input_mask is not None:
         output.masked_fill_(input_mask, 0)
     elif tp_mode == TensorParallelMode.ROW:
         if gather_output:
