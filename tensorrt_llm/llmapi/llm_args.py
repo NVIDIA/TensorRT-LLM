@@ -732,19 +732,30 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
             SkipSoftmaxParams, SkipSoftmaxScheduler,
-            skip_softmax_target_sparsity_from_checkpoint_config)
+            skip_softmax_target_sparsity_from_ckpt_sparse_attention_config)
 
+        ckpt_sparse_attention_config = kwargs.get(
+            "ckpt_sparse_attention_config", None)
         checkpoint_config = kwargs.get("checkpoint_config", None)
+        if ckpt_sparse_attention_config is None and isinstance(
+                checkpoint_config, dict):
+            ckpt_sparse_attention_config = checkpoint_config.get(
+                "sparse_attention_config", checkpoint_config)
         pretrained_config = kwargs.get("pretrained_config", None)
-        if checkpoint_config is None and pretrained_config is not None:
-            checkpoint_config = getattr(pretrained_config,
-                                        "sparse_attention_config", None)
+        if ckpt_sparse_attention_config is None and isinstance(
+                pretrained_config, dict):
+            ckpt_sparse_attention_config = pretrained_config.get(
+                "sparse_attention_config", pretrained_config)
+        if ckpt_sparse_attention_config is None and pretrained_config is not None:
+            ckpt_sparse_attention_config = getattr(pretrained_config,
+                                                   "sparse_attention_config",
+                                                   None)
         target_sparsity = self.target_sparsity
         if target_sparsity is None:
-            target_sparsity = skip_softmax_target_sparsity_from_checkpoint_config(
-                checkpoint_config)
+            target_sparsity = skip_softmax_target_sparsity_from_ckpt_sparse_attention_config(
+                ckpt_sparse_attention_config)
         if (self.threshold_scale_factor is None and target_sparsity is not None
-                and not isinstance(checkpoint_config, dict)):
+                and not isinstance(ckpt_sparse_attention_config, dict)):
             raise ValueError(
                 "sparse_attention_config with target_sparsity requires formula "
                 "coefficients in the model's config.json "
@@ -752,10 +763,12 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                 "threshold_scale_factor.{prefill,decode}.{a,b}), "
                 "but sparse_attention_config was not found or was not dict type in config.json."
             )
-        scheduler = (SkipSoftmaxScheduler.from_threshold_scale_factor(
-            self.threshold_scale_factor) if self.threshold_scale_factor
-                     is not None else SkipSoftmaxScheduler.from_target_sparsity(
-                         target_sparsity, checkpoint_config=checkpoint_config))
+        scheduler = (
+            SkipSoftmaxScheduler.from_threshold_scale_factor(
+                self.threshold_scale_factor) if self.threshold_scale_factor
+            is not None else SkipSoftmaxScheduler.from_target_sparsity(
+                target_sparsity,
+                ckpt_sparse_attention_config=ckpt_sparse_attention_config))
         return SkipSoftmaxParams(scheduler=scheduler)
 
 
