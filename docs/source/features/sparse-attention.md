@@ -151,7 +151,7 @@ Example checkpoint config:
 
 The checkpoint config may contain multiple `config_groups` for different sparse attention algorithms. At most one group may configure Skip Softmax Attention. Multiple groups whose `algorithm` is `skip_softmax` are invalid.
 
-- `formula` — an **arbitrary** [numexpr](https://numexpr.readthedocs.io/) expression of `target_sparsity` and one or more named coefficients. Standard math functions such as `exp`, `log`, `sqrt`, `pow`, and `**` are available. The runtime parses and evaluates it directly, so calibration is not locked to a fixed functional form. It can be configured separately for prefill and decode; otherwise both phases use the same config.
+- `formula` — an **arbitrary** [numexpr](https://numexpr.readthedocs.io/) expression of `threshold_scale_factor` using `target_sparsity` and one or more named coefficients. Standard math functions such as `exp`, `log`, `sqrt`, `pow`, and `**` are available. The runtime parses and evaluates it directly, so calibration is not locked to a fixed functional form. It can be configured separately for prefill and decode; otherwise both phases use the same config.
 - `target_sparsity` — optional checkpoint-provided target values. It can be configured separately for prefill and decode; otherwise both phases use the same config.
 - `ignore` — optional fnmatch layer patterns where the calibrated Skip Softmax Attention config should not apply.
 
