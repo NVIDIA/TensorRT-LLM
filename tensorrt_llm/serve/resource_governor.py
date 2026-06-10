@@ -19,6 +19,7 @@ PyExecutor via a dedicated resource governor queue, bypassing the
 LLM/Proxy/Worker chain.
 """
 
+import asyncio
 import traceback
 from http import HTTPStatus
 from typing import Callable, List, Optional
@@ -27,7 +28,7 @@ from fastapi import FastAPI
 from starlette.responses import JSONResponse, Response
 
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
-from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
+from tensorrt_llm.inputs.utils import ConversationMessage, async_apply_chat_template
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
@@ -86,7 +87,7 @@ class ResourceGovernor:
         queue.put(request)
         return None
 
-    def _convert_messages(
+    async def _convert_messages(
         self,
         messages,
         tool_dicts,
@@ -97,20 +98,24 @@ class ResourceGovernor:
     ) -> List[int]:
         """Convert chat messages to token IDs via chat template + tokenization."""
         conversation: List[ConversationMessage] = []
-        conversation, _, __ = parse_chat_messages_coroutines(messages, self.model_config, None)
-        return apply_chat_template(
+        conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+            messages, self.model_config, None
+        )
+        token_task = async_apply_chat_template(
             model_type=self.model_config.model_type,
             tokenizer=self.tokenizer,
             processor=self.processor,
             conversation=conversation,
             add_generation_prompt=add_generation_prompt,
-            mm_placeholder_counts=[],
+            mm_placeholder_counts=mm_placeholder_counts,
             tools=tool_dicts,
             documents=documents,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs or {},
             enable_tokenize=True,
         )
+        token_ids, _ = await asyncio.gather(token_task, mm_coroutines)
+        return token_ids
 
     async def _truncate_kv_cache(self, request: KVCacheTruncateRequest) -> Response:
         try:
@@ -120,7 +125,7 @@ class ResourceGovernor:
             chat_template_kwargs = request.chat_template_kwargs or {}
 
             messages_to_retain = (
-                self._convert_messages(
+                await self._convert_messages(
                     request.messages_to_retain,
                     tool_dicts,
                     request.add_generation_prompt,
@@ -133,7 +138,7 @@ class ResourceGovernor:
             )
 
             messages = (
-                self._convert_messages(
+                await self._convert_messages(
                     request.messages,
                     tool_dicts,
                     request.add_generation_prompt,
