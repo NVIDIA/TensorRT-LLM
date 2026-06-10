@@ -40,8 +40,8 @@ from defs.examples.test_visual_gen import (
 )
 
 try:
+    from tensorrt_llm._torch.visual_gen.config import ParallelConfig
     from tensorrt_llm._utils import get_free_port
-    from tensorrt_llm.visual_gen.args import ParallelConfig
 
     MODULES_AVAILABLE = True
 except ImportError:
