@@ -44,6 +44,15 @@ def _get_cosmos3_model_paths(config: PretrainedConfig) -> Tuple[str, str, str]:
 
     return root_path, llm_path, vision_path
 
+PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
+    placeholder_map={
+        "image": "<|vision_start|><|image_pad|><|vision_end|>",
+        "video": "<|vision_start|><|video_pad|><|vision_end|>",
+    },
+    placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    placeholders_separator="",
+    content_format=ContentFormat.STRING,
+)
 
 @support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
@@ -51,15 +60,13 @@ def _get_cosmos3_model_paths(config: PretrainedConfig) -> Tuple[str, str, str]:
 @register_input_processor(
     Qwen3VLInputProcessorBase,
     model_type="cosmos3",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            "image": "<|vision_start|><|image_pad|><|vision_end|>",
-            "video": "<|vision_start|><|video_pad|><|vision_end|>",
-        },
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        placeholders_separator="",
-        content_format=ContentFormat.STRING,
-    ),
+    placeholder_metadata=PLACEHOLDER_METADATA
+)
+# cosmos3_omni is the backward-compat alias for cosmos3, remove it when checkpoints migrate to cosmos3
+@register_input_processor(
+    Qwen3VLInputProcessorBase,
+    model_type="cosmos3_omni",
+    placeholder_metadata=PLACEHOLDER_METADATA
 )
 class Cosmos3Model(Qwen3VLModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
