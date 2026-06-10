@@ -486,8 +486,9 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attn_config=self.sparse_attention_config)
 
         self.spec_metadata = None
-        if self.is_spec_decode and not self.is_draft_model:
-            update_spec_config_from_loaded_model(self.spec_config, self.model)
+        if self.is_spec_decode:
+            if not self.is_draft_model:
+                update_spec_config_from_loaded_model(self.spec_config, self.model)
             max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
