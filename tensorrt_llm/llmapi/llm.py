@@ -1539,9 +1539,6 @@ class _TorchLLM(BaseLLM):
         if self.args.video_pruning_rate is not None:
             input_processor_kwargs[
                 'video_pruning_rate'] = self.args.video_pruning_rate
-        if getattr(self.args, 'input_processor', None) is not None:
-            input_processor_kwargs[
-                'input_processor'] = self.args.input_processor
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,

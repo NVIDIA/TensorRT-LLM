@@ -880,18 +880,13 @@ def create_input_processor(
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
         **kwargs: Additional arguments passed to input processor constructors
-            (e.g., video_pruning_rate for multimodal models).  A special key
-            ``input_processor`` (str) overrides automatic processor selection with
-            the named registered model_type.
+            (e.g., video_pruning_rate for multimodal models).
 
     Returns:
         An InputProcessor implementation (model-specific if registered; otherwise DefaultInputProcessor).
     """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import get_model_architecture
-
-    # Pop the override before passing kwargs to constructors.
-    input_processor_override = kwargs.pop("input_processor", None)
 
     config = None
 
@@ -908,19 +903,15 @@ def create_input_processor(
         logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
+        from tensorrt_llm._torch.models.modeling_mistral import \
+            MistralNativeInputProcessor
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
-        # The only case where a model class may use two processors.
-        # Will need a more generic approach if more such models appear.
-        if input_processor_override == "mistral_common":
-            from tensorrt_llm._torch.models.modeling_mistral import \
-                MistralNativeInputProcessor
-            return MistralNativeInputProcessor(
-                model_path_or_dir,
-                config,
-                tokenizer,
-                trust_remote_code=trust_remote_code,
-                **kwargs)
+        return MistralNativeInputProcessor(model_path_or_dir,
+                                           config,
+                                           tokenizer,
+                                           trust_remote_code=trust_remote_code,
+                                           **kwargs)
     else:
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")
