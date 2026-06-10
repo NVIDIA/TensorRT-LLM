@@ -16,9 +16,12 @@
 """Tests for OpenELM custom model implementation.
 
 Compares the custom AD model against an inline HF reference implementation.
-The HF config is loaded via trust_remote_code=True; for unit tests we create
-a small config using the same class.
+Unit tests construct a small config with the vendored ``OpenELMConfig`` —
+the same class production code uses — so the per-layer derivation logic is
+exercised by every test.
 """
+
+import json
 
 import pytest
 import torch
@@ -26,11 +29,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _model_test_utils import assert_rmse_close
 from torch.export import Dim
-from transformers import PretrainedConfig
+from transformers import AutoConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import (
     OpenELMAttention,
+    OpenELMConfig,
     OpenELMDecoderLayer,
     OpenELMFeedForwardNetwork,
     OpenELMForCausalLM,
@@ -52,28 +57,21 @@ def set_seed():
 # =============================================================================
 
 
-class _TestOpenELMConfig(PretrainedConfig):
-    """Standalone test config matching OpenELM's attribute interface."""
+def _create_small_config() -> OpenELMConfig:
+    """Create a small OpenELM config for testing (no network access needed).
 
-    model_type = "openelm"
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-        super().__init__()
-
-
-def _create_small_config():
-    """Create a small OpenELM config for testing (no network access needed)."""
-    return _TestOpenELMConfig(
+    Uses the vendored ``OpenELMConfig`` directly so its per-layer derivation
+    runs in every test. ``qkv_multipliers=[0.5, 1.0]`` derives varying
+    per-layer heads: num_query_heads=[2, 4, 4], num_kv_heads=[1, 2, 2].
+    """
+    return OpenELMConfig(
         vocab_size=1000,
         max_context_length=128,
         num_transformer_layers=3,
         model_dim=64,
         head_dim=16,
+        qkv_multipliers=[0.5, 1.0],
         num_gqa_groups=2,
-        num_query_heads=[2, 3, 4],
-        num_kv_heads=[1, 1, 2],
         ffn_multipliers=[0.5, 2.0, 4.0],
         ffn_with_glu=True,
         ffn_dim_divisor=16,
@@ -522,8 +520,6 @@ _EXPECTED_3B_NUM_KV_HEADS = [
 
 
 def test_openelm_config_derivation_matches_apple():
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
-
     # `use_cache=True` would crash Apple's remote config under transformers 5.x;
     # the vendored class must accept it without raising.
     config = OpenELMConfig(use_cache=True, **_OPENELM_270M)
@@ -540,8 +536,6 @@ def test_openelm_config_derivation_matches_apple():
 
 def test_openelm_config_derivation_matches_apple_3b():
     """Derivation must also be correct for a different size point (3B, head_dim=128)."""
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
-
     config = OpenELMConfig(use_cache=True, **_OPENELM_3B)
 
     assert config.num_transformer_layers == 36
@@ -575,8 +569,6 @@ def test_openelm_config_fulfills_config_subclass_contract():
     Shadowing that hook with a legacy zero-kwarg method is what crashed
     Apple's original class.
     """
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
-
     config = OpenELMConfig(use_cache=True, some_future_field=123, **_OPENELM_270M)
 
     # Duty 1 + Duty 2 end-to-end: an unknown key can only become an attribute by
@@ -594,10 +586,6 @@ def test_openelm_config_fulfills_config_subclass_contract():
 
 
 def test_openelm_config_registered_as_local_class():
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
-
     assert "openelm" in CONFIG_MAPPING
     registered = CONFIG_MAPPING["openelm"]
     assert registered is OpenELMConfig
@@ -613,13 +601,6 @@ def test_openelm_autoconfig_prefers_local_over_remote(tmp_path):
     configuration_openelm.py on disk, so a remote-code path would fail — the
     local class is used. This proves Apple's remote code never runs.
     """
-    import json
-
-    from transformers import AutoConfig
-
-    # Importing the modeling module triggers AutoConfig.register("openelm", ...).
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
-
     config_json = {
         "model_type": "openelm",
         "auto_map": {"AutoConfig": "configuration_openelm.OpenELMConfig"},
