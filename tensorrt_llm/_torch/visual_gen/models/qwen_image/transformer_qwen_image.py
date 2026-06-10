@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
@@ -465,6 +466,7 @@ class QwenJointAttention(Attention):
         )
         self.heads = num_attention_heads
         self.head_dim = attention_head_dim
+        self._uses_ulysses_attention = type(self.attn).__name__ == "UlyssesAttention"
 
         # Text-stream QKV (diffusers names).
         self.add_q_proj = Linear(
@@ -570,25 +572,26 @@ class QwenJointAttention(Attention):
         joint_k = joint_k.transpose(1, 2)
         joint_v = joint_v.transpose(1, 2)
 
-        attn_mask = None
-        if attention_mask is not None:
-            # attention_mask is (B, Sjoint) bool or float. Expand to
-            # (B, 1, 1, Sjoint) so SDPA broadcasts over (H, Sq).
-            # Qwen pads text embeddings before concatenating [text | image],
-            # so masked SDPA is required to ignore padded text tokens.
-            attn_mask = attention_mask[:, None, None, :]
+        key_padding_mask = None
+        if attention_mask is not None and not bool(attention_mask.all()):
+            # attention_mask is (B, Sjoint) bool; True = valid key.  Pass it
+            # through the shared attention path so Ulysses all-to-all remains
+            # active instead of falling back to local-rank SDPA.
+            key_padding_mask = attention_mask.to(torch.bool)
 
-        if attn_mask is None:
+        if key_padding_mask is None:
             out = self._attn_impl(
                 joint_q.transpose(1, 2).flatten(2),
                 joint_k.transpose(1, 2).flatten(2),
                 joint_v.transpose(1, 2).flatten(2),
             )
         else:
-            out = F.scaled_dot_product_attention(
-                joint_q, joint_k, joint_v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+            out = self._attn_impl(
+                joint_q.transpose(1, 2).flatten(2),
+                joint_k.transpose(1, 2).flatten(2),
+                joint_v.transpose(1, 2).flatten(2),
+                key_padding_mask=key_padding_mask,
             )
-            out = out.transpose(1, 2).flatten(2, 3).to(joint_q.dtype)
 
         txt_attn_output = out[:, :seq_txt, :]
         img_attn_output = out[:, seq_txt:, :]
@@ -769,6 +772,12 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         self.num_attention_heads = num_attention_heads
         self.joint_attention_dim = joint_attention_dim
         self.inner_dim = num_attention_heads * attention_head_dim
+        vgm = self.model_config.visual_gen_mapping
+        self.sharder = SequenceSharder.from_vgm(
+            vgm,
+            num_attention_heads=num_attention_heads,
+            num_kv_heads=num_attention_heads,
+        )
 
         self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
         self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
@@ -965,13 +974,29 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
         text_seq_len = encoder_hidden_states.shape[1]
+        padded_text_seq_len = text_seq_len
+        if self.sharder.is_active and text_seq_len % self.sharder.size != 0:
+            padded_text_seq_len += self.sharder.size - (text_seq_len % self.sharder.size)
+
+        hidden_states = self.sharder.shard(hidden_states, dim=1)
+        encoder_hidden_states = self.sharder.shard(
+            encoder_hidden_states,
+            dim=1,
+            pad_to_multiple=True,
+        )
 
         # Timestep-conditioning vector.
         temb = self.time_text_embed(timestep, hidden_states)
 
         image_rotary_emb = self.pos_embed(
-            img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device
+            img_shapes, max_txt_seq_len=padded_text_seq_len, device=hidden_states.device
         )
+        if self.sharder.is_active:
+            img_freqs, txt_freqs = image_rotary_emb
+            image_rotary_emb = (
+                self.sharder.shard(img_freqs, dim=0),
+                self.sharder.shard(txt_freqs, dim=0),
+            )
 
         # Build joint attention mask [text_mask | all-ones image_mask] once.
         block_attention_mask = None
@@ -979,12 +1004,19 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             if encoder_hidden_states_mask.dtype != torch.bool:
                 encoder_hidden_states_mask = encoder_hidden_states_mask.to(torch.bool)
             batch_size, image_seq_len = hidden_states.shape[:2]
+            encoder_hidden_states_mask = self.sharder.shard(
+                encoder_hidden_states_mask,
+                dim=1,
+                pad_to_multiple=True,
+            )
             image_mask = torch.ones(
                 (batch_size, image_seq_len),
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
             block_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+            if self.sharder.is_active:
+                block_attention_mask = self.sharder.gather(block_attention_mask, dim=1)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -995,6 +1027,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 attention_mask=block_attention_mask,
             )
 
+        hidden_states = self.sharder.gather(hidden_states, dim=1)
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
