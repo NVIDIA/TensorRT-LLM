@@ -67,9 +67,11 @@ def _unified_kv_pool_includes_mamba(
 
 
 def _is_lock_infra_error(exc: BaseException) -> bool:
-    """Whether exc is a lock-infrastructure failure eligible for tempdir fallback."""
-    # filelock.Timeout subclasses OSError with errno=None, so match it explicitly.
-    if isinstance(exc, (filelock.Timeout, PermissionError)):
+    """Whether exc indicates broken lock infrastructure (not mere contention)."""
+    # filelock.Timeout is contention, not broken infra, so it is not eligible.
+    if isinstance(exc, filelock.Timeout):
+        return False
+    if isinstance(exc, PermissionError):
         return True
     if isinstance(exc, OSError):
         return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
@@ -95,8 +97,15 @@ def config_file_lock(timeout: int = 10):
     # Guard only acquisition so caller-body exceptions propagate (single-yield).
     try:
         lock.acquire(timeout=timeout)
-    except (PermissionError, OSError, filelock.Timeout) as e:
-        # Primary lock unusable (NFS ENOLCK/ESTALE, perms, or timeout); use tempdir.
+    except filelock.Timeout:
+        # Contention, not broken infra: a tempdir lock can't serialize against
+        # the holder, so degrade to no lock instead of crashing the process.
+        logger.warning(
+            f"could not acquire config lock within {timeout}s, proceeding without lock"
+        )
+        yield
+    except (PermissionError, OSError) as e:
+        # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
         if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
@@ -105,12 +114,9 @@ def config_file_lock(timeout: int = 10):
                                      timeout=timeout)
         try:
             tmp_lock.acquire(timeout=timeout)
-        except (PermissionError, OSError, filelock.Timeout) as tmp_e:
-            if not _is_lock_infra_error(tmp_e):
-                raise
+        except (PermissionError, OSError, filelock.Timeout):
             logger.warning(
-                f"failed to acquire tempdir config lock within {timeout}s, proceeding without lock"
-            )
+                "tempdir config lock unavailable, proceeding without lock")
             yield
         else:
             try:
