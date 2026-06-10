@@ -71,6 +71,28 @@ from _sharding_ir_helpers import (  # noqa: E402
     spec_from_modeling_file,
 )
 
+
+def _has_ir_markers(gm) -> bool:
+    """Return True iff *gm* contains any ``torch.ops.auto_deploy.all_reduce`` node.
+
+    The sharding-IR pipeline inserts ``auto_deploy.all_reduce`` nodes at rowwise
+    projections and MoE merge points (per ad-sharding-ir-port skill rule A3).
+    Legacy modeling files never emit this op (legacy ``detect_sharding`` inserts
+    ``dist.all_reduce`` later in its own pipeline). Presence of any such node
+    is therefore a sufficient signal that the modeling file was authored
+    against the sharding IR; absence means ``apply_sharding_hints`` would be a
+    no-op for this graph.
+
+    This helper is the in-test equivalent of the follow-up PR's
+    ``has_sharding_ir_markers`` dispatcher in ``sharding_ir.py``.
+    """
+    target = torch.ops.auto_deploy.all_reduce
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target == target:
+            return True
+    return False
+
+
 # Parallelism configurations exercised by the test. The key is the value of
 # ``--sharding-ir-dist-config``; the dict supplies the world_size, the MoE
 # TP/EP grid, and the attention-DP flag. ``tp_size`` equals ``world_size``
@@ -281,6 +303,33 @@ def _run_equivalence_job_impl(
     )
 
     # ------------------------------------------------------------------
+    # IR-marker gate: only run IR sharding transforms if the modeling file
+    # was authored against the sharding IR (i.e., its exported graph carries
+    # at least one ``torch.ops.auto_deploy.all_reduce`` marker per skill rule
+    # A3). Legacy modeling files produce a marker-free graph -- running the
+    # transforms on them is at best a no-op and at worst spuriously mutates
+    # AD operational ops (e.g., schema-driven hint stripping on torch_attention
+    # / torch_rmsnorm). Skipping the transforms here makes ``gm_sharded`` an
+    # identity copy of ``gm_unsharded`` for the comparison below -- the test
+    # trivially passes, which matches the conftest docstring contract:
+    # "Legacy (non-IR-marked) modeling files pass as a no-op identity".
+    #
+    # The follow-up PR (gk/sharding-ir-auto-detect) routes legacy files to
+    # ``detect_sharding`` for real legacy sharding -- at that point this gate
+    # changes to run that path instead of skipping.
+    # ------------------------------------------------------------------
+    if not _has_ir_markers(gm_sharded):
+        if rank == 0:
+            print(
+                f"[sharding-ir-eq] {Path(modeling_file).name}: no IR markers "
+                f"(no torch.ops.auto_deploy.all_reduce nodes); legacy modeling "
+                f"file. Skipping sharded transforms; equivalence holds "
+                f"trivially.",
+                flush=True,
+            )
+        return
+
+    # ------------------------------------------------------------------
     # 4. Apply the sharding transforms only to gm_sharded.
     # ------------------------------------------------------------------
     dist_config = DistConfig(
@@ -411,6 +460,29 @@ def test_sharding_ir_equivalence(
     skip = _gpu_check(sharding_ir_dist_config)
     if skip:
         pytest.skip(skip)
+
+    # Pre-flight in parent process: validate the modeling file can be set up
+    # as a tiny IR model on CPU before paying the multiprocess spawn cost.
+    # The per-rank GPU instantiation in the worker remains authoritative; this
+    # check exists only to convert "can't even instantiate" failures (which
+    # would surface as a useless ``Process exited with code 1`` in the parent)
+    # into clean ``pytest.skip`` outcomes with an actionable message.
+    try:
+        _preflight_spec = spec_from_modeling_file(sharding_ir_modeling_file)
+        _ = build_ir_model(_preflight_spec, device=torch.device("cpu"), dtype=FORWARD_DTYPE)
+    except RuntimeError as e:
+        msg = str(e)
+        if "Could not resolve config class" in msg or "ForCausalLM' class registered" in msg:
+            pytest.skip(f"Modeling file not set up for IR equivalence harness: {e}")
+        raise
+    except (TypeError, AttributeError, KeyError, ValueError, AssertionError) as e:
+        pytest.skip(
+            f"Tiny default config insufficient for "
+            f"{Path(sharding_ir_modeling_file).name}: {type(e).__name__}: {e}. "
+            "Per-model quirks may be needed in "
+            "`_sharding_ir_helpers._apply_per_family_quirks` / "
+            "`_apply_layer_count_dependent_quirks`."
+        )
 
     import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 

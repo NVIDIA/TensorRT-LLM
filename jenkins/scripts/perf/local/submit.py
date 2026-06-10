@@ -412,6 +412,7 @@ def generate_pytest_command(
 
     pytest_command = (
         f"pytest -v "
+        f"perf/test_perf_sanity.py "
         f"--test-prefix={test_prefix} "
         f"--test-list={test_list_path} "
         f"--output-dir={work_dir} "

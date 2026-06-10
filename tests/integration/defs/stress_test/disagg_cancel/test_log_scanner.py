@@ -71,8 +71,8 @@ def harness_with_two_workers(tmp_path: Path):
     gen_log.touch()
 
     h._worker_specs = [
-        make_spec("ctx", 0, ctx_log),
-        make_spec("gen", 0, gen_log),
+        make_spec("ctx", 0, log_path=ctx_log),
+        make_spec("gen", 0, log_path=gen_log),
     ]
     return h, ctx_log, gen_log
 
@@ -326,8 +326,8 @@ def test_specs_with_none_log_path_skip_gracefully(tmp_path: Path):
     yaml_path.write_text(DUMMY_YAML)
     h = DisaggCancellationStressHarness(yaml_path)
     h._worker_specs = [
-        make_spec("ctx", 0, None),
-        make_spec("gen", 0, None),
+        make_spec("ctx", 0, log_path=None),
+        make_spec("gen", 0, log_path=None),
     ]
 
     t = threading.Thread(target=h._log_scanner_thread_body, daemon=True)
@@ -360,7 +360,7 @@ def test_no_hard_zero_patterns_exits_immediately(tmp_path: Path):
     h = DisaggCancellationStressHarness(yaml_path)
     ctx_log = tmp_path / "worker_ctx_18000.log"
     ctx_log.write_text("Broken promise: A\n")  # would match in normal config
-    h._worker_specs = [make_spec("ctx", 0, ctx_log)]
+    h._worker_specs = [make_spec("ctx", 0, log_path=ctx_log)]
 
     t = threading.Thread(target=h._log_scanner_thread_body, daemon=True)
     t.start()
@@ -401,7 +401,7 @@ def test_invalid_regex_is_skipped_with_warning(tmp_path: Path, caplog):
     h = DisaggCancellationStressHarness(yaml_path, log_scanner_poll_interval_s=0.02)
     ctx_log = tmp_path / "worker_ctx_18000.log"
     ctx_log.write_text("Broken promise: A\n")
-    h._worker_specs = [make_spec("ctx", 0, ctx_log)]
+    h._worker_specs = [make_spec("ctx", 0, log_path=ctx_log)]
 
     with caplog.at_level("ERROR"):
         fired = _run_scanner_until_failure_or_timeout(h)
@@ -443,7 +443,7 @@ def _consume_marks(seen: list[str]) -> Callable[[str], None]:
 
 
 def test_log_source_poll_returns_false_when_file_absent(tmp_path: Path):
-    spec = make_spec("ctx", 0, tmp_path / "missing.log")
+    spec = make_spec("ctx", 0, log_path=tmp_path / "missing.log")
     src = _LogSource(spec=spec, path=Path(spec.log_path))  # type: ignore[arg-type]
     seen: list[str] = []
     assert src.poll([("X", re.compile("X"))], _consume_marks(seen)) is False
@@ -453,7 +453,7 @@ def test_log_source_poll_returns_false_when_file_absent(tmp_path: Path):
 def test_log_source_poll_returns_false_on_empty_read(tmp_path: Path):
     log = tmp_path / "empty.log"
     log.touch()
-    spec = make_spec("gen", 0, log)
+    spec = make_spec("gen", 0, log_path=log)
     src = _LogSource(spec=spec, path=log)
     seen: list[str] = []
     assert src.poll([("X", re.compile("X"))], _consume_marks(seen)) is False
@@ -464,7 +464,7 @@ def test_log_source_poll_returns_false_on_empty_read(tmp_path: Path):
 def test_log_source_close_is_idempotent(tmp_path: Path):
     log = tmp_path / "x.log"
     log.write_text("hello\n")
-    spec = make_spec("ctx", 0, log)
+    spec = make_spec("ctx", 0, log_path=log)
     src = _LogSource(spec=spec, path=log)
     src.poll([("X", re.compile("X"))], lambda r: None)
     src.close()

@@ -27,6 +27,30 @@ skip_unsupported = pytest.mark.skipif(
 )
 
 
+# Arch-gating predicate (GPU-free) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sm_version, expected",
+    [
+        (90, True),  # Hopper
+        (100, True),  # datacenter Blackwell (B200)
+        (103, True),  # datacenter Blackwell (B300/GB200)
+        (120, False),  # consumer Blackwell (RTX 5090 / PRO 6000) -> Triton
+        (121, False),  # other consumer Blackwell -> Triton
+        (89, False),  # Ada
+        (80, False),  # Ampere
+    ],
+)
+def test_is_flashinfer_gdn_supported_arch(sm_version, expected):
+    """FlashInfer ships GDN prefill/decode kernels only for SM90/SM100/SM103;
+    every other arch (notably SM120) must fall back to Triton. Pure predicate,
+    no GPU required."""
+    from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+
+    assert is_flashinfer_gdn_supported_arch(sm_version) is expected
+
+
 # Input factory ------------------------------------------------------------
 
 
@@ -338,32 +362,39 @@ def test_indexed_gather_inplace_scatter_matches_triton():
 # Env-flag routing test (no GPU required) ---------------------------------
 
 
-def test_gdn_mixer_default_uses_flashinfer_wrapper(monkeypatch):
-    """Default (no env): gdn_mixer imports the FlashInfer wrapper.
-    Opt-out (``TLLM_USE_FLASHINFER_GDN_PREFILL=0``) restores the Triton path.
+def test_gdn_mixer_resolve_chunk_gated_delta_rule(monkeypatch):
+    """gdn_mixer resolves its prefill kernel lazily (``_resolve_chunk_gated_delta_rule``):
+    the FlashInfer wrapper when the env opt-in is set (default) *and* the arch is
+    supported (SM90/SM100/SM103), otherwise the vendored Triton kernel (env
+    opt-out, or an unsupported arch such as SM120).
 
-    Independent of GPU availability; only checks Python import wiring.
+    The arch predicate is monkeypatched so the routing is checked independent of
+    the actual GPU; only dispatch wiring is exercised (no kernel launch).
     """
-    import importlib
-
-    # Default — env unset, expect FlashInfer wrapper.
-    monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
     import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
-
-    importlib.reload(gdn_mixer)
+    from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as triton_fn
     from tensorrt_llm._torch.modules.fla.flashinfer_chunk import (
-        chunk_gated_delta_rule as wrapper_fn,
+        chunk_gated_delta_rule as flashinfer_fn,
     )
 
-    assert gdn_mixer.chunk_gated_delta_rule is wrapper_fn
+    def resolve(env, arch_supported):
+        if env is None:
+            monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
+        else:
+            monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", env)
+        monkeypatch.setattr(gdn_mixer, "is_flashinfer_gdn_supported_arch", lambda: arch_supported)
+        gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
+        return gdn_mixer._resolve_chunk_gated_delta_rule()
 
-    # Opt out — env=0 restores the Triton path.
-    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "0")
-    importlib.reload(gdn_mixer)
-    from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as triton_fn
+    # Default env + supported arch -> FlashInfer wrapper.
+    assert resolve(None, True) is flashinfer_fn
+    # Explicit opt-in + supported arch -> FlashInfer wrapper.
+    assert resolve("1", True) is flashinfer_fn
+    # Opt-out env -> Triton even on a supported arch.
+    assert resolve("0", True) is triton_fn
+    # Unsupported arch (e.g. SM120) -> Triton even with the default opt-in.
+    assert resolve(None, False) is triton_fn
 
-    assert gdn_mixer.chunk_gated_delta_rule is triton_fn
-
-    # Reset to default for subsequent tests in the same process.
-    monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
-    importlib.reload(gdn_mixer)
+    # Clear the cached resolution so later tests re-resolve against the real
+    # arch/env (monkeypatch restores the env var and predicate on teardown).
+    gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
