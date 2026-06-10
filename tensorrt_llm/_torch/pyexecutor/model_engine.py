@@ -538,11 +538,9 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.encoder_attn_metadata = None
-        # KV-cache compression manager (sparse-attention behavior layer). Set
-        # by create_py_executor_instance when a sparse method is configured;
-        # None otherwise. Also registered in the resource-manager registry so
-        # PyExecutor auto-drives its lifecycle; this member exposes it to the
-        # attention-metadata builder for the per-layer attention hooks.
+        # KV-cache compression manager (None unless a sparse method is
+        # configured). Set by create_py_executor_instance; exposed here so the
+        # attention-metadata builder can pass it to the per-layer hooks.
         self.compression_manager = None
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
@@ -1607,10 +1605,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
-        # The KV-cache compression manager is passed to AttentionMetadata at
-        # construction; TrtllmAttention.forward reads
-        # metadata.compression_manager to fire the per-layer attention hooks.
-        # None when no behavior-layer sparse method is configured.
+        # Passed to AttentionMetadata so TrtllmAttention.forward can read
+        # metadata.compression_manager and fire the per-layer hooks.
         compression_manager = self.compression_manager
 
         if kv_cache_manager is None:

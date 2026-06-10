@@ -1737,10 +1737,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 self.sparse_attention_config, SkipSoftmaxAttentionConfig)):
             kv_idx, kv_off, at_idx, at_off = None, None, None, None
             if metadata.compression_manager is not None:
-                # Methods driving their algorithm via the KV-cache compression
-                # manager: the on_*_attention hooks fire here on the single
-                # registered manager (returns a sparse-mask tuple, None for
-                # dense-over-compacted, or writes aux state).
+                # Fire the compression manager's per-layer attention hooks.
+                # A hook may return an (indices, offsets) sparse mask, or None
+                # to leave attention dense.
                 layer_idx = self.get_local_layer_idx(metadata)
                 ctx_result = metadata.compression_manager.on_context_attention(
                     layer_idx, q, k, None, metadata)
@@ -1783,12 +1782,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self._run(q, k, v, metadata, forward_args)
 
-        # post-attention hooks fire AFTER the attention output is
-        # computed so executors that conceptually run after attention (e.g. a
-        # RocketKV unified-update path that stashes per-layer q/k/output and
-        # evicts in on_context_end) can act on the result. Side-effect only;
-        # mirrors the attention-hooks gate above. Both phases fire and the executor
-        # self-gates on metadata (num_ctx_tokens / num_generations).
+        # Post-attention hooks, fired after the output is computed, for a
+        # method that needs the attention result (e.g. to stash per-layer
+        # q/k/output for a later eviction). Side-effect only; both phases fire
+        # and the manager decides what to act on.
         if (self.sparse_attention_config is not None and not isinstance(
                 self.sparse_attention_config, SkipSoftmaxAttentionConfig)
                 and metadata.compression_manager is not None):

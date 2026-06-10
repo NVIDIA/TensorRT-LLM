@@ -88,15 +88,16 @@ def get_kv_cache_manager_cls(
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
-    if (sparse_attn_config is not None
-            and not sparse_attn_config.is_behavior_layer_method):
-        # Legacy memory-layer dispatch (legacy RocketKV / DSA / skip_softmax
-        # own a sparse-aware cache manager subclass). Behavior-layer
-        # compression methods fall through below; their algorithm runs
-        # inside a ``SparseAttentionManager`` constructed via
-        # ``create_sparse_attention_manager`` after PyExecutor instantiation.
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
-    elif is_hybrid_linear(config):
+    if sparse_attn_config is not None:
+        # The legacy methods (rocket / dsa / skip_softmax) own their own
+        # cache-manager class; use it. A compression-framework method returns
+        # None here, so we fall through to the standard manager (its algorithm
+        # runs in the compression manager registered via
+        # create_sparse_attention_manager after PyExecutor instantiation).
+        cls = get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        if cls is not None:
+            return cls
+    if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
         if model_config.get_num_mamba_layers() == 0:
@@ -555,10 +556,7 @@ class KvCacheCreator:
         # heterogeneous layer_types) uses MambaHybridCacheManager and would
         # have its max_tokens estimate inflated incorrectly otherwise.
         num_pool_groups = 1
-        # Use ``issubclass`` so RocketKV's V2-subclass (Pattern 3) also
-        # picks up the split-pool semantics.
-        if (self._kv_cache_manager_cls is not None
-                and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
+        if self._kv_cache_manager_cls == KVCacheManagerV2:
             model_cfg = self._model_engine.model.model_config.pretrained_config
             layer_types = getattr(model_cfg, "layer_types", None)
             if isinstance(layer_types, (list, tuple)):
@@ -1659,6 +1657,19 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
+    # Register the compression manager (if the method provides one) with the
+    # other managers, before building ResourceManager. Created before
+    # PyExecutor.__init__/warmup so CUDA-graph capture sees the per-layer hooks.
+    if llm_args.sparse_attention_config is not None:
+        from ..attention_backend.sparse import create_compression_manager
+        compression_manager = create_compression_manager(
+            llm_args.sparse_attention_config, kv_cache_manager)
+        if compression_manager is not None:
+            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                compression_manager)
+            # Reference for the attention-metadata builder (per-layer hooks).
+            model_engine.compression_manager = compression_manager
+
     resource_manager = ResourceManager(resources)
 
     # Make sure the kv cache manager is always invoked last as it could
@@ -1666,29 +1677,12 @@ def create_py_executor_instance(
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
-
-    # Build + register the KV-cache compression manager BEFORE py_executor
-    # instantiation. PyExecutor's __init__ runs warmup, which captures CUDA
-    # graphs through ``TrtllmAttention.forward``; that path reads
-    # ``metadata.compression_manager`` to fire the attention events. If it is
-    # None at capture time, the captured graph bakes in DENSE attention and the
-    # hooks are absent from replay, so it must be set here for warmup to see.
-    if llm_args.sparse_attention_config is not None:
-        # Create the manager iff this method provides a compression manager;
-        # create_compression_manager returns None otherwise.
-        from ..attention_backend.sparse import create_compression_manager
-        compression_manager = create_compression_manager(
-            llm_args.sparse_attention_config, kv_cache_manager)
-        if compression_manager is not None:
-            # Register as a resource manager so PyExecutor's main loop
-            # auto-drives prepare/update/free_resources (the lifecycle hooks)
-            # each iteration. Also expose it on the model engine so the
-            # attention path reaches it via ``metadata.compression_manager``
-            # for the per-layer attention hooks.
-            resource_manager.resource_managers[
-                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
-                    compression_manager)
-            model_engine.compression_manager = compression_manager
+    # The compression manager runs after the cache manager: it reconciles the
+    # request's history length once the cache manager has resized it.
+    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+            in resource_manager.resource_managers):
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.

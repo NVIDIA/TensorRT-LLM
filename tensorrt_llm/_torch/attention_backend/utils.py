@@ -19,30 +19,26 @@ def get_attention_backend(
     sparse_attn_config: Optional["SparseAttentionConfig"] = None
 ) -> Type[AttentionBackend]:
     backend_name = backend_name.upper()
-    # Behavior-layer sparse methods (is_behavior_layer_method) drive their
-    # algorithm via PyExecutor hook call sites and use the base attention
-    # class unchanged, so skip the per-method attention dispatch below.
-    # Memory-layer methods keep their own attention shim + Metadata and
-    # fall through to the per-method dispatch below.
-    if (sparse_attn_config is not None
-            and sparse_attn_config.is_behavior_layer_method):
-        # Behavior-layer methods use the base attention class (no per-method
-        # shim). Memory-layer methods keep their shim.
-        sparse_attn_config = None
 
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
-            return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
+            cls = get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
+            if cls is not None:
+                return cls
         return VanillaAttention
     elif backend_name == "TRTLLM":
         if sparse_attn_config is not None:
-            return get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
+            cls = get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
+            if cls is not None:
+                return cls
         return TrtllmAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
         if sparse_attn_config is not None:
-            return get_flashinfer_sparse_attn_attention_backend(
+            cls = get_flashinfer_sparse_attn_attention_backend(
                 sparse_attn_config)
+            if cls is not None:
+                return cls
         return FlashInferAttention
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
