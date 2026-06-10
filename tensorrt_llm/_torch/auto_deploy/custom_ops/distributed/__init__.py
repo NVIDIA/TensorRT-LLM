@@ -16,13 +16,11 @@
 """Distributed operations.
 
 This module provides distributed communication primitives:
-- cute_dist: CuTe DSL experimental distributed operations
 - torch_dist: PyTorch distributed backend operations
 - trtllm_dist: TensorRT-LLM optimized distributed operations
 """
 
 __all__ = [
-    "cute_dist",
     "torch_dist",
     "trtllm_dist",
 ]

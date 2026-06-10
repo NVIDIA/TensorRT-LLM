@@ -12,18 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Transformations for fusing collective operations.
-
-This module matches TRT-LLM distributed nodes inserted in MPI mode and replaces
-them with an explicitly selected fused backend op. The torch backend (demollm
-mode) does not benefit from this fusion.
-"""
+"""Transformations for fusing collective operations."""
 
 from functools import partial
 from typing import Literal, Tuple, Type
 
 import torch
-from pydantic import Field
 from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
@@ -100,7 +94,7 @@ def _make_allreduce_residual_rmsnorm_pattern(
     return pattern_fn
 
 
-def _trtllm_allreduce_residual_rmsnorm_replacement(
+def _allreduce_residual_rmsnorm_replacement(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, strategy: str
 ):
     """Replacement using TRT-LLM fused kernel."""
@@ -126,24 +120,19 @@ def _cute_allreduce_residual_rmsnorm_replacement(
 class FuseAllreduceResidualRMSNormConfig(TransformConfig):
     """Configuration for allreduce + residual + RMSNorm fusion."""
 
-    backend: Literal["trtllm", "cute"] = Field(
-        default="trtllm",
-        description=(
-            "Backend used for the fused allreduce + residual + RMSNorm replacement. "
-            "'cute' selects the experimental bf16 CuTe POC op explicitly in the graph."
-        ),
-    )
+    backend: Literal["trtllm", "cute"] = "trtllm"
 
 
 @TransformRegistry.register("fuse_allreduce_residual_rmsnorm")
 class FuseAllreduceResidualRMSNorm(BaseTransform):
     """Fuse (allreduce + residual add + RMSNorm) into one fused op with tuple output.
 
-    This transform matches TRT-LLM allreduce nodes inserted in MPI mode and
-    replaces the matched subgraph with the configured fused backend.
+    This transform applies when TRT-LLM ops are used (MPI mode). The torch
+    backend (demollm mode) does not benefit from this fusion and uses unfused
+    operations.
 
-    Note: This transform expects canonical RMSNorm custom ops in the graph,
-    which are created by transforms that run earlier in the pipeline.
+    Note: This transform expects torch_rmsnorm ops in the graph, which are created
+    by the match_rmsnorm_pattern transform that runs earlier in the pipeline.
     """
 
     config: FuseAllreduceResidualRMSNormConfig
@@ -189,10 +178,9 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # ============================================================================
 
         if self.config.backend == "trtllm":
-            replace_fn = partial(_trtllm_allreduce_residual_rmsnorm_replacement, strategy=strategy)
+            replace_fn = partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy)
         else:
             replace_fn = _cute_allreduce_residual_rmsnorm_replacement
-        ad_logger.info(f"allreduce residual RMSNorm backend selected = {self.config.backend!r}")
 
         patterns = ADPatternMatcherPass()
 

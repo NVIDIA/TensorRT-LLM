@@ -124,7 +124,6 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.trtllm_dist_all_gather` | All-gather (TRT-LLM backend, MPI mode) |
 | `torch.ops.auto_deploy.trtllm_dist_all_reduce` | All-reduce (TRT-LLM backend, MPI mode) |
 | `torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm` | Fused all-reduce + residual add + RMSNorm (TRT-LLM backend, MPI mode) |
-| `torch.ops.auto_deploy.cute_dist_fused_allreduce_residual_rmsnorm` | Experimental fused all-reduce + residual add + RMSNorm (CuTe bf16 POC backend) |
 
 #### Utilities
 
