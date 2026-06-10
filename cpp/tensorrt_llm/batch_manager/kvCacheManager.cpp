@@ -2984,8 +2984,31 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     TLLM_LOG_DEBUG("%s::releaseBlocks - requestId=%lu, llmRequest.id=%s", mLogPrefix.c_str(), requestId,
         llmRequest.has_value() ? std::to_string(llmRequest->mRequestId).c_str() : "null");
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
-    auto node = mAllocatedBlocksPerSeq.extract(requestId);
-    TLLM_CHECK(node);
+    // Claim this request's blocks under mAllocatedBlocksMtx so the extract() cannot race
+    // releaseOrphanedBlocks(), which can run concurrently for the same request (see that
+    // method and the mutex declaration). extract() is the single atomic claim point: the
+    // winner gets the node and proceeds to release the blocks below; a concurrent
+    // releaseOrphanedBlocks() then sees an empty node and bails, so the refcount loop here
+    // operates on a node no other path can hold. The lock is released before storeBlocks()
+    // and the eviction work so it stays a leaf lock (no inversion with the reuse trie).
+    decltype(mAllocatedBlocksPerSeq)::node_type node;
+    {
+        std::scoped_lock<std::mutex> lock(mAllocatedBlocksMtx);
+        node = mAllocatedBlocksPerSeq.extract(requestId);
+    }
+    // A concurrent releaseOrphanedBlocks() for the same request may have already claimed
+    // and released these blocks (it fires when storeContextBlocks finds the sequence gone,
+    // which happens after removeSequence extracts mSequences but before it reaches here).
+    // In that case the node is empty and there is nothing left to release — return without
+    // aborting. Whichever path wins the extract() is the single owner; the other no-ops.
+    if (node.empty())
+    {
+        TLLM_LOG_DEBUG(
+            "%s::releaseBlocks - blocks for request %lu already released "
+            "(claimed by releaseOrphanedBlocks); nothing to do",
+            mLogPrefix.c_str(), requestId);
+        return lastStoredId;
+    }
     auto& allocatedBlocks = node.mapped();
     if (llmRequest.has_value() && !isRecurrentState()) // only store context blocks for recurrent states
     {
@@ -3749,7 +3772,71 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     }
     else
     {
-        TLLM_LOG_WARNING("[kv cache manager] storeContextBlocks: Can not find sequence for request %lu", requestId);
+        // The sequence was removed (warmup teardown, TRT overlap with MTP, or early
+        // termination) before storeContextBlocks could register its blocks in the reuse
+        // trie. The blocks are still allocated on GPU with stale KV data.
+        //
+        // If we leave them untracked, the eviction policy will eventually recycle them
+        // to new requests via the radix trie. Those requests will read garbage context,
+        // output immediate EOS, and cascade the corruption through the entire trie until
+        // the engine is restarted.
+        //
+        // Fix: release orphaned blocks to the free pool WITHOUT storing them for reuse.
+        TLLM_LOG_WARNING(
+            "[kv cache manager] storeContextBlocks: Can not find sequence for request %lu. "
+            "Releasing orphaned blocks to prevent KV-cache corruption under block reuse.",
+            requestId);
+
+        mBlockManager.releaseOrphanedBlocks(requestId);
+    }
+}
+
+void BlockManager::releaseOrphanedBlocks(RequestIdType requestId)
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.releaseOrphanedBlocks(requestId);
+    }
+}
+
+void WindowBlockManager::releaseOrphanedBlocks(RequestIdType requestId)
+{
+    // Extract the block tracking for this request. If removeSequence already
+    // cleaned it up, this returns an empty node and we're done (no double-free).
+    // The lock serializes against releaseBlocks(): both extract() the same node and
+    // mutate the same block refcounts, and they can run concurrently for one request
+    // (storeContextBlocks's orphan path fires precisely when a teardown removed the
+    // sequence). Without it, the concurrent extract() races on the map and the refcount
+    // updates double-decrement. Held only over the map + refcount work, never over
+    // storeBlocks()/the reuse trie, so it stays a leaf lock.
+    std::scoped_lock<std::mutex> lock(mAllocatedBlocksMtx);
+    auto node = mAllocatedBlocksPerSeq.extract(requestId);
+    if (node.empty())
+    {
+        return;
+    }
+
+    auto& allocatedBlocks = node.mapped();
+    TLLM_LOG_DEBUG(
+        "%s::releaseOrphanedBlocks - Releasing %zu orphaned blocks for request %lu "
+        "(blocks contain stale KV data, NOT stored for reuse)",
+        mLogPrefix.c_str(), allocatedBlocks.size(), requestId);
+
+    // Release blocks WITHOUT storing them in the reuse trie. This is the same
+    // cleanup as the no-reuse path in releaseBlocks() above: decrement refcounts
+    // and return zero-ref blocks to the eviction policy free pool. We deliberately
+    // skip storeBlocks() — the data is stale and must not poison the trie.
+    for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
+    {
+        auto& block = *it;
+        if (block->hasRefs())
+        {
+            block->decRefCount();
+        }
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(block);
+        }
     }
 }
 
