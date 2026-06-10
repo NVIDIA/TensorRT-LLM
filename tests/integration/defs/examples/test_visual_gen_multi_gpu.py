@@ -196,7 +196,6 @@ def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
     _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
     "variant_name,parallel",
     WAN22_LPIPS_MULTI_GPU_VARIANTS,
@@ -206,7 +205,6 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
     "variant_name,parallel",
     WAN22_LPIPS_TP_VARIANTS,
