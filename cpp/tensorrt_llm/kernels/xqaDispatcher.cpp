@@ -495,25 +495,14 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        // Tree decode Q length is bounded by the padded draft-mask row dim.
-        if (params.is_spec_dec_tree && params.multi_query_tokens && params.spec_decoding_max_generation_length > 0)
+        bool const isSpecDecTree = params.is_spec_dec_tree && params.multi_query_tokens;
+        if (isSpecDecTree)
         {
+            TLLM_CHECK_WITH_INFO(params.spec_decoding_max_generation_length > 0,
+                "spec_decoding_max_generation_length must be positive for spec-dec tree.");
             tllmRunnerParams.mMaxSeqLenQ
                 = std::min(tllmRunnerParams.mMaxSeqLenQ, params.spec_decoding_max_generation_length);
-        }
-        // Pin mMaxSeqLenKv to a static per-layer value so warmup and runtime pick the same
-        // FMHA kernel (no JIT miss). For PagedKv we use the per-layer attention window:
-        // strides do not depend on mMaxSeqLenKv, and extra KV CTAs exit early via
-        // seqLensKvPtr. ContiguousKv keeps its true past-kv length because its strides
-        // depend on it.
-        // Include the generation span in spec-dec tree kernel selection.
-        if (params.is_spec_dec_tree && params.multi_query_tokens)
-        {
-            tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length + params.generation_input_length;
-        }
-        else if (tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv)
-        {
-            tllmRunnerParams.mMaxSeqLenKv = params.max_attention_window_size;
+            tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length + tllmRunnerParams.mMaxSeqLenQ;
         }
         else
         {
