@@ -31,6 +31,22 @@ from tensorrt_llm._torch.auto_deploy.export.export import (
     _clean_up_export_forward_hooks,
     _load_hook_for_deduplication,
 )
+from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
+    _kv_b_proj_dequant_load_hook,
+    _rope_deinterleave_load_hook,
+)
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma4 import (
+    Gemma4ForCausalLM,
+    Gemma4Model,
+    Gemma4TextDecoderLayer,
+)
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHModel
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5MoeRMSNorm,
+    Qwen3_5MoeSparseMoeBlock,
+    Qwen3_5MoeTextModel,
+)
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import (
@@ -47,6 +63,13 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     ParameterUpdateInfo,
     ShardingTransformConfig,
     ShardingTransformContainer,
+    _load_hook,
+    _split_tensor_for_tp,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import (
+    _fp8_block_scale_pipeline_cache_spec,
+    _shard_scale_and_hook,
+    _split_fp8_block_scale,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.hooks import (
@@ -390,6 +413,7 @@ def _pre_sharding_optimizer_config(
 
 
 def test_pipeline_cache_config_defaults_root_for_enabled_cache():
+    """An enabled cache config defaults to the standard cache root and disables runtime transform knobs."""
     config = PipelineCacheConfig(stage=Stages.SHARDING, enabled=True)
     unsupported_transform_options = {
         "cache_key_extra",
@@ -418,6 +442,7 @@ def test_pipeline_cache_config_defaults_root_for_enabled_cache():
 
 
 def test_pipeline_cache_config_accepts_user_root_by_default(tmp_path):
+    """A user-supplied cache root is preserved on the config."""
     config = PipelineCacheConfig(
         stage=Stages.SHARDING,
         enabled=True,
@@ -447,6 +472,7 @@ def test_pipeline_cache_config_accepts_user_root_by_default(tmp_path):
 def test_pipeline_cache_config_rejects_unsupported_transform_options(
     tmp_path, field_name, field_value
 ):
+    """Generic transform options that don't apply to the cache are rejected at config construction."""
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
         PipelineCacheConfig(
             stage=Stages.SHARDING,
@@ -457,6 +483,7 @@ def test_pipeline_cache_config_rejects_unsupported_transform_options(
 
 
 def test_pipeline_cache_transform_restores_and_skips_prefix(monkeypatch, tmp_path):
+    """Second run restores from cache and skips re-running the pre-boundary build transform."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
@@ -482,6 +509,7 @@ def test_pipeline_cache_transform_restores_and_skips_prefix(monkeypatch, tmp_pat
 
 
 def test_pipeline_cache_ignores_post_boundary_runtime_transform_config(monkeypatch, tmp_path):
+    """Post-boundary runtime transform settings don't affect the cache key, so a second run still hits."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
@@ -510,6 +538,7 @@ def test_pipeline_cache_ignores_post_boundary_runtime_transform_config(monkeypat
 
 
 def test_pipeline_cache_ignores_dist_config_before_sharding_boundary(monkeypatch, tmp_path):
+    """A cache boundary before sharding excludes dist config from the key, so differing TP still hits."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
@@ -531,6 +560,7 @@ def test_pipeline_cache_ignores_dist_config_before_sharding_boundary(monkeypatch
 
 
 def test_pipeline_cache_keeps_dist_config_after_sharding_boundary(monkeypatch, tmp_path):
+    """A cache boundary after sharding keeps dist config in the key, so differing TP misses and rebuilds."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
@@ -552,6 +582,7 @@ def test_pipeline_cache_keeps_dist_config_after_sharding_boundary(monkeypatch, t
 
 
 def test_pipeline_cache_keeps_world_size_factory_model_kwarg_in_key(monkeypatch, tmp_path):
+    """A world_size factory model kwarg participates in the cache key, so differing values miss."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     cm = _cache_seq_interface()
@@ -569,6 +600,7 @@ def test_pipeline_cache_keeps_world_size_factory_model_kwarg_in_key(monkeypatch,
 
 
 def test_pipeline_cache_keeps_structural_factory_model_kwargs_in_key(monkeypatch, tmp_path):
+    """Structural factory model kwargs (e.g. hidden_size) participate in the key, so differing values miss."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     cm = _cache_seq_interface()
@@ -586,6 +618,7 @@ def test_pipeline_cache_keeps_structural_factory_model_kwargs_in_key(monkeypatch
 
 
 def test_pipeline_cache_restore_uses_pre_mutation_config(monkeypatch, tmp_path):
+    """Cache key uses the config as it was before any pre-boundary transform mutated it, so the rerun hits."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
@@ -603,6 +636,7 @@ def test_pipeline_cache_restore_uses_pre_mutation_config(monkeypatch, tmp_path):
 
 
 def test_pipeline_cache_transform_allows_call_module(monkeypatch, tmp_path):
+    """A graph containing a call_module node round-trips through the cache and rebuilds the submodule."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
@@ -618,6 +652,7 @@ def test_pipeline_cache_transform_allows_call_module(monkeypatch, tmp_path):
 
 
 def test_pipeline_cache_transform_restores_wrapper_with_graphmodule(monkeypatch, tmp_path):
+    """A wrapper module nesting a GraphModule restores with its GraphModule and sibling modules intact."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
@@ -636,6 +671,7 @@ def test_pipeline_cache_transform_restores_wrapper_with_graphmodule(monkeypatch,
 
 
 def test_pipeline_cache_rejects_forward_hooks(monkeypatch, tmp_path):
+    """A graph carrying forward hooks is not cached (warns and skips publish), since hooks aren't serializable."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     warnings = []
@@ -656,6 +692,7 @@ def test_pipeline_cache_rejects_forward_hooks(monkeypatch, tmp_path):
 
 
 def test_pipeline_cache_cleans_tmp_dir_when_publish_fails(monkeypatch, tmp_path):
+    """A failed atomic publish leaves no manifest and removes the temp staging dir, so optimization proceeds."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
 
@@ -681,6 +718,7 @@ def test_pipeline_cache_cleans_tmp_dir_when_publish_fails(monkeypatch, tmp_path)
 
 
 def test_pipeline_cache_saves_graphmodule_snapshot_without_graphmodule_reduce(monkeypatch):
+    """Structural save/load reconstructs a GraphModule (preserving meta) without pickling the GraphModule itself."""
     gm = symbolic_trace(_ToyModule())
     gm._tracer_cls = _RequiresArgTracer
     gm.graph._tracer_cls = _RequiresArgTracer
@@ -705,6 +743,7 @@ def test_pipeline_cache_saves_graphmodule_snapshot_without_graphmodule_reduce(mo
 
 
 def test_pipeline_cache_rejects_native_graphmodule_pickle():
+    """A natively-pickled GraphModule payload is rejected by the structural loader as an unsupported shape."""
     gm = symbolic_trace(_ToyModule())
     buffer = io.BytesIO()
     torch.save(gm, buffer)
@@ -715,6 +754,7 @@ def test_pipeline_cache_rejects_native_graphmodule_pickle():
 
 
 def test_pipeline_cache_restored_graphmodule_rebuilds_weight_node_mapping():
+    """A restored GraphModule drops the cached weight-mapping meta and recomputes it lazily for GEMM fusion."""
     root = nn.Module()
     root.register_parameter("w0", nn.Parameter(torch.ones(2, 1, device="meta")))
     root.register_parameter("w1", nn.Parameter(torch.ones(3, 1, device="meta")))
@@ -746,6 +786,7 @@ def test_pipeline_cache_restored_graphmodule_rebuilds_weight_node_mapping():
 
 
 def test_pipeline_cache_drops_consumed_sharding_transforms_from_graphmodule_body():
+    """Saving drops already-applied sharding transforms from the container while keeping its config."""
     gm = symbolic_trace(_ToyModule())
     call_node = next(node for node in gm.graph.nodes if node.op == "call_function")
     config = ShardingTransformConfig(stage=Stages.SHARDING, allreduce_strategy="NCCL")
@@ -772,6 +813,7 @@ def test_pipeline_cache_drops_consumed_sharding_transforms_from_graphmodule_body
 
 
 def test_pipeline_cache_restores_graphmodule_bound_methods():
+    """Custom bound methods attached to a GraphModule (e.g. get_input_embeddings) survive save/load."""
     gm = symbolic_trace(_EmbeddingToyModule())
     gm.get_input_embeddings = types.MethodType(_EmbeddingToyModule.get_input_embeddings, gm)
 
@@ -785,6 +827,7 @@ def test_pipeline_cache_restores_graphmodule_bound_methods():
 
 
 def test_pipeline_cache_saves_exported_program_module_train_eval_methods():
+    """An ExportedProgram.module()'s synthesized train/eval methods survive save/load and toggle training."""
     ep = torch.export.export(_ToyModule(), (torch.ones(1),))
     gm = ep.module()
 
@@ -808,6 +851,7 @@ def test_pipeline_cache_saves_exported_program_module_train_eval_methods():
 
 
 def test_pipeline_cache_saves_graphmodule_snapshot_with_op_overload_target():
+    """A graph node targeting an OpOverload (aten.sym_size.int) round-trips and stays executable."""
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
     size = graph.call_function(torch.ops.aten.sym_size.int, args=(x, 0))
@@ -824,6 +868,7 @@ def test_pipeline_cache_saves_graphmodule_snapshot_with_op_overload_target():
 
 
 def test_pipeline_cache_rejects_unknown_ad_pipeline_hook(monkeypatch, tmp_path):
+    """A graph with an unrecognized AutoDeploy pipeline hook is not cached (warns and skips publish)."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     warnings = []
@@ -846,6 +891,7 @@ def test_pipeline_cache_rejects_unknown_ad_pipeline_hook(monkeypatch, tmp_path):
 
 
 def test_pipeline_cache_allows_materialized_buffers(monkeypatch, tmp_path):
+    """A graph with materialized (non-meta) buffers is cached and the buffer values are restored."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
@@ -864,6 +910,7 @@ def test_pipeline_cache_allows_materialized_buffers(monkeypatch, tmp_path):
 
 
 def test_pipeline_cache_rejects_materialized_parameters(monkeypatch, tmp_path):
+    """A graph with materialized (non-meta) parameters is not cached (warns and skips publish)."""
     _reset_counters()
     _patch_mem_stats(monkeypatch)
     warnings = []
@@ -909,6 +956,7 @@ def _make_gm_with_hooks():
 
 
 def test_hook_spec_round_trip_dedup_and_alias():
+    """Dedup and aliasing pre-hooks serialize to JSON specs and reattach to a fresh module."""
     gm = _make_gm_with_hooks()
 
     specs, has_unknown = collect_hook_specs(gm)
@@ -923,11 +971,7 @@ def test_hook_spec_round_trip_dedup_and_alias():
 
 
 def test_hook_spec_round_trip_shard_tp():
-    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
-        _load_hook,
-        _split_tensor_for_tp,
-    )
-
+    """A marked TP-shard load hook serializes to a JSON spec and reattaches to a fresh module."""
     gm = symbolic_trace(_ToyModule())
     f_split = partial(_split_tensor_for_tp, dim=0, rank=0, world_size=2, min_local_shape=1)
     hook = partial(_load_hook, f_split=f_split, param_key="weight", param_shape=torch.Size([1]))
@@ -959,12 +1003,7 @@ def test_hook_spec_round_trip_shard_tp():
 
 
 def test_hook_spec_round_trip_sharding_ir_fp8_block_scale():
-    from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import (
-        _fp8_block_scale_pipeline_cache_spec,
-        _shard_scale_and_hook,
-        _split_fp8_block_scale,
-    )
-
+    """An FP8 block-scale shard hook round-trips through a spec and re-shards the scale on reload."""
     gm = symbolic_trace(_ToyModule())
     scale = torch.arange(24 * 12, dtype=torch.float32).reshape(24, 12)
     rank = 3
@@ -1005,6 +1044,7 @@ def test_hook_spec_round_trip_sharding_ir_fp8_block_scale():
 
 
 def test_hook_spec_round_trip_post_load_hooks():
+    """An importable post-load hook round-trips as a 'post' phase spec and runs on reload."""
     gm = symbolic_trace(_ToyModule())
     gm.register_load_state_dict_post_hook(_unit_test_load_state_dict_post_hook)
 
@@ -1025,6 +1065,7 @@ def test_hook_spec_round_trip_post_load_hooks():
 
 
 def test_hook_spec_round_trip_with_module_load_hooks():
+    """A with_module pre-hook round-trips and reattaches preserving its with_module binding."""
     gm = symbolic_trace(_ToyModule())
     gm.register_load_state_dict_pre_hook(_unit_test_load_state_dict_pre_hook)
 
@@ -1048,8 +1089,7 @@ def test_hook_spec_round_trip_with_module_load_hooks():
 
 
 def test_hook_specs_reject_unsupported_marked_sharding_closures():
-    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _load_hook
-
+    """A marked hook wrapping an unpickleable local closure is reported via has_unknown, not cached."""
     gm = symbolic_trace(_ToyModule())
     start_idx = 0
     end_idx = 1
@@ -1085,11 +1125,7 @@ def test_hook_specs_reject_unsupported_marked_sharding_closures():
 
 
 def test_hook_specs_cover_unpickleable_fused_tp_closures():
-    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
-        _load_hook,
-        _split_tensor_for_tp,
-    )
-
+    """A fused-TP hook (unpickleable closure) is still captured by its marker spec and stays JSON-safe."""
     fused_gm = symbolic_trace(_ToyModule())
     rank = 0
     world_size = 2
@@ -1146,11 +1182,7 @@ def test_hook_specs_cover_unpickleable_fused_tp_closures():
 
 
 def test_hook_spec_round_trip_mla_rope_utils():
-    from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
-        _kv_b_proj_dequant_load_hook,
-        _rope_deinterleave_load_hook,
-    )
-
+    """MLA RoPE-deinterleave and kv_b dequant load hooks round-trip as importable-hook specs."""
     gm = symbolic_trace(_ToyModule())
     gm._register_load_state_dict_pre_hook(
         partial(
@@ -1185,6 +1217,7 @@ def test_hook_spec_round_trip_mla_rope_utils():
 
 
 def test_hook_spec_round_trip_partial_bound_method():
+    """A partial over a bound method serializes its owner class/payload and rebuilds a working hook."""
     gm = symbolic_trace(_ToyModule())
     owner = _PartialBoundHookOwner(payload_value=7)
     gm._register_load_state_dict_pre_hook(partial(owner.load_hook, weight_name="weight"))
@@ -1211,6 +1244,7 @@ def test_hook_spec_round_trip_partial_bound_method():
 
 
 def test_hook_spec_round_trip_module_bound_method_with_read_only_property():
+    """A module-bound hook reattaches by rebinding to the live module, and legacy owner-payload specs still load."""
     module = _ReadOnlyPropertyHookModule(payload_value=7)
 
     specs, has_unknown = collect_hook_specs(module)
@@ -1260,19 +1294,7 @@ def test_hook_spec_round_trip_module_bound_method_with_read_only_property():
 
 
 def test_hook_spec_round_trip_custom_model_checkpoint_hooks():
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma4 import (
-        Gemma4ForCausalLM,
-        Gemma4Model,
-        Gemma4TextDecoderLayer,
-    )
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHModel
-    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
-        Qwen3_5MoeForConditionalGeneration,
-        Qwen3_5MoeRMSNorm,
-        Qwen3_5MoeSparseMoeBlock,
-        Qwen3_5MoeTextModel,
-    )
-
+    """Checkpoint load hooks from Gemma4/NemotronH/Qwen3.5-MoE custom models round-trip and reapply."""
     gm = symbolic_trace(_ToyModule())
     qwen_norm = nn.Module()
     qwen_norm._register_load_state_dict_pre_hook(Qwen3_5MoeRMSNorm._offset_weight)
