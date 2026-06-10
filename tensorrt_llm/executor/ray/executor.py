@@ -50,6 +50,81 @@ __all__ = [
     "RayExecutor",
 ]
 
+_GCS_STARTUP_TIMEOUT_MARKERS = ("timed out during startup",
+                                "GCS has become overloaded")
+
+
+def _is_gcs_startup_timeout(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(marker in msg for marker in _GCS_STARTUP_TIMEOUT_MARKERS)
+
+
+def _reclaim_timed_out_node(exc: Exception) -> None:
+    """Tear down the head-node processes left behind by a failed ray.init().
+
+    ``Node.__init__`` spawns the GCS, raylet and their workers before it waits
+    for the raylet to register, so a startup timeout raises with those
+    processes running. Ray only records the node in its global state on a
+    successful return and builds head nodes with ``shutdown_at_exit=False``, so
+    nothing else can reap them: ray.shutdown() finds no node to stop and the
+    atexit handler has nothing registered. The half-built node is still
+    reachable as ``self`` in the frame that raised, which is the only handle
+    left that can stop its processes.
+    """
+    node = None
+    tb = exc.__traceback__
+    while tb is not None:
+        candidate = tb.tb_frame.f_locals.get("self")
+        if isinstance(candidate, ray._private.node.Node):
+            node = candidate
+        tb = tb.tb_next
+    if node is None:
+        logger.warning(
+            "Ray node startup timed out but the node object could not be "
+            "located; its processes may stay alive until the job ends.")
+        return
+    try:
+        node.kill_all_processes(check_alive=False, allow_graceful=True)
+    except Exception as e:
+        logger.warning(
+            f"Could not reclaim the timed-out Ray node's processes: {e}")
+
+
+def _ray_init_local_with_retry(max_attempts: int = 3,
+                               backoff_s: float = 5.0,
+                               **ray_init_args) -> None:
+    """Start a local Ray cluster, retrying on transient GCS startup timeouts.
+
+    Ray gives the raylet a fixed 30s to register with the GCS and raises "The
+    current node timed out during startup ... GCS has become overloaded" when a
+    loaded runner overshoots it. The condition is transient, but the failed
+    attempt leaves a live GCS and raylet behind (see
+    ``_reclaim_timed_out_node``), so each bare retry would add another head
+    node to the machine. Reclaim the abandoned processes before retrying.
+
+    ConnectionError is re-raised immediately so the caller's address="auto"
+    fall-through to local-cluster startup stays intact.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ray.init(**ray_init_args)
+            return
+        except ConnectionError:
+            raise
+        except Exception as e:
+            if not _is_gcs_startup_timeout(e):
+                raise
+            _reclaim_timed_out_node(e)
+            if attempt == max_attempts:
+                raise
+            logger.warning(
+                f"Ray cluster startup timed out on attempt "
+                f"{attempt}/{max_attempts}: {e}. Reclaimed the partially "
+                f"started node; retrying after {backoff_s}s.")
+            if ray.is_initialized():
+                ray.shutdown()
+            time.sleep(backoff_s)
+
 
 class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
@@ -88,10 +163,10 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                     logger.info(f"Ray cluster not found, starting a new one.")
 
                 if not ray.is_initialized():
-                    ray.init(**ray_init_args)
+                    _ray_init_local_with_retry(**ray_init_args)
                     self.has_start_local_cluser = True
             else:
-                ray.init(address="local", **ray_init_args)
+                _ray_init_local_with_retry(address="local", **ray_init_args)
                 self.has_start_local_cluser = True
 
             self.world_size = model_world_size
