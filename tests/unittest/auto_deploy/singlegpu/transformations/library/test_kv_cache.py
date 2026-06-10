@@ -14,7 +14,7 @@
 # limitations under the License.
 from types import SimpleNamespace
 from typing import List, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -33,7 +33,10 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
     ModelFactory,
     SubModuleExportInfo,
 )
-from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+from tensorrt_llm._torch.auto_deploy.shim.interface import (
+    CachedSequenceInterface,
+    SpeculativeDecodingModelArgs,
+)
 from tensorrt_llm._torch.auto_deploy.transform.interface import Stages, TransformConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
     InitializeCache,
@@ -637,6 +640,50 @@ def test_resize_kv_cache_transform_runs_when_needed():
 
     # Verify transform was not skipped
     assert info.skipped is False
+
+
+def test_resize_kv_cache_passes_sa_manager_to_spec_dec_model():
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        max_tokens=256,
+        free_gpu_memory_fraction=0.5,
+    )
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model="draft-model",
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+        spec_config=spec_config,
+    )
+    cm.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    cm.sa_manager = object()
+
+    transform = ResizeKVCache(config=TransformConfig(stage=Stages.PATTERN_MATCHER))
+    mock_module = MagicMock(return_value=None)
+
+    with (
+        patch(
+            "tensorrt_llm._torch.auto_deploy.transform.library.kvcache.get_mem_info",
+            return_value=(0, 0, 0, 0),
+        ),
+        patch.object(cm, "resize_kv_cache_manager") as resize_kv_cache_manager,
+    ):
+        result_mod, info = transform._apply_to_full_model(mock_module, cm, MagicMock(), MagicMock())
+
+    spec_dec_args = mock_module.call_args.kwargs["spec_dec_args"]
+    assert result_mod is mock_module
+    assert info.skipped is False
+    assert isinstance(spec_dec_args, SpeculativeDecodingModelArgs)
+    assert spec_dec_args.cache_seq_interface is cm
+    assert spec_dec_args.sa_manager is cm.sa_manager
+    resize_kv_cache_manager.assert_called_once_with(0)
 
 
 def test_insert_cached_attention_uses_add_resource():

@@ -20,7 +20,7 @@ from torch.fx import GraphModule
 
 from ...compile import ArgsKwargs, CompileBackendRegistry
 from ...models.factory import ModelFactory
-from ...shim.interface import CachedSequenceInterface
+from ...shim.interface import CachedSequenceInterface, SpeculativeDecodingModelArgs
 from ...utils.logger import ad_logger
 from ..interface import (
     BaseTransform,
@@ -126,13 +126,20 @@ class CompileModel(BaseTransform):
         def _get_args_kwargs(bs: int) -> ArgsKwargs:
             if spec_config is not None:
                 cm.info.set_capture_batch(batch_size=bs, max_draft_len=spec_config.max_draft_len)
-                return (), {**cm.named_args, "cache_seq_interface": cm}
+                if cm.sa_manager is not None:
+                    cm.sa_manager.prepare(list(range(bs)), spec_config.max_draft_len)
+                return (), {
+                    **cm.named_args,
+                    "spec_dec_args": SpeculativeDecodingModelArgs(
+                        cache_seq_interface=cm, sa_manager=cm.sa_manager
+                    ),
+                }
             cm.info.set_capture_batch(batch_size=bs)
             return (), cm.named_args
 
         resource_input_names = list(cm.resource_names)
-        if spec_config is not None and "cache_seq_interface" not in resource_input_names:
-            resource_input_names.append("cache_seq_interface")
+        if spec_config is not None and "spec_dec_args" not in resource_input_names:
+            resource_input_names.append("spec_dec_args")
         extra_kwargs = {"resource_input_names": tuple(resource_input_names)}
         config_overrides = {}
         if self.config.piecewise_enabled:

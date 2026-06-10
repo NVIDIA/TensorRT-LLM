@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
-from tensorrt_llm._torch.auto_deploy.shim.ad_executor import create_autodeploy_executor
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine, create_autodeploy_executor
 
 
 class MockTokenizer:
@@ -73,6 +73,28 @@ class MockFactory:
 
 
 """Unit tests for create_autodeploy_executor function."""
+
+
+def test_ad_engine_passes_sa_manager_to_model_factory():
+    cache_seq_interface = SimpleNamespace(
+        info=SimpleNamespace(max_num_tokens=64, max_seq_len=32, max_batch_size=2),
+        sa_manager=None,
+    )
+    sa_manager = object()
+    model_build_state = {}
+
+    def get_inference_model(cache_seq_interface):
+        model_build_state["sa_manager"] = cache_seq_interface.sa_manager
+        return Mock()
+
+    engine = ADEngine(
+        get_inference_model=get_inference_model,
+        cache_seq_interface=cache_seq_interface,
+        sa_manager=sa_manager,
+    )
+
+    assert model_build_state["sa_manager"] is sa_manager
+    assert engine.sa_manager is sa_manager
 
 
 @pytest.mark.parametrize("guided_decoding_backend", ["xgrammar", "llguidance"])
@@ -228,3 +250,61 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
     # lazily fetched from the resource managers during prepare_inputs). The eager workspace
     # reservation and its before-build ordering are asserted in the side_effect above.
     assert build_from_config_mock.call_args.kwargs["sa_manager"] is mock_sa_manager
+
+
+def test_create_autodeploy_executor_skips_sa_resource_manager_without_sa_config():
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model="draft-model",
+    )
+    ad_config = LlmArgs(
+        model="target-model",
+        max_batch_size=4,
+        max_seq_len=128,
+        max_input_len=64,
+        speculative_config=spec_config,
+        backend="_autodeploy",
+        cuda_graph_config={"max_batch_size": 4},
+    )
+
+    mock_engine = Mock()
+    mock_engine.cache_seq_interface.info.max_num_tokens = 512
+    mock_engine.cache_seq_interface.info.vocab_size_padded = 1000
+    mock_engine.cache_seq_interface.max_num_state_slots = ad_config.max_batch_size
+    mock_engine.cache_seq_interface.kv_cache_manager = Mock()
+    mock_engine.cache_seq_interface.kv_cache_manager.impl = Mock()
+    mock_engine.cache_seq_interface.kv_cache_config_tuned = SimpleNamespace(tokens_per_block=64)
+
+    with (
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.mpi_world_size", return_value=1),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.mpi_rank", return_value=0),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.get_free_port", return_value=12345),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.initialize_or_skip"),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.torch.cuda.set_device"),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config",
+            return_value=mock_engine,
+        ) as build_from_config_mock,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.SuffixAutomatonManager",
+        ) as sa_manager_cls,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.instantiate_sampler",
+            return_value=Mock(),
+        ),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor",
+            side_effect=MockPyExecutor,
+        ),
+    ):
+        result = create_autodeploy_executor(ad_config)
+
+    sa_manager_cls.assert_not_called()
+    assert build_from_config_mock.call_args.kwargs["sa_manager"] is None
+    assert (
+        result.resource_manager.get_resource_manager(ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        is None
+    )

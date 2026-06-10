@@ -160,6 +160,9 @@ class CachedSequenceInterface:
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
+        # Optional SA runtime resource. Populated by ADEngine before compile-time capture so
+        # spec-dec models see the same non-tensor resource object during capture and replay.
+        self.sa_manager: Optional["SuffixAutomatonManager"] = None
         self._requires_uniform_kv_caches = requires_uniform_kv_caches
 
         # Propagate spec-dec config into BatchInfo so attention backends can read it
@@ -1379,10 +1382,15 @@ class SpeculativeDecodingModelArgs:
         cache_seq_interface: Per-iteration sequence and KV-cache state. Always present whenever a
             spec-dec model forward runs with caches (inference and the resize transform).
         sa_manager: Suffix-automaton manager backing the SA draft enhancer. Owned by the
-            ``PyExecutor`` resource managers, not by the engine. Set only when SA enhancement is
-            enabled (``spec_config.sa_config`` is not ``None``) and the managers exist; ``None``
-            otherwise (e.g. the resize transform, or non-SA speculation).
+            ``PyExecutor`` resource managers and held by the AutoDeploy engine/cache interface as
+            a reference. Set only when SA enhancement is enabled (``spec_config.sa_config`` is not
+            ``None``) and the managers exist; ``None`` otherwise (e.g. the resize transform, or
+            non-SA speculation).
     """
 
     cache_seq_interface: CachedSequenceInterface
     sa_manager: Optional["SuffixAutomatonManager"] = None
+
+    def __hash__(self) -> int:
+        """Hash by resource identity so cudagraph static-arg checks survive wrapper recreation."""
+        return hash((id(self.cache_seq_interface), id(self.sa_manager)))

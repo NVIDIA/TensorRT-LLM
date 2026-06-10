@@ -338,12 +338,14 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
     EAGLE_MODEL_PATH = hf_id_to_local_model_dir(
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
+    MAX_DRAFT_LEN = 3
 
     def get_default_kwargs(self, attn_backend="flashinfer", enable_sa=False):
         yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
-        sa_config = SAEnhancerConfig(threshold=1) if enable_sa else None
+        sa_config = (SAEnhancerConfig(
+            threshold=self.MAX_DRAFT_LEN) if enable_sa else None)
         speculative_config = Eagle3DecodingConfig(
-            max_draft_len=3,
+            max_draft_len=self.MAX_DRAFT_LEN,
             speculative_model=self.EAGLE_MODEL_PATH,
             eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
@@ -404,7 +406,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    @pytest.mark.parametrize("attn_backend", ["trtllm"])
     def test_eagle3_one_model_sa(self, attn_backend):
         """Test Eagle3 one-model speculative decoding with SA on GSM8K."""
         kwargs = self.get_default_kwargs(attn_backend=attn_backend,

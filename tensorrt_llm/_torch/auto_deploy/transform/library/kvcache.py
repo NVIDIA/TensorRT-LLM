@@ -776,11 +776,11 @@ class ResizeKVCache(BaseTransform):
         cm.info.set_max_num_tokens_sample()
         try:
             if cm._spec_config is not None:
-                # Resize runs before the executor's resource managers exist, so there is no
-                # SAManager yet; spec_dec_args.sa_manager stays None and SA enhancement no-ops.
                 mod(
                     **cm.named_args,
-                    spec_dec_args=SpeculativeDecodingModelArgs(cache_seq_interface=cm),
+                    spec_dec_args=SpeculativeDecodingModelArgs(
+                        cache_seq_interface=cm, sa_manager=cm.sa_manager
+                    ),
                 )
             else:
                 mod(**cm.named_args)

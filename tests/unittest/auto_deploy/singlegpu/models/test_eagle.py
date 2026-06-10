@@ -202,6 +202,20 @@ def test_eagle_wrapper_instantiates_sa_enhancer():
     assert wrapper.sa_enhancer.threshold == 2
 
 
+def test_eagle_wrapper_skips_sa_enhancer_without_sa_config():
+    wrapper = EagleWrapper(
+        EagleWrapperConfig(
+            max_draft_len=3,
+            load_embedding_from_target=True,
+            load_lm_head_from_target=True,
+        ),
+        target_model=torch.nn.Module(),
+        draft_model=torch.nn.Module(),
+    )
+
+    assert wrapper.sa_enhancer is None
+
+
 def test_eagle_one_model_factory_populates_sa_enhancer_config(monkeypatch):
     from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
 
@@ -231,6 +245,35 @@ def test_eagle_one_model_factory_populates_sa_enhancer_config(monkeypatch):
     assert isinstance(wrapper, EagleWrapper)
     assert wrapper.sa_enhancer is not None
     assert wrapper.sa_enhancer.threshold == 5
+
+
+def test_eagle_one_model_factory_skips_sa_enhancer_without_sa_config(monkeypatch):
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model="draft-model",
+    )
+    factory = EagleOneModelFactory(
+        model="target-model",
+        speculative_config=spec_config,
+        skip_loading_weights=True,
+        max_seq_len=64,
+    )
+    target_model = torch.nn.Module()
+    draft_model = torch.nn.Module()
+    draft_model.config = SimpleNamespace(
+        load_embedding_from_target=True,
+        load_lm_head_from_target=True,
+        normalize_target_hidden_state=False,
+    )
+    monkeypatch.setattr(factory.target_factory, "build_model", lambda device: target_model)
+    monkeypatch.setattr(factory.draft_factory, "build_model", lambda device: draft_model)
+
+    wrapper = factory._build_model("cpu")
+
+    assert isinstance(wrapper, EagleWrapper)
+    assert wrapper.sa_enhancer is None
 
 
 def test_eagle_wrapper_sa_override_updates_next_new_tokens():
@@ -271,35 +314,41 @@ def test_eagle_wrapper_sa_override_updates_next_new_tokens():
     )
 
 
-def test_eagle_wrapper_sa_override_noop_without_manager():
-    """SA override must no-op when sa_manager is None even though sa_enhancer is set.
-
-    This is the KV-cache resize-transform flow: the resize runs forward before the executor's
-    resource managers exist, so it passes sa_manager=None. It guards the class-docstring invariant
-    that the two guards (sa_enhancer is not None AND sa_manager is not None) are not redundant --
-    collapsing them to a single sa_enhancer check would wrongly fire SA here.
-    """
-
-    class FakeSAEnhancer:
-        def maybe_override_all_draft_tokens(self, draft_tokens):
-            raise AssertionError("SA override must not run when sa_manager is None")
+def test_eagle_wrapper_sa_override_requires_manager():
+    from tensorrt_llm.llmapi import SAEnhancerConfig
 
     wrapper = EagleWrapper(
         EagleWrapperConfig(
             max_draft_len=2,
             load_embedding_from_target=True,
             load_lm_head_from_target=True,
+            sa_config=SAEnhancerConfig(threshold=2),
         ),
         target_model=torch.nn.Module(),
         draft_model=torch.nn.Module(),
     )
-    wrapper.sa_enhancer = FakeSAEnhancer()
     next_new_tokens = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
-    original = next_new_tokens.clone()
 
-    wrapper._maybe_apply_sa_draft_override(next_new_tokens, num_prefill=1, sa_manager=None)
+    with pytest.raises(RuntimeError):
+        wrapper._maybe_apply_sa_draft_override(next_new_tokens, num_prefill=1, sa_manager=None)
 
-    torch.testing.assert_close(next_new_tokens, original)
+
+def test_eagle_wrapper_cached_forward_requires_manager_when_sa_enabled():
+    from tensorrt_llm.llmapi import SAEnhancerConfig
+
+    wrapper = EagleWrapper(
+        EagleWrapperConfig(
+            max_draft_len=2,
+            load_embedding_from_target=True,
+            load_lm_head_from_target=True,
+            sa_config=SAEnhancerConfig(threshold=2),
+        ),
+        target_model=torch.nn.Module(),
+        draft_model=torch.nn.Module(),
+    )
+
+    with pytest.raises(RuntimeError):
+        wrapper._forward_with_kv_cache(csi=object(), sa_manager=None)
 
 
 def test_eagle_wrapper_forward_unpacks_spec_dec_args():

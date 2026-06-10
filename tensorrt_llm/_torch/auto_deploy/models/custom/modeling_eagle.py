@@ -764,12 +764,9 @@ class EagleWrapper(nn.Module):
         `self.sa_enhancer` is set at construction iff SA is configured (`config.sa_config` is not
         None); it is a stateless override policy. The suffix-automaton data structure it operates
         on (`sa_manager`) is a per-iteration runtime object passed into `forward` and is only
-        available during executor inference. It is intentionally None during the KV-cache resize
-        transform, which calls `forward` purely to size memory before the executor's resource
-        managers exist. SA work therefore requires *both*: every SA call site guards on
-        `self.sa_enhancer is not None and sa_manager is not None`. The two checks are not
-        redundant and must not be collapsed — `sa_enhancer` set with `sa_manager` None is the
-        expected resize-time state and correctly no-ops SA.
+        available when executor inference passes speculative-decoding runtime args. If cached
+        inference reaches this wrapper with an SA enhancer but no manager, the executor/model
+        contract has been broken and the wrapper fails loudly.
     """
 
     def __init__(self, config: EagleWrapperConfig, target_model: nn.Module, draft_model: nn.Module):
@@ -973,9 +970,10 @@ class EagleWrapper(nn.Module):
         num_prefill: int,
         sa_manager,
     ) -> None:
-        # Both required (see class docstring): sa_manager is None during the resize transform.
-        if self.sa_enhancer is None or sa_manager is None:
+        if self.sa_enhancer is None:
             return
+        if sa_manager is None:
+            raise RuntimeError("SA enhancer is enabled but no SA manager was provided.")
 
         # next_new_tokens is [batch, 1 + max_draft_len]: column 0 is the golden/bonus token and
         # columns 1: are the draft proposals. Slice to generation rows (num_prefill:) and to the
@@ -997,6 +995,9 @@ class EagleWrapper(nn.Module):
         Expected kwargs that are accessed directly are described in the required_kwargs property.
         Additional kwargs are forwarded to target/draft submodules (kv caches, etc.).
         """
+        if self.sa_enhancer is not None and sa_manager is None:
+            raise RuntimeError("SA enhancer is enabled but no SA manager was provided.")
+
         # ---- Phase 0: Check batch information ----
         # determine batch information from batch_info_host
         batch_info = csi.info.batch_info
@@ -1092,8 +1093,7 @@ class EagleWrapper(nn.Module):
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
 
-        # Both required (see class docstring): sa_manager is None during the resize transform.
-        if self.sa_enhancer is not None and sa_manager is not None:
+        if self.sa_enhancer is not None:
             self.sa_enhancer.extend_and_prepare(
                 sa_manager=sa_manager,
                 # extend_and_prepare takes request_ids but only consumes their count here: the

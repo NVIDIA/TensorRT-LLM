@@ -39,6 +39,7 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import SplitInfo, s
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
+from tensorrt_llm._torch.auto_deploy.shim.interface import SpeculativeDecodingModelArgs
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
     CompileModel,
     _generate_default_piecewise_num_tokens,
@@ -1127,7 +1128,7 @@ class TestCompileModelGraphModuleTargetCollection:
         assert compiler_kwargs_seen[0]["resource_input_names"] == ("explicit_cache",)
         assert compiler_kwargs_seen[0]["num_batched_inputs"] is None
 
-    def test_compile_model_marks_cache_seq_interface_static_for_spec_decode(self, monkeypatch):
+    def test_compile_model_marks_spec_dec_args_static_for_spec_decode(self, monkeypatch):
         wrapper = self._make_wrapper_with_graphmodule_child()
         compiler_kwargs_seen = []
 
@@ -1151,6 +1152,8 @@ class TestCompileModelGraphModuleTargetCollection:
         )
         cm = self._make_cm()
         cm._spec_config = MagicMock()
+        cm._spec_config.max_draft_len = 3
+        cm.sa_manager = MagicMock()
 
         transform._apply_to_full_model(
             wrapper,
@@ -1161,9 +1164,21 @@ class TestCompileModelGraphModuleTargetCollection:
 
         assert compiler_kwargs_seen[0]["resource_input_names"] == (
             "explicit_cache",
-            "cache_seq_interface",
+            "spec_dec_args",
         )
         assert compiler_kwargs_seen[0]["num_batched_inputs"] is None
+
+        args, kwargs = compiler_kwargs_seen[0]["get_args_kwargs_for_compile"](2)
+        assert args == ()
+        assert "cache_seq_interface" not in kwargs
+        assert isinstance(kwargs["spec_dec_args"], SpeculativeDecodingModelArgs)
+        assert kwargs["spec_dec_args"].cache_seq_interface is cm
+        assert kwargs["spec_dec_args"].sa_manager is cm.sa_manager
+        assert hash(kwargs["spec_dec_args"]) == hash(
+            SpeculativeDecodingModelArgs(cache_seq_interface=cm, sa_manager=cm.sa_manager)
+        )
+        cm.info.set_capture_batch.assert_called_with(batch_size=2, max_draft_len=3)
+        cm.sa_manager.prepare.assert_called_with([0, 1], 3)
 
     @pytest.mark.parametrize(
         "backend", ["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"]

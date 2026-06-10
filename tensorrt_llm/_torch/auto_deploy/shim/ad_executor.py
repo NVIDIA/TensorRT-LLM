@@ -494,6 +494,7 @@ class ADEngine(ModelEngine):
 
         # Store the cache sequence interface
         self.cache_seq_interface = cache_seq_interface
+        self.cache_seq_interface.sa_manager = self.sa_manager
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
