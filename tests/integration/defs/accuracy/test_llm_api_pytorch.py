@@ -3774,11 +3774,6 @@ def _deepseekv4_pro_agg_llm_kwargs(**overrides):
     return kwargs
 
 
-def _sync_cuda():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
 def _run_deepseekv4_eplb(model_name,
                          model_path,
                          moe_backend,
@@ -3887,7 +3882,6 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_full_accuracy(self):
         with LLM(self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
-            _sync_cuda()
             task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,

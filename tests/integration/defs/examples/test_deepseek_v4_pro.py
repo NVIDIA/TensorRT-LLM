@@ -26,7 +26,6 @@ import json
 import os
 
 import pytest
-import torch
 from defs.conftest import llm_models_root, skip_pre_blackwell
 
 from tensorrt_llm import LLM
@@ -68,11 +67,6 @@ def _deepseekv4_pro_agg_llm_kwargs(**overrides):
     )
     kwargs.update(overrides)
     return kwargs
-
-
-def _sync_cuda():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
 
 
 def _get_llm_vocab_size(llm):
@@ -139,7 +133,6 @@ def _run_token_id_smoke_wave(llm, prompt_lengths, max_tokens, vocab_size):
         assert len(generated_tokens) == max_tokens, (
             f"Expected {max_tokens} generated tokens, got {len(generated_tokens)}"
         )
-    _sync_cuda()
 
 
 @pytest.mark.timeout(14400)
@@ -150,7 +143,6 @@ def _run_token_id_smoke_wave(llm, prompt_lengths, max_tokens, vocab_size):
 def test_short_token_boundary_smoke():
     model_path = f"{llm_models_root()}/DeepSeek-V4-Pro"
     with LLM(model_path, **_deepseekv4_pro_agg_llm_kwargs(max_batch_size=32)) as llm:
-        _sync_cuda()
         vocab_size = _get_llm_vocab_size(llm)
         _run_token_id_smoke_wave(llm, [1] * 32, 1, vocab_size)
         _run_token_id_smoke_wave(llm, [1] * 31, 2, vocab_size)
