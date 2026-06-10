@@ -18,6 +18,7 @@ import os
 
 import torch
 from einops import rearrange, repeat
+from flashinfer.mamba import checkpointing_ssu
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
@@ -46,6 +47,25 @@ from .selective_state_update import \
     selective_state_update as selective_state_update_native
 from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
 from .ssd_combined import mamba_chunk_scan_combined
+
+# Head dims the flashinfer single-token SSU kernel (selective_state_update)
+# supports.  Other dims (e.g. Nemotron-v2-Nano's head_dim=80) fall back to the
+# native Triton kernel.
+# TODO: widen once flashinfer adds more head dims.
+_FI_SSU_SUPPORTED_HEAD_DIMS = (64, 128)
+
+# flashinfer checkpointing_ssu (SSU replay + checkpointing) kernel limits.
+# The kernel asserts max_window <= 16, i.e. it can replay/cache at most 16
+# tokens per sequence.  In TRT-LLM this window equals the MTP draft length
+# T = max_draft_len + 1, so the kernel is only usable when T <= 16.
+_FI_CHECKPOINTING_MAX_WINDOW = 16
+
+# State dtypes the checkpointing_ssu kernel accepts WITHOUT a state_scale
+# tensor.  Quantized state (e.g. int8 / fp8_e4m3fn) needs a per-(cache, head,
+# dim) decode-scale that the TRT-LLM replay path does not supply; any dtype not
+# in this whitelist falls back to the Triton replay kernel.
+_FI_CHECKPOINTING_SUPPORTED_STATE_DTYPES = (torch.bfloat16, torch.float16,
+                                            torch.float32)
 
 
 class Mamba2Mixer(nn.Module):
@@ -155,49 +175,9 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
-        # Choose between flashinfer and native implementation. (default to flashinfer)
-        self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        # TODO: Update head_dims once flashinfer is updated.
-        # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
-        supported_head_dims = [64, 128]
-        self._use_flashinfer = head_dim in supported_head_dims
-        self._stochastic_rounding_requested = (
-            config.quant_config.mamba_ssm_stochastic_rounding)
-        self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
-        # SR needs fp16 cache.  Replay and flashinfer each supply a Philox impl;
-        # custom_op does not.  Only use_replay is resolved per-forward (from the
-        # cache manager), so precompute both gate values here.
-        sr_base = (self._stochastic_rounding_requested
-                   and self._mamba_ssm_cache_dtype == torch.float16)
-        # Keep replay SSM-cache writes on the same stochastic-rounding policy
-        # as flashinfer; the replay kernel masks stale slots before using them.
-        self._stochastic_rounding_for_replay = sr_base
-        self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
-
-        self._use_mtp_custom_op = os.environ.get(
-            "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
-
-        if self._use_flashinfer:
-            logger.info_once("Using flashinfer for selective state update",
-                             key="selective_state_update")
-            self.selective_state_update_func = selective_state_update_fi
-        else:
-            logger.info_once("Using native for selective state update",
-                             key="selective_state_update")
-            self.selective_state_update_func = selective_state_update_native
-
-        # Warn if stochastic rounding was requested but no path can supply it.
-        if self._stochastic_rounding_requested:
-            if self._mamba_ssm_cache_dtype != torch.float16:
-                logger.warning_once(
-                    f"Stochastic rounding needs fp16 SSM cache, "
-                    f"have {self._mamba_ssm_cache_dtype}. Disabled.",
-                    key="stochastic_rounding_disabled")
-            elif not self._use_flashinfer:
-                logger.warning_once(
-                    "Stochastic rounding needs flashinfer or replay; "
-                    "neither available with current configuration.",
-                    key="stochastic_rounding_disabled")
+        # Resolve which Mamba kernels to use (and enforce their static limits).
+        self._select_mamba_kernels(config.quant_config, config.spec_config,
+                                   head_dim)
 
         # D
         self.D = nn.Parameter(
@@ -252,6 +232,145 @@ class Mamba2Mixer(nn.Module):
 
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    def _select_mamba_kernels(self, quant_config, spec_config,
+                              head_dim: int) -> None:
+        """Resolve which Mamba kernels to use and enforce their static limits.
+
+        Computation paths (one mixer dispatches all three phases):
+
+          Phase          Kernel(s)                         Selected by / limits
+          -------------- --------------------------------- ----------------------
+          Prefill (SSD)  mamba_chunk_scan_combined         backend chosen inside
+                         (FI SSDCombined | Triton)         ssd_combined.py: env
+                                                           TRTLLM_USE_MAMBA_FI_SSD,
+                                                           SM100+, chunk/dstate/
+                                                           headdim in {64,128}
+
+          Decode 1-tok   selective_state_update            self._use_fi_stp
+           (SSU / STP)   (FI | native Triton)              (head_dim in {64,128})
+                         -> self._stp_ssu_func
+
+          Decode MTP     priority order, in forward():     is_target_verify (spec):
+           (T drafts)     1 checkpointing_ssu (FI fused)     self._use_fi_checkpointing
+                          2 replay_selective_state_update    use_replay (cache mgr)
+                            (Triton)
+                          3 selective_state_update_mtp_...    self._use_mtp_custom_op
+                            (CUDA custom op, no SR)
+                          4 selective_state_update            self._use_fi_mtp
+                            (MTP "simple", FI | native)       -> self._mtp_ssu_func
+
+        NOTE: "Decode 1-tok" (STP) and MTP path 4 ("simple") call the *same*
+        flashinfer kernel (selective_state_update) and share one head-dim limit
+        — single token vs cache_steps>1 is the only difference.  They are gated
+        by two separate flags (self._use_fi_stp / self._use_fi_mtp, equal today)
+        so each call site reads an intent-revealing flag and a future MTP-only
+        limit can diverge them.  checkpointing_ssu (MTP path 1) is the one
+        flashinfer kernel with extra limits (dtype + draft-window), so it builds
+        on self._use_fi_mtp and keeps its own gate.
+
+        Cache path (owned by the Mamba cache manager, surfaced via attn_metadata):
+          * mamba_ssm_cache_dtype    SSM-state storage dtype (bf16/fp16/fp32/quant)
+          * use_replay_state_update  allocates the double-buffered replay/checkpoint
+                                     history (old_x/old_B/old_dt/old_dA_cumsum,
+                                     cache_buf_idx, prev_num_accepted_tokens);
+                                     prerequisite for MTP paths 1 & 2
+          * stochastic rounding      fp16 cache only; Philox supplied by the replay
+                                     and flashinfer kernels (not the custom op)
+
+        All limits (including the MTP draft-window limit
+        T = max_draft_len + 1 <= _FI_CHECKPOINTING_MAX_WINDOW) are static and
+        resolved here — `forward` reads only the resolved `self._use_*` flags.
+        """
+        # ── SSM-state cache dtype (set by the cache manager; read-only here) ──
+        self._mamba_ssm_cache_dtype = quant_config.mamba_ssm_cache_dtype
+
+        # ── selective_state_update backend: flashinfer vs native ──
+        # Two decode regimes call the SAME flashinfer kernel
+        # (selective_state_update): single-token (STP) and MTP-"simple"
+        # (cache_steps > 1).  They share one head-dim limit, so the two gates
+        # are equal today.  They are kept separate so each forward call site
+        # reads an intent-revealing flag and a future MTP-only flashinfer limit
+        # can diverge them without restructuring.
+        fi_ssu_ok = head_dim in _FI_SSU_SUPPORTED_HEAD_DIMS
+        self._use_fi_stp = fi_ssu_ok  # flashinfer for single-token decode
+        self._use_fi_mtp = fi_ssu_ok  # flashinfer for MTP-"simple"
+        self._stp_ssu_func = (selective_state_update_fi if self._use_fi_stp else
+                              selective_state_update_native)
+        self._mtp_ssu_func = (selective_state_update_fi if self._use_fi_mtp else
+                              selective_state_update_native)
+        logger.info_once(
+            "Mamba selective_state_update backend: "
+            f"stp={'flashinfer' if self._use_fi_stp else 'native'}, "
+            f"mtp={'flashinfer' if self._use_fi_mtp else 'native'}",
+            key="selective_state_update")
+
+        # ── MTP opt-ins (only relevant on the speculative is_target_verify path) ──
+        # (a) Upstream CUDA custom op for the MTP SSM-cache update (no SR support).
+        self._use_mtp_custom_op = os.environ.get(
+            "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
+        # (b) flashinfer fused replay+checkpointing for the MTP replay path.
+        #     Static limits (all resolvable here):
+        #       - flashinfer-supported head_dim (via _use_fi_mtp; head_dim >= 32
+        #         is the kernel's true floor, kept aligned with the SSU set)
+        #       - non-quantized state cache (we pass no state_scale)
+        #       - draft window T <= _FI_CHECKPOINTING_MAX_WINDOW.  TRT-LLM sizes
+        #         the replay window to T = draft_token_num = max_draft_len + 1,
+        #         which is static (the mixer processes max_draft_len+1 tokens per
+        #         MTP step), so resolve it from spec_config here.  spec_config is
+        #         None / max_draft_len is None when speculation is off, in which
+        #         case the checkpointing path is never reached at runtime.
+        #         TODO(TRTLLM-10319): if per-step dynamic draft lengths land, the
+        #         mixer's draft_token_num itself becomes dynamic — revisit then.
+        fi_ckpt_requested = os.environ.get("TRTLLM_MAMBA2_USE_FI_CHECKPOINTING",
+                                           "1") == "1"
+        fi_ckpt_state_ok = (self._mamba_ssm_cache_dtype
+                            in _FI_CHECKPOINTING_SUPPORTED_STATE_DTYPES)
+        max_draft_len = (spec_config.max_draft_len
+                         if spec_config is not None else None)
+        fi_ckpt_window_ok = (max_draft_len is None or (max_draft_len + 1)
+                             <= _FI_CHECKPOINTING_MAX_WINDOW)
+        # checkpointing_ssu is an MTP flashinfer path, so it builds on _use_fi_mtp.
+        self._use_fi_checkpointing = (fi_ckpt_requested and self._use_fi_mtp
+                                      and fi_ckpt_state_ok
+                                      and fi_ckpt_window_ok)
+        if fi_ckpt_requested and not self._use_fi_checkpointing:
+            logger.warning_once(
+                "flashinfer checkpointing_ssu requested "
+                "(TRTLLM_MAMBA2_USE_FI_CHECKPOINTING=1) but unsupported for "
+                f"this config (head_dim={head_dim}, "
+                f"mtp_flashinfer_supported={self._use_fi_mtp}, "
+                f"ssm_cache_dtype={self._mamba_ssm_cache_dtype}, "
+                f"max_draft_len={max_draft_len}, window_ok={fi_ckpt_window_ok} "
+                f"[needs max_draft_len+1 <= {_FI_CHECKPOINTING_MAX_WINDOW}]); "
+                "falling back to the Triton replay kernel.",
+                key="fi_checkpointing_disabled")
+
+        # ── Stochastic-rounding policy (fp16 cache only) ──
+        # Resolved per backend up front; only `use_replay` is known per-forward.
+        # Replay and flashinfer each supply a Philox SR impl; the custom op does
+        # not.  The replay kernel masks stale slots before using them, so it
+        # shares flashinfer's SR policy.
+        self._stochastic_rounding_requested = (
+            quant_config.mamba_ssm_stochastic_rounding)
+        self._philox_rounds = quant_config.mamba_ssm_philox_rounds
+        sr_ok = (self._stochastic_rounding_requested
+                 and self._mamba_ssm_cache_dtype == torch.float16)
+        self._stochastic_rounding_for_replay = sr_ok
+        # SR-for-flashinfer covers both fi SSU regimes (STP and MTP-simple);
+        # their flashinfer availability is identical (fi_ssu_ok).
+        self._stochastic_rounding_for_flashinfer = sr_ok and fi_ssu_ok
+        if self._stochastic_rounding_requested:
+            if self._mamba_ssm_cache_dtype != torch.float16:
+                logger.warning_once(
+                    "Stochastic rounding needs fp16 SSM cache, have "
+                    f"{self._mamba_ssm_cache_dtype}. Disabled.",
+                    key="stochastic_rounding_disabled")
+            elif not fi_ssu_ok:
+                logger.warning_once(
+                    "Stochastic rounding needs flashinfer or replay; neither "
+                    "available with current configuration.",
+                    key="stochastic_rounding_disabled")
 
     def post_load_weights(self):
         """Post-process after loading weights."""
@@ -525,13 +644,43 @@ class Mamba2Mixer(nn.Module):
                         "_util.py passes mamba_ssm_stochastic_rounding=True "
                         "to the cache manager.")
                     rand_seed.add_(1)
-                    if use_replay:
+                    if use_replay and not self._use_fi_checkpointing:
+                        # Triton replay indexes the per-slot seed buffer by
+                        # cache_batch_idx, so it takes the full (cache,) tensor.
                         philox_kwargs['rand_seed'] = rand_seed
                     else:
+                        # flashinfer (checkpointing_ssu and the STP kernel)
+                        # requires a single-element seed tensor.
                         philox_kwargs['rand_seed'] = rand_seed[:1]
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
-                if use_replay:
+                if use_replay and self._use_fi_checkpointing:
+                    # flashinfer fused replay. The mma-based kernel needs
+                    # contiguous x/B/C; dt keeps its tie_hdim (stride[-1]==0)
+                    # layout from the repeat() above. cache_buf_idx is still
+                    # flipped caller-side by the mamba cache manager.
+                    checkpointing_ssu(
+                        ssm_states,
+                        layer_cache.old_x,
+                        layer_cache.old_B,
+                        layer_cache.old_dt,
+                        layer_cache.old_dA_cumsum,
+                        layer_cache.cache_buf_idx,
+                        layer_cache.prev_num_accepted_tokens,
+                        x_d_4d.contiguous(),
+                        dt_d_4d,
+                        A,
+                        B_d_4d.contiguous(),
+                        C_d_4d.contiguous(),
+                        out=out_4d,
+                        D=D,
+                        dt_bias=dt_bias,
+                        dt_softplus=self.delta_softplus,
+                        state_batch_indices=state_batch_indices,
+                        enable_pdl=True,
+                        **philox_kwargs,
+                    )
+                elif use_replay:
                     replay_selective_state_update(
                         ssm_states,
                         layer_cache.old_x,
@@ -583,7 +732,7 @@ class Mamba2Mixer(nn.Module):
                     x_d_4d = x_d_4d.contiguous()
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()
-                    self.selective_state_update_func(
+                    self._mtp_ssu_func(
                         ssm_states,
                         x_d_4d,
                         dt_d_4d,
@@ -635,7 +784,7 @@ class Mamba2Mixer(nn.Module):
                     ssu_kwargs['rand_seed'] = rand_seed[:1]
                     ssu_kwargs['philox_rounds'] = self._philox_rounds
 
-                self.selective_state_update_func(
+                self._stp_ssu_func(
                     ssm_states,
                     x_d,
                     dt_d,
