@@ -46,13 +46,7 @@ llm_spark_func:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
   - test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
-  - test_e2e.py::test_openai_health
   - test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]
-  - test_e2e.py::test_trtllm_multimodal_benchmark_serving
-  - test_e2e.py::test_openai_completions_example[pytorch]
-  - test_e2e.py::test_openai_reasoning[pytorch]
-  - test_e2e.py::test_openai_chat_harmony
-  - test_e2e.py::test_trtllm_benchmark_serving[llama-3.1-model/Meta-Llama-3.1-8B]
   - examples/serve/test_serve.py::test_nemotron3_super_120b_nvfp4
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_on]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_off]
@@ -60,22 +54,6 @@ llm_spark_func:
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[tool_calling]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[image]
   - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[video]
-  - examples/serve/test_serve_negative.py::test_invalid_max_tokens
-  - examples/serve/test_serve_negative.py::test_invalid_temperature
-  - examples/serve/test_serve_negative.py::test_invalid_top_p[-0.1]
-  - examples/serve/test_serve_negative.py::test_invalid_top_p[1.1]
-  - examples/serve/test_serve_negative.py::test_empty_messages_array
-  - examples/serve/test_serve_negative.py::test_missing_message_role
-  - examples/serve/test_serve_negative.py::test_invalid_token_ids
-  - examples/serve/test_serve_negative.py::test_extremely_large_token_id
-  - examples/serve/test_serve_negative.py::test_server_stability_under_invalid_requests
-  - examples/serve/test_serve_negative.py::test_concurrent_invalid_requests
-  - examples/serve/test_serve_negative.py::test_mixed_valid_invalid_requests
-  - examples/serve/test_serve_negative.py::test_health_check_during_errors
-  - examples/serve/test_serve_negative.py::test_request_exceeds_context_length
-  - examples/serve/test_serve_negative.py::test_malformed_json_request
-  - examples/serve/test_serve_negative.py::test_missing_content_type_header
-  - examples/serve/test_serve_negative.py::test_extremely_large_batch
 # ===============================================================================
 # 2: Multi-GPU (2 GPUs) Spark func cases with multinode support
 # ===============================================================================
@@ -94,5 +72,3 @@ llm_spark_func:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass_eagle3]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1DistillLlama70B::test_auto_dtype_tp2
-  - accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp8_tp2
-  - accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype_tp2

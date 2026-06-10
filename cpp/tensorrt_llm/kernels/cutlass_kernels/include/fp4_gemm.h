@@ -54,7 +54,7 @@ public:
 
     virtual void gemm(void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
         float const* global_sf, int m, int n, int k, int batch_count, tkc::CutlassGemmConfig gemmConfig,
-        char* workspace, const size_t workspaceBytes, cudaStream_t stream)
+        char* workspace, const size_t workspaceBytes, cudaStream_t stream, void const* bias = nullptr)
         = 0;
 
     // Returns desired workspace size in bytes.
@@ -78,7 +78,7 @@ public:
 
     void gemm(void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
         float const* global_sf, int m, int n, int k, int batch_count, tkc::CutlassGemmConfig gemmConfig,
-        char* workspace, const size_t workspaceBytes, cudaStream_t stream) override;
+        char* workspace, const size_t workspaceBytes, cudaStream_t stream, void const* bias = nullptr) override;
 
     // Returns desired workspace size in bytes.
     size_t getWorkspaceSize(int const m, int const n, int const k, int const batch_count) override;
@@ -88,7 +88,8 @@ public:
 private:
     size_t dispatchToArch(T* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
         float const* global_sf, int m, int n, int k, int batch_count, tkc::CutlassGemmConfig gemmConfig,
-        char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr);
+        char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr,
+        void const* bias = nullptr);
 
     size_t getWorkspaceSizeImpl(int const m, int const n, int const k, int const batch_count);
 

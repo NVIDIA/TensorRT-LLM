@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from strenum import StrEnum
@@ -54,16 +54,20 @@ from tensorrt_llm.mapping import Mapping
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
+from ..utils.cuda_graph import BypassCapturedGraphs
 from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
-# Non-tensor multimodal metadata consumed by _store_prefill_multimodal_metadata.
+# Non-model multimodal metadata consumed before the exported graph or ignored by AD.
 # These keys must NOT leak into the generic extra_args dict — entries there
-# are expected to be tensors, and these are lists or nested dicts.
+# are expected to be tensors, and these may be scalars, lists, or nested dicts.
 _RESERVED_MM_DATA_KEYS = frozenset(
     {
         "layout_metadata",
+        "mm_bidirectional_blocks",
+        "multimodal_embedding",
+        "multimodal_embedding_lengths",
         "special_token_offsets",
         "multimodal_embed_mask_cumsum",
     }
@@ -126,6 +130,15 @@ def maybe_pad_for_cuda_graph(func):
         def _call_func():
             return func(self, scheduled_requests, resource_manager, *args, **kwargs)
 
+        def _call_func_eager():
+            # When this wrapper has decided that all ranks must run eager, also force
+            # the inner cudagraph backend to bypass captured graphs. Otherwise, ranks
+            # whose shapes happen to match a captured graph would still replay and
+            # use stale capture-time scalar kernel args (e.g. runtime_max_tokens_per_rank
+            # baked from local total at capture, vs cross-rank max read fresh in eager).
+            with BypassCapturedGraphs():
+                return _call_func()
+
         # check conditions for current rank
         can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
@@ -157,7 +170,7 @@ def maybe_pad_for_cuda_graph(func):
         can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
 
         if not can_run_cuda_graph_all:
-            return _call_func()
+            return _call_func_eager()
 
         # get closest cudagraph batch size based on max_batch_size across ALL ranks
         # NOTE: we assume uniform cudagraph batch sizes across all ranks ensuring all ranks get the
@@ -166,14 +179,14 @@ def maybe_pad_for_cuda_graph(func):
         cg_batch_size = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
 
         if cg_batch_size is None:
-            return _call_func()
+            return _call_func_eager()
 
         # let's check if all ranks can pad the batch if they need to
         can_pad_all = all(r_info[1] or (r_info[2] == cg_batch_size) for r_info in all_rank_info)
 
         # fall back if we cannot run cudagraph due to padding issues
         if not can_pad_all:
-            return _call_func()
+            return _call_func_eager()
 
         # check actual amount of padding needed
         num_padding = cg_batch_size - batch_size
@@ -200,6 +213,139 @@ def maybe_pad_for_cuda_graph(func):
         return ret
 
     return wrapper
+
+
+def _compute_window_local_view(
+    all_indices: Sequence[int],
+    front_removed: int,
+    end_compute_i: int,
+    group_window: int,
+    tokens_per_block: int,
+) -> Tuple[List[int], int, int, int]:
+    """Compute the window-coherent metadata view for one (request, window) pair.
+
+    The C++ KVCacheManager allocates blocks linearly during prefill and only
+    front-evicts during generation (kvCacheManager.cpp::adjustBlocksIfNeeded
+    is invoked from addToken, not addSequenceBatch).  Two regimes follow:
+
+      * Pre-eviction (typically a single long prefill that has not yet been
+        decoded past the window): ``front_removed == 0`` and the live page
+        list covers the full sequence.  The kernel needs every live page and
+        the unclamped local cache length; the sliding-window mask is applied
+        inside the kernel.
+
+      * Post-eviction (decode/extend has advanced past the window): the C++
+        side has bumped ``mNumFrontBlocksRemovedPerWindow`` without popping
+        ``mCacheBlockIds``, so the head of the page list is stale.  After
+        slicing those entries off, the live cache length in window-local
+        coords is ``end_compute_i - front_removed * tokens_per_block`` —
+        bounded above by ``group_window + tokens_per_block - 1`` by the
+        ``while (live >= window + page_size) detachFrontBlock`` loop.
+
+    Both regimes collapse to a single rule: trust the C++ accounting and
+    derive the local cache length from ``end_compute_i`` and ``front_removed``
+    rather than artificially clamping to ``group_window``.  Disagreement
+    between the Python and C++ sides (e.g. a caller passing a stale
+    ``end_compute_i`` against a fresher ``front_removed``) is asserted on
+    rather than silently masked.
+
+    Args:
+        all_indices: Full historical page list from ``get_cache_indices``,
+            including stale front entries when eviction has fired.
+        front_removed: Count of stale front entries, from
+            ``get_num_front_blocks_removed``.
+        end_compute_i: Global token position after this step's tokens are
+            processed (``input_pos + seq_len``).
+        group_window: Sliding-window size for this pool.  Currently only used
+            for the defensive sanity assertion below; the window mask itself
+            is applied inside the kernel via the ``sliding_window`` constant.
+        tokens_per_block: Cache page size.
+
+    Returns:
+        active_indices: the live slice of all_indices to hand the kernel.
+        extra_page: the next page after the live slice (used by the overlap
+            scheduler's deferred-page insertion), or -1 when there is no
+            slot past the live region.
+        seq_len_with_cache: window-local cache length the kernel should see.
+        last_page_len: derived from seq_len_with_cache and tokens_per_block.
+    """
+    live_len = len(all_indices) - front_removed
+    # Window-local cache length: how many tokens the live pages actually hold.
+    # Pre-eviction: end_compute_i (the full prefill so far).
+    # Post-eviction: end_compute_i - front_removed * page_size (capped above by
+    # window + page_size - 1 thanks to the C++ eviction loop).
+    local_cache_len = end_compute_i - front_removed * tokens_per_block
+    # Live cache length must fit inside the live pages.  The C++ KVCacheManager
+    # keeps the two in sync (it bumps front_removed exactly as it frees blocks,
+    # and allocates new ones for incoming tokens), so a violation means the
+    # Python side and C++ side disagree on either end_compute_i or
+    # front_removed -- fail loudly rather than silently clamp.
+    live_capacity = live_len * tokens_per_block
+    assert local_cache_len <= live_capacity, (
+        f"window-local cache length {local_cache_len} exceeds live page capacity "
+        f"{live_capacity} (live_len={live_len}, end_compute_i={end_compute_i}, "
+        f"front_removed={front_removed}, tokens_per_block={tokens_per_block}). "
+        f"C++ KVCacheManager accounting is expected to keep these in sync."
+    )
+    active_token_count = local_cache_len
+    # Sanity: live cache should never exceed window + one spillover page once
+    # front-eviction has fired (the C++ ``while (live >= window + page_size)
+    # detachFrontBlock`` loop guarantees this).  Pre-eviction (front_removed=0,
+    # e.g. a single long prefill) may legitimately exceed the window because
+    # blocks are allocated linearly for the full prompt and only detached
+    # during generation -- so we skip the check there.
+    assert active_token_count <= group_window + tokens_per_block or front_removed == 0, (
+        f"window-local cache length {active_token_count} exceeds "
+        f"window {group_window} + page_size {tokens_per_block} "
+        f"(end_compute_i={end_compute_i}, front_removed={front_removed})"
+    )
+    # Pages needed to address active_token_count tokens; equals live_len in
+    # the common case (post-eviction live = window + spillover, pre-eviction
+    # live = ceil(end_compute_i / page_size)).
+    pages_for_active = (active_token_count + tokens_per_block - 1) // tokens_per_block
+    num_active = min(live_len, pages_for_active)
+    active_indices = list(all_indices[front_removed : front_removed + num_active])
+    extra_slot_idx = front_removed + num_active
+    extra_page = all_indices[extra_slot_idx] if len(all_indices) > extra_slot_idx else -1
+    if active_token_count > 0:
+        last_page_len = (active_token_count - 1) % tokens_per_block + 1
+    else:
+        last_page_len = 0
+    return active_indices, extra_page, active_token_count, last_page_len
+
+
+def _compute_cyclic_full_view(
+    all_indices: Sequence[int],
+    end_compute_i: int,
+    tokens_per_block: int,
+) -> Tuple[List[int], int, int, int]:
+    """Compute the metadata view for a cyclic-SWA kernel (trtllm).
+
+    Unlike ``_compute_window_local_view`` (which slices the block table down to
+    the live sliding window for kernels that cannot cyclic-index), the trtllm
+    ``thop.attention`` kernel applies the sliding-window mask itself by wrapping
+    KV reads modulo the attention window. It therefore needs:
+
+      * the FULL per-window block table (``all_indices`` verbatim, including any
+        stale front-evicted entries -- the kernel's modulo indexing skips them),
+        and
+      * the GLOBAL (un-window-capped) KV length ``end_compute_i``.
+
+    This mirrors the PyTorch backend, which copies the manager's full block list
+    from index 0 and passes ``host_past_key_value_lengths == total KV length``.
+
+    Returns the same 4-tuple shape as ``_compute_window_local_view``:
+    ``(active_indices, extra_page, seq_len_with_cache, last_page_len)``.
+    ``extra_page`` is always -1: the full table already contains the next page,
+    so the overlap scheduler needs no deferred-page insertion.
+    """
+    active_indices = list(all_indices)
+    seq_len_with_cache = end_compute_i
+    if seq_len_with_cache > 0:
+        last_page_len = (seq_len_with_cache - 1) % tokens_per_block + 1
+    else:
+        last_page_len = 0
+    return active_indices, -1, seq_len_with_cache, last_page_len
 
 
 class ADEngine(ModelEngine):
@@ -294,11 +440,6 @@ class ADEngine(ModelEngine):
         self.llm_args.print_iter_log = reporting_info.print_log
         self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
-        self.llm_args.stream_interval = 1
-        self.llm_args.attention_dp_config = None
-        self.llm_args.batch_wait_timeout_ms = 0
-        self.llm_args.batch_wait_timeout_iters = 0
-        self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
@@ -308,12 +449,22 @@ class ADEngine(ModelEngine):
         self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
 
         if ad_config is not None:
+            self.llm_args.stream_interval = ad_config.stream_interval
+            self.llm_args.attention_dp_config = ad_config.attention_dp_config
+            self.llm_args.batch_wait_timeout_ms = ad_config.batch_wait_timeout_ms
+            self.llm_args.batch_wait_timeout_iters = ad_config.batch_wait_timeout_iters
+            self.llm_args.batch_wait_max_tokens_ratio = ad_config.batch_wait_max_tokens_ratio
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
             self.llm_args.max_stats_len = ad_config.max_stats_len
             self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
+            self.llm_args.stream_interval = 1
+            self.llm_args.attention_dp_config = None
+            self.llm_args.batch_wait_timeout_ms = 0
+            self.llm_args.batch_wait_timeout_iters = 0
+            self.llm_args.batch_wait_max_tokens_ratio = 0.0
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
@@ -658,17 +809,42 @@ class ADEngine(ModelEngine):
             if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
-        # store cache information for all requests now
+        # Store cache information for all requests.
+        # All KV pools are hosted by a single C++ KVCacheManager; pool index is
+        # the position of the window in self.cache_seq_interface.kv_group_windows
+        # (the same source the kvcache transform used to register window groups
+        # on SequenceInfo).  Per-window queries on the manager route to the
+        # correct C++ pool via mLayerToWindowSize.
+        kv_group_windows = self.cache_seq_interface.kv_group_windows
+        # When the attention kernel applies the sliding-window mask itself via
+        # cyclic KV indexing (trtllm), the executor must hand it the full
+        # per-window block table and a global (un-window-capped) KV length --
+        # the same contract as the PyTorch backend. Otherwise (triton /
+        # flashinfer) host-slice the block table to the live window below.
+        cyclic_swa = self.cache_seq_interface.kernel_handles_cyclic_swa
+        # Cache hot lookups so the per-request loop avoids repeated C++
+        # dispatch / hasattr calls.
         _tokens_per_block = kv_cache_manager.tokens_per_block
         _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
-        cache_loc: List[int] = []
-        cu_num_pages: List[int] = [0]
-        extra_page_per_seq: List[int] = []
         state_slot_idx: List[int] = []
 
-        batch_cache_indices = kv_cache_manager.get_batch_cache_indices(
-            [r.py_request_id for r in ordered_requests]
-        )
+        # Uniform per-pool transport: a single-pool deployment is just the
+        # degenerate case of VSWA with one pool, so all pools (including 0)
+        # take the same code path below.
+        num_pools = len(kv_group_windows)
+        cache_loc_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+        cu_num_pages_per_pool: List[List[int]] = [[0] for _ in range(num_pools)]
+        extra_page_per_seq_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+        seq_len_with_cache_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+        last_page_len_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+
+        # Batched per-pool lookup preserves the #13560 host-overhead
+        # optimization: one C++ call per pool instead of one per (request, pool).
+        request_ids = [r.py_request_id for r in ordered_requests]
+        batch_cache_indices_per_pool: List[List[List[int]]] = [
+            kv_cache_manager.get_batch_cache_indices(request_ids, window_size=group_window)
+            for group_window in kv_group_windows
+        ]
 
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
@@ -682,17 +858,61 @@ class ADEngine(ModelEngine):
             # get some info on the current request
             seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
             end_compute_i = input_pos[i] + seq_len_i
-            # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)
-            num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
 
-            # construct cache information for the current request
-            cache_indices = batch_cache_indices[i]
-            cache_loc.extend(cache_indices[:num_active_blocks_i])
-            cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
-            if len(cache_indices) > num_active_blocks_i:
-                extra_page_per_seq.append(cache_indices[num_active_blocks_i])
-            else:
-                extra_page_per_seq.append(-1)
+            for pool_idx, group_window in enumerate(kv_group_windows):
+                all_indices = batch_cache_indices_per_pool[pool_idx][i]
+                if cyclic_swa:
+                    # Cyclic-SWA kernels (trtllm) want the FULL per-window block
+                    # table and the GLOBAL KV length; the kernel masks the window
+                    # internally. No front-eviction slicing, so the
+                    # get_num_front_blocks_removed C++ dispatch is skipped here.
+                    (
+                        active_indices,
+                        extra_page,
+                        active_token_count,
+                        lpl_i,
+                    ) = _compute_cyclic_full_view(
+                        all_indices,
+                        end_compute_i=end_compute_i,
+                        tokens_per_block=_tokens_per_block,
+                    )
+                    num_active = len(active_indices)
+                else:
+                    # SWA front-eviction: get_batch_cache_indices returns the FULL
+                    # historical page list including front-evicted entries (the
+                    # C++ side bumps a counter rather than popping mCacheBlockIds).
+                    # _compute_window_local_view slices it down to the live window
+                    # in window-local coords.
+                    front_removed = kv_cache_manager.get_num_front_blocks_removed(
+                        request.py_request_id, window_size=group_window
+                    )
+                    (
+                        active_indices,
+                        extra_page,
+                        active_token_count,
+                        lpl_i,
+                    ) = _compute_window_local_view(
+                        all_indices,
+                        front_removed=front_removed,
+                        end_compute_i=end_compute_i,
+                        group_window=group_window,
+                        tokens_per_block=_tokens_per_block,
+                    )
+                    num_active = len(active_indices)
+
+                cache_loc_per_pool[pool_idx].extend(active_indices)
+                cu_num_pages_per_pool[pool_idx].append(
+                    cu_num_pages_per_pool[pool_idx][i] + num_active
+                )
+                extra_page_per_seq_per_pool[pool_idx].append(extra_page)
+                # seq_len_with_cache / last_page_len per pool (including 0).
+                # Cyclic-SWA (trtllm): the global KV length for every pool.
+                # Host-sliced (triton/flashinfer): the unclamped global value for
+                # full-attention pools (window == max_seq_len, no clamping), and
+                # the window-local coords for SWA pools under front-eviction --
+                # identical to the legacy single-pool path for non-SWA models.
+                seq_len_with_cache_per_pool[pool_idx].append(active_token_count)
+                last_page_len_per_pool[pool_idx].append(lpl_i)
 
         # Store batch information based on prefill, decode, and extend requests.
         num_decode = len(generation_requests)
@@ -717,9 +937,11 @@ class ADEngine(ModelEngine):
             cu_seqlen=cu_seqlen,
             input_pos=input_pos,
             batch_info=batch_info,
-            cache_loc=cache_loc,
-            cu_num_pages=cu_num_pages,
-            extra_page_per_seq=extra_page_per_seq,
+            cache_loc_per_pool=cache_loc_per_pool if num_pools > 0 else None,
+            cu_num_pages_per_pool=cu_num_pages_per_pool if num_pools > 0 else None,
+            extra_page_per_seq_per_pool=extra_page_per_seq_per_pool if num_pools > 0 else None,
+            seq_len_with_cache_per_pool=seq_len_with_cache_per_pool if num_pools > 0 else None,
+            last_page_len_per_pool=last_page_len_per_pool if num_pools > 0 else None,
             slot_idx=state_slot_idx,
             prompt_lens=prompt_lens,
             gather_context_logits=gather_context_logits,
@@ -793,6 +1015,20 @@ class ADEngine(ModelEngine):
             scheduled_requests, resource_manager, new_tokens, new_tokens_lens, gather_context_logits
         )
         self.iter_counter += 1
+
+        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 14
+        # (``max_dp_num_tokens``). Mirrors base TRT-LLM's pattern in
+        # ``model_engine._get_all_rank_num_tokens``: MoE all-to-all needs the
+        # cross-rank max to size dispatch padding without over-padding to the
+        # static config ``max_num_tokens``. ``nest_sequences`` already
+        # initialized slot 14 to the local ``total_num_tokens``; this overrides
+        # with the cross-rank max only when attention-DP requires it.
+        if self.enable_attention_dp and self.dist_config.tp_size > 1:
+            assert self.dist is not None, "Distributed object is required for attention DP mode"
+            info = self.cache_seq_interface.info
+            local_total_num_tokens = info.batch_info.get_total_num_tokens()
+            all_rank_num_tokens = list(self.dist.tp_allgather(local_total_num_tokens))
+            info.batch_info.update_max_dp_num_tokens(max(all_rank_num_tokens))
 
         # compute outputs
         outputs = self._run_forward()
@@ -1016,5 +1252,6 @@ def create_autodeploy_executor(
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
         resource_governor_queue=resource_governor_queue,
+        garbage_collection_gen0_threshold=ad_config.garbage_collection_gen0_threshold,
     )
     return py_executor

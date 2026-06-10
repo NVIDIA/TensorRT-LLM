@@ -1,6 +1,6 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 import torch
 
@@ -8,10 +8,12 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
-from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
+
+MAX_SPEC_DECODE_POSITIONS = 16
 '''
 CONTEXT_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.CONTEXT_INIT: 2>
 ENCODER_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.ENCODER_INIT: 1>
@@ -39,6 +41,10 @@ REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_GENERATION_ONLY:
     LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
 }
+
+# Internal request id for the attention-DP padding dummy. Generated real
+# request ids do not use 0; disaggregated global ids use a separate high range.
+ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
 if TYPE_CHECKING:
     from .sampling_utils import Strategy
@@ -213,19 +219,21 @@ class LogitsStorage:
 
 class LogProbStorage:
     beam_width: int = -1
-    log_probs: list[TokenLogprobs]
+    log_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs]
     cum_log_probs: list[float]
 
-    def _init(self, first_input: list[TokenLogprobs]):
+    def _init(self, first_input: list[TokenLogprobs]
+              | list[SimpleTokenLogprobs]):
         self.beam_width = len(first_input)
         self.log_probs = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
 
     def append(self,
-               new_probs: list[TokenLogprobs],
+               new_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs],
                cum_log_probs: Optional[list[float]] = None):
         """
-        new_probs: [beam_width, num_tokens]
+        new_probs: [beam_width, num_tokens]; per-token entry is either a
+            ``dict[int, Logprob]`` (default) or a ``float`` (simple format).
         cum_log_probs: [beam_width]
         """
         if self.beam_width == -1:
@@ -236,14 +244,19 @@ class LogProbStorage:
             self.log_probs[beam_idx].extend(probs)
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
-            else:
-                # FIXME: This relies on the ordering of LogProb's in the dictionary. TorchSampler ensures
-                #        that the sampled logprob is in the first position.
-                self.cum_log_probs[beam_idx] += sum(
-                    next(iter(prob.values())).logprob for prob in probs)
+            elif probs:
+                if isinstance(probs[0], dict):
+                    # FIXME: This relies on the ordering of LogProb's in the dictionary.
+                    #        TorchSampler ensures that the sampled logprob is in the
+                    #        first position.
+                    self.cum_log_probs[beam_idx] += sum(
+                        next(iter(prob.values())).logprob for prob in probs)
+                else:
+                    # Simple format: probs is SimpleTokenLogprobs (list[float]).
+                    self.cum_log_probs[beam_idx] += sum(probs)
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+    def set_log_probs(self, log_probs: list[TokenLogprobs]
+                      | list[SimpleTokenLogprobs], cum_log_probs: list[float]):
         """
         Reset the storage and refill it with new values
         log_probs: [beam_width, num_tokens]
@@ -268,7 +281,7 @@ class PyResult:
         exclude_last_generation_logits: bool | None = None
         context_logits_list: list[torch.Tensor] = field(default_factory=list)
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
-        reset_log_probs: tuple[list[TokenLogprobs],
+        reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
@@ -377,27 +390,25 @@ class PyResult:
             self.diff.generation_logits_list.append(generation_logits)
 
     def append_log_probs(self,
-                         log_probs: list[TokenLogprobs],
+                         log_probs: list[TokenLogprobs]
+                         | list[SimpleTokenLogprobs],
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             multimodal_lengths: List[int]):
+                             mm_embedding_lengths: List[int]):
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
-            multimodal_lengths: Current per-item split lengths.
+            mm_embedding_lengths: Per-item encoder-output embedding lengths.
         """
-        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
-        # a prompt-side MM-token count that may include non-embedding
-        # special/framing tokens. This split needs per-item encoder-output
-        # embedding lengths instead.
-        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+        split_embeddings = torch.split(mm_embeddings,
+                                       mm_embedding_lengths,
+                                       dim=0)
 
-        # Create a SharedTensorContainer handle for each split
         self._mm_embeddings = [
             SharedTensorContainer.from_tensor(emb).dump_to_dict()
             for emb in split_embeddings
@@ -409,10 +420,10 @@ class PyResult:
         mrope_position_ids: torch.Tensor,
         mrope_position_deltas: torch.Tensor,
     ):
-        self._mrope_position_ids = (SharedTensorContainer.from_tensor(
-            mrope_position_ids).dump_to_dict())
-        self._mrope_position_deltas = (SharedTensorContainer.from_tensor(
-            mrope_position_deltas).dump_to_dict())
+        self._mrope_position_ids = SharedTensorContainer.from_tensor(
+            mrope_position_ids).dump_to_dict()
+        self._mrope_position_deltas = SharedTensorContainer.from_tensor(
+            mrope_position_deltas).dump_to_dict()
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
 
@@ -435,8 +446,8 @@ class PyResult:
         self.diff.additional_generation_outputs_list.append(
             (name, self._additional_generation_outputs[name][-1]))
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+    def set_log_probs(self, log_probs: list[TokenLogprobs]
+                      | list[SimpleTokenLogprobs], cum_log_probs: list[float]):
         """
         Set log_probs and cum_log_probs to the new values
         log_probs: [beam_width, num_tokens]
@@ -484,7 +495,8 @@ class PyResult:
         return storage.transpose(0, 1)
 
     @property
-    def log_probs(self) -> list[TokenLogprobs] | None:
+    def log_probs(
+            self) -> list[TokenLogprobs] | list[SimpleTokenLogprobs] | None:
         if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
             return None
         return self._log_probs.log_probs
@@ -626,6 +638,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
+            logprobs_simple_format: bool = False,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -646,7 +659,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 return_perf_metrics=return_perf_metrics,
                 stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
                 if stop_words_list else None,
-                **kwargs)
+                **kwargs,
+            )
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
@@ -670,6 +684,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_accepted_draft_tokens = 0
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
+        self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
+        self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
@@ -683,11 +699,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
+        self.py_logprobs_simple_format = logprobs_simple_format
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_additional_outputs = additional_outputs
 
+        self.py_beam_width = cast(int, self.sampling_config.beam_width)
         self.py_is_draft = is_draft
         # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
         self.py_seq_slot = seq_slot
@@ -791,7 +809,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.
-        need_deep_copy_logprobs = self.py_result.log_probs and self.sampling_config.beam_width <= 1
+        need_deep_copy_logprobs = self.py_result.log_probs and self.py_beam_width <= 1
         need_deep_copy_generation_logits = self.py_result._generation_logits is not None
         need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
         # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
@@ -925,6 +943,50 @@ def convert_wordlist(word_list) -> List[List[int]]:
     return [tokens, offsets]
 
 
+def _validate_optional_int_list(values: Any,
+                                field_name: str) -> Optional[List[int]]:
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise TypeError(f"{field_name} must be a list")
+    if not all(isinstance(value, int) for value in values):
+        raise TypeError(f"{field_name} must contain only integers")
+    return values
+
+
+def get_multimodal_embedding_lengths(
+        request: LlmRequest) -> Optional[List[int]]:
+    """Return explicit per-item encoder-output lengths for a multimodal request."""
+    py_multimodal_data = request.py_multimodal_data
+    if py_multimodal_data is not None and not isinstance(
+            py_multimodal_data, dict):
+        raise TypeError("py_multimodal_data must be a dict")
+    # `multimodal_embedding_lengths` is Python-side layout metadata, not a
+    # nanobind request field, so validate the flat handoff contract here.
+    multimodal_embedding_lengths = _validate_optional_int_list(
+        py_multimodal_data.get("multimodal_embedding_lengths")
+        if py_multimodal_data is not None else None,
+        "multimodal_embedding_lengths")
+    if multimodal_embedding_lengths is None:
+        return None
+
+    if any(length < 0 for length in multimodal_embedding_lengths):
+        raise ValueError("multimodal_embedding_lengths must be non-negative")
+    multimodal_lengths = request.multimodal_lengths
+    if multimodal_lengths is not None:
+        if len(multimodal_embedding_lengths) != len(multimodal_lengths):
+            raise ValueError("multimodal_embedding_lengths length must match "
+                             "multimodal_lengths")
+        for item_idx, (embedding_length, prompt_length) in enumerate(
+                zip(multimodal_embedding_lengths, multimodal_lengths)):
+            if embedding_length > prompt_length:
+                raise ValueError(
+                    f"multimodal_embedding_lengths[{item_idx}] exceeds "
+                    f"multimodal_lengths[{item_idx}]")
+
+    return multimodal_embedding_lengths
+
+
 def executor_request_to_llm_request(
         req_id: int,
         executor_request: ExecutorRequest,
@@ -946,11 +1008,20 @@ def executor_request_to_llm_request(
     multimodal_positions = None
     multimodal_lengths = None
     multimodal_uuids = None
+    multimodal_item_run_cu_offsets = None
+    multimodal_run_positions = None
+    multimodal_run_lengths = None
     if executor_request.multimodal_input is not None:
         multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
         multimodal_positions = executor_request.multimodal_input.multimodal_positions
         multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
         multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
+        multimodal_item_run_cu_offsets = (
+            executor_request.multimodal_input.multimodal_item_run_cu_offsets)
+        multimodal_run_positions = (
+            executor_request.multimodal_input.multimodal_run_positions)
+        multimodal_run_lengths = (
+            executor_request.multimodal_input.multimodal_run_lengths)
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
@@ -985,6 +1056,9 @@ def executor_request_to_llm_request(
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
         multimodal_uuids=multimodal_uuids,
+        multimodal_item_run_cu_offsets=multimodal_item_run_cu_offsets,
+        multimodal_run_positions=multimodal_run_positions,
+        multimodal_run_lengths=multimodal_run_lengths,
         multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
@@ -1033,6 +1107,8 @@ def executor_request_to_llm_request(
         agent_hierarchy=agent_hierarchy,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
                               LogprobMode.RAW),
+        logprobs_simple_format=getattr(executor_request,
+                                       "py_logprobs_simple_format", False),
     )
 
     llm_request.py_original_end_id = getattr(executor_request,

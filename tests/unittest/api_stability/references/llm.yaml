@@ -80,7 +80,7 @@ methods:
         default: pytorch
         status: deprecated
       cuda_graph_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
       attention_dp_config:
@@ -101,6 +101,10 @@ methods:
         status: prototype
       mx_config:
         annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
+        default: null
+        status: prototype
+      gms_config:
+        annotation: tensorrt_llm.llmapi.llm_args.GmsConfig
         default: null
         status: prototype
       mm_encoder_only:
@@ -140,6 +144,10 @@ methods:
         default: False
         status: prototype
       enable_speculative_beam_history_d2h:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_early_first_token_response:
         annotation: bool
         default: False
         status: prototype
@@ -344,10 +352,13 @@ methods:
       add_special_tokens:
         annotation: bool
         default: True
+      return_raw_logits:
+        annotation: bool
+        default: False
       model_kwargs:
         annotation: Any
         default: inspect._empty
-    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]
     status: prototype
   preprocess:
     parameters:

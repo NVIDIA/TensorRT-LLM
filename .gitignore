@@ -57,6 +57,7 @@ tensorrt_llm/flash_mla/
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
 tensorrt_llm/runtime/kv_cache_manager_v2/**/*.so
+!tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/attention/cubins/**/*.so
 **/*__mypyc*.so
 tensorrt_llm/scripts
 *docs/cpp_docs*
@@ -64,6 +65,9 @@ tensorrt_llm/scripts
 docs/source/**/*.rst
 !docs/source/examples/index.rst
 !docs/source/_includes/note_sections.rst
+!docs/source/features/auto_deploy/transforms.rst
+!docs/source/features/auto_deploy/transforms/
+!docs/source/features/auto_deploy/transforms/*.rst
 *.swp
 .nfs*
 
@@ -114,3 +118,4 @@ enroot/tensorrt_llm.devel.sqsh
 .claude/agent-memory/
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
+.claude/settings.json

@@ -317,7 +317,7 @@ Example output:
 Configuring with YAML Files
 ----------------------------
 
-You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. The arguments in the file override the corresponding command line arguments.
+You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. Explicit CLI flags take precedence over values in the YAML; un-set CLI flags fall back to the YAML.
 
 .. include:: ../../_includes/note_sections.rst
    :start-after: .. start-note-config-flag-alias

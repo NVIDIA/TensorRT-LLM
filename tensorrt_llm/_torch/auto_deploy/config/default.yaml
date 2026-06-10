@@ -191,6 +191,9 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_mxfp4_moe:
+    stage: post_load_fusion
+    expect_mem_change: true  # adds padding for trtllm-gen kernel alignment during weight repack
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -217,6 +220,9 @@ transforms:
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  fuse_rmsnorm_quant_nvfp4:
+    stage: post_load_fusion
+    enabled: true
   fuse_gdn_gating:
     stage: post_load_fusion
   fuse_l2norm:
@@ -235,11 +241,6 @@ transforms:
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
     enabled: false
-  mlir_elementwise_fusion:
-    stage: post_load_fusion
-    enabled: false
-    run_shape_prop: false
-    bypass_ops: []
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
@@ -257,6 +258,11 @@ transforms:
     enabled: false
   optimize_rope:
     stage: post_load_fusion
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: false
+    run_shape_prop: false
+    bypass_ops: []
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################

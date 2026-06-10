@@ -37,7 +37,11 @@ import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as HFWanTransformer3DModel
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionModelConfig,
+    DiffusionPipelineConfig,
+    VisualGenArgs,
+)
 from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -117,12 +121,10 @@ def _load_models(checkpoint_dir: str):
         .eval()
     )
 
-    args = VisualGenArgs(
-        checkpoint_path=checkpoint_dir,
-        device=DEVICE,
-        dtype="bfloat16",
-    )
-    model_config = DiffusionModelConfig.from_pretrained(checkpoint_dir, args=args)
+    args = VisualGenArgs(model=checkpoint_dir)
+    model_config = DiffusionPipelineConfig.from_pretrained(checkpoint_dir, args=args).model_configs[
+        "transformer"
+    ]
     our_model = WanTransformer3DModel(model_config=model_config).to(DEVICE).eval()
 
     # Initialize our model with the exact same weights as the HF model.

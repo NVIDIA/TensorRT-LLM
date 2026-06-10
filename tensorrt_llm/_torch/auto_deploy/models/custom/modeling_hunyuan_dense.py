@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -13,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prefill-only HunYuan Dense V1 model implementation for auto_deploy export.
+"""HunYuan Dense V1 model (sharding IR).
 
 Source:
 https://huggingface.co/tencent/Hunyuan-MT-7B
@@ -26,7 +30,7 @@ This implementation differs from the original HuggingFace version in the followi
 * Removed attention dropout (inference only)
 
 The HunYuan Dense V1 model is a Llama-like dense transformer with:
-* Grouped-Query Attention (GQA) with QK normalization (RMSNorm on Q/K)
+* Grouped-Query Attention (GQA) with QK normalization (RMSNorm on Q/K after RoPE)
 * Dynamic NTK-Alpha RoPE scaling
 * SiLU-gated MLP
 * Tied word embeddings
@@ -121,7 +125,13 @@ class HunYuanDenseRotaryEmbedding(nn.Module):
 
 
 class HunYuanDenseMLP(nn.Module):
-    """SiLU-gated MLP for HunYuan Dense V1."""
+    """SiLU-gated MLP for HunYuan Dense V1.
+
+    Sharding strategy:
+      gate_proj -> colwise
+      up_proj   -> colwise
+      down_proj -> rowwise + all_reduce
+    """
 
     def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str = "silu"):
         super().__init__()
@@ -131,7 +141,29 @@ class HunYuanDenseMLP(nn.Module):
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias,
+            tp_mode="colwise",
+            layer_type="mlp",
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.up_proj.weight,
+            self.up_proj.bias,
+            tp_mode="colwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
+        return down
 
 
 class HunYuanDenseAttention(nn.Module):
@@ -139,6 +171,13 @@ class HunYuanDenseAttention(nn.Module):
 
     Applies RMSNorm to Q and K after RoPE (matching HF implementation order).
     Uses auto_deploy torch_attention and torch_rope_with_explicit_cos_sin ops.
+
+    Sharding strategy:
+      q_proj -> colwise (+ tp_min_local_shape for GQA)
+      k_proj -> colwise (+ tp_min_local_shape for GQA)
+      v_proj -> colwise (+ tp_min_local_shape for GQA)
+      view   -> tp_scaled_dim=2 (head count dimension)
+      o_proj -> rowwise + all_reduce
     """
 
     def __init__(
@@ -177,9 +216,48 @@ class HunYuanDenseAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Project Q, K, V -> [B, S, N, D] (BSND layout)
-        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        q = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        q = torch.ops.auto_deploy.view(
+            q,
+            [bsz, q_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.view(
+            k,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.view(
+            v,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         # Get cos/sin from position_embeddings (full cached from shared rotary embedding)
         cos = position_embeddings[0]  # [max_seq_len, head_dim]
@@ -218,8 +296,20 @@ class HunYuanDenseAttention(nn.Module):
         )
 
         # Reshape and project output
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
-        attn_output = self.o_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 

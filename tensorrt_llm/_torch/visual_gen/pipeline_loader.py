@@ -2,7 +2,7 @@
 Model loader for diffusion pipelines.
 
 Flow:
-1. Load config via DiffusionModelConfig.from_pretrained()
+1. Load config via DiffusionPipelineConfig.from_pretrained()
 2. Create pipeline via AutoPipeline.from_config() with MetaInit
 3. Load weights with on-the-fly quantization if dynamic_weight_quant=True
 4. Call pipeline.post_load_weights()
@@ -16,7 +16,7 @@ Dynamic Quantization:
 
 import os
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -25,10 +25,13 @@ from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig, apply_skip_softmax_overrides
 
-from .config import DiffusionModelConfig, VisualGenArgs
+from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
+from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
     from .models import BasePipeline
@@ -44,16 +47,15 @@ class PipelineLoader:
 
     Example:
         args = VisualGenArgs(
-            checkpoint_path="/path/to/model",
-            linear=LinearConfig(type="trtllm-fp8-blockwise"),
-            parallel=ParallelConfig(dit_tp_size=2),
+            model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            parallel_config=ParallelConfig(ulysses_size=2),
         )
         pipeline = PipelineLoader(args).load()
     """
 
     def __init__(
         self,
-        args: Optional[VisualGenArgs] = None,
+        args: VisualGenArgs,
         *,
         device: str = "cuda",
     ):
@@ -61,11 +63,13 @@ class PipelineLoader:
         Initialize model loader.
 
         Args:
-            args: VisualGenArgs containing all configuration (preferred)
-            device: Device to load model on (fallback if args is None)
+            args: VisualGenArgs containing all configuration.
+            device: CUDA device to load the model on (e.g., "cuda:0").
+                Per-rank device routing is the caller's responsibility;
+                the engine config itself is device-agnostic.
         """
         self.args = args
-        self.device = torch.device(args.device if args is not None else device)
+        self.device = torch.device(device)
 
     def _resolve_checkpoint_dir(self, checkpoint_dir: str) -> str:
         """Resolve checkpoint_dir to a local directory path.
@@ -88,7 +92,7 @@ class PipelineLoader:
         if os.path.exists(checkpoint_dir):
             return checkpoint_dir
 
-        revision = self.args.revision if self.args else None
+        revision = self.args.revision
         logger.info(
             f"'{checkpoint_dir}' not found locally; "
             f"attempting HuggingFace Hub download (revision={revision})"
@@ -102,71 +106,115 @@ class PipelineLoader:
             ) from e
         return str(local_dir)
 
-    def _setup_visual_gen_mapping(self, config: DiffusionModelConfig) -> None:
-        if self.args is not None:
-            ws = dist.get_world_size() if dist.is_initialized() else 1
-            rk = dist.get_rank() if dist.is_initialized() else 0
-            vgm = VisualGenMapping(
-                ws,
-                rk,
-                cfg_size=self.args.parallel.dit_cfg_size,
-                tp_size=self.args.parallel.dit_tp_size,
-                ulysses_size=self.args.parallel.dit_ulysses_size,
-                ring_size=self.args.parallel.dit_ring_size,
-                attn2d_row_size=self.args.parallel.dit_attn2d_row_size,
-                attn2d_col_size=self.args.parallel.dit_attn2d_col_size,
-                parallel_vae_size=self.args.parallel.parallel_vae_size,
-                order=self.args.parallel.dit_dim_order,
+    def _resolve_pipeline_config(self, checkpoint_dir: str) -> dict:
+        """Validate VisualGenArgs.pipeline_config against the registry and merge.
+
+        The user-facing dict on ``VisualGenArgs.pipeline_config`` is strict:
+        keys must appear in the resolved pipeline family's ``defaults``
+        (the schema-by-example carried on the registry entry). Unknown
+        keys raise immediately so typos surface at load time. The merged
+        dict is ``{**entry.defaults, **user_dict}`` — user-supplied values
+        win.
+        """
+        user_pipeline_config = dict(self.args.pipeline_config)
+
+        # Detect _class_name from the resolved checkpoint, look up the
+        # registry entry. If detection fails (or the class_name isn't
+        # registered) leave the validation to AutoPipeline.from_config
+        # so the user gets the existing "Unknown pipeline" error rather
+        # than a confusing pipeline_config validation error.
+        try:
+            class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+        except ValueError:
+            return user_pipeline_config
+
+        entry = PIPELINE_REGISTRY.get(class_name)
+        if entry is None:
+            return user_pipeline_config
+
+        unknown = set(user_pipeline_config) - set(entry.defaults)
+        if unknown:
+            raise ValueError(
+                f"Unknown pipeline_config keys for {class_name} ({checkpoint_dir}): "
+                f"{sorted(unknown)}. Valid keys: {sorted(entry.defaults)}"
             )
-        else:
-            # Single-GPU fallback. no args = no parallelism.
-            vgm = VisualGenMapping(world_size=1, rank=0)
+        return {**entry.defaults, **user_pipeline_config}
+
+    def _setup_visual_gen_mapping(self, config: DiffusionPipelineConfig) -> None:
+        ws = dist.get_world_size() if dist.is_initialized() else 1
+        rk = dist.get_rank() if dist.is_initialized() else 0
+        attn2d_row, attn2d_col = self.args.parallel_config.attn2d_size
+        vgm = VisualGenMapping(
+            ws,
+            rk,
+            cfg_size=self.args.parallel_config.cfg_size,
+            ulysses_size=self.args.parallel_config.ulysses_size,
+            ring_size=self.args.parallel_config.ring_size,
+            attn2d_row_size=attn2d_row,
+            attn2d_col_size=attn2d_col,
+            tp_size=self.args.parallel_config.tp_size,
+            parallel_vae_size=self.args.parallel_config.parallel_vae_size,
+        )
+        llm_mapping = vgm.to_llm_mapping()
         config.visual_gen_mapping = vgm
-        config.mapping = vgm.to_llm_mapping()
+        config.mapping = llm_mapping
+        for model_config in config.model_configs.values():
+            model_config.visual_gen_mapping = vgm
+            model_config.mapping = llm_mapping
 
     def load(
         self,
         checkpoint_dir: Optional[str] = None,
         skip_warmup: bool = False,
+        skip_components: Optional[List[Union[str, PipelineComponent]]] = None,
     ) -> "BasePipeline":
         """
         Load a diffusion pipeline with optional dynamic quantization.
 
         Flow:
         1. Resolve checkpoint_dir (local path or HuggingFace Hub model ID)
-        2. Load config via DiffusionModelConfig.from_pretrained()
+        2. Load config via DiffusionPipelineConfig.from_pretrained()
         3. Create pipeline via AutoPipeline.from_config() with MetaInit
         4. Load transformer weights via pipeline.load_transformer_weights()
         5. Load auxiliary components (VAE, text_encoder)
         6. Call pipeline.post_load_weights()
 
         Args:
-            checkpoint_dir: Local path or HF Hub model ID (uses args.checkpoint_path if not provided)
+            checkpoint_dir: Local path or HF Hub model ID (uses ``args.model`` if not provided)
             skip_warmup: If True, skip warmup inference after loading (useful for testing)
+            skip_components: Optional internal escape hatch — list of
+                ``PipelineComponent`` values (or their string equivalents) to
+                skip loading. Intended for memory-constrained unit tests
+                that only exercise the transformer; not part of the public
+                ``VisualGenArgs`` surface.
 
         Returns:
             Loaded pipeline (WanPipeline, FluxPipeline, etc.) - type auto-detected
         """
-        # Resolve checkpoint_dir
-        checkpoint_dir = checkpoint_dir or (self.args.checkpoint_path if self.args else None)
+        checkpoint_dir = checkpoint_dir or self.args.model
         if not checkpoint_dir:
             raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
 
-        # Get loading options from args
-        skip_components = self.args.skip_components if self.args else []
+        # Strict pipeline_config validation: detect _class_name from the
+        # checkpoint, look up the registry entry, reject unknown keys.
+        resolved_pipeline_config = self._resolve_pipeline_config(checkpoint_dir)
 
         load_start = time.time()
-        text_encoder_path = self.args.text_encoder_path if self.args else ""
+        # text_encoder_path is an LTX-2 pipeline_config knob; it lives in
+        # the merged dict that _resolve_pipeline_config produced, not on
+        # VisualGenArgs directly.
+        text_encoder_path = resolved_pipeline_config.get("text_encoder_path", "")
 
         # =====================================================================
         # STEP 1: Load Config (includes quant config parsing)
         # Merge pretrained checkpoint config with user-provided VisualGenArgs
         # =====================================================================
         logger.info(f"Loading config from {checkpoint_dir}")
-        config = DiffusionModelConfig.from_pretrained(
+        config = DiffusionPipelineConfig.from_pretrained(
             checkpoint_dir,
             args=self.args,
+            pipeline_config=resolved_pipeline_config,
         )
 
         # Log quantization settings
@@ -216,7 +264,7 @@ class PipelineLoader:
         pipeline.load_standard_components(
             checkpoint_dir,
             self.device,
-            skip_components,
+            skip_components=skip_components,
             **extra_kwargs,
         )
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
@@ -232,7 +280,14 @@ class PipelineLoader:
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
-        if config.torch_compile.enable_torch_compile:
+        sparse_cfg = config.attention.sparse_attention_config
+        if isinstance(sparse_cfg, SkipSoftmaxConfig) and (
+            sparse_cfg._layer_overrides or sparse_cfg._component_configs
+        ):
+            n = apply_skip_softmax_overrides(pipeline, sparse_cfg)
+            logger.info(f"Applied skip_softmax sparse config to {n} backends")
+
+        if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128
             pipeline.torch_compile()
         else:
@@ -251,7 +306,7 @@ class PipelineLoader:
         else:
             logger.info("Warmup skipped (skip_warmup=True)")
 
-        if config.pipeline.enable_layerwise_nvtx_marker:
+        if config.enable_layerwise_nvtx_marker:
             from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
 
             marker = LayerwiseNvtxMarker()
@@ -279,7 +334,7 @@ class PipelineLoader:
             if t.device != torch.device("meta"):
                 return t
             if t not in memo:
-                memo[t] = torch.empty_like(t, device="cuda")
+                memo[t] = torch.empty_like(t, device=self.device)
             return memo[t]
 
         module._apply(init_meta_tensor)

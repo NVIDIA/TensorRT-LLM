@@ -38,6 +38,8 @@ from .base import PRInputs, Rule, RuleResult
 #   consumed by any L0 pipeline.
 # - tests/integration/defs/.test_durations : pytest-split timing cache;
 #   used at runtime, doesn't affect test selection.
+# - tests/integration/defs/.test_durations_* : per-cluster timing caches
+#   (e.g. .test_durations_aws_dfw); same rationale as above.
 # - tests/integration/defs/agg_unit_mem_df.csv : per-(gpu, case)
 #   pytest-xdist parallel_factor table consumed by test_unittests.py;
 #   tunes worker count only, no impact on which tests run or their
@@ -57,14 +59,24 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "jenkins/scripts/cbts/",
 )
 
-# Path suffixes (extensions) under tests/ with no test-execution impact.
-OUT_OF_SCOPE_TESTS_SUFFIXES: tuple[str, ...] = (".md",)
+# Path suffixes (extensions) with no test-execution impact, anywhere in
+# the tree.
+# - `.md`: docs only, not loaded by any test.
+# Excluded on purpose:
+# - `.txt`: requirements.txt / constraints.txt are runtime-relevant.
+# - `.png` / `.jpg` / `.jpeg` / `.gif` / `.svg` / `.webp`: image files
+#   under `examples/visual_gen/` are real test fixtures (e.g.
+#   `cat_piano.png`, `woman_skyline_original_720p.jpeg` loaded by
+#   `tests/unittest/_torch/visual_gen/`). Since location alone cannot
+#   distinguish a fixture from a doc diagram, image edits fall back to
+#   baseline rather than being claimed as noop here.
+OUT_OF_SCOPE_SUFFIXES: tuple[str, ...] = (".md",)
 
 
 def is_out_of_scope(path: str) -> bool:
     if any(path.startswith(p) for p in OUT_OF_SCOPE_PREFIXES):
         return True
-    if path.startswith("tests/") and path.endswith(OUT_OF_SCOPE_TESTS_SUFFIXES):
+    if path.endswith(OUT_OF_SCOPE_SUFFIXES):
         return True
     return False
 

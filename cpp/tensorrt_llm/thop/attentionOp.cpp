@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/attentionOp.h"
+#include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -28,6 +29,7 @@
 #include <cstdint>
 #include <functional>
 #include <torch/extension.h>
+#include <type_traits>
 #include <unordered_set>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -35,8 +37,280 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 using tensorrt_llm::common::op::AttentionOp;
+using tensorrt_llm::common::op::AttentionWorkspaceManager;
 using tensorrt_llm::common::op::hash;
 using tensorrt_llm::runtime::RequestType;
+
+namespace
+{
+
+int64_t exportOffset(tensorrt_llm::common::op::WorkspaceSlice const& slice)
+{
+    if (slice.size == 0)
+    {
+        return -1;
+    }
+    return static_cast<int64_t>(slice.offset);
+}
+
+template <typename T>
+T readHostTensor2D(at::Tensor const& tensor, int64_t const row, int64_t const col, char const* tensorName)
+{
+    TORCH_CHECK(tensor.device().is_cpu(), tensorName, " must be a CPU tensor.");
+    TORCH_CHECK(tensor.dim() == 2, tensorName, " must be a 2D tensor.");
+    TORCH_CHECK(row >= 0 && row < tensor.size(0), tensorName, " row is out of bounds.");
+    TORCH_CHECK(col >= 0 && col < tensor.size(1), tensorName, " column is out of bounds.");
+
+    auto const* data = tensor.data_ptr<T>();
+    return data[row * tensor.stride(0) + col * tensor.stride(1)];
+}
+
+template <typename T>
+T readHostTensor3D(at::Tensor const& tensor, int64_t const i, int64_t const j, int64_t const k, char const* tensorName)
+{
+    TORCH_CHECK(tensor.device().is_cpu(), tensorName, " must be a CPU tensor.");
+    TORCH_CHECK(tensor.dim() == 3, tensorName, " must be a 3D tensor.");
+    TORCH_CHECK(i >= 0 && i < tensor.size(0), tensorName, " dim 0 index is out of bounds.");
+    TORCH_CHECK(j >= 0 && j < tensor.size(1), tensorName, " dim 1 index is out of bounds.");
+    TORCH_CHECK(k >= 0 && k < tensor.size(2), tensorName, " dim 2 index is out of bounds.");
+
+    auto const* data = tensor.data_ptr<T>();
+    return data[i * tensor.stride(0) + j * tensor.stride(1) + k * tensor.stride(2)];
+}
+
+template <typename T>
+T* tensorPtr2D(at::Tensor const& tensor, int64_t const row, int64_t const col, char const* tensorName)
+{
+    TORCH_CHECK(tensor.dim() >= 2, tensorName, " must have at least 2 dimensions.");
+    TORCH_CHECK(row >= 0 && row < tensor.size(0), tensorName, " row is out of bounds.");
+    TORCH_CHECK(col >= 0 && col < tensor.size(1), tensorName, " column is out of bounds.");
+
+    using ValueType = std::remove_const_t<T>;
+    auto* data = static_cast<ValueType*>(tensor.data_ptr());
+    return data + row * tensor.stride(0) + col * tensor.stride(1);
+}
+
+} // namespace
+
+KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t const layerIdx)
+{
+    TORCH_CHECK(hostKvCachePoolMapping.device().is_cpu(), "host_kv_cache_pool_mapping must be a CPU tensor.");
+    TORCH_CHECK(hostKvCachePoolMapping.dim() == 2, "host_kv_cache_pool_mapping must be a 2D tensor.");
+    TORCH_CHECK(hostKvCachePoolMapping.size(1) >= 2, "host_kv_cache_pool_mapping must have at least two columns.");
+    TORCH_CHECK(layerIdx >= 0 && layerIdx < hostKvCachePoolMapping.size(0),
+        "host_kv_cache_pool_mapping layer index is out of bounds.");
+
+    auto const* data = hostKvCachePoolMapping.data_ptr<int32_t>();
+    auto const rowOffset = layerIdx * hostKvCachePoolMapping.stride(0);
+    auto const colStride = hostKvCachePoolMapping.stride(1);
+    KvCachePoolMapping mapping;
+    mapping.poolIndex = data[rowOffset];
+    mapping.layerIdxInCachePool = data[rowOffset + colStride];
+    return mapping;
+}
+
+std::optional<at::Tensor> TrtllmAttentionWorkspaceManager::makeWorkspaceView(
+    at::Tensor const& workspace, int64_t const offset, int64_t const sizeBytes, at::ScalarType const scalarType)
+{
+    if (sizeBytes == 0)
+    {
+        return std::nullopt;
+    }
+
+    auto const* workspaceBase = static_cast<uint8_t const*>(workspace.data_ptr());
+    auto const workspaceSizeBytes = static_cast<int64_t>(workspace.nbytes());
+    TORCH_CHECK(offset >= 0, "Negative workspace offset is invalid.");
+    TORCH_CHECK(offset + sizeBytes <= workspaceSizeBytes, "Workspace view exceeds workspace bounds.");
+
+    auto const itemSize = static_cast<int64_t>(c10::elementSize(scalarType));
+    TORCH_CHECK(sizeBytes % itemSize == 0, "Workspace slice is not aligned to dtype size.");
+
+    auto options = at::TensorOptions().dtype(scalarType).device(workspace.device());
+    return torch::from_blob(const_cast<uint8_t*>(workspaceBase) + offset, {sizeBytes / itemSize}, options);
+}
+
+TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLayout(at::ScalarType const qDtype,
+    int64_t const batchSize, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
+    int64_t const rotaryEmbeddingDim, bool const separateQKvInput, bool const fp8ContextFmha)
+{
+    auto const dtypeSize = static_cast<int64_t>(c10::elementSize(qDtype));
+    auto const localHiddenUnitsQo = numHeads * headSize;
+    auto const cuSeqlensSize = static_cast<int64_t>(sizeof(int32_t)) * (batchSize + 1);
+    auto const rotaryInvFreqSize
+        = rotaryEmbeddingDim > 0 ? static_cast<int64_t>(sizeof(float)) * batchSize * rotaryEmbeddingDim / 2 : 0;
+    auto const qBufSize = separateQKvInput ? (fp8ContextFmha ? 1 : dtypeSize) * numTokens * localHiddenUnitsQo : 0;
+    auto const tokensInfoSize = static_cast<int64_t>(sizeof(int32_t) * 2) * numTokens;
+    auto const fmhaTileCounterSize = static_cast<int64_t>(sizeof(uint32_t));
+    auto const fmhaBmm1ScaleSize = fp8ContextFmha ? static_cast<int64_t>(sizeof(float) * 2) : 0;
+    auto const fmhaBmm2ScaleSize = fp8ContextFmha ? static_cast<int64_t>(sizeof(float)) : 0;
+
+    tensorrt_llm::common::op::AttentionContextWorkspaceSizes workspaceSizes{};
+    workspaceSizes.cuQSeqlens = cuSeqlensSize;
+    workspaceSizes.cuKvSeqlens = cuSeqlensSize;
+    workspaceSizes.cuMaskRows = cuSeqlensSize;
+    workspaceSizes.rotaryInvFreq = rotaryInvFreqSize;
+    workspaceSizes.qBuf = qBufSize;
+    workspaceSizes.tokensInfo = tokensInfoSize;
+    workspaceSizes.fmhaTileCounter = fmhaTileCounterSize;
+    workspaceSizes.fmhaBmm1Scale = fmhaBmm1ScaleSize;
+    workspaceSizes.fmhaBmm2Scale = fmhaBmm2ScaleSize;
+    auto const layout = AttentionWorkspaceManager::buildContextLayout(workspaceSizes, kWorkspaceAlignment);
+
+    return TrtllmGenContextWorkspaceLayout{
+        .trtllmGenWorkspaceOffset = exportOffset(layout.cublasWorkspace),
+        .cuQSeqlensOffset = exportOffset(layout.cuQSeqlens),
+        .cuKvSeqlensOffset = exportOffset(layout.cuKvSeqlens),
+        .cuMaskRowsOffset = exportOffset(layout.cuMaskRows),
+        .rotaryInvFreqOffset = exportOffset(layout.rotaryInvFreq),
+        .qBufOffset = exportOffset(layout.qBuf),
+        .tokensInfoOffset = exportOffset(layout.tokensInfo),
+        .fmhaTileCounterOffset = exportOffset(layout.fmhaTileCounter),
+        .fmhaBmm1ScaleOffset = exportOffset(layout.fmhaBmm1Scale),
+        .fmhaBmm2ScaleOffset = exportOffset(layout.fmhaBmm2Scale),
+        .trtllmGenWorkspaceSize = kTrtllmGenWorkspaceSize,
+        .cuSeqlensSize = cuSeqlensSize,
+        .rotaryInvFreqSize = rotaryInvFreqSize,
+        .qBufSize = qBufSize,
+        .tokensInfoSize = tokensInfoSize,
+        .fmhaTileCounterSize = fmhaTileCounterSize,
+        .fmhaBmm1ScaleSize = fmhaBmm1ScaleSize,
+        .fmhaBmm2ScaleSize = fmhaBmm2ScaleSize,
+        .totalSize = static_cast<int64_t>(layout.totalSize),
+        .qBufScalarType = fp8ContextFmha ? at::kByte : qDtype,
+    };
+}
+
+TrtllmGenGenerationWorkspaceLayout TrtllmAttentionWorkspaceManager::buildGenerationLayout(at::ScalarType const qDtype,
+    int64_t const batchBeam, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
+    int64_t const rotaryEmbeddingDim, int64_t const numKvHeads, int64_t const maxBlocksPerSequence,
+    bool const useSparseAttention)
+{
+    auto const dtypeSize = static_cast<int64_t>(c10::elementSize(qDtype));
+    auto const cuSeqlensSize = static_cast<int64_t>(sizeof(int32_t)) * (batchBeam + 1);
+    auto const cuKvSeqlensSize = static_cast<int64_t>(sizeof(int32_t)) * (batchBeam + 1);
+    auto const rotaryInvFreqSize
+        = rotaryEmbeddingDim > 0 ? static_cast<int64_t>(sizeof(float)) * batchBeam * rotaryEmbeddingDim / 2 : 0;
+    auto const tokensInfoSize = static_cast<int64_t>(sizeof(int32_t) * 2) * numTokens;
+    auto const qBufSize = dtypeSize * numTokens * numHeads * headSize;
+    auto const bmm1ScaleSize = static_cast<int64_t>(sizeof(float) * 2);
+    auto const bmm2ScaleSize = static_cast<int64_t>(sizeof(float));
+    auto const sparseAttnCacheSize = useSparseAttention
+        ? static_cast<int64_t>(sizeof(int32_t)) * (batchBeam + batchBeam * 2 * maxBlocksPerSequence) * numKvHeads
+        : 0;
+
+    tensorrt_llm::common::op::AttentionXqaWorkspaceSizes workspaceSizes{};
+    workspaceSizes.cuSeqlens = cuSeqlensSize;
+    workspaceSizes.cuKvSeqlens = cuKvSeqlensSize;
+    workspaceSizes.rotaryInvFreq = rotaryInvFreqSize;
+    workspaceSizes.tokensInfo = tokensInfoSize;
+    workspaceSizes.bmm1Scale = bmm1ScaleSize;
+    workspaceSizes.bmm2Scale = bmm2ScaleSize;
+    workspaceSizes.sparseAttnCache = sparseAttnCacheSize;
+    workspaceSizes.kernelWorkspace = qBufSize;
+    auto const xqaLayout = AttentionWorkspaceManager::buildXqaLayout(workspaceSizes, kWorkspaceAlignment);
+    auto const trtllmGenWorkspaceOffset = static_cast<int64_t>(xqaLayout.totalSize);
+    auto const totalSize = xqaLayout.totalSize
+        + tensorrt_llm::common::alignSize(static_cast<size_t>(kTrtllmGenWorkspaceSize), kWorkspaceAlignment);
+
+    return TrtllmGenGenerationWorkspaceLayout{
+        .trtllmGenWorkspaceOffset = trtllmGenWorkspaceOffset,
+        .cuSeqlensOffset = exportOffset(xqaLayout.cuSeqlens),
+        .cuKvSeqlensOffset = exportOffset(xqaLayout.cuKvSeqlens),
+        .rotaryInvFreqOffset = exportOffset(xqaLayout.rotaryInvFreq),
+        .tokensInfoOffset = exportOffset(xqaLayout.tokensInfo),
+        .qBufOffset = exportOffset(xqaLayout.kernelWorkspace),
+        .bmm1ScaleOffset = exportOffset(xqaLayout.bmm1Scale),
+        .bmm2ScaleOffset = exportOffset(xqaLayout.bmm2Scale),
+        .sparseAttnCacheOffset = exportOffset(xqaLayout.sparseAttnCache),
+        .trtllmGenWorkspaceSize = kTrtllmGenWorkspaceSize,
+        .cuSeqlensSize = cuSeqlensSize,
+        .cuKvSeqlensSize = cuKvSeqlensSize,
+        .rotaryInvFreqSize = rotaryInvFreqSize,
+        .tokensInfoSize = tokensInfoSize,
+        .qBufSize = qBufSize,
+        .bmm1ScaleSize = bmm1ScaleSize,
+        .bmm2ScaleSize = bmm2ScaleSize,
+        .sparseAttnCacheSize = sparseAttnCacheSize,
+        .totalSize = static_cast<int64_t>(totalSize),
+        .qBufScalarType = qDtype,
+    };
+}
+
+int64_t TrtllmAttentionWorkspaceManager::getContextWorkspaceSize(at::ScalarType const qDtype, int64_t const batchSize,
+    int64_t const numTokens, int64_t const numHeads, int64_t const headSize, int64_t const rotaryEmbeddingDim,
+    bool const separateQKvInput, bool const fp8ContextFmha)
+{
+    return buildContextLayout(
+        qDtype, batchSize, numTokens, numHeads, headSize, rotaryEmbeddingDim, separateQKvInput, fp8ContextFmha)
+        .totalSize;
+}
+
+int64_t TrtllmAttentionWorkspaceManager::getGenerationWorkspaceSize(at::ScalarType const qDtype,
+    int64_t const batchBeam, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
+    int64_t const rotaryEmbeddingDim, int64_t const numKvHeads, int64_t const maxBlocksPerSequence,
+    bool const useSparseAttention)
+{
+    return buildGenerationLayout(qDtype, batchBeam, numTokens, numHeads, headSize, rotaryEmbeddingDim, numKvHeads,
+        maxBlocksPerSequence, useSparseAttention)
+        .totalSize;
+}
+
+TrtllmGenContextWorkspaceViews TrtllmAttentionWorkspaceManager::materializeContextWorkspace(
+    at::Tensor const& workspace, TrtllmGenContextWorkspaceLayout const& layout)
+{
+    return TrtllmGenContextWorkspaceViews{
+        .trtllmGenWorkspace
+        = *makeWorkspaceView(workspace, layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, at::kByte),
+        .cuQSeqlens = *makeWorkspaceView(workspace, layout.cuQSeqlensOffset, layout.cuSeqlensSize, at::kInt),
+        .cuKvSeqlens = *makeWorkspaceView(workspace, layout.cuKvSeqlensOffset, layout.cuSeqlensSize, at::kInt),
+        .cuMaskRows = *makeWorkspaceView(workspace, layout.cuMaskRowsOffset, layout.cuSeqlensSize, at::kInt),
+        .rotaryInvFreqBuf
+        = makeWorkspaceView(workspace, layout.rotaryInvFreqOffset, layout.rotaryInvFreqSize, at::kFloat),
+        .qBuf = makeWorkspaceView(workspace, layout.qBufOffset, layout.qBufSize, layout.qBufScalarType),
+        .tokensInfo = *makeWorkspaceView(workspace, layout.tokensInfoOffset, layout.tokensInfoSize, at::kInt),
+        .fmhaTileCounter
+        = *makeWorkspaceView(workspace, layout.fmhaTileCounterOffset, layout.fmhaTileCounterSize, at::kUInt32),
+        .fmhaBmm1Scale = makeWorkspaceView(workspace, layout.fmhaBmm1ScaleOffset, layout.fmhaBmm1ScaleSize, at::kFloat),
+        .fmhaBmm2Scale = makeWorkspaceView(workspace, layout.fmhaBmm2ScaleOffset, layout.fmhaBmm2ScaleSize, at::kFloat),
+    };
+}
+
+TrtllmGenContextWorkspaceViews TrtllmAttentionWorkspaceManager::materializeContextWorkspace(at::Tensor const& workspace,
+    at::ScalarType const qDtype, int64_t const batchSize, int64_t const numTokens, int64_t const numHeads,
+    int64_t const headSize, int64_t const rotaryEmbeddingDim, bool const fp8ContextFmha)
+{
+    auto const layout = buildContextLayout(
+        qDtype, batchSize, numTokens, numHeads, headSize, rotaryEmbeddingDim, true, fp8ContextFmha);
+    return materializeContextWorkspace(workspace, layout);
+}
+
+TrtllmGenGenerationWorkspaceViews TrtllmAttentionWorkspaceManager::materializeGenerationWorkspace(
+    at::Tensor const& workspace, TrtllmGenGenerationWorkspaceLayout const& layout)
+{
+    return TrtllmGenGenerationWorkspaceViews{
+        .trtllmGenWorkspace
+        = *makeWorkspaceView(workspace, layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, at::kByte),
+        .cuSeqlens = *makeWorkspaceView(workspace, layout.cuSeqlensOffset, layout.cuSeqlensSize, at::kInt),
+        .cuKvSeqlens = *makeWorkspaceView(workspace, layout.cuKvSeqlensOffset, layout.cuKvSeqlensSize, at::kInt),
+        .rotaryInvFreqBuf
+        = makeWorkspaceView(workspace, layout.rotaryInvFreqOffset, layout.rotaryInvFreqSize, at::kFloat),
+        .tokensInfo = *makeWorkspaceView(workspace, layout.tokensInfoOffset, layout.tokensInfoSize, at::kInt),
+        .qBuf = *makeWorkspaceView(workspace, layout.qBufOffset, layout.qBufSize, layout.qBufScalarType),
+        .bmm1Scale = *makeWorkspaceView(workspace, layout.bmm1ScaleOffset, layout.bmm1ScaleSize, at::kFloat),
+        .bmm2Scale = *makeWorkspaceView(workspace, layout.bmm2ScaleOffset, layout.bmm2ScaleSize, at::kFloat),
+        .sparseAttnCache
+        = makeWorkspaceView(workspace, layout.sparseAttnCacheOffset, layout.sparseAttnCacheSize, at::kInt),
+    };
+}
+
+TrtllmGenGenerationWorkspaceViews TrtllmAttentionWorkspaceManager::materializeGenerationWorkspace(
+    at::Tensor const& workspace, at::ScalarType const qDtype, int64_t const batchBeam, int64_t const numTokens,
+    int64_t const numHeads, int64_t const headSize, int64_t const rotaryEmbeddingDim, int64_t const numKvHeads)
+{
+    auto const layout = buildGenerationLayout(
+        qDtype, batchBeam, numTokens, numHeads, headSize, rotaryEmbeddingDim, numKvHeads, 0, false);
+    return materializeGenerationWorkspace(workspace, layout);
+}
 
 namespace trtllm::attention
 {
@@ -59,11 +333,10 @@ public:
     int32_t beam_width;
     int32_t max_num_requests;
     int32_t attention_window_size;
-    int32_t sink_token_length;
 
     auto data() const
     {
-        return std::make_tuple(beam_width, max_num_requests, attention_window_size, sink_token_length);
+        return std::make_tuple(beam_width, max_num_requests, attention_window_size);
     };
 
     virtual ~RunnerBase() = default;
@@ -77,7 +350,8 @@ public:
         torch::Tensor workspace, torch::Tensor output, torch::optional<torch::Tensor> output_sf, torch::Tensor qkv_or_q,
         torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v, torch::Tensor sequence_length,
         torch::Tensor host_past_key_value_lengths, int32_t const total_kv_len, torch::Tensor context_lengths,
-        torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
+        torch::Tensor host_context_lengths, std::optional<int64_t> max_context_q_len_override,
+        torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
         torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -85,9 +359,14 @@ public:
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
-        std::vector<std::optional<torch::Tensor>> helix_tensor_params,
+        std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
         torch::optional<torch::Tensor> softmax_stats_tensor,
-        c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
+        std::optional<torch::Tensor> spec_decoding_generation_lengths,
+        std::optional<torch::Tensor> spec_decoding_position_offsets_for_cpp,
+        std::optional<torch::Tensor> spec_decoding_packed_mask,
+        std::optional<torch::Tensor> spec_decoding_bl_tree_mask_offset,
+        std::optional<torch::Tensor> spec_decoding_bl_tree_mask,
+        std::optional<torch::Tensor> spec_bl_tree_first_sparse_mask_offset_kv,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
         torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
@@ -96,8 +375,8 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt) const
+        std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
+        std::optional<int64_t> compressed_kv_cache_pool_ptr) const
         = 0;
 };
 
@@ -111,7 +390,6 @@ public:
         enqueueParams.max_attention_window_size = attention_window_size;
         enqueueParams.cyclic_attention_window_size = attention_window_size;
         enqueueParams.max_cyclic_attention_window_size = attention_window_size;
-        enqueueParams.sink_token_length = sink_token_length;
         enqueueParams.beam_width = beam_width;
         enqueueParams.num_requests = max_num_requests;
 
@@ -140,7 +418,8 @@ public:
         torch::Tensor workspace, torch::Tensor output, torch::optional<torch::Tensor> output_sf, torch::Tensor qkv_or_q,
         torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v, torch::Tensor sequence_length,
         torch::Tensor host_past_key_value_lengths, int32_t const total_kv_len, torch::Tensor context_lengths,
-        torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
+        torch::Tensor host_context_lengths, std::optional<int64_t> max_context_q_len_override,
+        torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
         torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -148,9 +427,14 @@ public:
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
-        std::vector<std::optional<torch::Tensor>> helix_tensor_params,
+        std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
         torch::optional<torch::Tensor> softmax_stats_tensor,
-        c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
+        std::optional<torch::Tensor> spec_decoding_generation_lengths,
+        std::optional<torch::Tensor> spec_decoding_position_offsets_for_cpp,
+        std::optional<torch::Tensor> spec_decoding_packed_mask,
+        std::optional<torch::Tensor> spec_decoding_bl_tree_mask_offset,
+        std::optional<torch::Tensor> spec_decoding_bl_tree_mask,
+        std::optional<torch::Tensor> spec_bl_tree_first_sparse_mask_offset_kv,
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
         torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
@@ -159,7 +443,7 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits,
+        std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
@@ -190,8 +474,6 @@ public:
         [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
         {
-            TORCH_CHECK(helix_tensor_params.size() == 2,
-                "Expecting 2 tensors for helix_tensor_params: helix_position_offsets and helix_is_inactive_rank.");
             if (is_context && op.mUseSparseAttention)
             {
                 if (latent_cache.has_value())
@@ -235,8 +517,6 @@ public:
                 mla_params.v_buf = v_ptr;
 
                 // For generation, helix position is in ropeOp
-                auto const& helix_position_offsets = helix_tensor_params[0];
-                auto const& helix_is_inactive_rank = helix_tensor_params[1];
                 if (helix_position_offsets.has_value())
                 {
                     mla_params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
@@ -297,10 +577,33 @@ public:
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
         int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();
         // Note we still need context length during generation for MMHA optimization.
-        int32_t const max_context_q_len
+        // For encoder CUDA graphs compatibility, allow the caller to override the
+        // max context Q length so FMHA kernel launch params (mMaxSeqLenQ-driven grid
+        // and cluster dims) are stable across graph replays even when actual per-batch
+        // sequence lengths vary.
+        int32_t const max_context_q_len_computed
             = host_context_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
-        int32_t const max_past_kv_length
+        int32_t const max_past_kv_length_computed
             = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+
+        if (max_context_q_len_override.has_value())
+        {
+            int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
+            TORCH_CHECK(override_value >= max_context_q_len_computed,
+                "max_context_q_len_override (%d) must be >= computed max context q length (%d).", override_value,
+                max_context_q_len_computed);
+            TORCH_CHECK(override_value >= max_past_kv_length_computed,
+                "max_context_q_len_override (%d) must be >= computed max past kv length (%d).", override_value,
+                max_past_kv_length_computed);
+        }
+
+        int32_t const max_context_q_len = max_context_q_len_override.has_value()
+            ? static_cast<int32_t>(max_context_q_len_override.value())
+            : max_context_q_len_computed;
+        // Override the max_past_kv_length as well for encoder CUDA graph compatibility
+        int32_t const max_past_kv_length = max_context_q_len_override.has_value()
+            ? static_cast<int32_t>(max_context_q_len_override.value())
+            : max_past_kv_length_computed;
 
         // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
         // unless each layer has different attention window sizes.
@@ -312,18 +615,23 @@ public:
         int const cyclic_attention_window_size = attention_window_size;
         bool const can_use_one_more_block = beam_width > 1;
 
-        int max_blocks_per_sequence
+        int max_blocks_per_sequence = 0;
+        int32_t pool_index = 0;
+        int32_t layer_idx_in_cache_pool = 0;
+        KVBlockArray::DataType* block_offsets = nullptr;
+        bool use_kv_cache = false;
+        KvCachePoolPointers pool_pointers;
+        max_blocks_per_sequence
             = op.useKVCache() && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
-        int32_t const pool_index = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+        pool_index = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
             ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>()
             : 0;
-        int32_t const layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+        layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
             ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
             : 0;
-        KVBlockArray::DataType* block_offsets
-            = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
-                    ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
-                    : nullptr);
+        block_offsets = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
+                ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
+                : nullptr);
 
         // The cache element size in bits.
         int cache_elem_bits = op.getKvCacheElemSizeInBits<T>();
@@ -333,8 +641,7 @@ public:
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
         // Build KV cache pool pointers from the host tensor.
-        bool const use_kv_cache = op.useKVCache() && host_kv_cache_pool_pointers.has_value();
-        KvCachePoolPointers pool_pointers;
+        use_kv_cache = op.useKVCache() && host_kv_cache_pool_pointers.has_value();
         if (use_kv_cache)
         {
             pool_pointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers.value(), pool_index, intra_pool_offset,
@@ -421,7 +728,6 @@ public:
         common_enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.max_cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.can_use_one_more_block = can_use_one_more_block;
-        common_enqueue_params.sink_token_length = sink_token_length;
         common_enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant_ptr;
         common_enqueue_params.kv_scale_quant_orig = kv_scale_quant_orig_ptr;
         common_enqueue_params.attention_output_orig_quant = out_scale_ptr;
@@ -440,6 +746,7 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+        common_enqueue_params.trtllm_gen_jit_warmup = trtllm_gen_jit_warmup;
         if (softmax_stats_tensor.has_value())
         {
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().scalar_type() == at::ScalarType::Float,
@@ -453,23 +760,18 @@ public:
             common_enqueue_params.softmax_stats = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
         }
 
-        // Shared helper to extract helix params from helix_tensor_params into enqueue params.
+        // Shared helper to wire helix params into the enqueue params.
         // Works for both EnqueueContextParams and EnqueueGenerationParams since both have
         // helix_position_offsets and helix_is_inactive_rank fields.
-        auto const extractHelixParams = [&helix_tensor_params](auto& params)
+        auto const extractHelixParams = [&helix_position_offsets, &helix_is_inactive_rank](auto& params)
         {
-            if (helix_tensor_params.size() == 2)
+            if (helix_position_offsets.has_value())
             {
-                auto const& helix_position_offsets = helix_tensor_params[0];
-                auto const& helix_is_inactive_rank = helix_tensor_params[1];
-                if (helix_position_offsets.has_value())
-                {
-                    params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
-                }
-                if (helix_is_inactive_rank.has_value())
-                {
-                    params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
-                }
+                params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
+            }
+            if (helix_is_inactive_rank.has_value())
+            {
+                params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
             }
         };
 
@@ -531,51 +833,33 @@ public:
             if (op.mIsSpecDecodingEnabled && op.mUseSpecDecoding)
             {
                 bool useTllmGen = tensorrt_llm::common::isSM100Family();
+                TORCH_CHECK(spec_decoding_generation_lengths.has_value(),
+                    "Expecting spec_decoding_generation_lengths in spec-dec mode.");
+                TORCH_CHECK(spec_decoding_position_offsets_for_cpp.has_value(),
+                    "Expecting spec_decoding_position_offsets_for_cpp in spec-dec mode.");
+                TORCH_CHECK(
+                    spec_decoding_packed_mask.has_value(), "Expecting spec_decoding_packed_mask in spec-dec mode.");
                 if (useTllmGen)
                 {
-                    TORCH_CHECK(spec_decoding_tensor_params.size() == 6,
-                        "Expecting 6 tensors for spec-dec mode, spec_decoding_generation_lengths, "
-                        "spec_decoding_position_offsets, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset, "
-                        "spec_decoding_bl_tree_mask and spec_bl_tree_first_sparse_mask_offset_kv.");
-                    TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
-                        "Expecting spec_decoding_generation_lengths spec-dec mode.");
-                    TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
-                        "Expecting spec_decoding_position_offsets spec-dec mode.");
-                    TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
-                        "Expecting spec_decoding_packed_mask spec-dec mode.");
-                    TORCH_CHECK(spec_decoding_tensor_params[3].has_value(),
-                        "Expecting spec_decoding_bl_tree_mask_offset spec-dec mode.");
-                    TORCH_CHECK(spec_decoding_tensor_params[4].has_value(),
-                        "Expecting spec_decoding_bl_tree_mask spec-dec mode.");
-                    TORCH_CHECK(spec_decoding_tensor_params[5].has_value(),
-                        "Expecting spec_bl_tree_first_sparse_mask_offset_kv spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_bl_tree_mask_offset.has_value(),
+                        "Expecting spec_decoding_bl_tree_mask_offset in trtllm-gen spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_bl_tree_mask.has_value(),
+                        "Expecting spec_decoding_bl_tree_mask in trtllm-gen spec-dec mode.");
+                    TORCH_CHECK(spec_bl_tree_first_sparse_mask_offset_kv.has_value(),
+                        "Expecting spec_bl_tree_first_sparse_mask_offset_kv in trtllm-gen spec-dec mode.");
                     enqueue_params.spec_decoding_bl_tree_mask_offset
-                        = spec_decoding_tensor_params[3].value().data_ptr<int64_t>();
-                    enqueue_params.spec_decoding_bl_tree_mask
-                        = spec_decoding_tensor_params[4].value().data_ptr<uint32_t>();
+                        = spec_decoding_bl_tree_mask_offset->data_ptr<int64_t>();
+                    enqueue_params.spec_decoding_bl_tree_mask = spec_decoding_bl_tree_mask->data_ptr<uint32_t>();
                     enqueue_params.spec_bl_tree_first_sparse_mask_offset_kv
-                        = spec_decoding_tensor_params[5].value().data_ptr<int32_t>();
+                        = spec_bl_tree_first_sparse_mask_offset_kv->data_ptr<int32_t>();
                 }
-                else
-                {
-                    TORCH_CHECK(spec_decoding_tensor_params.size() == 3,
-                        "Expecting 3 tensors for spec-dec mode, spec_decoding_generation_lengths, "
-                        "spec_decoding_position_offsets and spec_decoding_packed_mask.");
-                    TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
-                        "Expecting spec_decoding_generation_lengths spec-dec mode.");
-                    TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
-                        "Expecting spec_decoding_position_offsets spec-dec mode.");
-                    TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
-                        "Expecting spec_decoding_packed_mask spec-dec mode.");
-                }
-                enqueue_params.spec_decoding_generation_lengths
-                    = spec_decoding_tensor_params[0].value().data_ptr<int32_t>();
+                enqueue_params.spec_decoding_generation_lengths = spec_decoding_generation_lengths->data_ptr<int32_t>();
                 enqueue_params.spec_decoding_position_offsets
-                    = spec_decoding_tensor_params[1].value().data_ptr<int32_t>();
-                enqueue_params.spec_decoding_packed_mask = spec_decoding_tensor_params[2].value().data_ptr<int32_t>();
+                    = spec_decoding_position_offsets_for_cpp->data_ptr<int32_t>();
+                enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask->data_ptr<int32_t>();
                 enqueue_params.spec_decoding_is_generation_length_variable = true;
-                TLLM_CHECK(spec_decoding_tensor_params[1].value().dim() == 2); // [batch_size, max_draft_len + 1]
-                enqueue_params.spec_decoding_max_generation_length = spec_decoding_tensor_params[1].value().sizes()[1];
+                TLLM_CHECK(spec_decoding_position_offsets_for_cpp->dim() == 2); // [batch_size, max_draft_len + 1]
+                enqueue_params.spec_decoding_max_generation_length = spec_decoding_position_offsets_for_cpp->sizes()[1];
             }
 
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
@@ -597,12 +881,16 @@ public:
                     }
                 }
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
-                op.mlaGeneration<T>(mla_params, enqueue_params, stream);
+                {
+                    op.mlaGeneration<T>(mla_params, enqueue_params, stream);
+                }
             }
             else
             {
                 extractHelixParams(enqueue_params);
-                op.enqueueGeneration<T, KVBlockArray>(enqueue_params, stream);
+                {
+                    op.enqueueGeneration<T, KVBlockArray>(enqueue_params, stream);
+                }
             }
 
             {
@@ -637,28 +925,34 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> output_sf, std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length,
     torch::Tensor host_past_key_value_lengths, torch::Tensor host_total_kv_lens, torch::Tensor context_lengths,
     torch::Tensor host_context_lengths, torch::Tensor host_request_types,
-    std::optional<torch::Tensor> kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_pool_pointers,
-    std::optional<torch::Tensor> host_kv_cache_pool_mapping, std::optional<torch::Tensor> cache_indirection,
-    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
-    std::optional<torch::Tensor> out_scale, std::optional<torch::Tensor> rotary_inv_freq,
-    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
-    std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
-    std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
-    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
-    int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
-    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
-    std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
+    std::optional<int64_t> max_context_q_len_override, std::optional<torch::Tensor> kv_cache_block_offsets,
+    std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
+    std::optional<torch::Tensor> cache_indirection, std::optional<torch::Tensor> kv_scale_orig_quant,
+    std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> out_scale,
+    std::optional<torch::Tensor> rotary_inv_freq, std::optional<torch::Tensor> rotary_cos_sin,
+    std::optional<torch::Tensor> latent_cache, std::optional<torch::Tensor> q_pe,
+    std::optional<torch::Tensor> block_ids_per_seq, std::optional<torch::Tensor> attention_sinks,
+    bool const is_fused_qkv, bool const update_kv_cache, int64_t const predicted_tokens_per_seq,
+    int64_t const local_layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
+    int64_t const max_seq_len, int64_t const attention_window_size, int64_t const beam_width, int64_t const mask_type,
+    int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type, int64_t const rope_dim,
+    double const rope_base, int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
+    double const rope_long_m_scale, int64_t const rope_max_positions, int64_t const rope_original_max_positions,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim, std::optional<bool> rope_append,
     std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
-    std::vector<std::optional<torch::Tensor>> helix_tensor_params, std::optional<int64_t> attention_chunk_size,
-    std::optional<torch::Tensor> softmax_stats_tensor, std::vector<bool> spec_decoding_bool_params,
-    std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
+    std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
+    std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
+    bool const is_spec_decoding_enabled, bool const use_spec_decoding, bool const is_spec_dec_tree,
+    std::optional<torch::Tensor> spec_decoding_generation_lengths,
+    std::optional<torch::Tensor> spec_decoding_position_offsets_for_cpp,
+    std::optional<torch::Tensor> spec_decoding_packed_mask,
+    std::optional<torch::Tensor> spec_decoding_bl_tree_mask_offset,
+    std::optional<torch::Tensor> spec_decoding_bl_tree_mask,
+    std::optional<torch::Tensor> spec_bl_tree_first_sparse_mask_offset_kv,
     std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
     std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
     int64_t const sparse_attn_indices_block_size, std::optional<int64_t> num_sparse_topk,
@@ -670,10 +964,10 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
-    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
+    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
     std::optional<int64_t> compressed_kv_cache_pool_ptr)
 {
-    TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
+    TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
@@ -751,18 +1045,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     runner->beam_width = beam_width;
     runner->max_num_requests = max_num_requests;
     runner->attention_window_size = attention_window_size;
-    runner->sink_token_length = sink_token_length;
-
-    double const rotary_embedding_scale = rotary_embedding_scales[0];
-    double const rotary_embedding_short_m_scale = rotary_embedding_scales[1];
-    double const rotary_embedding_long_m_scale = rotary_embedding_scales[2];
-    int64_t const rotary_embedding_max_positions = rotary_embedding_max_position_info[0];
-    int64_t const rotary_embedding_original_max_positions = rotary_embedding_max_position_info[1];
 
     auto op = std::make_shared<AttentionOp>();
     op->mType = dtype;
     op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
-    op->mLayerIdx = layer_idx;
+    op->mLayerIdx = local_layer_idx;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;
@@ -774,18 +1061,19 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mFP8GenerationMLA = false;
     op->mFuseFp4Quant = is_fp4_out;
     op->mMaxContextLength = max_context_length;
+    op->mMaxSeqLen = max_seq_len;
+    op->mMaxNumRequests = max_num_requests;
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
         = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));
-    op->mRotaryEmbeddingDim = rotary_embedding_dim;
-    op->mRotaryEmbeddingBase = rotary_embedding_base;
-    op->mRotaryEmbeddingScaleType
-        = static_cast<tensorrt_llm::kernels::RotaryScalingType>(int8_t(rotary_embedding_scale_type));
-    op->mRotaryEmbeddingScale = rotary_embedding_scale;
-    op->mRotaryEmbeddingShortMscale = rotary_embedding_short_m_scale;
-    op->mRotaryEmbeddingLongMscale = rotary_embedding_long_m_scale;
-    op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
-    op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
+    op->mRotaryEmbeddingDim = rope_dim;
+    op->mRotaryEmbeddingBase = rope_base;
+    op->mRotaryEmbeddingScaleType = static_cast<tensorrt_llm::kernels::RotaryScalingType>(int8_t(rope_scale_type));
+    op->mRotaryEmbeddingScale = rope_scale;
+    op->mRotaryEmbeddingShortMscale = rope_short_m_scale;
+    op->mRotaryEmbeddingLongMscale = rope_long_m_scale;
+    op->mRotaryEmbeddingMaxPositions = rope_max_positions;
+    op->mRotaryEmbeddingOriginalMaxPositions = rope_original_max_positions;
     op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
         || use_sage_attn;
     // SageAttention block sizes and quantization mode.
@@ -805,11 +1093,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
     op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;
 #endif
-    TORCH_CHECK(spec_decoding_bool_params.size() == 3,
-        "Expecting 3 bools for spec-dec mode, is_spec_decoding_enabled, use_spec_decoding, and is_spec_dec_tree.");
-    op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
-    op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
-    op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
+    op->mIsSpecDecodingEnabled = is_spec_decoding_enabled;
+    op->mUseSpecDecoding = use_spec_decoding;
+    op->mIsSpecDecTree = is_spec_dec_tree;
 
     op->mUseSparseAttention = false;
     op->mUseTllmGenSparseAttentionPaged = false;
@@ -880,13 +1166,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>> op_cache;
     if (auto it = op_cache.find(cache_key); it != op_cache.end())
     {
-        TLLM_LOG_TRACE("Attention op for layer %d is cached", layer_idx);
+        TLLM_LOG_TRACE("Attention op for layer %d is cached", local_layer_idx);
         op = it->second;
     }
     else
     {
-        TLLM_LOG_TRACE(
-            "Preparing new attention op for layer %d with cache key: %s", layer_idx, to_string(cache_key).c_str());
+        TLLM_LOG_TRACE("Preparing new attention op for layer %d with cache key: %s", local_layer_idx,
+            to_string(cache_key).c_str());
         op->initialize();
         runner->prepare(*op);
         op_cache[cache_key] = op;
@@ -947,13 +1233,16 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             /*num_seqs=*/num_contexts, token_offset,
             /*num_tokens=*/num_ctx_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv_or_q, k, v,
             sequence_length, host_past_key_value_lengths, ctx_total_kv_len, context_lengths, host_context_lengths,
-            kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_tensor_params, softmax_stats_tensor,
-            spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
-            sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
-            cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
-            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
+            max_context_q_len_override, kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+            cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
+            latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
+            helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
+            sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
+            num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
+            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -966,16 +1255,19 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             /*num_seqs=*/num_generations, token_offset,
             /*num_tokens=*/num_gen_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv_or_q, k, v,
             sequence_length, host_past_key_value_lengths, gen_total_kv_len, context_lengths, host_context_lengths,
-            kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_tensor_params, softmax_stats_tensor,
-            spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
-            sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
-            cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
-            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
+            max_context_q_len_override, kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+            cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
+            latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
+            helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
+            sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
+            num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
+            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr);
     }
 
-    TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
+    TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
 }
 
 bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
@@ -1037,29 +1329,37 @@ KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPo
         // The layout of host_kv_cache_pool_pointers is [num_pools, 2 (primary and secondary), 2 (data and scale)].
         TORCH_CHECK(hostKvCachePoolPointers.dim() == 3);
         pointers.primaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0, 0}).item<int64_t>())
+            reinterpret_cast<char*>(
+                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, 0, "host_kv_cache_pool_pointers"))
             + intraPoolOffset);
         pointers.secondaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1, 0}).item<int64_t>())
+            reinterpret_cast<char*>(
+                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, 0, "host_kv_cache_pool_pointers"))
             + intraPoolOffset);
         // NVFP4 block scaling uses a fixed vector size of 16.
         auto constexpr vectorSize = 16;
         auto const bytesPerBlockSf = blockSize / vectorSize * 1 /*bytes per E4M3 sf*/;
         auto const intraPoolOffsetSf = layerIdxInCachePool * kvFactor * bytesPerBlockSf;
         pointers.primaryBlockScalePoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0, 1}).item<int64_t>())
+            reinterpret_cast<char*>(
+                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, 1, "host_kv_cache_pool_pointers"))
             + intraPoolOffsetSf);
         pointers.secondaryBlockScalePoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1, 1}).item<int64_t>())
+            reinterpret_cast<char*>(
+                readHostTensor3D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, 1, "host_kv_cache_pool_pointers"))
             + intraPoolOffsetSf);
     }
     else
     {
         TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
         pointers.primaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0}).item<int64_t>()) + intraPoolOffset);
+            reinterpret_cast<char*>(
+                readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))
+            + intraPoolOffset);
         pointers.secondaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1}).item<int64_t>()) + intraPoolOffset);
+            reinterpret_cast<char*>(
+                readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, "host_kv_cache_pool_pointers"))
+            + intraPoolOffset);
     }
     return pointers;
 }
@@ -1069,8 +1369,8 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
     std::optional<torch::Tensor> const& host_kv_cache_pool_pointers,
     std::optional<torch::Tensor> const& host_kv_cache_pool_mapping, common::QuantMode quantMode, int64_t layer_idx,
     int64_t batch_size, int64_t tokens_per_block, int64_t kv_head_num, int64_t size_per_head,
-    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t sink_token_length,
-    int64_t beam_width, int64_t seq_offset, bool is_mla_enable, size_t elem_size)
+    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t beam_width, int64_t seq_offset,
+    bool is_mla_enable, size_t elem_size)
 {
     using kernels::KVBlockArray;
 
@@ -1081,11 +1381,11 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
         return {};
     }
 
-    int32_t const poolIndex = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 0}).item<int32_t>();
-    int32_t const layerIdxInCachePool
-        = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 1}).item<int32_t>();
-    auto* blockOffsets = static_cast<KVBlockArray::DataType*>(
-        kv_cache_block_offsets->index({poolIndex, static_cast<int64_t>(seq_offset)}).data_ptr());
+    auto const mapping = readKvCachePoolMapping(host_kv_cache_pool_mapping.value(), layer_idx);
+    int32_t const poolIndex = mapping.poolIndex;
+    int32_t const layerIdxInCachePool = mapping.layerIdxInCachePool;
+    auto* blockOffsets = tensorPtr2D<KVBlockArray::DataType>(
+        kv_cache_block_offsets.value(), poolIndex, static_cast<int64_t>(seq_offset), "kv_cache_block_offsets");
 
     int cacheElemBits = common::op::AttentionOp::getKvCacheElemSizeInBits(quantMode, elem_size);
 
@@ -1103,9 +1403,63 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
         maxBlocksPerSequence, static_cast<int32_t>(tokens_per_block), sizePerToken,
         static_cast<int32_t>(cyclic_attention_window_size),
         static_cast<int32_t>(std::max(cyclic_attention_window_size, max_attention_window_size)),
-        static_cast<int32_t>(sink_token_length), beam_width > 1, poolPointers.primaryPoolPtr,
-        poolPointers.secondaryPoolPtr, poolPointers.primaryBlockScalePoolPtr, poolPointers.secondaryBlockScalePoolPtr,
-        blockOffsets, quantMode.hasFp4KvCache());
+        /*sink_token_length=*/0, beam_width > 1, poolPointers.primaryPoolPtr, poolPointers.secondaryPoolPtr,
+        poolPointers.primaryBlockScalePoolPtr, poolPointers.secondaryBlockScalePoolPtr, blockOffsets,
+        quantMode.hasFp4KvCache());
+}
+
+std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedKvCacheBuffers(
+    at::Tensor host_kv_cache_pool_pointers, at::Tensor host_kv_cache_pool_mapping, int64_t layer_idx,
+    int64_t num_kv_heads, int64_t tokens_per_block, int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks,
+    int64_t kv_cache_quant_mode, at::ScalarType dtype)
+{
+    auto const mapping = readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
+    int32_t const poolIndex = mapping.poolIndex;
+    int32_t const layerIdxInCachePool = mapping.layerIdxInCachePool;
+
+    auto quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
+    bool const isFp4 = quantMode.hasFp4KvCache();
+
+    size_t const inputElemSize = isFp4 ? 1 : (quantMode.hasFp8KvCache() || quantMode.hasInt8KvCache() ? 1 : 2);
+    int const cacheElemBits = common::op::AttentionOp::getKvCacheElemSizeInBits(quantMode, inputElemSize);
+
+    auto const blockSize = tokens_per_block * num_kv_heads * head_dim;
+    auto const bytesPerBlock = blockSize * cacheElemBits / CHAR_BIT;
+    auto const intraPoolOffset = layerIdxInCachePool * kv_factor * bytesPerBlock;
+
+    auto poolPointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers, poolIndex, intraPoolOffset, blockSize,
+        layerIdxInCachePool, static_cast<int32_t>(kv_factor), isFp4);
+    TORCH_CHECK(poolPointers.primaryPoolPtr != nullptr, "Primary KV cache pool pointer is null.");
+
+    at::ScalarType storageDtype = dtype;
+    if (quantMode.hasFp8KvCache())
+        storageDtype = at::kFloat8_e4m3fn;
+    else if (quantMode.hasInt8KvCache())
+        storageDtype = at::kByte;
+    else if (quantMode.hasFp4KvCache())
+        storageDtype = at::kByte; // FP4 packed as bytes
+
+    int64_t containerDim = isFp4 ? head_dim / 2 : head_dim;
+
+    // Flat-block KV cache: [total_blocks, num_kv_heads, tokens_per_block, containerDim]
+    auto options = at::TensorOptions()
+                       .dtype(storageDtype)
+                       .device(c10::Device(at::kCUDA, static_cast<c10::DeviceIndex>(at::cuda::current_device())));
+    auto kv_pool = torch::from_blob(
+        poolPointers.primaryPoolPtr, {total_num_blocks, num_kv_heads, tokens_per_block, containerDim}, options);
+
+    std::optional<at::Tensor> kvScalePool = std::nullopt;
+    if (isFp4 && poolPointers.primaryBlockScalePoolPtr != nullptr)
+    {
+        auto scaleOptions
+            = at::TensorOptions()
+                  .dtype(at::kFloat8_e4m3fn)
+                  .device(c10::Device(at::kCUDA, static_cast<c10::DeviceIndex>(at::cuda::current_device())));
+        kvScalePool = torch::from_blob(poolPointers.primaryBlockScalePoolPtr,
+            {total_num_blocks, num_kv_heads, tokens_per_block, head_dim / 16}, scaleOptions);
+    }
+
+    return {kv_pool, kvScalePool};
 }
 
 } // namespace torch_ext
@@ -1113,7 +1467,7 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
 void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_scheduler_metadata, torch::Tensor num_splits,
     int64_t batch_size, int64_t s_q, int64_t num_q_heads, int64_t num_kv_heads, int64_t head_size_v)
 {
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(seqlens_k.get_device());
     static constexpr int block_size_n = 64;
     static constexpr int fixed_overhead_num_blocks = 5;
     int const num_sm_parts = tensorrt_llm::common::op::AttentionOp::getFlashMlaNumSmPartsStatic(static_cast<int>(s_q),

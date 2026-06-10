@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -103,14 +103,16 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
 #endif
 
 template <uint32_t ropeStyle>
-InputHead applyRoPE(InputHead const& head, Vec<float, validElemsPerHead> const& ropeCosSin)
+InputHead applyRoPE(InputHead const& head, Vec<float, validRopeElemsPerHead> const& ropeCosSin)
 {
     if constexpr (ropeStyle == 0)
     {
         return head;
     }
-    constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
-    InputHead dst;
+    // Only the first validRopeElemsPerHead elements are rotated (the rope region); the trailing
+    // [validRopeElemsPerHead, validElemsPerHead) elements pass through unrotated (partial rotary).
+    constexpr uint32_t nbPairs = exactDiv(validRopeElemsPerHead, 2);
+    InputHead dst = head;
     constexpr bool isNeox = (ropeStyle == 1);
     for (uint32_t i = 0; i < nbPairs; i++)
     {

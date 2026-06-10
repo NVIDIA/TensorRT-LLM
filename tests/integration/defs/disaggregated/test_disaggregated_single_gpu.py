@@ -1,11 +1,12 @@
 import asyncio
 import os
 import pickle
+import platform
 import sys
 
 import cloudpickle
 import pytest
-from defs.conftest import skip_no_hopper
+from defs.conftest import get_sm_version, skip_no_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -14,6 +15,22 @@ from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
+
+
+def get_ucx_tls():
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
+    for UCX_TLS.
+    """
+    sm = get_sm_version()
+    if sm == 103 and "aarch" in platform.machine().lower():
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
+
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -267,7 +284,7 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     with MPIPoolExecutor(max_workers=2,
                          env={
-                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_TLS": get_ucx_tls(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
@@ -416,7 +433,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 
     with MPIPoolExecutor(max_workers=2,
                          env={
-                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_TLS": get_ucx_tls(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
@@ -527,7 +544,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     mpi_info.Set("oversubscribe", "true")
     with MPIPoolExecutor(max_workers=2,
                          env={
-                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_TLS": get_ucx_tls(),
                              "UCX_MM_ERROR_HANDLING": "y",
                              "OMPI_MCA_rmaps_base_oversubscribe": "1"
                          },
@@ -618,7 +635,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
 
     with MPIPoolExecutor(max_workers=2,
                          env={
-                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_TLS": get_ucx_tls(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
@@ -727,7 +744,7 @@ def test_disaggregated_cancel_gen_requests(model):
 
     with MPIPoolExecutor(max_workers=2,
                          env={
-                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_TLS": get_ucx_tls(),
                              "UCX_MM_ERROR_HANDLING": "y",
                          }) as executor:
         futures = []
@@ -833,7 +850,7 @@ def test_disaggregated_logits(model, generation_overlap):
 
     with MPIPoolExecutor(max_workers=2,
                          env={
-                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_TLS": get_ucx_tls(),
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []

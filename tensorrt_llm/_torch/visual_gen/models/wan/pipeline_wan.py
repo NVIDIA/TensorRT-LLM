@@ -13,7 +13,6 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
@@ -21,7 +20,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -79,25 +78,37 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
-@register_pipeline("WanPipeline")
+@register_pipeline(
+    "WanPipeline",
+    hf_ids=[
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8",
+        "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
+    ],
+    doc="Wan 2.1 & 2.2 text-to-video family.",
+)
 class WanPipeline(BasePipeline):
-    def __init__(self, model_config):
+    def __init__(self, pipeline_config):
         # Wan2.2 A14B two-stage denoising parameters
         self.transformer_2 = None
-        self.boundary_ratio = getattr(model_config.pretrained_config, "boundary_ratio", None)
-        self.expand_timesteps = getattr(model_config.pretrained_config, "expand_timesteps", False)
+        primary_pretrained_config = pipeline_config.primary_pretrained_config
+        self.boundary_ratio = getattr(primary_pretrained_config, "boundary_ratio", None)
+        self.expand_timesteps = getattr(primary_pretrained_config, "expand_timesteps", False)
         # Derived model type flags
         self.is_wan22_14b = self.boundary_ratio is not None
         self.is_wan22_5b = self.expand_timesteps
 
         # Validate TeaCache compatibility before allocating GPU memory
-        if (self.is_wan22_14b or self.is_wan22_5b) and model_config.cache_backend == "teacache":
+        if (self.is_wan22_14b or self.is_wan22_5b) and pipeline_config.cache_backend == "teacache":
             raise ValueError(
                 "TeaCache is not supported for Wan 2.2 models. "
                 "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
 
-        super().__init__(model_config)
+        super().__init__(pipeline_config)
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
@@ -116,7 +127,7 @@ class WanPipeline(BasePipeline):
 
         t_emb = ce.time_embedder(t_freq)
 
-        teacache = self.model_config.teacache
+        teacache = self.pipeline_config.teacache
         if teacache is not None and teacache.use_ret_steps:
             return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
         else:
@@ -124,7 +135,7 @@ class WanPipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -168,12 +179,16 @@ class WanPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
-        self.transformer = WanTransformer3DModel(model_config=self.model_config)
+        self.transformer = WanTransformer3DModel(
+            model_config=self.pipeline_config.model_configs["transformer"]
+        )
 
         # Wan2.2 A14B: create second transformer for two-stage denoising
         if self.is_wan22_14b:
             logger.info("Creating second transformer for Wan2.2 A14B two-stage denoising...")
-            self.transformer_2 = WanTransformer3DModel(model_config=self.model_config)
+            self.transformer_2 = WanTransformer3DModel(
+                model_config=self.pipeline_config.model_configs["transformer_2"]
+            )
 
     def load_standard_components(
         self,
@@ -198,7 +213,6 @@ class WanPipeline(BasePipeline):
         else:
             logger.info("Detected Wan 2.1 T2V (single-stage denoising)")
 
-        # Set default VAE scale factors (will be overridden if VAE is loaded)
         default_vae_scale_factor_spatial = 16 if self.is_wan22_5b else 8
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = default_vae_scale_factor_spatial
@@ -215,7 +229,7 @@ class WanPipeline(BasePipeline):
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         if PipelineComponent.VAE not in skip_components:
@@ -279,7 +293,7 @@ class WanPipeline(BasePipeline):
             logger.info("Transformer_2 weights loaded successfully.")
 
         # Cache the target dtype from model config (default: bfloat16)
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
         # Set model to eval mode
         if self.transformer is not None:
@@ -291,7 +305,7 @@ class WanPipeline(BasePipeline):
         super().post_load_weights()  # Calls transformer.post_load_weights() for FP8 scale transformations
         if self.transformer is not None:
             # TeaCache extractor only when using TeaCache (not Cache-DiT).
-            if self.model_config.cache_backend == "teacache":
+            if self.pipeline_config.cache_backend == "teacache":
                 register_extractor_from_config(
                     ExtractorConfig(
                         model_class_name="WanTransformer3DModel",
@@ -306,7 +320,7 @@ class WanPipeline(BasePipeline):
                 )
                 self.transformer_cache_backend = self.cache_accelerator
             else:
-                if self.model_config.cache_backend == "cache_dit":
+                if self.pipeline_config.cache_backend == "cache_dit":
                     self._setup_cache_acceleration(self.transformer, coefficients=None)
                 # TeaCache is not supported for Wan 2.2 unless using Cache-DiT.
                 self.transformer_cache_backend = self.cache_accelerator

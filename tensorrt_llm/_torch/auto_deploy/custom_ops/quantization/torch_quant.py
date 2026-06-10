@@ -1,3 +1,7 @@
+# Copyright contributors to the SGLang project
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/sgl-project/sglang
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
