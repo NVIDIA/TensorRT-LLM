@@ -6,13 +6,13 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Generator, List, Mapping, Union
 
-logger = logging.getLogger(__name__)
-
 from .controller import Controller, ParallelProcess
 from .execution_scope import ExecutionScope, current_scope
 from .result import ScaffoldingResult
 from .task import Task
 from .worker import Worker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

@@ -33,11 +33,11 @@ def format_alert(feature: dict) -> str:
     """Format an alert feature into a readable string."""
     props = feature["properties"]
     return f"""
-Event: {props.get('event', 'Unknown')}
-Area: {props.get('areaDesc', 'Unknown')}
-Severity: {props.get('severity', 'Unknown')}
-Description: {props.get('description', 'No description available')}
-Instructions: {props.get('instruction', 'No specific instructions provided')}
+Event: {props.get("event", "Unknown")}
+Area: {props.get("areaDesc", "Unknown")}
+Severity: {props.get("severity", "Unknown")}
+Description: {props.get("description", "No description available")}
+Instructions: {props.get("instruction", "No specific instructions provided")}
 """
 
 
@@ -88,27 +88,25 @@ async def get_forecast(latitude: float, longitude: float) -> str:
     forecasts = []
     for period in periods[:5]:  # Only show next 5 periods
         forecast = f"""
-{period['name']}:
-Temperature: {period['temperature']}°{period['temperatureUnit']}
-Wind: {period['windSpeed']} {period['windDirection']}
-Forecast: {period['detailedForecast']}
+{period["name"]}:
+Temperature: {period["temperature"]}°{period["temperatureUnit"]}
+Wind: {period["windSpeed"]} {period["windDirection"]}
+Forecast: {period["detailedForecast"]}
 """
         forecasts.append(forecast)
 
     return "\n---\n".join(forecasts)
 
 
-def create_starlette_app(mcp_server: Server,
-                         *,
-                         debug: bool = False) -> Starlette:
+def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
     """Create a Starlette application that can server the provided mcp server with SSE."""
     sse = SseServerTransport("/messages/")
 
     async def handle_sse(request: Request) -> None:
         async with sse.connect_sse(
-                request.scope,
-                request.receive,
-                request._send,  # noqa: SLF001
+            request.scope,
+            request.receive,
+            request._send,  # noqa: SLF001
         ) as (read_stream, write_stream):
             await mcp_server.run(
                 read_stream,
@@ -130,12 +128,9 @@ if __name__ == "__main__":
 
     import argparse
 
-    parser = argparse.ArgumentParser(description='Run MCP SSE-based server')
-    parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port',
-                        type=int,
-                        default=8080,
-                        help='Port to listen on')
+    parser = argparse.ArgumentParser(description="Run MCP SSE-based server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
     args = parser.parse_args()
 
     # Bind SSE request handling to MCP server
