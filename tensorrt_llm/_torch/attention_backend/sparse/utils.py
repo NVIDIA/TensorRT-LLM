@@ -1,3 +1,4 @@
+import functools
 from typing import TYPE_CHECKING, Optional
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
@@ -13,21 +14,28 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
-# Every sparse-attention algorithm the framework knows about (mirrors the
-# SparseAttentionConfig union). One not in this set that reaches a dispatch
-# fall-through below was never registered.
-_KNOWN_ALGORITHMS = frozenset({"rocket", "dsa", "skip_softmax"})
+
+@functools.lru_cache(maxsize=1)
+def _known_algorithms() -> frozenset:
+    """Algorithm names from the ``SparseAttentionConfig`` union (derived so it
+    can't drift)."""
+    from typing import get_args
+
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+    algos = set()
+    for member in get_args(get_args(SparseAttentionConfig)[0]):
+        algos.update(get_args(member.model_fields["algorithm"].annotation))
+    return frozenset(algos)
 
 
-def _warn_if_unregistered(sparse_attn_config: "SparseAttentionConfig") -> None:
-    """Warn if a configured algorithm is unregistered (added to the config but
-    not wired into the dispatch here). A known algorithm that returns None from
-    one dispatch because it is handled elsewhere does not warn."""
-    if sparse_attn_config.algorithm not in _KNOWN_ALGORITHMS:
+def _warn_if_unregistered(sparse_attn_config: "SparseAttentionConfig",
+                          fallback: str) -> None:
+    """Warn when a configured algorithm isn't registered in this dispatch;
+    ``fallback`` is what is used instead."""
+    if sparse_attn_config.algorithm not in _known_algorithms():
         logger.warning(
             f"Sparse-attention algorithm '{sparse_attn_config.algorithm}' is not "
-            f"registered in attention_backend/sparse/utils.py; it will run "
-            f"without its sparse path. Add it to the relevant dispatch.")
+            f"registered here; {fallback}.")
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -43,7 +51,8 @@ def get_sparse_attn_kv_cache_manager(
         return DSACacheManager
     elif sparse_attn_config.algorithm == "skip_softmax":
         return KVCacheManager
-    _warn_if_unregistered(sparse_attn_config)
+    _warn_if_unregistered(sparse_attn_config,
+                          "using the standard KV-cache manager")
     return None
 
 
@@ -54,7 +63,8 @@ def create_kv_cache_compression_manager(
     """Return the KV-cache compression manager for the configured algorithm,
     or ``None`` if the algorithm does not use the compression framework (e.g.
     legacy rocket / dsa)."""
-    _warn_if_unregistered(sparse_attn_config)
+    _warn_if_unregistered(sparse_attn_config,
+                          "running without a compression manager")
     return None
 
 
@@ -62,7 +72,8 @@ def get_vanilla_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
     if sparse_attn_config.algorithm == "rocket":
         return RocketVanillaAttention
-    _warn_if_unregistered(sparse_attn_config)
+    _warn_if_unregistered(sparse_attn_config,
+                          "using the base vanilla attention backend")
     return None
 
 
@@ -74,11 +85,13 @@ def get_trtllm_sparse_attn_attention_backend(
         return DSATrtllmAttention
     elif sparse_attn_config.algorithm == "skip_softmax":
         return TrtllmAttention
-    _warn_if_unregistered(sparse_attn_config)
+    _warn_if_unregistered(sparse_attn_config,
+                          "using the base TRTLLM attention backend")
     return None
 
 
 def get_flashinfer_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
-    _warn_if_unregistered(sparse_attn_config)
+    _warn_if_unregistered(sparse_attn_config,
+                          "using the base FlashInfer attention backend")
     return None
