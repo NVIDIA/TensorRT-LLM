@@ -359,7 +359,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     # Default KV layout for flashinfer
     # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
     DEFAULT_KV_LAYOUT = "HND"
-    REQUIRES_PAGED_KV = True
     # Keep shared paged indices disabled to match the current TensorRT-LLM
     # block-table layout used by the fused preprocessing path.
     USE_SHARED_PAGED_KV_IDX = False
@@ -767,7 +766,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         forward_args: AttentionForwardArgs,
         is_gen_only: bool,
     ) -> bool:
-        del q, metadata, forward_args
         kv_cache_quant_mode = QuantMode(self.attn.quant_mode)
         return (
             output.dtype == torch.float8_e4m3fn
@@ -785,7 +783,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         forward_args: AttentionForwardArgs,
         workspace: torch.Tensor,
     ) -> None:
-        del k, v
         attn = self.attn
         # Lazily cache the SM count from the first query tensor's device.
         if self._multi_processor_count is None:
