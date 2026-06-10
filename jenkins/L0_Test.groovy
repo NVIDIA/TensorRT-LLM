@@ -1397,19 +1397,21 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     numRetries: 3
                 )
 
-                def slurmJobId = Utils.exec(
-                    pipeline,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        "\"cat ${jobWorkspace}/slurm_job_id.txt\""
-                    ),
-                    returnStdout: true,
-                    numRetries: 3
-                ).trim()
-                Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
-                if (placementContext != null) {
-                    placementContext.slurmJobId = slurmJobId
+                def slurmMetadata = captureSlurmWorkspaceMetadata(pipeline, remote, jobWorkspace, placementContext, stageName)
+                def slurmJobId = slurmMetadata.slurmJobId
+                if (!slurmJobId) {
+                    slurmJobId = Utils.exec(
+                        pipeline,
+                        script: Utils.sshUserCmd(
+                            remote,
+                            "\"cat ${jobWorkspace}/slurm_job_id.txt\""
+                        ),
+                        returnStdout: true,
+                        numRetries: 3
+                    ).trim()
+                    recordSlurmPlacementContext(placementContext, slurmJobId, null, stageName)
                 }
+                Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
 
                 def scriptTrack = """#!/bin/bash
                     set -xEeuo pipefail
@@ -1463,7 +1465,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     fi
 
                     # We already have valid STATUS from the loop that caused the break
-                    NODE_LIST=\$(sacct -j \$jobId --format=NodeList -Pn --allocations 2>/dev/null | head -1 || true)
+                    NODE_LIST=""
+                    if [ -s "${jobWorkspace}/slurm_node_list.txt" ]; then
+                        NODE_LIST=\$(awk 'NF { print; exit }' "${jobWorkspace}/slurm_node_list.txt" || true)
+                    fi
+                    if [ -z "\$NODE_LIST" ]; then
+                        NODE_LIST=\$(sacct -j \$jobId --format=NodeList -Pn --allocations 2>/dev/null | head -1 || true)
+                    fi
                     echo "Slurm job \$jobId nodelist: \${NODE_LIST:-UNKNOWN}"
                     printf '%s\n' "\$NODE_LIST" > "${jobWorkspace}/slurm_node_list.txt"
 
@@ -1506,7 +1514,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         stageIsInterrupted = true
         throw e
     } finally {
-        captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName)
+        captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
         uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
@@ -1865,20 +1873,99 @@ def rememberAvoidedSlurmNodeLists(List avoidedNodeLists, def nodes, String stage
     }
 }
 
-def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID, Map placementContext, String stageName)
+def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageName, int numRetries=1)
 {
-    if (placementContext == null || !slurmJobID) {
+    try {
+        def value = Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"cat ${path} 2>/dev/null || true\""
+            ),
+            returnStdout: true,
+            numRetries: numRetries
+        ).trim()
+        return value.readLines().collect { it.trim() }.find { it } ?: ""
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "[INFRA-RETRY] ${stageName}: unable to read SLURM metadata file ${path}: ${e.toString()}"
+        return ""
+    }
+}
+
+def recordSlurmPlacementContext(Map placementContext, String slurmJobID, def nodeList, String stageName)
+{
+    if (placementContext == null) {
         return null
     }
 
+    if (slurmJobID) {
+        placementContext.slurmJobId = slurmJobID
+    }
+
+    def normalized = trtllm_utils.normalizeSlurmNodeLists(nodeList)
+    if (!normalized.isEmpty()) {
+        placementContext.lastSlurmNodeList = normalized.join(' ')
+        def jobLabel = slurmJobID ? "job ${slurmJobID}" : "job"
+        echo "[INFRA-RETRY] ${stageName}: SLURM ${jobLabel} ran on node list(s): ${placementContext.lastSlurmNodeList}"
+    }
+    return placementContext.lastSlurmNodeList
+}
+
+def captureSlurmWorkspaceMetadata(def pipeline, Map remote, String jobWorkspace, Map placementContext, String stageName)
+{
+    def metadata = [slurmJobId: null, nodeList: null]
+    if (!jobWorkspace) {
+        return metadata
+    }
+
+    metadata.slurmJobId = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_id.txt", stageName)
+    metadata.nodeList = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_node_list.txt", stageName)
+    if (placementContext != null && metadata.slurmJobId) {
+        placementContext.slurmJobId = metadata.slurmJobId
+    }
+    def normalized = trtllm_utils.normalizeSlurmNodeLists(metadata.nodeList)
+    if (placementContext != null && !normalized.isEmpty()) {
+        placementContext.lastSlurmNodeList = normalized.join(' ')
+        metadata.nodeList = placementContext.lastSlurmNodeList
+    }
+    return metadata
+}
+
+def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID, Map placementContext, String stageName, String jobWorkspace=null)
+{
+    if (placementContext == null) {
+        return null
+    }
+
+    def capturedJobID = slurmJobID
     def nodeList = null
     try {
         CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+            def metadata = captureSlurmWorkspaceMetadata(pipeline, remote, jobWorkspace, placementContext, stageName)
+            capturedJobID = capturedJobID ?: metadata.slurmJobId
+            nodeList = metadata.nodeList
+            if (!capturedJobID && jobWorkspace) {
+                capturedJobID = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_id.txt", stageName, 3)
+                recordSlurmPlacementContext(placementContext, capturedJobID, null, stageName)
+            }
+            if (!nodeList && jobWorkspace) {
+                nodeList = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_node_list.txt", stageName, 3)
+            }
+            if (!capturedJobID) {
+                return
+            }
+
+            if (nodeList) {
+                return
+            }
+
             nodeList = Utils.exec(
                 pipeline,
                 script: Utils.sshUserCmd(
                     remote,
-                    "\"sacct -j ${slurmJobID} --format=NodeList -Pn --allocations 2>/dev/null | head -1 || true\""
+                    "\"sacct -j ${capturedJobID} --format=NodeList -Pn --allocations 2>/dev/null | head -1 || true\""
                 ),
                 returnStdout: true,
                 numRetries: 1
@@ -1888,7 +1975,7 @@ def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterNa
                     pipeline,
                     script: Utils.sshUserCmd(
                         remote,
-                        "\"scontrol show job ${slurmJobID} 2>/dev/null | tr ' ' '\\n' | sed -n 's/^NodeList=//p' | head -1 || true\""
+                        "\"scontrol show job ${capturedJobID} 2>/dev/null | tr ' ' '\\n' | sed -n 's/^NodeList=//p' | head -1 || true\""
                     ),
                     returnStdout: true,
                     numRetries: 1
@@ -1898,14 +1985,10 @@ def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterNa
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "[INFRA-RETRY] ${stageName}: unable to capture SLURM node list for job ${slurmJobID}: ${e.toString()}"
+        echo "[INFRA-RETRY] ${stageName}: unable to capture SLURM node list for job ${capturedJobID}: ${e.toString()}"
     }
 
-    def normalized = trtllm_utils.normalizeSlurmNodeLists(nodeList)
-    if (!normalized.isEmpty()) {
-        placementContext.lastSlurmNodeList = normalized.join(' ')
-        echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} ran on node list(s): ${placementContext.lastSlurmNodeList}"
-    }
+    recordSlurmPlacementContext(placementContext, capturedJobID, nodeList, stageName)
     return placementContext.lastSlurmNodeList
 }
 
