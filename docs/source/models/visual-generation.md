@@ -18,6 +18,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
+- CPU offloading for Wan text-to-video pipelines to reduce peak GPU memory usage.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
 ## Supported Models
@@ -44,16 +45,16 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
-|---|---|---|---|---|---|---|---|---|---|---|--|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.2** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **LTX-2** | Yes | Yes | Yes [^4] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image** [^5] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | T2V only | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | T2V only | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | T2V only | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **LTX-2** | Yes | Yes | Yes [^4] | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image** [^5] | Yes | Yes | No | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -267,6 +268,9 @@ attention_config:
     vsa_sparsity: 0.90
 ```
 
+### CPU Offloading (Wan T2V only)
+
+CPU offloading stages move selected Wan T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true` or `--enable_offloading` in the example script.
 
 ### Multi-GPU Parallelism
 
@@ -280,6 +284,7 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+
 ## Developer Guide
 
 ### Architecture Overview
