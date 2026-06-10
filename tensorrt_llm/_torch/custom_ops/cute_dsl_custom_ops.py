@@ -5916,6 +5916,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     cluster_size = 1
 
+            # Clamp to per-device hardware limit (per-GPC SM count). The
+            # kernel's __init__ validates against the absolute [1, 16] cap,
+            # but the actual launchable cluster size depends on GPC
+            # topology; pinning a value that exceeds it would fail at
+            # launch with a CUDA error. ``_query_max_cluster_size`` is
+            # lru_cache'd so the driver query runs once per process.
+            if cluster_size > 1:
+                hw_max_cluster = _query_max_cluster_size()
+                if cluster_size > hw_max_cluster:
+                    logger.warning_once(
+                        f"cute_dsl_gvr_topk_decode: cluster_size={cluster_size} "
+                        f"exceeds device max ({hw_max_cluster}); clamping.",
+                        key="cute_dsl_gvr_topk_decode_cluster_clamp",
+                    )
+                    cluster_size = hw_max_cluster
+
             cls._compile(
                 cute_dtype,
                 top_k,
