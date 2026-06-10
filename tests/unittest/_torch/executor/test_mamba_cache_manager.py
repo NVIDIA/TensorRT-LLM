@@ -365,6 +365,7 @@ def _build_hybrid_with_mamba_layer(
     max_batch_size=4,
     enable_block_reuse=False,
     mamba_state_cache_interval=None,
+    is_estimating_kv_cache=False,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
@@ -402,6 +403,7 @@ def _build_hybrid_with_mamba_layer(
         mapping=mapping,
         spec_config=spec_config,
         layer_mask=attn_mask,
+        is_estimating_kv_cache=is_estimating_kv_cache,
     )
 
 
@@ -540,6 +542,32 @@ def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
         f"recurrent-state pool has {recurrent_primary} slots with block reuse enabled, "
         f"need >= max_batch_size + 1 = {max_batch_size + 1} to prevent the padding "
         f"sentinel from evicting live recurrent state"
+    )
+
+
+@skip_no_cuda
+def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
+    """Dry-run path (is_estimating_kv_cache=True) under block reuse must
+    keep the live-state floor *plus* room for snapshots, not collapse to
+    max(snapshots, live). With max_batch_size=4, interval=256, max_tokens=512:
+      old:  max_snapshots = max(512//256, 4)         = 4   (no headroom for snapshots)
+      new:  max_snapshots = 4 + 512//256             = 6   (live + snapshots)
+    """
+    max_batch_size = 4
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=True,
+        mamba_state_cache_interval=256,
+        is_estimating_kv_cache=True,
+    )
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    # 4 live state slots + 2 reuse snapshots = 6.
+    expected_min = max_batch_size + (512 // 256)
+    assert recurrent_primary >= expected_min, (
+        f"dry-run recurrent-state pool has {recurrent_primary} slots, "
+        f"need >= live_state + reuse_snapshots = {expected_min}; the old "
+        f"max(reuse, live) formula dropped reuse headroom"
     )
 
 

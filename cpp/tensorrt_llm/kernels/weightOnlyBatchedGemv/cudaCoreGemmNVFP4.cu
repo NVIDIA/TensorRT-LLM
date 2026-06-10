@@ -30,7 +30,7 @@ template <typename InputType, typename OutputType, typename ScaleType, SizeType3
     SizeType32 BLOCK_SIZE>
 __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType const* __restrict__ weight,
     ScaleType const* __restrict__ scale_a, ScaleType const* __restrict__ scale_w, float const alpha,
-    OutputType* __restrict__ output, SizeType32 m, SizeType32 n, SizeType32 k)
+    OutputType* __restrict__ output, OutputType const* __restrict__ bias, SizeType32 m, SizeType32 n, SizeType32 k)
 {
     using VecType = int4;
 
@@ -63,6 +63,7 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
     act += tile_id_m * k / 2;
     weight += tile_id_n * k / 2;
     output += tile_id_m * n + tile_id_n;
+    OutputType const* __restrict__ bias_tile = (bias != nullptr) ? bias + tile_id_n : nullptr;
 
     scale_a += tile_id_m * k / nvfp4_scale_granularity;
 
@@ -154,6 +155,10 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
         {
             val += shmem[jj * TILE_M * TILE_N + ii];
         }
+        if (bias_tile != nullptr)
+        {
+            val += static_cast<float>(bias_tile[nid]);
+        }
         output[mid * n + nid] = static_cast<OutputType>(val);
     }
 
@@ -166,13 +171,13 @@ template <typename InputType, typename OutputType, typename ScaleType, SizeType3
     SizeType32 BLOCK_SIZE>
 __global__ void cudaCoreGemmFp4(InputType const* __restrict__ act, InputType const* __restrict__ weight,
     ScaleType const* __restrict__ scale_a, ScaleType const* __restrict__ scale_w, float const* alpha_ptr,
-    OutputType* __restrict__ output, SizeType32 m, SizeType32 n, SizeType32 k)
+    OutputType* __restrict__ output, OutputType const* __restrict__ bias, SizeType32 m, SizeType32 n, SizeType32 k)
 {
     float alpha = alpha_ptr[0];
     cudaCoreGemmImpl<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE>(
         reinterpret_cast<InputType const*>(act), reinterpret_cast<InputType const*>(weight),
         reinterpret_cast<ScaleType const*>(scale_a), reinterpret_cast<ScaleType const*>(scale_w), alpha,
-        reinterpret_cast<OutputType*>(output), m, n, k);
+        reinterpret_cast<OutputType*>(output), reinterpret_cast<OutputType const*>(bias), m, n, k);
 }
 
 template <typename InputType, typename OutputType, typename ScaleType, SizeType32 TILE_M, SizeType32 TILE_N,
@@ -203,7 +208,8 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
                 cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE>,
                 reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
                 reinterpret_cast<ScaleType const*>(params.scale_a), reinterpret_cast<ScaleType const*>(params.scale_b),
-                params.alpha_ptr, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k));
+                params.alpha_ptr, reinterpret_cast<OutputType*>(params.output),
+                reinterpret_cast<OutputType const*>(params.bias), params.m, params.n, params.k));
         }
     }
     else
@@ -213,7 +219,8 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
             cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
                 reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
                 reinterpret_cast<ScaleType const*>(params.scale_a), reinterpret_cast<ScaleType const*>(params.scale_b),
-                params.alpha_ptr, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+                params.alpha_ptr, reinterpret_cast<OutputType*>(params.output),
+                reinterpret_cast<OutputType const*>(params.bias), params.m, params.n, params.k);
         }
     }
 }

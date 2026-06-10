@@ -221,6 +221,9 @@ Qwen/Qwen3.5-35B-A3B:
     accuracy: 94.53
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 94.52
+  - spec_dec_algo: DFlash
+    quant_algo: FP8_BLOCK_SCALES
+    accuracy: 94.52
 Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
@@ -330,7 +333,7 @@ microsoft/phi-4:
 mistralai/Codestral-22B-v0.1:
   - accuracy: 67.10
 openai/gpt-oss-120b:
-  - accuracy: 10.0 # TODO: update this when the perf is good.
+  - accuracy: 90.3
 openai/gpt-oss-20b:
   - accuracy: 85.823
 GPT-OSS/120B-MXFP4:
@@ -454,7 +457,7 @@ nvidia/Nemotron-3-Nano:
     kv_cache_quant_algo: FP8
     accuracy: 65.428
 MiniMaxAI/MiniMax-M2:
-  - accuracy: 93.75
+  - accuracy: 89.045
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75
 nvidia/NVIDIA-Nemotron-Nano-9B-v2:

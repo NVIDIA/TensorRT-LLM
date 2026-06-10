@@ -57,7 +57,7 @@ from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..speculative import SpecMetadata
 from .modeling_multimodal_utils import (
-    _is_disagg,
+    _is_mm_disagg,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -946,7 +946,7 @@ class Step3p7VLForConditionalGeneration(nn.Module):
         allow_partial_loading: bool = False,
     ):
         """Split vision/text weights and delegate to the inner LM loader."""
-        if self.mm_encoder is None and not _is_disagg() and hasattr(weights, "items"):
+        if self.mm_encoder is None and not _is_mm_disagg() and hasattr(weights, "items"):
             # Construct the vision tower here, outside MetaInitMode, so its
             # PerceptionEncoder / HF submodules allocate real tensors. Move it
             # straight to CUDA (model_loader already ran model.to("cuda") for

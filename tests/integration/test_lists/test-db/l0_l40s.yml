@@ -32,7 +32,7 @@ l0_l40s:
   - accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
   # AutoDeploy: Nemotron-Nano-V3 on Ada uses flashinfer; trtllm has no
   # (E4M3 input, BF16 output, paged_kv, head_dim=128, sm_89) FMHA cubin.
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-flashinfer]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-flashinfer]
 - condition:
     ranges:
       system_gpu_count:
