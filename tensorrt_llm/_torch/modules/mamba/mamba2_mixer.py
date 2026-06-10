@@ -348,12 +348,6 @@ class Mamba2Mixer(nn.Module):
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
-            has_initial_states_p = has_initial_states[:num_prefills]
-            # Explicitly zero fresh context slots. Recycled slots may still
-            # carry a prior request's SSM/conv state, which kernels read.
-            fresh_p = state_indices_p[~has_initial_states_p]
-            conv_states[fresh_p] = 0
-            ssm_states[fresh_p] = 0
             # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
             xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
                                                     self.tp_d_inner,
@@ -380,6 +374,7 @@ class Mamba2Mixer(nn.Module):
 
             initial_states = None
             if mamba_metadata.use_initial_states:
+                # Rows without cached prefix state start SSM from zero.
                 initial_states = torch.where(
                     has_initial_states[:, None, None, None],
                     ssm_states[state_indices_p], 0)
