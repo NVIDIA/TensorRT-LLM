@@ -225,8 +225,6 @@ full:A100X/llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_mtp SKI
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugs/5161074)
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugs/5161074)
 full:B200/perf/test_perf.py::test_perf[quant:w4a8_awq] SKIP (https://nvbugs/5161074)
-full:B300/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM" SKIP (https://nvbugs/6165866)
-full:DGX_B200/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM" SKIP (https://nvbugs/6165866)
 full:DGX_B200/unittest/_torch/visual_gen/test_cosmos3_pipeline.py SKIP (temporary ToT main waive; Cosmos3 config split fix pending)
 full:DGX_B200/unittest/_torch/visual_gen/test_cosmos3_pipeline.py::TestCosmos3FP8Load::test_fp8_load_and_t2v SKIP (temporary ToT main waive; Cosmos3 config split fix pending)
 full:DGX_B200/unittest/_torch/visual_gen/test_cosmos3_transformer.py SKIP (temporary ToT main waive; Cosmos3 config split fix pending)
