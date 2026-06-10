@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """MegaMoE fused dispatch + fc1 + fc2 + combine kernel.
 
 The base class owns the local fc1/fc2 GEMM pipeline.  This subclass owns the
@@ -38,7 +40,7 @@ multiple of ``token_padding_block``.
 # quoted explicitly.
 
 import dataclasses
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -47,7 +49,7 @@ from cutlass.cutlass_dsl import Int64
 
 from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
 from .token_comm import TokenCommArgs as ExtractedTokenCommArgs
-from .token_comm import TokenInPullTokenBackPush
+from .token_comm import TokenInPullTokenBackPush, TokenSrcMetadata
 
 # =============================================================================
 # Module-level constants.
@@ -60,9 +62,9 @@ _DispatchToSchedNamedBarrierId = 9  # 4 dispatch + 1 sched (160 threads)
 # Dispatch warp count.
 _DispatchWarpCount = 4
 
-# Per-pool-slot provenance record consumed by combine STG redirect (S3).
-# Three packed Uint32 fields = 12 bytes: ``{src_rank, src_token, src_topk}``.
-_TokenMetadataBytes = 12
+# Per-pool-slot provenance record consumed by combine STG redirect (S3) and
+# token-back; one i64 = {src_rank, src_token, src_topk} (see TokenSrcMetadata).
+_TokenMetadataBytes = TokenSrcMetadata.nbytes
 
 # NVLink signal slots used by the DeepGEMM-style phase/sign barrier.
 # A separate local counter selects phase/sign; the signal slots are not reset
@@ -175,9 +177,12 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         fc2_output_dtype: Type[cutlass.Numeric],
         non_ubulk_fc2_store: bool = True,
         in_kernel_fc2_reduce: bool = False,
-        token_back_by_dispatch: bool = False,
+        token_back_mode: Literal["epi_warps", "standalone_warps",
+                                 "reuse_dispatch_warps"] = "epi_warps",
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
+        epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
+        flag_batch: int = 1,
     ) -> None:
         if static_expert_shape is None:
             raise NotImplementedError(
@@ -190,6 +195,20 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             raise ValueError(
                 f"hidden ({hidden}) must equal "
                 f"static_expert_shape[2] ({static_expert_shape[2]}).")
+
+        # token_back_mode selects where the cross-rank fc2 push-back runs:
+        #   epi_warps            -> epilogue warps STG directly to the peer
+        #   standalone_warps     -> dedicated warp group 12-15, concurrent
+        #                           with dispatch_pull
+        #   reuse_dispatch_warps -> dispatch warps 8-11 push after dispatch_pull
+        # The two non-epi modes both stage fc2 to a local workspace first, i.e.
+        # token_back_by_dispatch=True; epi_warps keeps the epilogue STG redirect.
+        if token_back_mode not in ("epi_warps", "standalone_warps",
+                                   "reuse_dispatch_warps"):
+            raise ValueError(
+                f"token_back_mode must be 'epi_warps', 'standalone_warps', "
+                f"or 'reuse_dispatch_warps'; got {token_back_mode!r}.")
+        token_back_by_dispatch = token_back_mode != "epi_warps"
 
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
@@ -212,16 +231,26 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             token_back_by_dispatch=token_back_by_dispatch,
             apply_topk_in_fc1=apply_topk_in_fc1,
             gate_up_clamp=gate_up_clamp,
+            epi_flag_batch=epi_flag_batch,
         )
 
         self.enable_token_comm = True
         self.dispatch_warp_id = (8, 9, 10, 11)
+        # Standalone token-back: a dedicated 4-warp group (12-15) doing
+        # token_back_by_push concurrently with dispatch_pull, selected by the
+        # user-facing token_back_mode knob ("standalone_warps").
+        self.token_back_mode = token_back_mode
+        self.token_back_standalone = token_back_mode == "standalone_warps"
+        self.token_back_warp_id = (12, 13, 14,
+                                   15) if self.token_back_standalone else None
+        num_token_back_warps = (len(self.token_back_warp_id)
+                                if self.token_back_standalone else 0)
         self.threads_per_cta = 32 * (
             len(self.epilogue_warp_id) + 1  # mma
             + 1  # tma_a
             + 1  # tma_b
             + 1  # sched
-            + len(self.dispatch_warp_id))
+            + len(self.dispatch_warp_id) + num_token_back_warps)
 
         # Independent MegaMoE-specific constants.
         self.world_size = world_size
@@ -275,6 +304,12 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             (self.hidden + cluster_fc2_tile_hidden - 1) //
             cluster_fc2_tile_hidden) * self.cluster_shape_mn[0]
 
+        # Homomorphic to the fc1+fc2 scheduler: atomic_counter token-back only
+        # nets a win with enough tokens, the same condition that selects the
+        # atomic_counter fc1+fc2 scheduler.  Static when token-back is off.
+        self.token_back_schedule_mode = (
+            self.load_balance_mode if self.token_back_by_dispatch else "static")
+
         self.token_comm = TokenInPullTokenBackPush(
             world_size=self.world_size,
             local_rank=self.local_rank,
@@ -287,6 +322,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                               if self.token_back_by_dispatch else None),
             fc2_publishes_per_token_cluster_tile=
             fc2_publishes_per_token_cluster_tile,
+            token_back_reduce_topk=(self.token_back_by_dispatch
+                                    and self.in_kernel_fc2_reduce),
+            token_back_standalone=self.token_back_standalone,
             sf_uint32_per_token=self.sf_uint32_per_token,
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,
@@ -294,6 +332,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             cluster_shape_mn=self.cluster_shape_mn,
             dispatch_warp_start=self.dispatch_warp_id[0],
             num_other_warps=num_other_warps,
+            flag_batch=flag_batch,
+            token_back_schedule_mode=self.token_back_schedule_mode,
         )
 
         # Region layout (same call drives both get_workspace_sizes() and
@@ -322,9 +362,13 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         pull_mbar_bytes = _DispatchWarpCount * 8
         expert_count_bytes = self.num_total_experts * 4
         pull_buffer_bytes = _DispatchWarpCount * self.hidden_bytes
-        return (_round_up(pull_mbar_bytes, 16) +
-                _round_up(expert_count_bytes, 16) +
-                _round_up(pull_buffer_bytes, 128))
+        total = (_round_up(pull_mbar_bytes, 16) +
+                 _round_up(expert_count_bytes, 16) +
+                 _round_up(pull_buffer_bytes, 128))
+        if self.token_back_standalone:
+            total += (_round_up(_DispatchWarpCount * 8, 16) + _round_up(
+                _DispatchWarpCount * self.token_comm.tb_chunk_bytes, 128))
+        return total
 
     def _smem_misc_budget_bytes(self) -> int:
         """Base misc reservation plus dispatch-warp SMEM."""
@@ -504,6 +548,14 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                     (num_experts_per_rank, ),
                     16,
                 ))
+            if self.token_back_schedule_mode == "atomic_counter":
+                specs.append(
+                    _RegionSpec(
+                        "token_back_schedule_counter",
+                        cutlass.Int32,
+                        (1, ),
+                        16,
+                    ))
 
         if self.load_balance_mode == "atomic_counter":
             specs.append(
@@ -881,6 +933,15 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             fc2_done_counter = None
             combine_output_u8 = combine_output
 
+        if cutlass.const_expr(
+                self.token_back_schedule_mode == "atomic_counter"):
+            token_back_schedule_counter = self._view_local(
+                local_workspace,
+                "token_back_schedule_counter",
+            ).iterator
+        else:
+            token_back_schedule_counter = None
+
         token_comm_args = ExtractedTokenCommArgs(
             input_token_buffer=activation,
             input_sf_buffer=activation_sf,
@@ -898,6 +959,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             combine_output=combine_output_u8,
             fc2_output_workspace=fc2_output_workspace_u8,
             fc2_done_counter=fc2_done_counter,
+            token_back_schedule_counter=token_back_schedule_counter,
             nvlink_barrier_signal=nvlink_barrier_signal,
             nvlink_barrier_counter=nvlink_barrier_counter,
             grid_sync_counter=grid_sync_counter,
@@ -987,6 +1049,24 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         tidx,
     ):
         self.token_comm.dispatch_warp_body(
+            token_comm_args,
+            token_comm_storage,
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
+            tidx=tidx,
+        )
+
+    @cute.jit
+    def token_comm_hook_token_back_warp_body(
+        self,
+        token_comm_args,
+        token_comm_storage,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
+    ):
+        self.token_comm.token_back_warp_body(
             token_comm_args,
             token_comm_storage,
             warp_idx=warp_idx,

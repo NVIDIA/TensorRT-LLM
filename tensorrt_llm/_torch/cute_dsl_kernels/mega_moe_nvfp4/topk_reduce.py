@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Standalone CuTeDSL topk reduce kernel.
 
 Form A writes one BF16 fc2 output row per ``(token, topk)`` cell into
@@ -200,8 +202,8 @@ def _pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     """Round FP32 to FP4 E2M1 and pack pairs along the last dimension."""
     if fp32.dim() == 0 or fp32.shape[-1] % 2 != 0:
         raise ValueError(
-            f"FP4 packing requires an even non-empty last dim, got {tuple(fp32.shape)}."
-        )
+            f"FP4 packing requires an even non-empty last dim, got "
+            f"{tuple(fp32.shape)}.")
     device = fp32.device
     boundaries = torch.tensor(
         [
@@ -260,8 +262,8 @@ def unpack_fp4_to_f32(packed: torch.Tensor) -> torch.Tensor:
         raw = packed.view(torch.uint8)
     else:
         raise TypeError(
-            f"packed must be torch.uint8 or torch.float4_e2m1fn_x2, got {packed.dtype}."
-        )
+            "packed must be torch.uint8 or torch.float4_e2m1fn_x2, got "
+            f"{packed.dtype}.")
     lo = (raw & 0x0F).to(torch.int64)
     hi = (raw >> 4).to(torch.int64)
     lut = _Fp4DecodeTable.to(raw.device)
@@ -942,17 +944,15 @@ def _validate_tensors(
     nvfp4_global_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[int, int, int, int]:
     if combine_output.dim() != 3:
-        raise ValueError(
-            f"combine_output must have shape (T, K, H), got {tuple(combine_output.shape)}."
-        )
+        raise ValueError(f"combine_output must have shape (T, K, H), got "
+                         f"{tuple(combine_output.shape)}.")
     if reduced_output.dim() != 2:
-        raise ValueError(
-            f"reduced_output must have shape (T, H), got {tuple(reduced_output.shape)}."
-        )
+        raise ValueError(f"reduced_output must have shape (T, H), got "
+                         f"{tuple(reduced_output.shape)}.")
     if reduced_output.dtype not in (torch.float32, torch.bfloat16):
         raise TypeError(
-            f"reduced_output must be torch.float32 or torch.bfloat16, got {reduced_output.dtype}."
-        )
+            f"reduced_output must be torch.float32 or torch.bfloat16, "
+            f"got {reduced_output.dtype}.")
     if not combine_output.is_cuda or not reduced_output.is_cuda:
         raise ValueError(
             "combine_output and reduced_output must both be CUDA tensors.")
@@ -977,9 +977,8 @@ def _validate_tensors(
     nvfp4_mode = nvfp4_sfc_scale is not None
     H = int(H_storage) * 2 if nvfp4_mode else int(H_storage)
     if reduced_output.shape != (T, H):
-        raise ValueError(
-            f"reduced_output shape must be {(T, H)}, got {tuple(reduced_output.shape)}."
-        )
+        raise ValueError(f"reduced_output shape must be {(T, H)}, got "
+                         f"{tuple(reduced_output.shape)}.")
 
     mxfp8_scale_rank = 0
     if mxfp8_scale is None and not nvfp4_mode:
@@ -994,22 +993,20 @@ def _validate_tensors(
                 "MXFP8 mode requires torch float8_e4m3fn and float8_e8m0fnu.")
         if combine_output.dtype != torch.float8_e4m3fn:
             raise TypeError(
-                f"MXFP8 combine_output must be torch.float8_e4m3fn, got {combine_output.dtype}."
-            )
+                f"MXFP8 combine_output must be torch.float8_e4m3fn, got "
+                f"{combine_output.dtype}.")
         if mxfp8_scale.dtype != torch.float8_e8m0fnu:
-            raise TypeError(
-                f"mxfp8_scale must be torch.float8_e8m0fnu, got {mxfp8_scale.dtype}."
-            )
+            raise TypeError(f"mxfp8_scale must be torch.float8_e8m0fnu, got "
+                            f"{mxfp8_scale.dtype}.")
         if reduced_output.dtype != torch.bfloat16:
-            raise TypeError(
-                f"MXFP8 reduced_output must be torch.bfloat16, got {reduced_output.dtype}."
-            )
+            raise TypeError(f"MXFP8 reduced_output must be torch.bfloat16, got "
+                            f"{reduced_output.dtype}.")
         if not mxfp8_scale.is_cuda:
             raise ValueError("mxfp8_scale must be a CUDA tensor.")
         if mxfp8_scale.device != combine_output.device:
             raise ValueError(
-                f"mxfp8_scale must be on {combine_output.device}, got {mxfp8_scale.device}."
-            )
+                f"mxfp8_scale must be on {combine_output.device}, got "
+                f"{mxfp8_scale.device}.")
         scale_cols = (H + MXFP8_SCALE_BLOCK_SIZE - 1) // MXFP8_SCALE_BLOCK_SIZE
         if mxfp8_scale.dim() == 2:
             expected_scale_shape = (T, scale_cols)
@@ -1021,30 +1018,28 @@ def _validate_tensors(
                 f"(T, K, ceil_div(H, 32)), got {tuple(mxfp8_scale.shape)}.")
         if mxfp8_scale.shape != expected_scale_shape:
             raise ValueError(
-                f"mxfp8_scale shape must be {expected_scale_shape}, got {tuple(mxfp8_scale.shape)}."
-            )
+                f"mxfp8_scale shape must be {expected_scale_shape}, got "
+                f"{tuple(mxfp8_scale.shape)}.")
         mxfp8_scale_rank = mxfp8_scale.dim()
     else:
         if not hasattr(torch, "float8_e4m3fn"):
             raise TypeError("NVFP4 mode requires torch float8_e4m3fn.")
         if combine_output.dtype != torch.uint8:
             raise TypeError(
-                f"NVFP4 combine_output must be packed torch.uint8, got {combine_output.dtype}."
-            )
+                f"NVFP4 combine_output must be packed torch.uint8, got "
+                f"{combine_output.dtype}.")
         if nvfp4_sfc_scale.dtype != torch.float8_e4m3fn:
-            raise TypeError(
-                f"nvfp4_sfc_scale must be torch.float8_e4m3fn, got {nvfp4_sfc_scale.dtype}."
-            )
+            raise TypeError(f"nvfp4_sfc_scale must be torch.float8_e4m3fn, got "
+                            f"{nvfp4_sfc_scale.dtype}.")
         if nvfp4_global_scale.dtype != torch.float32:
-            raise TypeError(
-                f"nvfp4_global_scale must be torch.float32, got {nvfp4_global_scale.dtype}."
-            )
+            raise TypeError(f"nvfp4_global_scale must be torch.float32, got "
+                            f"{nvfp4_global_scale.dtype}.")
         if not nvfp4_sfc_scale.is_cuda or not nvfp4_global_scale.is_cuda:
             raise ValueError("NVFP4 scales must be CUDA tensors.")
         if nvfp4_sfc_scale.device != combine_output.device:
             raise ValueError(
-                f"nvfp4_sfc_scale must be on {combine_output.device}, got {nvfp4_sfc_scale.device}."
-            )
+                f"nvfp4_sfc_scale must be on {combine_output.device}, got "
+                f"{nvfp4_sfc_scale.device}.")
         if nvfp4_global_scale.device != combine_output.device:
             raise ValueError(
                 f"nvfp4_global_scale must be on {combine_output.device}, got "
@@ -1060,16 +1055,15 @@ def _validate_tensors(
             raise ValueError(
                 f"nvfp4_sfc_scale shape must be {expected_sfc_shape}, got "
                 f"{tuple(nvfp4_sfc_scale.shape)}.")
-        if nvfp4_global_scale.dim(
-        ) != 3 or nvfp4_global_scale.shape != expected_global_shape:
+        if (nvfp4_global_scale.dim() != 3
+                or nvfp4_global_scale.shape != expected_global_shape):
             raise ValueError(
                 f"nvfp4_global_scale shape must be {expected_global_shape}, got "
                 f"{tuple(nvfp4_global_scale.shape)}.")
     if topk_score is not None:
         if topk_score.dim() != 2:
-            raise ValueError(
-                f"topk_score must have shape (T, K), got {tuple(topk_score.shape)}."
-            )
+            raise ValueError(f"topk_score must have shape (T, K), got "
+                             f"{tuple(topk_score.shape)}.")
         if topk_score.dtype != torch.float32:
             raise TypeError(
                 f"topk_score must be torch.float32, got {topk_score.dtype}.")
@@ -1077,12 +1071,11 @@ def _validate_tensors(
             raise ValueError("topk_score must be a CUDA tensor.")
         if topk_score.device != combine_output.device:
             raise ValueError(
-                f"topk_score must be on {combine_output.device}, got {topk_score.device}."
-            )
+                f"topk_score must be on {combine_output.device}, got "
+                f"{topk_score.device}.")
         if topk_score.shape != (T, K):
-            raise ValueError(
-                f"topk_score shape must be {(T, K)}, got {tuple(topk_score.shape)}."
-            )
+            raise ValueError(f"topk_score shape must be {(T, K)}, got "
+                             f"{tuple(topk_score.shape)}.")
     return int(T), int(K), int(H), int(mxfp8_scale_rank)
 
 
@@ -1140,8 +1133,8 @@ def compile_topk_reduce(
         topk_score) if topk_score is not None else None
     mxfp8_scale_cute = _to_cute_tensor(
         mxfp8_scale) if mxfp8_scale is not None else None
-    nvfp4_sfc_scale_cute = _to_cute_tensor(
-        nvfp4_sfc_scale) if nvfp4_sfc_scale is not None else None
+    nvfp4_sfc_scale_cute = (_to_cute_tensor(nvfp4_sfc_scale)
+                            if nvfp4_sfc_scale is not None else None)
     nvfp4_global_scale_cute = (_to_cute_tensor(nvfp4_global_scale)
                                if nvfp4_global_scale is not None else None)
     nvfp4_mode = nvfp4_sfc_scale is not None
@@ -1603,9 +1596,9 @@ def benchmark_topk_reduce_vs_torch_sum(
 
 
 def _parse_bench_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=(
-        "Benchmark CuTeDSL topk_reduce against combine_output_ref.to(torch.float32).sum(dim=1)."
-    ))
+    parser = argparse.ArgumentParser(
+        description=("Benchmark CuTeDSL topk_reduce against "
+                     "combine_output_ref.to(torch.float32).sum(dim=1)."))
     parser.add_argument("--tokens", type=int, default=192)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--hidden", type=int, default=7168)

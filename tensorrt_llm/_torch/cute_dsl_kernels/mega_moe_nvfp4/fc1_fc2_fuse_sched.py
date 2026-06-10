@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Fused fc1 + fc2 MegaMoE scheduler."""
 
 from enum import IntEnum
@@ -669,6 +671,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             cumulative_token_block_count=Int32(0),
             valid_tokens_in_tile=Int32(0),
             phase_and_peek=Int32(BlockPhase.None_),
+            fc1_counter_index=Int32(0),
         )
 
         sched_producer_group = pipeline.CooperativeGroup(
@@ -1193,6 +1196,10 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             tile_m_idx = cta_token_block_idx
             tile_n_idx = cta_intermediate_or_hidden_block_idx
 
+        # fc1_counter_index: intra-expert token-block index.
+        fc1_counter_index = tile_n_idx if const_expr(
+            params.is_swap_ab) else cluster_token_block_idx
+
         # ext.enrich_work_tile_info may OR the peek bit into phase_and_peek.
         return self._ext.WorkTileInfo(
             expert_idx=state.current_expert_idx,
@@ -1203,6 +1210,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             cumulative_token_block_count=state.current_token_block_cumul,
             valid_tokens_in_tile=valid_tokens_in_tile,
             phase_and_peek=state.current_phase,
+            fc1_counter_index=fc1_counter_index,
         )
 
     @dsl_user_op
@@ -1227,6 +1235,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             cumulative_token_block_count=Int32(0),
             valid_tokens_in_tile=Int32(0),
             phase_and_peek=Int32(BlockPhase.None_),
+            fc1_counter_index=Int32(0),
         )
 
         # DSL carry for mutated self and while-condition fields.
