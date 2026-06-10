@@ -63,7 +63,8 @@ install_ubuntu_requirements() {
       apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
     fi
 
-    CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
+    CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
     NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
     apt-get install -y --no-install-recommends \
@@ -72,8 +73,8 @@ install_ubuntu_requirements() {
         libcudnn9-headers-cuda-13=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
-        libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
-        libcublas-dev-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
+        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
+        libcublas${CUBLAS_MAJOR_VER}-dev-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
         cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
 
     apt-get clean
@@ -82,6 +83,8 @@ install_ubuntu_requirements() {
 
 install_rockylinux_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
+    CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
 
     ARCH=$(uname -m)
     if [ "$ARCH" = "x86_64" ];then ARCH1="x86_64" && ARCH2="x64" && ARCH3=$ARCH1;fi
@@ -95,8 +98,8 @@ install_rockylinux_requirements() {
         "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
-        "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
-        "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
+        "libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}" \
+        "libcublas${CUBLAS_MAJOR_VER}-devel-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}"; do
         wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
@@ -111,8 +114,8 @@ install_rockylinux_requirements() {
         cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
-        libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm \
-        libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm
+        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}.rpm \
+        libcublas${CUBLAS_MAJOR_VER}-devel-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}.rpm
 
     # Clean up
     rm -f *.rpm
