@@ -5830,86 +5830,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # caller passes peak runtime N so the captured kernel selects
             # the large-N (T=1024, V=256) variant instead of the
             # capture-time-small-N variant.
-            N_dec = max_seq_len if max_seq_len is not None else logits.shape[1]
+            N_row = max_seq_len if max_seq_len is not None else logits.shape[1]
             num_sms = _get_num_sms()
 
-            # Production tuning knobs (fixed across shapes).
-            enable_unroll_4 = True
-            enable_phase3_unroll = True
-            use_constant_hint = False
-
-            # ---- T (num_threads_per_block) + V (use_256bit_load) ----
-            # T=1024 only when grid fits 1 CTA/SM and each thread has
-            # enough vec-loop work (N >= 65536). For half-prec under
-            # graph capture, raise the bar to 131072 so a small capture-N
-            # never forces T=1024 onto small-N replays (~14-16% regression).
-            if max_seq_len is not None and logits.dtype != torch.float32:
-                n_thresh_t = 131072
-            else:
-                n_thresh_t = 65536
-            num_threads_per_block = (1024 if (num_rows <= num_sms
-                                              and N_dec >= n_thresh_t) else 512)
-            # V=256-bit only for fp32 above N=16K. Half-prec cvt-to-fp32
-            # doubles fragment reg footprint and regresses 5-11% on K=512/1024.
-            # Caller contract: when this fires, ``logits.data_ptr()`` must
-            # be 32-byte aligned (satisfied by torch.empty() and row slices;
-            # column slices / stride-padded layouts may violate it).
-            use_256bit_load = (logits.dtype == torch.float32 and N_dec >= 16384)
-            if use_256bit_load:
-                ptr = logits.data_ptr()
-                assert ptr % 32 == 0, (
-                    f"use_256bit_load=True requires 32B-aligned "
-                    f"logits.data_ptr(), got {ptr} % 32 = {ptr % 32}. "
-                    f"Pass a contiguous tensor (column slices / stride-"
-                    f"padded layouts violate alignment).")
-            # Warp-parallel reduce only pays off at 32-warp (T=1024); at
-            # 16-warp (T=512) it costs ~2pp on synth data.
-            enable_warp_parallel_reduce = num_threads_per_block == 1024
-
-            # ---- min_blocks_per_mp (ptxas __launch_bounds cap) ----
-            # Reg-vs-occupancy 3-tier heuristic. Tier-3 ordering differs
-            # by dtype: half-prec puts tier-3 first (cvt-ILP fits in 40
-            # regs, extra CTA/SM hides cvt latency); fp32 keeps tier-0
-            # first (4-LDG ILP wants ~70 regs, mb=2 cap=64 caps ILP).
-            vec_bits_host = 256 if use_256bit_load else 128
-            vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32
-                                           else 16)
-            n_vec_iters = max(1, N_dec // (num_threads_per_block * vec_w_host))
-            is_fp32 = logits.dtype == torch.float32
-            if is_fp32:
-                if n_vec_iters < 4:
-                    min_blocks_per_mp = 0
-                elif num_rows <= num_sms:
-                    min_blocks_per_mp = 1
-                elif (num_sms * 2 < num_rows <= num_sms * 3 and N_dec <= 32768):
-                    # Wave-fit + latency-bound: mb=3 caps each CTA to fit
-                    # all num_rows CTAs in a single wave. At N>=65K the
-                    # kernel becomes bandwidth-bound and mb=2 wins.
-                    min_blocks_per_mp = 3
-                else:
-                    min_blocks_per_mp = 2
-            else:
-                if num_rows > num_sms:
-                    min_blocks_per_mp = 3
-                elif n_vec_iters < 4:
-                    min_blocks_per_mp = 0
-                else:
-                    min_blocks_per_mp = 1
-
-            # ---- cluster_size auto-dispatch ----
-            # Synth-bundle sweep (commit 513890fee1) on B200 SXM5 picks
-            # the cluster size by (N, BS):
-            #   N < 65K              -> 1 (cluster sync overhead unrecouped)
-            #   BS * cs > num_sms    -> 1 (multi-wave perf regression, 1.5-3.6x slower than V5)
-            #   N >= 65K, BS <= 16,
-            #     BS*4 <= num_sms    -> 4 (single-wave, up to 42% win)
-            #   N >= 65K, BS*2 <= num_sms -> 2
-            #   else                 -> 1
+            # ---- cluster_size auto-dispatch (must run first) ----
+            # The cluster decision uses the FULL row length (cluster only
+            # pays for itself when the row is large enough to recoup the
+            # cluster sync + DSMEM gather overhead). Tuning on synth-data
+            # bundles (B200 SXM5, synth_comprehensive sweep 2026-06-10):
+            #   N < 64K              -> 1 (cluster sync unrecouped)
+            #   N >= 128K, BS <= 4   -> 8 (large N + tiny grid → 8-way
+            #                              parallel fits + wins up to 1.84x)
+            #   BS * 4 <= num_sms    -> 4 (single-wave for cs=4)
+            #   BS * 2 <= num_sms    -> 2 (single-wave for cs=2)
+            #   else                 -> 1 (multi-wave for any cs > 1 loses)
             # Caller can pin a value (1..16); auto only when None.
             if cluster_size is None:
-                if N_dec < 65536:
+                if N_row < 65536:
                     cluster_size = 1
-                elif num_rows <= 16 and num_rows * 4 <= num_sms:
+                elif num_rows <= 4 and N_row >= 131072:
+                    cluster_size = 8
+                elif num_rows * 4 <= num_sms:
                     cluster_size = 4
                 elif num_rows * 2 <= num_sms:
                     cluster_size = 2
@@ -5931,6 +5872,81 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         key="cute_dsl_gvr_topk_decode_cluster_clamp",
                     )
                     cluster_size = hw_max_cluster
+
+            # Per-CTA effective scan length. With cluster_size > 1 each
+            # CTA only scans ``N_row // cluster_size`` of the row, so
+            # T / V / min_blocks heuristics below compare against the
+            # per-CTA work rather than the full row.
+            N_per_cta = N_row // cluster_size
+
+            # Production tuning knobs (fixed across shapes).
+            enable_unroll_4 = True
+            enable_phase3_unroll = True
+            use_constant_hint = False
+
+            # ---- T (num_threads_per_block) + V (use_256bit_load) ----
+            # T=1024 only when grid fits 1 CTA/SM and each thread has
+            # enough per-CTA vec-loop work (N_per_cta >= 65536). For
+            # half-prec under graph capture, raise the bar to 131072 so
+            # a small capture-N never forces T=1024 onto small-N replays
+            # (~14-16% regression).
+            if max_seq_len is not None and logits.dtype != torch.float32:
+                n_thresh_t = 131072
+            else:
+                n_thresh_t = 65536
+            num_threads_per_block = (1024 if
+                                     (num_rows <= num_sms
+                                      and N_per_cta >= n_thresh_t) else 512)
+            # V=256-bit only for fp32 above N=16K (per-CTA). Half-prec
+            # cvt-to-fp32 doubles fragment reg footprint and regresses
+            # 5-11% on K=512/1024. Caller contract: when this fires,
+            # ``logits.data_ptr()`` must be 32-byte aligned (satisfied by
+            # torch.empty() and row slices; column slices / stride-padded
+            # layouts may violate it).
+            use_256bit_load = (logits.dtype == torch.float32
+                               and N_per_cta >= 16384)
+            if use_256bit_load:
+                ptr = logits.data_ptr()
+                assert ptr % 32 == 0, (
+                    f"use_256bit_load=True requires 32B-aligned "
+                    f"logits.data_ptr(), got {ptr} % 32 = {ptr % 32}. "
+                    f"Pass a contiguous tensor (column slices / stride-"
+                    f"padded layouts violate alignment).")
+            # Warp-parallel reduce only pays off at 32-warp (T=1024); at
+            # 16-warp (T=512) it costs ~2pp on synth data.
+            enable_warp_parallel_reduce = num_threads_per_block == 1024
+
+            # ---- min_blocks_per_mp (ptxas __launch_bounds cap) ----
+            # Reg-vs-occupancy 3-tier heuristic. Tier-3 ordering differs
+            # by dtype: half-prec puts tier-3 first (cvt-ILP fits in 40
+            # regs, extra CTA/SM hides cvt latency); fp32 keeps tier-0
+            # first (4-LDG ILP wants ~70 regs, mb=2 cap=64 caps ILP).
+            vec_bits_host = 256 if use_256bit_load else 128
+            vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32
+                                           else 16)
+            n_vec_iters = max(1,
+                              N_per_cta // (num_threads_per_block * vec_w_host))
+            is_fp32 = logits.dtype == torch.float32
+            if is_fp32:
+                if n_vec_iters < 4:
+                    min_blocks_per_mp = 0
+                elif num_rows <= num_sms:
+                    min_blocks_per_mp = 1
+                elif (num_sms * 2 < num_rows <= num_sms * 3
+                      and N_per_cta <= 32768):
+                    # Wave-fit + latency-bound: mb=3 caps each CTA to fit
+                    # all num_rows CTAs in a single wave. At N>=65K the
+                    # kernel becomes bandwidth-bound and mb=2 wins.
+                    min_blocks_per_mp = 3
+                else:
+                    min_blocks_per_mp = 2
+            else:
+                if num_rows > num_sms:
+                    min_blocks_per_mp = 3
+                elif n_vec_iters < 4:
+                    min_blocks_per_mp = 0
+                else:
+                    min_blocks_per_mp = 1
 
             cls._compile(
                 cute_dtype,
