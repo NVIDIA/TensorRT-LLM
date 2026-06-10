@@ -356,6 +356,9 @@ def generate_disagg_config_schema() -> dict[str, Any]:
             "urls, and router."
         ),
     }
+    # server_block_properties was cloned before _add_schema_metadata runs, so
+    # the env_overrides widening must be applied to the block explicitly.
+    _widen_env_overrides(defs["DisaggServerBlock"])
 
     properties = schema["properties"]
     # The disagg orchestrator accepts pytorch and _autodeploy backends; TRT is
@@ -406,6 +409,8 @@ def generate_disagg_config_schema() -> dict[str, Any]:
     }
     properties["node_id"] = {
         "type": ["integer", "null"],
+        "minimum": 0,
+        "maximum": 1023,
         "default": None,
         "description": (
             "Node id for this orchestrator. Auto-derived from the host MAC "

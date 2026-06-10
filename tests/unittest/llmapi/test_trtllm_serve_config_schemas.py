@@ -247,6 +247,33 @@ def test_disagg_config_schema_rejects_bad_schedule_style(disagg_config_validator
         disagg_config_validator.validate({"schedule_style": "round_robin"})
 
 
+def test_disagg_config_schema_accepts_unquoted_env_overrides_in_server_block(
+    disagg_config_validator,
+):
+    # The same runtime str-coercion that applies to a worker config applies to
+    # env_overrides inside context_servers / generation_servers blocks.
+    disagg_config_validator.validate(
+        {
+            "env_overrides": {"TRTLLM_ENABLE_PDL": 1},
+            "context_servers": {
+                "env_overrides": {"TRTLLM_ENABLE_PDL": 1, "SOME_FLAG": True},
+                "urls": ["localhost:8001"],
+            },
+            "generation_servers": {"urls": ["localhost:8002"]},
+        }
+    )
+
+
+def test_disagg_config_schema_enforces_node_id_bounds(disagg_config_validator):
+    disagg_config_validator.validate({"node_id": 0})
+    disagg_config_validator.validate({"node_id": 1023})
+    disagg_config_validator.validate({"node_id": None})
+    with pytest.raises(ValidationError):
+        disagg_config_validator.validate({"node_id": 1024})
+    with pytest.raises(ValidationError):
+        disagg_config_validator.validate({"node_id": -1})
+
+
 @pytest.mark.parametrize(
     "config_path",
     ALL_DISAGG_CONFIGS,
@@ -284,7 +311,7 @@ def test_visual_gen_config_schema_rejects_nested_typo(visual_gen_config_validato
 
 
 def _load_schema_assets_extension():
-    extension_path = REPO_ROOT / "docs" / "source" / "_ext" / ("trtllm_schema_assets.py")
+    extension_path = REPO_ROOT / "docs" / "source" / "_ext" / "trtllm_schema_assets.py"
     return _load_module("trtllm_schema_assets", extension_path)
 
 
