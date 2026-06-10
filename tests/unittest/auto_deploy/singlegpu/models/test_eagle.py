@@ -18,6 +18,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, Dict
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -268,6 +269,79 @@ def test_eagle_wrapper_sa_override_updates_next_new_tokens():
         fake_sa_enhancer.seen_draft_tokens,
         torch.tensor([[5, 6]], dtype=torch.int32),
     )
+
+
+def test_eagle_wrapper_sa_override_noop_without_manager():
+    """SA override must no-op when sa_manager is None even though sa_enhancer is set.
+
+    This is the KV-cache resize-transform flow: the resize runs forward before the executor's
+    resource managers exist, so it passes sa_manager=None. It guards the class-docstring invariant
+    that the two guards (sa_enhancer is not None AND sa_manager is not None) are not redundant --
+    collapsing them to a single sa_enhancer check would wrongly fire SA here.
+    """
+
+    class FakeSAEnhancer:
+        def maybe_override_all_draft_tokens(self, draft_tokens):
+            raise AssertionError("SA override must not run when sa_manager is None")
+
+    wrapper = EagleWrapper(
+        EagleWrapperConfig(
+            max_draft_len=2,
+            load_embedding_from_target=True,
+            load_lm_head_from_target=True,
+        ),
+        target_model=torch.nn.Module(),
+        draft_model=torch.nn.Module(),
+    )
+    wrapper.sa_enhancer = FakeSAEnhancer()
+    next_new_tokens = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    original = next_new_tokens.clone()
+
+    wrapper._maybe_apply_sa_draft_override(next_new_tokens, num_prefill=1, sa_manager=None)
+
+    torch.testing.assert_close(next_new_tokens, original)
+
+
+def test_eagle_wrapper_forward_unpacks_spec_dec_args():
+    """forward() routes spec-dec inputs through SpeculativeDecodingModelArgs.
+
+    The struct is the executor->model contract: forward must unpack it and call the cached
+    path with the struct's cache_seq_interface and sa_manager. With no struct (export time),
+    it must fall back to the prefill-only path.
+    """
+    from tensorrt_llm._torch.auto_deploy.shim.interface import SpeculativeDecodingModelArgs
+
+    wrapper = EagleWrapper(
+        EagleWrapperConfig(
+            max_draft_len=2,
+            load_embedding_from_target=True,
+            load_lm_head_from_target=True,
+        ),
+        target_model=torch.nn.Module(),
+        draft_model=torch.nn.Module(),
+    )
+
+    csi = object()
+    sa_manager = object()
+    with (
+        patch.object(wrapper, "_forward_with_kv_cache") as mock_cached,
+        patch.object(wrapper, "_forward_prefill_only") as mock_prefill,
+    ):
+        wrapper.forward(
+            spec_dec_args=SpeculativeDecodingModelArgs(
+                cache_seq_interface=csi, sa_manager=sa_manager
+            )
+        )
+        mock_cached.assert_called_once_with(csi, sa_manager=sa_manager)
+        mock_prefill.assert_not_called()
+
+    with (
+        patch.object(wrapper, "_forward_with_kv_cache") as mock_cached,
+        patch.object(wrapper, "_forward_prefill_only") as mock_prefill,
+    ):
+        wrapper.forward(input_ids="tokens", position_ids="pos")
+        mock_prefill.assert_called_once_with(input_ids="tokens", position_ids="pos")
+        mock_cached.assert_not_called()
 
 
 @pytest.fixture

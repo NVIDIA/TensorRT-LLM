@@ -255,8 +255,8 @@ class TestSpeculativeConfigValidation:
             eagle3_one_model=True,
             sa_config=SAEnhancerConfig(),
         )
-        # Should not raise.
-        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        # SA requires an explicit max_seq_len; should not raise.
+        args = LlmArgs(model="test-model", max_seq_len=8192, speculative_config=spec_config)
         assert args.model_factory == "eagle_one_model"
 
     def test_accepts_mtp_eagle_one_model(self):
@@ -312,14 +312,28 @@ class TestSpeculativeConfigValidation:
             mtp_eagle_one_model=True,
             sa_config=SAEnhancerConfig(),
         )
-        # Should not raise.
-        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        # SA requires an explicit max_seq_len; should not raise.
+        args = LlmArgs(model="test-model", max_seq_len=8192, speculative_config=spec_config)
         assert args.model_factory == "eagle_one_model"
+
+    def test_rejects_sa_enhancer_without_max_seq_len(self):
+        from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
+
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+            sa_config=SAEnhancerConfig(),
+        )
+        # SA sizes its GPU workspace from max_seq_len and is built before the factory can infer
+        # it, so an unset max_seq_len must be rejected (not silently sized from None).
+        with pytest.raises(ValueError):
+            LlmArgs(model="test-model", speculative_config=spec_config)
 
     def test_rejects_standalone_sa(self):
         from tensorrt_llm.llmapi import SADecodingConfig
 
-        with pytest.raises(ValueError, match="Speculation type SA does not support backend"):
+        with pytest.raises(ValueError, match=r"Speculation type SA"):
             LlmArgs(
                 model="test-model",
                 speculative_config=SADecodingConfig(max_draft_len=3),

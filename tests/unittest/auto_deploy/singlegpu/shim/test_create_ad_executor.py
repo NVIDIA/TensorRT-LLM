@@ -184,6 +184,14 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
     mock_engine.cache_seq_interface.kv_cache_config_tuned = SimpleNamespace(tokens_per_block=64)
     mock_sa_manager = Mock()
 
+    def _assert_workspace_reserved_before_build(*args, **kwargs):
+        # Resize accounting depends on the SA workspace being reserved BEFORE the engine builds
+        # (the build runs the KV-cache resize). Asserting from build_from_config's side_effect pins
+        # the ordering: the eager empty-batch prepare() must already have run by the time the engine
+        # is built. A plain assert_called_once after the call would not catch a reordering.
+        mock_sa_manager.prepare.assert_called_once_with([], spec_config.max_draft_len)
+        return mock_engine
+
     with (
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.mpi_world_size", return_value=1),
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.mpi_rank", return_value=0),
@@ -192,8 +200,8 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.torch.cuda.set_device"),
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config",
-            return_value=mock_engine,
-        ),
+            side_effect=_assert_workspace_reserved_before_build,
+        ) as build_from_config_mock,
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.SuffixAutomatonManager",
             return_value=mock_sa_manager,
@@ -216,3 +224,7 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
         result.resource_manager.get_resource_manager(ResourceManagerType.SPEC_RESOURCE_MANAGER)
         is mock_sa_manager
     )
+    # The SAManager is created up front and handed to the engine at build time (rather than
+    # lazily fetched from the resource managers during prepare_inputs). The eager workspace
+    # reservation and its before-build ordering are asserted in the side_effect above.
+    assert build_from_config_mock.call_args.kwargs["sa_manager"] is mock_sa_manager

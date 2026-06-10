@@ -236,6 +236,8 @@ def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
     experiment_config["args"]["disable_overlap_scheduler"] = True
     experiment_config["args"]["compile_backend"] = "torch-simple"
     experiment_config["args"]["max_num_tokens"] = 256
+    # SA enhancer requires an explicit max_seq_len (it sizes the suffix-automaton workspace).
+    experiment_config["args"]["max_seq_len"] = 2048
     experiment_config["prompt"]["batch_size"] = 1
     experiment_config["prompt"]["queries"] = test_prompt
 

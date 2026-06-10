@@ -15,7 +15,8 @@
 
 import copy
 import functools
-from typing import Callable, Dict, List, Optional, Tuple, Union, final
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union, final
 
 import torch
 import torch.nn as nn
@@ -69,6 +70,9 @@ from ..distributed.common import all_gather_object, get_world_size
 from ..distributed.common import is_initialized as is_distributed_initialized
 from ..utils.cuda_mem_tracker import bytes_to, get_mem_info
 from ..utils.logger import ad_logger
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.speculative.suffix_automaton import SuffixAutomatonManager
 
 
 def with_pre_callback(method, callback):
@@ -1359,3 +1363,26 @@ class CachedSequenceInterface:
 
 
 GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
+
+
+@dataclass
+class SpeculativeDecodingModelArgs:
+    """Runtime objects a speculative-decoding model's ``forward`` needs that are not graph tensors.
+
+    The executor (:class:`tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine`) and the
+    KV-cache resize transform bundle these into a single object and pass it to the spec-dec
+    model's ``forward`` instead of threading them through as loose keyword arguments. This keeps
+    the executor->model contract explicit and self-documenting. Non-speculative models never
+    receive this object; they are still invoked with just ``cache_seq_interface.named_args``.
+
+    Attributes:
+        cache_seq_interface: Per-iteration sequence and KV-cache state. Always present whenever a
+            spec-dec model forward runs with caches (inference and the resize transform).
+        sa_manager: Suffix-automaton manager backing the SA draft enhancer. Owned by the
+            ``PyExecutor`` resource managers, not by the engine. Set only when SA enhancement is
+            enabled (``spec_config.sa_config`` is not ``None``) and the managers exist; ``None``
+            otherwise (e.g. the resize transform, or non-SA speculation).
+    """
+
+    cache_seq_interface: CachedSequenceInterface
+    sa_manager: Optional["SuffixAutomatonManager"] = None

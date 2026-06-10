@@ -59,7 +59,7 @@ from ...custom_ops.attention_interface import (
 )
 from ...custom_ops.semantic_mask_registry import SemanticMaskRegistry
 from ...models.factory import ModelFactory
-from ...shim.interface import CachedSequenceInterface
+from ...shim.interface import CachedSequenceInterface, SpeculativeDecodingModelArgs
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info
 from ...utils.logger import ad_logger
@@ -776,7 +776,12 @@ class ResizeKVCache(BaseTransform):
         cm.info.set_max_num_tokens_sample()
         try:
             if cm._spec_config is not None:
-                mod(**cm.named_args, cache_seq_interface=cm)
+                # Resize runs before the executor's resource managers exist, so there is no
+                # SAManager yet; spec_dec_args.sa_manager stays None and SA enhancement no-ops.
+                mod(
+                    **cm.named_args,
+                    spec_dec_args=SpeculativeDecodingModelArgs(cache_seq_interface=cm),
+                )
             else:
                 mod(**cm.named_args)
         except torch.OutOfMemoryError as e:
