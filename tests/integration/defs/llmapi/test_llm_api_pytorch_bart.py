@@ -64,6 +64,7 @@ def _test_case(
     exact_match: bool,
     feature_id: str,
     marks=(),
+    kv_cache_dtype: str = "auto",
 ):
     expected_output_token_ids = [_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS] if num_beams == 1 else None
     assert not exact_match or expected_output_token_ids is not None
@@ -76,6 +77,7 @@ def _test_case(
         num_beams,
         num_return_sequences,
         exact_match,
+        kv_cache_dtype,
         id=f"{feature_id}-{_MODEL_NAME}",
         marks=marks,
     )
@@ -129,6 +131,27 @@ _TRTLLM_GEN_TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="trtllm-gen-bf16-kv-v1-cuda-graph-off-greedy",
+        marks=skip_pre_blackwell,
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        feature_id="trtllm-gen-bf16-kv-v1-cuda-graph-off-beam2",
+        marks=skip_pre_blackwell,
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        kv_cache_dtype="fp8",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=False,
+        feature_id="trtllm-gen-bf16-fp8kv-kv-v1-cuda-graph-off-greedy",
         marks=skip_pre_blackwell,
     ),
 ]
@@ -277,6 +300,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    kv_cache_dtype: str = "auto",
 ) -> None:
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
@@ -285,7 +309,8 @@ def _run_bart_pytorch_generate_encoder_decoder(
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     case_id = (
         f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
-        f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}"
+        f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}, "
+        f"kv_dtype={kv_cache_dtype}"
     )
     sampling_params = _sampling_params(num_beams, num_return_sequences)
 
@@ -303,6 +328,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
             free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            dtype=kv_cache_dtype,
         ),
         max_batch_size=1,
         max_beam_width=num_beams,
@@ -332,7 +358,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
 
 @pytest.mark.parametrize(
     "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,kv_cache_dtype",
     _TEST_CASES,
 )
 def test_bart_pytorch_generate_encoder_decoder_end_to_end(
@@ -344,6 +370,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    kv_cache_dtype: str,
 ) -> None:
     _run_bart_pytorch_generate_encoder_decoder(
         monkeypatch,
@@ -354,12 +381,13 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
         num_beams,
         num_return_sequences,
         exact_match,
+        kv_cache_dtype,
     )
 
 
 @pytest.mark.parametrize(
     "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,kv_cache_dtype",
     _TRTLLM_GEN_TEST_CASES,
 )
 def test_bart_pytorch_generate_encoder_decoder_trtllm_gen_attention(
@@ -371,6 +399,7 @@ def test_bart_pytorch_generate_encoder_decoder_trtllm_gen_attention(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    kv_cache_dtype: str,
 ) -> None:
     _enable_trtllm_gen_attention(monkeypatch)
     _run_bart_pytorch_generate_encoder_decoder(
@@ -382,6 +411,7 @@ def test_bart_pytorch_generate_encoder_decoder_trtllm_gen_attention(
         num_beams,
         num_return_sequences,
         exact_match,
+        kv_cache_dtype,
     )
 
 

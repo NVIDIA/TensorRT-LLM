@@ -224,17 +224,17 @@ class T5Attention(Attention):
 
     When ``position_bias`` is provided (from a ``T5RelativePositionBias``
     module living on layer 0), it is added to the QK^T scores before
-    softmax.  Without a KV cache the module computes SDPA directly
-    (bypassing the VANILLA backend's ``flash_attn_varlen_func`` which
-    cannot accept an additive bias).  With a KV cache it passes the learned
-    relative-attention table to the TRTLLM backend.
+    softmax. T5 self-attention requires the TRTLLM backend so the relative
+    bias can be routed through the attention backend. Without a KV cache, this
+    module passes a precomputed dense relative bias as explicit attention bias.
+    With a KV cache, decoder attention passes the learned relative-attention
+    table to the TRTLLM backend.
     """
 
     def __init__(
         self,
         model_config: ModelConfig[T5Config],
         layer_idx: Optional[int] = None,
-        is_decoder: bool = True,
     ):
         config = model_config.pretrained_config
         num_heads = config.num_heads
@@ -254,36 +254,10 @@ class T5Attention(Attention):
             q_scaling=_t5_q_scaling(config),
             head_dim=_t5_head_dim(config),
         )
-        self._is_decoder = is_decoder
-        self._head_dim = _t5_head_dim(config)
 
     def apply_rope(self, q, k, v, position_ids):
         """T5 has no RoPE — pass through unchanged."""
         return q, k, v
-
-    def _split_qkv(
-        self,
-        hidden_states: torch.Tensor,
-        num_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qkv = self.qkv_proj(hidden_states)
-        q_size = self.num_heads * self._head_dim
-        kv_size = self.num_key_value_heads * self._head_dim
-        q, k, v = qkv[:num_tokens].split([q_size, kv_size, kv_size], dim=-1)
-
-        q = q.view(-1, self.num_heads, self._head_dim)
-        k = k.view(-1, self.num_key_value_heads, self._head_dim)
-        v = v.view(-1, self.num_key_value_heads, self._head_dim)
-        return q, k, v
-
-    @staticmethod
-    def _slice_position_bias(
-        position_bias: torch.Tensor,
-        query_length: int,
-        key_length: int,
-    ) -> torch.Tensor:
-        query_start = key_length - query_length
-        return position_bias[:, :, query_start:key_length, :key_length].squeeze(0)
 
     def _local_position_bias(
         self,
@@ -336,70 +310,43 @@ class T5Attention(Attention):
         relative_attention_max_distance: int = 0,
         **kwargs,
     ) -> torch.Tensor:
-        if position_bias is None and relative_attention_bias is None:
-            return super().forward(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                attention_mask=attention_mask,
-                **kwargs,
+        if self.attn_backend != "TRTLLM":
+            raise ValueError(
+                "T5 self-attention with relative position bias requires "
+                f"attn_backend='TRTLLM'. Current backend: {self.attn_backend}."
             )
 
-        assert attn_metadata is not None
-        assert hidden_states is not None
-        if attn_metadata.kv_cache_manager is not None:
+        forward_kwargs = dict(kwargs)
+        if attn_metadata is not None and attn_metadata.kv_cache_manager is not None:
             if relative_attention_bias is None:
                 raise ValueError("Cached T5 attention requires a relative attention bias table.")
+            assert hidden_states is not None
             relative_attention_bias = self._local_relative_attention_bias(
                 relative_attention_bias,
                 hidden_states,
             )
-            return super().forward(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                attention_mask=attention_mask,
-                relative_attention_bias=relative_attention_bias,
-                relative_attention_max_distance=relative_attention_max_distance,
-                **kwargs,
+        elif position_bias is not None:
+            assert hidden_states is not None
+            position_bias = self._local_position_bias(position_bias, hidden_states)
+            relative_attention_bias = position_bias.squeeze(0).contiguous()
+            relative_attention_max_distance = 0
+            forward_kwargs["attention_window_size"] = relative_attention_bias.shape[-1]
+        elif relative_attention_bias is not None:
+            assert hidden_states is not None
+            relative_attention_bias = self._local_relative_attention_bias(
+                relative_attention_bias,
+                hidden_states,
             )
 
-        # Manual SDPA with additive position bias (no-KV-cache path).
-        assert position_bias is not None
-        position_bias = self._local_position_bias(position_bias, hidden_states)
-        num_tokens = attn_metadata.num_tokens
-        q, k, v = self._split_qkv(hidden_states, num_tokens)
-
-        # Per-request SDPA with position bias applied to each request's scores.
-        seq_lens = attn_metadata.seq_lens
-        offset = 0
-        outputs = []
-        for seq_len in seq_lens:
-            sl = int(seq_len)
-            q_s = q[offset : offset + sl].transpose(0, 1)  # (H, S, D)
-            k_s = k[offset : offset + sl].transpose(0, 1)
-            v_s = v[offset : offset + sl].transpose(0, 1)
-
-            scores = torch.matmul(q_s, k_s.transpose(-2, -1))
-            # position_bias: (1, H, qlen, klen) — slice to this request's lengths
-            scores = scores + self._slice_position_bias(position_bias, sl, sl)
-
-            if self._is_decoder:
-                causal_mask = torch.triu(
-                    torch.full((sl, sl), float("-inf"), device=scores.device, dtype=scores.dtype),
-                    diagonal=1,
-                )
-                scores = scores + causal_mask
-
-            attn_weights = F.softmax(scores.float(), dim=-1).to(q.dtype)
-            out = torch.matmul(attn_weights, v_s)  # (H, S, D)
-            outputs.append(out.transpose(0, 1))  # (S, H, D)
-            offset += sl
-
-        attn_output = torch.cat(outputs, dim=0)  # (T, H, D)
-        attn_output = attn_output.reshape(num_tokens, -1)
-        attn_output = self.o_proj(attn_output)
-        return attn_output
+        return super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_mask=attention_mask,
+            relative_attention_bias=relative_attention_bias,
+            relative_attention_max_distance=relative_attention_max_distance,
+            **forward_kwargs,
+        )
 
 
 class T5CrossAttention(CrossAttention):
@@ -450,7 +397,7 @@ class T5EncoderLayer(nn.Module):
 
         act_fn = _t5_gated_act_fn(config) if is_gated else _t5_dense_act_fn(config)
 
-        self.self_attn = T5Attention(model_config, layer_idx=layer_idx, is_decoder=False)
+        self.self_attn = T5Attention(model_config, layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(
             hidden_size=hidden_size,
@@ -536,7 +483,7 @@ class T5DecoderLayer(nn.Module):
 
         act_fn = _t5_gated_act_fn(config) if is_gated else _t5_dense_act_fn(config)
 
-        self.self_attn = T5Attention(model_config, layer_idx=layer_idx, is_decoder=True)
+        self.self_attn = T5Attention(model_config, layer_idx=layer_idx)
 
         self.cross_attn = T5CrossAttention(model_config, layer_idx=layer_idx)
 
@@ -664,7 +611,12 @@ class T5Encoder(nn.Module):
         attn_metadata: AttentionMetadata,
         position_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
-        seq_len = hidden_states.shape[0]
+        max_context_q_len_override = getattr(attn_metadata, "max_context_q_len_override", None)
+        if max_context_q_len_override is not None:
+            seq_len = int(max_context_q_len_override)
+        else:
+            seq_lens = attn_metadata.seq_lens
+            seq_len = hidden_states.shape[0] if seq_lens is None else int(seq_lens.max().item())
         position_bias = self.relative_position_bias(seq_len, seq_len, hidden_states.device)
 
         for layer in self.layers:

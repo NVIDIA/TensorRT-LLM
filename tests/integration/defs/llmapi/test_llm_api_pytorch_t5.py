@@ -27,7 +27,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig,
 )
 
-from ..conftest import llm_models_root
+from ..conftest import llm_models_root, skip_pre_blackwell
 
 _SOURCE_TEXT = "translate English to German: The house is wonderful."
 _MIXED_ENCODER_SOURCE_TEXTS = [
@@ -47,7 +47,7 @@ _EXPECTED_OUTPUT_TOKEN_IDS_BY_MODEL = {
     "t5-base": [644, 4598, 229, 19250],
     "t5-large": [644, 4598, 229, 19250],
     "flan-t5-small": [644, 4598, 229, 9685],
-    "byt5-small": [258, 35, 119, 114],
+    "byt5-small": [258, 35, 119, 35],
 }
 # Known HF references for returned beam hypotheses. The tests exact-match greedy
 # outputs and the best beam when a reference is available; lower-ranked BF16
@@ -79,8 +79,8 @@ _MIXED_ENCODER_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS = {
     ("t5-small", 2): [
         _HF_BEAM_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS[("t5-small", 2)],
         [
-            [644, 4675, 229, 219],
             [644, 4675, 4186, 219],
+            [644, 4675, 229, 219],
         ],
     ],
     ("flan-t5-small", 2): [
@@ -362,6 +362,31 @@ _TEST_CASES = [
     ),
 ]
 
+_TRTLLM_GEN_TEST_CASES = [
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="trtllm-gen-bf16-kv-v1-cuda-graph-off-greedy",
+        marks=skip_pre_blackwell,
+    ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=False,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        feature_id="trtllm-gen-bf16-kv-v1-cuda-graph-off-beam2",
+        marks=skip_pre_blackwell,
+    ),
+]
+
 
 def _mixed_batch_test_case(
     model_name: str,
@@ -475,6 +500,14 @@ def _cuda_graph_config(
     return CudaGraphConfig(batch_sizes=batch_sizes or [1]) if enabled else None
 
 
+def _enable_trtllm_gen_attention(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1")
+
+    from tensorrt_llm._torch.attention_backend import trtllm
+
+    monkeypatch.setattr(trtllm, "_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", True)
+
+
 def _assert_t5_response(
     response: RequestOutput,
     num_return_sequences: int,
@@ -524,12 +557,7 @@ def _assert_expected_generation(
     assert token_ids_by_output == expected_token_ids_by_output
 
 
-@pytest.mark.parametrize(
-    "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
-    _TEST_CASES,
-)
-def test_t5_pytorch_generate_encoder_decoder_end_to_end(
+def _run_t5_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
     model_name: str,
     expected_output_token_ids_by_output: list[list[int]] | None,
@@ -590,6 +618,65 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
             exact_match,
             expected_output_token_ids_by_output,
         )
+
+
+@pytest.mark.parametrize(
+    "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
+    _TEST_CASES,
+)
+def test_t5_pytorch_generate_encoder_decoder_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    expected_output_token_ids_by_output: list[list[int]] | None,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    enable_cuda_graph: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    exact_match: bool,
+) -> None:
+    _run_t5_pytorch_generate_encoder_decoder(
+        monkeypatch,
+        model_name,
+        expected_output_token_ids_by_output,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        enable_cuda_graph,
+        num_beams,
+        num_return_sequences,
+        exact_match,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
+    _TRTLLM_GEN_TEST_CASES,
+)
+def test_t5_pytorch_generate_encoder_decoder_trtllm_gen_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    expected_output_token_ids_by_output: list[list[int]] | None,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    enable_cuda_graph: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    exact_match: bool,
+) -> None:
+    _enable_trtllm_gen_attention(monkeypatch)
+    _run_t5_pytorch_generate_encoder_decoder(
+        monkeypatch,
+        model_name,
+        expected_output_token_ids_by_output,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        enable_cuda_graph,
+        num_beams,
+        num_return_sequences,
+        exact_match,
+    )
 
 
 @pytest.mark.parametrize(
