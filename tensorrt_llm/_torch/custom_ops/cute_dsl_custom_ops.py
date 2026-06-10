@@ -5900,7 +5900,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Synth-bundle sweep (commit 513890fee1) on B200 SXM5 picks
             # the cluster size by (N, BS):
             #   N < 65K              -> 1 (cluster sync overhead unrecouped)
-            #   BS * cs > num_sms    -> 1 (multi-wave penalty, cs=4 can crash)
+            #   BS * cs > num_sms    -> 1 (multi-wave perf regression, 1.5-3.6x slower than V5)
             #   N >= 65K, BS <= 16,
             #     BS*4 <= num_sms    -> 4 (single-wave, up to 42% win)
             #   N >= 65K, BS*2 <= num_sms -> 2
