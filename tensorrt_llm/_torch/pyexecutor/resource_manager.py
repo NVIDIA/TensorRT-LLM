@@ -989,10 +989,14 @@ class KVCacheManager(BaseResourceManager):
 
     @staticmethod
     def _has_mm_bidirectional_block(req: LlmRequest) -> bool:
-        # Mirror the gate in scheduler_v2._align_chunk_to_mm_block: re-chunking
-        # a request whose boundary would split a bidirectional multimodal block
-        # silently breaks attention, so such requests are deferred whole rather
-        # than re-chunked.
+        """Whether ``req`` carries a bidirectional multimodal block that makes
+        re-chunking unsafe.
+
+        Mirrors the gate in ``scheduler_v2._align_chunk_to_mm_block``:
+        re-chunking a request whose boundary would split a bidirectional
+        multimodal block silently breaks attention, so such requests are
+        deferred whole rather than re-chunked.
+        """
         mm = getattr(req, "py_multimodal_data", None)
         return isinstance(mm, dict) and mm.get("mm_bidirectional_blocks", False)
 
@@ -1048,10 +1052,16 @@ class KVCacheManager(BaseResourceManager):
         remaining = budget - gen_tokens
         kept: RequestList = []
         deferring = False
+        # Tracks whether we changed the batch at all -- either by dropping a
+        # context request (deferral) or by shrinking one's chunk (re-chunk).
+        # Re-chunking does not change len(kept), so the count alone is not a
+        # sufficient signal that the batch's last-chunk/chunking bins are stale.
+        modified = False
         for req in scheduled_batch.context_requests:
             # Disagg generation-init requests only allocate/transfer KV cache
             # and contribute no compute tokens, so never shed them.
             if deferring and not req.is_disagg_generation_init_state:
+                modified = True
                 continue
             cost = self._request_forward_tokens(req, is_context=True)
             if cost <= remaining:
@@ -1071,20 +1081,31 @@ class KVCacheManager(BaseResourceManager):
             if (new_chunk >= self.tokens_per_block
                     and new_chunk < req.context_chunk_size
                     and not self._has_mm_bidirectional_block(req)):
-                req.context_chunk_size = new_chunk  # now a non-last chunk
+                # Shrinking context_chunk_size flips is_last_context_chunk (a
+                # computed property: context_current_position + chunk_size ==
+                # prompt_len) to False, so this is now a non-last chunk and must
+                # be re-binned into the chunking list below -- otherwise
+                # downstream treats it as a final chunk and appends generation /
+                # draft tokens to it, corrupting the forward pass.
+                req.context_chunk_size = new_chunk
                 kept.append(req)
                 remaining -= new_chunk
+                modified = True
+            else:
+                # Cannot re-chunk: defer this request entirely.
+                modified = True
             # remaining budget is now < one block, so no further context
             # request can fit this iteration.
             deferring = True
 
-        if len(kept) != scheduled_batch.num_context_requests:
+        if modified:
             logger.debug(
                 f"_fit_token_budget: kept {len(kept)}/"
                 f"{scheduled_batch.num_context_requests} context requests to "
                 f"stay within max_num_tokens={budget}")
-            # reset_context_requests re-derives chunking vs last-chunk from each
-            # request's (possibly updated) is_last_context_chunk.
+            # Re-bin kept requests into chunking vs last-chunk from each
+            # request's (possibly updated) is_last_context_chunk, and drop any
+            # deferred requests from this iteration's batch.
             scheduled_batch.reset_context_requests(kept)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):

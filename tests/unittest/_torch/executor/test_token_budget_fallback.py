@@ -24,17 +24,32 @@ class _FakeRequest:
         *,
         context_chunk_size=0,
         is_last_context_chunk=True,
+        prompt_len=None,
+        context_current_position=0,
         py_beam_width=1,
         py_draft_tokens=None,
         is_disagg_generation_init_state=False,
         mm_bidirectional=False,
     ):
         self.context_chunk_size = context_chunk_size
-        self.is_last_context_chunk = is_last_context_chunk
+        self.context_current_position = context_current_position
+        # Mirrors the C++ semantics: is_last_context_chunk is a *computed*
+        # property (context_current_position + context_chunk_size == prompt_len),
+        # so shrinking the chunk during re-chunk flips it to False. When
+        # prompt_len is None the flag is a fixed override (for tests that don't
+        # exercise re-chunk re-binning).
+        self._prompt_len = prompt_len
+        self._is_last_override = is_last_context_chunk
         self.py_beam_width = py_beam_width
         self.py_draft_tokens = py_draft_tokens
         self.is_disagg_generation_init_state = is_disagg_generation_init_state
         self.py_multimodal_data = {"mm_bidirectional_blocks": True} if mm_bidirectional else None
+
+    @property
+    def is_last_context_chunk(self):
+        if self._prompt_len is None:
+            return self._is_last_override
+        return self.context_current_position + self.context_chunk_size == self._prompt_len
 
 
 def _make_manager(max_num_tokens, tokens_per_block):
@@ -99,6 +114,30 @@ class TestFitTokenBudget(unittest.TestCase):
             gen, is_context=False
         )
         self.assertLessEqual(total, mgr.max_num_tokens)
+
+    def test_rechunk_only_rebins_to_chunking(self):
+        # Regression for the prep-boundary corruption (issue #13318 follow-up):
+        # when the overshoot is absorbed purely by re-chunking the *last*
+        # context request (no deferral), len(kept) is unchanged, but the request
+        # has flipped from last-chunk to non-last and MUST be moved out of the
+        # last-chunk bin. Otherwise downstream treats it as a final chunk and
+        # appends generation/draft tokens, corrupting the forward pass.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        # Full prompt is 64 tokens, processed in one (last) chunk.
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        self.assertTrue(ctx.is_last_context_chunk)
+        gen = _FakeRequest(py_beam_width=100)  # remaining = 28
+        batch = _make_batch([ctx], [gen])
+
+        mgr._fit_token_budget(batch)
+
+        # Re-chunked to (28 // 16) * 16 == 16, now a non-last chunk.
+        self.assertEqual(ctx.context_chunk_size, 16)
+        self.assertFalse(ctx.is_last_context_chunk)
+        # Count is unchanged, but it must have been re-binned into chunking.
+        self.assertEqual(batch.num_context_requests, 1)
+        self.assertIn(ctx, batch.context_requests_chunking)
+        self.assertNotIn(ctx, batch.context_requests_last_chunk)
 
     def test_overshoot_defers_when_cannot_rechunk(self):
         # Only an 8-token budget remains -- smaller than one block -- so the
