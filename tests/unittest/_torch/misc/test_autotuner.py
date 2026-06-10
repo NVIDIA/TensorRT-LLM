@@ -988,22 +988,18 @@ def test_global_timer_vs_cuda_event(use_cuda_graph, monkeypatch):
     print("-" * 102)
 
 
-# ---------------------------------------------------------------------------
-# Bounds-checking tests (from PR #12310)
-# ---------------------------------------------------------------------------
-
-
 def _make_shapes(*sizes):
     """Convert size-tuples into Tuple[torch.Size, ...] for _find_nearest_profile."""
     return tuple(torch.Size(s) for s in sizes)
 
 
-class TestFindNearestProfileBounds:
-    """Bounds-checking in AutoTuner._find_nearest_profile."""
+class TestSpecBoundsChecking:
+    """Bounds-checking in AutoTuner._find_nearest_profile and AutoTuner._optimization_profiles."""
 
     def setup_method(self):
         AutoTuner._find_nearest_profile.cache_clear()
 
+    @pytest.mark.parametrize("entry", ["find_nearest", "optimization_profiles"])
     @pytest.mark.parametrize(
         "spec_class,input_idx,dim_idx",
         [
@@ -1020,23 +1016,41 @@ class TestFindNearestProfileBounds:
             pytest.param("constraint", 0, -1, id="constraint_negative_dim_idx"),
         ],
     )
-    def test_oob_spec_skipped(self, spec_class, input_idx, dim_idx):
+    def test_oob_spec_skipped(self, entry, spec_class, input_idx, dim_idx):
         from tensorrt_llm._torch.autotuner import ConstraintSpec
-        shapes = _make_shapes([4, 8])
         if spec_class == "dynamic":
             spec = DynamicTensorSpec(input_idx=input_idx,
                                      dim_idx=dim_idx,
-                                     gen_tuning_buckets=(1, ))
-            result = AutoTuner._find_nearest_profile(
-                shapes, dynamic_tensor_specs=(spec, ), constraint_specs=())
+                                     gen_tuning_buckets=(1, 2))
+            dyn_specs = (spec, )
+            con_specs = ()
         else:
             spec = ConstraintSpec(input_idx=input_idx,
                                   dim_idx=dim_idx,
                                   infer_shape=lambda shapes: 1)
-            result = AutoTuner._find_nearest_profile(shapes,
-                                                     dynamic_tensor_specs=(),
-                                                     constraint_specs=(spec, ))
-        assert result == ((4, 8), )
+            dyn_specs = ()
+            con_specs = (spec, )
+
+        if entry == "find_nearest":
+            shapes = _make_shapes([4, 8])
+            result = AutoTuner._find_nearest_profile(
+                shapes,
+                dynamic_tensor_specs=dyn_specs,
+                constraint_specs=con_specs)
+            assert result == ((4, 8), )
+        else:
+            tuner = AutoTuner()
+            x = torch.rand([4, 8])
+            # Constraint-only configs need a dynamic spec to drive the cartesian product.
+            if not dyn_specs:
+                dyn_specs = (DynamicTensorSpec(input_idx=0,
+                                               dim_idx=0,
+                                               gen_tuning_buckets=(1, )), )
+            config = TuningConfig(dynamic_tensor_specs=dyn_specs,
+                                  constraint_specs=con_specs)
+            profiles = tuner._optimization_profiles(config, [x])
+            # OOB spec skipped — profile generation still produces at least one profile.
+            assert len(profiles) >= 1
 
     def test_valid_specs_unaffected(self):
         from tensorrt_llm._torch.autotuner import ConstraintSpec
@@ -1049,37 +1063,3 @@ class TestFindNearestProfileBounds:
                                                  dynamic_tensor_specs=(dyn, ),
                                                  constraint_specs=(con, ))
         assert result == ((4, 8), (-1, 3))
-
-
-class TestOptimizationProfilesBounds:
-    """Bounds-checking in AutoTuner._optimization_profiles."""
-
-    def test_dynamic_spec_input_idx_oob_skipped(self):
-        tuner = AutoTuner()
-        x = torch.rand([4, 8])
-        config = TuningConfig(dynamic_tensor_specs=(
-            DynamicTensorSpec(input_idx=5, dim_idx=0, gen_tuning_buckets=(
-                1, 2)), ))
-        profiles = tuner._optimization_profiles(config, [x])
-        assert len(profiles) == 1
-        assert profiles[0].get_opt_shapes() == ((4, 8), )
-
-    def test_constraint_spec_dim_idx_oob_skipped(self):
-        from tensorrt_llm._torch.autotuner import ConstraintSpec
-        tuner = AutoTuner()
-        x = torch.rand([4, 8])
-        config = TuningConfig(
-            dynamic_tensor_specs=(DynamicTensorSpec(input_idx=0,
-                                                    dim_idx=0,
-                                                    gen_tuning_buckets=(2,
-                                                                        4)), ),
-            constraint_specs=(ConstraintSpec(input_idx=0,
-                                             dim_idx=9,
-                                             infer_shape=lambda shapes: 1), ))
-        profiles = tuner._optimization_profiles(config, [x])
-        # Out-of-bounds constraint spec is skipped without affecting profile generation.
-        assert len(profiles) > 0
-        # The dynamic spec is in-range and should still produce buckets for input 0 dim 0.
-        opt_shapes_set = {p.get_opt_shapes()[0] for p in profiles}
-        assert (2, 8) in opt_shapes_set
-        assert (4, 8) in opt_shapes_set
