@@ -755,15 +755,21 @@ def test_fp4_linear_cuda_core(dtype, mnk):
     reason="Marlin NVFP4 backend runs Hopper",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mnk", [
-    (1, 1024, 1024),
-    (8, 1024, 2048),
-    (128, 2048, 1024),
-    (1, 18560, 4096),
-    (128, 18560, 4096),
-    (1, 4096, 8192),
-    (128, 4096, 8192),
-])
+@pytest.mark.parametrize(
+    "mnk",
+    [
+        (1, 1024, 1024),
+        (8, 1024, 2048),
+        (128, 2048, 1024),
+        (1, 18560, 4096),
+        (128, 18560, 4096),
+        (1, 4096, 8192),
+        (128, 4096, 8192),
+        # Non-64-aligned N and K (e.g. from TP sharding): exercises the
+        # zero-padding path in MarlinNVFP4LinearMethod.
+        (8, 2576, 672),
+        (128, 2576, 672),
+    ])
 def test_fp4_linear_marlin(dtype, mnk):
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
