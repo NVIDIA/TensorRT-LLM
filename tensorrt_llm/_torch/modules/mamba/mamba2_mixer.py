@@ -75,7 +75,6 @@ class Mamba2Mixer(nn.Module):
         super().__init__()
 
         config = config or ModelConfig()
-        self.mapping = config.mapping
 
         if config.mapping.enable_attention_dp:
             self.mapping = Mapping(
@@ -157,12 +156,13 @@ class Mamba2Mixer(nn.Module):
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
+        self._stochastic_rounding_requested = (
+            config.quant_config.mamba_ssm_stochastic_rounding)
+        self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
+
         # TODO: Update head_dims once flashinfer is updated.
         # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
         supported_head_dims = [64, 128]
-        self._use_flashinfer = head_dim in supported_head_dims
-        self._stochastic_rounding_requested = (
-            config.quant_config.mamba_ssm_stochastic_rounding)
         supported_head_group_ratios = [1, 8, 16]
         supported_d_states = [64, 128, 256]
         head_group_ratio = (self.tp_nheads //
@@ -170,21 +170,11 @@ class Mamba2Mixer(nn.Module):
         self._use_flashinfer = (head_dim in supported_head_dims and
                                 head_group_ratio in supported_head_group_ratios
                                 and d_state in supported_d_states)
-        # Stochastic rounding requires FlashInfer and fp16 cache
-        self._use_stochastic_rounding = (
-            config.quant_config.mamba_ssm_stochastic_rounding
-            and self._use_flashinfer
+
+        self._stochastic_rounding_for_replay = (
+            self._stochastic_rounding_requested
             and self._mamba_ssm_cache_dtype == torch.float16)
-        self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
-        # SR needs fp16 cache.  Replay and flashinfer each supply a Philox impl;
-        # custom_op does not.  Only use_replay is resolved per-forward (from the
-        # cache manager), so precompute both gate values here.
-        sr_base = (self._stochastic_rounding_requested
-                   and self._mamba_ssm_cache_dtype == torch.float16)
-        # Keep replay SSM-cache writes on the same stochastic-rounding policy
-        # as flashinfer; the replay kernel masks stale slots before using them.
-        self._stochastic_rounding_for_replay = sr_base
-        self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
+        self._stochastic_rounding_for_flashinfer = self._stochastic_rounding_for_replay and self._use_flashinfer
 
         self._use_mtp_custom_op = os.environ.get(
             "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
