@@ -26,7 +26,10 @@ import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 
 # Initialize resources first (KVPagedResourceHandler is used within tests below)
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import KVPagedResourceHandler
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+    AttentionType,
+    KVPagedResourceHandler,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
@@ -553,7 +556,8 @@ def test_initialize_cache_transform_calls_initialize_resources(dummy_cached_inte
     )
 
     dummy_cached_interface.add_resource(
-        "kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16)
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
     )
 
     # Mock the factory and shared_config
@@ -574,7 +578,8 @@ def test_initialize_cache_transform_calls_initialize_resources(dummy_cached_inte
 def test_resize_kv_cache_transform_skipped_when_not_needed(dummy_cached_interface):
     """Verify ResizeKVCache transform is skipped when resize not needed."""
     dummy_cached_interface.add_resource(
-        "kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16)
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
     )
     dummy_cached_interface.initialize_resources()
 
@@ -615,7 +620,10 @@ def test_resize_kv_cache_transform_runs_when_needed():
         kv_cache_config=kv_cache_config,
     )
 
-    cm.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    cm.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     cm.initialize_resources()
 
     # Create the transform with a proper config
@@ -1254,7 +1262,9 @@ def _non_speculative_handlers():
     return [
         SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
         CausalConvResourceHandler(conv_dim=128, d_conv=4, dtype=torch.float32),
-        KVPagedResourceHandler(num_kv_heads=4, head_dim=64, dtype=torch.bfloat16),
+        KVPagedResourceHandler(
+            num_kv_heads=4, head_dim=64, dtype=torch.bfloat16, attention_type=AttentionType.mha
+        ),
     ]
 
 

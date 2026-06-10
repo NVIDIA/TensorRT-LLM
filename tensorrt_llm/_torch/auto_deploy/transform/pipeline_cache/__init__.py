@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,10 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""AutoDeploy's modular graph transform + inference optimizer pipeline."""
 
-from . import (
-    library,  # noqa: F401 - ensure all transforms are registered
-    pipeline_cache,  # noqa: F401 - ensure the cache transform is registered
-)
-from .interface import *
+"""AutoDeploy pipeline cache transform package."""
+
+from .pipeline_cache import PipelineCache  # noqa: F401
