@@ -233,6 +233,11 @@ class OpenAIDisaggregatedService(OpenAIService):
         event: bytes,
         ctx_response: Optional[UCompletionResponse],
     ) -> bytes:
+        # Only the final chunk has a top-level `usage` to rewrite, but this ran
+        # json.loads on every relayed chunk. A usage field can't exist unless the
+        # bytes contain `"usage"`, so skip the parse when they don't.
+        if b'"usage"' not in event:
+            return event
         separator_match = self._sse_separator_index(event)
         separator = separator_match[1] if separator_match else b""
         event_body = event[: -len(separator)] if separator else event

@@ -1,6 +1,7 @@
 accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype SKIP (https://nvbugs/6162940)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[adp-mtp2] SKIP
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[noadp-mtp0] SKIP
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype SKIP (https://nvbugs/6200572)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/6117811)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True] SKIP (https://nvbugs/6117811)
