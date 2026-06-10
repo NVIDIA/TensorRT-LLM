@@ -65,7 +65,7 @@ takes precedence over `target_sparsity`.
 formula from checkpoint `config.json`. If checkpoint metadata also provides
 `target_sparsity`, the user config value wins.
 
-`disabled_layers` is a list of fnmatch patterns. A matching attention module
+`exclude_modules` is a list of fnmatch patterns. A matching attention module
 gets no skip-softmax `SparseParams`. Patterns match both full module names and
 component-relative names, so `blocks.0.attn1` matches
 `transformer.blocks.0.attn1` and `transformer_2.blocks.0.attn1`.
@@ -127,7 +127,7 @@ checkpoint/
 
 When both user config and checkpoint metadata are present, checkpoint metadata
 supplies formulas per model component. The public config can override runtime
-knobs such as `target_sparsity`, `disabled_layers`, and
+knobs such as `target_sparsity`, `exclude_modules`, and
 `initial_disabled_steps`. The public config object does not store formulas or
 component sub-configs.
 

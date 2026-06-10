@@ -61,9 +61,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         le=1.0,
         description="Semantic target sparsity in [0, 1]; requires a calibration formula.",
     )
-    disabled_layers: Optional[list[str]] = PydanticField(
+    exclude_modules: Optional[list[str]] = PydanticField(
         default=None,
-        description="Fnmatch patterns for layers where skip-softmax is disabled.",
+        description="Fnmatch patterns for modules where skip-softmax is disabled.",
     )
     initial_disabled_steps: Optional[int] = PydanticField(
         default=None,
@@ -127,13 +127,13 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         )
 
         candidate_names = self._layer_pattern_match_names(module_name)
-        disabled_layers = list(self.disabled_layers or ())
-        disabled_layers.extend(
+        exclude_modules = list(self.exclude_modules or ())
+        exclude_modules.extend(
             skip_softmax_disabled_layers_from_checkpoint_config(checkpoint_config) or ()
         )
         return any(
             fnmatch.fnmatch(name, pattern)
-            for pattern in disabled_layers
+            for pattern in exclude_modules
             for name in candidate_names
         )
 
