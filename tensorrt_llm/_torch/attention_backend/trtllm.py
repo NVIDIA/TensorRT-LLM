@@ -1782,10 +1782,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self._run(q, k, v, metadata, forward_args)
 
-        # Post-attention hooks, fired after the output is computed, for a
-        # method that needs the attention result (e.g. to stash per-layer
-        # q/k/output for a later eviction). Side-effect only; both phases fire
-        # and the manager decides what to act on.
+        # Post-attention hooks, fired after the output is computed, for a method
+        # that needs the attention result (e.g. to stash q/k/output for a later
+        # eviction).
         if (self.sparse_attention_config is not None and not isinstance(
                 self.sparse_attention_config, SkipSoftmaxAttentionConfig)
                 and metadata.compression_manager is not None):

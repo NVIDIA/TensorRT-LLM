@@ -71,10 +71,7 @@ class AttentionMetadata:
     kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
     draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
-    # When set, ``TrtllmAttention.forward`` dispatches the per-attention
-    # sparse hooks (``on_context_attention`` / ``on_generation_attention``)
-    # to this compression manager. Its other lifecycle hooks fire from
-    # PyExecutor's BaseResourceManager callbacks and do not use this field.
+    # Compression manager whose per-attention hooks the attention backend fires.
     compression_manager: Optional["BaseKVCacheCompressionManager"] = None
     mapping: Optional[Mapping] = None
 

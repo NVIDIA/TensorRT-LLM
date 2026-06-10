@@ -19,7 +19,7 @@ prepare_resources / update_resources / free_resources each iteration; those
 calls are forwarded to the hooks below.
 """
 
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -51,21 +51,11 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     hold ``KVCacheManagerV2`` as a tool.
     """
 
-    # ------------------------------------------------------------------ #
-    # Class-level metadata                                                #
-    # ------------------------------------------------------------------ #
-
-    # Can this method run with KV-cache block reuse? Default False: a method
-    # that evicts/rewrites stored keys and values makes a shared prefix block
-    # unsafe to reuse. A reuse-safe method sets this True.
-    supports_kv_cache_reuse: ClassVar[bool] = False
-
     def __init__(self, kv_cache_manager: "KVCacheManagerV2"):
         self.kv_cache_manager = kv_cache_manager
-        # A method that evicts/rewrites stored keys and values can't share a
-        # prefix block, so it can't run with block reuse (same check as
-        # RocketKVCacheManager).
-        if not self.supports_kv_cache_reuse and kv_cache_manager.enable_block_reuse:
+        # Compression evicts/rewrites stored keys and values, so a shared prefix
+        # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
+        if kv_cache_manager.enable_block_reuse:
             raise ValueError(
                 f"{type(self).__name__} changes stored keys and values and cannot "
                 f"run with KV-cache block reuse. Set "
@@ -93,16 +83,14 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         attn_scores: Optional[torch.Tensor],
         metadata: "AttentionMetadata",
         **kwargs,
-    ) -> None:
-        """Per-layer hook after every context-phase attention forward.
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Per-layer hook fired during each context-phase attention, from
+        ``TrtllmAttention.forward`` via ``metadata.compression_manager`` (once
+        per layer, or per chunk per layer under chunked prefill).
 
-        Fires once per chunk per layer under chunked prefill; once per
-        layer otherwise. ``attn_scores`` is populated only when the
-        attention kernel instantiation exposes scores (compile-time
-        template flag); ``None`` when scores are not materialized.
-
-        Side-effect only. Called directly from ``TrtllmAttention.forward``
-        via ``metadata.compression_manager``.
+        Return the sparse-attention mask ``(indices, offsets)`` to apply for
+        this layer, or ``None`` for dense attention. ``attn_scores`` is set only
+        when the attention kernel exposes scores, else ``None``.
         """
         pass
 
@@ -115,15 +103,9 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        """Post-attention hook — per-layer, fired AFTER the context-phase attention output
-        is computed (post-kernel), unlike :meth:`on_context_attention` which
-        fires before/at the kernel to supply an input-side sparse mask.
-
-        Side-effect only (returns ``None``): the sparse mask, if any, was
-        already applied. Use this when the algorithm conceptually runs *after*
-        attention — e.g. stash per-layer ``q``/``k``/``attn_output`` so a
-        unified eviction can be computed in :meth:`on_context_step_end`,
-        rather than per-layer during attention.
+        """Per-layer hook fired after the context-phase attention output is
+        computed. Read the output here -- e.g. stash ``q``/``k``/``attn_output``
+        for an eviction computed later in :meth:`on_context_step_end`.
         """
         pass
 
@@ -134,10 +116,7 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         **kwargs,
     ) -> None:
         """Fired once per request, when its prefill finishes (its final
-        chunk). A subclass overrides this and may gate its action with an
-        ``if`` inside, the same way ``on_generation_step_end`` is used.
-
-        Override for one-shot prefill-end eviction.
+        chunk). Override for a one-shot prefill-end eviction.
         """
         pass
 
@@ -149,11 +128,12 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         attn_scores: Optional[torch.Tensor],
         metadata: "AttentionMetadata",
         **kwargs,
-    ) -> None:
-        """Per-layer hook after every generation-phase attention forward.
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Per-layer hook fired during each generation-phase attention, from
+        ``TrtllmAttention.forward`` via ``metadata.compression_manager``.
 
-        Side-effect only. Called directly from ``TrtllmAttention.forward``
-        via ``metadata.compression_manager``.
+        Return the sparse-attention mask ``(indices, offsets)`` to apply for
+        this layer, or ``None`` for dense attention.
         """
         pass
 
@@ -166,9 +146,9 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        """Post-attention hook — per-layer, fired AFTER the generation-phase attention
-        output is computed (post-kernel). Side-effect only (returns ``None``);
-        the decode-phase analogue of :meth:`on_context_attention_end`.
+        """Per-layer hook fired after the generation-phase attention output is
+        computed; the generation-phase analogue of
+        :meth:`on_context_attention_end`.
         """
         pass
 
@@ -178,13 +158,8 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        """Cross-layer, cross-batch hook fired once per generation step
-        after every layer's forward completes.
-
-        Override for periodic or budget-triggered eviction, or runtime
-        cleanup (e.g. RocketKV rewind). Storage managers may invalidate active
-        compressed copies here if the cache shape changed (e.g., after a
-        sparse evict).
+        """Fired once per generation step, after every layer's forward
+        completes. Override for periodic or budget-triggered eviction.
         """
         pass
 

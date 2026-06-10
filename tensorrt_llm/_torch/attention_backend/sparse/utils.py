@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Optional
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.logger import logger
 
 from .dsa import DSACacheManager, DSATrtllmAttention
 from .kv_cache_compression_manager import BaseKVCacheCompressionManager
@@ -11,6 +12,10 @@ from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+
+# Methods that own their own cache manager instead of the compression framework;
+# they return None from the factory below by design.
+_LEGACY_ALGORITHMS = frozenset({"rocket", "dsa", "skip_softmax"})
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -29,41 +34,22 @@ def get_sparse_attn_kv_cache_manager(
     return None
 
 
-def create_sparse_attention_manager(
+def create_kv_cache_compression_manager(
     sparse_attn_config: "SparseAttentionConfig",
     kv_cache_manager: "KVCacheManagerV2",
 ) -> Optional[BaseKVCacheCompressionManager]:
-    """Build the compression manager for the configured algorithm, or ``None``
-    if the algorithm does not run on the compression framework (it is one of the
-    legacy methods that owns its own cache manager, e.g. ``rocket`` / ``dsa``).
-
-    This PR ships the framework only; no concrete algorithm is registered yet.
-    A concrete method adds its dispatch branch here in its own PR, returning its
-    :class:`BaseKVCacheCompressionManager` subclass. Compression managers need
-    :class:`KVCacheManagerV2` (the older ``KVCacheManager`` lacks the page-table
-    / block-read API they use).
-    """
+    """Return the KV-cache compression manager for the configured algorithm,
+    or ``None`` if the algorithm does not use the compression framework (e.g.
+    legacy rocket / dsa)."""
+    # A framework method returns from its own branch above; reaching here with a
+    # non-legacy algorithm means it was never registered.
+    if sparse_attn_config.algorithm not in _LEGACY_ALGORITHMS:
+        logger.warning(
+            f"No compression manager is registered for sparse-attention "
+            f"algorithm '{sparse_attn_config.algorithm}'; add a branch in "
+            f"create_kv_cache_compression_manager. Running without compression."
+        )
     return None
-
-
-def create_compression_manager(
-    sparse_attn_config: "Optional[SparseAttentionConfig]",
-    kv_cache_manager: "KVCacheManagerV2",
-) -> Optional[BaseKVCacheCompressionManager]:
-    """Build the single KV-cache compression manager to register with
-    PyExecutor from the user-facing config, or ``None`` if no compression-
-    framework method is configured (no config, or only legacy methods such as
-    ``rocket`` / ``dsa`` / ``skip_softmax``).
-
-    Returns one :class:`BaseKVCacheCompressionManager`. It inherits
-    :class:`BaseResourceManager`, so PyExecutor's main loop auto-drives its
-    lifecycle hooks once it is added to the resource-manager registry.
-    Multi-method stacking (composing several axes) is future work and
-    intentionally unsupported here.
-    """
-    if sparse_attn_config is None:
-        return None
-    return create_sparse_attention_manager(sparse_attn_config, kv_cache_manager)
 
 
 def get_vanilla_sparse_attn_attention_backend(

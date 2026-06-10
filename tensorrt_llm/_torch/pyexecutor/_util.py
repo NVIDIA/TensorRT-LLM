@@ -89,11 +89,9 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
-        # The legacy methods (rocket / dsa / skip_softmax) own their own
-        # cache-manager class; use it. A compression-framework method returns
-        # None here, so we fall through to the standard manager (its algorithm
-        # runs in the compression manager registered via
-        # create_sparse_attention_manager after PyExecutor instantiation).
+        # Legacy methods return their own cache manager; framework methods
+        # return None and fall through to the checks below (they use the
+        # standard manager).
         cls = get_sparse_attn_kv_cache_manager(sparse_attn_config)
         if cls is not None:
             return cls
@@ -1661,24 +1659,22 @@ def create_py_executor_instance(
     # other managers, before building ResourceManager. Created before
     # PyExecutor.__init__/warmup so CUDA-graph capture sees the per-layer hooks.
     if llm_args.sparse_attention_config is not None:
-        from ..attention_backend.sparse import create_compression_manager
-        compression_manager = create_compression_manager(
+        from ..attention_backend.sparse import \
+            create_kv_cache_compression_manager
+        compression_manager = create_kv_cache_compression_manager(
             llm_args.sparse_attention_config, kv_cache_manager)
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
-            # Reference for the attention-metadata builder (per-layer hooks).
-            model_engine.compression_manager = compression_manager
 
     resource_manager = ResourceManager(resources)
 
-    # Make sure the kv cache manager is always invoked last as it could
-    # depend on the results of other resource managers.
+    # KV cache manager runs last (others may depend on it), except the
+    # compression manager which reconciles after it (below).
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
-    # The compression manager runs after the cache manager: it reconciles the
-    # request's history length once the cache manager has resized it.
+    # Compression manager runs after the cache manager: reconciles history once it's resized.
     if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
             in resource_manager.resource_managers):
         resource_manager.resource_managers.move_to_end(

@@ -16,18 +16,16 @@ Covers:
   ``update_resources`` fires ``on_context_step_end`` for each request in
   ``context_requests_last_chunk`` + one ``on_generation_step_end`` per
   iteration; ``free_resources`` fires ``on_request_finish``.
-- :func:`create_compression_manager` / :func:`create_sparse_attention_manager`
-  factories.
+- :func:`create_kv_cache_compression_manager` factory.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tensorrt_llm._torch.attention_backend.sparse import (
     BaseKVCacheCompressionManager,
-    create_compression_manager,
-    create_sparse_attention_manager,
+    create_kv_cache_compression_manager,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
 
@@ -183,18 +181,28 @@ class TestResourceManagerAPI:
 
 
 class TestFactories:
-    def test_compression_manager_none_for_none_config(self, fake_kv_cache_manager):
-        assert create_compression_manager(None, fake_kv_cache_manager) is None
-
-    def test_sparse_factory_none_for_legacy_algorithm(self, fake_kv_cache_manager):
+    def test_factory_none_for_legacy_algorithm(self, fake_kv_cache_manager):
         cfg = MagicMock()
         cfg.algorithm = "rocket"  # a legacy method (owns its own cache manager)
-        assert create_sparse_attention_manager(cfg, fake_kv_cache_manager) is None
+        assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
 
-    def test_compression_manager_none_for_legacy_algorithm(self, fake_kv_cache_manager):
+    def test_warns_for_unregistered_algorithm(self, fake_kv_cache_manager):
+        from tensorrt_llm._torch.attention_backend.sparse import utils
+
+        cfg = MagicMock()
+        cfg.algorithm = "made_up_method"
+        with patch.object(utils, "logger") as mock_logger:
+            assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
+            mock_logger.warning.assert_called_once()
+
+    def test_no_warning_for_legacy_algorithm(self, fake_kv_cache_manager):
+        from tensorrt_llm._torch.attention_backend.sparse import utils
+
         cfg = MagicMock()
         cfg.algorithm = "rocket"
-        assert create_compression_manager(cfg, fake_kv_cache_manager) is None
+        with patch.object(utils, "logger") as mock_logger:
+            create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
+            mock_logger.warning.assert_not_called()
 
 
 # ---------------------------------------------------------------------- #
@@ -207,7 +215,7 @@ class TestCanonicalImports:
         from tensorrt_llm._torch.attention_backend import sparse
 
         assert hasattr(sparse, "BaseKVCacheCompressionManager")
-        assert hasattr(sparse, "create_compression_manager")
+        assert hasattr(sparse, "create_kv_cache_compression_manager")
 
     def test_old_coordinator_names_removed(self):
         from tensorrt_llm._torch.attention_backend import sparse
@@ -216,6 +224,7 @@ class TestCanonicalImports:
         assert not hasattr(sparse, "BaseKVCacheCompressionExecutor")
         assert not hasattr(sparse, "SparseAttentionExecutor")
         assert not hasattr(sparse, "create_behavior_coordinator")
+        assert not hasattr(sparse, "create_compression_manager")
 
 
 # ---------------------------------------------------------------------- #
@@ -232,19 +241,12 @@ class TestBlockReuseGuard:
         m.enable_block_reuse = enable_block_reuse
         return m
 
-    def test_raises_when_reuse_on_and_unsupported(self):
-        # supports_kv_cache_reuse is False by default.
+    def test_raises_when_reuse_on(self):
         with pytest.raises(ValueError, match="block reuse"):
             BaseKVCacheCompressionManager(self._mgr(enable_block_reuse=True))
 
     def test_ok_when_reuse_off(self):
         BaseKVCacheCompressionManager(self._mgr(enable_block_reuse=False))  # no raise
-
-    def test_ok_when_method_supports_reuse(self):
-        class ReuseSafe(BaseKVCacheCompressionManager):
-            supports_kv_cache_reuse = True
-
-        ReuseSafe(self._mgr(enable_block_reuse=True))  # no raise
 
 
 class TestRemovedSymbols:

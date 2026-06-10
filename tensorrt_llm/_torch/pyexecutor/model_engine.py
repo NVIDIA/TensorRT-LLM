@@ -538,10 +538,6 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.encoder_attn_metadata = None
-        # KV-cache compression manager (None unless a sparse method is
-        # configured). Set by create_py_executor_instance; exposed here so the
-        # attention-metadata builder can pass it to the per-layer hooks.
-        self.compression_manager = None
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
@@ -1579,10 +1575,11 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_draft_tokens = []
 
     def _set_up_attn_metadata(
-        self,
-        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
-        draft_kv_cache_manager: Optional[Union[KVCacheManager,
-                                               KVCacheManagerV2]] = None):
+            self,
+            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+            draft_kv_cache_manager: Optional[Union[KVCacheManager,
+                                                   KVCacheManagerV2]] = None,
+            compression_manager=None):
         enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
@@ -1604,10 +1601,6 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv = num_attention_heads // num_key_value_heads
         else:
             num_heads_per_kv = 1
-
-        # Passed to AttentionMetadata so TrtllmAttention.forward can read
-        # metadata.compression_manager and fire the per-layer hooks.
-        compression_manager = self.compression_manager
 
         if kv_cache_manager is None:
             # Cache the no-cache metadata.
@@ -4412,9 +4405,12 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
+        compression_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
-                                                   draft_kv_cache_manager)
+                                                   draft_kv_cache_manager,
+                                                   compression_manager)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
