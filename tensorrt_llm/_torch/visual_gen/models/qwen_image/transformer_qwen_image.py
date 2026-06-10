@@ -529,7 +529,7 @@ class QwenJointAttention(Attention):
         encoder_hidden_states: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        step_index: Optional[int] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_txt = encoder_hidden_states.shape[1]
 
@@ -586,7 +586,7 @@ class QwenJointAttention(Attention):
                 joint_q.transpose(1, 2).flatten(2),
                 joint_k.transpose(1, 2).flatten(2),
                 joint_v.transpose(1, 2).flatten(2),
-                step_index=step_index,
+                timestep=timestep,
             )
         else:
             out = F.scaled_dot_product_attention(
@@ -697,7 +697,7 @@ class QwenImageTransformerBlock(nn.Module):
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        step_index: Optional[int] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         img_mod_params = self.img_mod(temb)
         txt_mod_params = self.txt_mod(temb)
@@ -715,7 +715,7 @@ class QwenImageTransformerBlock(nn.Module):
             encoder_hidden_states=txt_modulated,
             image_rotary_emb=image_rotary_emb,
             attention_mask=attention_mask,
-            step_index=step_index,
+            timestep=timestep,
         )
 
         # Residual.
@@ -948,7 +948,6 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_mask: Optional[torch.Tensor] = None,
-        step_index: Optional[int] = None,
         timestep: Optional[torch.Tensor] = None,
         img_shapes: Optional[list] = None,
         txt_seq_lens: Optional[list] = None,
@@ -958,8 +957,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         """Forward pass.
 
         Args:
-            step_index: Ordinal denoising-loop index; distinct from scheduler timestep.
-            timestep: Scheduler timestep tensor for diffusion conditioning.
+            timestep: Normalized scheduler timestep tensor in [0, 1].
         """
         del kwargs, txt_seq_lens  # Only kept for diffusers API compat.
         missing = []
@@ -1007,7 +1005,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
                 attention_mask=block_attention_mask,
-                step_index=step_index,
+                timestep=timestep,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)

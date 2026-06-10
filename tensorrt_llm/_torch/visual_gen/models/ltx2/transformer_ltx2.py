@@ -303,7 +303,7 @@ class LTX2Attention(Attention):
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_padding_mask: torch.Tensor | None = None,
-        step_index=None,
+        timestep=None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -346,7 +346,7 @@ class LTX2Attention(Attention):
             and pre_projected_kv is None
             and hasattr(self.attn, "forward_async")
         ):
-            return self.forward_async(x, freqs=pe, step_index=step_index)
+            return self.forward_async(x, freqs=pe, timestep=timestep)
 
         # Fused gate: prod uses fused kernels (head_dim ∈ {64, 128}); mini-config
         # tests (head_dim=32) fall to naive ops.
@@ -420,7 +420,7 @@ class LTX2Attention(Attention):
         attn_kwargs = {}
         if key_padding_mask is not None:
             attn_kwargs["key_padding_mask"] = key_padding_mask
-        out = self._attn_impl(q, k, v, step_index=step_index, **attn_kwargs)
+        out = self._attn_impl(q, k, v, timestep=timestep, **attn_kwargs)
 
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
@@ -436,7 +436,7 @@ class LTX2Attention(Attention):
         self,
         x: torch.Tensor,
         freqs: tuple[torch.Tensor, torch.Tensor] | None = None,
-        step_index=None,
+        timestep=None,
     ) -> torch.Tensor:
         """LTX-2 async-Ulysses self-attn driver. Structurally mirrors base
         ``Attention.forward_async`` (single function, fused/unfused branches)
@@ -505,9 +505,7 @@ class LTX2Attention(Attention):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(
-            compute_q, compute_k, compute_v, step_index=step_index
-        )
+        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
 
         # LTX-2 gated-attention scaling in 4D before to_out.
         if self.to_gate_logits is not None:
@@ -800,7 +798,7 @@ class BasicAVTransformerBlock(nn.Module):
                     self.attn1(
                         norm_vx,
                         pe=video.positional_embeddings,
-                        step_index=step_index,
+                        timestep=video.timesteps,
                     )
                     * vgate_msa
                 )
@@ -815,7 +813,7 @@ class BasicAVTransformerBlock(nn.Module):
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
                 pre_projected_kv=text_kv_video,
-                step_index=step_index,
+                timestep=video.timesteps,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -834,7 +832,7 @@ class BasicAVTransformerBlock(nn.Module):
                         norm_ax,
                         pe=audio.positional_embeddings,
                         key_padding_mask=audio.audio_padding_mask,
-                        step_index=step_index,
+                        timestep=audio.timesteps,
                     )
                     * agate_msa
                 )
@@ -849,7 +847,7 @@ class BasicAVTransformerBlock(nn.Module):
                 rms_norm(ax, eps=self.norm_eps),
                 context=audio.context,
                 pre_projected_kv=text_kv_audio,
-                step_index=step_index,
+                timestep=audio.timesteps,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -917,7 +915,7 @@ class BasicAVTransformerBlock(nn.Module):
                         pre_projected_kv=(k_a2v, v_a2v),
                         pe=video.cross_positional_embeddings,
                         key_padding_mask=audio.audio_padding_mask,
-                        step_index=step_index,
+                        timestep=video.timesteps,
                     )
                     * gate_out_a2v
                 )
@@ -958,7 +956,7 @@ class BasicAVTransformerBlock(nn.Module):
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
-                        step_index=step_index,
+                        timestep=audio.timesteps,
                     )
                     * gate_out_v2a
                 )

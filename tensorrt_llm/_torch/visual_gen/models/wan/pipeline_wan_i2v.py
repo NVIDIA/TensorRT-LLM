@@ -607,8 +607,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
             return current_model(
                 hidden_states=latent_model_input,
-                step_index=step_index,
-                timestep=timestep_input,
+                timestep=timestep_input / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds_to_use,
             )

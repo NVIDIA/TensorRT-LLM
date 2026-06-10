@@ -772,7 +772,6 @@ class FluxTransformer2DModel(BaseDiffusionModel):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
         pooled_projections: torch.Tensor = None,
-        step_index: Optional[int] = None,
         timestep: torch.Tensor = None,
         img_ids: torch.Tensor = None,
         txt_ids: torch.Tensor = None,
@@ -786,8 +785,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
             hidden_states: Latent image tokens (batch, seq_len, in_channels)
             encoder_hidden_states: T5 text embeddings (batch, txt_seq_len, joint_attention_dim)
             pooled_projections: CLIP pooled text embeddings (batch, pooled_projection_dim)
-            step_index: Ordinal denoising-loop index; distinct from scheduler timestep.
-            timestep: Timestep tensor (batch,)
+            timestep: Normalized timestep tensor in [0, 1], shape (batch,)
             img_ids: Image position IDs (seq_len, 3) or (batch, seq_len, 3)
             txt_ids: Text position IDs (txt_seq_len, 3) or (batch, txt_seq_len, 3)
             guidance: Guidance scale tensor (batch,) for FLUX.1-dev
@@ -798,8 +796,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
             Noise prediction tensor of shape (batch, seq_len, patch_size^2 * out_channels)
         """
         joint_attention_kwargs = dict(joint_attention_kwargs or {})
-        if step_index is not None:
-            joint_attention_kwargs["step_index"] = step_index
+        joint_attention_kwargs["timestep"] = timestep
 
         # Embed inputs (contiguous needed for FP8 quantize ops)
         hidden_states = self.x_embedder(hidden_states.contiguous())

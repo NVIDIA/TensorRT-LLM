@@ -248,7 +248,7 @@ class FluxJointAttention(Attention):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        step_index: Optional[int] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass of joint attention.
 
@@ -269,7 +269,7 @@ class FluxJointAttention(Attention):
             hidden_states, encoder_hidden_states, image_rotary_emb
         )
 
-        hidden_states = self._attn_impl(query, key, value, step_index=step_index)
+        hidden_states = self._attn_impl(query, key, value, timestep=timestep)
         hidden_states = hidden_states.to(query.dtype)
 
         if is_dual_stream:
@@ -422,7 +422,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        step_index: Optional[int] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -438,7 +438,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         q, k, v = self._apply_norm_rope(qkv, image_rotary_emb)
 
-        attn_out = self._attn_impl(q, k, v, step_index=step_index)
+        attn_out = self._attn_impl(q, k, v, timestep=timestep)
         attn_out = attn_out.to(q.dtype)
 
         # Parallel MLP path (reshape to 2D for Triton kernel, then back)

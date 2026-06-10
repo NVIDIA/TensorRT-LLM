@@ -513,7 +513,7 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        step_index: Optional[int] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
         batch_size, seq_len = hidden_states.shape[:2]
@@ -532,7 +532,7 @@ class Attention(nn.Module):
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-            out = self._attn_impl(q, k, v, step_index=step_index)
+            out = self._attn_impl(q, k, v, timestep=timestep)
             return self.to_out[0](out)
 
         # Unfused path: separate QK norm → separate RoPE → attention
@@ -551,7 +551,7 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v, step_index=step_index)
+        out = self._attn_impl(q, k, v, timestep=timestep)
         out = self.to_out[0](out)
         return out
 
@@ -559,6 +559,7 @@ class Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Async-Ulysses self-attn driver. Structurally mirrors ``forward``:
         each closure does ``to_{q,k,v}`` + (optional) fused norm+RoPE on the
@@ -652,6 +653,6 @@ class Attention(nn.Module):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
+        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
         b, t = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(b, t, H * D))

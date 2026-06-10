@@ -245,7 +245,7 @@ class Cosmos3CausalAttention(Attention):
         hidden_states: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-        step_index=None,
+        timestep=None,
     ) -> torch.Tensor:
         batch_size, seq_len = hidden_states.shape[:2]
 
@@ -263,7 +263,7 @@ class Cosmos3CausalAttention(Attention):
             k,
             v,
             attention_mask=PredefinedAttentionMask.CAUSAL,
-            step_index=step_index,
+            timestep=timestep,
         )
 
         return self.to_out[0](out), k, v
@@ -332,7 +332,7 @@ class Cosmos3CrossAttention(Attention):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-        step_index=None,
+        timestep=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -364,7 +364,7 @@ class Cosmos3CrossAttention(Attention):
             k_all,
             v_all,
             attention_mask=PredefinedAttentionMask.FULL,
-            step_index=step_index,
+            timestep=timestep,
         )
 
         return self.to_out[0](out)
@@ -412,7 +412,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
-        step_index=None,
+        timestep=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -427,7 +427,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             hidden_states,
             cos,
             sin,
-            step_index=step_index,
+            timestep=timestep,
         )
         hidden_states = residual + attn_out
 
@@ -484,7 +484,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         k_und: torch.Tensor,
         v_und: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
-        step_index=None,
+        timestep=None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -496,7 +496,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             v_und=v_und,
             freqs_cos=cos,
             freqs_sin=sin,
-            step_index=step_index,
+            timestep=timestep,
         )
         hidden_states = residual + hidden_states
 
@@ -637,7 +637,7 @@ class Cosmos3LanguageModel(nn.Module):
         text_ids: torch.Tensor,
         text_mask: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
-        step_index=None,
+        timestep=None,
     ) -> list[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -655,7 +655,7 @@ class Cosmos3LanguageModel(nn.Module):
         cached_kv: list[Tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers:
             hidden = hidden * mask_3d
-            hidden, k, v = layer(hidden, freqs, step_index=step_index)
+            hidden, k, v = layer(hidden, freqs, timestep=timestep)
             cached_kv.append((k, v))
 
         return cached_kv
@@ -865,7 +865,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        step_index: Optional[int] = None,
         timestep: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
@@ -879,8 +878,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         Args:
             hidden_states: [B, C, T, H, W] noisy latents
-            step_index: Ordinal denoising-loop index; distinct from scheduler timestep.
-            timestep: [B] diffusion timestep per sample
+            timestep: Normalized diffusion timestep in [0, 1], shape [B]
             text_ids: [B, S_text] tokenized text input
             text_mask: [B, S_text] attention mask for text (1=real, 0=pad)
             video_shape: (T, H, W) in latent space
@@ -933,7 +931,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 text_ids,
                 text_mask,
                 freqs_und,
-                step_index=step_index,
+                timestep=timestep,
             )
             self.cached_freqs_gen = freqs_gen
 
@@ -973,7 +971,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 k_und,
                 v_und,
                 freqs_gen,
-                step_index=step_index,
+                timestep=timestep,
             )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import numexpr
+import torch
 from pydantic import ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
@@ -77,7 +78,7 @@ def _looks_like_skip_softmax_group(group: Dict[str, Any]) -> bool:
             "target_sparsity",
             "disabled_layers",
             "ignore",
-            "initial_disabled_steps",
+            "disabled_until_timestep",
         )
     )
 
@@ -127,14 +128,14 @@ def skip_softmax_target_sparsity_from_checkpoint_config(
     return None
 
 
-def skip_softmax_initial_disabled_steps_from_checkpoint_config(
+def skip_softmax_disabled_until_timestep_from_checkpoint_config(
     checkpoint_config: Optional[Dict[str, Any]],
-) -> Optional[int]:
-    """Return checkpoint-provided initial step disablement, if present."""
+) -> Optional[float]:
+    """Return checkpoint-provided normalized timestep cutoff, if present."""
     for group in skip_softmax_config_groups_from_checkpoint_config(checkpoint_config):
-        initial_disabled_steps = group.get("initial_disabled_steps")
-        if isinstance(initial_disabled_steps, int):
-            return initial_disabled_steps
+        disabled_until_timestep = group.get("disabled_until_timestep")
+        if isinstance(disabled_until_timestep, (float, int)):
+            return float(disabled_until_timestep)
     return None
 
 
@@ -310,11 +311,11 @@ class SkipSoftmaxScheduler:
         self,
         threshold_scale_factor_prefill: float = 0.0,
         threshold_scale_factor_decode: float = 0.0,
-        initial_disabled_steps: Optional[int] = None,
+        disabled_until_timestep: Optional[float] = None,
     ):
         self.threshold_scale_factor_prefill = threshold_scale_factor_prefill
         self.threshold_scale_factor_decode = threshold_scale_factor_decode
-        self.initial_disabled_steps = initial_disabled_steps
+        self.disabled_until_timestep = disabled_until_timestep
 
     @staticmethod
     def _phase(
@@ -340,14 +341,14 @@ class SkipSoftmaxScheduler:
         cls,
         threshold_scale_factor: Optional[Union[float, Dict[str, float]]],
         *,
-        initial_disabled_steps: Optional[int] = None,
+        disabled_until_timestep: Optional[float] = None,
     ) -> "SkipSoftmaxScheduler":
         prefill = cls._phase(threshold_scale_factor, "prefill")
         decode = cls._phase(threshold_scale_factor, "decode")
         return cls(
             threshold_scale_factor_prefill=0.0 if prefill is None else prefill,
             threshold_scale_factor_decode=0.0 if decode is None else decode,
-            initial_disabled_steps=initial_disabled_steps,
+            disabled_until_timestep=disabled_until_timestep,
         )
 
     @classmethod
@@ -356,11 +357,11 @@ class SkipSoftmaxScheduler:
         target_sparsity: Optional[Union[float, Dict[str, float]]],
         *,
         checkpoint_config: Optional[Dict[str, Any]] = None,
-        initial_disabled_steps: Optional[int] = None,
+        disabled_until_timestep: Optional[float] = None,
     ) -> "SkipSoftmaxScheduler":
         """Build a scheduler by resolving target sparsity through checkpoint formula."""
         if target_sparsity is None:
-            return cls(initial_disabled_steps=initial_disabled_steps)
+            return cls(disabled_until_timestep=disabled_until_timestep)
 
         threshold_config = cls._threshold_scale_factor_config(checkpoint_config)
         shared_formula = (
@@ -391,28 +392,40 @@ class SkipSoftmaxScheduler:
         return cls(
             threshold_scale_factor_prefill=0.0 if prefill is None else prefill,
             threshold_scale_factor_decode=0.0 if decode is None else decode,
-            initial_disabled_steps=initial_disabled_steps,
+            disabled_until_timestep=disabled_until_timestep,
         )
 
     @staticmethod
-    def get_graph_phase_for_step_index(
-        step_index: Optional[int],
-        *,
-        initial_disabled_steps: Optional[int],
-    ) -> Optional[int]:
-        """Return the stable graph-key phase for the initial-disabled boundary."""
-        if step_index is None:
+    def _as_float(value: Any) -> Optional[float]:
+        if value is None:
             return None
-        if initial_disabled_steps is None or initial_disabled_steps <= 0:
-            return None
-        return int(step_index >= initial_disabled_steps)
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            return float(value.flatten()[0].item())
+        return float(value)
 
-    def get_kernel_params(self, *, step_index: Optional[int] = None):
-        """Return kernel params, applying step-based disablement when provided."""
+    @classmethod
+    def get_graph_phase_for_timestep(
+        cls,
+        timestep: Any,
+        *,
+        disabled_until_timestep: Optional[float],
+    ) -> Optional[int]:
+        """Return the graph-key phase for the timestep disablement boundary."""
+        if disabled_until_timestep is None:
+            return None
+        timestep_value = cls._as_float(timestep)
+        if timestep_value is None:
+            return None
+        return int(timestep_value < disabled_until_timestep)
+
+    def get_kernel_params(self, *, timestep: Any = None):
+        """Return kernel params, applying timestep-based disablement when provided."""
         if (
-            self.get_graph_phase_for_step_index(
-                step_index,
-                initial_disabled_steps=self.initial_disabled_steps,
+            self.get_graph_phase_for_timestep(
+                timestep,
+                disabled_until_timestep=self.disabled_until_timestep,
             )
             == 0
         ):

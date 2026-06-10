@@ -1576,7 +1576,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_params = self.sparse_params
             skip_softmax_kernel_params = (
                 sparse_params.scheduler.get_kernel_params(
-                    step_index=forward_args.step_index) if isinstance(
+                    timestep=forward_args.timestep) if isinstance(
                         sparse_params,
                         SkipSoftmaxParams) else SkipSoftmaxKernelParams())
 

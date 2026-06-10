@@ -449,7 +449,6 @@ class Flux2Pipeline(BasePipeline):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=encoder_hidden_states,
-                step_index=step_index,
                 timestep=timestep / 1000,  # FLUX.2 expects normalized timesteps
                 img_ids=latent_ids,
                 txt_ids=text_ids,
