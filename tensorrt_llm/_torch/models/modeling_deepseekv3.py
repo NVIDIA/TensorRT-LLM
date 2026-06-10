@@ -44,6 +44,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -1445,6 +1446,48 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 spec_metadata=spec_metadata,
             )
 
+    def _use_trtllm_gen_finalize_fusion(self,
+                                        hidden_states: torch.Tensor) -> bool:
+        """Gate TRTLLMGen MoE output-finalize fusion for DeepSeek/Kimi MoE."""
+        reasons = []
+        moe_backend = self.model_config.moe_backend.upper()
+
+        if self.mapping.is_multi_node():
+            reasons.append("multi-node mapping")
+        if not self.fusion_config.POST_MOE_FUSION:
+            reasons.append("post-MoE fusion disabled")
+        if self.moe_allreduce is None:
+            reasons.append("MoE allreduce unavailable")
+        elif hidden_states.shape[0] > self.moe_allreduce.max_token:
+            reasons.append(
+                f"token count {hidden_states.shape[0]} exceeds "
+                f"MoE allreduce limit {self.moe_allreduce.max_token}")
+        if moe_backend != "TRTLLM":
+            reasons.append(f"moe_backend={self.model_config.moe_backend}")
+
+        experts = getattr(self.mlp, "experts", None)
+        supports_finalize_fusion = getattr(experts,
+                                           "supports_finalize_fusion", False)
+        if callable(supports_finalize_fusion):
+            supports_finalize_fusion = supports_finalize_fusion()
+        if not bool(supports_finalize_fusion):
+            reasons.append("MoE backend cannot return unfinalized output")
+        if not self.is_p2p_supported:
+            reasons.append("peer access unavailable")
+
+        if not reasons:
+            return True
+
+        if moe_backend == "TRTLLM":
+            log_once = (logger.info_once if self.model_config.enable_min_latency
+                        else logger.debug_once)
+            log_once(
+                "DeepSeek/Kimi TRTLLMGen MoE finalize fusion disabled "
+                f"on layer {self.layer_idx}: {', '.join(reasons)}.",
+                key="deepseek_trtllm_gen_finalize_fusion_disabled",
+            )
+        return False
+
     def forward_MoE(
         self,
         hidden_states: torch.Tensor,
@@ -1481,12 +1524,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
-        do_finalize = self.mapping.is_multi_node() or (
-            not (self.fusion_config.POST_MOE_FUSION
-                 and hidden_states.shape[0] <= self.moe_allreduce.max_token
-                 and self.model_config.moe_backend == "TRTLLM"
-                 and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
+        use_trtllm_gen_finalize_fusion = self._use_trtllm_gen_finalize_fusion(
+            hidden_states)
+        do_finalize = not use_trtllm_gen_finalize_fusion
 
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,

@@ -436,6 +436,19 @@ class TRTLLMGenFusedMoE(MoE):
             return True
         return self.use_dp and self.parallel_size > 1
 
+    @property
+    def supports_finalize_fusion(self) -> bool:
+        """Return whether ``run_moe(..., do_finalize=False)`` is supported.
+
+        DeepSeek/Kimi can fuse the post-MoE finalize with the following TP
+        allreduce only when the backend returns the unfinalized FC2 payload plus
+        routing metadata. FP8 block-scale and W4A8_MXFP4_FP8 paths finalize
+        inside their kernels today, so keep them on the normal path.
+        """
+        return (self.has_nvfp4 or self.has_w4a16_mxfp4
+                or self.has_w4a8_nvfp4_fp8
+                or self.has_w4a8_mxfp4_mxfp8)
+
     @cached_property
     def enable_alltoall(self):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter

@@ -718,6 +718,12 @@ class ConfigurableMoE(MoE):
         """Delegate has_nvfp4 to backend"""
         return getattr(self.backend, "has_nvfp4", False)
 
+    @property
+    def supports_finalize_fusion(self):
+        """Delegate post-MoE finalize-fusion capability to backend."""
+        supports = getattr(self.backend, "supports_finalize_fusion", False)
+        return supports() if callable(supports) else bool(supports)
+
     def forward_fake(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
