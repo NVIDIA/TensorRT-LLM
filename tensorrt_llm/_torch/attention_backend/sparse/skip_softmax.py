@@ -57,7 +57,6 @@ def _sparse_attention_config_from_checkpoint(
             "config_groups",
             "threshold_scale_factor",
             "target_sparsity",
-            "disabled_layers",
             "ignore",
         )
     ):
@@ -76,7 +75,6 @@ def _looks_like_skip_softmax_group(group: Dict[str, Any]) -> bool:
         for key in (
             "threshold_scale_factor",
             "target_sparsity",
-            "disabled_layers",
             "ignore",
             "disabled_until_timestep",
         )
@@ -235,11 +233,11 @@ class SkipSoftmaxFormula(StrictBaseModel):
         return cls.parse_from_dict(tsf.get(coefficient_key), formula=tsf.get("formula"))
 
 
-def skip_softmax_disabled_layers_from_checkpoint_config(
+def skip_softmax_ignore_patterns_from_checkpoint_config(
     checkpoint_config: Optional[Dict[str, Any]],
 ) -> Optional[list[str]]:
-    """Read checkpoint-provided layer-disable patterns for skip-softmax."""
-    disabled_layers: list[str] = []
+    """Read ModelOpt checkpoint ``ignore`` patterns for skip-softmax."""
+    ignore_patterns: list[str] = []
     seen: set[str] = set()
 
     def _extend(patterns: Any) -> None:
@@ -249,16 +247,14 @@ def skip_softmax_disabled_layers_from_checkpoint_config(
             pattern = str(pattern)
             if pattern not in seen:
                 seen.add(pattern)
-                disabled_layers.append(pattern)
+                ignore_patterns.append(pattern)
 
     sparse_cfg = _sparse_attention_config_from_checkpoint(checkpoint_config)
     if isinstance(sparse_cfg, dict):
-        for key in ("ignore", "disabled_layers"):
-            _extend(sparse_cfg.get(key))
+        _extend(sparse_cfg.get("ignore"))
     for group in skip_softmax_config_groups_from_checkpoint_config(checkpoint_config):
-        for key in ("ignore", "disabled_layers"):
-            _extend(group.get(key))
-    return disabled_layers or None
+        _extend(group.get("ignore"))
+    return ignore_patterns or None
 
 
 def skip_softmax_formula_from_checkpoint_config(

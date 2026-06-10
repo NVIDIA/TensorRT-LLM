@@ -67,11 +67,6 @@ takes precedence over `target_sparsity`.
 formula from checkpoint `config.json`. If checkpoint metadata also provides
 `target_sparsity`, the user config value wins.
 
-`exclude_modules` is a list of fnmatch patterns. A matching attention module
-gets no skip-softmax `SparseParams`. Patterns match both full module names and
-component-relative names, so `blocks.0.attn1` matches
-`transformer.blocks.0.attn1` and `transformer_2.blocks.0.attn1`.
-
 `disabled_until_timestep` is a normalized `[0, 1]` transformer-forward timestep
 cutoff. Denoising starts near 1 and moves toward 0, so skip-softmax is disabled
 while `timestep >= disabled_until_timestep` and enabled after the timestep drops
@@ -116,8 +111,10 @@ Single-model `config.json`:
 The ModelOpt-generated `config_groups` block can contain many groups.
 Skip-softmax scans groups whose `algorithm` is `"skip_softmax"`. `ignore`
 carries checkpoint-provided fnmatch patterns for layers that should not receive
-skip-softmax `SparseParams`; calibration defaults come from the first matching
-group with `threshold_scale_factor`.
+skip-softmax `SparseParams`. Patterns match both full module names and
+component-relative names, so `blocks.0.attn1` matches
+`transformer.blocks.0.attn1` and `transformer_2.blocks.0.attn1`. Calibration
+defaults come from the first matching group with `threshold_scale_factor`.
 
 Multi-model diffusers checkpoints keep calibration per component:
 
@@ -130,9 +127,9 @@ checkpoint/
 
 When both user config and checkpoint metadata are present, checkpoint metadata
 supplies formulas per model component. The public config can override runtime
-knobs such as `target_sparsity`, `exclude_modules`, and
-`disabled_until_timestep`. The public config object does not store formulas or
-component sub-configs.
+knobs such as `target_sparsity` and `disabled_until_timestep`; layer-disable
+patterns come from ModelOpt `config.json` `ignore`. The public config object
+does not store formulas or component sub-configs.
 
 ### CUDA Graphs
 
