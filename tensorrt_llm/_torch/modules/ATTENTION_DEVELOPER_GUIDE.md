@@ -235,13 +235,32 @@ The main differences across backends:
 | `VANILLA` | Python-side | Python-side slicing |
 | `FLASHINFER` | Python-side (explicit append) | Page-table metadata |
 
-#### 3.2.2 `TRTLLM` internal `trtllm_gen` path
+#### 3.2.2 `TRTLLM` internal FMHA libraries
 
-`trtllm_gen.py` integrates trtllm-gen kernels from FlashInfer into the
-`TRTLLM` backend. It is not a separate backend. It is an internal fast path
-disabled by default (`TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION`). It bridges the
-TRTLLM block-offset format into the page-table shape expected by those kernels.
-If it does not apply, `TrtllmAttention` stays on its regular runtime path.
+`TrtllmAttention` dispatches attention through an ordered list of internal FMHA
+libraries. `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from
+FlashInfer into the `TRTLLM` backend, and `FallbackFmha` calls the regular
+`thop.attention` runtime path. These are not separate attention backends.
+
+`TLLM_FMHA_LIBS` controls the ordered list. Unset means
+`flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback` or
+`TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force the fallback path. Each FMHA
+library exposes `is_available()` for module/static environment checks and
+`is_supported()` for per-forward request checks.
+
+The FMHA package is split by role:
+
+- `fmha/interface.py` defines the `Fmha` runtime contract.
+- `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
+  requests and dispatches them to phase-specific hooks.
+- `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
+  library.
+- `fmha/fallback.py` implements the regular `thop.attention` fallback library.
+- `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
+
+Use `PhasedFmha` for libraries that need separate context/generation or MHA/MLA
+entry points. Use `Fmha` directly for libraries that already own the full
+request shape.
 
 #### 3.2.3 MLA cached-context semantics
 
@@ -330,7 +349,7 @@ Working rules:
 | `tensorrt_llm/_torch/attention_backend/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention_backend/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention_backend/trtllm.py` | TRTLLM backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/trtllm_gen.py` | Internal dense fast path |
+| `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/sparse/` | DSA, Rocket sparse backends, metadata, cache managers |
