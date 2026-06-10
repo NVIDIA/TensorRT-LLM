@@ -15,9 +15,13 @@ def to_velocity(
 
     velocity = (sample - denoised) / sigma
     """
+    # Tensor sigma: keep on device. `.item()` would force a D2H sync that
+    # deadlocks under nsys profiling combined with CUDA graph replay.
+    # The scheduler guarantees sigma > 0 inside the denoise loop, so we
+    # skip the zero check on the tensor path (re-checking would re-sync).
     if isinstance(sigma, torch.Tensor):
-        sigma = sigma.to(calc_dtype).item()
-    if sigma == 0:
+        sigma = sigma.to(calc_dtype)
+    elif sigma == 0:
         raise ValueError("Sigma can't be 0.0")
     return ((sample.to(calc_dtype) - denoised.to(calc_dtype)) / sigma).to(sample.dtype)
 

@@ -20,7 +20,8 @@ from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import (FileResponse, JSONResponse, Response,
+                               StreamingResponse)
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -44,6 +45,7 @@ from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
+from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
@@ -58,7 +60,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatMessage, CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
-                                                ErrorResponse, ImageEditRequest,
+                                                ErrorResponse,
                                                 ImageGenerationRequest,
                                                 ImageGenerationResponse,
                                                 ImageObject,
@@ -321,6 +323,14 @@ class OpenAIServer(_VideoRoutesMixin):
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
+            if self.server_role is ServerRole.VISUAL_GEN:
+                return self._create_visual_gen_validation_error_response(exc)
+            # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
+            # response shape that integration tests (e.g.
+            # ``test_malformed_json_request``) and existing clients
+            # expect.
+            if self.metrics_collector:
+                self.metrics_collector.log_request_error(http_code=400)
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is ServerRole.VISUAL_GEN:
@@ -590,6 +600,36 @@ class OpenAIServer(_VideoRoutesMixin):
             status_code=HTTPStatus.NOT_IMPLEMENTED,
         )
 
+    def _create_visual_gen_validation_error_response(
+            self, exc: RequestValidationError) -> Response:
+        """Render a ``RequestValidationError`` as the visual-gen 422 envelope.
+
+        The body has the LLM-style ``{message, type, code}`` shape with
+        HTTP 422. The ``message`` field names the offending field(s) for
+        each error in ``exc.errors()`` so clients can fix the request
+        without parsing the full Pydantic payload.
+        """
+        parts: List[str] = []
+        for err in exc.errors():
+            loc = ".".join(
+                str(seg) for seg in err.get("loc", ()) if seg != "body")
+            etype = err.get("type", "")
+            msg = err.get("msg", "")
+            if etype == "extra_forbidden":
+                parts.append(
+                    f"Unknown request field {loc!r}. Pass model-specific "
+                    "parameters via 'extra_params' instead.")
+            elif loc:
+                parts.append(f"{loc}: {msg}")
+            else:
+                parts.append(msg)
+        message = "; ".join(parts) if parts else str(exc)
+        return self.create_error_response(
+            message=message,
+            err_type="BadRequestError",
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+        )
+
     def _check_health(self) -> bool:
         if isinstance(self.generator, LLM):
             return self.generator._check_health()
@@ -747,6 +787,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/images/edits",
                                self.openai_image_edit,
                                methods=["POST"])
+        self.app.add_api_route("/v1/images/{image_id}/content",
+                               self.get_image_content,
+                               methods=["GET"])
 
         # Video generation endpoints (Extended OpenAI API)
         # Asynchronous video generation (returns immediately with job metadata, OpenAI API)
@@ -1597,6 +1640,7 @@ class OpenAIServer(_VideoRoutesMixin):
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
         """Chat Completion API with harmony format support.
+
         Supports both streaming and non-streaming modes.
         """
 
@@ -1942,18 +1986,34 @@ class OpenAIServer(_VideoRoutesMixin):
                                       raw_request: Request) -> Response:
         """OpenAI-compatible image generation endpoint.
 
-        Follows the OpenAI Images API specification for image generation.
+        Follows the OpenAI Images API specification for image generation,
+        with ``request.format`` extended to accept tensor payloads
+        (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id, self.generator)
-            logger.info(
-                f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
-            )
 
-            image_gen_start = time.perf_counter()
-            output = self.generator.generate(inputs=request.prompt,
-                                             params=params)
+            # Client-side ValueErrors from request translation and
+            # parameter validation are 400. Serialization failures below
+            # (server-side: missing media, inconsistent batch) fall
+            # through to the outer ``except Exception`` → 500 so the
+            # client doesn't get blamed for a server-internal failure.
+            try:
+                params = parse_visual_gen_params(request, image_id,
+                                                 self.generator)
+                logger.info(
+                    f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
+                )
+                image_gen_start = time.perf_counter()
+                output = self.generator.generate(inputs=request.prompt,
+                                                 params=params)
+            except ValueError as exc:
+                logger.error(f"Image request error: {exc}")
+                return self.create_error_response(
+                    message=str(exc),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
             if output.image is None:
                 return self.create_error_response(
                     message="Image generation failed",
@@ -1961,29 +2021,78 @@ class OpenAIServer(_VideoRoutesMixin):
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            # Build response
-            output_images = _normalize_image_output(output.image)
+            if is_tensor_format(request.format):
+                # Tensor payloads carry every populated modality in a
+                # single file. Match the image-encoder fan-out by
+                # emitting one ``ImageObject`` per batch item.
+                from tensorrt_llm.media.tensor_payload import infer_batch_size
 
-            if request.response_format == "b64_json":
-                data = [
-                    ImageObject(
-                        b64_json=base64.b64encode(
-                            image_to_bytes(image)).decode('utf-8'),
-                        revised_prompt=request.prompt,
-                    ) for image in output_images
-                ]
-
+                ext = f".{request.format}"
+                batch_size = infer_batch_size(output)
+                if request.response_format == "b64_json":
+                    data = [
+                        ImageObject(
+                            b64_json=base64.b64encode(
+                                output._save_bytes(
+                                    request.format,
+                                    batch_index=i)).decode("utf-8"),
+                            revised_prompt=request.prompt,
+                        ) for i in range(batch_size)
+                    ]
+                else:
+                    paths_in = [
+                        self.media_storage_path / f"{image_id}_{i}{ext}"
+                        for i in range(batch_size)
+                    ]
+                    output.save(paths_in, format=request.format)
+                    data = [
+                        ImageObject(
+                            url=self._build_image_content_url(
+                                raw_request, image_id, i),
+                            revised_prompt=request.prompt,
+                        ) for i in range(batch_size)
+                    ]
                 response = ImageGenerationResponse(
                     created=int(time.time()),
                     data=data,
+                    output_format=request.format,
                     size=f"{params.width}x{params.height}",
                 )
-
-            elif request.response_format == "url":
-                output.save(self.media_storage_path / f"{image_id}.png")
-                # TODO: Support URL mode
-                return self._create_not_supported_error(
-                    "URL mode is not supported for image generation")
+            else:
+                output_images = _normalize_image_output(output.image)
+                # Pillow's format name is the upper-case form of our
+                # request token. The on-disk extension matches the
+                # request token directly; ``.jpeg`` is interchangeable
+                # with ``.jpg`` for Pillow, the OS, and the OpenAI API.
+                pil_format = request.format.upper()
+                ext = f".{request.format}"
+                if request.response_format == "b64_json":
+                    data = [
+                        ImageObject(
+                            b64_json=base64.b64encode(
+                                image_to_bytes(
+                                    image, format=pil_format)).decode("utf-8"),
+                            revised_prompt=request.prompt,
+                        ) for image in output_images
+                    ]
+                else:
+                    data = []
+                    for i, image in enumerate(output_images):
+                        path = self.media_storage_path / f"{image_id}_{i}{ext}"
+                        path.write_bytes(
+                            image_to_bytes(image, format=pil_format))
+                        data.append(
+                            ImageObject(
+                                url=self._build_image_content_url(
+                                    raw_request, image_id, i),
+                                revised_prompt=request.prompt,
+                            ))
+                response = ImageGenerationResponse(
+                    created=int(time.time()),
+                    data=data,
+                    output_format=request.format,
+                    size=f"{params.width}x{params.height}",
+                )
 
             latency = time.perf_counter() - image_gen_start  # seconds
             metrics = output.metrics
@@ -1998,20 +2107,59 @@ class OpenAIServer(_VideoRoutesMixin):
 
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                message=str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
-    async def openai_image_edit(self, request: ImageEditRequest,
-                                raw_request: Request) -> Response:
-        """OpenAI-compatible image editing endpoint.
+    async def get_image_content(
+        self,
+        image_id: str,
+        raw_request: Request,
+        i: int = 0,
+    ) -> Response:
+        """Serve a generated image by ID and batch index.
 
-        Follows the OpenAI Images API specification for image editing.
-        Creates an edited or extended image given an original image and a prompt.
+        ``GET /v1/images/{image_id}/content?i=<batch_index>`` returns
+        the image file the corresponding ``POST /v1/images/generations``
+        wrote into ``media_storage_path``. ``i`` defaults to ``0`` for
+        single-image requests; URL responses for ``n > 1`` requests
+        carry ``?i=N`` per item.
+        """
+        for ext in (".png", ".webp", ".jpg", ".jpeg", ".safetensors", ".pt"):
+            candidate = self.media_storage_path / f"{image_id}_{i}{ext}"
+            if candidate.exists():
+                media_type = ("application/octet-stream"
+                              if ext in (".safetensors", ".pt") else
+                              f"image/{ext.lstrip('.').replace('jpg', 'jpeg')}")
+                return FileResponse(
+                    str(candidate),
+                    media_type=media_type,
+                    filename=candidate.name,
+                )
+        return self.create_error_response(
+            message=f"Image {image_id!r} (batch index {i}) not found",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+
+    @staticmethod
+    def _build_image_content_url(raw_request: Request, image_id: str,
+                                 i: int) -> str:
+        """Return a fetchable HTTP URL for a generated image item."""
+        base = str(raw_request.base_url).rstrip("/")
+        return f"{base}/v1/images/{image_id}/content?i={i}"
+
+    async def openai_image_edit(self, raw_request: Request) -> Response:
+        """OpenAI-compatible image editing endpoint — returns HTTP 501.
 
         No in-tree pipeline implements image editing today: Flux/Flux2 are
         text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-        video, not edited images. Return 501 here so callers get an honest
-        NotImplemented signal instead of a 500 from a downstream None check.
-        Re-enable the full handler when an edit-capable pipeline lands.
+        video, not edited images. The route is registered so callers get an
+        honest NotImplemented signal instead of a 404. The request body is
+        not parsed because no schema is committed for this endpoint yet —
+        bring a typed request model back when an edit-capable pipeline lands.
         """
         return self._create_not_supported_error(
             "Image editing is not supported by any in-tree pipeline yet.")

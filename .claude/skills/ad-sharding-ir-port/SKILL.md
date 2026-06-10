@@ -117,6 +117,7 @@ transforms:
 
 To force the legacy pipeline (e.g. while an IR port has a known bug awaiting fix), add `enable_legacy_sharding.yaml` to the model's `yaml_extra` — that override disables `apply_sharding_hints` and re-enables the legacy stages explicitly.
 
+
 Set `world_size` once, to the **maximum number of GPUs available on the machine**, auto-detected with `python -c 'import torch; print(torch.cuda.device_count())'` (or `nvidia-smi --list-gpus | wc -l`). Do **not** hardcode `world_size: 8` (or any other literal) — porting agents run on heterogeneous hardware and an 8-GPU literal will simply fail to launch on a 2- or 4-GPU machine. If the model's `num_attention_heads` (and, for GQA, `num_key_value_heads`) does not divide the detected GPU count, fall back to the largest power-of-two divisor that does (e.g. 4 on an 8-GPU machine if `num_attention_heads = 12`). Run the end-to-end command exactly once at that size — there is no value in repeating it at multiple smaller sizes, because the offline sharding equivalence test (Step 10b) already exercises 2- and 4-GPU dist configs cheaply.
 
 Optional `shard_layers` limits which `layer_type` hints are processed; unset means shard all shardable nodes.

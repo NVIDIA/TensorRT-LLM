@@ -33,7 +33,7 @@ respective model files and registered via get_eagle_layers().
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, ClassVar, Dict, Optional, Union
+from typing import Any, ClassVar, Dict, Optional, Set, Union
 
 import torch
 import torch.nn as nn
@@ -978,9 +978,13 @@ class EagleWrapper(nn.Module):
     # ================================================================== #
 
     @staticmethod
+    def _submodule_placeholder_names(submodule: nn.Module) -> Set[str]:
+        return {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+
+    @staticmethod
     def _filter_kwargs_for_submodule(kwargs: dict, submodule: nn.Module) -> dict:
         """Filter kwargs to only include those accepted by submodule's forward (GraphModule)."""
-        expected_names = {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+        expected_names = EagleWrapper._submodule_placeholder_names(submodule)
         return {k: v for k, v in kwargs.items() if k in expected_names}
 
     @staticmethod
@@ -1161,6 +1165,7 @@ class EagleWrapper(nn.Module):
         next_new_tokens[:, 0] = csi.info.maybe_gather_and_squeeze(csi.get_arg("input_ids"))
 
         # ---- Phase 5: Draft loop ----
+        draft_arg_names = self._submodule_placeholder_names(self.draft_model)
         for draft_idx in range(self.max_draft_len):
             # run forward pass on the draft model in shape [num_sequences, 1]
             draft_output = self.draft_model(
@@ -1188,9 +1193,9 @@ class EagleWrapper(nn.Module):
             # switch to generate (if not done already), store new tokens, and offset cache
             # can be skipped for last iteration since after we return metadata will be reset
             if draft_idx < self.max_draft_len - 1:
-                csi.info.switch_to_generate_()
+                csi.info.switch_to_generate_(active_args_override=draft_arg_names)
                 csi.info.copy_("input_ids", draft_tokens)
-                csi.info.offset_pos_and_cache_(c_offset)
+                csi.info.offset_pos_and_cache_(c_offset, active_args_override=draft_arg_names)
 
         # ---- Phase 6: Package output ----
         return EagleWrapperOutput(

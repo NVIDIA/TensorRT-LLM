@@ -1,7 +1,6 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import math
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
@@ -14,7 +13,15 @@ from einops import rearrange as einops_rearrange
 from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    DisaggPrefillMultimodalInputs,
+    MultimodalParams,
+    _as_cpu_tensor,
+    _compute_mm_masks,
+    _find_mm_token_runs_from_mask,
+    _find_mm_token_start_pos_from_masks,
+    find_mm_token_lengths,
+)
 
 from ...inputs import (
     AudioData,
@@ -24,10 +31,12 @@ from ...inputs import (
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     TextPrompt,
+    TokensPrompt,
     compute_retained_tokens_count,
     compute_retained_tokens_from_tubelet_budget,
     compute_retention_mask,
     register_input_processor,
+    support_multimodal_disaggregated,
 )
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -35,13 +44,16 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
+    _is_mm_disagg,
     find_input_mm_embeds,
     fuse_input_embeds,
+    get_attached_multimodal_embeddings,
     get_multimodal_embeddings,
+    has_raw_multimodal_payload,
 )
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
-from .modeling_utils import register_auto_model
+from .modeling_utils import register_auto_model, register_vision_encoder
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -390,10 +402,6 @@ class DynamicResolutionImageTiler:
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
-    return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
-
-
 class SquaredReLU(nn.Module):
     def forward(self, x):
         return torch.pow(torch.nn.functional.relu(x), 2)
@@ -406,6 +414,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     def __init__(self, model_config: ModelConfig[transformers.PretrainedConfig]):
         config = model_config.pretrained_config
         super().__init__(config)
+        self.model_config = model_config
         self.image_size = config.force_image_size
         self.patch_size = config.patch_size
         self.num_image_token = int(
@@ -876,6 +885,39 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             iw // self.patch_size * self.downsample_ratio
         )
         return num_tubelets, wh
+
+
+class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
+    """EPD-only encoder wrapper for Nano VL image/video handoff.
+
+    Full Nano V3 can support more modalities through the full model path.
+    This wrapper is only for the mm_encoder_only EPD worker. It returns one
+    vision embedding tensor for image/video inputs and does not run Nano audio
+    or video-audio interleave logic.
+    """
+
+    def __init__(self, model_config: ModelConfig[transformers.PretrainedConfig], *args, **kwargs):
+        super().__init__(model_config)
+
+    def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        for param in multimodal_params:
+            modality_type = param.multimodal_data["modality_type"]
+            if modality_type == "audio":
+                # EPD encoder-only handoff does not own the Nano audio encoder.
+                raise NotImplementedError(
+                    "NanoV2VL MultimodalEncoder currently supports image/video inputs, not audio."
+                )
+            audio_data = param.multimodal_data[modality_type].get("audio")
+            if audio_data is not None:
+                # TODO(TRTLLM-13129): Add audio support for encoder handoff.
+                raise NotImplementedError(
+                    "NanoV2VL MultimodalEncoder does not yet encode audio extracted from video."
+                )
+
+        mm_embeddings, _ = super().forward(multimodal_params)
+        if not mm_embeddings:
+            return []
+        return [torch.cat(mm_embeddings, dim=0)]
 
 
 class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
@@ -2229,6 +2271,93 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "multimodal_data": multimodal_data,
         }
 
+    def build_disagg_prefill_multimodal_inputs(
+        self, inputs: Union[TextPrompt, TokensPrompt], mm_handles: List[Dict[str, Any]]
+    ) -> DisaggPrefillMultimodalInputs:
+        text_prompt = inputs.get("prompt")
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if prompt_token_ids is None and not text_prompt:
+            raise ValueError("Either prompt_token_ids or text prompt is required")
+        if not isinstance(mm_handles, list):
+            raise TypeError("mm_handles must be a list")
+
+        mm_data = inputs.get("multi_modal_data") or {}
+        if not mm_data:
+            raise ValueError("multi_modal_data is required for NanoV2VL multimodal handoff")
+        modalities = [name for name, value in mm_data.items() if value is not None]
+        if len(modalities) != 1:
+            raise ValueError(
+                "NanoV2VL multimodal handoff supports exactly one modality per request"
+            )
+        if modalities[0] == "audio":
+            raise NotImplementedError(
+                "NanoV2VL multimodal handoff does not support audio-only inputs"
+            )
+
+        num_mm_tokens_by_key = find_mm_token_lengths(mm_data, self)
+        num_mm_tokens = [length for lengths in num_mm_tokens_by_key.values() for length in lengths]
+        if len(num_mm_tokens) != len(mm_handles):
+            raise RuntimeError(
+                f"Expected {len(num_mm_tokens)} multimodal handles, got {len(mm_handles)}."
+            )
+
+        expected_hidden_size = self.config.llm_config.hidden_size
+        multimodal_embedding_lengths: List[int] = []
+        for i, mm_handle in enumerate(mm_handles):
+            tensor_size = mm_handle["tensor_size"]
+            if len(tensor_size) != 2:
+                raise RuntimeError(
+                    f"Expected multimodal embedding {i} to be rank 2, got tensor_size={tensor_size}."
+                )
+            if tensor_size[1] != expected_hidden_size:
+                raise RuntimeError(
+                    f"Expected multimodal embedding {i} to have hidden size "
+                    f"{expected_hidden_size}, got {tensor_size[1]}."
+                )
+            multimodal_embedding_lengths.append(tensor_size[0])
+
+        if prompt_token_ids is None:
+            prompt_token_ids = self.tokenizer.encode(text_prompt, add_special_tokens=False)
+        prompt_token_ids = list(prompt_token_ids)
+
+        expanded_ids, _ = self.expand_prompt_token_ids_for_mm(
+            prompt_token_ids,
+            num_mm_tokens,
+            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
+            mm_data=mm_data,
+        )
+
+        input_ids_tensor = _as_cpu_tensor(expanded_ids)
+        mm_mask, embed_mask, special_mask = _compute_mm_masks(
+            input_ids_tensor,
+            vocab_size=self.get_vocab_size(),
+            mm_token_ids=self.get_mm_token_ids(),
+            mm_special_token_ids=self.get_mm_special_token_ids(),
+        )
+        if int(embed_mask.sum().item()) != sum(multimodal_embedding_lengths):
+            raise RuntimeError(
+                "Multimodal embedding length mismatch: "
+                f"prompt has {int(embed_mask.sum().item())} embedding slots, "
+                f"handles provide {sum(multimodal_embedding_lengths)}."
+            )
+        mm_token_offsets, special_token_offsets = _find_mm_token_start_pos_from_masks(
+            mm_mask, special_mask, num_mm_tokens
+        )
+        item_run_cu_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(
+            mm_mask, num_mm_tokens
+        )
+
+        return DisaggPrefillMultimodalInputs(
+            prompt_token_ids=expanded_ids,
+            multimodal_lengths=num_mm_tokens,
+            multimodal_positions=mm_token_offsets,
+            multimodal_embedding_lengths=multimodal_embedding_lengths,
+            multimodal_item_run_cu_offsets=item_run_cu_offsets,
+            multimodal_run_positions=run_positions,
+            multimodal_run_lengths=run_lengths,
+            special_token_offsets=special_token_offsets,
+        )
+
     def _prepare_audio_features(
         self,
         text: str,
@@ -2423,6 +2552,8 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 
 
+@support_multimodal_disaggregated
+@register_vision_encoder(NanoV2VLMultimodalEncoder)
 @register_auto_model("NemotronH_Nano_Omni_Reasoning_V3")
 @register_auto_model("NemotronH_Nano_VL_V2")
 @register_input_processor(
@@ -2439,9 +2570,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
     _supports_flash_attn = True
 
     def __init__(self, model_config: ModelConfig):
-        if _is_disagg():
-            raise ValueError("NanoV2VL does not support disaggregated inference yet.")
-
         config = model_config.pretrained_config
         super().__init__(config)
 
@@ -2493,10 +2621,12 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         # to be the LLM-only config and no longer has vision_config /
         # sound_config / force_image_size / etc.
         mm_pretrained = self._mm_model_config.pretrained_config
-        if self.vision_encoder is None and not _is_disagg():
+        # Normal workers own encoders. MM E/P handoff uses attached embeddings.
+        is_multimodal_encoder_worker = not _is_mm_disagg()
+        if self.vision_encoder is None and is_multimodal_encoder_worker:
             self.vision_encoder = NanoV2VLVisionEncoder(self._mm_model_config).eval().to("cuda")
         sound_config = getattr(mm_pretrained, "sound_config", None)
-        if self.sound_encoder is None and sound_config is not None:
+        if self.sound_encoder is None and sound_config is not None and is_multimodal_encoder_worker:
             self.sound_encoder = (
                 ProjectedParakeet(
                     sound_config,
@@ -2680,6 +2810,24 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 "context requests yet. merge_evs_mm_embeds currently assumes "
                 "multimodal context chunks form a contiguous input_ids prefix."
             )
+
+    def _check_encoders_exist(self, raw_ctx_params: List[MultimodalParams]) -> None:
+        """Check encoders needed by raw inputs exist.
+
+        Raw image/video needs vision encoder; raw audio needs sound encoder.
+        Encoder-only EPD worker may have only one. Reject early with clear
+        message, not deep encoder failure.
+        """
+        needs_vision_encoder = any(
+            param.multimodal_data["modality_type"] in ("image", "video") for param in raw_ctx_params
+        )
+        if needs_vision_encoder and self.vision_encoder is None:
+            raise ValueError("Raw image/video inputs require a local NanoV2VL vision encoder.")
+        needs_sound_encoder = any(
+            param.multimodal_data["modality_type"] == "audio" for param in raw_ctx_params
+        )
+        if needs_sound_encoder and self.sound_encoder is None:
+            raise ValueError("Raw audio inputs require a local NanoV2VL sound encoder.")
 
     def merge_evs_mm_embeds(
         self,
@@ -2996,16 +3144,27 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             ctx_params = multimodal_params[:num_context_requests]
             if self.video_pruning_rate > 0:
                 self._validate_evs_context_batch(ctx_params, num_context_requests)
-            if not _is_disagg():
+            raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
+            # Raw image/video/audio tensors: run local encoder.
+            if raw_ctx_params:
+                self._check_encoders_exist(raw_ctx_params)
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self._encode_multimodal,
                     multimodal_params=ctx_params,
                 )
+            # E/P prefill: encoder already ran; use attached embeddings.
             else:
-                raise NotImplementedError(
-                    "Nano-V2-VLM does not support disaggregated inference yet. Please unset "
-                    "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
-                )
+                if self.video_pruning_rate > 0 and any(
+                    param.has_content() and param.multimodal_data.get("modality_type") == "video"
+                    for param in ctx_params
+                ):
+                    # TODO(TRTLLM-12534): Carry EVS retained-token counts through
+                    # encoder handoff before enabling video pruning for E/P.
+                    raise ValueError(
+                        "EVS video pruning is not supported with attached "
+                        "multimodal embeddings yet."
+                    )
+                mm_embedding = get_attached_multimodal_embeddings(ctx_params)
             # Adjust input_ids in videos if EVS is applied.
             if self.video_pruning_rate > 0:
                 # Retrieve per-video count stashed by `_encode_multimodal`.
