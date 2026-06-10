@@ -92,27 +92,26 @@ struct XQAKernelRuntimeHasher
 {
     size_t operator()(XQAKernelRuntimeHashKey const& s) const
     {
-        size_t key = s.kv_data_type;
-        key <<= 16; // 16
-        key ^= s.head_size;
-        key <<= 8;  // 24
+        size_t key = s.kv_data_type; // 6
+        key <<= 6;                   // 12
+        key ^= s.head_size / 16;
+        key <<= 8;                   // 20
         key ^= s.num_q_heads_per_kv;
-        key <<= 8;  // 32
+        key <<= 8;                   // 28
         key ^= s.beam_size;
-        key <<= 6;  // 38
+        key <<= 6;                   // 34
         key ^= s.m_tilesize;
-        key <<= 10; // 48
+        key <<= 10;                  // 44
         key ^= s.tokens_per_page;
-        key <<= 1;  // 49
+        key <<= 1;                   // 45
         key ^= s.paged_kv_cache;
-        key <<= 1;  // 50
+        key <<= 1;                   // 46
         key ^= s.multi_query_tokens;
-        key <<= 1;  // 51
+        key <<= 1;                   // 47
         key ^= s.is_fp8_output;
-        key <<= 8;  // 59
+        key <<= 6;                   // 53
         key ^= static_cast<int8_t>(s.position_embedding_type);
-        // FIXME: overflow here
-        key <<= 9; // 68; rotary dims are <= 256, 0 means not used.
+        key <<= 9;                   // 62; rotary dims are <= 256, 0 means not used.
         key ^= static_cast<size_t>(s.rotary_embedding_dim);
         return key;
     }
