@@ -39,6 +39,7 @@ _MXFP4_SCALING_VECTOR_SIZE = 32
 _WEIGHT_ALIGNMENT = 128
 _MXFP4_DEFAULT_EXPERT_BLOCK_SIZE = 32
 _MXFP4_SUPPORTED_EXPERT_BLOCK_SIZE = 32
+_MXFP4_VALUES_PER_BYTE = 2
 _MXFP4_LAYOUT_ARG_NAMES = (
     "gate_up_blocks",
     "gate_up_scales",
@@ -375,12 +376,24 @@ def _register_existing_mxfp4_expert_layout_hooks(
     return num_hooks
 
 
+def _mxfp4_block_count(name: str, dim: int, expert_block_size: int) -> int:
+    if dim <= 0:
+        raise ValueError(f"MXFP4 expert {name} should be positive, got {dim}.")
+    if dim % expert_block_size != 0:
+        raise ValueError(
+            f"MXFP4 expert {name} should be divisible by expert_block_size="
+            f"{expert_block_size}, got {dim}."
+        )
+    return dim // expert_block_size
+
+
 def _register_mxfp4_expert_params(
     gm: GraphModule,
     gate_up_w_name: str,
     gate_up_b_name: str,
     down_w_name: str,
     down_b_name: str,
+    expert_block_size: int = _MXFP4_DEFAULT_EXPERT_BLOCK_SIZE,
 ) -> Tuple[str, str, str, str]:
     """Create (if missing) the four MXFP4 params under the experts module and return their full names.
 
@@ -404,9 +417,9 @@ def _register_mxfp4_expert_params(
         # Fallback: use down bias last dim
         H = int(dn_b.shape[1])
 
-    # Compute block dims (assume divisible; zero-init anyway)
-    H_blk = max(1, H // 32)
-    I_blk = max(1, In // 32)
+    packed_block_width = expert_block_size // _MXFP4_VALUES_PER_BYTE
+    H_blk = _mxfp4_block_count("hidden_size", H, expert_block_size)
+    I_blk = _mxfp4_block_count("intermediate_size", In, expert_block_size)
 
     experts_mod, experts_path, _ = get_submodule_of_param(gm, gate_up_w_name)
 
@@ -421,9 +434,13 @@ def _register_mxfp4_expert_params(
     # (meta in the normal meta-device build) so we don't materialize giant CPU
     # buffers before load.
     param_device = gu_w.device
-    gu_blocks = torch.empty((E, 2 * In, H_blk, 16), dtype=torch.uint8, device=param_device)
+    gu_blocks = torch.empty(
+        (E, 2 * In, H_blk, packed_block_width), dtype=torch.uint8, device=param_device
+    )
     gu_scales = torch.empty((E, 2 * In, H_blk), dtype=torch.uint8, device=param_device)
-    dn_blocks = torch.empty((E, H, I_blk, 16), dtype=torch.uint8, device=param_device)
+    dn_blocks = torch.empty(
+        (E, H, I_blk, packed_block_width), dtype=torch.uint8, device=param_device
+    )
     dn_scales = torch.empty((E, H, I_blk), dtype=torch.uint8, device=param_device)
 
     experts_mod.register_parameter(gu_blocks_name, nn.Parameter(gu_blocks, requires_grad=False))
@@ -722,8 +739,7 @@ class QuantizeMXFP4MOE(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
         checkpoint_layout = _get_packed_mxfp4_expert_layout(qcfg)
-        if checkpoint_layout is not None or qcfg.get("expert_block_size") is not None:
-            _resolve_mxfp4_expert_block_size(qcfg, checkpoint_layout)
+        expert_block_size = _resolve_mxfp4_expert_block_size(qcfg, checkpoint_layout)
         num_existing_hooks = 0
         if checkpoint_layout is not None:
             num_existing_hooks = _register_existing_mxfp4_expert_layout_hooks(
@@ -744,7 +760,9 @@ class QuantizeMXFP4MOE(BaseTransform):
         ad_logger.info(f"quantize_mxfp4_moe: dispatching to backend={backend!r}")
 
         if backend == "triton":
-            gm, info = self._apply_triton(gm, cm, factory, shared_config)
+            gm, info = self._apply_triton(
+                gm, cm, factory, shared_config, expert_block_size=expert_block_size
+            )
         elif backend == "trtllm":
             gm, info = self._apply_trtllm(gm, cm, factory, shared_config)
         else:
@@ -767,6 +785,8 @@ class QuantizeMXFP4MOE(BaseTransform):
         cm,
         factory,
         shared_config,
+        *,
+        expert_block_size: int = _MXFP4_DEFAULT_EXPERT_BLOCK_SIZE,
     ) -> Tuple[GraphModule, TransformInfo]:
         """Triton backend: graph rewrite to ``triton_mxfp4_moe``.
 
@@ -820,7 +840,14 @@ class QuantizeMXFP4MOE(BaseTransform):
 
             # Register MXFP4 params on experts
             gu_blocks_name, gu_scales_name, dn_blocks_name, dn_scales_name = (
-                _register_mxfp4_expert_params(gm, gu_w_name, gu_b_name, dn_w_name, dn_b_name)
+                _register_mxfp4_expert_params(
+                    gm,
+                    gu_w_name,
+                    gu_b_name,
+                    dn_w_name,
+                    dn_b_name,
+                    expert_block_size=expert_block_size,
+                )
             )
 
             # Alpha/limit (from dense call)

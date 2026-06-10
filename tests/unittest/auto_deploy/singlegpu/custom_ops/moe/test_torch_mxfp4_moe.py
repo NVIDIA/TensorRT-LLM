@@ -23,9 +23,13 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     build_deepseek_v4_packed_mxfp4_experts_layout,
 )
 from tensorrt_llm._torch.auto_deploy.transform.interface import Stages  # noqa: E402
-from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (  # noqa: E402
-    InsertMXFP4MLP,
-    MXFP4MLPConfig,
+from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (  # noqa: E402
+    QuantizeMXFP4MOE as InsertMXFP4MLP,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
+    QuantizeMXFP4MOEConfig as MXFP4MLPConfig,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
     _mxfp4_target_names_from_node,
     _resolve_mxfp4_expert_block_size,
 )
@@ -752,18 +756,11 @@ def test_torch_mxfp4_moe_from_routing_ep_allows_cuda_graph_capture() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_mxfp4_transform_backend_selector_prefers_torch_for_checkpoint_layout() -> None:
-    config = MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER)
+def test_mxfp4_transform_backend_selector_respects_explicit_triton() -> None:
+    config = MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER, backend="triton")
     transform = InsertMXFP4MLP(config)
 
-    assert transform._resolve_backend({"quant_method": "mxfp4"}, None) == "triton"
-    assert transform._resolve_backend({"expert_quant_method": "mxfp4"}, object()) == "torch"
-    assert (
-        InsertMXFP4MLP(
-            MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER, mxfp4_backend="triton")
-        )._resolve_backend({"expert_quant_method": "mxfp4"}, object())
-        == "triton"
-    )
+    assert transform._resolve_backend() == "triton"
 
 
 def test_mxfp4_target_names_from_node_uses_op_schema_names_for_kwargs() -> None:

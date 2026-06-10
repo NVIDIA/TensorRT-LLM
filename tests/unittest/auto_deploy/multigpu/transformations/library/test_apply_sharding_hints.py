@@ -35,9 +35,11 @@ import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import QuantizedCheckpointLayout
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, Stages
-from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (
-    InsertMXFP4MLP,
-    MXFP4MLPConfig,
+from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
+    QuantizeMXFP4MOE as InsertMXFP4MLP,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4 import (
+    QuantizeMXFP4MOEConfig as MXFP4MLPConfig,
 )
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _get_dist_ops
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
