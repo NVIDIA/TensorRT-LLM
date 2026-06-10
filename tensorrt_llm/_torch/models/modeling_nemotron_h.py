@@ -798,12 +798,6 @@ def _force_moe_backend_for_w4a16_on_hopper(
 
     if model_config.moe_backend.upper() in ('CUTLASS', 'AUTO'):
         return
-    logger.warning(
-        f"Nemotron-H SM{get_sm_version()}: forcing moe_backend "
-        f"'{model_config.moe_backend}' -> 'CUTLASS' for W4A16 fallback")
-    model_config._frozen = False
-    model_config.moe_backend = 'CUTLASS'
-    model_config._frozen = True
 
 
 @contextmanager
