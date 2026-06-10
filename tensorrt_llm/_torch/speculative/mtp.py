@@ -50,13 +50,10 @@ def _repair_fp4_mla_hp_kv_after_mtp_acceptance(
                                             "_fp4_mla_mtp_hp_snapshots", None):
         return
 
-    from ..attention_backend.fp4_mla import (
-        repair_fp4_mla_hp_kv_for_mtp_rejection,
-        repair_fp4_mla_page_stage_for_mtp_rejection)
+    from ..attention_backend.fp4_mla import \
+        repair_fp4_mla_hp_kv_for_mtp_rejection
 
     repair_fp4_mla_hp_kv_for_mtp_rejection(attn_metadata, num_accepted_tokens)
-    repair_fp4_mla_page_stage_for_mtp_rejection(attn_metadata,
-                                                num_accepted_tokens)
 
 
 class MTPHiddenStatesManager(BaseResourceManager):

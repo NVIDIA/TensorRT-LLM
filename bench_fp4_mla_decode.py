@@ -39,7 +39,7 @@ BACKEND_CHOICES = (
 )
 
 
-def _bench(fn, warmup=0, iters=1):
+def _bench(fn, warmup=10, iters=50):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -261,8 +261,8 @@ def main():
         choices=BACKEND_CHOICES,
         help=("Backend to benchmark; default runs all fast backends."),
     )
-    p.add_argument("--warmup", type=int, default=0)
-    p.add_argument("--iters", type=int, default=1)
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--iters", type=int, default=50)
     args = p.parse_args()
 
     batches = args.batch if args.batch else [16, 30, 60, 120, 200, 300]

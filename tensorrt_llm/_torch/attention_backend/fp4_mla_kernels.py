@@ -566,7 +566,7 @@ def _fp4_mla_v_scale_store_context_tokens_kernel(
         tl.max(tl.abs(odd_values), axis=1),
     )
     tile_amax = tl.max(amax_per_token, axis=0)
-    global_scale = tl.load(global_scale_ptr)
+    kv_global_scale = tl.load(global_scale_ptr)
     # K consumes scales as [token, dim-block], while V consumes scales as
     # [dim, token-block].  Only the compressed-KV prefix has both views, so
     # tail K-only dims keep K's per-token scale.
@@ -574,8 +574,11 @@ def _fp4_mla_v_scale_store_context_tokens_kernel(
     tile_scale = tl.where(tile_amax > 0.0, tile_amax / 6.0, 1.0)
     token_scale = tl.where(amax_per_token > 0.0, amax_per_token / 6.0, 1.0)
     local_scale = tl.where(shared_tile, tile_scale, token_scale)
-    stored_scale = local_scale * global_scale
-    v_stored_scale = tile_scale * global_scale
+    # A capped page amax (or a block above the static reference amax) can push an
+    # outlier block's e4m3 scale above the e4m3 ceiling (448); clamp so it clips
+    # gracefully instead of overflowing the scale's e4m3 representation.
+    stored_scale = tl.minimum(local_scale * kv_global_scale, 448.0)
+    v_stored_scale = tl.minimum(tile_scale * kv_global_scale, 448.0)
 
     low = _fp4_e2m1_quantize(even_values / local_scale[:, None])
     high = _fp4_e2m1_quantize(odd_values / local_scale[:, None])

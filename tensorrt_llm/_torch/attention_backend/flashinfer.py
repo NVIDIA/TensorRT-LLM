@@ -24,7 +24,7 @@ from .fp4_mla import (FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV,
                       get_fp4_mla_decode_cache,
                       is_flashinfer_fp4_mla_attention_enabled,
                       run_fp4_mla_attention_decode, scatter_fp4_mla_kv_cache,
-                      update_hp_kv_for_fp4_mla, update_page_stage_for_fp4_mla)
+                      update_hp_kv_for_fp4_mla)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
@@ -186,23 +186,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                            default=None)
     fp4_mla_hp_snapshot_pool: Optional[torch.Tensor] = field(init=False,
                                                              default=None)
-    # BF16 staging buffer for the per-page dynamic-scale no-dequant path,
-    # shape [max_num_sequences, num_local_layers, kv_factor=1,
-    # page_size * head_dim]. Unlike high_precision_kv_pool (which buffers only
-    # the trailing 16-token NVFP4 V-block), this holds the whole in-progress
-    # page so the active page can be re-quantized to FP4 with the exact
-    # per-page amax / global scale each step. Allocated only when the
-    # FlashInfer no-dequant FP4 MLA path is active.
-    fp4_mla_page_stage_pool: Optional[torch.Tensor] = field(init=False,
-                                                            default=None)
-    fp4_mla_page_stage_snapshot_pool: Optional[torch.Tensor] = field(
-        init=False, default=None)
-    # Per-page (K/V shared) FP4 global scale for the dynamic-scale path, shape
-    # [num_local_layers, num_physical_pages] fp32. page_gscale = 448*6/page_amax
-    # is baked into each page's K and V block scales at re-quant time and undone
-    # at read. Untouched pages stay 1.0 (== the previous static behaviour).
-    fp4_mla_page_scale_pool: Optional[torch.Tensor] = field(init=False,
-                                                            default=None)
     # Auxiliary FP4 MLA V-scale pool for the no-dequant PV path.  The
     # physical storage is flat per [local_layer, physical_page]; callers view
     # it with get_fp4_mla_v_scale_pool_view(..., v_head_dim=kv_lora_rank).
@@ -218,8 +201,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                                default=None)
     _fp4_mla_attention_denom_buf: Optional[torch.Tensor] = field(init=False,
                                                                  default=None)
-    # Debug ownership map: seq_slot to last request_id that wrote it.
-    hp_pool_owners: Optional[dict] = field(init=False, default=None)
     # True during warmup forward passes (dummy requests, no real data).
     is_warmup: bool = field(init=False, default=False)
 
@@ -716,7 +697,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             device='cpu',
             pin_memory=prefer_pinned(),
         )
-        self.hp_pool_owners = {}
 
         num_local_layers = self.kv_cache_manager.num_local_layers
         head_dim = self.kv_cache_manager.head_dim
@@ -778,56 +758,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 raise RuntimeError(
                     "FP4 MLA attention requires the C++ KV cache manager to "
                     "allocate the V-scale pool.")
-
-            # Per-page dynamic-scale staging buffer: holds the in-progress page
-            # in BF16 so it can be re-quantized to FP4 with the exact per-page
-            # amax. Sized to one full page (tokens_per_block) instead of the
-            # HP pool's 16-token NVFP4 V-block.
-            page_stage_slots = self.kv_cache_manager.tokens_per_block
-            stage_pool_shape = [
-                max_num_sequences, num_local_layers, kv_factor,
-                page_stage_slots * head_dim
-            ]
-            existing_stage_pool = self.fp4_mla_page_stage_pool
-            if (capture_graph and existing_stage_pool is not None
-                    and existing_stage_pool.dtype == torch.bfloat16
-                    and existing_stage_pool.device.type == "cuda"
-                    and len(existing_stage_pool.shape) == len(stage_pool_shape)
-                    and all(existing_stage_pool.shape[idx] >= dim
-                            for idx, dim in enumerate(stage_pool_shape))):
-                # Persistent seq-slot state: CUDA graph metadata shares it
-                # rather than reserving a fresh pool per captured graph.
-                self.fp4_mla_page_stage_pool = existing_stage_pool
-            else:
-                self.fp4_mla_page_stage_pool = self.get_empty(
-                    buffers,
-                    stage_pool_shape,
-                    cache_name="fp4_mla_page_stage_pool",
-                    dtype=torch.bfloat16,
-                    capture_graph=capture_graph,
-                )
-            if capture_graph:
-                self.fp4_mla_page_stage_snapshot_pool = self.get_empty(
-                    buffers,
-                    stage_pool_shape,
-                    cache_name="fp4_mla_page_stage_snapshot_pool",
-                    dtype=torch.bfloat16,
-                    capture_graph=capture_graph,
-                )
-            else:
-                self.fp4_mla_page_stage_snapshot_pool = None
-
-            # Per-page (K/V shared) FP4 global scale, one fp32 per physical
-            # page per local layer. Initialised to 1.0 so untouched pages and
-            # the read path match the previous static-scale behaviour.
-            self.fp4_mla_page_scale_pool = self.get_empty(
-                buffers,
-                [num_local_layers, max_num_pages],
-                cache_name="fp4_mla_page_scale_pool",
-                dtype=torch.float32,
-                capture_graph=capture_graph,
-            )
-            self.fp4_mla_page_scale_pool.fill_(1.0)
 
         # Runtime-alias backing buffers: GPU for kv/prompt lens, CPU pinned for
         # the helper's prompt_lens_cpu read.
@@ -940,87 +870,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._batch_indices[:self.num_tokens].copy_(batch_indices,
                                                     non_blocking=True)
         self._positions[:self.num_tokens].copy_(positions, non_blocking=True)
-
-    def repage_fp4_mla_decode_from_kv_lens(self) -> None:
-        """Rebuild the read-side decode paging from the corrected kv_lens.
-
-        The overlap scheduler builds the generation metadata from the
-        all-draft-accepted over-estimate; ``_preprocess_inputs`` then corrects
-        ``kv_lens_cuda_runtime``. ``prepare()`` derived ``num_blocks`` /
-        ``num_generation_blocks`` / ``paged_kv_indptr_decode`` /
-        ``paged_kv_indices`` / ``paged_kv_last_page_len`` from the over-estimate.
-        This recomputes the generation slice of that paging from the corrected
-        kv_lens so the decode kernels that index the page table see lengths
-        consistent with what attention actually masks to. Opt-in
-        (``TRTLLM_FP4_MLA_OVERLAP_REPAGE``); host-syncs and is skipped under
-        CUDA-graph capture.
-        """
-        if os.getenv("TRTLLM_FP4_MLA_OVERLAP_REPAGE",
-                     "0").lower() not in ("1", "true", "yes", "on"):
-            return
-        if self.high_precision_kv_pool is None or self.kv_lens_cuda_runtime is None:
-            return
-        # num_blocks / num_generation_blocks are python scalars consumed when
-        # shaping kernel launches; mutating them cannot affect an already
-        # captured graph, so skip (and avoid the per-step host sync) under
-        # CUDA graphs and capture.
-        if getattr(self, "is_cuda_graph", False):
-            return
-        if torch.cuda.is_current_stream_capturing():
-            return
-        num_contexts = self.num_contexts
-        num_seqs = self.num_contexts + self.num_generations
-        num_gen = num_seqs - num_contexts
-        if num_gen <= 0 or not self.num_blocks:
-            return
-
-        page_size = self.page_size
-        kv_lens_gen = self.kv_lens_cuda_runtime[num_contexts:num_seqs].detach(
-        ).to("cpu", torch.int64).tolist()
-        new_blocks_gen = [(kv + page_size - 1) // page_size
-                          for kv in kv_lens_gen]
-        old_blocks_gen = [
-            int(b) for b in self.num_blocks[num_contexts:num_seqs]
-        ]
-        if new_blocks_gen == old_blocks_gen:
-            return  # No page-boundary over-estimate this step.
-
-        # Compact the generation page-id slice: per seq keep its first new_b
-        # block ids (corrected kv_len <= over-estimate => new_b <= old_b).
-        ctx_blocks = self.num_context_blocks
-        old_gen_total = sum(old_blocks_gen)
-        old_gen = self._paged_kv_indices[ctx_blocks:ctx_blocks +
-                                         old_gen_total].detach().to(
-                                             "cpu", torch.int64).tolist()
-        new_gen: list[int] = []
-        off = 0
-        for old_b, new_b in zip(old_blocks_gen, new_blocks_gen):
-            nb = min(new_b, old_b)
-            new_gen.extend(old_gen[off:off + nb])
-            off += old_b
-        if new_gen:
-            self._paged_kv_indices[ctx_blocks:ctx_blocks + len(new_gen)].copy_(
-                torch.tensor(new_gen, dtype=self._paged_kv_indices.dtype),
-                non_blocking=False)
-
-        for i, new_b in enumerate(new_blocks_gen):
-            self.num_blocks[num_contexts + i] = new_b
-        self.num_generation_blocks = sum(new_blocks_gen)
-
-        indptr = [0]
-        for b in new_blocks_gen:
-            indptr.append(indptr[-1] + b)
-        self.paged_kv_indptr_decode[:len(indptr)].copy_(torch.tensor(
-            indptr, dtype=self.paged_kv_indptr_decode.dtype),
-                                                        non_blocking=False)
-
-        last_page = [
-            kv - (b - 1) * page_size
-            for kv, b in zip(kv_lens_gen, new_blocks_gen)
-        ]
-        self._paged_kv_last_page_len[num_contexts:num_seqs].copy_(
-            torch.tensor(last_page, dtype=self._paged_kv_last_page_len.dtype),
-            non_blocking=False)
 
     def update_for_spec_dec(self) -> None:
         if self.high_precision_kv_pool is None:
@@ -1913,10 +1762,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                                      latent_cache,
                                      self._local_layer_idx(metadata),
                                      phase="context")
-            update_page_stage_for_fp4_mla(metadata,
-                                          latent_cache,
-                                          self._local_layer_idx(metadata),
-                                          phase="context")
         else:
             ckv_cache, kpe_cache = self._get_mla_caches(metadata)
 
@@ -2012,11 +1857,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                                              latent_cache,
                                              self._local_layer_idx(metadata),
                                              phase="generation")
-                    update_page_stage_for_fp4_mla(
-                        metadata,
-                        latent_cache,
-                        self._local_layer_idx(metadata),
-                        phase="generation")
                 else:
                     scatter_fp4_mla_kv_cache(
                         metadata,
@@ -2028,11 +1868,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                                              latent_cache,
                                              self._local_layer_idx(metadata),
                                              phase="generation")
-                    update_page_stage_for_fp4_mla(
-                        metadata,
-                        latent_cache,
-                        self._local_layer_idx(metadata),
-                        phase="generation")
             if not use_fp4_attention:
                 combined_cache = get_fp4_mla_decode_cache(
                     metadata,

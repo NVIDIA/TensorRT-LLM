@@ -2124,16 +2124,10 @@ class PyTorchModelEngine(ModelEngine):
                             )
                     else:
                         md.kv_lens_cuda_runtime[num_ctx_requests:num_seqs] += (
-                            self.previous_kv_lens_offsets_cuda[:num_gen_requests]
-                        )
+                            self.
+                            previous_kv_lens_offsets_cuda[:num_gen_requests])
                     md.on_update_kv_lens()
                     md._populate_fp4_mla_batch_indices_positions()
-                    # Opt-in: also rebuild the read-side decode paging
-                    # (num_blocks / paged_kv_indptr_decode / paged_kv_indices /
-                    # last_page_len) from the corrected kv_lens, since prepare()
-                    # derived those from the all-draft-accepted over-estimate.
-                    if hasattr(md, "repage_fp4_mla_decode_from_kv_lens"):
-                        md.repage_fp4_mla_decode_from_kv_lens()
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -2200,8 +2194,8 @@ class PyTorchModelEngine(ModelEngine):
                             )
                     else:
                         md.kv_lens_cuda_runtime[num_ctx_requests:num_seqs] -= (
-                            self.previous_kv_lens_offsets_cuda[:num_gen_requests]
-                        )
+                            self.
+                            previous_kv_lens_offsets_cuda[:num_gen_requests])
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
