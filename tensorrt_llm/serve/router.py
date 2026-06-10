@@ -889,6 +889,254 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._server_state = new_state
 
 
+class DynamoKvCacheAwareRouter(KvCacheAwareRouter):
+    """KV-aware router backed by Dynamo's in-process KvRouter.
+
+    This router keeps TRT-LLM's server lifecycle and request accounting, but
+    delegates KV overlap scoring to ``dynamo.router.Router``.  Server
+    membership is explicit: a TRT-LLM server must expose or register a
+    ``dynamo_worker_id`` before it can be selected.
+    """
+
+    def __init__(self,
+                 server_role: ServerRole = None,
+                 servers: list[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
+                 metadata_server: JsonDictionary = None,
+                 endpoint: str = None,
+                 router_block_size: int = 128,
+                 model_path: Optional[str] = None,
+                 tokenizer_path: Optional[str] = None,
+                 discovery_backend: Optional[str] = None,
+                 request_plane: Optional[str] = None,
+                 event_plane: Optional[str] = None,
+                 worker_id_map: Optional[dict] = None,
+                 **kwargs):
+        if endpoint is None:
+            raise ValueError("dynamo_kv_cache_aware router requires `endpoint`")
+        super().__init__(server_role=server_role,
+                         servers=servers,
+                         metadata_server_cfg=metadata_server_cfg,
+                         metadata_server=metadata_server,
+                         tokens_per_block=router_block_size,
+                         **kwargs)
+        self._dynamo_endpoint = endpoint
+        self._dynamo_block_size = router_block_size
+        self._dynamo_model_path = model_path or tokenizer_path
+        self._dynamo_discovery_backend = discovery_backend
+        self._dynamo_request_plane = request_plane
+        self._dynamo_event_plane = event_plane
+        self._dynamo_router = None
+        self._dynamo_preprocessor = None
+        self._server_to_worker_id: dict[str, int] = {}
+        self._worker_id_to_server: dict[int, str] = {}
+        self._request_id_by_obj: dict[int, str] = {}
+        self._worker_id_map = {
+            self._normalize_url(server): int(worker_id)
+            for server, worker_id in (worker_id_map or {}).items()
+        }
+        self._warned_python_tokenizer_fallback = False
+
+    @staticmethod
+    def _normalize_url(server: str) -> str:
+        return server if server.startswith("http") else f"http://{server}"
+
+    async def _ensure_dynamo_router(self):
+        if self._dynamo_router is not None:
+            return
+        try:
+            from dynamo.router import Preprocessor
+            from dynamo.router import Router as DynamoRouter
+        except Exception as exc:
+            raise RuntimeError(
+                "dynamo_kv_cache_aware router requires the `dynamo` Python "
+                "package with `dynamo.router.Router`") from exc
+
+        if self._dynamo_model_path:
+            self._dynamo_preprocessor = await Preprocessor.create(
+                self._dynamo_model_path)
+
+        self._dynamo_router = DynamoRouter(
+            endpoint=self._dynamo_endpoint,
+            block_size=self._dynamo_block_size,
+            discovery_backend=self._dynamo_discovery_backend,
+            request_plane=self._dynamo_request_plane,
+            event_plane=self._dynamo_event_plane,
+            preprocessor=self._dynamo_preprocessor,
+        )
+        await self._dynamo_router.initialize()
+        for server in self._servers:
+            if server in self._prepared_ready_servers:
+                await self._register_dynamo_server(server)
+
+    async def _prepare_server(self, server: str):
+        await super()._prepare_server(server)
+        if server not in self._prepared_ready_servers:
+            return
+        await self._register_dynamo_server(server)
+
+    async def add_server(self, server: str):
+        await super().add_server(server)
+        if server in self._prepared_ready_servers:
+            await self._register_dynamo_server(server)
+
+    async def remove_server(self, server: str):
+        worker_id = self._server_to_worker_id.get(server)
+        await super().remove_server(server)
+        if worker_id is not None and self._dynamo_router is not None:
+            await self._dynamo_router.delete_server(worker_id)
+        self._server_to_worker_id.pop(server, None)
+        if worker_id is not None:
+            self._worker_id_to_server.pop(worker_id, None)
+
+    def _on_servers_updated(self, old_servers, new_servers):
+        super()._on_servers_updated(old_servers, new_servers)
+        removed = set(old_servers) - set(new_servers)
+        for server in removed:
+            worker_id = self._server_to_worker_id.pop(server, None)
+            if worker_id is not None:
+                self._worker_id_to_server.pop(worker_id, None)
+                if self._dynamo_router is not None:
+                    asyncio.create_task(
+                        self._dynamo_router.delete_server(worker_id))
+
+    def _metadata_for_server(self, server: str) -> dict:
+        if not self._metadata_server:
+            return {}
+        normalized = self._normalize_url(server)
+        try:
+            for key in self._metadata_server.keys():
+                if not key.startswith("trtllm/"):
+                    continue
+                metadata = self._metadata_server.get(key)
+                if metadata and self._normalize_url(metadata.get(
+                        "url", "")) == normalized:
+                    return metadata
+        except Exception as exc:
+            logger.warning(
+                f"Failed to read metadata for Dynamo router server {server}: {exc}"
+            )
+        return {}
+
+    def _extract_dynamo_worker_id(self, server: str) -> Optional[int]:
+        normalized = self._normalize_url(server)
+        if normalized in self._worker_id_map:
+            return self._worker_id_map[normalized]
+        if server in self._worker_id_map:
+            return self._worker_id_map[server]
+
+        candidates = []
+        candidates.append(self._server_info.get(server, {}))
+        candidates.append(self._metadata_for_server(server))
+        for data in candidates:
+            if not isinstance(data, dict):
+                continue
+            for key in ("dynamo_worker_id", "worker_id", "backend_instance_id"):
+                value = data.get(key)
+                if value is not None:
+                    return int(value)
+        return None
+
+    async def _register_dynamo_server(self, server: str):
+        await self._ensure_dynamo_router()
+        worker_id = self._extract_dynamo_worker_id(server)
+        if worker_id is None:
+            raise RuntimeError(
+                f"Server {server} is missing `dynamo_worker_id` metadata")
+        self._server_to_worker_id[server] = worker_id
+        self._worker_id_to_server[worker_id] = server
+        metadata = {
+            "server_info": self._server_info.get(server, {}),
+            "metadata": self._metadata_for_server(server),
+        }
+        await self._dynamo_router.add_server(worker_id,
+                                             url=self._normalize_url(server),
+                                             metadata=metadata)
+
+    async def _token_ids_for_request(self, request: OpenAIRequest) -> list[int]:
+        if isinstance(
+                request,
+                ChatCompletionRequest) and request.prompt_token_ids is not None:
+            return list(request.prompt_token_ids)
+        if isinstance(request, CompletionRequest):
+            prompt = request.prompt
+            if isinstance(prompt, list) and prompt and isinstance(
+                    prompt[0], int):
+                return list(prompt)
+            if isinstance(prompt, list) and prompt and isinstance(
+                    prompt[0], list):
+                if len(prompt) != 1:
+                    raise ValueError(
+                        "Dynamo router does not support batched prompts")
+                return list(prompt[0])
+            if isinstance(prompt, str) and self._dynamo_preprocessor:
+                token_ids = await self._dynamo_preprocessor.tokenize_text(prompt
+                                                                          )
+                request.prompt = token_ids
+                return token_ids
+
+        if isinstance(request, ChatCompletionRequest):
+            if not self._warned_python_tokenizer_fallback:
+                self._warned_python_tokenizer_fallback = True
+                logger.warning(
+                    "Dynamo router falling back to TRT-LLM Python tokenizer for "
+                    "chat request because Dynamo chat-template preprocessor is "
+                    "not exposed in this environment")
+            return (await asyncio.to_thread(self._tokenize, request))[0]
+
+        token_lists = await asyncio.to_thread(self._tokenize, request)
+        return token_lists[0]
+
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+        self._validate_servers_available()
+        await self._ensure_dynamo_router()
+        token_ids = await self._token_ids_for_request(request)
+
+        allowed_worker_ids = list(self._worker_id_to_server)
+        if exclude_server is not None:
+            excluded_worker_id = self._server_to_worker_id.get(exclude_server)
+            if excluded_worker_id is not None:
+                allowed_worker_ids = [
+                    worker_id for worker_id in allowed_worker_ids
+                    if worker_id != excluded_worker_id
+                ]
+        request_id = str(id(request))
+        decision = await self._dynamo_router.best_worker(
+            token_ids,
+            request_id=request_id,
+            update_indexer=True,
+            allowed_worker_ids=allowed_worker_ids,
+        )
+        server = self._worker_id_to_server.get(decision.worker_id)
+        if server is None or server == exclude_server:
+            raise RuntimeError(
+                f"Dynamo selected worker_id={decision.worker_id}, but no eligible TRT-LLM server is mapped"
+            )
+
+        async with self._lock:
+            await self._register_request(server, request)
+            self._request_id_by_obj[id(request)] = request_id
+
+        return server, {
+            "token_lists": [token_ids],
+            "matches": [decision.overlap_blocks * self._tokens_per_block],
+            "dynamo_worker_id": decision.worker_id,
+            "dynamo_dp_rank": decision.dp_rank,
+            "server_info": self._server_info.get(server, {}),
+        }
+
+    async def finish_request(self, request: OpenAIRequest):
+        request_id = None
+        async with self._lock:
+            await self._unregister_request(request)
+            request_id = self._request_id_by_obj.pop(id(request), None)
+        if request_id and self._dynamo_router is not None:
+            await self._dynamo_router.free(request_id)
+
+
 class _BlockHashTrie:
     """Prefix tree mapping block-hash sequences to session IDs.
 
@@ -1360,6 +1608,7 @@ def create_router(
             - "round_robin": Creates a RoundRobinRouter (default)
             - "load_balancing": Creates a LoadBalancingRouter, which balances requests or tokens across instances
             - "kv_cache_aware": Creates a KvCacheAwareRouter, which balances requests across instances additionally based on KV cache hits
+            - "dynamo_kv_cache_aware": Creates a DynamoKvCacheAwareRouter, which delegates KV scoring to Dynamo
         servers: List of server URLs
 
     Returns:
@@ -1372,6 +1621,7 @@ def create_router(
         "round_robin": RoundRobinRouter,
         "load_balancing": LoadBalancingRouter,
         "kv_cache_aware": KvCacheAwareRouter,
+        "dynamo_kv_cache_aware": DynamoKvCacheAwareRouter,
         "conversation": ConversationRouter,
     }
     router_type = router_config.type if router_config else "round_robin"
