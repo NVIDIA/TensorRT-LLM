@@ -118,6 +118,8 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
 
 
 def _skip_if_insufficient_gpus_for_parallel(parallel):
+    if not MODULES_AVAILABLE:
+        pytest.skip("Required modules not available")
     parallel_cfg = ParallelConfig(**parallel)
     required = parallel_cfg.n_workers
     available = torch.cuda.device_count()
