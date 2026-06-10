@@ -205,7 +205,6 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-cuda-graph-off-greedy-batch2-t5-small]
   - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-non-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-enable_request_rate] # negative test
   - test_e2e.py::test_trtllm_bench_help_sanity[meta-llama/Llama-3.1-8B]
   - test_e2e.py::test_openai_chat_harmony
