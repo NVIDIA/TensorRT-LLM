@@ -32,7 +32,7 @@ The value actually consumed by the kernel is **`threshold_scale_factor`**. The k
 
 [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) (ModelOpt) can perform calibration and store metadata for Skip Softmax Attention in the model checkpoint's `config.json`. The checkpoint config provides the formula that maps `target_sparsity` to `threshold_scale_factor`.
 
-This checkpoint config is **optional**. It is only required when using `target_sparsity`, which is often more intuitive than directly choosing the kernel-facing `threshold_scale_factor`. `target_sparsity` only serves as guidance; the actual **achieved** sparsity in the kernel can vary.
+This checkpoint config is **optional**. It is only required when using `target_sparsity`, which is a [0, 1] scalar that is more intuitive than directly choosing the kernel-facing `threshold_scale_factor`. `target_sparsity` only serves as guidance; the actual **achieved** sparsity in the kernel can vary.
 
 Example checkpoint config:
 
