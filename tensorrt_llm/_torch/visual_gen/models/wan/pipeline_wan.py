@@ -85,6 +85,8 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
         "Wan-AI/Wan2.1-T2V-14B-Diffusers",
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8",
+        "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
     ],
     doc="Wan 2.1 & 2.2 text-to-video family.",
 )

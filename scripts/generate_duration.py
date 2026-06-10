@@ -10,6 +10,13 @@ parser.add_argument(
     type=str,
     default="new_test_duration.json",
     help="Path to the output duration file (default: new_test_duration.json)")
+parser.add_argument(
+    "--cluster",
+    type=str,
+    default=None,
+    help="Cluster name (e.g. 'aws_dfw').  When set, writes "
+    "tests/integration/defs/.test_durations_<cluster> relative to the "
+    "repo root instead of --duration-file.")
 args = parser.parse_args()
 
 # Define the directory containing the test result folders
@@ -17,7 +24,12 @@ TEST_RESULTS_DIR = os.getcwd()
 
 # Define the output file paths
 FULL_RESULT_LOG = "full_result.log"
-NEW_TEST_DURATION = args.duration_file
+if args.cluster:
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    NEW_TEST_DURATION = os.path.join(_repo_root, "tests", "integration", "defs",
+                                     f".test_durations_{args.cluster}")
+else:
+    NEW_TEST_DURATION = args.duration_file
 
 # Step 1: Prepare full_result.log
 with open(FULL_RESULT_LOG, 'w') as full_result_file:

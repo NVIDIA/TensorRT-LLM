@@ -191,6 +191,9 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_mxfp4_moe:
+    stage: post_load_fusion
+    expect_mem_change: true  # adds padding for trtllm-gen kernel alignment during weight repack
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
