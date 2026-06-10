@@ -517,8 +517,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     f"Image embedding {index} must be rank 2, got shape {tuple(image_embedding.shape)}"
                 )
 
-        get_prompt_token_ids = getattr(self, "get_prompt_token_ids", None)
-        if not callable(get_prompt_token_ids):
+        build_disagg_prefill_multimodal_inputs = getattr(
+            self, "build_disagg_prefill_multimodal_inputs", None)
+        if not callable(build_disagg_prefill_multimodal_inputs):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support external multimodal embeddings"
             )
@@ -526,7 +527,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mm_handles = [{
             "tensor_size": tuple(image_embedding.shape)
         } for image_embedding in image_embeddings]
-        prompt_token_ids, _, _ = get_prompt_token_ids(inputs, mm_handles)
+        prompt_token_ids = build_disagg_prefill_multimodal_inputs(
+            inputs, mm_handles).prompt_token_ids
 
         mrope_input_ids = torch.tensor(prompt_token_ids,
                                        dtype=torch.long).unsqueeze(0)

@@ -169,6 +169,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     separate timestamp tokens, so each frame is its own (1, h, w) block rather
     than a ``tokens_per_second``-scaled stretch.
     """
+
     def __init__(
         self,
         model_path: str,
