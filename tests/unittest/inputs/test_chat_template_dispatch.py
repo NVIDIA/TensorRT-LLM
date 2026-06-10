@@ -2,6 +2,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for content-format-driven chat template dispatch and placeholder handling."""
 
+import threading
+
 import pytest
 
 from tensorrt_llm.inputs.content_format import ContentFormat
@@ -15,6 +17,7 @@ from tensorrt_llm.inputs.utils import (
     _build_openai_content,
     _resolve_content_format,
     add_multimodal_placeholders,
+    async_apply_chat_template,
     interleave_mm_placeholders,
 )
 
@@ -324,3 +327,33 @@ class TestAddMultimodalPlaceholdersDedup:
         )
         assert result == text
         assert result.count("<image>") == 3
+
+
+class TestAsyncApplyChatTemplate:
+    @pytest.mark.asyncio
+    async def test_runs_in_worker_thread(self):
+        event_loop_thread_id = threading.current_thread().ident
+
+        class TrackingTokenizer:
+            def __init__(self):
+                self.worker_thread_id = None
+
+            def apply_chat_template(self, **_):
+                self.worker_thread_id = threading.current_thread().ident
+                return "rendered"
+
+        tokenizer = TrackingTokenizer()
+
+        result = await async_apply_chat_template(
+            model_type="test_string_model",
+            tokenizer=tokenizer,
+            processor=None,
+            conversation=[ConversationMessage(role="user", content="hello", media=[])],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            chat_template="{{ messages }}",
+        )
+
+        assert result == "rendered"
+        assert tokenizer.worker_thread_id is not None
+        assert tokenizer.worker_thread_id != event_loop_thread_id
