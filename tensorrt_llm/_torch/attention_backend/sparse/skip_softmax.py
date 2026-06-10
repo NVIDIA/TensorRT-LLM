@@ -251,19 +251,11 @@ def skip_softmax_formula_from_ckpt_sparse_attention_config(
     if not isinstance(ckpt_sparse_attention_config, dict):
         return None
 
-    formula = SkipSoftmaxFormula.parse_from_ckpt_sparse_attention_config(
-        ckpt_sparse_attention_config, coefficient_key="prefill"
-    )
-    if formula is not None:
-        return formula
-    formula = SkipSoftmaxFormula.parse_from_ckpt_sparse_attention_config(
-        ckpt_sparse_attention_config, coefficient_key="coefficients"
-    )
-    if formula is not None:
-        return formula
     threshold_config = skip_softmax_threshold_scale_factor_config_from_ckpt_sparse_attention_config(
         ckpt_sparse_attention_config
     )
+    if not isinstance(threshold_config, dict) and "formula" in ckpt_sparse_attention_config:
+        threshold_config = ckpt_sparse_attention_config
     if isinstance(threshold_config, dict):
         return SkipSoftmaxFormula.parse_from_dict(
             threshold_config.get("coefficients"),

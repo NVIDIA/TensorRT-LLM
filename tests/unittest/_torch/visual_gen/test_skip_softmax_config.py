@@ -30,14 +30,12 @@ def _checkpoint_config(
         "targets": ["WanAttention"],
         "threshold_scale_factor": {
             "formula": "exp(log_a + b * target_sparsity)",
-            "prefill": {
+            "coefficients": {
                 "log_a": log_a,
                 "b": b,
             },
         },
-        "target_sparsity": {
-            "prefill": target_sparsity,
-        },
+        "target_sparsity": target_sparsity,
     }
     if ignore is not None:
         group["ignore"] = ignore
@@ -136,6 +134,15 @@ class TestPublicApi:
         )
 
         assert _prefill_threshold(sparse_params) == pytest.approx(7e-5 * math.exp(7.929109 * 0.5))
+
+    def test_checkpoint_phase_target_sparsity_is_rejected(self):
+        checkpoint_config = _checkpoint_config(log_a=math.log(7e-5), b=7.929109)
+        group = checkpoint_config["sparse_attention_config"]["config_groups"]["group_0"]
+        group["target_sparsity"] = {"prefill": 0.5}
+
+        config = SkipSoftmaxAttentionConfig()
+        with pytest.raises(ValueError, match="prefill/decode phase dictionaries are LLM-only"):
+            config.to_sparse_params(checkpoint_config=checkpoint_config)
 
     def test_multiple_checkpoint_skip_softmax_groups_raise(self):
         checkpoint_config = _checkpoint_config(log_a=math.log(7e-5), b=7.929109)
@@ -255,14 +262,12 @@ class TestCheckpointMetadata:
                     "ignore": ["blocks.0.attn1"],
                     "threshold_scale_factor": {
                         "formula": "exp(log_a + b * target_sparsity)",
-                        "prefill": {
+                        "coefficients": {
                             "log_a": -10.0,
                             "b": 2.0,
                         },
                     },
-                    "target_sparsity": {
-                        "prefill": 0.5,
-                    },
+                    "target_sparsity": 0.5,
                 },
             },
         },
