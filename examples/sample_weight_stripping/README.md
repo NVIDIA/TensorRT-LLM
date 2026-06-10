@@ -68,7 +68,7 @@ wget https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/merges.txt
 ```
 
 2. Convert the Hugging Face checkpoint into TensorRT LLM format.
-Run below command lines in [`examples/models/contrib/gpt`](../gptj) directory.
+Run below command lines in [`examples/models/contrib/gptj`](../models/contrib/gptj) directory.
 ```bash
 # Build a float16 checkpoint using HF weights.
 python convert_checkpoint.py --model_dir ./gpt-j-6b \
