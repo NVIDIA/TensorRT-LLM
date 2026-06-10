@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -80,8 +81,13 @@ def autodeploy_config_validator() -> jsonschema.Draft202012Validator:
 
 
 @pytest.fixture(scope="module")
-def disagg_config_validator() -> jsonschema.Draft202012Validator:
-    return _validator(SCHEMA_GENERATOR.generate_disagg_config_schema())
+def disagg_config_schema() -> dict:
+    return SCHEMA_GENERATOR.generate_disagg_config_schema()
+
+
+@pytest.fixture(scope="module")
+def disagg_config_validator(disagg_config_schema) -> jsonschema.Draft202012Validator:
+    return _validator(disagg_config_schema)
 
 
 @pytest.fixture(scope="module")
@@ -261,6 +267,42 @@ def test_disagg_config_schema_accepts_unquoted_env_overrides_in_server_block(
             },
             "generation_servers": {"urls": ["localhost:8002"]},
         }
+    )
+
+
+def _named_parameters(func) -> set[str]:
+    return {
+        name
+        for name, parameter in inspect.signature(func).parameters.items()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+
+
+def test_disagg_config_schema_covers_runtime_yaml_contract(disagg_config_schema):
+    # parse_disagg_config_file calls extract_disagg_cfg(**config), so the
+    # function's named parameters are exactly the recognized top-level YAML
+    # keys. If this test fails, a key was added to (or renamed in) the runtime
+    # without updating generate_disagg_config_schema in
+    # scripts/generate_trtllm_serve_schemas.py.
+    from tensorrt_llm.llmapi.disagg_utils import extract_ctx_gen_cfgs, extract_disagg_cfg
+
+    top_level_keys = _named_parameters(extract_disagg_cfg)
+    missing = top_level_keys - disagg_config_schema["properties"].keys()
+    assert not missing, (
+        f"extract_disagg_cfg accepts top-level YAML key(s) {sorted(missing)} that the "
+        "disagg schema does not declare; update generate_disagg_config_schema."
+    )
+
+    # Server blocks accept extract_ctx_gen_cfgs's named parameters (`type` is
+    # supplied by extract_disagg_cfg itself, not by YAML authors) plus the
+    # `router` key popped by extract_router_config.
+    block_keys = (_named_parameters(extract_ctx_gen_cfgs) - {"type"}) | {"router"}
+    block_properties = disagg_config_schema["$defs"]["DisaggServerBlock"]["properties"]
+    missing = block_keys - block_properties.keys()
+    assert not missing, (
+        f"Disagg server blocks accept YAML key(s) {sorted(missing)} that DisaggServerBlock "
+        "does not declare; update generate_disagg_config_schema."
     )
 
 
