@@ -1,3 +1,5 @@
+import re
+
 import torch
 
 import tensorrt_llm.logger as logger
@@ -59,7 +61,6 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
             # MTP layers are stored as mtp.layers.0.xxx (sublayer 0, Attention) and mtp.layers.1.xxx (sublayer 1, MoE)
             if "mtp.layers." in key:
-                import re
                 match = re.match(r'mtp\.layers\.(\d+)\.(.*)', key)
                 if match:
                     sublayer_idx, rest = match.groups()
@@ -126,7 +127,33 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 if self.config.moe_backend == 'VANILLA':
                     new_weights[key] = weights[name]
                 else:
-                    if "up_proj" in key:
+                    # HF transformers 5.x exposes routed MoE experts as fused
+                    # tensors stacked along dim 0 ([num_experts, ...]) under keys
+                    # ``experts.up_proj`` and ``experts.down_proj`` (no per-expert
+                    # index in the name). The on-disk safetensors checkpoint, by
+                    # contrast, stores per-expert keys (``experts.{i}.up_proj``).
+                    # The VANILLA FusedMoE loader expects per-expert keys, so
+                    # unfuse the 3D HF format here before the standard rename.
+                    val = weights[name]
+                    m = re.match(r"(.*\.mixer\.experts)\.(up_proj|down_proj)$",
+                                 key)
+                    is_hf_fused = (m is not None and isinstance(val, torch.Tensor)
+                                   and val.dim() == 3)
+                    if is_hf_fused:
+                        prefix, sub = m.group(1), m.group(2)
+                        num_experts = val.shape[0]
+                        if sub == "up_proj":
+                            for i in range(num_experts):
+                                w1_k = f"{prefix}.{i}.w1.weight"
+                                w3_k = f"{prefix}.{i}.w3.weight"
+                                # Nemotron-H MoE is non-gated; w3 (gate) is empty.
+                                new_weights[w1_k] = val[i]
+                                new_weights[w3_k] = val[i][:0]
+                        else:  # down_proj
+                            for i in range(num_experts):
+                                w2_k = f"{prefix}.{i}.w2.weight"
+                                new_weights[w2_k] = val[i]
+                    elif "up_proj" in key:
                         w1_key = key.replace("up_proj", "w1")
                         w3_key = key.replace("up_proj", "w3")
                         # Don't need to handle with input_scale and weight_scale_2 since they are scalar for fp8 and nvfp4 models.
