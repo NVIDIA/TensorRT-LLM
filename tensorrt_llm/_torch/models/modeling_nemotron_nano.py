@@ -2861,13 +2861,13 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         for multimodal_param, context_part in zip(multimodal_params, context_parts, strict=True):
             start = multimodal_param.input_ids_start_offset
             end = start + context_part.shape[0]
-            if end > input_ids.shape[0]:
+            if not (0 <= start <= end <= input_ids.shape[0]):
                 raise ValueError(
-                    f"EVS-adjusted context span ([{start}, {end})) exceeds "
-                    f"input_ids length ({input_ids.shape[0]}). This usually means "
-                    "a chunked multimodal request reached merge_evs_mm_embeds "
-                    "without multimodal_runtime metadata, or input_ids_start_offset "
-                    "was not set for this request."
+                    f"EVS-adjusted context span [{start}, {end}) is invalid for "
+                    f"input_ids of length {input_ids.shape[0]} (expected "
+                    "0 <= start <= end <= length). This usually means an incorrect "
+                    "input_ids_start_offset, or a chunked multimodal request reached "
+                    "merge_evs_mm_embeds without multimodal_runtime metadata."
                 )
             input_ids[start:end] = context_part.to(device=input_ids.device, dtype=input_ids.dtype)
 
