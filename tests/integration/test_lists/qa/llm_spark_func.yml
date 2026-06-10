@@ -72,5 +72,3 @@ llm_spark_func:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_2gpus[latency_moe_cutlass_eagle3]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1DistillLlama70B::test_auto_dtype_tp2
-  - accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp8_tp2
-  - accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype_tp2

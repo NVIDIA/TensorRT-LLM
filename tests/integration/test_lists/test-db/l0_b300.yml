@@ -33,6 +33,7 @@ l0_b300:
   - unittest/_torch/modules/test_moe_load_balancer.py
   - unittest/_torch/modules/test_moe_routing.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
+  - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- legacy MoE tests ---------------
   - unittest/_torch/modules/test_fused_moe.py
   # ------------- MoE: test_moe_backend (by backend) ---------------

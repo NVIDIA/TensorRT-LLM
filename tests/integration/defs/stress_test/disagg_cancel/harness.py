@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 # simply aren't passed to the constructor, so the field defaults
 # apply automatically and are not duplicated here.
 _STRESS_CONFIG_COERCERS: dict[str, Callable[[Any], Any]] = {
-    "duration_min": int,
+    "duration_min": float,
     "kv_cache_manager": str,
     "transceiver": str,
     "base_concurrency": int,
@@ -76,7 +76,7 @@ class StressConfig:
     pass them around without re-parsing.
     """
 
-    duration_min: int = 120
+    duration_min: float = 120.0
     kv_cache_manager: str = "v1"  # v1 | v2  (v2 + CPP is invalid)
     transceiver: str = "cpp"  # cpp | python
     base_concurrency: int = 64
@@ -704,6 +704,111 @@ def _tokens_equivalent(returned: Optional[list[int]], reference: Optional[list[i
 
 
 # ---------------------------------------------------------------------------
+# Load-thread helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_token_range(raw: Any, default: tuple[int, int], label: str) -> tuple[int, int]:
+    """Parse a YAML ``input_length`` mapping into a `(min_tokens, max_tokens)` tuple."""
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError(f"{label} must be a mapping with min_tokens/max_tokens, got {raw!r}")
+    try:
+        min_tokens = int(raw.get("min_tokens", default[0]))
+        max_tokens = int(raw.get("max_tokens", default[1]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} min_tokens/max_tokens must be integers: {raw!r}") from exc
+    if min_tokens <= 0 or max_tokens < min_tokens:
+        raise ValueError(
+            f"{label} must satisfy 0 < min_tokens <= max_tokens, got {min_tokens}/{max_tokens}"
+        )
+    return min_tokens, max_tokens
+
+
+def _parse_cancel_after_range(raw: Any) -> tuple[float, float]:
+    """Parse optional ``cancel_after_range`` config; default to existing test values."""
+    default = (0.01, 0.1)
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError(f"cancel_after_range must be a mapping, got {raw!r}")
+    try:
+        min_s = float(raw.get("min_s", raw.get("min", default[0])))
+        max_s = float(raw.get("max_s", raw.get("max", default[1])))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"cancel_after_range min/max must be numbers: {raw!r}") from exc
+    if min_s < 0.0 or max_s < min_s:
+        raise ValueError(f"cancel_after_range must satisfy 0 <= min <= max, got {min_s}/{max_s}")
+    return min_s, max_s
+
+
+def _load_iteration_shape(config: StressConfig, elapsed_s: float) -> dict[str, Any]:
+    """Return the load shape that should run at ``elapsed_s``.
+
+    Bursts start after the first full ``bursts.interval_min`` period,
+    then repeat every interval. This keeps the marathon from starting
+    immediately in burst mode and preserves a steady-state baseline at
+    T+0.
+    """
+    steady_prompt_range = _parse_token_range(
+        config.raw.get("input_length"), (4096, 12288), "stress_config.input_length"
+    )
+    if config.base_concurrency <= 0:
+        raise ValueError(
+            f"stress_config.base_concurrency must be positive, got {config.base_concurrency}"
+        )
+    shape: dict[str, Any] = {
+        "mode": "steady",
+        "requests_per_burst": config.base_concurrency,
+        "prompt_len_range": steady_prompt_range,
+    }
+
+    bursts = config.raw.get("bursts")
+    if bursts is None:
+        return shape
+    if not isinstance(bursts, dict):
+        raise ValueError("stress_config.bursts must be a mapping")
+
+    try:
+        interval_s = float(bursts.get("interval_min", 0.0)) * 60.0
+        duration_s = float(bursts.get("duration_s", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stress_config.bursts interval_min/duration_s must be numbers") from exc
+
+    if interval_s <= 0.0:
+        raise ValueError(
+            f"stress_config.bursts.interval_min must be positive, got {bursts.get('interval_min')!r}"
+        )
+    if duration_s <= 0.0:
+        raise ValueError(
+            f"stress_config.bursts.duration_s must be positive, got {bursts.get('duration_s')!r}"
+        )
+    if elapsed_s < interval_s:
+        return shape
+
+    offset_s = elapsed_s % interval_s
+    if offset_s >= duration_s:
+        return shape
+
+    try:
+        requests_per_burst = int(bursts.get("concurrency", config.base_concurrency))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stress_config.bursts.concurrency must be an integer") from exc
+    if requests_per_burst <= 0:
+        raise ValueError(
+            f"stress_config.bursts.concurrency must be positive, got {requests_per_burst}"
+        )
+    return {
+        "mode": "burst",
+        "requests_per_burst": requests_per_burst,
+        "prompt_len_range": _parse_token_range(
+            bursts.get("input_length"), steady_prompt_range, "stress_config.bursts.input_length"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
 
@@ -742,6 +847,8 @@ class DisaggCancellationStressHarness:
         injector_poll_interval_s: float = 1.0,
         canary_request_timeout_s: float = 10.0,
         canary_interval_s: Optional[float] = None,
+        load_duration_s: Optional[float] = None,
+        load_iteration_pause_s: float = 0.05,
     ) -> None:
         """Construct a marathon harness.
 
@@ -773,6 +880,14 @@ class DisaggCancellationStressHarness:
                 gap between requests. `None` derives from
                 `canary.rate_per_min` (`60 / rate_per_min`); tests
                 pass a small value.
+            load_duration_s: Optional override (seconds) for the load
+                loop duration. `None` derives from `duration_min`;
+                tests pass a small value.
+            load_iteration_pause_s: Minimum pause between load
+                generator calls. Keeps the wrapper from busy-spinning
+                when the injected load runner returns immediately in
+                unit tests; the production generator already spends
+                most of its time in HTTP requests.
 
         Raises:
             ValueError: If the YAML is malformed or its
@@ -794,6 +909,8 @@ class DisaggCancellationStressHarness:
         self._injector_poll_interval_s: float = injector_poll_interval_s
         self._canary_request_timeout_s: float = canary_request_timeout_s
         self._canary_interval_s: Optional[float] = canary_interval_s
+        self._load_duration_s: Optional[float] = load_duration_s
+        self._load_iteration_pause_s: float = load_iteration_pause_s
 
         # Cluster + worker tracking (populated by setup()).
         self._cluster: Any = None  # tuple returned by setup_disagg_cluster
@@ -818,6 +935,7 @@ class DisaggCancellationStressHarness:
         self._canary_records: list[dict[str, Any]] = []
         self._kv_utilization_samples: list[dict[str, Any]] = []
         self._injection_events: list[dict[str, Any]] = []
+        self._load_records: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -872,10 +990,9 @@ class DisaggCancellationStressHarness:
     def start(self) -> None:
         """Spawn the five worker threads. Returns immediately.
 
-        Stub stage: each thread body is a no-op that returns
-        immediately. The load-thread stub signals ``stop_event`` on
-        exit so the lifecycle smoke ``start() -> wait_until_done() ->
-        stop()`` completes cleanly without waiting out the
+        If ``setup()`` has not bound a live server endpoint yet, the
+        load thread warns and signals ``stop_event`` so the lifecycle
+        smoke still completes cleanly without waiting out the
         ``wait_until_done`` timeout.
         """
         self._marathon_start_monotonic = time.monotonic()
@@ -1008,6 +1125,7 @@ class DisaggCancellationStressHarness:
             for the caller to mutate without affecting the harness):
 
             - ``canary_records``: per-canary request outcomes.
+            - ``load_records``: per-load-generator call outcomes.
             - ``kv_utilization_samples``: timestamped KV-cache
               utilization scrapes from the metrics thread.
             - ``injection_events``: SIGSTOP / SIGCONT / SIGKILL
@@ -1018,6 +1136,7 @@ class DisaggCancellationStressHarness:
         """
         return {
             "canary_records": list(self._canary_records),
+            "load_records": list(self._load_records),
             "kv_utilization_samples": list(self._kv_utilization_samples),
             "injection_events": list(self._injection_events),
             "failure_reason": self.failure_reason,
@@ -1030,17 +1149,120 @@ class DisaggCancellationStressHarness:
     def _load_thread_body(self) -> None:
         """Wrap ``run_cancel_stress_test`` in a duration-bounded loop.
 
-        Stub: no-op that immediately signals end-of-marathon via
-        ``stop_event``. The real implementation loops until either
-        ``duration_min`` elapses or ``stop_event`` is set, calling
-        ``run_cancel_stress_test`` repeatedly; at end-of-marathon it
-        sets ``stop_event`` so the other four threads wind down.
-        Setting ``stop_event`` here in the stub preserves that
-        downstream contract and lets ``wait_until_done`` return
-        cleanly from the lifecycle smoke.
+        Loops until ``duration_min`` elapses or a stop/fail-fast
+        event is set. Each loop iteration picks the current steady
+        or burst load shape from ``stress_config``, runs one burst of
+        the existing disagg cancellation load generator, and appends
+        a record to ``_load_records`` for later correlation with
+        canary/metrics/injection observations.
+
+        At normal end-of-marathon, the load thread sets
+        ``stop_event`` so the other four threads wind down.
         """
-        logger.debug("[load_thread] stub — exiting and signalling stop_event")
-        self.stop_event.set()
+        if not self._server_url:
+            logger.warning("[load_thread] no server endpoint bound (setup() not wired); exiting")
+            self.stop_event.set()
+            return
+
+        duration_s = (
+            self._load_duration_s
+            if self._load_duration_s is not None
+            else float(self.config.duration_min) * 60.0
+        )
+        if duration_s <= 0.0:
+            logger.info("[load_thread] non-positive duration %.3fs; exiting", duration_s)
+            self.stop_event.set()
+            return
+
+        try:
+            cancel_after_range = _parse_cancel_after_range(
+                self.config.raw.get("cancel_after_range")
+            )
+        except ValueError as exc:
+            self.mark_failed(f"load_thread config error: {exc}")
+            return
+
+        deadline = time.monotonic() + duration_s
+        logger.info(
+            "[load_thread] running for %.1fs against %s (base_concurrency=%d)",
+            duration_s,
+            self._server_url,
+            self.config.base_concurrency,
+        )
+
+        try:
+            while (
+                time.monotonic() < deadline
+                and not self.stop_event.is_set()
+                and not self.failed_event.is_set()
+            ):
+                iteration_start = time.monotonic()
+                elapsed_s = iteration_start - self._marathon_start_monotonic
+                try:
+                    shape = _load_iteration_shape(self.config, elapsed_s)
+                except ValueError as exc:
+                    self.mark_failed(f"load_thread config error: {exc}")
+                    break
+
+                record: dict[str, Any] = {
+                    "timestamp": time.time(),
+                    "elapsed_s": elapsed_s,
+                    "mode": shape["mode"],
+                    "num_bursts": 1,
+                    "requests_per_burst": shape["requests_per_burst"],
+                    "prompt_len_range": shape["prompt_len_range"],
+                    "cancel_after_range": cancel_after_range,
+                    "success": False,
+                    "error": None,
+                }
+                try:
+                    self._run_cancel_stress_iteration(
+                        server_url=self._server_url,
+                        num_bursts=1,
+                        requests_per_burst=shape["requests_per_burst"],
+                        prompt_len_range=shape["prompt_len_range"],
+                        cancel_after_range=cancel_after_range,
+                    )
+                    record["success"] = True
+                except Exception as exc:
+                    record["error"] = f"{type(exc).__name__}: {exc}"
+                    self.mark_failed(f"load_thread runner failed: {record['error']}")
+                    break
+                finally:
+                    record["duration_s"] = time.monotonic() - iteration_start
+                    self._load_records.append(record)
+
+                pause_s = min(self._load_iteration_pause_s, max(0.0, deadline - time.monotonic()))
+                if pause_s > 0.0:
+                    self.stop_event.wait(timeout=pause_s)
+        finally:
+            if not self.failed_event.is_set():
+                logger.info("[load_thread] completed; signalling stop_event")
+                self.stop_event.set()
+
+    def _run_cancel_stress_iteration(
+        self,
+        *,
+        server_url: str,
+        num_bursts: int,
+        requests_per_burst: int,
+        prompt_len_range: tuple[int, int],
+        cancel_after_range: tuple[float, float],
+    ) -> None:
+        """Run one call to the shared disaggregated cancellation load generator.
+
+        Kept as a method so unit tests can monkeypatch it without
+        importing the heavyweight disaggregated integration module.
+        """
+        from test_disaggregated import run_cancel_stress_test
+
+        run_cancel_stress_test(
+            server_url,
+            num_bursts=num_bursts,
+            requests_per_burst=requests_per_burst,
+            prompt_len_range=prompt_len_range,
+            cancel_after_range=cancel_after_range,
+        )
 
     def _canary_thread_body(self) -> None:
         """Send greedy canaries and append per-request records to `_canary_records`.

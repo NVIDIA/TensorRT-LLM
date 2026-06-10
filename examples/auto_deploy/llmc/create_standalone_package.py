@@ -185,6 +185,10 @@ EXCLUDE_TEST_FILES = {
     # Imports utils.util.skip_pre_blackwell (not shipped in standalone) and exercises
     # fuse_finegrained_fp8_swiglu which depends on TRT-LLM runtime.
     "test_finegrained_fp8_swiglu.py",
+    # Exercise trtllm-gen MXFP4 MoE kernels (Blackwell-only) and import the
+    # prepare_trtllm_gen_moe_mxfp4_weights / utils.util helpers not in standalone.
+    "test_fuse_mxfp4_moe.py",
+    "test_trtllm_quant_mxfp4_trtllm_gen_moe.py",
 }
 
 # Import path rewrite: old -> new (applied to test files only).

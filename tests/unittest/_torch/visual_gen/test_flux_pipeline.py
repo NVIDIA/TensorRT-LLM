@@ -176,7 +176,7 @@ class TestFluxPipelineLoading:
         assert pipeline is not None
         assert hasattr(pipeline, "transformer")
         assert pipeline.transformer is not None
-        assert pipeline.model_config.attention.backend == "VANILLA"
+        assert pipeline.pipeline_config.attention.backend == "VANILLA"
 
         del pipeline
         gc.collect()
@@ -210,7 +210,7 @@ class TestFluxPipelineLoading:
 
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
-        assert pipeline.model_config.attention.backend == backend
+        assert pipeline.pipeline_config.attention.backend == backend
 
         del pipeline
         gc.collect()
@@ -236,7 +236,7 @@ class TestFluxQuantization:
 
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
-        assert pipeline.model_config.quant_config.quant_algo is not None
+        assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
         # Count quantized Linear layers and verify FP8 weights
         quant_count = 0
@@ -277,7 +277,7 @@ class TestFluxQuantization:
 
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
-        assert pipeline.model_config.quant_config.quant_algo is not None
+        assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
         quant_count = 0
         found_fp8 = False
@@ -1157,7 +1157,7 @@ def _run_all_optimizations_worker(
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
-        assert pipeline.model_config.visual_gen_mapping.ulysses_size == world_size, (
+        assert pipeline.pipeline_config.visual_gen_mapping.ulysses_size == world_size, (
             "Ulysses parallel not enabled"
         )
         assert transformer.model_config.quant_config.quant_algo == QuantAlgo.FP8, "FP8 not enabled"

@@ -26,6 +26,7 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
@@ -641,10 +642,9 @@ class Cosmos3LanguageModel(nn.Module):
         return cached_kv
 
 
-class Cosmos3VFMTransformer(nn.Module):
+class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
-        super().__init__()
-        self.model_config = model_config
+        super().__init__(model_config)
         pretrained_config = model_config.pretrained_config
 
         self.hidden_size = pretrained_config.hidden_size

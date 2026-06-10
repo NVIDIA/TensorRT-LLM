@@ -41,6 +41,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     AdaLayerNormContinuous,
     _remap_checkpoint_keys,
 )
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -417,7 +418,7 @@ class Flux2SingleTransformerBlock(nn.Module):
 # =============================================================================
 
 
-class Flux2Transformer2DModel(nn.Module):
+class Flux2Transformer2DModel(BaseDiffusionModel):
     """FLUX.2 Transformer model for image generation (Native TRT-LLM).
 
     This implements the full FLUX.2 architecture matching HuggingFace diffusers:
@@ -433,8 +434,7 @@ class Flux2Transformer2DModel(nn.Module):
         Args:
             model_config: DiffusionModelConfig instance (from DiffusionModelLoader)
         """
-        super().__init__()
-        self.model_config = model_config
+        super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 48)
