@@ -62,6 +62,7 @@ _HELPERS_DIR = str(Path(__file__).resolve().parents[3] / "_utils_test")
 if _HELPERS_DIR not in sys.path:
     sys.path.insert(0, _HELPERS_DIR)
 
+from _deterministic_routing import DeterministicMoeRoutingMode  # noqa: E402
 from _sharding_ir_helpers import (  # noqa: E402
     build_eagle_draft_model,
     build_ir_model,
@@ -69,7 +70,6 @@ from _sharding_ir_helpers import (  # noqa: E402
     build_random_prefill_inputs,
     extract_draft_output,
     extract_logits,
-    fix_moe_routers_deterministic,
     random_init_with_seed,
     spec_from_modeling_file,
 )
@@ -235,16 +235,10 @@ def _run_equivalence_job_impl(
     # MoE top-k routing is a non-smooth ``argmax`` whose decisions can flip
     # under bf16 reduction-order noise -- producing per-token O(absmax) errors
     # that look like sharding bugs but are really finite-precision artifacts.
-    # Override the router weights / biases (and Qwen3.5-MoE's bias-less
-    # router's forward) so top-k always picks experts ``[0..top_k-1]``
-    # regardless of input. Routing decisions then become rock-stable across
-    # ranks and precisions; only true sharding bugs cause output drift.
-    n_routers_fixed = fix_moe_routers_deterministic(model)
-    if rank == 0 and n_routers_fixed > 0:
-        print(
-            f"[sharding-ir-eq] fixed {n_routers_fixed} MoE router(s) to deterministic top-k",
-            flush=True,
-        )
+    # The forward calls below are wrapped in ``DeterministicMoeRoutingMode``
+    # which intercepts ``aten.topk`` / ``trtllm.noaux_tc_op`` /
+    # ``auto_deploy.torch_moe_router`` and forces every routing decision to
+    # pick experts ``[0..top_k-1]``. Model state is left untouched.
 
     # ------------------------------------------------------------------
     # 2. Build random prefill inputs and snapshot the unsharded weights.
@@ -392,12 +386,18 @@ def _run_equivalence_job_impl(
     #   and concatenate into the full-batch order to compare against the
     #   replicated unsharded reference.
     # ------------------------------------------------------------------
-    with torch.inference_mode():
+    with torch.inference_mode(), DeterministicMoeRoutingMode():
         # Call the exported GMs with the same kwarg convention used at
         # export time (see step 3 above). The GM's traced forward signature
         # mirrors the export call, and calling by name keeps it that way --
         # we never reintroduce a positional dependency that would tie this
         # test back to ``forward()`` parameter ordering.
+        #
+        # ``DeterministicMoeRoutingMode`` intercepts MoE-routing ops
+        # (``aten.topk`` / ``trtllm.noaux_tc_op`` / ``auto_deploy.torch_moe_router``)
+        # to force every routing decision to pick experts ``[0..top_k-1]`` --
+        # see the docstring of that class for the rationale. Both forwards run
+        # inside the same ``with`` block so they see identical routing.
         y_unsharded = extract_logits(gm_unsharded(input_ids=input_ids, position_ids=position_ids))
         y_local = extract_logits(
             gm_sharded(input_ids=local_in_for_export, position_ids=local_pos_for_export)
@@ -534,13 +534,8 @@ def _run_eagle_draft_equivalence_job_impl(
     # 1. Build tiny Eagle draft with deterministic random weights.
     model = build_eagle_draft_model(model_type, device=device, dtype=FORWARD_DTYPE)
     random_init_with_seed(model, seed=WEIGHT_SEED, std=INIT_STD)
-    # NemotronH MTP draft has a MoE ('E') layer -> stabilize its router top-k.
-    n_routers_fixed = fix_moe_routers_deterministic(model)
-    if rank == 0 and n_routers_fixed > 0:
-        print(
-            f"[sharding-ir-eq] fixed {n_routers_fixed} MoE router(s) to deterministic top-k",
-            flush=True,
-        )
+    # NemotronH MTP draft has a MoE ('E') layer; routing stability is enforced
+    # by ``DeterministicMoeRoutingMode`` wrapping the forward calls below.
 
     hidden_size = int(model.config.hidden_size)
 
@@ -600,9 +595,11 @@ def _run_eagle_draft_equivalence_job_impl(
     missing, _ = gm_sharded.load_state_dict(sd_snapshot, strict=False)
     assert not missing, f"Missing keys when loading sharded state_dict: {missing[:5]}"
 
-    # 6. Forward both and compare via relative RMSE.
+    # 6. Forward both and compare via relative RMSE. Both run inside
+    #    ``DeterministicMoeRoutingMode`` so MoE-routing decisions in the
+    #    NemotronH MTP draft are stable across sharded/unsharded paths.
     rel_rmse_tol = float(os.environ.get("SHARDING_IR_REL_RMSE_TOL", REL_RMSE_TOL))
-    with torch.inference_mode():
+    with torch.inference_mode(), DeterministicMoeRoutingMode():
         y_unsharded = extract_draft_output(gm_unsharded(**full_kwargs))
         y_local = extract_draft_output(gm_sharded(**local_kwargs))
         if enable_attention_dp:
