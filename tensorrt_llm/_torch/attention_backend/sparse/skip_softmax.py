@@ -25,7 +25,7 @@ pipelines.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 import numexpr
 import torch
@@ -57,34 +57,39 @@ def _looks_like_skip_softmax_group(group: Dict[str, Any]) -> bool:
     )
 
 
-def skip_softmax_config_groups_from_ckpt_sparse_attention_config(
+def skip_softmax_config_from_ckpt_sparse_attention_config(
     ckpt_sparse_attention_config: Optional[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Return skip-softmax groups from checkpoint ``sparse_attention_config``."""
+) -> Optional[Dict[str, Any]]:
+    """Return the skip-softmax config from checkpoint ``sparse_attention_config``."""
     if not isinstance(ckpt_sparse_attention_config, dict):
-        return []
+        return None
 
     config_groups = ckpt_sparse_attention_config.get("config_groups")
     if isinstance(config_groups, dict):
-        return [
+        groups = [
             group
             for group in config_groups.values()
             if isinstance(group, dict) and _is_skip_softmax_group(group)
         ]
+        if len(groups) > 1:
+            raise ValueError(
+                "checkpoint sparse_attention_config contains multiple skip-softmax "
+                "config groups; expected at most one."
+            )
+        return groups[0] if groups else None
 
     if _looks_like_skip_softmax_group(ckpt_sparse_attention_config):
-        return [ckpt_sparse_attention_config]
-    return []
+        return ckpt_sparse_attention_config
+    return None
 
 
 def skip_softmax_threshold_scale_factor_config_from_ckpt_sparse_attention_config(
     ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Return the first skip-softmax calibration formula config."""
-    for group in skip_softmax_config_groups_from_ckpt_sparse_attention_config(
-        ckpt_sparse_attention_config
-    ):
-        threshold_config = group.get("threshold_scale_factor")
+    """Return the skip-softmax calibration formula config."""
+    config = skip_softmax_config_from_ckpt_sparse_attention_config(ckpt_sparse_attention_config)
+    if isinstance(config, dict):
+        threshold_config = config.get("threshold_scale_factor")
         if isinstance(threshold_config, dict):
             return threshold_config
     return None
@@ -94,10 +99,9 @@ def skip_softmax_target_sparsity_from_ckpt_sparse_attention_config(
     ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> Optional[Union[float, Dict[str, float]]]:
     """Return checkpoint-provided skip-softmax target sparsity, if present."""
-    for group in skip_softmax_config_groups_from_ckpt_sparse_attention_config(
-        ckpt_sparse_attention_config
-    ):
-        target_sparsity = group.get("target_sparsity")
+    config = skip_softmax_config_from_ckpt_sparse_attention_config(ckpt_sparse_attention_config)
+    if isinstance(config, dict):
+        target_sparsity = config.get("target_sparsity")
         if isinstance(target_sparsity, dict):
             return {str(k): float(v) for k, v in target_sparsity.items()}
         if isinstance(target_sparsity, (float, int)):
@@ -109,10 +113,9 @@ def skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
     ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> Optional[float]:
     """Return checkpoint-provided normalized timestep cutoff, if present."""
-    for group in skip_softmax_config_groups_from_ckpt_sparse_attention_config(
-        ckpt_sparse_attention_config
-    ):
-        disabled_until_timestep = group.get("disabled_until_timestep")
+    config = skip_softmax_config_from_ckpt_sparse_attention_config(ckpt_sparse_attention_config)
+    if isinstance(config, dict):
+        disabled_until_timestep = config.get("disabled_until_timestep")
         if isinstance(disabled_until_timestep, (float, int)):
             return float(disabled_until_timestep)
     return None
@@ -235,10 +238,9 @@ def skip_softmax_ignore_from_ckpt_sparse_attention_config(
 
     if isinstance(ckpt_sparse_attention_config, dict):
         _extend(ckpt_sparse_attention_config.get("ignore"))
-    for group in skip_softmax_config_groups_from_ckpt_sparse_attention_config(
-        ckpt_sparse_attention_config
-    ):
-        _extend(group.get("ignore"))
+    config = skip_softmax_config_from_ckpt_sparse_attention_config(ckpt_sparse_attention_config)
+    if isinstance(config, dict) and config is not ckpt_sparse_attention_config:
+        _extend(config.get("ignore"))
     return ignore or None
 
 

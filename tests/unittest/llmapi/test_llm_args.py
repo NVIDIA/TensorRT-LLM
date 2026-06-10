@@ -2366,8 +2366,8 @@ class TestSkipSoftmaxAttentionConfig:
     """
 
     # Checkpoint calibration metadata lives under sparse_attention_config
-    # config groups. The runtime searches the groups instead of assuming a
-    # fixed group name.
+    # config groups. Skip-softmax reads the single matching group instead of
+    # assuming a fixed group name.
     CHECKPOINT_CONFIG: ClassVar[dict] = {
         "sparse_attention_config": {
             "config_groups": {
@@ -2470,6 +2470,20 @@ class TestSkipSoftmaxAttentionConfig:
             100.0 * math.exp(5.0 * 0.5))
         assert params.threshold_scale_factor_decode == pytest.approx(
             0.05 * math.exp(10.0 * 0.5))
+
+    def test_multiple_skip_softmax_groups_raise(self):
+        import copy
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        checkpoint_config = copy.deepcopy(self.CHECKPOINT_CONFIG)
+        groups = checkpoint_config["sparse_attention_config"]["config_groups"]
+        groups["group_1"] = copy.deepcopy(groups["group_0"])
+
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+        with pytest.raises(ValueError, match="multiple skip-softmax"):
+            cfg.to_sparse_params(checkpoint_config=checkpoint_config
+                                 ).scheduler.get_kernel_params()
 
     def test_resolve_without_formula_raises(self):
         # Doc: target_sparsity is unusable if the checkpoint ships no formula.
