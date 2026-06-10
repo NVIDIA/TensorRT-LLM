@@ -19,7 +19,7 @@
 #include <string>
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 
 TRTLLM_NAMESPACE_BEGIN
 

@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
-#include "compileEngine.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/compileEngine.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
@@ -31,6 +31,24 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+template <>
+void DecoderXQAImpl::run(
+    XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream)
+{
+    runWithKVLinearBuffer(xqa_params, kv_linear_buffer, stream);
+}
+
+template <>
+void DecoderXQAImpl::run(XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream)
+{
+    runWithKVBlockArray(xqa_params, kv_block_array, stream);
+}
+
+std::unique_ptr<DecoderXQAImpl> DecoderXQAImpl::create(DecoderXQARunner* runner)
+{
+    return std::make_unique<DecoderXQAImplJIT>(runner);
+}
 
 DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
     : DecoderXQAImpl(runner)

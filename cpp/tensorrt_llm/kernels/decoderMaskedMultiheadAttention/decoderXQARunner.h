@@ -23,7 +23,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/cubinObjRegistry.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/gptKernels.h"

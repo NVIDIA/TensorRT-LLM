@@ -26,7 +26,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
