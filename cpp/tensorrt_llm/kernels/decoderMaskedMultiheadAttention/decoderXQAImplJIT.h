@@ -37,16 +37,19 @@ class DecoderXQARunnerResource;
  *
  * XQA kernels are compiled on the fly via NVRTC.
  */
-class DecoderXQAImpl
+class DecoderXQAImplJIT
 {
 public:
     // TODO: shouldUse()/prepare() should be templated with KVCacheBuffer.
     // Whether it is beneficial to use this XQA codepath.
     //
     // forConfigurePlugin: whether this method is called in configure plugin phase.
-    virtual bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin) = 0;
+    DecoderXQAImplJIT(DecoderXQARunner* runner);
+
+    bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin);
     // Prepares for the kernel running. Must be called before calling run.
-    virtual void prepare(XQAParams const& xqa_params) = 0;
+    void prepare(XQAParams const& xqaParams);
+
     // Run XQA kernel with KVCacheBuffer.
     //
     // Sub-classes should implement runWithKVLinearBuffer and runWithKVBlockArray.
@@ -54,43 +57,19 @@ public:
     void run(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
 
     // Needs runner pointer for accessing resources in DecoderXQARunner class.
-    static std::unique_ptr<DecoderXQAImpl> create(DecoderXQARunner* runner);
+    static std::unique_ptr<DecoderXQAImplJIT> create(DecoderXQARunner* runner);
 
-    virtual ~DecoderXQAImpl() = default;
-
-protected:
-    DecoderXQAImpl(DecoderXQARunner* runner)
-        : mRunner(runner)
-    {
-    }
-
-    virtual void runWithKVLinearBuffer(
-        XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream)
-        = 0;
-    virtual void runWithKVBlockArray(
-        XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream)
-        = 0;
-
-    DecoderXQARunner* mRunner;
-};
-
-class DecoderXQAImplJIT : public DecoderXQAImpl
-{
-public:
-    DecoderXQAImplJIT(DecoderXQARunner* runner);
-
-    bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin) override;
-    void prepare(XQAParams const& xqaParams) override;
-
-    ~DecoderXQAImplJIT() override = default;
+    ~DecoderXQAImplJIT() = default;
 
 protected:
     void runWithKVLinearBuffer(
-        XQAParams const& xqaParams, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream) override;
+        XQAParams const& xqaParams, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream);
     void runWithKVBlockArray(
-        XQAParams const& xqaParams, KVBlockArray const& kv_block_array, cudaStream_t const& stream) override;
+        XQAParams const& xqaParams, KVBlockArray const& kv_block_array, cudaStream_t const& stream);
 
 private:
+    DecoderXQARunner* mRunner;
+
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     std::shared_ptr<DecoderXQARunnerResource> mResource;
 

@@ -33,25 +33,25 @@ namespace kernels
 {
 
 template <>
-void DecoderXQAImpl::run(
+void DecoderXQAImplJIT::run(
     XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream)
 {
     runWithKVLinearBuffer(xqa_params, kv_linear_buffer, stream);
 }
 
 template <>
-void DecoderXQAImpl::run(XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream)
+void DecoderXQAImplJIT::run(XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream)
 {
     runWithKVBlockArray(xqa_params, kv_block_array, stream);
 }
 
-std::unique_ptr<DecoderXQAImpl> DecoderXQAImpl::create(DecoderXQARunner* runner)
+std::unique_ptr<DecoderXQAImplJIT> DecoderXQAImplJIT::create(DecoderXQARunner* runner)
 {
     return std::make_unique<DecoderXQAImplJIT>(runner);
 }
 
 DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
-    : DecoderXQAImpl(runner)
+    : mRunner(runner)
     , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
     , mResource(DecoderXQARunner::getResourceGlobal())
     , mForceXQA(tensorrt_llm::common::forceXQAKernels())

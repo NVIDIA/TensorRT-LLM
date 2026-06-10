@@ -45,14 +45,14 @@ DecoderXQARunner::DecoderXQARunner(
 {
     mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-    // This assignment must be the last line of this constructor. DecoderXQAImpl::create() relies on *this being fully
-    // initialized.
-    mJITImpl = DecoderXQAImpl::create(this);
+    // This assignment must be the last line of this constructor. DecoderXQAImplJIT::create() relies on *this being
+    // fully initialized.
+    mJITImpl = DecoderXQAImplJIT::create(this);
 }
 
 DecoderXQARunner::~DecoderXQARunner() = default;
 
-DecoderXQAImpl* DecoderXQARunner::getImpl()
+DecoderXQAImplJIT* DecoderXQARunner::getImpl()
 {
     return mJITImpl.get();
 }

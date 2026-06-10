@@ -82,8 +82,8 @@ private:
     bool mMultiBlockMode;
     int mMultiProcessorCount;
 
-    std::unique_ptr<DecoderXQAImpl> mJITImpl;
-    DecoderXQAImpl* getImpl();
+    std::unique_ptr<DecoderXQAImplJIT> mJITImpl;
+    DecoderXQAImplJIT* getImpl();
 
     friend DecoderXQAImplJIT;
 };
