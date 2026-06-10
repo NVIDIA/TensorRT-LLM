@@ -109,17 +109,16 @@ void DecoderXQARunner::prepare(XQAParams const& umbrellaXQAParams)
     }
 }
 
-template <>
-void DecoderXQARunner::run(XQAParams const& xqaParams, KVLinearBuffer const& kvLinearBuffer, cudaStream_t const& stream)
+template <typename KVCacheBuffer>
+void DecoderXQARunner::run(XQAParams const& xqaParams, KVCacheBuffer const& kvCacheBuffer, cudaStream_t const& stream)
 {
-    runDispatchKVCacheBuffer<KVLinearBuffer>(xqaParams, kvLinearBuffer, stream);
+    runDispatchKVCacheBuffer<KVCacheBuffer>(xqaParams, kvCacheBuffer, stream);
 }
 
-template <>
-void DecoderXQARunner::run(XQAParams const& xqaParams, KVBlockArray const& kvBlockArray, cudaStream_t const& stream)
-{
-    runDispatchKVCacheBuffer<KVBlockArray>(xqaParams, kvBlockArray, stream);
-}
+template void DecoderXQARunner::run(
+    XQAParams const& xqaParams, KVLinearBuffer const& kvCacheBuffer, cudaStream_t const& stream);
+template void DecoderXQARunner::run(
+    XQAParams const& xqaParams, KVBlockArray const& kvCacheBuffer, cudaStream_t const& stream);
 
 std::shared_ptr<DecoderXQARunnerResource> DecoderXQARunner::getResourceGlobal()
 {
