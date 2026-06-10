@@ -30,6 +30,7 @@ LLM_ROOT = "llm"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
+ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -899,6 +900,11 @@ def getPytestBaseCommandLine(
         portEnvVars = "CONTAINER_PORT_START=${containerPortStart} CONTAINER_PORT_NUM=${containerPortNum}"
     }
 
+    def jUnitLogging = "out-err"
+    if (ENABLE_UPLOAD_TEST_RESULTS) {
+        jUnitLogging = "all"
+    }
+
     def testCmdLine = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
@@ -919,7 +925,7 @@ def getPytestBaseCommandLine(
         "--waives-file=${waivesFilePath}",
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
-        "-o junit_logging=out-err",
+        "-o junit_logging=${jUnitLogging}",
         "--cov=${llmSrc}/examples/",
         "--cov=${llmSrc}/tensorrt_llm/",
         "--cov=${trtllmWheelPath}/tensorrt_llm/",
@@ -1000,7 +1006,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
-        withCredentials([string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN')]) {
+        withCredentials([
+            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
+            string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
+        ]) {
             CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
@@ -1024,6 +1033,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
             def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
+            def s3SecretKeyPathLocal = Utils.createTempLocation(pipeline, "./s3_secret_key")
+            def s3SecretKeyPathNode = "${jobWorkspace}/s3_secret_key"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
@@ -1091,6 +1102,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     waivesListPathNode
                 )
 
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    pipeline.writeFile(file: s3SecretKeyPathLocal, text: S3_SECRET_KEY)
+                    // Preserve the secret file mode through scp -p instead of issuing
+                    // an extra remote chmod, which adds another flaky SSH round trip.
+                    Utils.exec(pipeline, script: "chmod 600 ${s3SecretKeyPathLocal}")
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        s3SecretKeyPathLocal,
+                        s3SecretKeyPathNode
+                    )
+                }
+
                 // generate .coveragerc in workspace and add file path to pytest command
                 sh """
                     touch ./.coveragerc
@@ -1114,12 +1138,27 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
+                def uploadPath = "${env.JOB_NAME}/${env.BUILD_NUMBER}"
 
                 def clusterDurationsArgsNode = []
                 if (useClusterDurations) {
                     def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
                     def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
                     clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                }
+                def extraArgs = [
+                    "--test-list=$testListPathNode",
+                    "--splitting-algorithm least_duration",
+                    "--splits $splits",
+                    "--group $splitId",
+                    *clusterDurationsArgsNode,
+                ]
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    extraArgs += [
+                        "-s",
+                        "--s3-upload-path=${uploadPath}/${stageName}",
+                        "--s3-echo-stdout",
+                    ]
                 }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
@@ -1130,13 +1169,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "__PLACEHOLDER_TRTLLM_WHL_PATH__",
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
-                    [
-                      "--test-list=$testListPathNode",
-                      "--splitting-algorithm least_duration",
-                      "--splits $splits",
-                      "--group $splitId",
-                      *clusterDurationsArgsNode,
-                    ]
+                    extraArgs,
                 ).join(" ")
 
                 // Generate Job Launch Script
@@ -1210,6 +1243,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--container-mounts=$mounts",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    srunArgs.add("--container-env=S3_SECRET_KEY")
+                }
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
@@ -1252,6 +1288,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
                     export HF_TOKEN=$HF_TOKEN
+                    if [ -f "${s3SecretKeyPathNode}" ]; then
+                        set +x
+                        export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
+                        set -x
+                    fi
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
                     ${envExportStatements}
@@ -1323,6 +1364,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     waivesListPathNode,
                     coverageConfigFile
                 ]
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    filesToKeepWhenRetry += [
+                        s3SecretKeyPathNode
+                    ]
+                }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
 
                 def scriptSubmit = """#!/bin/bash
@@ -3262,10 +3308,19 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def hostNodeName = getHostNodeName()
         def containerPortStart = getStartingPortForHost(hostNodeName, stageName)
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
+        def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
 
         // Some clusters do not allow dmesg -C so we add || true
         // Temporarily disable to reduce the log size
         // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
+        def extraArgs = [*clusterDurationsArgs]
+        if (ENABLE_UPLOAD_TEST_RESULTS) {
+            extraArgs += [
+                "-s",
+                "--s3-upload-path=${uploadPath}/${stageName}",
+                "--s3-echo-stdout",
+            ]
+        }
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
@@ -3275,7 +3330,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             TRTLLM_WHL_PATH,
             coverageConfigFile,
             "",  // pytestUtil
-            clusterDurationsArgs,
+            extraArgs,  // extraArgs
             containerPortStart,
             containerPortNum
         )
@@ -3300,6 +3355,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     usernameVariable: 'GITLAB_API_USER',
                     passwordVariable: 'GITLAB_API_TOKEN'
                 ),
+                string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
