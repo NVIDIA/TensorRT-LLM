@@ -22,7 +22,7 @@ def _checkpoint_config(
     log_a: float = -10.0,
     b: float = 2.0,
     target_sparsity: float = 0.5,
-    ignore_patterns: Optional[list[str]] = None,
+    ignore: Optional[list[str]] = None,
     disabled_until_timestep: Optional[float] = None,
 ) -> dict:
     group = {
@@ -39,8 +39,8 @@ def _checkpoint_config(
             "prefill": target_sparsity,
         },
     }
-    if ignore_patterns is not None:
-        group["ignore"] = ignore_patterns
+    if ignore is not None:
+        group["ignore"] = ignore
     if disabled_until_timestep is not None:
         group["disabled_until_timestep"] = disabled_until_timestep
     return {
@@ -52,16 +52,16 @@ def _checkpoint_config(
     }
 
 
-def _checkpoint_config_with_ignore_patterns(
+def _checkpoint_config_with_ignore(
     *,
-    ignore_patterns: list[str],
+    ignore: list[str],
     log_a: float = -10.0,
     b: float = 2.0,
 ) -> dict:
     return _checkpoint_config(
         log_a=log_a,
         b=b,
-        ignore_patterns=ignore_patterns,
+        ignore=ignore,
     )
 
 
@@ -151,11 +151,9 @@ class TestPublicApi:
 
         assert _prefill_threshold(config.to_sparse_params()) == 5000.0
 
-    def test_checkpoint_ignore_patterns_are_applied_during_lowering(self):
+    def test_checkpoint_ignore_is_applied_during_lowering(self):
         config = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
-        checkpoint_config = _checkpoint_config_with_ignore_patterns(
-            ignore_patterns=["blocks.0.attn1", "*.attn2"]
-        )
+        checkpoint_config = _checkpoint_config_with_ignore(ignore=["blocks.0.attn1", "*.attn2"])
 
         assert (
             config.to_sparse_params(
@@ -277,8 +275,8 @@ class TestCheckpointMetadata:
         )
         (tmp_path / "transformer" / "config.json").write_text(
             json.dumps(
-                _checkpoint_config_with_ignore_patterns(
-                    ignore_patterns=["blocks.0.attn1"],
+                _checkpoint_config_with_ignore(
+                    ignore=["blocks.0.attn1"],
                     log_a=-10.0,
                     b=2.0,
                 )

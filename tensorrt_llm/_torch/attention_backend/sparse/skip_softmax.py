@@ -233,11 +233,11 @@ class SkipSoftmaxFormula(StrictBaseModel):
         return cls.parse_from_dict(tsf.get(coefficient_key), formula=tsf.get("formula"))
 
 
-def skip_softmax_ignore_patterns_from_checkpoint_config(
+def skip_softmax_ignore_from_checkpoint_config(
     checkpoint_config: Optional[Dict[str, Any]],
 ) -> Optional[list[str]]:
     """Read ModelOpt checkpoint ``ignore`` patterns for skip-softmax."""
-    ignore_patterns: list[str] = []
+    ignore: list[str] = []
     seen: set[str] = set()
 
     def _extend(patterns: Any) -> None:
@@ -247,14 +247,14 @@ def skip_softmax_ignore_patterns_from_checkpoint_config(
             pattern = str(pattern)
             if pattern not in seen:
                 seen.add(pattern)
-                ignore_patterns.append(pattern)
+                ignore.append(pattern)
 
     sparse_cfg = _sparse_attention_config_from_checkpoint(checkpoint_config)
     if isinstance(sparse_cfg, dict):
         _extend(sparse_cfg.get("ignore"))
     for group in skip_softmax_config_groups_from_checkpoint_config(checkpoint_config):
         _extend(group.get("ignore"))
-    return ignore_patterns or None
+    return ignore or None
 
 
 def skip_softmax_formula_from_checkpoint_config(
