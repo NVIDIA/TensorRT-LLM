@@ -655,6 +655,9 @@ class KVCacheManager(BaseResourceManager):
         # Import here to avoid circular imports
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        # Kept so prepare_resources can re-validate the per-step token budget
+        # (the forward-pass scratch size enforced in _prepare_tp_inputs).
+        self.max_num_tokens = max_num_tokens
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
@@ -984,7 +987,111 @@ class KVCacheManager(BaseResourceManager):
             remaining_tokens / self.tokens_per_block)
         return need_blocks
 
+    @staticmethod
+    def _has_mm_bidirectional_block(req: LlmRequest) -> bool:
+        # Mirror the gate in scheduler_v2._align_chunk_to_mm_block: re-chunking
+        # a request whose boundary would split a bidirectional multimodal block
+        # silently breaks attention, so such requests are deferred whole rather
+        # than re-chunked.
+        mm = getattr(req, "py_multimodal_data", None)
+        return isinstance(mm, dict) and mm.get("mm_bidirectional_blocks", False)
+
+    def _request_forward_tokens(self, req: LlmRequest, *,
+                                is_context: bool) -> int:
+        """Upper bound on the number of position ids ``req`` contributes to a
+        forward pass in ``_prepare_tp_inputs``.
+
+        This MUST over-estimate. Under-counting would reintroduce the
+        ``total_num_tokens <= max_num_tokens`` assert in ``_prepare_tp_inputs``
+        that this guard exists to prevent.
+        """
+        draft_len = get_draft_token_length(req)
+        if is_context:
+            # Context contributes ``context_chunk_size`` positions; draft tokens
+            # are appended only on the last chunk.
+            return req.context_chunk_size + (draft_len if
+                                             req.is_last_context_chunk else 0)
+        # Generation: one position per beam for the new token, plus draft tokens
+        # (speculative verification) per beam.
+        return req.py_beam_width * (1 + draft_len)
+
+    def _fit_token_budget(self, scheduled_batch: ScheduledRequests) -> None:
+        """Defer or re-chunk context requests so the scheduled batch cannot
+        exceed ``max_num_tokens`` in the forward pass.
+
+        The micro-batch scheduler's token-budget estimate can diverge from the
+        tokens actually materialized by ``_prepare_tp_inputs`` -- for example
+        when a reuse-discounted last context chunk lands next to a near-full
+        generation batch (see GitHub issue #13318). Rather than letting that
+        divergence trip a hard assert and wedge the executor loop, re-validate
+        the budget here -- before any KV cache is allocated -- and gracefully
+        shed only the deferrable work (context chunks), leaving in-flight
+        generation requests untouched.
+
+        Deferred context requests are simply dropped from this iteration's
+        ``scheduled_batch``; they remain in the active pool and are rescheduled
+        on a later iteration with a fresh budget.
+        """
+        budget = self.max_num_tokens
+
+        # Generation requests are in-flight and cannot be deferred. If they
+        # alone exceed the budget something is genuinely misconfigured -- fail
+        # this batch loudly rather than overshoot silently.
+        gen_tokens = sum(
+            self._request_forward_tokens(req, is_context=False)
+            for req in scheduled_batch.generation_requests)
+        if gen_tokens > budget:
+            raise RuntimeError(
+                f"In-flight generation requests need {gen_tokens} tokens, "
+                f"exceeding max_num_tokens ({budget}); cannot schedule.")
+
+        remaining = budget - gen_tokens
+        kept: RequestList = []
+        deferring = False
+        for req in scheduled_batch.context_requests:
+            # Disagg generation-init requests only allocate/transfer KV cache
+            # and contribute no compute tokens, so never shed them.
+            if deferring and not req.is_disagg_generation_init_state:
+                continue
+            cost = self._request_forward_tokens(req, is_context=True)
+            if cost <= remaining:
+                kept.append(req)
+                remaining -= cost
+                continue
+
+            # Doesn't fit. Try re-chunking the compute (fewer tokens this step)
+            # before deferring. Re-chunking only reduces compute tokens -- KV is
+            # allocated for the full prompt regardless -- so block accounting is
+            # unaffected. Only safe when the request can be chunked further, the
+            # shrunk chunk still holds at least one block (aligned to block
+            # size), and the boundary won't split a bidirectional multimodal
+            # block.
+            new_chunk = (remaining //
+                         self.tokens_per_block) * self.tokens_per_block
+            if (new_chunk >= self.tokens_per_block
+                    and new_chunk < req.context_chunk_size
+                    and not self._has_mm_bidirectional_block(req)):
+                req.context_chunk_size = new_chunk  # now a non-last chunk
+                kept.append(req)
+                remaining -= new_chunk
+            # remaining budget is now < one block, so no further context
+            # request can fit this iteration.
+            deferring = True
+
+        if len(kept) != scheduled_batch.num_context_requests:
+            logger.debug(
+                f"_fit_token_budget: kept {len(kept)}/"
+                f"{scheduled_batch.num_context_requests} context requests to "
+                f"stay within max_num_tokens={budget}")
+            # reset_context_requests re-derives chunking vs last-chunk from each
+            # request's (possibly updated) is_last_context_chunk.
+            scheduled_batch.reset_context_requests(kept)
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        if not self.is_draft:
+            # The draft-model engine builds inputs with a different token shape;
+            # its budget is handled separately.
+            self._fit_token_budget(scheduled_batch)
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
