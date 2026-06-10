@@ -72,20 +72,22 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
-            skip_softmax_disabled_until_timestep_from_checkpoint_config,
-            skip_softmax_target_sparsity_from_checkpoint_config,
+            skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
+            skip_softmax_target_sparsity_from_ckpt_sparse_attention_config,
         )
 
         module_name = kwargs.get("module_name", None)
-        checkpoint_config = self._checkpoint_config_from_kwargs(kwargs)
+        ckpt_sparse_attention_config = self._ckpt_sparse_attention_config_from_kwargs(kwargs)
 
-        if module_name is not None and self._is_disabled(module_name, checkpoint_config):
+        if module_name is not None and self._is_disabled(module_name, ckpt_sparse_attention_config):
             return None
 
         disabled_until_timestep = self.disabled_until_timestep
         if disabled_until_timestep is None:
-            disabled_until_timestep = skip_softmax_disabled_until_timestep_from_checkpoint_config(
-                checkpoint_config
+            disabled_until_timestep = (
+                skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
+                    ckpt_sparse_attention_config
+                )
             )
 
         if self.threshold_scale_factor is not None:
@@ -96,14 +98,14 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         else:
             target_sparsity = self.target_sparsity
             if target_sparsity is None:
-                target_sparsity = skip_softmax_target_sparsity_from_checkpoint_config(
-                    checkpoint_config
+                target_sparsity = skip_softmax_target_sparsity_from_ckpt_sparse_attention_config(
+                    ckpt_sparse_attention_config
                 )
             if target_sparsity is None:
                 return None
             scheduler = SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
-                checkpoint_config=checkpoint_config,
+                ckpt_sparse_attention_config=ckpt_sparse_attention_config,
                 disabled_until_timestep=disabled_until_timestep,
             )
 
@@ -117,15 +119,18 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     def _is_disabled(
         self,
         module_name: str,
-        checkpoint_config: Optional[Dict[str, Any]],
+        ckpt_sparse_attention_config: Optional[Dict[str, Any]],
     ) -> bool:
         """Return whether skip-softmax should be disabled for this layer."""
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-            skip_softmax_ignore_from_checkpoint_config,
+            skip_softmax_ignore_from_ckpt_sparse_attention_config,
         )
 
         candidate_names = self._layer_pattern_match_names(module_name)
-        ignore = skip_softmax_ignore_from_checkpoint_config(checkpoint_config) or ()
+        ignore = (
+            skip_softmax_ignore_from_ckpt_sparse_attention_config(ckpt_sparse_attention_config)
+            or ()
+        )
         return any(fnmatch.fnmatch(name, pattern) for pattern in ignore for name in candidate_names)
 
     @staticmethod
@@ -140,7 +145,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
     def resolve_threshold_scale_factor(
         self,
-        checkpoint_config: Optional[Dict[str, Any]] = None,
+        ckpt_sparse_attention_config: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
         """Resolve to a concrete scalar threshold via shared formula helpers.
 
@@ -153,11 +158,11 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         sparsity = self.target_sparsity
         if sparsity is None:
             from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-                skip_softmax_target_sparsity_from_checkpoint_config,
+                skip_softmax_target_sparsity_from_ckpt_sparse_attention_config,
             )
 
-            checkpoint_sparsity = skip_softmax_target_sparsity_from_checkpoint_config(
-                checkpoint_config
+            checkpoint_sparsity = skip_softmax_target_sparsity_from_ckpt_sparse_attention_config(
+                ckpt_sparse_attention_config
             )
             if isinstance(checkpoint_sparsity, dict):
                 sparsity = checkpoint_sparsity.get("prefill")
@@ -167,10 +172,12 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             return None
 
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-            skip_softmax_formula_from_checkpoint_config,
+            skip_softmax_formula_from_ckpt_sparse_attention_config,
         )
 
-        formula = skip_softmax_formula_from_checkpoint_config(checkpoint_config)
+        formula = skip_softmax_formula_from_ckpt_sparse_attention_config(
+            ckpt_sparse_attention_config
+        )
         if formula is None:
             raise ValueError(
                 "SkipSoftmaxAttentionConfig: target_sparsity requires calibration formula "
@@ -179,18 +186,23 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         return formula.compute_threshold_scale_factor(sparsity)
 
     @staticmethod
-    def _checkpoint_config_from_kwargs(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _ckpt_sparse_attention_config_from_kwargs(
+        kwargs: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
         checkpoint_config = kwargs.get("checkpoint_config", None)
         if isinstance(checkpoint_config, dict):
-            return checkpoint_config
+            sparse_cfg = checkpoint_config.get("sparse_attention_config")
+            return sparse_cfg if isinstance(sparse_cfg, dict) else checkpoint_config
 
         pretrained_config = kwargs.get("pretrained_config", None)
         if isinstance(pretrained_config, dict):
-            return pretrained_config
+            sparse_cfg = pretrained_config.get("sparse_attention_config")
+            return sparse_cfg if isinstance(sparse_cfg, dict) else pretrained_config
         if isinstance(pretrained_config, SimpleNamespace):
-            return vars(pretrained_config)
+            sparse_cfg = getattr(pretrained_config, "sparse_attention_config", None)
+            return sparse_cfg if isinstance(sparse_cfg, dict) else None
         if pretrained_config is not None:
             sparse_config = getattr(pretrained_config, "sparse_attention_config", None)
             if isinstance(sparse_config, dict):
-                return {"sparse_attention_config": sparse_config}
+                return sparse_config
         return None

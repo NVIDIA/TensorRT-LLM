@@ -40,30 +40,6 @@ _RESERVED_FORMULA_KEYS = frozenset({"formula", "target_sparsity"})
 _SKIP_SOFTMAX_ALGORITHMS = frozenset({"skip_softmax", "softmax_skip"})
 
 
-def _sparse_attention_config_from_checkpoint(
-    checkpoint_config: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    if not isinstance(checkpoint_config, dict):
-        return None
-
-    sparse_cfg = checkpoint_config.get("sparse_attention_config")
-    if isinstance(sparse_cfg, dict):
-        return sparse_cfg
-
-    # Some call sites already pass the inner sparse_attention_config dict.
-    if any(
-        key in checkpoint_config
-        for key in (
-            "config_groups",
-            "threshold_scale_factor",
-            "target_sparsity",
-            "ignore",
-        )
-    ):
-        return checkpoint_config
-    return None
-
-
 def _is_skip_softmax_group(group: Dict[str, Any]) -> bool:
     algorithm = group.get("algorithm", group.get("sparse_algo"))
     return algorithm in _SKIP_SOFTMAX_ALGORITHMS
@@ -81,15 +57,14 @@ def _looks_like_skip_softmax_group(group: Dict[str, Any]) -> bool:
     )
 
 
-def skip_softmax_config_groups_from_checkpoint_config(
-    checkpoint_config: Optional[Dict[str, Any]],
+def skip_softmax_config_groups_from_ckpt_sparse_attention_config(
+    ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Return skip-softmax config groups from checkpoint metadata."""
-    sparse_cfg = _sparse_attention_config_from_checkpoint(checkpoint_config)
-    if not isinstance(sparse_cfg, dict):
+    """Return skip-softmax groups from checkpoint ``sparse_attention_config``."""
+    if not isinstance(ckpt_sparse_attention_config, dict):
         return []
 
-    config_groups = sparse_cfg.get("config_groups")
+    config_groups = ckpt_sparse_attention_config.get("config_groups")
     if isinstance(config_groups, dict):
         return [
             group
@@ -97,27 +72,31 @@ def skip_softmax_config_groups_from_checkpoint_config(
             if isinstance(group, dict) and _is_skip_softmax_group(group)
         ]
 
-    if _looks_like_skip_softmax_group(sparse_cfg):
-        return [sparse_cfg]
+    if _looks_like_skip_softmax_group(ckpt_sparse_attention_config):
+        return [ckpt_sparse_attention_config]
     return []
 
 
-def skip_softmax_threshold_scale_factor_config_from_checkpoint_config(
-    checkpoint_config: Optional[Dict[str, Any]],
+def skip_softmax_threshold_scale_factor_config_from_ckpt_sparse_attention_config(
+    ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     """Return the first skip-softmax calibration formula config."""
-    for group in skip_softmax_config_groups_from_checkpoint_config(checkpoint_config):
+    for group in skip_softmax_config_groups_from_ckpt_sparse_attention_config(
+        ckpt_sparse_attention_config
+    ):
         threshold_config = group.get("threshold_scale_factor")
         if isinstance(threshold_config, dict):
             return threshold_config
     return None
 
 
-def skip_softmax_target_sparsity_from_checkpoint_config(
-    checkpoint_config: Optional[Dict[str, Any]],
+def skip_softmax_target_sparsity_from_ckpt_sparse_attention_config(
+    ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> Optional[Union[float, Dict[str, float]]]:
     """Return checkpoint-provided skip-softmax target sparsity, if present."""
-    for group in skip_softmax_config_groups_from_checkpoint_config(checkpoint_config):
+    for group in skip_softmax_config_groups_from_ckpt_sparse_attention_config(
+        ckpt_sparse_attention_config
+    ):
         target_sparsity = group.get("target_sparsity")
         if isinstance(target_sparsity, dict):
             return {str(k): float(v) for k, v in target_sparsity.items()}
@@ -126,11 +105,13 @@ def skip_softmax_target_sparsity_from_checkpoint_config(
     return None
 
 
-def skip_softmax_disabled_until_timestep_from_checkpoint_config(
-    checkpoint_config: Optional[Dict[str, Any]],
+def skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
+    ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> Optional[float]:
     """Return checkpoint-provided normalized timestep cutoff, if present."""
-    for group in skip_softmax_config_groups_from_checkpoint_config(checkpoint_config):
+    for group in skip_softmax_config_groups_from_ckpt_sparse_attention_config(
+        ckpt_sparse_attention_config
+    ):
         disabled_until_timestep = group.get("disabled_until_timestep")
         if isinstance(disabled_until_timestep, (float, int)):
             return float(disabled_until_timestep)
@@ -214,27 +195,30 @@ class SkipSoftmaxFormula(StrictBaseModel):
         )
 
     @classmethod
-    def parse_from_ckpt_config(
+    def parse_from_ckpt_sparse_attention_config(
         cls,
-        checkpoint_config: Dict[str, Any],
+        ckpt_sparse_attention_config: Dict[str, Any],
         *,
         coefficient_key: str = "prefill",
     ) -> Optional["SkipSoftmaxFormula"]:
-        """Lift the calibration formula out of a HuggingFace config dict."""
-        tsf = (
-            checkpoint_config
-            if "formula" in checkpoint_config
-            else skip_softmax_threshold_scale_factor_config_from_checkpoint_config(
-                checkpoint_config
+        """Lift the calibration formula out of checkpoint sparse metadata."""
+        threshold_config = (
+            ckpt_sparse_attention_config
+            if "formula" in ckpt_sparse_attention_config
+            else skip_softmax_threshold_scale_factor_config_from_ckpt_sparse_attention_config(
+                ckpt_sparse_attention_config
             )
         )
-        if not isinstance(tsf, dict):
+        if not isinstance(threshold_config, dict):
             return None
-        return cls.parse_from_dict(tsf.get(coefficient_key), formula=tsf.get("formula"))
+        return cls.parse_from_dict(
+            threshold_config.get(coefficient_key),
+            formula=threshold_config.get("formula"),
+        )
 
 
-def skip_softmax_ignore_from_checkpoint_config(
-    checkpoint_config: Optional[Dict[str, Any]],
+def skip_softmax_ignore_from_ckpt_sparse_attention_config(
+    ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> Optional[list[str]]:
     """Read ModelOpt checkpoint ``ignore`` patterns for skip-softmax."""
     ignore: list[str] = []
@@ -249,33 +233,34 @@ def skip_softmax_ignore_from_checkpoint_config(
                 seen.add(pattern)
                 ignore.append(pattern)
 
-    sparse_cfg = _sparse_attention_config_from_checkpoint(checkpoint_config)
-    if isinstance(sparse_cfg, dict):
-        _extend(sparse_cfg.get("ignore"))
-    for group in skip_softmax_config_groups_from_checkpoint_config(checkpoint_config):
+    if isinstance(ckpt_sparse_attention_config, dict):
+        _extend(ckpt_sparse_attention_config.get("ignore"))
+    for group in skip_softmax_config_groups_from_ckpt_sparse_attention_config(
+        ckpt_sparse_attention_config
+    ):
         _extend(group.get("ignore"))
     return ignore or None
 
 
-def skip_softmax_formula_from_checkpoint_config(
-    checkpoint_config: Optional[Dict[str, Any]],
+def skip_softmax_formula_from_ckpt_sparse_attention_config(
+    ckpt_sparse_attention_config: Optional[Dict[str, Any]],
 ) -> Optional[SkipSoftmaxFormula]:
     """Read the scalar skip-softmax calibration formula from checkpoint config."""
-    if not isinstance(checkpoint_config, dict):
+    if not isinstance(ckpt_sparse_attention_config, dict):
         return None
 
-    formula = SkipSoftmaxFormula.parse_from_ckpt_config(
-        checkpoint_config, coefficient_key="prefill"
+    formula = SkipSoftmaxFormula.parse_from_ckpt_sparse_attention_config(
+        ckpt_sparse_attention_config, coefficient_key="prefill"
     )
     if formula is not None:
         return formula
-    formula = SkipSoftmaxFormula.parse_from_ckpt_config(
-        checkpoint_config, coefficient_key="coefficients"
+    formula = SkipSoftmaxFormula.parse_from_ckpt_sparse_attention_config(
+        ckpt_sparse_attention_config, coefficient_key="coefficients"
     )
     if formula is not None:
         return formula
-    threshold_config = skip_softmax_threshold_scale_factor_config_from_checkpoint_config(
-        checkpoint_config
+    threshold_config = skip_softmax_threshold_scale_factor_config_from_ckpt_sparse_attention_config(
+        ckpt_sparse_attention_config
     )
     if isinstance(threshold_config, dict):
         return SkipSoftmaxFormula.parse_from_dict(
@@ -324,13 +309,15 @@ class SkipSoftmaxScheduler:
 
     @staticmethod
     def _threshold_scale_factor_config(
-        checkpoint_config: Optional[Dict[str, Any]],
+        ckpt_sparse_attention_config: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        if not isinstance(checkpoint_config, dict):
+        if not isinstance(ckpt_sparse_attention_config, dict):
             return None
-        if "formula" in checkpoint_config:
-            return checkpoint_config
-        return skip_softmax_threshold_scale_factor_config_from_checkpoint_config(checkpoint_config)
+        if "formula" in ckpt_sparse_attention_config:
+            return ckpt_sparse_attention_config
+        return skip_softmax_threshold_scale_factor_config_from_ckpt_sparse_attention_config(
+            ckpt_sparse_attention_config
+        )
 
     @classmethod
     def from_threshold_scale_factor(
@@ -352,14 +339,14 @@ class SkipSoftmaxScheduler:
         cls,
         target_sparsity: Optional[Union[float, Dict[str, float]]],
         *,
-        checkpoint_config: Optional[Dict[str, Any]] = None,
+        ckpt_sparse_attention_config: Optional[Dict[str, Any]] = None,
         disabled_until_timestep: Optional[float] = None,
     ) -> "SkipSoftmaxScheduler":
         """Build a scheduler by resolving target sparsity through checkpoint formula."""
         if target_sparsity is None:
             return cls(disabled_until_timestep=disabled_until_timestep)
 
-        threshold_config = cls._threshold_scale_factor_config(checkpoint_config)
+        threshold_config = cls._threshold_scale_factor_config(ckpt_sparse_attention_config)
         shared_formula = (
             threshold_config.get("formula") if isinstance(threshold_config, dict) else None
         )
