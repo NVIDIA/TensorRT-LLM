@@ -87,10 +87,30 @@ def cleanup_output_files():
 
 # Fatal patterns whose presence in worker/server logs after a stress run
 # indicates the cluster did not stay healthy and the test should be failed.
+#
+# NOTE: this scan only catches failures that are *caught and logged* by our own
+# code (C++ TLLM_LOG_ERROR / TllmException, or the Python event-loop except).
+# It does NOT cover a hard SIGABRT / std::terminate / core dump, which may leave
+# only a partial line or nothing in the log. Anchor on specific strings we
+# ourselves write, NOT on std::*::what() text (a libstdc++ implementation detail
+# that can change across stdlib versions). Avoid over-broad anchors: the generic
+# "Assertion failed:" prefix would match any of the ~hundreds of TLLM_CHECK
+# input-validation failures (often caught and surfaced as a normal request
+# error), so match the bug-specific invariant message instead.
 _FATAL_LOG_PATTERNS = (
     "Hang detected on rank",
     "RuntimeError: Cluster is not ready",
     "Internal server error",
+    # NVBugs 6104831 — disagg prefill-side KV transfer wedge. Three near
+    # simultaneous crash signatures (broken promise during transfer, bad
+    # optional access in the event loop, cascade-prune trie assertion). All
+    # are caught + logged by our code, so anchor on our own message text:
+    "Error occurred during context transfer",  # cacheTransceiver.cpp catch (#1)
+    "Error occurred during generation transfer",  # cacheTransceiver.cpp catch (#1)
+    "Error in event loop",  # py_executor.py event-loop death (#2 + generic)
+    # cascade-prune trie corruption (#3); precise message from templatedTrie.h
+    # so we don't false-positive on unrelated TLLM_CHECK failures.
+    "cascade prune: parent did not find this node as a child",
 )
 
 
