@@ -58,6 +58,16 @@ WAN22_LPIPS_MULTI_GPU_VARIANTS = [
     ("attn2d_2x2_ulysses2", {"attn2d_size": (2, 2), "ulysses_size": 2}),
 ]
 
+# Tensor Parallel variants. NOTE: ParallelConfig.total_parallel_size does NOT include
+# tp_size, but the runtime launches ParallelConfig.n_workers (= cfg_size *
+# seq_parallel_size * tp_size) workers and asserts world_size == n_workers. TP variants
+# must therefore be sized by n_workers; see test_wan22_t2v_lpips_against_golden_tp.
+WAN22_LPIPS_TP_VARIANTS = [
+    ("tp2", {"tp_size": 2}),
+    ("cfg2_tp2", {"cfg_size": 2, "tp_size": 2}),
+    ("tp2_ulysses2", {"tp_size": 2, "ulysses_size": 2}),
+]
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
@@ -121,6 +131,20 @@ def _skip_if_insufficient_gpus_for_parallel(parallel):
         )
 
 
+def _skip_if_insufficient_gpus_for_n_workers(parallel):
+    # TP is excluded from total_parallel_size but counted in n_workers, which is the actual
+    # number of worker processes the runtime launches (world_size == n_workers is asserted
+    # by the pipeline). TP variants must therefore be sized by n_workers.
+    parallel_cfg = ParallelConfig(**parallel)
+    required = parallel_cfg.n_workers
+    available = torch.cuda.device_count()
+    if available < required:
+        pytest.skip(
+            f"Insufficient GPUs for parallel={parallel}: requires {required} (n_workers), "
+            f"available {available}"
+        )
+
+
 def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> None:
     parallel = kwargs["parallel"]
     ParallelConfig(**parallel).validate_world_size(world_size)
@@ -169,6 +193,56 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
 
     run_test_in_distributed(
         world_size=parallel_cfg.total_parallel_size,
+        test_fn=_wan22_lpips_distributed_worker,
+        model_path=_lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
+        generated_path=str(generated_path),
+        prompt=WAN22_LPIPS_PROMPT,
+        negative_prompt=WAN22_LPIPS_NEGATIVE_PROMPT,
+        height=WAN22_LPIPS_HEIGHT,
+        width=WAN22_LPIPS_WIDTH,
+        num_frames=WAN22_LPIPS_NUM_FRAMES,
+        num_inference_steps=WAN22_LPIPS_NUM_INFERENCE_STEPS,
+        guidance_scale=WAN22_LPIPS_GUIDANCE_SCALE,
+        seed=WAN22_LPIPS_SEED,
+        frame_rate=WAN22_LPIPS_FRAME_RATE,
+        parallel=parallel,
+    )
+
+    assert generated_path.is_file(), f"Distributed run did not produce {generated_path}"
+    score = _run_lpips_eval(
+        tmp_path,
+        f"wan22_t2v_{variant_name}",
+        "video",
+        WAN22_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    "variant_name,parallel",
+    WAN22_LPIPS_TP_VARIANTS,
+    ids=[name for name, _ in WAN22_LPIPS_TP_VARIANTS],
+)
+def test_wan22_t2v_lpips_against_golden_tp(tmp_path, variant_name, parallel):
+    """End-to-end Tensor Parallel quality check against the golden video.
+
+    Exercises the real VisualGenArgs -> PipelineLoader -> checkpoint load -> generate
+    path with tp_size > 1 (alone and combined with CFG / Ulysses), which the synthetic
+    module-parity unit tests (test_*_tp.py) do not cover. World size is derived from
+    n_workers (which includes tp_size), not total_parallel_size (which does not).
+    """
+    _skip_if_insufficient_gpus_for_n_workers(parallel)
+    parallel_cfg = ParallelConfig(**parallel)
+    generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}.mp4"
+    golden_path = _golden_media_path(
+        tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
+    )
+
+    run_test_in_distributed(
+        world_size=parallel_cfg.n_workers,
         test_fn=_wan22_lpips_distributed_worker,
         model_path=_lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
         generated_path=str(generated_path),
