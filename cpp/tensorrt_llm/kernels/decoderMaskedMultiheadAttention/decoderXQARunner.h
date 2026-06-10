@@ -16,21 +16,13 @@
 
 #pragma once
 
-#include <NvInferRuntime.h>
-#include <cuda_fp16.h>
-
 #include "decoderXQARunnerResource.h"
 
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/cubinObjRegistry.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
-#include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
-#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 using namespace tensorrt_llm::common;
 
@@ -42,36 +34,52 @@ namespace kernels
 class DecoderXQARunner
 {
 public:
-    DecoderXQARunner(
-        const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode);
+    DecoderXQARunner(XQADataType const dataType, int numHeads, int numKVHeads, int headSize, bool multiBlockMode);
     ~DecoderXQARunner();
 
     /**
      * \param[in] xqaParams the xqaParams to be tested against.
      * \param[in] forConfigurePlugin indicates whether this method is called in configurePlugin, or in
      * enqueueGeneration.
+     * TODO: shouldUse()/prepare() should be templated with KVCacheBuffer.
+     * Whether it is beneficial to use this XQA codepath.
      */
     bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin);
-
-    void prepare(XQAParams const& xqa_params)
-    {
-        this->prepareForRun(xqa_params);
-    }
+    // Prepares for the kernel running. Must be called before calling run.
+    void prepare(XQAParams const& xqaParams);
 
     template <typename KVCacheBuffer>
-    void dispatch(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
+    void dispatch(XQAParams const& xqaParams, KVCacheBuffer const& kvCacheBuffer, cudaStream_t const& stream)
     {
         sync_check_cuda_error(stream);
-        this->run(xqa_params, kv_cache_buffer, stream);
+        this->run(xqaParams, kvCacheBuffer, stream);
     }
 
     static std::shared_ptr<DecoderXQARunnerResource> getResourceGlobal();
 
 private:
-    void prepareForRun(XQAParams const& xqa_params);
+    template <typename KVCacheBuffer>
+    void run(XQAParams const& xqaParams, KVCacheBuffer const& kvCacheBuffer, cudaStream_t const& stream);
+
+    //! Whether DecoderXQARunner needs to compile 2 sets (tilesize = 16, 32) kernels for spec-dec
+    bool needHMMASpecDec(XQAParams const& xqaParams, bool forConfigurePlugin) const;
+
+    //! Whether DecoderXQARunner supports xqaParams.
+    bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
+    //! Whether DecoderXQARunner has perf gain over the default (non-XQA-optimized) implementation.
+    bool mayHavePerfGain(XQAParams const& xqaParams) const;
+
+    jit::CubinObjKey getCubinObjKeyFromXQAParams(XQAParams const& xqaParams) const;
+
+    void prepareForActualXQAParams(XQAParams const& xqaParams);
 
     template <typename KVCacheBuffer>
-    void run(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
+    void runDispatchKVCacheBuffer(
+        XQAParams const& xqaParams, KVCacheBuffer const& kvCacheBuffer, cudaStream_t const& stream);
+
+    template <typename T, typename KVCacheBuffer>
+    void runImpl(XQAParams const& xqaParams, KVCacheBuffer const& kvCacheBuffer, int multiprocessorCount,
+        cudaStream_t const& stream) const;
 
     static constexpr int kMaxBeamWidth = 4;
 
@@ -81,11 +89,10 @@ private:
     int mHeadSize;
     bool mMultiBlockMode;
     int mMultiProcessorCount;
-
-    std::unique_ptr<DecoderXQAImplJIT> mJITImpl;
-    DecoderXQAImplJIT* getImpl();
-
-    friend DecoderXQAImplJIT;
+    std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
+    std::shared_ptr<DecoderXQARunnerResource> mResource;
+    bool mForceXQA;
+    int mSM;
 };
 
 } // namespace kernels
