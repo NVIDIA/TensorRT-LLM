@@ -49,6 +49,7 @@ _E2M1_PACKED_VALUES = tuple(
 )
 _E8M0_EXPONENT_BIAS = 127
 _MXFP4_BLOCK_SIZE = 32
+_TORCH_MXFP4_ROUTED_MOE_TOKEN_CHUNK = 16
 
 # Prepared (swizzled) triton_kernels tensors; typed as ``object`` so the module
 # imports without ``triton_kernels``.
@@ -319,18 +320,23 @@ def _run_torch_mxfp4_from_routing_slots(
 
     x_for_bmm = x.unsqueeze(-1)
     for route_idx in range(local_expert_idx.shape[1]):
-        expert_idx = local_expert_idx[:, route_idx]
-        gate_up = torch.bmm(gate_up_weight.index_select(0, expert_idx), x_for_bmm).squeeze(-1)
-        gate_up = gate_up + gate_up_bias.index_select(0, expert_idx).to(torch.float32)
-        inter = _apply_swiglu(gate_up, alpha, limit, gate_up_order, swiglu_mode)
-        expert_output = torch.bmm(
-            down_weight.index_select(0, expert_idx), inter.unsqueeze(-1)
-        ).squeeze(-1)
-        expert_output = expert_output + down_bias.index_select(0, expert_idx).to(torch.float32)
-        route_scale = routing_weights[:, route_idx, None] * valid_route[:, route_idx, None].to(
-            torch.float32
-        )
-        output = output + expert_output * route_scale
+        for start in range(0, x.shape[0], _TORCH_MXFP4_ROUTED_MOE_TOKEN_CHUNK):
+            end = min(start + _TORCH_MXFP4_ROUTED_MOE_TOKEN_CHUNK, x.shape[0])
+            token_slice = slice(start, end)
+            expert_idx = local_expert_idx[token_slice, route_idx]
+            gate_up = torch.bmm(
+                gate_up_weight.index_select(0, expert_idx), x_for_bmm[token_slice]
+            ).squeeze(-1)
+            gate_up = gate_up + gate_up_bias.index_select(0, expert_idx).to(torch.float32)
+            inter = _apply_swiglu(gate_up, alpha, limit, gate_up_order, swiglu_mode)
+            expert_output = torch.bmm(
+                down_weight.index_select(0, expert_idx), inter.unsqueeze(-1)
+            ).squeeze(-1)
+            expert_output = expert_output + down_bias.index_select(0, expert_idx).to(torch.float32)
+            route_scale = routing_weights[token_slice, route_idx, None] * valid_route[
+                token_slice, route_idx, None
+            ].to(torch.float32)
+            output[token_slice] = output[token_slice] + expert_output * route_scale
 
     return output.reshape(*leading_shape, hidden_size).to(output_dtype)
 

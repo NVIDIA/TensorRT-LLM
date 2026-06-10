@@ -592,6 +592,61 @@ def test_torch_mxfp4_moe_from_routing_matches_deepseek_layout_reference() -> Non
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
+def test_torch_mxfp4_moe_from_routing_matches_reference_across_token_chunks() -> None:
+    num_experts = 3
+    hidden_size = 32
+    intermediate_size = 32
+    alpha = 1.0
+    limit = 0.75
+    num_tokens = 20
+    x = torch.linspace(-0.3, 0.35, steps=num_tokens * hidden_size, dtype=torch.float32).reshape(
+        num_tokens, hidden_size
+    )
+    token_ids = torch.arange(num_tokens, dtype=torch.int64)
+    selected_experts = torch.stack(
+        (token_ids % num_experts, (token_ids + 1) % num_experts),
+        dim=1,
+    )
+    routing_weights = torch.stack(
+        (
+            torch.linspace(0.15, 0.45, steps=num_tokens),
+            torch.linspace(0.4, 0.1, steps=num_tokens),
+        ),
+        dim=1,
+    )
+    packed, w1_weight, w2_weight, w3_weight = _deepseek_packed_params_from_layout(num_experts)
+    gate_up_bias = torch.zeros((num_experts, 2 * intermediate_size), dtype=torch.float32)
+    down_bias = torch.zeros((num_experts, hidden_size), dtype=torch.float32)
+
+    actual = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+        x,
+        selected_experts,
+        routing_weights,
+        packed.gate_up_blocks,
+        gate_up_bias,
+        packed.gate_up_scales,
+        alpha,
+        limit,
+        packed.down_blocks,
+        down_bias,
+        packed.down_scales,
+        "up_gate",
+        "deepseek",
+    )
+    expected = _dense_deepseek_routing_reference(
+        x,
+        selected_experts,
+        routing_weights,
+        w1_weight,
+        w2_weight,
+        w3_weight,
+        alpha=alpha,
+        limit=limit,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() -> None:
     num_experts = 5
     ep_size = 3
