@@ -47,7 +47,7 @@ namespace torch_ext
 //   eps:       RMSNorm epsilon
 //
 // Returns (out_dir1, out_dir2), both bf16 [..., D].
-std::tuple<torch::Tensor, torch::Tensor> fused_dit_resid_rms_shift_scale_dual(torch::Tensor x,
+std::tuple<torch::Tensor, torch::Tensor> fused_dit_resid_rmsnorm_shift_scale_dual(torch::Tensor x,
     torch::Tensor const& attn2_out, torch::Tensor const& scale_dir1_table, torch::Tensor const& scale_dir1_ts,
     torch::Tensor const& shift_dir1_table, torch::Tensor const& shift_dir1_ts, torch::Tensor const& scale_dir2_table,
     torch::Tensor const& scale_dir2_ts, torch::Tensor const& shift_dir2_table, torch::Tensor const& shift_dir2_ts,
@@ -121,7 +121,8 @@ std::tuple<torch::Tensor, torch::Tensor> fused_dit_resid_rms_shift_scale_dual(to
     params.num_tokens = static_cast<int>(num_tokens);
     params.tokens_per_batch = static_cast<int>(tokens_per_batch);
     params.eps = static_cast<float>(eps);
-    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true,
+    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_NORM=*/true,
+        /*HAS_SHIFT_SCALE=*/true,
         /*NUM_OUT=*/2, /*HAS_QUANT=*/false>(params, static_cast<int>(hidden_dim), stream);
 
     return std::make_tuple(out_dir1, out_dir2);
@@ -129,7 +130,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_dit_resid_rms_shift_scale_dual(to
 
 // Same op as above, but emits two FP4 + SF pairs directly. Replaces the bf16 (out_dir1, out_dir2)
 // pair plus the two standalone tunable_fp4_quantize calls that production currently runs.
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dit_resid_rms_shift_scale_dual_quant(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dit_resid_rmsnorm_shift_scale_dual_quant(
     torch::Tensor x, torch::Tensor const& attn2_out, torch::Tensor const& scale_dir1_table,
     torch::Tensor const& scale_dir1_ts, torch::Tensor const& shift_dir1_table, torch::Tensor const& shift_dir1_ts,
     torch::Tensor const& scale_dir2_table, torch::Tensor const& scale_dir2_ts, torch::Tensor const& shift_dir2_table,
@@ -219,7 +220,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dit
     params.num_tokens = static_cast<int>(num_tokens);
     params.tokens_per_batch = static_cast<int>(tokens_per_batch);
     params.eps = static_cast<float>(eps);
-    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true,
+    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_NORM=*/true,
+        /*HAS_SHIFT_SCALE=*/true,
         /*NUM_OUT=*/2, /*HAS_QUANT=*/true>(params, static_cast<int>(hidden_dim), stream);
 
     return std::make_tuple(out1_fp4, out1_sf, out2_fp4, out2_sf);
@@ -228,7 +230,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dit
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fused_dit_resid_rms_shift_scale_dual("
+        "fused_dit_resid_rmsnorm_shift_scale_dual("
         "Tensor(a!) x, Tensor attn2_out, "
         "Tensor scale_dir1_table, Tensor scale_dir1_ts, "
         "Tensor shift_dir1_table, Tensor shift_dir1_ts, "
@@ -236,7 +238,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor shift_dir2_table, Tensor shift_dir2_ts, "
         "float eps) -> (Tensor, Tensor)");
     m.def(
-        "fused_dit_resid_rms_shift_scale_dual_quant("
+        "fused_dit_resid_rmsnorm_shift_scale_dual_quant("
         "Tensor(a!) x, Tensor attn2_out, "
         "Tensor scale_dir1_table, Tensor scale_dir1_ts, "
         "Tensor shift_dir1_table, Tensor shift_dir1_ts, "
@@ -248,8 +250,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fused_dit_resid_rms_shift_scale_dual", &fused_dit_resid_rms_shift_scale_dual);
-    m.impl("fused_dit_resid_rms_shift_scale_dual_quant", &fused_dit_resid_rms_shift_scale_dual_quant);
+    m.impl("fused_dit_resid_rmsnorm_shift_scale_dual", &fused_dit_resid_rmsnorm_shift_scale_dual);
+    m.impl("fused_dit_resid_rmsnorm_shift_scale_dual_quant", &fused_dit_resid_rmsnorm_shift_scale_dual_quant);
 }
 
 } // namespace torch_ext

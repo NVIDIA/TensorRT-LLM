@@ -1382,14 +1382,8 @@ class NVFP4LinearMethod(LinearMethodBase):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
-        # NVFP4 GEMM requires 2D mat1. We flatten three input shapes here:
-        #   - plain torch.Tensor:        reshape to (-1, K)
-        #   - Fp4QuantizedTensor (3D):   replace with a 2D-fp4_tensor view so
-        #     `_input_prepare` returns a 2D act_fp4 to the GEMM. Hit by
-        #     fused LayerNorm/AdaLN + NVFP4 quant kernels (e.g. LTX-2
-        #     fused_dit_*_quant ops) where fp4_tensor inherits the
-        #     upstream rank.
-        #   - tuple inputs:              left untouched (legacy contract).
+        # NVFP4 GEMM needs a 2D mat1. Flatten N-D plain tensors and N-D
+        # Fp4QuantizedTensor (from fused norm+quant ops) to 2D; tuples pass through.
         original_shape = None
         if not isinstance(input,
                           (tuple, Fp4QuantizedTensor)) and input.dim() > 2:

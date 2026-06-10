@@ -1185,7 +1185,7 @@ def _register_fake():
         return out_fp4, out_sf
 
     @torch.library.register_fake(
-        "trtllm::fused_dit_gate_resid_rms_modulate_quant")
+        "trtllm::fused_dit_gate_resid_rmsnorm_shift_scale_quant")
     def _(x, attn_out, gate_table, gate_ts, scale_table, scale_ts, shift_table,
           shift_ts, sf_scale, eps):
         """Fake/meta for fused KC + NVFP4 quant. SF layout is SWIZZLED 128x4.
@@ -1204,14 +1204,14 @@ def _register_fake():
         out_sf = x.new_empty((scale_shape, ), dtype=torch.uint8)
         return out_fp4, out_sf
 
-    @torch.library.register_fake("trtllm::fused_dit_resid_gate_rms_norm")
+    @torch.library.register_fake("trtllm::fused_dit_gate_resid_rmsnorm")
     def _(x, attn_out, gate_table, gate_ts, eps):
         """Fake/meta for fused KD bf16 (residual_add + gate_mul + rms_norm).
         Gate built inline from (table, ts) pair -- folds the upstream
         broadcast-add Triton prep + `attn * gate` mul into Phase 0b."""
         return torch.empty_like(x)
 
-    @torch.library.register_fake("trtllm::fused_dit_resid_gate_rms_norm_quant")
+    @torch.library.register_fake("trtllm::fused_dit_gate_resid_rmsnorm_quant")
     def _(x, attn_out, gate_table, gate_ts, sf_scale, eps):
         """Fake/meta for fused KD (residual_add + gate_mul + rms_norm + NVFP4 quant).
         Gate built inline from (table, ts) pair. SF layout is SWIZZLED 128x4."""
@@ -1227,7 +1227,7 @@ def _register_fake():
         return out_fp4, out_sf
 
     @torch.library.register_fake(
-        "trtllm::fused_dit_resid_rms_shift_scale_dual_quant")
+        "trtllm::fused_dit_resid_rmsnorm_shift_scale_dual_quant")
     def _(x, attn2_out, scale_dir1_table, scale_dir1_ts, shift_dir1_table,
           shift_dir1_ts, scale_dir2_table, scale_dir2_ts, shift_dir2_table,
           shift_dir2_ts, sf_scale1, sf_scale2, eps):

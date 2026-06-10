@@ -33,21 +33,21 @@ namespace kernels
 //   1. Phase 0a -- cp.async x -> SMEM                                     (always)
 //   2. Phase 0b -- combine modulator (table, ts) pairs into bf16 caches:
 //        gate (if HAS_GATE)
-//        NUM_OUT scale + shift (if HAS_MODULATE)
+//        NUM_OUT scale + shift (if HAS_SHIFT_SCALE)
 //   3. Phase 0c -- load attn into reg cache                                (if HAS_RESIDUAL)
 //   4. Phase 1  -- x_new = x [+ attn [* gate]]; sum^2; write x_new in-place if HAS_RESIDUAL
 //   5. Reduce   -- per-row warp + cross-warp reduce -> rms_rcp             (always)
 //   6. Phase 2  -- write NUM_OUT outputs:
-//        if HAS_MODULATE: y[k] = (1 + scale[k]) * normed + shift[k]
+//        if HAS_SHIFT_SCALE: y[k] = (1 + scale[k]) * normed + shift[k]
 //        else           : y    = normed
 //        HAS_QUANT=false: bf16 store to out_bf16[k]
 //        HAS_QUANT=true : NVFP4 + 128x4 swizzled SF to (out_fp4[k], out_sf[k])
 //
 // Specializations used by LTX-2:
-//   KA: HAS_RESIDUAL=false, HAS_GATE=false, HAS_MODULATE=true,  NUM_OUT=1
-//   KB: HAS_RESIDUAL=true,  HAS_GATE=false, HAS_MODULATE=true,  NUM_OUT=2
-//   KC: HAS_RESIDUAL=true,  HAS_GATE=true,  HAS_MODULATE=true,  NUM_OUT=1
-//   KD: HAS_RESIDUAL=true,  HAS_GATE=true,  HAS_MODULATE=false, NUM_OUT=1
+//   KA: HAS_RESIDUAL=false, HAS_GATE=false, HAS_SHIFT_SCALE=true,  NUM_OUT=1
+//   KB: HAS_RESIDUAL=true,  HAS_GATE=false, HAS_SHIFT_SCALE=true,  NUM_OUT=2
+//   KC: HAS_RESIDUAL=true,  HAS_GATE=true,  HAS_SHIFT_SCALE=true,  NUM_OUT=1
+//   KD: HAS_RESIDUAL=true,  HAS_GATE=true,  HAS_SHIFT_SCALE=false, NUM_OUT=1
 //
 // HAS_GATE implies HAS_RESIDUAL (asserted at compile time).
 //
@@ -72,7 +72,7 @@ struct AdaLNNormParams
     __nv_bfloat16 const* gate_ts = nullptr; // [batch, D] bf16
     int gate_ts_stride = 0;                 // inner stride between batches
 
-    // === Affine modulators (HAS_MODULATE) -- up to NUM_OUT={1,2} entries ===
+    // === Affine modulators (HAS_SHIFT_SCALE) -- up to NUM_OUT={1,2} entries ===
     float const* scale_table[2] = {nullptr, nullptr};
     __nv_bfloat16 const* scale_ts[2] = {nullptr, nullptr};
     int scale_ts_stride[2] = {0, 0};
@@ -96,7 +96,7 @@ struct AdaLNNormParams
 //
 // Supported hidden_dim: 2048, 4096. Caller is responsible for populating only the params
 // relevant to the chosen template configuration; unused fields can stay default-initialized.
-template <bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_MODULATE, int NUM_OUT, bool HAS_QUANT>
+template <bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_NORM, bool HAS_SHIFT_SCALE, int NUM_OUT, bool HAS_QUANT>
 void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStream_t stream);
 
 } // namespace kernels

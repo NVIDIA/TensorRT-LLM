@@ -98,12 +98,15 @@ __device__ __forceinline__ uint4 combine_modulator_chunk(uint4 const& ts_v, floa
 
 } // anonymous namespace
 
-template <int D, int ROWS_PER_BLOCK, int BLOCK_SIZE, bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_MODULATE, int NUM_OUT,
-    bool HAS_QUANT>
-__global__ void fusedDiTNormKernel(AdaLNNormParams p)
+template <int D, int ROWS_PER_BLOCK, int BLOCK_SIZE, bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_NORM,
+    bool HAS_SHIFT_SCALE, int NUM_OUT, bool HAS_QUANT>
+__global__ void fusedDiTGateResidNormShiftScaleKernel(AdaLNNormParams p)
 {
     static_assert(NUM_OUT == 1 || NUM_OUT == 2, "NUM_OUT must be 1 or 2");
     static_assert(!HAS_GATE || HAS_RESIDUAL, "HAS_GATE requires HAS_RESIDUAL");
+    static_assert(HAS_NORM || HAS_RESIDUAL, "HAS_NORM=false requires HAS_RESIDUAL (output is x_new in-place)");
+    static_assert(HAS_NORM || !HAS_SHIFT_SCALE, "HAS_NORM=false implies HAS_SHIFT_SCALE=false");
+    static_assert(HAS_NORM || !HAS_QUANT, "HAS_NORM=false implies HAS_QUANT=false");
 
     constexpr int THREADS_PER_ROW = BLOCK_SIZE / ROWS_PER_BLOCK;
     constexpr int WARPS_PER_ROW = THREADS_PER_ROW / 32;
@@ -134,7 +137,7 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
 
     // Hybrid TMA / cp.async gating, picked empirically from paired bench on B200:
     //   USE_TMA       : single-instruction cp.async.bulk for the X load. Wins on D=4096
-    //                   except when (HAS_QUANT && HAS_MODULATE && NUM_OUT==1) where the
+    //                   except when (HAS_QUANT && HAS_SHIFT_SCALE && NUM_OUT==1) where the
     //                   kernel is HBM-light and the mbarrier setup cost exceeds the LSU
     //                   saving. Disabled on D=2048 (audio path, 2-4us kernels).
     //   USE_TMA_ATTN  : also TMA-bulk the residual `attn` tensor into smem. Only enabled
@@ -142,7 +145,7 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
     //                   because the per-thread LDG for attn was already overlapping
     //                   the TMA-X load via different LSU pipes, while quant's heavy
     //                   Phase 2 hides the extra mbarrier wait.
-    constexpr bool USE_TMA = (D >= 4096) && !(HAS_QUANT && HAS_MODULATE && NUM_OUT == 1);
+    constexpr bool USE_TMA = (D >= 4096) && !(HAS_QUANT && HAS_SHIFT_SCALE && NUM_OUT == 1);
     constexpr bool USE_TMA_ATTN = USE_TMA && HAS_RESIDUAL && HAS_QUANT;
     constexpr int kAttnSmemBytes = USE_TMA_ATTN ? (ROWS_PER_BLOCK * D * static_cast<int>(sizeof(__nv_bfloat16))) : 0;
 
@@ -206,18 +209,18 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
     }
 
     // Phase 0b: load gate / scale / shift modulators into register caches.
-    // Per-thread storage scaled by HAS_GATE / HAS_MODULATE flags; compiler elides
+    // Per-thread storage scaled by HAS_GATE / HAS_SHIFT_SCALE flags; compiler elides
     // unused slots when the corresponding flag is false.
     uint4 gate_cache[HAS_GATE ? CHUNKS_PER_ROW : 1];
-    uint4 scale_cache[HAS_MODULATE ? NUM_OUT * CHUNKS_PER_ROW : 1];
-    uint4 shift_cache[HAS_MODULATE ? NUM_OUT * CHUNKS_PER_ROW : 1];
+    uint4 scale_cache[HAS_SHIFT_SCALE ? NUM_OUT * CHUNKS_PER_ROW : 1];
+    uint4 shift_cache[HAS_SHIFT_SCALE ? NUM_OUT * CHUNKS_PER_ROW : 1];
 
-    if constexpr (HAS_GATE || HAS_MODULATE)
+    if constexpr (HAS_GATE || HAS_SHIFT_SCALE)
     {
         int64_t const gateBase = HAS_GATE ? static_cast<int64_t>(batchIdx) * p.gate_ts_stride : 0;
         int64_t scaleBase[NUM_OUT];
         int64_t shiftBase[NUM_OUT];
-        if constexpr (HAS_MODULATE)
+        if constexpr (HAS_SHIFT_SCALE)
         {
 #pragma unroll
             for (int k = 0; k < NUM_OUT; k++)
@@ -239,7 +242,7 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
                 float4 const tbl_hi = *reinterpret_cast<float4 const*>(&p.gate_table[elemBase + 4]);
                 gate_cache[chunk] = combine_modulator_chunk(ts_v, tbl_lo, tbl_hi);
             }
-            if constexpr (HAS_MODULATE)
+            if constexpr (HAS_SHIFT_SCALE)
             {
 #pragma unroll
                 for (int k = 0; k < NUM_OUT; k++)
@@ -364,6 +367,14 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
         }
     }
 
+    // HAS_NORM=false variant: x_new is already written back in-place to p.x above (HAS_RESIDUAL
+    // is required when !HAS_NORM). Skip the rms reduce + Phase 2 shift_scale/store; the
+    // gate-residual fused result lives entirely in the residual-stream buffer.
+    if constexpr (!HAS_NORM)
+    {
+        return;
+    }
+
     // Per-row warp reduce + cross-warp reduce within the row.
     sum2 = tensorrt_llm::common::warpReduceSum(sum2);
     if (row_lane == 0)
@@ -384,7 +395,7 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
             sf_scale_val[k] = (p.sf_scale[k] != nullptr) ? *p.sf_scale[k] : 1.0f;
     }
 
-    // Phase 2: optional modulate + write outputs (NUM_OUT entries).
+    // Phase 2: optional shift_scale + write outputs (NUM_OUT entries).
 #pragma unroll
     for (int chunk = 0; chunk < CHUNKS_PER_ROW; chunk++)
     {
@@ -397,8 +408,8 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
 
         if constexpr (HAS_QUANT)
         {
-            // FP4 quant path: fp32 modulate + max-abs scan + e2m1 pack. Inlining the
-            // max scan with modulate shares the pair-lane reduction with the FP4
+            // FP4 quant path: fp32 shift_scale + max-abs scan + e2m1 pack. Inlining the
+            // max scan with shift_scale shares the pair-lane reduction with the FP4
             // conversion (saves ~10us/call vs cvt_float_to_fp4_inline + separate scan).
             float vals[NUM_OUT][8];
             float localMax[NUM_OUT];
@@ -417,7 +428,7 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
                 {
                     float yx;
                     float yy;
-                    if constexpr (HAS_MODULATE)
+                    if constexpr (HAS_SHIFT_SCALE)
                     {
                         uint4 const sv = scale_cache[k * CHUNKS_PER_ROW + chunk];
                         uint4 const hv = shift_cache[k * CHUNKS_PER_ROW + chunk];
@@ -485,9 +496,9 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
         }
         else
         {
-            // bf16 modulate path: byte-matches eager apply_fused_*_modulate semantics.
+            // bf16 shift_scale path: byte-matches eager apply_fused_*_shift_scale semantics.
             //   normed_bf16 = bf16(x_new_fp32 * rms_rcp_fp32)
-            //   y_bf16      = bf16(normed_bf16 * bf16(1 + scale_bf16) + shift_bf16)   if HAS_MODULATE
+            //   y_bf16      = bf16(normed_bf16 * bf16(1 + scale_bf16) + shift_bf16)   if HAS_SHIFT_SCALE
             //   y_bf16      = normed_bf16                                              else
             __nv_bfloat162 const one_b2 = __float2bfloat162_rn(1.0f);
             uint4 out_vecs[NUM_OUT];
@@ -501,7 +512,7 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
                 for (int k = 0; k < NUM_OUT; k++)
                 {
                     uint* o_uints = reinterpret_cast<uint*>(&out_vecs[k]);
-                    if constexpr (HAS_MODULATE)
+                    if constexpr (HAS_SHIFT_SCALE)
                     {
                         uint4 const sv = scale_cache[k * CHUNKS_PER_ROW + chunk];
                         uint4 const hv = shift_cache[k * CHUNKS_PER_ROW + chunk];
@@ -542,14 +553,14 @@ __global__ void fusedDiTNormKernel(AdaLNNormParams p)
 //   - empty_bar[NUM_STAGES]: consumers signal "slot reusable" (init=CONSUMER_WARPS arrives).
 //   - Producer warp (lane 0 active): wait empty_bar, issue cp.async.bulk for X (and attn when
 //     HAS_RESIDUAL), arrive full_bar with the expected tx-bytes.
-//   - Consumer warps: wait full_bar, compute x_new + sum^2, normalize + modulate + write,
+//   - Consumer warps: wait full_bar, compute x_new + sum^2, normalize + shift_scale + write,
 //     arrive empty_bar.
 //
 // Caller contract: tokens_per_batch >= R_CTA && tokens_per_batch % R_CTA == 0 so all R_CTA
 // rows in a CTA share batchIdx and modulator load amortizes once per CTA.
-template <int D, int R_CTA, int NUM_STAGES, bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_MODULATE, int NUM_OUT,
+template <int D, int R_CTA, int NUM_STAGES, bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_SHIFT_SCALE, int NUM_OUT,
     bool HAS_QUANT>
-__global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormParams p)
+__global__ __launch_bounds__(288, 2) void fusedDiTGateResidNormShiftScaleKernelPipelined(AdaLNNormParams p)
 {
     static_assert(D == 4096, "Pipelined variant requires D=4096");
     static_assert(R_CTA == 4, "Pipelined variant requires R_CTA=4");
@@ -605,7 +616,7 @@ __global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormP
     }
 
     // Pre-load modulator caches into REGs once per CTA. All R_CTA rows share batchIdx.
-    constexpr int kScaleCacheSize = HAS_MODULATE ? (NUM_OUT * VEC_PER_THREAD) : 1;
+    constexpr int kScaleCacheSize = HAS_SHIFT_SCALE ? (NUM_OUT * VEC_PER_THREAD) : 1;
     constexpr int kGateCacheSize = HAS_GATE ? VEC_PER_THREAD : 1;
     uint4 scale_cache[kScaleCacheSize];
     uint4 shift_cache[kScaleCacheSize];
@@ -613,7 +624,7 @@ __global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormP
 
     if (!is_producer)
     {
-        if constexpr (HAS_MODULATE)
+        if constexpr (HAS_SHIFT_SCALE)
         {
 #pragma unroll
             for (int k = 0; k < NUM_OUT; k++)
@@ -786,7 +797,7 @@ __global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormP
                 total += warp_sums[w];
             float const rms_rcp = rsqrtf(total / static_cast<float>(D) + p.eps);
 
-            // ---- Phase 2: normalize + (optional modulate) + write NUM_OUT outputs ----
+            // ---- Phase 2: normalize + (optional shift_scale) + write NUM_OUT outputs ----
             float sf_scale_val[NUM_OUT];
             if constexpr (HAS_QUANT)
             {
@@ -805,7 +816,7 @@ __global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormP
 
                 if constexpr (HAS_QUANT)
                 {
-                    // Per-v NVFP4 path: fp32 modulate + max-abs scan + e2m1 pack.
+                    // Per-v NVFP4 path: fp32 shift_scale + max-abs scan + e2m1 pack.
                     // Each thread covers 8 bf16 (one uint4) per v, half SF block.
                     // Pair of adjacent lanes (lane ^ 1) shares one 16-element SF block.
                     float vals[NUM_OUT][8];
@@ -824,7 +835,7 @@ __global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormP
                         for (int k = 0; k < NUM_OUT; k++)
                         {
                             float yx, yy;
-                            if constexpr (HAS_MODULATE)
+                            if constexpr (HAS_SHIFT_SCALE)
                             {
                                 uint4 const sv = scale_cache[k * VEC_PER_THREAD + v];
                                 uint4 const hv = shift_cache[k * VEC_PER_THREAD + v];
@@ -906,7 +917,7 @@ __global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormP
                         for (int k = 0; k < NUM_OUT; k++)
                         {
                             uint* o_u = reinterpret_cast<uint*>(&out_vecs[k]);
-                            if constexpr (HAS_MODULATE)
+                            if constexpr (HAS_SHIFT_SCALE)
                             {
                                 uint4 const sv = scale_cache[k * VEC_PER_THREAD + v];
                                 uint4 const hv = shift_cache[k * VEC_PER_THREAD + v];
@@ -952,10 +963,10 @@ __global__ __launch_bounds__(288, 2) void fusedDiTNormKernelPipelined(AdaLNNormP
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Host launcher template + explicit specializations for each (residual, gate, modulate, num_out)
+// Host launcher template + explicit specializations for each (residual, gate, shift_scale, num_out)
 // combination consumed by LTX-2's transformer block.
 
-template <bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_MODULATE, int NUM_OUT, bool HAS_QUANT>
+template <bool HAS_RESIDUAL, bool HAS_GATE, bool HAS_NORM, bool HAS_SHIFT_SCALE, int NUM_OUT, bool HAS_QUANT>
 void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(params.num_tokens >= 1, "num_tokens must be >= 1, got %d", params.num_tokens);
@@ -982,10 +993,10 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
     // Auto-selected on shapes where it wins; otherwise falls through to the default path below.
     //   - hidden_dim == 4096 (video path; audio D=2048 has too small a grid to amortize the
     //     warp-specialization overhead and bench-regresses)
-    //   - HAS_MODULATE || !HAS_GATE (the HAS_GATE && !HAS_MODULATE variant is HBM-bound and bench-regresses)
+    //   - HAS_SHIFT_SCALE || !HAS_GATE (the HAS_GATE && !HAS_SHIFT_SCALE variant is HBM-bound and bench-regresses)
     //   - tokens_per_batch >= 4 && % 4 == 0 (R_CTA=4 rows share batchIdx for per-CTA mod cache)
     //   - num_tokens % 4 == 0 (whole grid must be R_CTA-aligned)
-    constexpr bool kPipelinedVariantOK = HAS_MODULATE || !HAS_GATE;
+    constexpr bool kPipelinedVariantOK = HAS_SHIFT_SCALE || !HAS_GATE;
     if constexpr (kPipelinedVariantOK)
     {
         // NUM_STAGES chosen per HAS_QUANT: bf16 path is HBM-latency-bound so deeper pipeline
@@ -1006,8 +1017,13 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
             pipe_cfg.gridDim = dim3((params.num_tokens + PIPE_R_CTA - 1) / PIPE_R_CTA);
             pipe_cfg.blockDim = dim3(PIPE_BLOCK_SIZE);
             pipe_cfg.dynamicSmemBytes = static_cast<int>(pipe_smem_bytes);
-            auto* pipe_kp = fusedDiTNormKernelPipelined<PIPE_D, PIPE_R_CTA, PIPE_NUM_STAGES, HAS_RESIDUAL, HAS_GATE,
-                HAS_MODULATE, NUM_OUT, HAS_QUANT>;
+            // Pipelined kernel is only built for HAS_NORM=true variants. The dispatch predicate
+            // above requires HAS_SHIFT_SCALE || !HAS_GATE which is satisfied only by HAS_NORM=true
+            // paths; the gate-residual-only variant (HAS_SHIFT_SCALE=false, HAS_GATE=true) fails the
+            // predicate and falls through to the default tile.
+            static_assert(HAS_NORM, "pipelined dispatch requires HAS_NORM");
+            auto* pipe_kp = fusedDiTGateResidNormShiftScaleKernelPipelined<PIPE_D, PIPE_R_CTA, PIPE_NUM_STAGES,
+                HAS_RESIDUAL, HAS_GATE, HAS_SHIFT_SCALE, NUM_OUT, HAS_QUANT>;
             cudaFuncSetAttribute(
                 pipe_kp, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(pipe_smem_bytes));
             cudaLaunchKernelEx(&pipe_cfg, pipe_kp, params);
@@ -1018,7 +1034,7 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
 #define LAUNCH(D_VAL)                                                                                                  \
     do                                                                                                                 \
     {                                                                                                                  \
-        constexpr bool USE_TMA_HOST = (D_VAL >= 4096) && !(HAS_QUANT && HAS_MODULATE && NUM_OUT == 1);                 \
+        constexpr bool USE_TMA_HOST = (D_VAL >= 4096) && !(HAS_QUANT && HAS_SHIFT_SCALE && NUM_OUT == 1);              \
         constexpr bool USE_TMA_ATTN_HOST = USE_TMA_HOST && HAS_RESIDUAL && HAS_QUANT;                                  \
         int const attn_extra_bytes                                                                                     \
             = USE_TMA_ATTN_HOST ? (ROWS_PER_BLOCK * D_VAL * static_cast<int>(sizeof(__nv_bfloat16))) : 0;              \
@@ -1027,8 +1043,8 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
         cfg.dynamicSmemBytes = ROWS_PER_BLOCK * D_VAL * static_cast<int>(sizeof(__nv_bfloat16)) + attn_extra_bytes     \
             + ROWS_PER_BLOCK * WARPS_PER_ROW * static_cast<int>(sizeof(float));                                        \
         cudaLaunchKernelEx(&cfg,                                                                                       \
-            fusedDiTNormKernel<D_VAL, ROWS_PER_BLOCK, BLOCK_SIZE, HAS_RESIDUAL, HAS_GATE, HAS_MODULATE, NUM_OUT,       \
-                HAS_QUANT>,                                                                                            \
+            fusedDiTGateResidNormShiftScaleKernel<D_VAL, ROWS_PER_BLOCK, BLOCK_SIZE, HAS_RESIDUAL, HAS_GATE, HAS_NORM, \
+                HAS_SHIFT_SCALE, NUM_OUT, HAS_QUANT>,                                                                  \
             params);                                                                                                   \
     } while (0)
 
@@ -1041,27 +1057,35 @@ void launchFusedDiTNorm(AdaLNNormParams const& params, int hidden_dim, cudaStrea
 #undef LAUNCH
 }
 
-// Explicit instantiations -- one (bf16, fp4) pair per (residual, gate, modulate, num_out) variant.
-//   !RESIDUAL, !GATE, MODULATE, NUM_OUT=1: post-pre-norm RMSNorm + shift_scale modulate
-template void launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true, /*NUM_OUT=*/1,
-    /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
-template void launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true, /*NUM_OUT=*/1,
-    /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
-//   RESIDUAL, !GATE, MODULATE, NUM_OUT=2: post-text-attn residual + RMSNorm + dual shift_scale
-template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true, /*NUM_OUT=*/2,
-    /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
-template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true, /*NUM_OUT=*/2,
-    /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
-//   RESIDUAL, GATE, MODULATE, NUM_OUT=1: post-cross-attn FFN pre-norm gate*attn + residual + RMSNorm + shift_scale
-template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/true, /*NUM_OUT=*/1,
-    /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
-template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/true, /*NUM_OUT=*/1,
-    /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
-//   RESIDUAL, GATE, !MODULATE, NUM_OUT=1: post-self-attn gate*attn + residual + RMSNorm (+ optional quant)
-template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/false, /*NUM_OUT=*/1,
-    /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
-template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/false, /*NUM_OUT=*/1,
-    /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
+// Explicit instantiations -- one (bf16, fp4) pair per (residual, gate, norm, shift_scale, num_out) variant.
+//   !RESIDUAL, !GATE, NORM, MODULATE, NUM_OUT=1: post-pre-norm RMSNorm + shift_scale
+template void
+launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_NORM=*/true, /*HAS_SHIFT_SCALE=*/true,
+    /*NUM_OUT=*/1, /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
+template void
+launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_NORM=*/true, /*HAS_SHIFT_SCALE=*/true,
+    /*NUM_OUT=*/1, /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
+//   RESIDUAL, !GATE, NORM, MODULATE, NUM_OUT=2: post-text-attn residual + RMSNorm + dual shift_scale
+template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_NORM=*/true, /*HAS_SHIFT_SCALE=*/true,
+    /*NUM_OUT=*/2, /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
+template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/false, /*HAS_NORM=*/true, /*HAS_SHIFT_SCALE=*/true,
+    /*NUM_OUT=*/2, /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
+//   RESIDUAL, GATE, NORM, MODULATE, NUM_OUT=1: post-cross-attn FFN pre-norm gate*attn + residual + RMSNorm +
+//   shift_scale
+template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/true, /*HAS_SHIFT_SCALE=*/true,
+    /*NUM_OUT=*/1, /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
+template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/true, /*HAS_SHIFT_SCALE=*/true,
+    /*NUM_OUT=*/1, /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
+//   RESIDUAL, GATE, NORM, !MODULATE, NUM_OUT=1: post-self-attn gate*attn + residual + RMSNorm (+ optional quant)
+template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/true, /*HAS_SHIFT_SCALE=*/false,
+    /*NUM_OUT=*/1, /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
+template void launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/true, /*HAS_SHIFT_SCALE=*/false,
+    /*NUM_OUT=*/1, /*HAS_QUANT=*/true>(AdaLNNormParams const&, int, cudaStream_t);
+//   RESIDUAL, GATE, !NORM, !MODULATE, NUM_OUT=1: FFN-output gate-residual only (x_new = x + attn * gate),
+//   no RMSNorm, no shift_scale, no quant. In-place mutation of x; no separate output buffer.
+template void
+launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/false, /*HAS_SHIFT_SCALE=*/false,
+    /*NUM_OUT=*/1, /*HAS_QUANT=*/false>(AdaLNNormParams const&, int, cudaStream_t);
 
 } // namespace kernels
 

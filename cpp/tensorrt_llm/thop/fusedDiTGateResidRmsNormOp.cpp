@@ -51,7 +51,7 @@ namespace torch_ext
 //
 // Returns bf16 variant:  out_bf16: bf16 [..., D]
 // Returns quant variant: (out_fp4 [num_tokens, D/2] uint8, out_sf [SWIZZLED] uint8)
-torch::Tensor fused_dit_resid_gate_rms_norm(torch::Tensor x, torch::Tensor const& attn_out,
+torch::Tensor fused_dit_gate_resid_rmsnorm(torch::Tensor x, torch::Tensor const& attn_out,
     torch::Tensor const& gate_table, torch::Tensor const& gate_ts, double eps)
 {
     TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims; got ", x.dim());
@@ -90,13 +90,14 @@ torch::Tensor fused_dit_resid_gate_rms_norm(torch::Tensor x, torch::Tensor const
     params.num_tokens = static_cast<int>(num_tokens);
     params.tokens_per_batch = static_cast<int>(tokens_per_batch);
     params.eps = static_cast<float>(eps);
-    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/false,
+    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/true,
+        /*HAS_SHIFT_SCALE=*/false,
         /*NUM_OUT=*/1, /*HAS_QUANT=*/false>(params, static_cast<int>(hidden_dim), stream);
 
     return out_bf16;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> fused_dit_resid_gate_rms_norm_quant(torch::Tensor x,
+std::tuple<torch::Tensor, torch::Tensor> fused_dit_gate_resid_rmsnorm_quant(torch::Tensor x,
     torch::Tensor const& attn_out, torch::Tensor const& gate_table, torch::Tensor const& gate_ts,
     torch::Tensor const& sf_scale, double eps)
 {
@@ -148,7 +149,8 @@ std::tuple<torch::Tensor, torch::Tensor> fused_dit_resid_gate_rms_norm_quant(tor
     params.num_tokens = static_cast<int>(num_tokens);
     params.tokens_per_batch = static_cast<int>(tokens_per_batch);
     params.eps = static_cast<float>(eps);
-    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/false,
+    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/true,
+        /*HAS_SHIFT_SCALE=*/false,
         /*NUM_OUT=*/1, /*HAS_QUANT=*/true>(params, static_cast<int>(hidden_dim), stream);
 
     return std::make_tuple(out_fp4, out_sf);
@@ -157,18 +159,18 @@ std::tuple<torch::Tensor, torch::Tensor> fused_dit_resid_gate_rms_norm_quant(tor
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fused_dit_resid_gate_rms_norm("
+        "fused_dit_gate_resid_rmsnorm("
         "Tensor(a!) x, Tensor attn_out, Tensor gate_table, Tensor gate_ts, float eps) -> Tensor");
     m.def(
-        "fused_dit_resid_gate_rms_norm_quant("
+        "fused_dit_gate_resid_rmsnorm_quant("
         "Tensor(a!) x, Tensor attn_out, Tensor gate_table, Tensor gate_ts, Tensor sf_scale, float eps) "
         "-> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fused_dit_resid_gate_rms_norm", &fused_dit_resid_gate_rms_norm);
-    m.impl("fused_dit_resid_gate_rms_norm_quant", &fused_dit_resid_gate_rms_norm_quant);
+    m.impl("fused_dit_gate_resid_rmsnorm", &fused_dit_gate_resid_rmsnorm);
+    m.impl("fused_dit_gate_resid_rmsnorm_quant", &fused_dit_gate_resid_rmsnorm_quant);
 }
 
 } // namespace torch_ext

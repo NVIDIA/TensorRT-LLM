@@ -37,7 +37,7 @@ namespace torch_ext
 //   x   <- x + attn_out * gate
 // Computes:
 //   normed             = rsqrt(mean(x_new^2) + eps) * x_new          (over last dim)
-//   out_modulated[b,s,d] = normed[b,s,d] * (1 + scale[b,d]) + shift[b,d]
+//   out_shift_scaled[b,s,d] = normed[b,s,d] * (1 + scale[b,d]) + shift[b,d]
 //
 // Inputs:
 //   x:                                       bf16, [..., D] contig, MUTATED in-place
@@ -47,8 +47,8 @@ namespace torch_ext
 //                                            may match a [B, T_t, K, D] unbind view without .contiguous()
 //   eps:                                     RMSNorm epsilon
 //
-// Returns out_modulated: bf16 [..., D].
-torch::Tensor fused_dit_gate_resid_rms_modulate(torch::Tensor x, torch::Tensor const& attn_out,
+// Returns out_shift_scaled: bf16 [..., D].
+torch::Tensor fused_dit_gate_resid_rmsnorm_shift_scale(torch::Tensor x, torch::Tensor const& attn_out,
     torch::Tensor const& gate_table, torch::Tensor const& gate_ts, torch::Tensor const& scale_table,
     torch::Tensor const& scale_ts, torch::Tensor const& shift_table, torch::Tensor const& shift_ts, double eps)
 {
@@ -90,7 +90,7 @@ torch::Tensor fused_dit_gate_resid_rms_modulate(torch::Tensor x, torch::Tensor c
     // 3D (B, T_t, D) unbind views over a (B, T_t, K, D) parent.
     auto ts_stride_of = [&](torch::Tensor const& t) -> int64_t { return (n_rows > 1) ? t.stride(-2) : hidden_dim; };
 
-    auto out_modulated = torch::empty_like(x);
+    auto out_shift_scaled = torch::empty_like(x);
 
     auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
@@ -106,19 +106,20 @@ torch::Tensor fused_dit_gate_resid_rms_modulate(torch::Tensor x, torch::Tensor c
     params.shift_table[0] = reinterpret_cast<float const*>(shift_table.data_ptr());
     params.shift_ts[0] = reinterpret_cast<__nv_bfloat16 const*>(shift_ts.data_ptr());
     params.shift_ts_stride[0] = static_cast<int>(ts_stride_of(shift_ts));
-    params.out_bf16[0] = reinterpret_cast<__nv_bfloat16*>(out_modulated.data_ptr());
+    params.out_bf16[0] = reinterpret_cast<__nv_bfloat16*>(out_shift_scaled.data_ptr());
     params.num_tokens = static_cast<int>(num_tokens);
     params.tokens_per_batch = static_cast<int>(tokens_per_batch);
     params.eps = static_cast<float>(eps);
-    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/true,
+    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/true,
+        /*HAS_SHIFT_SCALE=*/true,
         /*NUM_OUT=*/1, /*HAS_QUANT=*/false>(params, static_cast<int>(hidden_dim), stream);
 
-    return out_modulated;
+    return out_shift_scaled;
 }
 
 // Same op as above, but emits packed FP4 + 128x4 SWIZZLED SF directly.
-// Replaces (out_modulated bf16) + a subsequent standalone tunable_fp4_quantize call.
-std::tuple<torch::Tensor, torch::Tensor> fused_dit_gate_resid_rms_modulate_quant(torch::Tensor x,
+// Replaces (out_shift_scaled bf16) + a subsequent standalone tunable_fp4_quantize call.
+std::tuple<torch::Tensor, torch::Tensor> fused_dit_gate_resid_rmsnorm_shift_scale_quant(torch::Tensor x,
     torch::Tensor const& attn_out, torch::Tensor const& gate_table, torch::Tensor const& gate_ts,
     torch::Tensor const& scale_table, torch::Tensor const& scale_ts, torch::Tensor const& shift_table,
     torch::Tensor const& shift_ts, torch::Tensor const& sf_scale, double eps)
@@ -190,7 +191,8 @@ std::tuple<torch::Tensor, torch::Tensor> fused_dit_gate_resid_rms_modulate_quant
     params.num_tokens = static_cast<int>(num_tokens);
     params.tokens_per_batch = static_cast<int>(tokens_per_batch);
     params.eps = static_cast<float>(eps);
-    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_MODULATE=*/true,
+    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/true, /*HAS_GATE=*/true, /*HAS_NORM=*/true,
+        /*HAS_SHIFT_SCALE=*/true,
         /*NUM_OUT=*/1, /*HAS_QUANT=*/true>(params, static_cast<int>(hidden_dim), stream);
 
     return std::make_tuple(out_fp4, out_sf);
@@ -199,14 +201,14 @@ std::tuple<torch::Tensor, torch::Tensor> fused_dit_gate_resid_rms_modulate_quant
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fused_dit_gate_resid_rms_modulate("
+        "fused_dit_gate_resid_rmsnorm_shift_scale("
         "Tensor(a!) x, Tensor attn_out, "
         "Tensor gate_table, Tensor gate_ts, "
         "Tensor scale_table, Tensor scale_ts, "
         "Tensor shift_table, Tensor shift_ts, "
         "float eps) -> Tensor");
     m.def(
-        "fused_dit_gate_resid_rms_modulate_quant("
+        "fused_dit_gate_resid_rmsnorm_shift_scale_quant("
         "Tensor(a!) x, Tensor attn_out, "
         "Tensor gate_table, Tensor gate_ts, "
         "Tensor scale_table, Tensor scale_ts, "
@@ -216,8 +218,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fused_dit_gate_resid_rms_modulate", &fused_dit_gate_resid_rms_modulate);
-    m.impl("fused_dit_gate_resid_rms_modulate_quant", &fused_dit_gate_resid_rms_modulate_quant);
+    m.impl("fused_dit_gate_resid_rmsnorm_shift_scale", &fused_dit_gate_resid_rmsnorm_shift_scale);
+    m.impl("fused_dit_gate_resid_rmsnorm_shift_scale_quant", &fused_dit_gate_resid_rmsnorm_shift_scale_quant);
 }
 
 } // namespace torch_ext

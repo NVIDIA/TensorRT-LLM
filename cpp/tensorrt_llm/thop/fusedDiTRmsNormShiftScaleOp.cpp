@@ -96,7 +96,8 @@ torch::Tensor fused_dit_rmsnorm_shift_scale(torch::Tensor const& x, torch::Tenso
     params.num_tokens = static_cast<int>(num_tokens);
     params.tokens_per_batch = static_cast<int>(tokens_per_batch);
     params.eps = static_cast<float>(eps);
-    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true,
+    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_NORM=*/true,
+        /*HAS_SHIFT_SCALE=*/true,
         /*NUM_OUT=*/1, /*HAS_QUANT=*/false>(params, static_cast<int>(hidden_dim), stream);
 
     return out;
@@ -166,7 +167,8 @@ std::tuple<torch::Tensor, torch::Tensor> fused_dit_rmsnorm_shift_scale_quant(tor
     params.num_tokens = static_cast<int>(num_tokens);
     params.tokens_per_batch = static_cast<int>(tokens_per_batch);
     params.eps = static_cast<float>(eps);
-    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_MODULATE=*/true,
+    tensorrt_llm::kernels::launchFusedDiTNorm</*HAS_RESIDUAL=*/false, /*HAS_GATE=*/false, /*HAS_NORM=*/true,
+        /*HAS_SHIFT_SCALE=*/true,
         /*NUM_OUT=*/1, /*HAS_QUANT=*/true>(params, static_cast<int>(hidden_dim), stream);
 
     return std::make_tuple(out_fp4, out_sf);

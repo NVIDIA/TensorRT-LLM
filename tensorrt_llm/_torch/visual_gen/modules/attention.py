@@ -510,10 +510,8 @@ class Attention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        # ``hidden_states`` is either a [B, S, hidden_size] torch.Tensor or an
-        # Fp4QuantizedTensor produced by an upstream fused LayerNorm/AdaLN +
-        # NVFP4 kernel (e.g. LTX-2 fused_dit_*_quant). Both wrap a 3D shape
-        # [B, S, *]; downstream Linear modules accept either.
+        # hidden_states may be [B, S, H] or an Fp4QuantizedTensor from an upstream
+        # fused norm+quant kernel; downstream Linear accepts either.
         if not isinstance(hidden_states, Fp4QuantizedTensor):
             assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
         batch_size, seq_len = hidden_states.shape[:2]

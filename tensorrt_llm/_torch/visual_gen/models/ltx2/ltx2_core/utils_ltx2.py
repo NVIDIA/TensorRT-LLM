@@ -81,7 +81,7 @@ def _maybe_reshape_fp4(out_fp4: torch.Tensor, orig_shape: torch.Size, D: int) ->
     return out_fp4
 
 
-def apply_fused_adaln_modulate(
+def apply_fused_rmsnorm_shift_scale(
     x: torch.Tensor,
     scale_table: torch.Tensor,
     scale_ts: torch.Tensor,
@@ -151,7 +151,7 @@ def apply_shift_scale(
     return x_normed * (1 + scale) + shift
 
 
-def apply_fused_gate_resid_rms_modulate(
+def apply_fused_gate_resid_rmsnorm_shift_scale(
     x: torch.Tensor,
     attn: torch.Tensor,
     gate_table: torch.Tensor,
@@ -165,7 +165,7 @@ def apply_fused_gate_resid_rms_modulate(
     *,
     fp4_input_scale: Optional[torch.Tensor] = None,
 ) -> "tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, Fp4QuantizedTensor]":
-    """Fused gate-residual + RMSNorm + shift/scale modulate:
+    """Fused gate-residual + RMSNorm + shift_scale:
     ``x_new = x + attn * gate``; ``normed = rms_norm(x_new)``;
     ``out = (1+scale)*normed + shift``.
 
@@ -174,7 +174,7 @@ def apply_fused_gate_resid_rms_modulate(
         scale[b,t,d] = scale_table[d] + scale_ts[b,t,d]
         shift[b,t,d] = shift_table[d] + shift_ts[b,t,d]
 
-    Returns ``(x_new, out_modulated)``. When ``fuse=True``, ``x`` is mutated
+    Returns ``(x_new, out_shift_scaled)``. When ``fuse=True``, ``x`` is mutated
     in place by the CUDA kernel and returned as ``x_new`` (same object).
 
     When ``fp4_input_scale`` is provided, the second tuple element is an
@@ -183,7 +183,7 @@ def apply_fused_gate_resid_rms_modulate(
     D = x.size(-1)
 
     if not fuse:
-        # Eager fallback: bf16 output (see apply_fused_adaln_modulate autotuner-bug note).
+        # Eager fallback: bf16 output (see apply_fused_rmsnorm_shift_scale autotuner-bug note).
         del fp4_input_scale
         gate = gate_table.to(gate_ts.dtype) + gate_ts
         scale = scale_table.to(scale_ts.dtype) + scale_ts
@@ -196,7 +196,7 @@ def apply_fused_gate_resid_rms_modulate(
     assert attn.is_contiguous(), "attn must be contiguous"
 
     if fp4_input_scale is None:
-        out = torch.ops.trtllm.fused_dit_gate_resid_rms_modulate(
+        out = torch.ops.trtllm.fused_dit_gate_resid_rmsnorm_shift_scale(
             x.view(-1, D),
             attn.view(-1, D),
             gate_table,
@@ -209,7 +209,7 @@ def apply_fused_gate_resid_rms_modulate(
         )
         return x, out.view_as(x)
 
-    out_fp4, out_sf = torch.ops.trtllm.fused_dit_gate_resid_rms_modulate_quant(
+    out_fp4, out_sf = torch.ops.trtllm.fused_dit_gate_resid_rmsnorm_shift_scale_quant(
         x.view(-1, D),
         attn.view(-1, D),
         gate_table,
@@ -225,7 +225,7 @@ def apply_fused_gate_resid_rms_modulate(
     return x, Fp4QuantizedTensor(out_fp4, out_sf)
 
 
-def apply_fused_resid_gate_rms_quant(
+def apply_fused_gate_resid_rmsnorm(
     x: torch.Tensor,
     attn_out: torch.Tensor,
     gate_table: torch.Tensor,
@@ -235,7 +235,7 @@ def apply_fused_resid_gate_rms_quant(
     *,
     fp4_input_scale: Optional[torch.Tensor] = None,
 ) -> "tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, Fp4QuantizedTensor]":
-    """Fused gate-residual + RMSNorm (no modulate):
+    """Fused gate-residual + RMSNorm (no shift_scale):
     ``x_new = x + attn_out * gate``; ``normed = rms_norm(x_new)``; optional
     NVFP4 quant of ``normed``.
 
@@ -253,7 +253,7 @@ def apply_fused_resid_gate_rms_quant(
     D = x.size(-1)
 
     if not fuse:
-        # Eager fallback: bf16 output (see apply_fused_adaln_modulate autotuner-bug note).
+        # Eager fallback: bf16 output (see apply_fused_rmsnorm_shift_scale autotuner-bug note).
         del fp4_input_scale
         gate = gate_table.to(gate_ts.dtype) + gate_ts
         x_new = x + attn_out * gate
@@ -266,20 +266,52 @@ def apply_fused_resid_gate_rms_quant(
         # Quant variant: residual_add + gate_mul + rms_norm + NVFP4 quant in one kernel.
         # Kernel returns flat [num_tokens, D/2] FP4; reshape back to caller's
         # rank so downstream (e.g. attn2 Q-norm) sees the same [B, S, D/2].
-        out_fp4, out_sf = torch.ops.trtllm.fused_dit_resid_gate_rms_norm_quant(
+        out_fp4, out_sf = torch.ops.trtllm.fused_dit_gate_resid_rmsnorm_quant(
             x.view(-1, D), attn_out.view(-1, D), gate_table, gate_ts, fp4_input_scale, eps
         )
         out_fp4 = _maybe_reshape_fp4(out_fp4, x.shape, D)
         return x, Fp4QuantizedTensor(out_fp4, out_sf)
 
     # bf16 variant: residual_add + gate_mul + rms_norm, no quant.
-    out = torch.ops.trtllm.fused_dit_resid_gate_rms_norm(
+    out = torch.ops.trtllm.fused_dit_gate_resid_rmsnorm(
         x.view(-1, D), attn_out.view(-1, D), gate_table, gate_ts, eps
     )
     return x, out.view_as(x)
 
 
-def apply_fused_resid_rms_dual_shift_scale(
+def apply_fused_gate_resid(
+    x: torch.Tensor,
+    attn_out: torch.Tensor,
+    gate_table: torch.Tensor,
+    gate_ts: torch.Tensor,
+    fuse: bool,
+) -> torch.Tensor:
+    """Fused gate-residual (no RMSNorm, no shift_scale):
+    ``gate[b,d] = gate_table[d].to(bf16) + gate_ts[b,d]``
+    ``x_new   = x + attn_out * gate``
+
+    Used by the FFN output gate site: ``vx = vx + ff(vx_scaled) * vgate_mlp``,
+    where ``(gate_table, gate_ts)`` is the pair-form of the FFN gate modulator
+    (slot 5 of the AdaLN table). Mutates ``x`` in place when ``fuse=True``.
+    """
+    D = x.size(-1)
+
+    if not fuse:
+        # Eager fallback: gate = gate_table + gate_ts is [B, T_t, D]; reshape x/attn to
+        # [B, T, D] (T via -1 to stay torch.compile-safe under symbolic shapes) so the
+        # per-batch gate broadcasts over the T tokens. ``view(B, -1, D)`` avoids the
+        # static reshape of the symbolic T_t dim that a ``gate_ts.view(B, D)`` would force.
+        gate = gate_table.to(gate_ts.dtype) + gate_ts
+        B = gate_ts.shape[0]
+        return (x.view(B, -1, D) + attn_out.view(B, -1, D) * gate).view_as(x)
+
+    assert x.is_contiguous(), "x must be contiguous (in-place kernel)"
+    assert attn_out.is_contiguous(), "attn_out must be contiguous"
+    torch.ops.trtllm.fused_dit_gate_resid(x.view(-1, D), attn_out.view(-1, D), gate_table, gate_ts)
+    return x
+
+
+def apply_fused_resid_rmsnorm_shift_scale_dual(
     x: torch.Tensor,
     attn2_out: torch.Tensor,
     scale1_table: torch.Tensor,
@@ -299,7 +331,7 @@ def apply_fused_resid_rms_dual_shift_scale(
     "tuple[torch.Tensor, torch.Tensor, torch.Tensor] "
     "| tuple[torch.Tensor, Fp4QuantizedTensor, Fp4QuantizedTensor]"
 ):
-    """Fused residual + RMSNorm + dual shift/scale modulate:
+    """Fused residual + RMSNorm + dual shift_scale:
     ``x_new = x + attn2_out``; ``normed = rms_norm(x_new)``;
     ``out1 = (1+scale1)*normed + shift1``; ``out2 = (1+scale2)*normed + shift2``.
 
@@ -316,7 +348,7 @@ def apply_fused_resid_rms_dual_shift_scale(
     D = x.size(-1)
 
     if not fuse:
-        # Eager fallback: bf16 outputs (see apply_fused_adaln_modulate autotuner-bug note).
+        # Eager fallback: bf16 outputs (see apply_fused_rmsnorm_shift_scale autotuner-bug note).
         del fp4_input_scale1, fp4_input_scale2
         scale1 = scale1_table.to(scale1_ts.dtype) + scale1_ts
         shift1 = shift1_table.to(shift1_ts.dtype) + shift1_ts
@@ -330,7 +362,7 @@ def apply_fused_resid_rms_dual_shift_scale(
     assert attn2_out.is_contiguous(), "attn2_out must be contiguous"
 
     if fp4_input_scale1 is None and fp4_input_scale2 is None:
-        out1, out2 = torch.ops.trtllm.fused_dit_resid_rms_shift_scale_dual(
+        out1, out2 = torch.ops.trtllm.fused_dit_resid_rmsnorm_shift_scale_dual(
             x.view(-1, D),
             attn2_out.view(-1, D),
             scale1_table,
@@ -349,7 +381,7 @@ def apply_fused_resid_rms_dual_shift_scale(
         "dual fp4: both input_scales must be provided or both absent"
     )
     out1_fp4, out1_sf, out2_fp4, out2_sf = (
-        torch.ops.trtllm.fused_dit_resid_rms_shift_scale_dual_quant(
+        torch.ops.trtllm.fused_dit_resid_rmsnorm_shift_scale_dual_quant(
             x.view(-1, D),
             attn2_out.view(-1, D),
             scale1_table,
