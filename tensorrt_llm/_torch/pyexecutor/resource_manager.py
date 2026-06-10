@@ -33,7 +33,7 @@ from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
+    DiskCacheTierConfig, GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManager as KVCacheManagerPy
@@ -162,6 +162,8 @@ def _ensure_int64_cpu_tensor(
 
 def _resolve_multimodal_run_metadata(
         req: LlmRequest) -> Optional[_MmRunMetadata]:
+    # TODO(perf): cache per request; block-reuse invokes this once per block,
+    # repeatedly rebuilding identical tensors for the same request metadata.
     # Worked example for one logical multimodal item split by text:
     #
     #   prompt index: 0    1      2      3    4      5
@@ -1502,6 +1504,31 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.get_num_front_blocks_removed(request_id,
                                                       window_size=window_size)
 
+    def commit_and_get_block_hashes(
+            self,
+            request: LlmRequest,
+            window_size: Optional[int] = None) -> List[int]:
+        """Commit and return the chain of stored block hashes for ``request``.
+
+        Wraps ``BaseKVCacheManager::commitAndGetBlockHashesForRequest``. The C++
+        side sets each block's ``mBlockKey`` and ``mHash`` on first call so the
+        hash matches what ``storeBlocks`` would later compute. Beam-width-1
+        only; the connector enforces this at startup.
+        """
+        if window_size is None:
+            # ``is_vswa`` (distinct window sizes) is the real VSWA signal; a
+            # uniform per-layer vector such as ``[4096, 4096, ...]`` has
+            # ``len > 1`` yet a single effective window, so keying off the
+            # length would spuriously reject it for connector callers that omit
+            # ``window_size``.
+            if self.is_vswa:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
+        return list(
+            self.impl.commit_and_get_block_hashes_for_request(
+                request, window_size))
+
     def unpin_blocks_by_id(self, kv_cache_block_id: int):
         self.impl.unpin_blocks_by_id(kv_cache_block_id)
 
@@ -2517,6 +2544,16 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers.append(HostCacheTierConfig(quota=host_quota))
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
+            )
+        disk_cache_size = kv_cache_config.disk_cache_size
+        if disk_cache_size is not None and disk_cache_size > 0:
+            disk_cache_path = kv_cache_config.disk_cache_path
+            assert disk_cache_path is not None
+            cache_tiers.append(
+                DiskCacheTierConfig(quota=disk_cache_size,
+                                    path=disk_cache_path))
+            logger.info(
+                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
         self.vocab_size = vocab_size

@@ -1,8 +1,8 @@
-# Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell & Hopper Hardware
+# Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell & Hopper Hardware
 
 ## Introduction
 
-This is a functional quick-start guide for running the Qwen3-Next model on TensorRT LLM. It focuses on a working setup with recommended defaults. Additional performance optimizations and support will be rolled out in future updates.
+This deployment guide provides step-by-step instructions for running the Qwen3.5-397B-A17B model using TensorRT LLM. It covers model access, environment setup, server configuration, and inference validation.
 
 ## Prerequisites
 
@@ -14,20 +14,47 @@ This is a functional quick-start guide for running the Qwen3-Next model on Tenso
 
 ## Models
 
-* BF16 model: [Qwen3-Next-80B-A3B-Thinking](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking)
+* [nvidia/Qwen3.5-397B-A17B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)
+* [Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) (base, BF16)
+
+## GPU Requirements
+
+The NVFP4 checkpoint is the recommended (and minimum-footprint) deployment precision for Qwen3.5. It quantizes the linear layers in the MoE blocks to NVFP4 and uses an FP8 KV cache.
+
+| Platform | Minimum GPUs |
+|----------|--------------|
+| B200     | 4x B200      |
+| B300     | 4x B300      |
+| GB200    | 4x GB200     |
+| GB300    | 4x GB300     |
+
+The NVFP4 checkpoint has been validated on B200 with `tensor_parallel_size = 4`. A single node of 4 Blackwell GPUs fits the NVFP4 weights plus the KV cache with headroom.
 
 ## Deployment Steps
 
 ### Run Docker Container
 
-Build and run the docker container. See the [Docker guide](../../../docker/README.md) for details.
-```
-cd TensorRT-LLM
+Run the docker container using the TensorRT LLM NVIDIA NGC image.
 
-make -C docker release_build IMAGE_TAG=qwen3-next-local
-
-make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=qwen3-next-local LOCAL_USER=1
+```shell
+docker run --rm -it \
+--ipc=host \
+--gpus all \
+-p 8000:8000 \
+-v ~/.cache:/root/.cache:rw \
+--name tensorrt_llm \
+nvcr.io/nvidia/tensorrt-llm/release:x.y.z \
+/bin/bash
 ```
+
+Note:
+
+* The command mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container. If the `~/.cache` directory doesn't exist please create it using `$ mkdir ~/.cache`.
+* You can mount additional directories and paths using the `-v <host_path>:<container_path>` flag if needed, such as mounting the downloaded weight paths.
+* The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host.
+* See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
+
+If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html)
 
 ### Recommended Performance Settings
 
@@ -35,7 +62,7 @@ We maintain YAML configuration files with recommended performance settings in th
 
 ```shell
 TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/qwen3-next.yaml
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/qwen3.5.yaml
 ```
 
 Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
@@ -43,7 +70,7 @@ Note: if you don't have access to the source code locally, you can manually crea
 ````{admonition} Show code
 :class: dropdown
 
-```{literalinclude} ../../../examples/configs/curated/qwen3-next.yaml
+```{literalinclude} ../../../examples/configs/curated/qwen3.5.yaml
 ---
 language: shell
 prepend: |
@@ -55,14 +82,17 @@ append: EOF
 ```
 ````
 
+The config is a starting point tuned for max throughput on 4x B200; adjust the parallelism, batch sizes, and KV cache fraction to match your hardware and traffic pattern.
 
 ### Launch the TensorRT LLM Server
 
-Below is an example command to launch the TensorRT LLM server with the Qwen3-Next model from within the container.
+Below is an example command to launch the TensorRT LLM server with the Qwen3.5 NVFP4 model from within the container.
 
 ```shell
-trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --host 0.0.0.0 --port 8000 --reasoning_parser deepseek-r1 --config ${EXTRA_LLM_API_FILE}
+trtllm-serve nvidia/Qwen3.5-397B-A17B-NVFP4 --host 0.0.0.0 --port 8000 --reasoning_parser qwen3_5 --tool_parser qwen3 --config ${EXTRA_LLM_API_FILE}
 ```
+
+Qwen3.5 uses the `qwen3_5` reasoning parser (its chat template pre-injects a `<think>` block, so reasoning starts at the beginning of the response). The `qwen3` tool parser handles the Qwen3 function-call format.
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
 
@@ -80,11 +110,14 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 * **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tensor_parallel_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
 
+#### `enable_attention_dp`
+
+* **Description:** Enables **attention data parallelism** for the attention/linear-attention layers while keeping the MoE expert-parallel. This generally improves throughput at high concurrency and long context.
+
 #### `kv_cache_config.free_gpu_memory_fraction`
 
 * **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
 * **Recommendation:** If you experience OOM errors, try reducing this value to `0.7` or lower.
-
 
 #### `max_batch_size`
 
@@ -147,7 +180,7 @@ After the TensorRT LLM server is set up and shows Application startup complete, 
 
 ```shell
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json"  -d '{
-    "model": "Qwen/Qwen3-Next-80B-A3B-Thinking",
+    "model": "nvidia/Qwen3.5-397B-A17B-NVFP4",
     "messages": [
         {
             "role": "user",
@@ -159,21 +192,14 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 }' -w "\n"
 ```
 
-Here is an example response:
-
-```
-{"id":"chatcmpl-64ac201c77bf46a7a3a4eca7759b1fd8","object":"chat.completion","created":1759022940,"model":"Qwen/Qwen3-Next-80B-A3B-Thinking","choices":[{"index":0,"message":{"role":"assistant","content":"Okay, the user is asking \"Where is New York?\" Hmm, this seems straightforward but I need to be careful. New York could mean different things—maybe they're confused about the city versus the state. \n\nFirst thought: Are they a tourist planning a trip? Or maybe a student doing homework? Could even be someone国外 who's only heard \"New York\" in movies and isn't sure if it's a city or state. \n\nI should clarify both possibilities immediately. People often mix them up. Like, if someone says \"I'm going to New York\" they're probably talking about NYC, but technically New York State is bigger. \n\nLet me break it down: \n- New York City (NYC) is the famous one—Manhattan, skyscrapers, Times Square. \n- Then New York State (NY) is the whole state, which includes NYC but also upstate areas like Albany (the capital), Buffalo, and even the Adirondacks. \n\nWait, should I mention that NYC is in New York State? Yeah, that's crucial. Otherwise they might think it's two separate things. Also, where is the state located? Northeast US, borders other states like Pennsylvania, New Jersey... maybe name a few neighbors for context. \n\nOh! And the city vs state confusion is super common. Like, people say \"New York\" for the city but forget it's part of a larger state. Should I give examples? \n- \"If someone says 'hot dogs in New York' they mean NYC\" \n- But \"the New York State Police\" covers the whole state\" \n\n...Maybe add a fun fact? Like how NYC is just one city within the state? Or that the state capital isn't NYC but Albany? Yeah, that'll help clear confusion. \n\nAlso—should I ask if they meant the city or the state? Nah, better to cover both upfront. Keep it simple but precise. No jargon. They might not know terms like \"metropolitan area\" or \"boroughs,\" so explain \"boroughs\" as neighborhoods (Manhattan, Brooklyn etc.). \n\nCoordinates: 40.7°N, 74°W? Maybe overkill unless they're into geography. But for the state, roughly 42°N to 45°N latitude? Hmm, probably unnecessary. Stick to landmarks: borders Lake Erie, Atlantic coast... \n\nWait—user might be asking literally for GPS coordinates? Unlikely, but just in case I can add: \"Geographically, New York City is at approximately 40.7°N latitude and 74.0°W longitude...\" but only if the answer feels too dry otherwise. \n\nPriority: Clear, simple, correct. No assuming prior knowledge. Say \"New York can refer to...\" then split into two cases. End with \"Most people mean the city when they say 'New York' in casual talk.\" That’s the key takeaway. \n\n...Double-check: Is Albany really the capital? Yes. And NYC is the largest city but not capital. Got it. Also, New York State is the 27th largest by area? Maybe not relevant. Stick to basics. \n\nFinal structure: \n1. \"New York can mean two things: the city or the state.\" \n2. For city: \n   - Where it is (Northeast US) \n   - Inside New York State \n   - Famous parts (Manhattan etc.) \n3. For state: \n   - Larger area, includes city \n   - Borders (PA, NJ, CT, MA, VT, Canada) \n   - Capital is Albany (not NYC!) \n4. Clear summary: \"In everyday talk, 'New York' usually means NYC.\" \n\nYeah. That covers it without overwhelming them. No markdown, just plain English. Keep it warm—add a \"hope that helps!\" at the end.\n</think>\n\nThat's a common point of confusion! **\"New York\" can refer to two different things**, and it's important to distinguish between them:\n\n### 1. **New York City (NYC)**  \n   - **What it is**: The largest and most famous city in the United States, known for landmarks like Times Square, Central Park, the Statue of Liberty, and Wall Street.  \n   - **Where it is**:  \n     - Located in the **northeastern United States**.  \n     - Situated at the mouth of the **Hudson River**, where it meets the **Atlantic Ocean**.  \n     - Part of **New York State** (see below).  \n   - **Geographic details**:  \n     - Coordinates: Approximately **40.7° N latitude, 74.0° W longitude**.  \n     - Composed of **5 boroughs**: Manhattan (the \"city\" most people picture), Brooklyn, Queens, The Bronx, and Staten Island.  \n     - Panoramic view of NYC (including Brooklyn and New Jersey skyline):","reasoning_content":null,"reasoning":null,"tool_calls":[]},"logprobs":null,"finish_reason":"length","stop_reason":null,"mm_embedding_handle":null,"disaggregated_params":null,"avg_decoded_tokens_per_iter":1.0}],"usage":{"prompt_tokens":15,"total_tokens":1039,"completion_tokens":1024},"prompt_token_ids":null}
-```
-
 ### Troubleshooting Tips
 
-* If you encounter CUDA out-of-memory errors, try reducing `max_batch_size` or `max_seq_len`.
+* If you encounter CUDA out-of-memory errors, try reducing `max_batch_size`, `max_num_tokens`, or `kv_cache_config.free_gpu_memory_fraction`.
 * Ensure your model checkpoints are compatible with the expected format.
-* For performance issues, check GPU utilization with nvidia-smi while the server is running.
+* For performance issues, check GPU utilization with `nvidia-smi` while the server is running.
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
 * For connection issues, make sure the server port (`8000` in this guide) is not being used by another application.
-* If you are using trtllm-serve and the thinking model of Qwen3-Next, make sure to add this server arg `--reasoning_parser deepseek-r1`.
-
+* Reasoning is controlled with `--reasoning_parser qwen3_5`. To toggle thinking per request, pass `enable_thinking` through `chat_template_kwargs` in the request body, for example `{"chat_template_kwargs": {"enable_thinking": true}}` (set it to `false` to disable reasoning).
 
 ## Benchmarking Performance
 
@@ -184,16 +210,18 @@ cat <<'EOF' > bench.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
+MODEL_NAME="nvidia/Qwen3.5-397B-A17B-NVFP4"
+
 concurrency_list="1 2 4 8 16 32 64 128 256"
 multi_round=5
 isl=1024
 osl=1024
-result_dir=/tmp/qwen3_output
+result_dir=/tmp/qwen3_5_output
 
 for concurrency in ${concurrency_list}; do
     num_prompts=$((concurrency * multi_round))
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
-        --model Qwen/Qwen3-Next-80B-A3B-Thinking \
+        --model ${MODEL_NAME} \
         --backend openai \
         --dataset-name "random" \
         --random-input-len ${isl} \
