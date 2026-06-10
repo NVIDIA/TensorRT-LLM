@@ -3779,74 +3779,6 @@ def _sync_cuda():
         torch.cuda.synchronize()
 
 
-def _get_llm_vocab_size(llm):
-    input_processor = getattr(llm, "input_processor", None)
-    if input_processor is not None and hasattr(input_processor,
-                                               "get_vocab_size"):
-        vocab_size = input_processor.get_vocab_size()
-        if vocab_size is not None:
-            return int(vocab_size)
-
-    tokenizer = getattr(llm, "tokenizer", None)
-    for candidate in (tokenizer, getattr(tokenizer, "tokenizer", None)):
-        if candidate is None:
-            continue
-        # The DeepSeek-V4 tokenizer raises NotImplementedError (not
-        # AttributeError) from vocab_size/__len__/get_vocab, which a plain
-        # getattr(..., None) would not swallow, so probe each defensively.
-        for getter in (lambda c: getattr(c, "vocab_size", None),
-                       lambda c: len(c.get_vocab()), lambda c: len(c)):
-            try:
-                vocab_size = getter(candidate)
-            except (AttributeError, TypeError, NotImplementedError):
-                vocab_size = None
-            if vocab_size:
-                return int(vocab_size)
-        # Final fallback: read vocab_size straight from the model config.
-        name_or_path = getattr(candidate, "name_or_path", None)
-        if name_or_path and os.path.isdir(str(name_or_path)):
-            try:
-                with open(os.path.join(str(name_or_path), "config.json")) as f:
-                    config_vocab_size = json.load(f).get("vocab_size")
-            except (OSError, ValueError):
-                config_vocab_size = None
-            if config_vocab_size:
-                return int(config_vocab_size)
-
-    pytest.fail("Cannot determine tokenizer vocab size for token-id smoke test")
-
-
-def _make_token_id_prompt(length, vocab_size, salt):
-    first_regular_token = 2 if vocab_size > 4 else 0
-    regular_vocab_size = vocab_size - first_regular_token
-    return [
-        first_regular_token + ((salt + i) % regular_vocab_size)
-        for i in range(length)
-    ]
-
-
-def _run_token_id_smoke_wave(llm, prompt_lengths, max_tokens, vocab_size):
-    inputs = [{
-        "prompt_token_ids":
-        _make_token_id_prompt(length, vocab_size, salt=idx * 257)
-    } for idx, length in enumerate(prompt_lengths)]
-    sampling_params = SamplingParams(max_tokens=max_tokens,
-                                     min_tokens=max_tokens,
-                                     temperature=0,
-                                     ignore_eos=True,
-                                     detokenize=False,
-                                     add_special_tokens=False)
-    outputs = llm.generate(inputs,
-                           sampling_params=sampling_params,
-                           use_tqdm=False)
-    for output in outputs:
-        generated_tokens = output.outputs[0].token_ids
-        assert len(generated_tokens) == max_tokens, (
-            f"Expected {max_tokens} generated tokens, got "
-            f"{len(generated_tokens)}")
-    _sync_cuda()
-
-
 def _run_deepseekv4_eplb(model_name,
                          model_path,
                          moe_backend,
@@ -3969,19 +3901,6 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
-
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_short_token_boundary_smoke(self):
-        with LLM(self.MODEL_PATH,
-                 **_deepseekv4_pro_agg_llm_kwargs(max_batch_size=32)) as llm:
-            _sync_cuda()
-            vocab_size = _get_llm_vocab_size(llm)
-            _run_token_id_smoke_wave(llm, [1] * 32, 1, vocab_size)
-            _run_token_id_smoke_wave(llm, [1] * 31, 2, vocab_size)
-            _run_token_id_smoke_wave(
-                llm,
-                [1, 2, 3, 4, 63, 64, 65, 127, 128, 129, 511, 512, 513, 2048], 8,
-                vocab_size)
 
 
 @pytest.mark.timeout(14400)
