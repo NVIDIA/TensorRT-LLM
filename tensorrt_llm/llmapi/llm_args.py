@@ -1,18 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import ast
 import functools
 import json
@@ -1768,13 +1753,13 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "Enable relaxed acceptance during thinking phase for reasoning models. Accepts draft tokens matching any top-K candidate instead of exact top-1."
     )
-    relaxed_topk: PositiveInt = Field(
+    relaxed_topk: int = Field(
         default=1,
         description=
         "Number of top candidate tokens to consider for relaxed acceptance. Draft token is accepted if it matches any of these."
     )
-    relaxed_delta: NonNegativeFloat = Field(
-        default=0.0,
+    relaxed_delta: float = Field(
+        default=0.,
         description=
         "Probability threshold for relaxed acceptance. Only candidates with prob >= (top-1 prob - delta) are kept."
     )
@@ -1805,12 +1790,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "Auto-populated from the model's pretrained config. Do not set manually."
     )
 
-    begin_thinking_phase_token: NonNegativeInt = Field(
+    begin_thinking_phase_token: int = Field(
         default=128798,
         description=
         "Token ID marking start of thinking phase. Relaxed acceptance only applies within this phase."
     )
-    end_thinking_phase_token: NonNegativeInt = Field(
+    end_thinking_phase_token: int = Field(
         default=128799,
         description=
         "Token ID marking end of thinking phase. Strict acceptance resumes after this."
@@ -1857,14 +1842,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def num_capture_layers(self) -> int:
-        # MTP_EAGLE (two-model) feeds captured target hidden states into the
-        # separate draft engine, so the shared Eagle3ResourceManager must
-        # allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes
-        # the target model's hidden_states straight to the MTP layer
-        # (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,
-        # both gated on self.is_mtp_eagle), so no capture buffer is needed
-        # and we should skip allocation to avoid disabling post-MLP/MoE
-        # fusion via the layer-capture hook.
         return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
 
     @property
