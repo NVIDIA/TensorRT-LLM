@@ -73,7 +73,6 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
             skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
-            skip_softmax_target_sparsity_from_ckpt_sparse_attention_config,
         )
 
         module_name = kwargs.get("module_name", None)
@@ -90,24 +89,13 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                 )
             )
 
-        if self.threshold_scale_factor is not None:
-            scheduler = SkipSoftmaxScheduler.from_threshold_scale_factor(
-                self.threshold_scale_factor,
-                disabled_until_timestep=disabled_until_timestep,
-            )
-        else:
-            target_sparsity = self.target_sparsity
-            if target_sparsity is None:
-                target_sparsity = skip_softmax_target_sparsity_from_ckpt_sparse_attention_config(
-                    ckpt_sparse_attention_config
-                )
-            if target_sparsity is None:
-                return None
-            scheduler = SkipSoftmaxScheduler.from_target_sparsity(
-                target_sparsity,
-                ckpt_sparse_attention_config=ckpt_sparse_attention_config,
-                disabled_until_timestep=disabled_until_timestep,
-            )
+        threshold_scale_factor = self.resolve_threshold_scale_factor(ckpt_sparse_attention_config)
+        if threshold_scale_factor is None:
+            return None
+        scheduler = SkipSoftmaxScheduler.from_threshold_scale_factor(
+            threshold_scale_factor,
+            disabled_until_timestep=disabled_until_timestep,
+        )
 
         if (
             scheduler.threshold_scale_factor_prefill <= 0
@@ -165,7 +153,10 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                 ckpt_sparse_attention_config
             )
             if isinstance(checkpoint_sparsity, dict):
-                sparsity = checkpoint_sparsity.get("prefill")
+                raise ValueError(
+                    "VisualGen skip-softmax checkpoint target_sparsity must be "
+                    "a scalar; prefill/decode phase dictionaries are LLM-only."
+                )
             else:
                 sparsity = checkpoint_sparsity
         if sparsity is None:

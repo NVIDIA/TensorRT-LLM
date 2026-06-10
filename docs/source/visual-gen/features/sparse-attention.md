@@ -94,14 +94,12 @@ Single-model `config.json`:
         "disabled_until_timestep": 0.6,
         "threshold_scale_factor": {
           "formula": "a * exp(b * target_sparsity)",
-          "prefill": {
+          "coefficients": {
             "a": 1443.4853294366435,
             "b": 4.303654042880227
           }
         },
-        "target_sparsity": {
-          "prefill": 0.5
-        }
+        "target_sparsity": 0.5
       }
     }
   }
@@ -115,7 +113,9 @@ carries checkpoint-provided fnmatch patterns for layers that should not receive
 skip-softmax `SparseParams`. Patterns match both full module names and
 component-relative names, so `blocks.0.attn1` matches
 `transformer.blocks.0.attn1` and `transformer_2.blocks.0.attn1`. Calibration
-defaults come from that single skip-softmax group.
+defaults come from that single skip-softmax group. VisualGen uses a scalar
+`target_sparsity` and scalar formula `coefficients`; LLM-only `prefill` /
+`decode` phase dictionaries are not part of the VisualGen checkpoint shape.
 
 Multi-model diffusers checkpoints keep calibration per component:
 
