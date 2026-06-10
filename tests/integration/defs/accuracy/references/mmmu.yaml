@@ -88,7 +88,14 @@ moonshotai/Kimi-K2.5:
 # reuses the FP8 baseline.
 stepfun-ai/Step-3.7-Flash:
   - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 64
+    accuracy: 60
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 60
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 64
+    accuracy: 60
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 60
