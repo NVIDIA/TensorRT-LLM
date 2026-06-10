@@ -1342,6 +1342,9 @@ private:
 
     // List of allocated blocks for each sequences
     std::unordered_map<LlmRequest::RequestIdType, std::vector<BlockPtr>> mAllocatedBlocksPerSeq;
+    // Request IDs whose stale recurrent-state context blocks have already been
+    // stored and replaced with placeholders at generation start.
+    std::set<LlmRequest::RequestIdType> mStoredLinearAttentionCopySourceReqIds;
 
     // Pool per unique numKvHeads in the model
     std::vector<KVCacheBlockPool> mPools;

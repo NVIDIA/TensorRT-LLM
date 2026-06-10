@@ -2580,6 +2580,15 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
     TLLM_LOG_DEBUG("%s::copyLinearAttentionBlock - Request %lu, currentPosition %d", mLogPrefix.c_str(), requestId,
         currentPosition);
 
+    // Copies issued during context prefill are asynchronous and are synchronized by
+    // refreshBlocks() before the next forward pass. Only store and release their
+    // source blocks once the request reaches generation, and do it before any copy
+    // that this generation step may issue.
+    if (request.isGenerationInProgressState() && mStoredLinearAttentionCopySourceReqIds.insert(requestId).second)
+    {
+        storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(sequence, request);
+    }
+
     // edge case: promptLen % tokensPerBlock == 0, and this is the first token of decoding phase
     if (currentPosition == request.getPromptLen() + 1 && request.getPromptLen() % mTokensPerBlock == 0)
     {
@@ -2608,7 +2617,6 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
     // copy only happens in context phase or the corner case above
     if (currentPosition % mTokensPerBlock != 0 || currentPosition > request.getPromptLen() || currentPosition == 0)
     {
-        storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(sequence, request);
         return false;
     }
 
@@ -2655,7 +2663,6 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         onboardedBlocks.insert({prevBlockId, nextBlockId});
         didCopy = true;
     }
-    storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(sequence, request);
     return didCopy;
 }
 
@@ -3234,6 +3241,7 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
     auto const requestId = sequence.getRequestId();
+    mStoredLinearAttentionCopySourceReqIds.erase(requestId);
     TLLM_LOG_DEBUG("%s::releaseBlocks - requestId=%lu, llmRequest.id=%s", mLogPrefix.c_str(), requestId,
         llmRequest.has_value() ? std::to_string(llmRequest->mRequestId).c_str() : "null");
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;

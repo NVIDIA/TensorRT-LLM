@@ -7853,8 +7853,9 @@ void testKVCacheManagerLinearAttention_BlockCopying(
                     = kvCacheManager.getCacheBlockIds(llmRequest0->mRequestId, linearWindowSizeCode);
                 for (int beam = 0; beam < beamWidth; ++beam)
                 {
-                    ASSERT_LT(blockIdsAfterCopy.at(beam).at(copiedBlockIndex), 0)
-                        << "Copied recurrent-state source should be replaced with a placeholder";
+                    ASSERT_EQ(
+                        blockIdsAfterCopy.at(beam).at(copiedBlockIndex), expectedBlockIds.at(beam).at(copiedBlockIndex))
+                        << "Copied recurrent-state sources are released only at generation start";
                 }
             }
         }
@@ -8111,9 +8112,23 @@ TEST_F(KVCacheManagerTest, LinearAttentionContextCopyReplacesComputedStatesWithP
         llmRequest->setContextCurrentPosition(contextPosition);
     }
 
+    auto const contextBlockIds = kvCacheManager.getCacheBlockIds(llmRequest->mRequestId, linearWindowSizeCode);
+    ASSERT_EQ(contextBlockIds.size(), 1);
+    EXPECT_THAT(contextBlockIds.at(0), testing::ElementsAre(-2, 0, -3, 1, -4, 2, -5, 3, 4));
+    EXPECT_EQ(blocksInPrimaryPool - kvCacheManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 5);
+
+    llmRequest->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    (void) kvCacheManager.copyLinearAttentionBlock(*llmRequest);
+    cudaDeviceSynchronize();
+
     auto const finalBlockIds = kvCacheManager.getCacheBlockIds(llmRequest->mRequestId, linearWindowSizeCode);
     ASSERT_EQ(finalBlockIds.size(), 1);
     EXPECT_THAT(finalBlockIds.at(0), testing::ElementsAre(-2, -6, -3, -7, -4, -8, -5, -9, 4));
+    EXPECT_EQ(blocksInPrimaryPool - kvCacheManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 1);
+
+    (void) kvCacheManager.copyLinearAttentionBlock(*llmRequest);
+    cudaDeviceSynchronize();
+    EXPECT_EQ(kvCacheManager.getCacheBlockIds(llmRequest->mRequestId, linearWindowSizeCode), finalBlockIds);
     EXPECT_EQ(blocksInPrimaryPool - kvCacheManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 1);
 
     kvCacheManager.storeContextBlocks(*llmRequest);
