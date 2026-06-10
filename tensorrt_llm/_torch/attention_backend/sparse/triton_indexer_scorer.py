@@ -89,6 +89,84 @@ def _mqa_logits_fused_mxfp4(
              mask=qm[:, None] & sm[None, :])
 
 
+@triton.jit
+def _mqa_logits_decode_mxfp4(
+        qc_ptr, qs_ptr,            # q codes [G,H,64] u8, q scale [G,H,4] u8
+        kc_ptr, ksc_ptr,           # k codes [Nk,64] u8,   k scale [Nk,4] u8
+        w_ptr, ke_ptr,             # weights [G,H] f32, ke [G] int32 (ks==0 in decode)
+        lut_ptr, out_ptr,          # lut [8] f32, out [G,Nk] f32
+        Nk,
+        H: tl.constexpr, HALF: tl.constexpr, BLOCK_S: tl.constexpr):
+    # Decode-specialized scorer. Nq==1 per generation, so instead of padding the
+    # single query onto the MMA M-axis (BLOCK_Q=64 -> 63/64 lanes wasted, one
+    # wasted MMA *per head*), put the H heads on the M-axis: one [H,64]@[64,BS]
+    # matmul yields all heads' q.k at once, then ReLU + per-head weight + reduce
+    # over H gives the [BS] logits. k is MQA (shared across heads) so it is loaded
+    # and dequantized once per tile. M=H=64 is a full tensor-core tile.
+    pid_g = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offh = tl.arange(0, H)             # heads on the M axis
+    offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offp = tl.arange(0, HALF)          # byte positions 0..63
+    sblk = offp // 16                  # scale-block per byte (0..3)
+    sm = offs < Nk
+
+    # dequant k tile [BS,64] low/high, transpose to [64,BS] for the matmul.
+    kb = tl.load(kc_ptr + offs[:, None] * HALF + offp[None, :],
+                 mask=sm[:, None], other=0).to(tl.int32)
+    klo_c = kb & 0xF
+    khi_c = (kb >> 4) & 0xF
+    klo = tl.load(lut_ptr + (klo_c & 7))
+    khi = tl.load(lut_ptr + (khi_c & 7))
+    klo = tl.where((klo_c & 8) != 0, -klo, klo)
+    khi = tl.where((khi_c & 8) != 0, -khi, khi)
+    ksb = tl.load(ksc_ptr + offs[:, None] * 4 + sblk[None, :],
+                  mask=sm[:, None], other=0).to(tl.int32)
+    ksf = (ksb << 23).to(tl.float32, bitcast=True)          # 2^(b-127)
+    klo_t = tl.trans(klo * ksf)                             # [64, BS]
+    khi_t = tl.trans(khi * ksf)
+
+    # dequant q for ALL H heads of this generation: [H, 64].
+    qb = tl.load(qc_ptr + pid_g * (H * HALF) + offh[:, None] * HALF + offp[None, :]).to(tl.int32)
+    qlo_c = qb & 0xF
+    qhi_c = (qb >> 4) & 0xF
+    qlo = tl.load(lut_ptr + (qlo_c & 7))
+    qhi = tl.load(lut_ptr + (qhi_c & 7))
+    qlo = tl.where((qlo_c & 8) != 0, -qlo, qlo)
+    qhi = tl.where((qhi_c & 8) != 0, -qhi, qhi)
+    qsb = tl.load(qs_ptr + pid_g * (H * 4) + offh[:, None] * 4 + sblk[None, :]).to(tl.int32)
+    qsf = (qsb << 23).to(tl.float32, bitcast=True)
+    qlo = qlo * qsf
+    qhi = qhi * qsf
+
+    dot = (tl.dot(qlo, klo_t, input_precision="ieee")
+           + tl.dot(qhi, khi_t, input_precision="ieee"))   # [H, BS]
+    dot = tl.maximum(dot, 0.0)
+    wh = tl.load(w_ptr + pid_g * H + offh)                  # [H]
+    logits = tl.sum(wh[:, None] * dot, axis=0)             # [BS]
+    kev = tl.load(ke_ptr + pid_g)
+    logits = tl.where(offs < kev, logits, float("-inf"))
+    tl.store(out_ptr + pid_g * Nk + offs, logits, mask=sm)
+
+
+def mqa_logits_mxfp4_decode(qc, qs, kc, ksc, weights, ke, BLOCK_S=64):
+    """Decode scorer: qc [G,H,64] u8, qs [G,H,4] u8, kc [Nk,64] u8, ksc [Nk,4] u8,
+    weights [G,H], ke [G] int32 (ks is implicitly 0). Returns [G, Nk] f32 with
+    -inf for s >= ke[g]. Equivalent to mqa_logits_mxfp4 with ks=0 but specialized
+    for the small-Nq decode shape (heads on the MMA M-axis)."""
+    G, H, _ = qc.shape
+    Nk = kc.shape[0]
+    lut = _get_lut(qc.device)
+    out = torch.empty(G, Nk, device=qc.device, dtype=torch.float32)
+    grid = (G, triton.cdiv(Nk, BLOCK_S))
+    _mqa_logits_decode_mxfp4[grid](
+        qc.contiguous(), qs.contiguous(), kc.contiguous(), ksc.contiguous(),
+        weights.contiguous().float(), ke.int(), lut, out,
+        Nk, H=H, HALF=qc.shape[-1], BLOCK_S=BLOCK_S,
+        num_stages=2, num_warps=4)
+    return out
+
+
 def mqa_logits_mxfp4(qc, qs, kc, ksc, weights, ks, ke, BLOCK_Q=64, BLOCK_S=32):
     """Fused MXFP4 weighted-ReLU-dot logits. qc [Nq,H,64] u8, qs [Nq,H,4] u8,
     kc [Nk,64] u8, ksc [Nk,4] u8, weights [Nq,H], ks/ke [Nq] int32.
