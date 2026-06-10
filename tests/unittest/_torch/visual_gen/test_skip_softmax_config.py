@@ -23,7 +23,7 @@ def _checkpoint_config(
     b: float = 2.0,
     target_sparsity: float = 0.5,
     disabled_layers: Optional[list[str]] = None,
-    initial_disabled_steps: Optional[int] = None,
+    disabled_until_timestep: Optional[float] = None,
 ) -> dict:
     group = {
         "algorithm": "skip_softmax",
@@ -41,8 +41,8 @@ def _checkpoint_config(
     }
     if disabled_layers is not None:
         group["ignore"] = disabled_layers
-    if initial_disabled_steps is not None:
-        group["initial_disabled_steps"] = initial_disabled_steps
+    if disabled_until_timestep is not None:
+        group["disabled_until_timestep"] = disabled_until_timestep
     return {
         "sparse_attention_config": {
             "config_groups": {
@@ -68,11 +68,11 @@ def _checkpoint_config_with_disabled_layers(
 def _prefill_threshold(
     sparse_params: Optional[SkipSoftmaxParams],
     *,
-    step_index: Optional[int] = None,
+    timestep: Optional[float] = None,
 ) -> float:
     assert isinstance(sparse_params, SkipSoftmaxParams)
     return sparse_params.scheduler.get_kernel_params(
-        step_index=step_index
+        timestep=timestep
     ).threshold_scale_factor_prefill
 
 
@@ -85,7 +85,7 @@ class TestPublicApi:
                 "threshold_scale_factor": 5000.0,
                 "target_sparsity": 0.5,
                 "exclude_modules": ["blocks.0.*", "*.attn2"],
-                "initial_disabled_steps": 2,
+                "disabled_until_timestep": 0.6,
             },
         )
 
@@ -94,7 +94,7 @@ class TestPublicApi:
         assert sparse_config.threshold_scale_factor == 5000.0
         assert sparse_config.target_sparsity == 0.5
         assert sparse_config.exclude_modules == ["blocks.0.*", "*.attn2"]
-        assert sparse_config.initial_disabled_steps == 2
+        assert sparse_config.disabled_until_timestep == 0.6
         assert AttentionConfig(**config.model_dump()).model_dump() == config.model_dump()
 
     @pytest.mark.parametrize("field", ["formula", "component_configs"])
@@ -190,51 +190,51 @@ class TestPublicApi:
             == 5000.0
         )
 
-    def test_initial_disabled_steps_use_explicit_step_index(self):
+    def test_disabled_until_timestep_uses_normalized_timestep(self):
         config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor=5000.0,
-            initial_disabled_steps=2,
+            disabled_until_timestep=0.6,
         )
         sparse_params = config.to_sparse_params()
 
-        assert _prefill_threshold(sparse_params, step_index=0) == 0.0
-        assert _prefill_threshold(sparse_params, step_index=1) == 0.0
-        assert _prefill_threshold(sparse_params, step_index=2) == 5000.0
+        assert _prefill_threshold(sparse_params, timestep=1.0) == 0.0
+        assert _prefill_threshold(sparse_params, timestep=0.6) == 0.0
+        assert _prefill_threshold(sparse_params, timestep=0.59) == 5000.0
 
-    def test_checkpoint_initial_disabled_steps_use_explicit_step_index(self):
+    def test_checkpoint_disabled_until_timestep_uses_normalized_timestep(self):
         config = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
         sparse_params = config.to_sparse_params(
-            checkpoint_config=_checkpoint_config(initial_disabled_steps=2)
+            checkpoint_config=_checkpoint_config(disabled_until_timestep=0.6)
         )
 
-        assert _prefill_threshold(sparse_params, step_index=0) == 0.0
-        assert _prefill_threshold(sparse_params, step_index=1) == 0.0
-        assert _prefill_threshold(sparse_params, step_index=2) == 5000.0
+        assert _prefill_threshold(sparse_params, timestep=1.0) == 0.0
+        assert _prefill_threshold(sparse_params, timestep=0.6) == 0.0
+        assert _prefill_threshold(sparse_params, timestep=0.59) == 5000.0
 
-    def test_graph_phase_tracks_initial_disabled_step_boundary(self):
+    def test_graph_phase_tracks_disabled_until_timestep_boundary(self):
         config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor=5000.0,
-            initial_disabled_steps=2,
+            disabled_until_timestep=0.6,
         )
 
         assert (
-            SkipSoftmaxScheduler.get_graph_phase_for_step_index(
-                0,
-                initial_disabled_steps=config.initial_disabled_steps,
+            SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+                1.0,
+                disabled_until_timestep=config.disabled_until_timestep,
             )
             == 0
         )
         assert (
-            SkipSoftmaxScheduler.get_graph_phase_for_step_index(
-                1,
-                initial_disabled_steps=config.initial_disabled_steps,
+            SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+                0.6,
+                disabled_until_timestep=config.disabled_until_timestep,
             )
             == 0
         )
         assert (
-            SkipSoftmaxScheduler.get_graph_phase_for_step_index(
-                2,
-                initial_disabled_steps=config.initial_disabled_steps,
+            SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+                0.59,
+                disabled_until_timestep=config.disabled_until_timestep,
             )
             == 1
         )
@@ -298,7 +298,7 @@ class TestCheckpointMetadata:
                     backend="TRTLLM",
                     sparse_attention_config=SkipSoftmaxAttentionConfig(
                         target_sparsity=0.5,
-                        initial_disabled_steps=1,
+                        disabled_until_timestep=0.6,
                     ),
                 ),
             ),
@@ -311,7 +311,7 @@ class TestCheckpointMetadata:
             "threshold_scale_factor": None,
             "target_sparsity": 0.5,
             "exclude_modules": None,
-            "initial_disabled_steps": 1,
+            "disabled_until_timestep": 0.6,
         }
 
         transformer_config = pipeline_config.model_configs["transformer"]
@@ -330,11 +330,11 @@ class TestCheckpointMetadata:
             module_name="transformer.blocks.0.attn1",
             pretrained_config=transformer_config.pretrained_config,
         )
-        assert _prefill_threshold(transformer_params, step_index=0) == 0.0
-        assert _prefill_threshold(transformer_params, step_index=1) == pytest.approx(
+        assert _prefill_threshold(transformer_params, timestep=0.6) == 0.0
+        assert _prefill_threshold(transformer_params, timestep=0.59) == pytest.approx(
             math.exp(-10.0 + 2.0 * 0.5)
         )
-        assert _prefill_threshold(transformer_2_params, step_index=1) == pytest.approx(
+        assert _prefill_threshold(transformer_2_params, timestep=0.59) == pytest.approx(
             math.exp(-20.0 + 4.0 * 0.5)
         )
         assert transformer_disabled_params is None

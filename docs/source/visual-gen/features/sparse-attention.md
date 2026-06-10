@@ -53,7 +53,9 @@ attention_config:
   sparse_attention_config:
     algorithm: skip_softmax
     threshold_scale_factor: 5000.0
-    initial_disabled_steps: 2
+    # Normalized transformer-forward timestep cutoff. Denoising starts near 1,
+    # so skip-softmax stays disabled while timestep >= 0.6.
+    disabled_until_timestep: 0.6
 ```
 
 ### Fields
@@ -70,10 +72,11 @@ gets no skip-softmax `SparseParams`. Patterns match both full module names and
 component-relative names, so `blocks.0.attn1` matches
 `transformer.blocks.0.attn1` and `transformer_2.blocks.0.attn1`.
 
-`initial_disabled_steps` disables skip-softmax for the first N denoising steps of
-each request, then enables the configured threshold. It is based on the ordinal
-denoising step, not the scheduler timestep value. A checkpoint can provide this
-default; the user config value wins when set.
+`disabled_until_timestep` is a normalized `[0, 1]` transformer-forward timestep
+cutoff. Denoising starts near 1 and moves toward 0, so skip-softmax is disabled
+while `timestep >= disabled_until_timestep` and enabled after the timestep drops
+below the cutoff. This keeps the API independent of the user-selected number of
+denoising steps.
 
 ### Checkpoint Metadata
 
@@ -93,7 +96,7 @@ Single-model `config.json`:
           "blocks.0.attn1",
           "blocks.0.attn2"
         ],
-        "initial_disabled_steps": 5,
+        "disabled_until_timestep": 0.6,
         "threshold_scale_factor": {
           "formula": "a * exp(b * target_sparsity)",
           "prefill": {
@@ -128,15 +131,15 @@ checkpoint/
 When both user config and checkpoint metadata are present, checkpoint metadata
 supplies formulas per model component. The public config can override runtime
 knobs such as `target_sparsity`, `exclude_modules`, and
-`initial_disabled_steps`. The public config object does not store formulas or
+`disabled_until_timestep`. The public config object does not store formulas or
 component sub-configs.
 
 ### CUDA Graphs
 
-`initial_disabled_steps` creates two sparse-attention phases when it is positive:
-the initial disabled phase and the enabled phase. VisualGen includes that phase
-in CUDA graph keys so graph capture does not reuse a graph across different
-skip-softmax settings.
+`disabled_until_timestep` creates two sparse-attention phases when it is set:
+the high-timestep disabled phase and the enabled phase after the cutoff.
+VisualGen includes that phase in CUDA graph keys so graph capture does not reuse
+a graph across different skip-softmax settings.
 
 ## Video Sparse Attention (VSA)
 TODO

@@ -65,17 +65,18 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         default=None,
         description="Fnmatch patterns for modules where skip-softmax is disabled.",
     )
-    initial_disabled_steps: Optional[int] = PydanticField(
+    disabled_until_timestep: Optional[float] = PydanticField(
         default=None,
-        ge=0,
-        description="Number of initial denoising steps with skip-softmax disabled.",
+        ge=0.0,
+        le=1.0,
+        description="Normalized timestep cutoff below which skip-softmax is enabled.",
     )
 
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
-            skip_softmax_initial_disabled_steps_from_checkpoint_config,
+            skip_softmax_disabled_until_timestep_from_checkpoint_config,
             skip_softmax_target_sparsity_from_checkpoint_config,
         )
 
@@ -85,15 +86,16 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if module_name is not None and self._is_disabled(module_name, checkpoint_config):
             return None
 
-        initial_disabled_steps = self.initial_disabled_steps
-        if initial_disabled_steps is None:
-            initial_disabled_steps = skip_softmax_initial_disabled_steps_from_checkpoint_config(
+        disabled_until_timestep = self.disabled_until_timestep
+        if disabled_until_timestep is None:
+            disabled_until_timestep = skip_softmax_disabled_until_timestep_from_checkpoint_config(
                 checkpoint_config
             )
 
         if self.threshold_scale_factor is not None:
             scheduler = SkipSoftmaxScheduler.from_threshold_scale_factor(
-                self.threshold_scale_factor, initial_disabled_steps=initial_disabled_steps
+                self.threshold_scale_factor,
+                disabled_until_timestep=disabled_until_timestep,
             )
         else:
             target_sparsity = self.target_sparsity
@@ -106,7 +108,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             scheduler = SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
                 checkpoint_config=checkpoint_config,
-                initial_disabled_steps=initial_disabled_steps,
+                disabled_until_timestep=disabled_until_timestep,
             )
 
         if (

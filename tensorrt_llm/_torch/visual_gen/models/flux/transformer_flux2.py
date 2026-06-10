@@ -275,7 +275,7 @@ class Flux2TransformerBlock(nn.Module):
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         img_mod: Tuple[Tuple[torch.Tensor, ...], ...],
         txt_mod: Tuple[Tuple[torch.Tensor, ...], ...],
-        step_index: Optional[int] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -308,7 +308,7 @@ class Flux2TransformerBlock(nn.Module):
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
-            step_index=step_index,
+            timestep=timestep,
         )
 
         # Attention residual with gate
@@ -389,7 +389,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         mod: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        step_index: Optional[int] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -413,7 +413,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         hidden_states = self.attn(
             hidden_states,
             image_rotary_emb=image_rotary_emb,
-            step_index=step_index,
+            timestep=timestep,
         )
 
         # Residual with gate
@@ -678,7 +678,6 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        step_index: Optional[int] = None,
         timestep: Optional[torch.Tensor] = None,
         img_ids: Optional[torch.Tensor] = None,
         txt_ids: Optional[torch.Tensor] = None,
@@ -691,8 +690,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
         Args:
             hidden_states: Latent image features [batch, img_seq, in_channels]
             encoder_hidden_states: Text features [batch, txt_seq, joint_attention_dim]
-            step_index: Ordinal denoising-loop index; distinct from scheduler timestep.
-            timestep: Diffusion timestep [batch]
+            timestep: Normalized diffusion timestep in [0, 1], shape [batch]
             img_ids: Image position IDs [img_seq, num_axes] or [batch, img_seq, num_axes]
             txt_ids: Text position IDs [txt_seq, num_axes] or [batch, txt_seq, num_axes]
             guidance: Guidance scale [batch]
@@ -747,7 +745,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
                 image_rotary_emb=image_rotary_emb,
                 img_mod=img_mod,
                 txt_mod=txt_mod,
-                step_index=step_index,
+                timestep=timestep,
             )
 
         # Concatenate for single-stream blocks
@@ -759,7 +757,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
                 hidden_states=hidden_states,
                 image_rotary_emb=image_rotary_emb,
                 mod=single_mod[0],  # Single tuple of (shift, scale, gate)
-                step_index=step_index,
+                timestep=timestep,
             )
 
         # Extract image features (discard text)

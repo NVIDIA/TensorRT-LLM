@@ -41,14 +41,14 @@ class BaseDiffusionModel(nn.Module):
         if not isinstance(sparse_config, SkipSoftmaxAttentionConfig):
             return
 
-        initial_disabled_steps = sparse_config.initial_disabled_steps
-        if initial_disabled_steps is None or initial_disabled_steps <= 0:
+        disabled_until_timestep = sparse_config.disabled_until_timestep
+        if disabled_until_timestep is None:
             return
 
         runner.register_extra_key_fn(
             "skip_softmax_phase",
-            lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_step_index(
-                kwargs.get("step_index"),
-                initial_disabled_steps=initial_disabled_steps,
+            lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+                kwargs.get("timestep"),
+                disabled_until_timestep=disabled_until_timestep,
             ),
         )

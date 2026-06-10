@@ -551,8 +551,7 @@ class WanPipeline(BasePipeline):
 
             return current_model(
                 hidden_states=latents,
-                step_index=step_index,
-                timestep=timestep,
+                timestep=timestep / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
             )
 
