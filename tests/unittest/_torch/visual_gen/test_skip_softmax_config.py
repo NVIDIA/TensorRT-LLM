@@ -22,7 +22,7 @@ def _checkpoint_config(
     log_a: float = -10.0,
     b: float = 2.0,
     target_sparsity: float = 0.5,
-    disabled_layers: Optional[list[str]] = None,
+    ignore_patterns: Optional[list[str]] = None,
     disabled_until_timestep: Optional[float] = None,
 ) -> dict:
     group = {
@@ -39,8 +39,8 @@ def _checkpoint_config(
             "prefill": target_sparsity,
         },
     }
-    if disabled_layers is not None:
-        group["ignore"] = disabled_layers
+    if ignore_patterns is not None:
+        group["ignore"] = ignore_patterns
     if disabled_until_timestep is not None:
         group["disabled_until_timestep"] = disabled_until_timestep
     return {
@@ -52,16 +52,16 @@ def _checkpoint_config(
     }
 
 
-def _checkpoint_config_with_disabled_layers(
+def _checkpoint_config_with_ignore_patterns(
     *,
-    disabled_layers: list[str],
+    ignore_patterns: list[str],
     log_a: float = -10.0,
     b: float = 2.0,
 ) -> dict:
     return _checkpoint_config(
         log_a=log_a,
         b=b,
-        disabled_layers=disabled_layers,
+        ignore_patterns=ignore_patterns,
     )
 
 
@@ -84,7 +84,6 @@ class TestPublicApi:
                 "algorithm": "skip_softmax",
                 "threshold_scale_factor": 5000.0,
                 "target_sparsity": 0.5,
-                "exclude_modules": ["blocks.0.*", "*.attn2"],
                 "disabled_until_timestep": 0.6,
             },
         )
@@ -93,11 +92,10 @@ class TestPublicApi:
         assert isinstance(sparse_config, SkipSoftmaxAttentionConfig)
         assert sparse_config.threshold_scale_factor == 5000.0
         assert sparse_config.target_sparsity == 0.5
-        assert sparse_config.exclude_modules == ["blocks.0.*", "*.attn2"]
         assert sparse_config.disabled_until_timestep == 0.6
         assert AttentionConfig(**config.model_dump()).model_dump() == config.model_dump()
 
-    @pytest.mark.parametrize("field", ["formula", "component_configs"])
+    @pytest.mark.parametrize("field", ["formula", "component_configs", "exclude_modules"])
     def test_calibration_internals_are_not_user_fields(self, field):
         from pydantic import ValidationError
 
@@ -153,29 +151,29 @@ class TestPublicApi:
 
         assert _prefill_threshold(config.to_sparse_params()) == 5000.0
 
-    def test_user_exclude_modules_use_fnmatch_and_component_relative_names(self):
-        config = SkipSoftmaxAttentionConfig(
-            threshold_scale_factor=5000.0,
-            exclude_modules=["blocks.0.attn1", "*.attn2"],
-        )
-
-        assert config.to_sparse_params(module_name="transformer.blocks.0.attn1") is None
-        assert config.to_sparse_params(module_name="transformer_2.blocks.0._orig_mod.attn1") is None
-        assert config.to_sparse_params(module_name="transformer.blocks.3.attn2") is None
-        assert (
-            _prefill_threshold(config.to_sparse_params(module_name="transformer.blocks.3.attn1"))
-            == 5000.0
-        )
-
-    def test_checkpoint_disabled_layers_are_applied_during_lowering(self):
+    def test_checkpoint_ignore_patterns_are_applied_during_lowering(self):
         config = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
-        checkpoint_config = _checkpoint_config_with_disabled_layers(
-            disabled_layers=["blocks.0.attn1"]
+        checkpoint_config = _checkpoint_config_with_ignore_patterns(
+            ignore_patterns=["blocks.0.attn1", "*.attn2"]
         )
 
         assert (
             config.to_sparse_params(
                 module_name="transformer.blocks.0.attn1",
+                checkpoint_config=checkpoint_config,
+            )
+            is None
+        )
+        assert (
+            config.to_sparse_params(
+                module_name="transformer_2.blocks.0._orig_mod.attn1",
+                checkpoint_config=checkpoint_config,
+            )
+            is None
+        )
+        assert (
+            config.to_sparse_params(
+                module_name="transformer.blocks.3.attn2",
                 checkpoint_config=checkpoint_config,
             )
             is None
@@ -279,8 +277,8 @@ class TestCheckpointMetadata:
         )
         (tmp_path / "transformer" / "config.json").write_text(
             json.dumps(
-                _checkpoint_config_with_disabled_layers(
-                    disabled_layers=["blocks.0.attn1"],
+                _checkpoint_config_with_ignore_patterns(
+                    ignore_patterns=["blocks.0.attn1"],
                     log_a=-10.0,
                     b=2.0,
                 )
@@ -310,7 +308,6 @@ class TestCheckpointMetadata:
             "algorithm": "skip_softmax",
             "threshold_scale_factor": None,
             "target_sparsity": 0.5,
-            "exclude_modules": None,
             "disabled_until_timestep": 0.6,
         }
 

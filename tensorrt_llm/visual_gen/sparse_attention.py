@@ -61,10 +61,6 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         le=1.0,
         description="Semantic target sparsity in [0, 1]; requires a calibration formula.",
     )
-    exclude_modules: Optional[list[str]] = PydanticField(
-        default=None,
-        description="Fnmatch patterns for modules where skip-softmax is disabled.",
-    )
     disabled_until_timestep: Optional[float] = PydanticField(
         default=None,
         ge=0.0,
@@ -125,17 +121,16 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     ) -> bool:
         """Return whether skip-softmax should be disabled for this layer."""
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-            skip_softmax_disabled_layers_from_checkpoint_config,
+            skip_softmax_ignore_patterns_from_checkpoint_config,
         )
 
         candidate_names = self._layer_pattern_match_names(module_name)
-        exclude_modules = list(self.exclude_modules or ())
-        exclude_modules.extend(
-            skip_softmax_disabled_layers_from_checkpoint_config(checkpoint_config) or ()
+        ignore_patterns = (
+            skip_softmax_ignore_patterns_from_checkpoint_config(checkpoint_config) or ()
         )
         return any(
             fnmatch.fnmatch(name, pattern)
-            for pattern in exclude_modules
+            for pattern in ignore_patterns
             for name in candidate_names
         )
 
