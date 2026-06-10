@@ -14,6 +14,9 @@
 # limitations under the License.
 
 
+from pathlib import Path
+
+import pytest
 import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
@@ -26,6 +29,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
     DetectHiddenStatesForCapture,
 )
 from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
+from tensorrt_llm._torch.speculative.sa_enhancer import SADraftEnhancer
 from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
 
 
@@ -157,6 +161,111 @@ def test_super_mtp_ssm_replay_smoke():
 
     prompts_and_outputs = results["prompts_and_outputs"]
     assert len(prompts_and_outputs) == 1
+
+
+def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
+    """Test Llama/Eagle runtime with SA enhancer enabled."""
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    test_prompt = "repeat repeat repeat repeat"
+    model_hub_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    eagle_model_hub_id = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+    model_path = hf_id_to_local_model_dir(model_hub_id)
+    eagle_model_path = hf_id_to_local_model_dir(eagle_model_hub_id)
+    if model_path is None or not Path(model_path).is_dir():
+        pytest.skip(f"Model {model_hub_id} not found")
+    if eagle_model_path is None or not Path(eagle_model_path).is_dir():
+        pytest.skip(f"Draft model {eagle_model_hub_id} not found")
+
+    sa_calls = {
+        "extend_and_prepare": [],
+        "maybe_override_all_draft_tokens": [],
+    }
+    original_extend_and_prepare = SADraftEnhancer.extend_and_prepare
+    original_maybe_override_all_draft_tokens = SADraftEnhancer.maybe_override_all_draft_tokens
+
+    def recording_extend_and_prepare(self, *args, **kwargs):
+        result = original_extend_and_prepare(self, *args, **kwargs)
+        sa_calls["extend_and_prepare"].append(
+            {
+                "num_gens": kwargs["num_gens"],
+                "num_contexts": kwargs["num_contexts"],
+                "max_draft_len": kwargs["max_draft_len"],
+                "draft_shape": tuple(self.sa_draft_tokens.shape),
+            }
+        )
+        return result
+
+    def recording_maybe_override_all_draft_tokens(self, draft_tokens):
+        output = original_maybe_override_all_draft_tokens(self, draft_tokens)
+        sa_calls["maybe_override_all_draft_tokens"].append(
+            {
+                "input_shape": tuple(draft_tokens.shape),
+                "output_shape": tuple(output.shape),
+            }
+        )
+        return output
+
+    monkeypatch.setattr(SADraftEnhancer, "extend_and_prepare", recording_extend_and_prepare)
+    monkeypatch.setattr(
+        SADraftEnhancer,
+        "maybe_override_all_draft_tokens",
+        recording_maybe_override_all_draft_tokens,
+    )
+
+    experiment_config = get_small_model_config(model_hub_id)
+    experiment_config["args"]["model_kwargs"]["num_hidden_layers"] = 3
+    experiment_config["args"]["model"] = model_path
+    experiment_config["args"]["runtime"] = "trtllm"
+    experiment_config["args"]["world_size"] = 1
+    experiment_config["args"]["speculative_config"] = {
+        "decoding_type": "Eagle3",
+        "max_draft_len": 3,
+        "eagle3_one_model": True,
+        "speculative_model": eagle_model_path,
+        "eagle3_layers_to_capture": [0, 1, 2],
+        "sa_config": {
+            "threshold": 1,
+        },
+    }
+    experiment_config["args"]["speculative_model_kwargs"] = {
+        "hidden_size": 64,
+        "torch_dtype": "bfloat16",
+    }
+    experiment_config["args"]["attn_backend"] = "flashinfer"
+    experiment_config["args"]["disable_overlap_scheduler"] = True
+    experiment_config["args"]["compile_backend"] = "torch-simple"
+    experiment_config["args"]["max_num_tokens"] = 256
+    # SA enhancer requires an explicit max_seq_len (it sizes the suffix-automaton workspace).
+    experiment_config["args"]["max_seq_len"] = 2048
+    experiment_config["prompt"]["batch_size"] = 1
+    experiment_config["prompt"]["queries"] = test_prompt
+
+    cfg = ExperimentConfig(**experiment_config)
+    cfg.prompt.sp_kwargs = {
+        "max_tokens": 64,
+        "top_k": None,
+        "temperature": 0.0,
+        "seed": 42,
+    }
+
+    results = main(cfg)
+
+    prompts_and_outputs = results["prompts_and_outputs"]
+    assert len(prompts_and_outputs) == 1
+    assert sa_calls["extend_and_prepare"]
+    assert sa_calls["maybe_override_all_draft_tokens"]
+    assert any(
+        call["num_gens"] == 0 and call["num_contexts"] > 0
+        for call in sa_calls["extend_and_prepare"]
+    )
+    assert any(call["num_gens"] > 0 for call in sa_calls["extend_and_prepare"])
+    assert all(call["max_draft_len"] == 3 for call in sa_calls["extend_and_prepare"])
+    assert all(call["draft_shape"][1] >= 3 for call in sa_calls["extend_and_prepare"])
+    assert all(
+        call["input_shape"] == call["output_shape"]
+        for call in sa_calls["maybe_override_all_draft_tokens"]
+    )
 
 
 def test_kv_cache_extra_seq_len_for_spec_dec():

@@ -42,9 +42,11 @@ from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.speculative.sa_enhancer import SADraftEnhancer
+from tensorrt_llm.llmapi import SAEnhancerConfig
 
 from ...distributed.common import broadcast
-from ...shim.interface import CachedSequenceInterface
+from ...shim.interface import CachedSequenceInterface, SpeculativeDecodingModelArgs
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
 from .modeling_nemotron_h import build_nemotron_eagle_layers
@@ -746,6 +748,7 @@ class EagleWrapperConfig:
     load_lm_head_from_target: bool
     normalize_target_hidden_state: bool = False
     sync_before_hidden_state_capture: bool = False
+    sa_config: Optional[SAEnhancerConfig] = None
 
 
 class EagleWrapper(nn.Module):
@@ -756,6 +759,17 @@ class EagleWrapper(nn.Module):
     2. KV-cache mode (inference): runs graph-captured models with cached attention and
        in-place metadata updates. Hidden states flow through layer-prefixed
        `*_hidden_states_cache` kwargs.
+
+    SA draft-enhancement invariant:
+        `self.sa_enhancer` is set at construction iff SA is configured (`config.sa_config` is not
+        None); it is a stateless override policy. The suffix-automaton data structure it operates
+        on (`sa_manager`) is a per-iteration runtime object passed into `forward` and is only
+        available during executor inference. It is intentionally None during the KV-cache resize
+        transform, which calls `forward` purely to size memory before the executor's resource
+        managers exist. SA work therefore requires *both*: every SA call site guards on
+        `self.sa_enhancer is not None and sa_manager is not None`. The two checks are not
+        redundant and must not be collapsed — `sa_enhancer` set with `sa_manager` None is the
+        expected resize-time state and correctly no-ops SA.
     """
 
     def __init__(self, config: EagleWrapperConfig, target_model: nn.Module, draft_model: nn.Module):
@@ -767,6 +781,9 @@ class EagleWrapper(nn.Module):
         self.load_lm_head_from_target = config.load_lm_head_from_target
         self.normalize_target_hidden_state = config.normalize_target_hidden_state
         self.sync_before_hidden_state_capture = config.sync_before_hidden_state_capture
+        self.sa_enhancer: Optional[SADraftEnhancer] = None
+        if config.sa_config is not None:
+            self.sa_enhancer = SADraftEnhancer(config.sa_config.threshold)
 
     @property
     def _draft_inner_model(self):
@@ -840,14 +857,18 @@ class EagleWrapper(nn.Module):
         broadcast(ret, src=0)
         return ret
 
-    def forward(self, cache_seq_interface: Optional[CachedSequenceInterface] = None, **kwargs):
+    def forward(self, spec_dec_args: Optional[SpeculativeDecodingModelArgs] = None, **kwargs):
         """Dispatch to appropriate forward implementation.
 
-        - If seq_info is provided: inference mode (after graph transforms + cache init).
+        - If spec_dec_args is provided: inference mode (after graph transforms + cache init, or
+          the KV-cache resize transform). Its cache_seq_interface drives the cached path; its
+          sa_manager (possibly None) drives optional SA draft enhancement.
         - Otherwise: prefill-only mode (export time, before caches are inserted).
         """
-        if cache_seq_interface is not None:
-            return self._forward_with_kv_cache(cache_seq_interface)
+        if spec_dec_args is not None:
+            return self._forward_with_kv_cache(
+                spec_dec_args.cache_seq_interface, sa_manager=spec_dec_args.sa_manager
+            )
         else:
             return self._forward_prefill_only(**kwargs)
 
@@ -946,7 +967,28 @@ class EagleWrapper(nn.Module):
             return layer_hidden_states[0]
         return torch.cat(layer_hidden_states, dim=1)
 
-    def _forward_with_kv_cache(self, csi: CachedSequenceInterface):
+    def _maybe_apply_sa_draft_override(
+        self,
+        next_new_tokens: torch.Tensor,
+        num_prefill: int,
+        sa_manager,
+    ) -> None:
+        # Both required (see class docstring): sa_manager is None during the resize transform.
+        if self.sa_enhancer is None or sa_manager is None:
+            return
+
+        # next_new_tokens is [batch, 1 + max_draft_len]: column 0 is the golden/bonus token and
+        # columns 1: are the draft proposals. Slice to generation rows (num_prefill:) and to the
+        # draft columns (1:) so the enhancer only sees and overrides draft tokens, leaving the
+        # golden token untouched. The PyTorch backend passes a separate pure-draft-token tensor
+        # (tensorrt_llm/_torch/speculative/eagle3.py), so the extra `1:` here only reflects AD
+        # packing the golden token alongside the drafts — it is not a behavioral difference.
+        next_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+            next_new_tokens[num_prefill:, 1:]
+        )
+        next_new_tokens[num_prefill:, 1:] = next_draft_tokens
+
+    def _forward_with_kv_cache(self, csi: CachedSequenceInterface, sa_manager=None):
         """Forward pass with KV cache (inference after graph transforms).
 
         Phases: target forward -> collect hidden states -> gather + sample + verify ->
@@ -1050,6 +1092,24 @@ class EagleWrapper(nn.Module):
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
 
+        # Both required (see class docstring): sa_manager is None during the resize transform.
+        if self.sa_enhancer is not None and sa_manager is not None:
+            self.sa_enhancer.extend_and_prepare(
+                sa_manager=sa_manager,
+                # extend_and_prepare takes request_ids but only consumes their count here: the
+                # real request->slot binding was already done by sa_manager.prepare() in the
+                # executor (with the actual IDs), so these values are unused. It is a small
+                # host-side Python list (not a device arange/tensor), so it is cheap even at
+                # batch=1. TODO: pass num_sequences instead of a dummy list once extend_and_prepare
+                # accepts a count (avoid touching the shared PyTorch enhancer signature in this PR).
+                request_ids=list(range(num_sequences)),
+                accepted_tokens=new_tokens_2d,
+                num_accepted_tokens=new_tokens_lens,
+                num_gens=num_extend,
+                num_contexts=num_prefill,
+                max_draft_len=self.max_draft_len,
+            )
+
         # MTP state promotion: commit accepted intermediate mamba states to base state
         # Must do this before num_prefill is updated by the drafting loop.
         kv_cache_manager = csi.kv_cache_manager
@@ -1131,6 +1191,8 @@ class EagleWrapper(nn.Module):
                 csi.info.switch_to_generate_(active_args_override=draft_arg_names)
                 csi.info.copy_("input_ids", draft_tokens)
                 csi.info.offset_pos_and_cache_(c_offset, active_args_override=draft_arg_names)
+
+        self._maybe_apply_sa_draft_override(next_new_tokens, num_prefill, sa_manager)
 
         # ---- Phase 6: Package output ----
         return EagleWrapperOutput(

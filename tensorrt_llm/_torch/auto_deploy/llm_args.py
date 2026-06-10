@@ -202,6 +202,30 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_sa_enhancer_requires_max_seq_len(self):
+        """Require an explicit max_seq_len when the SA (suffix-automaton) draft enhancer is used.
+
+        AutoDeploy builds the SA SuffixAutomatonManager and reserves its GPU workspace *before* the
+        KV-cache resize pass, so the resize sizes the cache leaving room for the SA pool. That
+        workspace is sized from max_seq_len and must be reserved before the model factory can infer
+        an unset max_seq_len from the model config, so for SA it must be set explicitly rather than
+        inferred.
+        """
+        spec_config = self.speculative_config
+        if (
+            spec_config is not None
+            and getattr(spec_config, "sa_config", None) is not None
+            and self.max_seq_len is None
+        ):
+            raise ValueError(
+                "AutoDeploy SA enhancer (speculative_config.sa_config) requires an explicit "
+                "max_seq_len: it sizes the suffix-automaton GPU workspace and is built before the "
+                "model factory can infer max_seq_len from the model config. Set max_seq_len to your "
+                "target context length."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_parallel_config(self):
         """Setup parallel config according to world_size.
 

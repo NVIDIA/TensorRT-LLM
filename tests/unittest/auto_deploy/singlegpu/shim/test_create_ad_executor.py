@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import Mock, patch
 
@@ -152,3 +153,78 @@ def test_create_autodeploy_executor_with_guided_decoding(
         assert guided_decoder.max_num_sequences == ad_config.max_batch_size
         assert guided_decoder.vocab_size_padded == vocab_size_padded
         assert result.resource_governor_queue is None
+
+
+def test_create_autodeploy_executor_registers_sa_resource_manager():
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
+
+    sa_config = SAEnhancerConfig(threshold=6)
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model="draft-model",
+        sa_config=sa_config,
+    )
+    ad_config = LlmArgs(
+        model="target-model",
+        max_batch_size=4,
+        max_seq_len=128,
+        max_input_len=64,
+        speculative_config=spec_config,
+        backend="_autodeploy",
+        cuda_graph_config={"max_batch_size": 4},
+    )
+
+    mock_engine = Mock()
+    mock_engine.cache_seq_interface.info.max_num_tokens = 512
+    mock_engine.cache_seq_interface.info.vocab_size_padded = 1000
+    mock_engine.cache_seq_interface.max_num_state_slots = ad_config.max_batch_size
+    mock_engine.cache_seq_interface.kv_cache_manager = Mock()
+    mock_engine.cache_seq_interface.kv_cache_manager.impl = Mock()
+    mock_engine.cache_seq_interface.kv_cache_config_tuned = SimpleNamespace(tokens_per_block=64)
+    mock_sa_manager = Mock()
+
+    def _assert_workspace_reserved_before_build(*args, **kwargs):
+        # Resize accounting depends on the SA workspace being reserved BEFORE the engine builds
+        # (the build runs the KV-cache resize). Asserting from build_from_config's side_effect pins
+        # the ordering: the eager empty-batch prepare() must already have run by the time the engine
+        # is built. A plain assert_called_once after the call would not catch a reordering.
+        mock_sa_manager.prepare.assert_called_once_with([], spec_config.max_draft_len)
+        return mock_engine
+
+    with (
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.mpi_world_size", return_value=1),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.mpi_rank", return_value=0),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.get_free_port", return_value=12345),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.initialize_or_skip"),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.torch.cuda.set_device"),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config",
+            side_effect=_assert_workspace_reserved_before_build,
+        ) as build_from_config_mock,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.SuffixAutomatonManager",
+            return_value=mock_sa_manager,
+        ) as sa_manager_cls,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.instantiate_sampler",
+            return_value=Mock(),
+        ),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor",
+            side_effect=MockPyExecutor,
+        ),
+    ):
+        result = create_autodeploy_executor(ad_config)
+
+    sa_manager_cls.assert_called_once_with(
+        sa_config, ad_config.max_batch_size, ad_config.max_seq_len
+    )
+    assert (
+        result.resource_manager.get_resource_manager(ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        is mock_sa_manager
+    )
+    # The SAManager is created up front and handed to the engine at build time (rather than
+    # lazily fetched from the resource managers during prepare_inputs). The eager workspace
+    # reservation and its before-build ordering are asserted in the side_effect above.
+    assert build_from_config_mock.call_args.kwargs["sa_manager"] is mock_sa_manager

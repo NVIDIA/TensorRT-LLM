@@ -45,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
 )
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler
+from tensorrt_llm._torch.speculative.suffix_automaton import SuffixAutomatonManager
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
@@ -57,7 +58,7 @@ from ..transform.optimizer import InferenceOptimizer
 from ..utils.cuda_graph import BypassCapturedGraphs
 from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
-from .interface import CachedSequenceInterface, GetInferenceModel
+from .interface import CachedSequenceInterface, GetInferenceModel, SpeculativeDecodingModelArgs
 
 # Non-model multimodal metadata consumed before the exported graph or ignored by AD.
 # These keys must NOT leak into the generic extra_args dict — entries there
@@ -368,6 +369,7 @@ class ADEngine(ModelEngine):
         # deprecation: Mapping will soon be replaced entirely by DistConfig
         mapping: Optional[Mapping] = None,
         dist: Optional[Distributed] = None,
+        sa_manager: Optional[SuffixAutomatonManager] = None,
     ):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
 
@@ -411,6 +413,7 @@ class ADEngine(ModelEngine):
             mapping=mapping,
             dist=dist,
             reporting_info=reporting_info,
+            sa_manager=sa_manager,
         )
 
     @torch.inference_mode()
@@ -423,6 +426,7 @@ class ADEngine(ModelEngine):
         mapping: Optional[Mapping] = None,
         dist: Optional[Distributed] = None,
         reporting_info: ReportingInfo = ReportingInfo(),
+        sa_manager: Optional[SuffixAutomatonManager] = None,
     ) -> None:
         """Initialize the engine with model and CachedSequenceInterface.
 
@@ -433,6 +437,9 @@ class ADEngine(ModelEngine):
             dist_config: DistConfig (single source of truth for distributed config within AD).
             mapping: Mapping for external TRT-LLM APIs (KV cache, sampler, etc.).
             reporting_info: Reporting configuration for logging.
+            sa_manager: SA suffix-automaton manager, set when SA enhancement is enabled. Owned by
+                the PyExecutor resource managers; passed in here so the engine holds it from
+                construction rather than lazily fetching it during prepare_inputs.
         """
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
         # This is not correctly declared in the base ModelEngine class though...
@@ -444,6 +451,11 @@ class ADEngine(ModelEngine):
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
+        # SA suffix-automaton manager, set at construction (not lazily fetched per-iteration). Its
+        # GPU workspace is reserved by create_autodeploy_executor before this engine builds, so the
+        # KV-cache resize pass (run below in get_inference_model) sizes the cache leaving room for
+        # the SA pool. None when SA is not enabled.
+        self.sa_manager = sa_manager
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
@@ -953,6 +965,10 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
+        if self.sa_manager is not None and num_extend > 0:
+            gen_request_ids = [request.py_request_id for request in extend_requests]
+            self.sa_manager.prepare(gen_request_ids, self.spec_config.max_draft_len)
+
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
         self.iter_states["has_context_multimodal_data"] = has_context_multimodal_data
@@ -966,7 +982,11 @@ class ADEngine(ModelEngine):
         csi = self.cache_seq_interface
 
         if self.spec_config is not None:
-            model_output = self.model(**csi.named_args, cache_seq_interface=csi)
+            spec_dec_args = SpeculativeDecodingModelArgs(
+                cache_seq_interface=csi,
+                sa_manager=self.sa_manager,
+            )
+            model_output = self.model(**csi.named_args, spec_dec_args=spec_dec_args)
         else:
             model_output = self.model(**csi.named_args)
         if self.iter_states.get("has_context_multimodal_data", False):
@@ -1148,17 +1168,36 @@ def create_autodeploy_executor(
 
     max_num_sequences = ad_config.max_batch_size * dc.pp_size
 
-    # initialize model engine
-    engine = ADEngine.build_from_config(
-        ad_config=ad_config, dist_config=dc, mapping=dist_mapping, dist=dist
-    )
-
     spec_config = ad_config.speculative_config
 
     if spec_config is not None and ad_config.guided_decoding_backend is not None:
         raise ValueError(
             "Guided decoding is not currently supported for speculative decoding in AutoDeploy."
         )
+
+    # Create the SA suffix-automaton manager (if enabled) and eagerly allocate its GPU workspace
+    # *before* building the engine, via a dummy empty-batch prepare() (which runs _ensure_workspace
+    # then no-ops on the empty request list). The engine build runs the KV-cache resize pass, which
+    # sizes the cache from the device's free GPU memory (resize_kv_cache_manager reads
+    # torch.cuda.mem_get_info). The SA pool is a live raw-CUDA allocation that torch.cuda.empty_cache
+    # cannot reclaim, so reserving it first reduces the free memory the resize sees and the cache is
+    # sized to leave room for it (otherwise the lazily-allocated pool would have to fit in the
+    # cache's leftover headroom and could OOM at first decode for large batch*context). Passing the
+    # manager in at build time also lets the engine hold it from construction rather than lazily
+    # fetching it every iteration; it is owned by the PyExecutor resource managers (registered below).
+    sa_manager = None
+    if spec_config is not None and getattr(spec_config, "sa_config", None) is not None:
+        sa_manager = SuffixAutomatonManager(
+            spec_config.sa_config,
+            max_num_sequences,
+            ad_config.max_seq_len,
+        )
+        sa_manager.prepare([], spec_config.max_draft_len)
+
+    # initialize model engine
+    engine = ADEngine.build_from_config(
+        ad_config=ad_config, dist_config=dc, mapping=dist_mapping, dist=dist, sa_manager=sa_manager
+    )
 
     # resource managers
     # KVCacheManager is now created and managed by CachedSequenceInterface during the
@@ -1167,12 +1206,13 @@ def create_autodeploy_executor(
     kv_cache_config_tuned = engine.cache_seq_interface.kv_cache_config_tuned
     seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
 
-    resource_manager = ResourceManager(
-        {
-            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
-            ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
-        }
-    )
+    resource_managers = {
+        ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+        ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
+    }
+    if sa_manager is not None:
+        resource_managers[ResourceManagerType.SPEC_RESOURCE_MANAGER] = sa_manager
+    resource_manager = ResourceManager(resource_managers)
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # TODO: consider passing through scheduler_config arguments here. Not doing this for now since
