@@ -29,6 +29,11 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
     ModelFactory,
     SubModuleExportInfo,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
+    FP8BMMQuantizationFromConfig,
+    FP8LinearQuantizationFromConfig,
+    Quantization,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale, pack_int4_in_uint8
@@ -55,6 +60,11 @@ class DummyFactory(ModelFactory):
     @property
     def max_seq_len(self) -> int:
         return 512
+
+
+def test_quantization_base_does_not_register_noop_post_load_hook():
+    assert FP8LinearQuantizationFromConfig.post_load_hook is Quantization.post_load_hook
+    assert FP8BMMQuantizationFromConfig.post_load_hook is not Quantization.post_load_hook
 
 
 @pytest.mark.parametrize(
