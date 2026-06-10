@@ -59,9 +59,9 @@ class FmhaParams:
 
 
 class PhasedFmha(Fmha):
-    """FMHA base that dispatches mixed requests by phase and attention family."""
+    """FMHA helper for paged-KV libraries that split work by request phase."""
 
-    REQUIRES_PAGED_KV = False
+    REQUIRES_PAGED_KV = True
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
