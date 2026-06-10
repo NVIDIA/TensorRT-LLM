@@ -26,7 +26,10 @@ from _model_test_utils import default_max_num_tokens
 
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import KVPagedResourceHandler
-from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _compute_window_local_view
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import (
+    _compute_cyclic_full_view,
+    _compute_window_local_view,
+)
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -310,6 +313,123 @@ def test_helper_does_not_consume_evicted_extra_slot(two_window_interface, monkey
         assert expected_extra_idx >= front_removed
     else:
         assert extra_page == -1
+
+
+# ---------------------------------------------------------------------------
+# Multi-pool gate: trtllm (and any backend) may host >1 KV pool
+# ---------------------------------------------------------------------------
+
+
+def _build_two_pool_interface(requires_uniform_kv_caches: bool):
+    interface = CachedSequenceInterface(
+        max_seq_len=FULL_WINDOW,
+        max_batch_size=2,
+        max_num_tokens=default_max_num_tokens(FULL_WINDOW, 2),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_tokens=1024,
+            free_gpu_memory_fraction=0.0,
+        ),
+        requires_uniform_kv_caches=requires_uniform_kv_caches,
+    )
+    interface.add_resource(
+        "kv_swa", KVPagedResourceHandler(4, 32, dtype=torch.float16, sliding_window=SWA_WINDOW)
+    )
+    interface.add_resource("kv_full", KVPagedResourceHandler(4, 32, dtype=torch.float16))
+    return interface
+
+
+def test_two_distinct_windows_allowed_by_default():
+    """Default (requires_uniform_kv_caches=False, the trtllm setting) hosts two pools."""
+    interface = _build_two_pool_interface(requires_uniform_kv_caches=False)
+    interface.initialize_resources()  # must not raise
+    # SWA pool + full-attention pool == two distinct windows.
+    windows = sorted(
+        {SWA_WINDOW, FULL_WINDOW}
+        & {pc.window_size for pc in interface._identify_managed_kv_resources()[1]}
+    )
+    assert windows == [SWA_WINDOW, FULL_WINDOW]
+
+
+def test_uniform_kv_caches_still_enforced_when_requested():
+    """The uniformity mechanism is intact: opting in still rejects >1 pool.
+
+    (No backend opts in today; trtllm now defaults to False -- this guards the
+    mechanism so a future single-pool backend can still rely on it.)
+    """
+    interface = _build_two_pool_interface(requires_uniform_kv_caches=True)
+    with pytest.raises(RuntimeError, match="not uniform"):
+        interface.initialize_resources()
+
+
+# ---------------------------------------------------------------------------
+# Cyclic-SWA view (trtllm): full block table + global KV length, no slicing
+# ---------------------------------------------------------------------------
+
+
+def test_cyclic_view_passes_full_table_and_global_length(two_window_interface):
+    """Trtllm path: hand the kernel the FULL block table and the GLOBAL length.
+
+    The trtllm kernel masks the sliding window internally via cyclic indexing,
+    so -- unlike the host-sliced triton/flashinfer path -- the executor must NOT
+    front-slice and must report the un-window-capped KV length.
+    """
+    manager = two_window_interface.kv_cache_manager
+    # A prefill that exceeds the SWA window so window-local slicing WOULD differ.
+    prefill_len = SWA_WINDOW * 3  # 192 tokens
+    req = _add_request(manager, request_id=50, token_num=prefill_len)
+    all_indices = manager.get_cache_indices(req, window_size=SWA_WINDOW)
+
+    active_indices, extra_page, swc, lpl = _compute_cyclic_full_view(
+        all_indices,
+        end_compute_i=prefill_len,
+        tokens_per_block=TOKENS_PER_BLOCK,
+    )
+
+    # Full table verbatim (no front-slice, no window cap).
+    assert active_indices == list(all_indices)
+    # Global (un-capped) KV length -- matches host_past_key_value_lengths.
+    assert swc == prefill_len
+    assert lpl == (prefill_len - 1) % TOKENS_PER_BLOCK + 1
+    # No deferred-page insertion in cyclic mode.
+    assert extra_page == -1
+
+
+def test_cyclic_view_differs_from_window_local_when_evicted(two_window_interface, monkeypatch):
+    """Cyclic view ignores front-eviction; window-local view slices it off.
+
+    Guards that the two staging paths genuinely diverge once the window has
+    been exceeded (so a backend mix-up would be caught).
+    """
+    manager = two_window_interface.kv_cache_manager
+    front_removed = 2
+    total_tokens = front_removed * TOKENS_PER_BLOCK + SWA_WINDOW + 1
+    req = _add_request(manager, request_id=51, token_num=total_tokens)
+    monkeypatch.setattr(
+        manager, "get_num_front_blocks_removed", lambda req_id, window_size=None: front_removed
+    )
+    all_indices = manager.get_cache_indices(req, window_size=SWA_WINDOW)
+
+    cyc_indices, _, cyc_swc, _ = _compute_cyclic_full_view(
+        all_indices, end_compute_i=total_tokens, tokens_per_block=TOKENS_PER_BLOCK
+    )
+    win_indices, _, win_swc, _ = _compute_window_local_view(
+        all_indices,
+        front_removed=front_removed,
+        end_compute_i=total_tokens,
+        group_window=SWA_WINDOW,
+        tokens_per_block=TOKENS_PER_BLOCK,
+    )
+
+    # Cyclic keeps the full list + global length; window-local slices + caps.
+    assert cyc_indices == list(all_indices)
+    assert cyc_swc == total_tokens
+    # Window-local view drops the stale front pages and starts at front_removed.
+    assert win_indices == list(all_indices[front_removed : front_removed + len(win_indices)])
+    assert len(win_indices) < len(cyc_indices)
+    assert win_swc == total_tokens - front_removed * TOKENS_PER_BLOCK
+    assert cyc_swc != win_swc
 
 
 if __name__ == "__main__":

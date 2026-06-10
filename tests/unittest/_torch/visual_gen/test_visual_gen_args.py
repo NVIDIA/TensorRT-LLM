@@ -201,7 +201,7 @@ class TestVisualGenArgsFromDict:
 
     def test_quant_config_dict_passthrough(self):
         """ModelOpt-format dicts are accepted as-is — they parse in PipelineLoader."""
-        from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 
         raw = {"quant_algo": "FP8", "dynamic": True}
         args = VisualGenArgs(model="/tmp/model", quant_config=raw)
@@ -210,8 +210,8 @@ class TestVisualGenArgsFromDict:
         assert isinstance(args.quant_config, dict)
         assert args.quant_config["quant_algo"] == "FP8"
         # The same dict is the source of truth for the derived flags; verify
-        # the parser DiffusionModelConfig.from_pretrained will run on it.
-        qc, _, dwq, daq = DiffusionModelConfig.load_diffusion_quant_config(args.quant_config)
+        # the pipeline-config parser will run on it.
+        qc, _, dwq, _ = DiffusionPipelineConfig.load_diffusion_quant_config(args.quant_config)
         assert qc.quant_algo is not None
         assert dwq is True
 

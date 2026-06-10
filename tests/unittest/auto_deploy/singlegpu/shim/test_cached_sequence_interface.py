@@ -27,10 +27,10 @@ from _model_test_utils import default_max_num_tokens
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     CausalConvResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
     KVPagedResourceHandler,
     SequenceInfo,
-    SpecCausalConvResourceHandler,
-    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
     UnpagedResourceHandler,
@@ -413,7 +413,7 @@ def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache
         resource_names.append(
             interface.add_resource(
                 f"intermediate_ssm_state_{i}",
-                SpecSSMResourceHandler(
+                IntermediateSSMStateHandler(
                     num_heads=num_heads,
                     head_dim=head_dim,
                     d_state=d_state,
@@ -430,7 +430,7 @@ def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache
         resource_names.append(
             interface.add_resource(
                 f"intermediate_conv_state_{i}",
-                SpecCausalConvResourceHandler(
+                IntermediateConvStateHandler(
                     conv_dim=conv_dim,
                     d_conv=4,
                     dtype=torch.float32,

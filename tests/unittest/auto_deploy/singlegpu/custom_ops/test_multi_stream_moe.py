@@ -46,7 +46,17 @@ Each architecture is tested for:
   3. Numerical correctness — output matches eager reference within tolerance.
   4. CUDA graph compatibility — capture + replay produces correct output.
   5. Multi-layer stacking — multiple MoE layers handled independently.
+
+Additionally, a regression suite for nvbugs/6248757 verifies that a trailing
+shared-expert all-reduce is kept on the MAIN stream (only the GEMMs overlap on
+the aux stream), and that a collective in the middle of the shared-expert
+branch makes the transform skip the node entirely.  A Nemotron Ultra V3 suite
+(produced by ``fuse_rmsnorm_quant_nvfp4`` at TP>=2) additionally checks graph
+structure, numerical correctness, CUDA-graph replay, and multi-layer stacking
+for the trailing-all-reduce topology.
 """
+
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -60,6 +70,7 @@ from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
     end_aux_stream_passthrough,
     wait_aux_stream_passthrough,
 )
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import all_reduce_ops, is_op
 
 # ---------------------------------------------------------------------------
 # Mock fused-MoE custom op (distinct name to avoid conflicts with other tests)
@@ -696,3 +707,395 @@ def test_tuple_fork_pattern_and_correctness():
     assert len(begin_nodes) == 1, f"Expected exactly one begin_aux node, got {len(begin_nodes)}"
     assert begin_nodes[0].args[0].target is torch.ops.auto_deploy.mock_tuple_fork_moe_test.default
     _assert_numerical_correctness(gm, model, torch.randn(4, hidden_dim, device="cuda"))
+
+
+# ===================================================================
+# Tests — shared-expert all-reduce placement (regression for nvbugs/6248757)
+# ===================================================================
+#
+# At TP>=6 on SM100 the shared-expert row-parallel all-reduce was moved onto
+# the aux stream together with the rest of the shared-expert subgraph.  Under
+# monolithic (decode) CUDA-graph replay the shared-expert collective on the aux
+# stream then ran concurrently with the routed-expert collective on the main
+# stream; the two symm-mem MULTIMEM all-reduces interleaved across ranks and
+# silently corrupted the output.  The transform must therefore keep any
+# trailing shared-expert collective on the MAIN stream and overlap only the
+# shared-expert GEMMs on the aux stream.
+
+# Custom op packet used directly as the FX node target after export.
+_ALL_REDUCE_TARGET = torch.ops.auto_deploy.torch_dist_all_reduce.default
+
+
+def _node_order(gm):
+    """Map each node to its position in graph (execution) order."""
+    return {n: i for i, n in enumerate(gm.graph.nodes)}
+
+
+def _first_node_with_target(gm, target):
+    """Return the first ``call_function`` node whose target is *target* (or None)."""
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and n.target is target:
+            return n
+    return None
+
+
+class _GatedMLPWithAllReduce(nn.Module):
+    """Shared expert whose row-parallel ``down_proj`` is followed by an all-reduce.
+
+    Mirrors the real DeepSeek/GLM4 sharded graph: the trailing collective (the
+    tensor-parallel shard reduction) is the last op of the shared-expert branch
+    and is what feeds the merge ``add``.
+    """
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+        return torch.ops.auto_deploy.torch_dist_all_reduce(y, "AUTO")
+
+
+class _MidBranchAllReduceMLP(nn.Module):
+    """Shared expert with an all-reduce in the *middle* of the branch.
+
+    The collective is not the trailing shared-output op, so it cannot be split
+    off onto the main stream — the transform must skip this node entirely
+    rather than place a collective on the aux stream.
+    """
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int):
+        super().__init__()
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = torch.relu(self.up_proj(x))
+        h = torch.ops.auto_deploy.torch_dist_all_reduce(h, "AUTO")
+        return self.down_proj(h)
+
+
+class MockSharedExpertAllReduceMoELayer(nn.Module):
+    """DeepSeek/GLM4 MoE layer whose shared expert ends in a row-parallel all-reduce."""
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int, num_experts: int = 8):
+        super().__init__()
+        self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
+        self.shared_experts = _GatedMLPWithAllReduce(hidden_dim, intermediate_dim)
+        self.expert_weight = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
+        self.layernorm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        identity = hidden_states
+        logits = self.gate(hidden_states)
+        routing_weights, selected_experts = torch.topk(logits, k=2, dim=-1)
+
+        moe_out = torch.ops.auto_deploy.mock_fused_moe_moe_test(
+            hidden_states, selected_experts, routing_weights, self.expert_weight
+        )
+        shared_out = self.shared_experts(identity)
+
+        return self.layernorm(moe_out + shared_out)
+
+
+class MockMidBranchAllReduceMoELayer(nn.Module):
+    """MoE layer whose shared expert has a collective in the middle of the branch."""
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int, num_experts: int = 8):
+        super().__init__()
+        self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
+        self.shared_experts = _MidBranchAllReduceMLP(hidden_dim, intermediate_dim)
+        self.expert_weight = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
+        self.layernorm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        identity = hidden_states
+        logits = self.gate(hidden_states)
+        routing_weights, selected_experts = torch.topk(logits, k=2, dim=-1)
+
+        moe_out = torch.ops.auto_deploy.mock_fused_moe_moe_test(
+            hidden_states, selected_experts, routing_weights, self.expert_weight
+        )
+        shared_out = self.shared_experts(identity)
+
+        return self.layernorm(moe_out + shared_out)
+
+
+def test_shared_expert_all_reduce_stays_on_main_stream():
+    """Regression for nvbugs/6248757.
+
+    A trailing shared-expert all-reduce must run on the MAIN stream: the
+    transform overlaps only the shared-expert GEMMs on the aux stream and emits
+    ``end_aux`` / ``wait_aux`` *before* the collective, so the collective is
+    rewired to consume the synced aux output and never lands inside the aux
+    region.
+    """
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockSharedExpertAllReduceMoELayer(hidden_dim, intermediate_dim).eval().to("cuda")
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+
+    assert num == 1, f"Expected 1 replacement, got {num}"
+    _assert_stream_nodes_present(gm)
+
+    order = _node_order(gm)
+    ar_node = _first_node_with_target(gm, _ALL_REDUCE_TARGET)
+    begin_aux = _first_node_with_target(gm, begin_aux_stream_passthrough)
+    end_aux = _first_node_with_target(gm, end_aux_stream_passthrough)
+    wait_aux = _first_node_with_target(gm, wait_aux_stream_passthrough)
+
+    assert ar_node is not None, "shared-expert all-reduce node missing after transform"
+
+    # The collective must run after the aux region is closed (i.e. after the
+    # current stream is switched back to main) — never between begin/end_aux.
+    assert order[ar_node] > order[end_aux], "all-reduce must run after end_aux (main stream)"
+    assert order[ar_node] > order[wait_aux], "all-reduce must run after wait_aux (main stream)"
+    assert not (order[begin_aux] < order[ar_node] < order[end_aux]), (
+        "all-reduce was placed inside the aux-stream region"
+    )
+
+    # The collective is rewired to consume the synced aux output, proving the
+    # GEMM result produced on the aux stream is awaited before the main-stream
+    # collective reads it.
+    assert wait_aux in ar_node.all_input_nodes, (
+        "all-reduce must consume wait_aux output (synced aux result)"
+    )
+
+
+def test_mid_branch_all_reduce_skips_transform():
+    """A non-trailing shared-expert collective must make the transform skip the node.
+
+    Such a collective cannot be split off onto the main stream, so the transform
+    must bail out rather than move a collective to the aux stream.
+    """
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockMidBranchAllReduceMoELayer(hidden_dim, intermediate_dim).eval().to("cuda")
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+
+    assert num == 0, f"Expected 0 replacements (mid-branch collective), got {num}"
+
+    # No aux-stream nodes should be inserted when the transform bails out.
+    targets = _stream_targets(gm)
+    assert begin_aux_stream_passthrough not in targets
+    assert end_aux_stream_passthrough not in targets
+    assert wait_aux_stream_passthrough not in targets
+
+
+# ===================================================================
+# Tests — Nemotron Ultra V3: shared expert with trailing all-reduce
+# (nvbugs/6248757 — the bug introduced by fuse_rmsnorm_quant_nvfp4)
+# ===================================================================
+
+
+class MockNemotronUltraSharedAllReduceMoELayer(nn.Module):
+    """Shared expert branch ending in an all-reduce collective.
+
+    Simulates the FX graph topology produced by ``fuse_rmsnorm_quant_nvfp4``
+    on Nemotron Ultra V3 at TP>=2.  After that fusion the shared-expert
+    ``down_proj`` (row-wise TP split) emits a standalone
+    ``torch_dist_all_reduce`` whose output feeds the merge ``add`` directly::
+
+        hidden_states ─┬─ gate ─ topk ──── mock_fused_moe ──── moe_out ──────────┐
+                       └─ up_proj ─ relu² ─ down_proj ─ all_reduce ─ shared_out ─┴─ add ─ out
+
+    Before PR #14917 (buggy): ``_execute_shared_expert_in_aux_stream`` treats
+    ``shared_output`` (the all_reduce node) as the last shared op and inserts
+    ``end_aux`` *after* it.  The collective therefore executes on the aux stream.
+
+    After PR #14917 (fixed): the all_reduce is detected as a collective, split
+    off from the aux region, and forced to run on the main stream with
+    ``end_aux`` / ``wait_aux`` inserted before it.
+    """
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int, num_experts: int = 8):
+        super().__init__()
+        self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False)
+        self.expert_weight = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
+        self.layernorm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residuals = hidden_states
+        logits = self.gate(hidden_states)
+        routing_weights, selected_experts = torch.topk(logits, k=2, dim=-1)
+
+        # Shared expert path: GEMMs on aux stream, all_reduce on main stream.
+        shared = self.down_proj(torch.relu(self.up_proj(residuals)) ** 2)
+        shared_out = torch.ops.auto_deploy.torch_dist_all_reduce(shared, "sum")
+
+        moe_out = torch.ops.auto_deploy.mock_fused_moe_moe_test(
+            hidden_states, selected_experts, routing_weights, self.expert_weight
+        )
+        return self.layernorm(shared_out + moe_out)
+
+
+def _get_node_order(gm):
+    return {n: i for i, n in enumerate(gm.graph.nodes)}
+
+
+def _find_nodes_by_target(gm, target):
+    return [n for n in gm.graph.nodes if n.op == "call_function" and n.target is target]
+
+
+def _find_allreduce_node(gm):
+    ar_ops = all_reduce_ops()
+    return next((n for n in gm.graph.nodes if is_op(n, ar_ops)), None)
+
+
+def _assert_allreduce_on_main_stream(gm):
+    """The all_reduce must come AFTER end_aux and wait_aux in graph order.
+
+    This is the key structural invariant of the fix (PR #14917).
+
+    With the bug:  graph order is  begin_aux → ... → all_reduce → end_aux → merge
+                   (collective runs on aux stream)
+    With the fix:  graph order is  begin_aux → ... → end_aux → wait_aux → all_reduce → merge
+                   (collective runs on main stream)
+    """
+    node_order = _get_node_order(gm)
+    all_reduce_node = _find_allreduce_node(gm)
+    assert all_reduce_node is not None, "No all_reduce node found in graph"
+
+    end_aux_nodes = _find_nodes_by_target(gm, end_aux_stream_passthrough)
+    wait_aux_nodes = _find_nodes_by_target(gm, wait_aux_stream_passthrough)
+    assert end_aux_nodes, "end_aux_stream_passthrough not found"
+    assert wait_aux_nodes, "wait_aux_stream_passthrough not found"
+
+    end_aux_node = end_aux_nodes[0]
+    wait_aux_node = wait_aux_nodes[0]
+
+    # Core invariant: all_reduce must come AFTER end_aux (and wait_aux) in
+    # graph order.  Violation means the collective is on the aux stream.
+    assert node_order[all_reduce_node] > node_order[end_aux_node], (
+        "BUG: all_reduce collective appears before end_aux in graph order — "
+        "it is running on the aux stream.  The collective must be on the main stream."
+    )
+    assert node_order[all_reduce_node] > node_order[wait_aux_node], (
+        "BUG: all_reduce appears before wait_aux — main stream is not waiting "
+        "for aux compute before running the collective."
+    )
+
+    # end_aux must NOT wrap the all_reduce node directly.
+    assert end_aux_node.args[0] is not all_reduce_node, (
+        "BUG: end_aux_stream_passthrough wraps the all_reduce node as its input, "
+        "meaning the collective ran on the aux stream."
+    )
+
+    # wait_aux must feed the all_reduce directly (it replaced the aux_boundary arg).
+    assert wait_aux_node in all_reduce_node.all_input_nodes, (
+        "wait_aux_stream_passthrough must be a direct input to the all_reduce node "
+        "so the main stream synchronizes with the aux stream before the collective."
+    )
+
+
+def test_trailing_allreduce_graph_structure():
+    """The all_reduce must stay on the main stream after the transform.
+
+    This test captures the exact bug from nvbugs/6248757:
+    - FAILS on pre-PR code: end_aux is inserted after the all_reduce, placing
+      the collective on the aux stream.
+    - PASSES on PR #14917 fix: end_aux/wait_aux are inserted before the
+      all_reduce, which runs on the main stream.
+    """
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockNemotronUltraSharedAllReduceMoELayer(hidden_dim, intermediate_dim).eval().to("cuda")
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+
+    assert num == 1, f"Expected 1 replacement, got {num}"
+    _assert_stream_nodes_present(gm)
+    _assert_allreduce_on_main_stream(gm)
+
+
+def test_trailing_allreduce_correctness():
+    """Numerical correctness for the shared-expert all_reduce topology.
+
+    Patches torch.distributed.all_reduce to identity (correct for world_size=1)
+    so the test runs without an initialized process group.
+    """
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockNemotronUltraSharedAllReduceMoELayer(hidden_dim, intermediate_dim).eval().to("cuda")
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+    assert num == 1
+
+    test_x = torch.randn(4, hidden_dim, device="cuda")
+    with patch("torch.distributed.all_reduce", lambda t, **kw: None):
+        ref = model(test_x)
+        out = gm(test_x)
+
+    assert torch.allclose(out, ref, atol=1e-5), (
+        f"Output mismatch after transform: max diff = {(out - ref).abs().max().item()}"
+    )
+
+
+def test_trailing_allreduce_cuda_graph():
+    """CUDA graph capture + replay for the shared-expert all_reduce topology."""
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockNemotronUltraSharedAllReduceMoELayer(hidden_dim, intermediate_dim).eval().to("cuda")
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+    assert num == 1
+
+    with patch("torch.distributed.all_reduce", lambda t, **kw: None):
+        _assert_cuda_graph_correctness(gm, model, torch.randn(4, hidden_dim, device="cuda"))
+
+
+def test_trailing_allreduce_multi_layer():
+    """Two stacked layers with trailing all_reduce — both transformed, both correct."""
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = (
+        nn.Sequential(
+            MockNemotronUltraSharedAllReduceMoELayer(hidden_dim, intermediate_dim),
+            MockNemotronUltraSharedAllReduceMoELayer(hidden_dim, intermediate_dim),
+        )
+        .eval()
+        .to("cuda")
+    )
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+
+    assert num == 2, f"Expected 2 replacements, got {num}"
+    _assert_stream_nodes_present(gm)
+
+    # Both all_reduce nodes must be on the main stream.
+    node_order = _get_node_order(gm)
+    ar_ops = all_reduce_ops()
+    ar_nodes = [n for n in gm.graph.nodes if is_op(n, ar_ops)]
+    end_aux_nodes = _find_nodes_by_target(gm, end_aux_stream_passthrough)
+    assert len(ar_nodes) == 2, f"Expected 2 all_reduce nodes, got {len(ar_nodes)}"
+    assert len(end_aux_nodes) == 2, f"Expected 2 end_aux nodes, got {len(end_aux_nodes)}"
+    for ar_node in ar_nodes:
+        # Each all_reduce must come after at least one end_aux node.
+        assert any(node_order[ar_node] > node_order[e] for e in end_aux_nodes), (
+            f"all_reduce node {ar_node.name} is not after any end_aux — "
+            "it would run on the aux stream."
+        )
