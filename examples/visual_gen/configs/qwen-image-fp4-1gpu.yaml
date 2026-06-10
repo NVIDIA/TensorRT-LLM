@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# 1-GPU Qwen-Image with NVFP4 dynamic quantization.
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+cuda_graph_config:
+  enable: false
