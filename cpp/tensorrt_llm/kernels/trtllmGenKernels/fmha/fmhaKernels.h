@@ -307,6 +307,13 @@ private:
         = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256};
     inline static std::vector<int> const kDefaultWarmupSeqLenQkvCandidates
         = {1, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+    // Engine-config maxima can be very large (e.g. max_num_requests=2048, max_seq_len=131072 for
+    // long-context Llama-3.1 disagg configs) and produce unrealizable warmup combinations whose
+    // batchSize * seqLenKv far exceeds any KV-cache pool. NVRTC compile time for the dense corner
+    // of that grid blows past server-startup timeouts. Cap the warmup grid to the realistic
+    // working set; any larger shape JIT-compiles lazily on first request.
+    inline static int constexpr kJITWarmupMaxBatchCap = 256;
+    inline static int constexpr kJITWarmupMaxSeqLenCap = 16384;
 
     static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
     {
@@ -382,9 +389,9 @@ private:
             "TRTLLM-Gen FMHA JIT warmup must not run during CUDA graph capture.");
 
         bool const useGenKernelForPrefill = runnerParams.mUseGenKernelForPrefill;
-        int const maxBatchSize = runnerParams.mJITWarmupMaxNumRequests;
-        int const maxSeqLenQ = runnerParams.mJITWarmupMaxSeqLenQ;
-        int const maxSeqLenKv = runnerParams.mJITWarmupMaxSeqLenKv;
+        int const maxBatchSize = std::min(runnerParams.mJITWarmupMaxNumRequests, kJITWarmupMaxBatchCap);
+        int const maxSeqLenQ = std::min(runnerParams.mJITWarmupMaxSeqLenQ, kJITWarmupMaxSeqLenCap);
+        int const maxSeqLenKv = std::min(runnerParams.mJITWarmupMaxSeqLenKv, kJITWarmupMaxSeqLenCap);
 
         TLLM_LOG_DEBUG(
             "TRTLLM-Gen Fmha Warmup Params: maxBatchSize=%d, maxSeqLenKv=%d, useGenKernelForPrefill=%d, maxSeqLenQ=%d",
