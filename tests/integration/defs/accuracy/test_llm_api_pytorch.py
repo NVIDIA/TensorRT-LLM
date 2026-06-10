@@ -7313,6 +7313,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
 class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
     # No thinking mode for now.
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
@@ -7338,6 +7339,32 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                 enable_attention_dp=True,
                 **pytorch_config,
         ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    @skip_post_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_nvfp4_marlin_8gpus(self):
+        """W4A16 NVFP4 Marlin MoE + Linear backend on Hopper (SM 90)."""
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="float16",
+            # free_gpu_memory_fraction=0.5,
+        )
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 moe_config=MoeConfig(backend="MARLIN"),
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=8,
+                 nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
