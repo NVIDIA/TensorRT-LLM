@@ -803,15 +803,11 @@ class BaseWorker(GenerationExecutor):
     def reset_prefix_cache(self) -> None:
         """Invalidate local KV prefix-cache reuse state on PyTorch engines."""
         engine = self.engine
-        if engine is None or not hasattr(engine, "control_action"):
+        if engine is None or not hasattr(engine, "reset_prefix_cache"):
             raise NotImplementedError(
                 "reset_prefix_cache() is only supported by the PyTorch backend."
             )
         with engine.control_action():
-            if not hasattr(engine, "reset_prefix_cache"):
-                raise NotImplementedError(
-                    "reset_prefix_cache() is only supported by the PyTorch backend."
-                )
             engine.reset_prefix_cache()
 
     def shutdown(self):

@@ -995,9 +995,16 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
         try:
-            reset_prefix_cache()
-        except (NotImplementedError, RuntimeError, ValueError) as e:
+            await asyncio.get_running_loop().run_in_executor(
+                None, reset_prefix_cache)
+        except NotImplementedError as e:
             return self._create_not_supported_error(str(e))
+        except (RuntimeError, ValueError) as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.CONFLICT,
+            )
 
         return Response(status_code=200)
 

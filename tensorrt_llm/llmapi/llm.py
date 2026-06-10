@@ -1475,7 +1475,7 @@ class _TorchLLM(BaseLLM):
         if self._encode_only:
             raise RuntimeError("reset_prefix_cache() is not available when "
                                "encode_only=True.")
-        if not hasattr(self, "_executor") or self._executor is None:
+        if self._executor is None:
             raise RuntimeError("reset_prefix_cache() requires an active "
                                "executor.")
 
