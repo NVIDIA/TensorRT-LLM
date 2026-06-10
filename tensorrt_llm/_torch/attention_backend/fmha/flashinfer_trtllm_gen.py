@@ -14,11 +14,12 @@
 # limitations under the License.
 
 """
-TrtLLM-Gen Attention Backend
+FlashInfer TRTLLM-Gen FMHA
 
 This module implements attention computation using flashinfer's trtllm-gen kernels.
-It provides a drop-in replacement for thop.attention() with support for trtllm-gen
-kernel only (Blackwell architecture: SM100/SM103). Enabled via TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1.
+It provides a TRT-LLM attention FMHA library for trtllm-gen kernels
+(Blackwell architecture: SM100/SM103). Enable or disable it through
+``TLLM_FMHA_LIBS``.
 
 Architecture:
     - QKV preprocessing & RoPE: C++ kernels via tensorrt_llm.bindings.internal.thop,
@@ -27,20 +28,17 @@ Architecture:
       the paged KV cache fields carried by FmhaParams.
 
 Entry points:
-    FlashInferTrtllmGenAttention.is_supported()  - Check if trtllm-gen can handle the given config.
-    FlashInferTrtllmGenAttention.forward()       - Main attention method.
+    FlashInferTrtllmGenFmha.is_available() - Check if this FMHA library can be instantiated.
+    FlashInferTrtllmGenFmha.is_supported() - Check if trtllm-gen can handle the given request.
+    FlashInferTrtllmGenFmha.forward()      - Main attention method.
 
 Example:
-    backend = FlashInferTrtllmGenAttention(attention_layer=...)
-    supported, reason = backend.is_supported(q, k, v, attn=..., meta=..., fwd=...)
-    if supported:
-        backend.forward(q, k, v, attn=..., meta=..., fwd=...)
-    else:
-        Fallback to thop.attention()
+    fmha = FlashInferTrtllmGenFmha(attn=...)
+    if fmha.is_supported(q, k, v, metadata, forward_args):
+        fmha.forward(q, k, v, metadata, forward_args)
 """
 
 import math
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -56,7 +54,10 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f, torch_dtype_to_bindi
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
+
+from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -350,36 +351,7 @@ def _get_workspace_size(
     return max(context_size, generation_size)
 
 
-@dataclass(slots=True)
-class FmhaParams:
-    attn: "TrtllmAttention"
-    meta: "TrtllmAttentionMetadata"
-    fwd: AttentionForwardArgs
-    workspace: torch.Tensor
-    attention_input: Optional[torch.Tensor] = None
-    qkv_input: Optional[torch.Tensor] = None
-    context_buf: Optional[torch.Tensor] = None
-    sequence_lengths: Optional[torch.Tensor] = None
-    context_lengths: Optional[torch.Tensor] = None
-    input_seq_length: int = 0
-    max_past_kv_length: int = 0
-    max_attention_window_size: int = 0
-    cyclic_attention_window_size: int = 0
-    num_tokens: int = 0
-    seq_offset: int = 0
-    tokens_per_block: int = 64
-    fp8_context_fmha: bool = False
-    kv_factor: int = 0
-    total_num_blocks: int = 0
-    # Context-only fields
-    batch_size: int = 0
-    # Generation-only fields
-    num_requests: int = 0
-    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
-    spec_decoding_position_offsets: Optional[torch.Tensor] = None
-
-
-class FlashInferTrtllmGenAttention:
+class FlashInferTrtllmGenFmha(PhasedFmha):
     """
     An attention backend using pure trtllm-gen kernels from flashinfer.
     """
@@ -387,6 +359,7 @@ class FlashInferTrtllmGenAttention:
     # Default KV layout for flashinfer
     # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
     DEFAULT_KV_LAYOUT = "HND"
+    REQUIRES_PAGED_KV = True
     # Keep shared paged indices disabled to match the current TensorRT-LLM
     # block-table layout used by the fused preprocessing path.
     USE_SHARED_PAGED_KV_IDX = False
@@ -436,21 +409,62 @@ class FlashInferTrtllmGenAttention:
         (576, 512, 32),
     }
 
-    def __init__(
-        self,
-        attention_layer: "TrtllmAttention",
-    ):
+    def __init__(self, attn: "TrtllmAttention"):
+        super().__init__(attn)
         self._layout = self.DEFAULT_KV_LAYOUT
         # Read once so the hot path is not sensitive to later environment changes.
         self._enable_pdl = get_env_enable_pdl()
-        missing_ops = self._missing_fused_nanobind_ops()
-        if missing_ops:
-            raise RuntimeError(
-                f"trtllm-gen requires fused nanobind ops, missing: {', '.join(missing_ops)}."
-            )
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
+
+    @classmethod
+    def is_available(cls, attn: "TrtllmAttention") -> bool:
+        if not IS_FLASHINFER_AVAILABLE:
+            logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
+            return False
+
+        missing_ops = cls._missing_fused_nanobind_ops()
+        if missing_ops:
+            logger.debug(
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: missing fused "
+                f"nanobind ops: {', '.join(missing_ops)}."
+            )
+            return False
+
+        sm = get_sm_version()
+        if not is_sm_100f(sm):
+            logger.debug(
+                f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
+            )
+            return False
+
+        has_skip_softmax = (
+            attn.skip_softmax_threshold_scale_factor_prefill is not None
+            or attn.skip_softmax_threshold_scale_factor_decode is not None
+        )
+        if has_skip_softmax:
+            logger.debug(
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: skip-softmax attention is enabled."
+            )
+            return False
+
+        if attn.num_heads <= 0 or attn.num_kv_heads <= 0:
+            logger.debug(
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: "
+                f"num_heads={attn.num_heads}, num_kv_heads={attn.num_kv_heads}."
+            )
+            return False
+
+        if attn.num_heads % attn.num_kv_heads != 0:
+            logger.debug(
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: "
+                f"num_heads ({attn.num_heads}) must be divisible by "
+                f"num_kv_heads ({attn.num_kv_heads})."
+            )
+            return False
+
+        return True
 
     @property
     def layout(self) -> str:
@@ -483,45 +497,13 @@ class FlashInferTrtllmGenAttention:
         return kv_scale_orig_quant, kv_scale_quant_orig
 
     @staticmethod
-    def _get_kv_cache_dtype_and_total_blocks(
+    def _get_kv_cache_dtype(
         meta: "TrtllmAttentionMetadata",
-        is_mla_enable: bool,
-    ) -> Tuple[Optional[DataType], int]:
-        kv_cache_dtype = None
-        total_num_blocks = 0
+    ) -> Optional[DataType]:
         kv_cache_manager = meta.kv_cache_manager
         if kv_cache_manager is not None:
-            kv_cache_dtype = kv_cache_manager.dtype
-            kv_factor = 1 if is_mla_enable else 2
-            blocks_in_primary_pool = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
-            if blocks_in_primary_pool is None:
-                blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", None)
-                if blocks_per_window:
-                    blocks_in_primary_pool = max(
-                        int(primary) for primary, _ in blocks_per_window.values()
-                    )
-            if blocks_in_primary_pool is not None:
-                total_num_blocks = (
-                    int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * kv_factor
-                )
-        return kv_cache_dtype, total_num_blocks
-
-    @staticmethod
-    def _get_kv_factor(attn: "TrtllmAttention") -> int:
-        return 1 if attn.is_mla_enable else 2
-
-    @staticmethod
-    def _get_generation_out_head_size(attn: "TrtllmAttention") -> int:
-        kv_lora_rank = attn.kv_lora_rank or 0
-        if attn.is_mla_enable and kv_lora_rank:
-            return kv_lora_rank
-        return attn.head_dim
-
-    @staticmethod
-    def _get_context_out_head_size(attn: "TrtllmAttention") -> int:
-        if attn.is_mla_enable and attn.v_head_dim:
-            return attn.v_head_dim
-        return attn.head_dim
+            return kv_cache_manager.dtype
+        return None
 
     @staticmethod
     def _get_bmm1_scale(attn: "TrtllmAttention") -> float:
@@ -588,6 +570,26 @@ class FlashInferTrtllmGenAttention:
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        supported, reason = self._is_supported_with_reason(
+            q,
+            k,
+            v,
+            self.attn,
+            metadata,
+            forward_args,
+        )
+        if not supported:
+            logger.debug(f"FlashInfer TRTLLM-Gen FMHA does not support request: {reason}")
+        return supported
+
+    def _is_supported_with_reason(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         attn: "TrtllmAttention",
         meta: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,
@@ -625,8 +627,6 @@ class FlashInferTrtllmGenAttention:
         if is_mla_enable and fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "trtllm-gen MLA supports generation-only attention."
 
-        if not IS_FLASHINFER_AVAILABLE:
-            return False, "flashinfer package is not installed."
         if meta.kv_cache_block_offsets is None:
             return False, "trtllm-gen requires paged KV cache."
         output = fwd.output
@@ -643,16 +643,12 @@ class FlashInferTrtllmGenAttention:
         q_dtype = q.dtype
         o_dtype = output.dtype
 
-        sm = get_sm_version()
-        if not is_sm_100f(sm):
-            return False, (f"trtllm-gen requires SM100 or SM103 (Blackwell). Current: SM{sm}.")
-
         if q_dtype not in self.SUPPORTED_INPUT_DTYPES:
             return False, (
                 f"Input dtype {q_dtype} not supported. Supported: FP16, BF16, FP8 (E4M3)."
             )
 
-        kv_cache_dtype, _ = self._get_kv_cache_dtype_and_total_blocks(meta, is_mla_enable)
+        kv_cache_dtype = self._get_kv_cache_dtype(meta)
         if kv_cache_dtype is None:
             kv_cache_dtype = torch_dtype_to_binding(q_dtype)
 
@@ -672,15 +668,6 @@ class FlashInferTrtllmGenAttention:
             )
         if o_dtype not in self.SUPPORTED_OUT_DTYPES:
             return False, f"Output dtype {o_dtype} not supported. Supported: FP16, BF16, FP8."
-
-        assert attn.num_heads > 0, "num_heads must be positive."
-        assert attn.num_kv_heads > 0, "num_kv_heads must be positive."
-        if attn.num_heads % attn.num_kv_heads != 0:
-            return (
-                False,
-                f"num_heads ({attn.num_heads}) must be divisible by "
-                f"num_kv_heads ({attn.num_kv_heads}).",
-            )
 
         has_alibi = attn.position_embedding_type in (4, 5)
         check_context_phase = has_context_phase and not is_mla_enable
@@ -772,184 +759,70 @@ class FlashInferTrtllmGenAttention:
             device_index = torch.cuda.current_device()
         return self._get_multi_processor_count_for_device(device_index)
 
-    def forward(
+    def get_fp8_context_fmha(
         self,
         q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        attn: "TrtllmAttention",
-        meta: "TrtllmAttentionMetadata",
-        fwd: AttentionForwardArgs,
-    ) -> None:
-        output = fwd.output
-        if output is None:
-            raise RuntimeError("trtllm-gen attention requires output.")
-        if meta.kv_cache_block_offsets is None:
-            raise RuntimeError("trtllm-gen attention requires paged KV cache.")
-
-        workspace = meta.effective_workspace
-        if workspace is None:
-            workspace = torch.empty((0,), device=q.device, dtype=torch.int8)
-
-        # Lazily cache the SM count from the first query tensor's device.
-        if self._multi_processor_count is None:
-            self._multi_processor_count = self._get_multi_processor_count(q.device)
-
-        num_heads = attn.num_heads
-        num_kv_heads = attn.num_kv_heads
-        head_size = attn.head_dim
-        quant_mode = attn.quant_mode
-        is_mla_enable = attn.is_mla_enable
-        tokens_per_block = meta.tokens_per_block
-        max_num_requests = meta.max_num_requests
-        max_context_length = meta.max_context_length
-        attention_window_size = fwd.attention_window_size
-        beam_width = meta.beam_width
-
-        num_tokens = q.size(0)
-        attn_input_type = fwd.attention_input_type
-        is_gen_only = attn_input_type == AttentionInputType.generation_only
-        is_fp8_out = output.dtype == torch.float8_e4m3fn
-        is_fp4_out = output.dtype == torch.uint8
-        kv_cache_quant_mode = QuantMode(quant_mode)
-        fp8_context_fmha = (
-            is_fp8_out
-            or is_fp4_out
+        output: torch.Tensor,
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        is_gen_only: bool,
+    ) -> bool:
+        del q, metadata, forward_args
+        kv_cache_quant_mode = QuantMode(self.attn.quant_mode)
+        return (
+            output.dtype == torch.float8_e4m3fn
+            or output.dtype == torch.uint8
             or kv_cache_quant_mode.has_fp4_kv_cache()
             or (kv_cache_quant_mode.has_fp8_kv_cache() and not is_gen_only)
         )
 
-        num_contexts = meta.num_contexts
-        num_ctx_tokens = meta.num_ctx_tokens
-        num_generations = meta.num_generations
-        num_gen_tokens = num_tokens if is_gen_only else num_tokens - num_ctx_tokens
-        if num_gen_tokens < 0:
-            raise RuntimeError(
-                f"Invalid trtllm-gen attention token counts: num_tokens={num_tokens}, "
-                f"num_ctx_tokens={num_ctx_tokens}, attention_input_type={attn_input_type}."
-            )
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+    ) -> None:
+        del k, v
+        attn = self.attn
+        # Lazily cache the SM count from the first query tensor's device.
+        if self._multi_processor_count is None:
+            self._multi_processor_count = self._get_multi_processor_count(q.device)
 
-        workspace_max_tokens = max(num_tokens, max_context_length)
-        workspace_max_gen_tokens = max(num_gen_tokens, max_num_requests)
+        num_tokens = q.size(0)
+        attention_input_type = forward_args.attention_input_type
+        is_gen_only = attention_input_type == AttentionInputType.generation_only
+        num_gen_tokens = num_tokens if is_gen_only else num_tokens - metadata.num_ctx_tokens
+        output = forward_args.output
+        if output is None:
+            raise RuntimeError(f"{type(self).__name__} requires output.")
+        fp8_context_fmha = self.get_fp8_context_fmha(q, output, metadata, forward_args, is_gen_only)
+
+        workspace_max_tokens = max(num_tokens, metadata.max_context_length)
+        workspace_max_gen_tokens = max(num_gen_tokens, metadata.max_num_requests)
         required_workspace_size = _get_workspace_size(
             dtype=q.dtype,
             num_tokens=workspace_max_tokens,
             num_gen_tokens=workspace_max_gen_tokens,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            max_num_requests=max_num_requests,
+            num_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            head_size=attn.head_dim,
+            max_num_requests=metadata.max_num_requests,
             rotary_embedding_dim=attn.rope_dim,
             fp8_context_fmha=fp8_context_fmha,
         )
 
         current_workspace_size = workspace.numel() * workspace.element_size()
         if current_workspace_size < required_workspace_size:
-            if meta.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+            if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "Attention CUDA graph workspace is smaller than the "
                     "required size for trtllm-gen."
                 )
             required_workspace_numel = math.ceil(required_workspace_size / workspace.element_size())
             workspace.resize_((required_workspace_numel,))
-
-        out_head_size = (
-            self._get_generation_out_head_size(attn)
-            if is_gen_only
-            else self._get_context_out_head_size(attn)
-        )
-        out_tensor = output.view(num_tokens, num_heads, out_head_size)
-
-        cache_indirection = meta.cache_indirection
-        max_attn_window_size = (
-            attention_window_size
-            if beam_width == 1
-            else (
-                cache_indirection.size(2)
-                if cache_indirection is not None
-                else attention_window_size
-            )
-        )
-        cyclic_attn_window_size = attention_window_size
-        tokens_per_block = tokens_per_block if tokens_per_block is not None else 64
-        _, total_num_blocks = self._get_kv_cache_dtype_and_total_blocks(meta, is_mla_enable)
-
-        params = FmhaParams(
-            attn=attn,
-            meta=meta,
-            fwd=fwd,
-            workspace=workspace,
-            max_attention_window_size=max_attn_window_size,
-            cyclic_attention_window_size=cyclic_attn_window_size,
-            tokens_per_block=tokens_per_block,
-            fp8_context_fmha=fp8_context_fmha,
-            kv_factor=self._get_kv_factor(attn),
-            total_num_blocks=total_num_blocks,
-        )
-
-        sequence_length = meta.kv_lens_cuda_runtime
-        host_past_key_value_lengths = meta.kv_lens_runtime
-
-        if num_contexts > 0 and attn_input_type != AttentionInputType.generation_only:
-            seq_offset = 0
-            token_offset = 0
-            num_seqs = num_contexts
-
-            context_lengths = meta.prompt_lens_cuda_runtime
-            host_context_lengths = meta.prompt_lens_cpu_runtime
-            max_context_q_len = int(host_context_lengths[seq_offset : seq_offset + num_seqs].max())
-            max_past_kv_len = int(
-                host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
-            )
-
-            params.attention_input = q[token_offset : token_offset + num_ctx_tokens]
-            params.qkv_input = params.attention_input
-            params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
-            params.sequence_lengths = sequence_length[seq_offset:]
-            params.context_lengths = context_lengths[seq_offset:]
-            params.max_past_kv_length = max_past_kv_len
-            params.num_tokens = num_ctx_tokens
-            params.seq_offset = seq_offset
-            params.input_seq_length = max_context_q_len
-            params.batch_size = num_seqs
-            self.run_context(params)
-
-        if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
-            seq_offset = num_contexts
-            token_offset = 0 if is_gen_only else num_ctx_tokens
-            num_seqs = num_generations
-
-            max_past_kv_len = int(
-                host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
-            )
-            input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
-
-            predicted_tokens_per_seq = attn.predicted_tokens_per_seq
-            spec_gen_lengths = None
-            spec_pos_offsets = None
-            if meta.is_spec_decoding_enabled and predicted_tokens_per_seq > 1:
-                spec_gen_lengths = meta.spec_decoding_generation_lengths
-                position_offsets_for_cpp = meta.spec_decoding_position_offsets_for_cpp
-                if position_offsets_for_cpp is not None and position_offsets_for_cpp.dim() == 1:
-                    position_offsets_for_cpp = position_offsets_for_cpp.view(max_num_requests, -1)
-                spec_pos_offsets = position_offsets_for_cpp
-
-            params.attention_input = q[token_offset : token_offset + num_gen_tokens]
-            params.qkv_input = params.attention_input
-            params.context_buf = out_tensor[token_offset : token_offset + num_gen_tokens]
-            params.sequence_lengths = sequence_length[seq_offset:]
-            params.max_past_kv_length = max_past_kv_len
-            params.num_tokens = num_gen_tokens
-            params.seq_offset = seq_offset
-            params.input_seq_length = input_seq_length
-            params.num_requests = num_seqs // beam_width
-            params.spec_decoding_generation_lengths = spec_gen_lengths
-            params.spec_decoding_position_offsets = spec_pos_offsets
-            if is_mla_enable:
-                self.run_mla_generation(params)
-            else:
-                self.run_generation(params)
-        return
 
     @staticmethod
     def _compute_window_left(
