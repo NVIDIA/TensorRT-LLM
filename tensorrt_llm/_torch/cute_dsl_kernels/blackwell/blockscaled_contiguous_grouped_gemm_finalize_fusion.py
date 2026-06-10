@@ -1667,6 +1667,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
             tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+            tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy("async.shared", space="cta")
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
@@ -1681,19 +1682,27 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 meta_stage = meta_producer_state.index
                 # Strided row assignment keeps the permuted_idx loads and smem
                 # stores coalesced (each fixed j: 32 lanes touch 32 contiguous
-                # rows). Padding rows hold -1; clamp the gather index in-bounds
-                # (branchless) -- the epilogue ignores padding rows via
-                # is_valid_row, so the value staged for them is irrelevant.
+                # rows). Rows beyond mn_limit are padding: their expanded_idx is
+                # not guaranteed to be in range, so gate the token_final_scales
+                # gather to token 0 for them (branchless) to keep it in-bounds.
+                # The epilogue ignores padding rows via its own is_valid_row, so
+                # the value staged for them is irrelevant.
                 for j in cutlass.range(
                     self.cta_tile_shape_mnk[0] // self.threads_per_warp,
                     unroll_full=True,
                 ):
                     r = meta_lane + j * self.threads_per_warp
-                    expanded_idx = permuted_idx_to_expanded_idx[tile_m_start + r]
+                    permuted_row = tile_m_start + r
+                    expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+                    # max(., 0) keeps topk_idx in-bounds for padding rows (-1);
+                    # the is_valid gate keeps token_idx in-bounds (padding rows
+                    # may hold out-of-range garbage, not just -1).
                     safe_idx = cutlass.max(expanded_idx, cutlass.Int32(0))
                     token_idx = safe_idx // topK
                     topk_idx = safe_idx % topK
-                    token_scale = token_final_scales[(token_idx, topk_idx)]
+                    is_valid_row = cutlass.Int32(permuted_row < tile_info[4])
+                    gather_tok = token_idx * is_valid_row
+                    token_scale = token_final_scales[(gather_tok, topk_idx)]
                     sMetaTokenIdx[(r, meta_stage)] = token_idx
                     sMetaScale[(r, meta_stage)] = alpha_val * token_scale
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -1704,6 +1713,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
                 tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy("async.shared", space="cta")
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
