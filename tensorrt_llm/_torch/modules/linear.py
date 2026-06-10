@@ -2805,30 +2805,51 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
         size_k = module.in_features
         group_size = module.scaling_vector_size  # 16
 
-        assert size_k >= 64 and size_k % 64 == 0, f"size_k {size_k} must be >= 64 and divisible by 64"
-        assert size_n >= 64 and size_n % 64 == 0, f"size_n {size_n} must be >= 64 and divisible by 64"
+        assert size_k % group_size == 0, (
+            f"size_k {size_k} must be divisible by group_size {group_size}")
 
-        qweight_int32 = weight.view(torch.int32).T.contiguous()  # [K/4, N]
-        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
-        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
-            b_q_weight=qweight_int32,
-            perm=perm,
-            size_k=size_k,
-            size_n=size_n,
-            num_bits=4,
-            is_a_8bit=False,
-        )
+        # Marlin CUDA kernel block size = 64
+        size_k_pad = fp4_utils.pad_up(size_k, 64)
+        size_n_pad = fp4_utils.pad_up(size_n, 64)
 
         num_groups = size_k // group_size
         n_padded = fp4_utils.pad_up(size_n, 128)
         scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
             weight_scale.view(n_padded, -1))
-        scale_2d = scale_unswizzled[:size_n, :num_groups].view(
-            torch.float8_e4m3fn).T.contiguous()
+        # [size_n, num_groups] block scales; uint8 storage (reverse interleave),
+        # reinterpreted as E4M3 after any padding. Pad in uint8 since F.pad does
+        # not support float8.
+        scale_2d = scale_unswizzled[:size_n, :num_groups]
+
+        if size_k_pad != size_k or size_n_pad != size_n:
+            num_groups_pad = size_k_pad // group_size
+            # weight: [N, K/2] uint8 -> [N_pad, K_pad/2] (FP4 zero == 0.0)
+            weight = F.pad(weight,
+                           (0,
+                            (size_k_pad - size_k) // 2, 0, size_n_pad - size_n))
+            # scales: [N, num_groups] -> [N_pad, num_groups_pad]
+            scale_2d = F.pad(
+                scale_2d,
+                (0, num_groups_pad - num_groups, 0, size_n_pad - size_n))
+
+        qweight_int32 = weight.view(
+            torch.int32).T.contiguous()  # [K_pad/4, N_pad]
+        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
+        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
+            b_q_weight=qweight_int32,
+            perm=perm,
+            size_k=size_k_pad,
+            size_n=size_n_pad,
+            num_bits=4,
+            is_a_8bit=False,
+        )
+
+        scale_2d = scale_2d.view(
+            torch.float8_e4m3fn).T.contiguous()  # [num_groups_pad, N_pad]
         marlin_scale = marlin_utils.marlin_permute_scales(scale_2d.to(
             torch.half),
-                                                          size_k,
-                                                          size_n,
+                                                          size_k_pad,
+                                                          size_n_pad,
                                                           group_size=group_size)
         marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
 
@@ -2842,12 +2863,24 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
         module.weight_scale = Parameter(marlin_scale, requires_grad=False)
         module.weight_global_scale = Parameter(weight_global_scale,
                                                requires_grad=False)
+        # Padded GEMM dims consumed by ``apply``; default to the real sizes.
+        module._marlin_size_k = size_k_pad
+        module._marlin_size_n = size_n_pad
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         assert is_nvfp4_marlin_enabled()
+        size_k = module.in_features
+        size_n = module.out_features
+        # Set by post_load_weights; equal to size_k/size_n when 64-aligned.
+        size_k_pad = getattr(module, "_marlin_size_k", size_k)
+        size_n_pad = getattr(module, "_marlin_size_n", size_n)
+
+        x = input.bfloat16()
+        if size_k_pad != size_k:
+            x = F.pad(x, (0, size_k_pad - size_k))
         output = torch.ops.trtllm.marlin_nvfp4_gemm(
-            input.bfloat16(),
+            x,
             module.weight,
             scale_a=None,
             scale_b=module.weight_scale,
@@ -2855,10 +2888,12 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
             weight_global_scale=module.weight_global_scale,
             bias=None,
             out_dtype=module.dtype,
-            size_n=module.out_features,
-            size_k=module.in_features,
+            size_n=size_n_pad,
+            size_k=size_k_pad,
             output_buffer_kind=int(BufferKind.DEFAULT),
         )
+        if size_n_pad != size_n:
+            output = output[..., :size_n].contiguous()
         if bias is not None:
             output = output + bias
         return output
