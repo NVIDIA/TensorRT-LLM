@@ -979,6 +979,12 @@ class IRShardingConfig(TransformConfig):
         default=None,
         description="When set, only shard nodes whose layer_type hint is in this list.",
     )
+    simple_shard_filter: Optional[str] = Field(
+        default=None,
+        description="Comma-separated weight-name keywords (e.g. 'lm_head'). Matching linears are "
+        "gather-sharded (column split + all_gather) regardless of shard_layers -- used for the "
+        "lm_head vocab projection, which the hint-driven sharder would otherwise replicate.",
+    )
     enable_attention_dp: bool = Field(default=False)
     dist_mapping: dict[str, int] = Field(default_factory=dict)
     dist_config: DistConfig = Field(default_factory=DistConfig)
@@ -1047,44 +1053,52 @@ def _apply_simple_shard(gm: GraphModule, dc: DistConfig) -> int:
     for node in list(gm.graph.nodes):
         if not is_any_lin_op(node):
             continue
-        weight_nodes = extract_weight_nodes(node)
-        if not weight_nodes.weights:
-            continue
-        for wn in weight_nodes.weights:
-            shard_weight_tensor(
-                gm=gm,
-                weight_tensor=wn.tensor,
-                param_key=wn.node_key,
-                dim=SplitDimension.COLUMN,
-                rank=dc.tp_rank,
-                world_size=dc.tp_size,
-            )
-        for bn in weight_nodes.biases:
-            shard_weight_tensor(
-                gm=gm,
-                weight_tensor=bn.tensor,
-                param_key=bn.node_key,
-                dim=SplitDimension.COLUMN,
-                rank=dc.tp_rank,
-                world_size=dc.tp_size,
-            )
-        enable_sharding = ShardableNode.from_node(node)
-        if isinstance(enable_sharding, LinearShardableNode):
-            enable_sharding._shard_scales(
-                gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None
-            )
-        # torch_dist_all_gather is the demollm backend op; signature is
-        # (tensor, dim=0, sizes=None) — plain torch.distributed all_gather,
-        # no strategy or symm_mem support (use the trtllm backend for those).
-        with gm.graph.inserting_after(node):
-            gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
-                args=(node, -1),
-            )
-            node.replace_all_uses_with(gather_node)
-            gather_node.replace_input_with(gather_node, node)
-        num_updates += 1
+        num_updates += _simple_shard_node(gm, node, dc)
     return num_updates
+
+
+def _simple_shard_node(gm: GraphModule, node: Node, dc: DistConfig) -> int:
+    """Column-split one linear's weight/bias/scale, then all_gather (the "gather" mode).
+
+    Used as the simple-shard fallback for every linear (``simple_shard_only``) and,
+    via ``simple_shard_filter``, to gather-shard specific linears like ``lm_head``
+    (huge vocab projection) that the hint-driven sharder would otherwise replicate.
+    """
+    weight_nodes = extract_weight_nodes(node)
+    if not weight_nodes.weights:
+        return 0
+    for wn in weight_nodes.weights:
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=wn.tensor,
+            param_key=wn.node_key,
+            dim=SplitDimension.COLUMN,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+    for bn in weight_nodes.biases:
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=bn.tensor,
+            param_key=bn.node_key,
+            dim=SplitDimension.COLUMN,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+    sn = ShardableNode.from_node(node)
+    if isinstance(sn, LinearShardableNode):
+        sn._shard_scales(gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None)
+    # torch_dist_all_gather is the demollm backend op; signature is
+    # (tensor, dim=0, sizes=None) — plain torch.distributed all_gather,
+    # no strategy or symm_mem support (use the trtllm backend for those).
+    with gm.graph.inserting_after(node):
+        gather_node = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            args=(node, -1),
+        )
+        node.replace_all_uses_with(gather_node)
+        gather_node.replace_input_with(gather_node, node)
+    return 1
 
 
 # =============================================================================
@@ -1190,6 +1204,8 @@ class ApplyShardingHints(BaseTransform):
             _log_sharding_result(dc, num_updates)
         else:
             shard_layers = self.config.shard_layers
+            ssf = self.config.simple_shard_filter
+            simple_shard_filter = [k.strip() for k in ssf.split(",") if k.strip()] if ssf else None
             num_skipped = 0
             all_dead_nodes = []
 
@@ -1202,6 +1218,14 @@ class ApplyShardingHints(BaseTransform):
                         shardable_node, (MoEShardableNode, StackedMoEShardableNode)
                     ):
                         continue
+                    # Gather-shard simple_shard_filter matches (e.g. lm_head) regardless of
+                    # shard_layers: column split + all_gather of the huge vocab projection.
+                    if simple_shard_filter and is_any_lin_op(node):
+                        wnodes = extract_weight_nodes(node)
+                        key = wnodes.weights[0].node_key if wnodes.weights else ""
+                        if any(kw in key for kw in simple_shard_filter):
+                            num_updates += _simple_shard_node(gm, node, dc)
+                            continue
                     if shard_layers is not None:
                         [lt] = extract_op_args(node, "layer_type")
                         if lt is not None and lt not in shard_layers:
