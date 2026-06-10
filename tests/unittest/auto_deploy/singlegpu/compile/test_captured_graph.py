@@ -34,10 +34,11 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
     _inject_out_param,
+    _setup_piecewise_mixed_batch,
 )
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner, OutputInfo
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import SplitInfo, submod_has_cuda_ops
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo, SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
@@ -1544,3 +1545,64 @@ class TestPiecewiseCapturedGraphMultiStreamWiring:
 
         assert isinstance(pcg.split_gm.submod_0, ADPiecewiseRunner)
         assert isinstance(pcg.split_gm.submod_1, ADPiecewiseRunner)
+
+
+class TestSetupPiecewiseMixedBatch:
+    """Coverage for piecewise warmup synthetic mixed-batch setup.
+
+    Regression for VSWA models (e.g. Gemma4 E2B) whose KV cache spans multiple
+    window groups: the synthetic capture batch must provide one cache_loc /
+    cu_num_pages entry per registered window group, otherwise nest_sequences
+    asserts ``cache_loc_per_pool has N entries, expected M`` during capture.
+    """
+
+    @staticmethod
+    def _make_seq_info() -> SequenceInfo:
+        return SequenceInfo(
+            max_seq_len=64,
+            max_batch_size=4,
+            max_num_tokens=64,
+            tokens_per_block=16,
+        )
+
+    @pytest.mark.parametrize("window_sizes", [None, [16, 64], [16, 32, 64]])
+    def test_setup_matches_registered_window_groups(self, window_sizes):
+        """_setup_piecewise_mixed_batch must not raise for single- or multi-pool seq_info."""
+        seq_info = self._make_seq_info()
+        if window_sizes is not None:
+            seq_info.register_window_groups(window_sizes)
+            expected_groups = len(window_sizes)
+        else:
+            # No VSWA registration -> single-pool path.
+            expected_groups = 0
+
+        assert seq_info.num_window_groups == expected_groups
+
+        # Must not raise the per-pool length assertion in nest_sequences.
+        _setup_piecewise_mixed_batch(seq_info, num_tokens=8)
+
+    def test_setup_replicates_cache_loc_per_pool(self):
+        """The synthetic per-pool cache_loc must be replicated for every window group."""
+        seq_info = self._make_seq_info()
+        seq_info.register_window_groups([16, 64])
+
+        captured = {}
+
+        original_nest = seq_info.nest_sequences
+
+        def _spy(*args, **kwargs):
+            captured.update(kwargs)
+            return original_nest(*args, **kwargs)
+
+        seq_info.nest_sequences = _spy
+        _setup_piecewise_mixed_batch(seq_info, num_tokens=8)
+
+        assert len(captured["cache_loc_per_pool"]) == seq_info.num_window_groups == 2
+        assert len(captured["cu_num_pages_per_pool"]) == 2
+        # Replicated metadata: each pool sees the same page indices (uniform block geometry).
+        torch.testing.assert_close(
+            captured["cache_loc_per_pool"][0], captured["cache_loc_per_pool"][1]
+        )
+        torch.testing.assert_close(
+            captured["cu_num_pages_per_pool"][0], captured["cu_num_pages_per_pool"][1]
+        )

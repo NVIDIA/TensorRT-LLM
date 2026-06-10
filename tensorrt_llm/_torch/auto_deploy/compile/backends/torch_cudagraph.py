@@ -1080,7 +1080,7 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
 
     Args:
         seq_info: SequenceInfo object (duck-typed: needs max_seq_len, max_batch_size,
-            tokens_per_block, and nest_sequences method).
+            tokens_per_block, num_window_groups, and nest_sequences method).
         num_tokens: Total number of tokens for this piecewise bucket.
     """
     assert num_tokens >= 3, (
@@ -1118,12 +1118,14 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
     cache_loc = torch.arange(cu_num_pages[-1].item())
     slot_idx = torch.arange(bs)
 
+    # Replicate cache metadata per KV pool for VSWA (uniform block geometry).
+    n_pools = max(1, getattr(seq_info, "num_window_groups", 1))
     seq_info.nest_sequences(
         input_ids=input_ids_flat,
         cu_seqlen=cu_seqlen,
         input_pos=0,
-        cache_loc_per_pool=[cache_loc],
-        cu_num_pages_per_pool=[cu_num_pages],
+        cache_loc_per_pool=[cache_loc for _ in range(n_pools)],
+        cu_num_pages_per_pool=[cu_num_pages for _ in range(n_pools)],
         slot_idx=slot_idx,
     )
 
