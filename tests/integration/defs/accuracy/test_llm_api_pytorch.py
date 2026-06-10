@@ -3755,10 +3755,15 @@ def _deepseekv4_pro_agg_llm_kwargs(**overrides):
         max_batch_size=16,
         max_num_tokens=8192,
         custom_tokenizer="deepseek_v4",
+        # Cap the KV cache so the padded CUDA-graph capture (batch sizes up to
+        # 1024) and other post-KV resources have headroom; without this the
+        # default fraction (~0.9) leaves too little and engine init OOMs on
+        # large-memory GPUs. These tests need very little KV.
         kv_cache_config=KvCacheConfig(enable_block_reuse=False,
                                       tokens_per_block=128,
                                       dtype="fp8",
-                                      host_cache_size=0),
+                                      host_cache_size=0,
+                                      free_gpu_memory_fraction=0.6),
         cuda_graph_config=CudaGraphConfig(batch_sizes=[
             1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 768, 1024
         ],
@@ -3784,9 +3789,29 @@ def _get_llm_vocab_size(llm):
 
     tokenizer = getattr(llm, "tokenizer", None)
     for candidate in (tokenizer, getattr(tokenizer, "tokenizer", None)):
-        vocab_size = getattr(candidate, "vocab_size", None)
-        if vocab_size is not None:
-            return int(vocab_size)
+        if candidate is None:
+            continue
+        # The DeepSeek-V4 tokenizer raises NotImplementedError (not
+        # AttributeError) from vocab_size/__len__/get_vocab, which a plain
+        # getattr(..., None) would not swallow, so probe each defensively.
+        for getter in (lambda c: getattr(c, "vocab_size", None),
+                       lambda c: len(c.get_vocab()), lambda c: len(c)):
+            try:
+                vocab_size = getter(candidate)
+            except (AttributeError, TypeError, NotImplementedError):
+                vocab_size = None
+            if vocab_size:
+                return int(vocab_size)
+        # Final fallback: read vocab_size straight from the model config.
+        name_or_path = getattr(candidate, "name_or_path", None)
+        if name_or_path and os.path.isdir(str(name_or_path)):
+            try:
+                with open(os.path.join(str(name_or_path), "config.json")) as f:
+                    config_vocab_size = json.load(f).get("vocab_size")
+            except (OSError, ValueError):
+                config_vocab_size = None
+            if config_vocab_size:
+                return int(config_vocab_size)
 
     pytest.fail("Cannot determine tokenizer vocab size for token-id smoke test")
 
