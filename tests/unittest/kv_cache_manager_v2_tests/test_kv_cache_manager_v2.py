@@ -22,7 +22,7 @@ import random
 import time
 import unittest
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
@@ -149,6 +149,16 @@ from copy import deepcopy
 
 from parameterized import parameterized
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManagerV2 as PyExecutorKVCacheManagerV2,
+)
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
+
 with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
     from fake_engine import FakeEngine, Role, Step
     from kernels import enable_kernel_delay
@@ -158,6 +168,160 @@ print(f"seed: {seed}")
 random.seed(seed)
 DBG_PRINT = int(os.environ.get("DBG_PRINT", "0")) != 0
 PRINT_TIME = int(os.environ.get("PRINT_TIME", "0")) != 0
+
+
+@dataclass
+class _ResourceManagerRequest:
+    request_id: int
+    tokens: list[int]
+    context_remaining_length: int
+    py_request_id: int = field(init=False)
+    lora_task_id: int | None = None
+    cache_salt_id: int | None = None
+    is_first_context_chunk: bool = True
+    is_last_context_chunk: bool = True
+    is_encoder_init_state: bool = False
+    is_dummy_request: bool = False
+    is_attention_dp_dummy: bool = False
+    is_cuda_graph_dummy: bool = False
+    is_disagg_generation_init_state: bool = False
+    is_disagg_generation_transmission_complete: bool = False
+    is_finished_due_to_cancellation: bool = False
+    context_phase_params: None = None
+    py_draft_tokens: list[int] = field(default_factory=list)
+    draft_tokens: list[int] = field(default_factory=list)
+    state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
+    context_current_position: int = 0
+    context_chunk_size: int = 0
+    prepopulated_prompt: tuple[int, int] | None = None
+    kv_cache_perf_metric_calls: list[dict[str, int]] = field(default_factory=list)
+    multimodal_hashes: None = None
+    multimodal_positions: None = None
+    multimodal_lengths: None = None
+
+    def __post_init__(self) -> None:
+        self.py_request_id = self.request_id
+        self.context_chunk_size = self.context_remaining_length
+
+    @property
+    def prompt_len(self) -> int:
+        return len(self.tokens)
+
+    @property
+    def is_dummy(self) -> bool:
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
+
+    def get_tokens(self, beam_id: int = DEFAULT_BEAM_INDEX) -> list[int]:
+        assert beam_id == DEFAULT_BEAM_INDEX
+        return self.tokens
+
+    def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
+        self.prepopulated_prompt = (length, tokens_per_block)
+
+    @property
+    def prepopulated_prompt_len(self) -> int:
+        if self.prepopulated_prompt is None:
+            return 0
+        return self.prepopulated_prompt[0]
+
+    def update_kv_cache_perf_metrics(
+        self,
+        alloc_total_blocks: int,
+        alloc_new_blocks: int,
+        reused_blocks: int,
+        missed_blocks: int,
+    ) -> None:
+        self.kv_cache_perf_metric_calls.append(
+            {
+                "alloc_total_blocks": alloc_total_blocks,
+                "alloc_new_blocks": alloc_new_blocks,
+                "reused_blocks": reused_blocks,
+                "missed_blocks": missed_blocks,
+            }
+        )
+
+
+def _create_pyexecutor_manager(gpu_bytes: int = 8 << 20) -> PyExecutorKVCacheManagerV2:
+    return PyExecutorKVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=True,
+            enable_partial_reuse=True,
+            max_gpu_total_bytes=gpu_bytes,
+            max_util_for_resume=1.0,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=128,
+        head_dim=1024,
+        tokens_per_block=4,
+        max_seq_len=16,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=4096,
+        enable_stats=True,
+    )
+
+
+def _context_batch(*requests: _ResourceManagerRequest) -> ScheduledRequests:
+    batch = ScheduledRequests()
+    for request in requests:
+        batch.append_context_request(request)
+    return batch
+
+
+class TestResourceManagerV2Cleanup(unittest.TestCase):
+    def setUp(self) -> None:
+        init_cuda_once()
+        self.manager = _create_pyexecutor_manager()
+
+    def tearDown(self) -> None:
+        if hasattr(self, "manager"):
+            self.manager.shutdown()
+            del self.manager
+
+    def _free_if_active(self, request: _ResourceManagerRequest) -> None:
+        if request.py_request_id in self.manager.kv_cache_map:
+            self.manager.free_resources(request)
+
+    def test_free_resources_does_not_commit_unfinished_context(self) -> None:
+        request = _ResourceManagerRequest(1, list(range(8)), context_remaining_length=8)
+        reuse_request = _ResourceManagerRequest(2, list(range(8)), context_remaining_length=8)
+
+        try:
+            self.assertTrue(self.manager.prepare_context(request))
+            self.assertTrue(self.manager.resize_context(request, num_tokens=4))
+            request.context_current_position = 4
+            request.context_remaining_length = 4
+
+            self.manager.free_resources(request)
+
+            self.assertTrue(self.manager.prepare_context(reuse_request))
+            self.assertEqual(reuse_request.prepopulated_prompt_len, 0)
+        finally:
+            self._free_if_active(reuse_request)
+            self._free_if_active(request)
+
+    def test_context_update_does_not_commit_canceled_request(self) -> None:
+        request = _ResourceManagerRequest(1, list(range(8)), context_remaining_length=8)
+        reuse_request = _ResourceManagerRequest(2, list(range(8)), context_remaining_length=8)
+
+        try:
+            self.assertTrue(self.manager.prepare_context(request))
+            self.assertTrue(self.manager.resize_context(request, num_tokens=8))
+            request.context_current_position = 8
+            request.context_remaining_length = 0
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.is_finished_due_to_cancellation = True
+
+            self.manager.update_context_resources(_context_batch(request))
+            self.manager.free_resources(request)
+
+            self.assertTrue(self.manager.prepare_context(reuse_request))
+            self.assertEqual(reuse_request.prepopulated_prompt_len, 0)
+        finally:
+            self._free_if_active(reuse_request)
+            self._free_if_active(request)
 
 
 @contextmanager

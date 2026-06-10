@@ -2021,11 +2021,16 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                self._handle_canceled_requests()
+                if self._scheduler_manages_kv_suspend:
+                    # Finalize V2 context KV before disagg transfer/response
+                    # handling can terminate the request.
+                    self.kv_cache_manager.update_context_resources(
+                        scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
                 self._flush_pending_transfer_responses()
-                self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
                 # Complete ctx send sessions AFTER responses are created so
@@ -2038,9 +2043,6 @@ class PyExecutor:
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
                                                    'kv_cache_dtype_byte_size',
                                                    None)
-                if self._scheduler_manages_kv_suspend:
-                    self.kv_cache_manager.update_context_resources(
-                        sample_state_scheduled_requests)
                 self.resource_manager.update_resources(
                     sample_state_scheduled_requests, attn_metadata,
                     kv_cache_dtype_byte_size)
@@ -2582,10 +2584,15 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
+                    self._handle_canceled_requests()
+                    if self._scheduler_manages_kv_suspend:
+                        # Finalize V2 context KV before disagg transfer/response
+                        # handling can terminate the request.
+                        self.kv_cache_manager.update_context_resources(
+                            scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
                     self._flush_pending_transfer_responses()
 
-                    self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
                     # Complete ctx send sessions AFTER responses are created so
                     # _handle_responses sees the request before it is terminated.
@@ -2599,9 +2606,6 @@ class PyExecutor:
                                             None)
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    if self._scheduler_manages_kv_suspend:
-                        self.kv_cache_manager.update_context_resources(
-                            scheduled_batch)
                     self.resource_manager.update_resources(
                         scheduled_batch, attn_metadata,
                         kv_cache_dtype_byte_size)
