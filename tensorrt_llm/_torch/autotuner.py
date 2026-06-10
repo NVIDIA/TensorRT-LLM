@@ -710,7 +710,7 @@ class AutoTunerProfilingCache:
         return cache
 
 
-def _spec_in_bounds(spec, shapes_list, spec_kind: str) -> bool:
+def _spec_in_bounds(spec, shapes_list) -> bool:
     """Validate that spec.input_idx and spec.dim_idx are in range for shapes_list.
 
     On out-of-bounds access, log a warning and return False. Otherwise return True.
@@ -721,11 +721,11 @@ def _spec_in_bounds(spec, shapes_list, spec_kind: str) -> bool:
 
     Args:
         spec: A ``DynamicTensorSpec`` or ``ConstraintSpec`` with ``input_idx`` and
-            ``dim_idx`` attributes.
+            ``dim_idx`` attributes. The spec's class name is used in the warning
+            message.
         shapes_list: An indexable container of per-input shape lists.
-        spec_kind: A label like ``"DynamicTensorSpec"`` or ``"ConstraintSpec"``
-            used in the warning message.
     """
+    spec_kind = type(spec).__name__
     if spec.input_idx < 0 or spec.input_idx >= len(shapes_list):
         logger.warning(
             f"[Autotuner] Skipping {spec_kind} with input_idx={spec.input_idx}: "
@@ -1340,8 +1340,7 @@ class AutoTuner:
         for spec in tuning_config.dynamic_tensor_specs:
             assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
-            if not _spec_in_bounds(spec, base_profile.shapes,
-                                   "DynamicTensorSpec"):
+            if not _spec_in_bounds(spec, base_profile.shapes):
                 continue
             if self.skip_dynamic_tuning_buckets:
                 if spec.map_to_tuning_buckets is not None:
@@ -1400,7 +1399,7 @@ class AutoTuner:
 
             # Adjust the profile to satisfy the constraints
             for spec in tuning_config.constraint_specs:
-                if not _spec_in_bounds(spec, p.shapes, "ConstraintSpec"):
+                if not _spec_in_bounds(spec, p.shapes):
                     continue
                 if p.shapes[spec.input_idx] == [StaticDim(0)]:
                     continue
@@ -1442,7 +1441,7 @@ class AutoTuner:
             # Bounds check: skip specs that reference inputs or dimensions not present in the
             # current shapes tuple. This can happen on hardware (e.g. SM121 / DGX Spark) where
             # ops produce fewer or differently-shaped tensors than the specs were authored for.
-            if not _spec_in_bounds(spec, base_profile, "DynamicTensorSpec"):
+            if not _spec_in_bounds(spec, base_profile):
                 continue
 
             # During runtime: apply map_to_tuning_buckets to map input to bucket
@@ -1460,7 +1459,7 @@ class AutoTuner:
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for spec in constraint_specs:
             # Bounds check: same defensive guard as above for constraint specs.
-            if not _spec_in_bounds(spec, base_profile, "ConstraintSpec"):
+            if not _spec_in_bounds(spec, base_profile):
                 continue
             if base_profile[spec.input_idx] == [0]:
                 continue
