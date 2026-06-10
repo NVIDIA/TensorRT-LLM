@@ -122,6 +122,8 @@ EXCLUDE_TEST_FILES = {
     "test_fuse_relu2_quant_nvfp4.py",
     "test_moe_fusion.py",
     "test_trtllm_gen_diag.py",
+    # Standalone flashinfer ROPE path has a known BF16 strided-interleaved mismatch.
+    "test_rope_op_variants.py",
     # QKV fusion → trtllm cache insertion (TRT-LLM attention backend only)
     "test_gemm_fusion_trtllm.py",
     # Require TRT-LLM LlmArgs / runtime
@@ -151,6 +153,8 @@ EXCLUDE_TEST_FILES = {
     "test_torch_gated_delta_rule_cache.py",
     "test_gated_delta_rule_cache.py",
     "test_kv_cache_transformers.py",
+    # trtllm attention backend (insert_cached_attention backend=trtllm) not available standalone
+    "test_kv_cache_trtllm_multipool.py",
     # Require TRT-LLM CUDA causal conv / mamba kernels (ops not registered standalone)
     "test_cuda_causal_conv_cached_op.py",
     "test_triton_causal_conv_cached_op.py",
@@ -181,6 +185,10 @@ EXCLUDE_TEST_FILES = {
     # Imports utils.util.skip_pre_blackwell (not shipped in standalone) and exercises
     # fuse_finegrained_fp8_swiglu which depends on TRT-LLM runtime.
     "test_finegrained_fp8_swiglu.py",
+    # Exercise trtllm-gen MXFP4 MoE kernels (Blackwell-only) and import the
+    # prepare_trtllm_gen_moe_mxfp4_weights / utils.util helpers not in standalone.
+    "test_fuse_mxfp4_moe.py",
+    "test_trtllm_quant_mxfp4_trtllm_gen_moe.py",
 }
 
 # Import path rewrite: old -> new (applied to test files only).

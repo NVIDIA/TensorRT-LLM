@@ -251,6 +251,23 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # MiniMax-M2.5 FP8 on 8 GPUs: intermediate_size=1536 with weight_block_size=128
+        # is not divisible under TP=8 (1536/8=192), so route MoE through EP=8 and use
+        # attention DP instead of TP.
+        {
+            'patterns': [
+                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-gpus:8',
+                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-gpus:8',
+                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:2000,500-ep:8-gpus:8',
+                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:1000,1000-ep:8-gpus:8',
+                'minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-gpus:8',
+                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-ep:8-gpus:8',
+                'minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-input_output_len:1000,1000-con:512-ep:8-gpus:8',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+            }
+        },
         {
             'patterns': [
                 'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4',
@@ -566,6 +583,28 @@ def get_model_yaml_config(model_label: str,
                     'decoding_type': 'MTP',
                     'num_nextn_predict_layers': 3,
                     'allow_advanced_sampling': True,
+                },
+            }
+        },
+        # Nemotron-3-Ultra-550B-NVFP4 throughput variant, aligned with curated yaml (served from HF).
+        {
+            'patterns': ['nemotron_3_ultra_550b_nvfp4-serve-pytorch-'],
+            'config': {
+                'enable_attention_dp': True,
+                'stream_interval': 10,
+                'num_postprocess_workers': 4,
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 256,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
                 },
             }
         },

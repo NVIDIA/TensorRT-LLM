@@ -299,6 +299,13 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
+        if llm_args.speculative_config is not None:
+            from tensorrt_llm._torch.speculative import \
+                update_spec_config_from_model_config
+
+            update_spec_config_from_model_config(llm_args.speculative_config,
+                                                 config.pretrained_config)
+
         model_cls = AutoModelForCausalLM._resolve_class(config)
 
         # model_cls is None when the architecture is unknown/unsupported.

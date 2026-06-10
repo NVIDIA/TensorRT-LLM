@@ -50,13 +50,13 @@ def test_meta_init_mode_creates_meta_tensors(checkpoint_exists):
         pytest.skip("Checkpoint not available")
 
     from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.models import AutoPipeline
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     # Load config directly
     args = VisualGenArgs(model=CHECKPOINT_PATH)
-    config = DiffusionModelConfig.from_pretrained(
+    config = DiffusionPipelineConfig.from_pretrained(
         CHECKPOINT_PATH,
         args=args,
     )
@@ -124,7 +124,7 @@ def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_exists):
     pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
 
     # Verify model config has dynamic_weight_quant enabled
-    assert pipeline.model_config.dynamic_weight_quant is True, (
+    assert pipeline.pipeline_config.dynamic_weight_quant is True, (
         "dynamic_weight_quant should be True when linear.type specifies FP8"
     )
 
@@ -174,15 +174,15 @@ def test_load_wan_pipeline_with_fp8_blockwise(checkpoint_exists):
 def test_visual_gen_args_to_quant_config():
     """Test that VisualGenArgs accepts ModelOpt-format quant_config dicts.
 
-    The dict stays a dict on the public schema; DiffusionModelConfig
+    The dict stays a dict on the public schema; DiffusionPipelineConfig
     parses it (via load_diffusion_quant_config) when a pipeline loads.
     """
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-    parse = DiffusionModelConfig.load_diffusion_quant_config
+    parse = DiffusionPipelineConfig.load_diffusion_quant_config
 
     # Default — no quantization. default_factory creates a QuantConfig
     # instance with quant_algo=None.
@@ -252,7 +252,7 @@ def test_load_without_quant_config_no_fp8(checkpoint_exists):
     pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
 
     # Verify dynamic_weight_quant is False
-    assert pipeline.model_config.dynamic_weight_quant is False, (
+    assert pipeline.pipeline_config.dynamic_weight_quant is False, (
         "dynamic_weight_quant should be False when no quant_config"
     )
 
@@ -268,7 +268,7 @@ def test_load_without_quant_config_no_fp8(checkpoint_exists):
 
 def test_visual_gen_args_from_dict():
     """Test VisualGenArgs can be created from a dictionary."""
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
@@ -283,7 +283,7 @@ def test_visual_gen_args_from_dict():
         os.environ["WORLD_SIZE"] = "2"
         args = VisualGenArgs(**config_dict)
         assert args.model == "/path/to/model"
-        qc, _, dwq, _ = DiffusionModelConfig.load_diffusion_quant_config(args.quant_config)
+        qc, _, dwq, _ = DiffusionPipelineConfig.load_diffusion_quant_config(args.quant_config)
         assert qc.quant_algo == QuantAlgo.FP8
         assert dwq is True
         assert args.parallel_config.ulysses_size == 2

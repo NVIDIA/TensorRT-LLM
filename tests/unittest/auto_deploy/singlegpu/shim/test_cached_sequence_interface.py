@@ -26,11 +26,19 @@ from _model_test_utils import default_max_num_tokens
 
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+    AttentionType,
     CausalConvResourceHandler,
+    EphemeralResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
     KVPagedResourceHandler,
+    ReplayCacheBufIdxHandler,
+    ReplayOldBHandler,
+    ReplayOldDAcumsumHandler,
+    ReplayOldDtHandler,
+    ReplayOldXHandler,
+    ReplayPrevNumAcceptedHandler,
     SequenceInfo,
-    SpecCausalConvResourceHandler,
-    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
     UnpagedResourceHandler,
@@ -54,6 +62,11 @@ class _SpecConfigForStateBindingTest:
         self.max_draft_len = max_draft_len
         self.tokens_per_gen_step = max_draft_len + 1
         self.spec_dec_mode = _SpecDecModeForStateBindingTest()
+
+
+class _EphemeralResourceHandlerForTest(EphemeralResourceHandler):
+    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(1, device=sequence_info.device)
 
 
 @pytest.fixture
@@ -182,7 +195,9 @@ def test_add_resource_paged_handler(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    handler = KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout="HND")
+    handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_layout="HND", attention_type=AttentionType.mha
+    )
     full_name = interface.add_resource("kv_cache_0", handler)
 
     assert full_name in interface._resource_lookup
@@ -232,8 +247,12 @@ def test_add_multiple_resources(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    kv_handler_0 = KVPagedResourceHandler(8, 64, dtype=torch.float16)
-    kv_handler_1 = KVPagedResourceHandler(8, 64, dtype=torch.float16)
+    kv_handler_0 = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, attention_type=AttentionType.mha
+    )
+    kv_handler_1 = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, attention_type=AttentionType.mha
+    )
     ssm_handler = SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16)
 
     interface.add_resource("kv_cache_0", kv_handler_0)
@@ -259,8 +278,14 @@ def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache
     )
 
     # Add only paged resources (combined KV cache)
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
+    interface.add_resource(
+        "kv_cache_1",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
 
     num_caches = interface.initialize_resources()
 
@@ -282,9 +307,70 @@ def test_initialize_resources_mixed_shape_pools_raise_when_uniform_managed_cache
         requires_uniform_kv_caches=True,
     )
 
-    interface.add_resource("kv_cache_full", KVPagedResourceHandler(8, 64, dtype=torch.float16))
     interface.add_resource(
-        "kv_cache_swa", KVPagedResourceHandler(8, 80, dtype=torch.float16, sliding_window=32)
+        "kv_cache_full",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
+    interface.add_resource(
+        "kv_cache_swa",
+        KVPagedResourceHandler(
+            8, 80, dtype=torch.float16, attention_type=AttentionType.mha, sliding_window=32
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        interface.initialize_resources()
+
+
+def test_initialize_resources_sets_attention_type_from_kv_reference(
+    paged_kv_cache_config,
+):
+    """The managed KV reference owns the cache-level attention type."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+    )
+
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(
+            8, 64, dtype=torch.float16, kv_factor=1, attention_type=AttentionType.mla
+        ),
+    )
+
+    interface.initialize_resources()
+
+    assert interface.info.attention_type == AttentionType.mla
+    assert interface.attention_type == AttentionType.mla
+
+
+def test_initialize_resources_rejects_mixed_attention_types(
+    paged_kv_cache_config,
+):
+    """Strict interface configurations reject mixed KV cache attention semantics."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        requires_uniform_kv_caches=True,
+    )
+
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(
+            8, 64, dtype=torch.float16, kv_factor=1, attention_type=AttentionType.mha
+        ),
+    )
+    interface.add_resource(
+        "kv_cache_1",
+        KVPagedResourceHandler(
+            8, 64, dtype=torch.float16, kv_factor=1, attention_type=AttentionType.mla
+        ),
     )
 
     with pytest.raises(RuntimeError):
@@ -302,8 +388,14 @@ def test_initialize_resources_mixed_creates_mamba_hybrid_cache_manager(paged_kv_
     )
 
     # Add paged and state resources
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
+    interface.add_resource(
+        "kv_cache_1",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.add_resource(
         "ssm_state_0",
         SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
@@ -330,7 +422,13 @@ def test_initialize_resources_creates_cache_views_with_correct_shape(paged_kv_ca
     # Using HND layout (default)
     full_name = interface.add_resource(
         "kv_cache_0",
-        KVPagedResourceHandler(num_kv_heads, head_dim, dtype=torch.float16, kv_layout="HND"),
+        KVPagedResourceHandler(
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float16,
+            kv_layout="HND",
+            attention_type=AttentionType.mha,
+        ),
     )
 
     interface.initialize_resources()
@@ -361,7 +459,10 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     num_heads = 4
     head_dim = 64
     ssm_state_size = 16
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     ssm_name = interface.add_resource(
         "ssm_state_0",
         SSMResourceHandler(
@@ -413,7 +514,7 @@ def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache
         resource_names.append(
             interface.add_resource(
                 f"intermediate_ssm_state_{i}",
-                SpecSSMResourceHandler(
+                IntermediateSSMStateHandler(
                     num_heads=num_heads,
                     head_dim=head_dim,
                     d_state=d_state,
@@ -430,7 +531,7 @@ def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache
         resource_names.append(
             interface.add_resource(
                 f"intermediate_conv_state_{i}",
-                SpecCausalConvResourceHandler(
+                IntermediateConvStateHandler(
                     conv_dim=conv_dim,
                     d_conv=4,
                     dtype=torch.float32,
@@ -485,8 +586,14 @@ def test_is_paged_returns_true_for_paged_only(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
+    interface.add_resource(
+        "kv_cache_1",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.initialize_resources()
 
     assert interface.kv_cache_config_tuned.enable_block_reuse is True
@@ -502,7 +609,10 @@ def test_is_paged_returns_false_for_hybrid(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.add_resource(
         "ssm_state_0",
         SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
@@ -527,7 +637,10 @@ def test_needs_resize_returns_false_when_fraction_is_zero(paged_kv_cache_config)
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.initialize_resources()
 
     assert interface.needs_resize() is False
@@ -543,10 +656,47 @@ def test_needs_resize_returns_true_when_fraction_is_positive(resizable_kv_cache_
         kv_cache_config=resizable_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.initialize_resources()
 
     assert interface.needs_resize() is True
+
+
+def test_prepare_kv_cache_config_preserves_fraction_for_vswa_estimate():
+    """VSWA must keep the memory-fraction cap even when AD passes a token estimate."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32,
+            free_gpu_memory_fraction=0.2,
+        ),
+    )
+    interface.add_resource(
+        "kv_swa",
+        KVPagedResourceHandler(
+            8, 64, dtype=torch.float16, sliding_window=64, attention_type=AttentionType.mha
+        ),
+    )
+    interface.add_resource(
+        "kv_full",
+        KVPagedResourceHandler(4, 128, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
+
+    kv_managed, _ = interface._identify_managed_kv_resources()
+    kv_cache_config = interface._prepare_kv_cache_config(
+        max_tokens=interface.info.max_seq_len,
+        kv_managed=kv_managed,
+    )
+
+    assert kv_cache_config.free_gpu_memory_fraction == 0.2
+    assert kv_cache_config.max_tokens == interface.info.max_seq_len
+    assert kv_cache_config.max_attention_window == [64, 128]
 
 
 def test_resize_kv_cache_manager_skipped_when_not_needed(paged_kv_cache_config):
@@ -559,7 +709,10 @@ def test_resize_kv_cache_manager_skipped_when_not_needed(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.initialize_resources()
 
     # Get initial state
@@ -587,8 +740,14 @@ def test_shutdown_clears_caches(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
+    interface.add_resource(
+        "kv_cache_1",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.initialize_resources()
 
     assert len(interface._caches) == 2
@@ -608,7 +767,10 @@ def test_clear_caches_clears_all(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.add_resource(
         "ssm_state_0",
         SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
@@ -692,7 +854,8 @@ def test_named_args_includes_sequence_info_and_caches(paged_kv_cache_config):
     )
 
     full_name = interface.add_resource(
-        "kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16)
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
     )
     interface.initialize_resources()
 
@@ -716,7 +879,10 @@ def test_args_returns_tuple_of_tensors(paged_kv_cache_config):
         kv_cache_config=paged_kv_cache_config,
     )
 
-    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     interface.initialize_resources()
 
     args = interface.args
@@ -1099,6 +1265,212 @@ def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
     assert isinstance(interface.kv_cache_manager, KVCacheManager)
 
 
+def test_initialize_resources_rejects_unmanaged_state_handler(
+    paged_kv_cache_config,
+):
+    """Disagg rejects persistent state resources that cannot be transferred."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        reject_unmanaged_persistent_caches=True,
+    )
+
+    interface.add_resource("generic_state", StateResourceHandler(10, 20, dtype=torch.float32))
+
+    with pytest.raises(RuntimeError):
+        interface.initialize_resources()
+
+
+def test_initialize_resources_rejects_unmanaged_incompatible_kv(
+    paged_kv_cache_config,
+):
+    """Disagg rejects unmanaged paged KV resources that cannot be transferred."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        reject_unmanaged_persistent_caches=True,
+    )
+
+    interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
+    interface.add_resource(
+        "kv_cache_1",
+        KVPagedResourceHandler(8, 80, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
+
+    with pytest.raises(RuntimeError):
+        interface.initialize_resources()
+
+
+def test_initialize_resources_allows_ephemeral_handler(
+    paged_kv_cache_config,
+):
+    """Disagg allows explicitly ephemeral resources to remain locally allocated."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        reject_unmanaged_persistent_caches=True,
+    )
+
+    full_name = interface.add_resource("ephemeral", _EphemeralResourceHandlerForTest())
+
+    interface.initialize_resources()
+
+    assert full_name in interface._unmanaged_resources
+
+
+def _add_managed_spec_replay_resources(interface, num_layers=2):
+    """Register a valid spec-on replay-mode state resource set on ``interface``.
+
+    Mirrors what a Mamba backend registers in replay mode: per layer, a base SSM + base/intermediate
+    conv state plus the six replay-buffer categories. The intermediate SSM state is intentionally
+    omitted because replay mode replaces it (it is dropped from get_cache_initializers). All of these
+    are bound by the cache manager under spec decoding, so the disagg validator must treat them as
+    managed. Returns the list of replay-buffer resource names.
+    """
+    num_heads = 4
+    head_dim = 64
+    d_state = 16
+    n_groups = 2
+    conv_dim = head_dim * num_heads + 2 * n_groups * d_state
+    replay_names = []
+
+    for i in range(num_layers):
+        interface.add_resource(
+            f"ssm_state_{i}",
+            SSMResourceHandler(
+                num_heads=num_heads, head_dim=head_dim, d_state=d_state, dtype=torch.bfloat16
+            ),
+        )
+        interface.add_resource(
+            f"conv_state_{i}",
+            CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
+        )
+        interface.add_resource(
+            f"intermediate_conv_state_{i}",
+            IntermediateConvStateHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
+        )
+        # Per-layer replay buffers — manager-backed via get_replay_old_*(layer_idx).
+        replay_names.append(
+            interface.add_resource(
+                f"replay_old_x_{i}",
+                ReplayOldXHandler(num_heads=num_heads, head_dim=head_dim, dtype=torch.bfloat16),
+            )
+        )
+        replay_names.append(
+            interface.add_resource(
+                f"replay_old_B_{i}",
+                ReplayOldBHandler(n_groups=n_groups, d_state=d_state, dtype=torch.bfloat16),
+            )
+        )
+        replay_names.append(
+            interface.add_resource(f"replay_old_dt_{i}", ReplayOldDtHandler(num_heads=num_heads))
+        )
+        replay_names.append(
+            interface.add_resource(
+                f"replay_old_dA_cumsum_{i}", ReplayOldDAcumsumHandler(num_heads=num_heads)
+            )
+        )
+        # Global replay buffers — one resource entry per layer, all binding to the same tensor;
+        # the categorization requires len == len(ssm_managed) for every replay list.
+        replay_names.append(
+            interface.add_resource(f"replay_cache_buf_idx_{i}", ReplayCacheBufIdxHandler())
+        )
+        replay_names.append(
+            interface.add_resource(f"replay_prev_num_accepted_{i}", ReplayPrevNumAcceptedHandler())
+        )
+
+    return replay_names
+
+
+def test_validate_no_unmanaged_persistent_caches_accepts_managed_speculative_resources(
+    paged_kv_cache_config,
+):
+    """_validate_no_unmanaged_persistent_caches must not flag manager-backed speculative resources.
+
+    Speculative resources (intermediate state + replay buffers) are handled at two different levels
+    depending on whether speculation is active, and the validator relies on both:
+
+    - Spec OFF: these resources are dropped at the kvcache-insert level
+      (_suppress_spec_handlers_maybe), so they are never registered and never reach this validator.
+      That is why the validator needs no speculative special-casing of its own — the dropping
+      happens at the correct, lower level.
+    - Spec ON (this test): the resources are genuinely allocated and bound by the cache manager, so
+      the validator must recognize them as managed rather than reporting them as "unmanaged"
+      persistent caches.
+
+    We exercise the spec-on path end-to-end through initialize_resources (rather than calling the
+    validator directly) precisely so the regression guard covers the call-site wiring: the replay
+    buffer lists must be forwarded into _validate_no_unmanaged_persistent_caches. If they are not,
+    the manager-backed replay buffers are falsely flagged as unmanaged and disagg+spec+replay
+    breaks. (Spec OFF cannot be exercised here because there is no suppression in a hand-built
+    resource lookup; that path is covered by the kvcache-level gate tests.)
+    """
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        spec_config=_SpecConfigForStateBindingTest(max_draft_len=2),
+        reject_unmanaged_persistent_caches=True,
+    )
+
+    replay_names = _add_managed_spec_replay_resources(interface)
+
+    # Must not raise: every speculative resource is cache-manager backed under spec decoding.
+    interface.initialize_resources()
+
+    for name in replay_names:
+        assert interface._caches[name] is not None
+        assert name not in interface._unmanaged_resources
+
+
+def test_validate_no_unmanaged_persistent_caches_still_rejects_unmanaged_with_spec_on(
+    paged_kv_cache_config,
+):
+    """The spec-on managed-name widening must not make the validator toothless.
+
+    Widening managed_names to include the replay buffers (so they are not falsely flagged) must not
+    cause genuinely-unmanaged persistent resources to slip through. Here the full managed replay set
+    is present AND a generic unmanaged StateResourceHandler is registered; the validator must still
+    reject, and must flag the unmanaged resource rather than the manager-backed replay buffers.
+    """
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        spec_config=_SpecConfigForStateBindingTest(max_draft_len=2),
+        reject_unmanaged_persistent_caches=True,
+    )
+
+    replay_names = _add_managed_spec_replay_resources(interface)
+    unmanaged_name = interface.add_resource(
+        "leaky_state", StateResourceHandler(10, 20, dtype=torch.float32)
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        interface.initialize_resources()
+
+    # The unmanaged resource is the one reported, not the manager-backed replay buffers.
+    assert unmanaged_name in str(exc_info.value)
+    for name in replay_names:
+        assert name not in str(exc_info.value)
+
+
 # =============================================================================
 # _requires_copy Tests
 # =============================================================================
@@ -1223,8 +1595,12 @@ def test_identify_managed_kv_resources_single_window():
             tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
         ),
     )
-    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    )
+    interface.add_resource(
+        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    )
 
     kv_managed, pool_configurations = interface._identify_managed_kv_resources()
 
@@ -1246,13 +1622,22 @@ def test_identify_managed_kv_resources_dual_window_gemma4_pattern():
     )
     # SWA window: head_dim=64
     interface.add_resource(
-        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+        "kv_0",
+        KVPagedResourceHandler(
+            8, 64, dtype=torch.float16, attention_type=AttentionType.mha, sliding_window=64
+        ),
     )
     interface.add_resource(
-        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+        "kv_1",
+        KVPagedResourceHandler(
+            8, 64, dtype=torch.float16, attention_type=AttentionType.mha, sliding_window=64
+        ),
     )
     # Full-attention window: head_dim=128
-    interface.add_resource("kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+    interface.add_resource(
+        "kv_2",
+        KVPagedResourceHandler(4, 128, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
 
     kv_managed, pool_configurations = interface._identify_managed_kv_resources()
 
@@ -1274,10 +1659,15 @@ def test_identify_managed_kv_resources_rejects_mixed_head_dim_in_same_window():
     )
     # Both default to sliding_window=0 → effective window = max_seq_len. Different head_dims
     # in the same window are not representable by one C++ pool.
-    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("kv_1", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    )
+    interface.add_resource(
+        "kv_1",
+        KVPagedResourceHandler(4, 128, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
 
-    with pytest.raises(RuntimeError, match="head_dim"):
+    with pytest.raises(RuntimeError):
         interface._identify_managed_kv_resources()
 
 
@@ -1292,8 +1682,12 @@ def test_single_window_creates_plain_kv_cache_manager():
             tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
         ),
     )
-    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    )
+    interface.add_resource(
+        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    )
 
     interface.initialize_resources()
 

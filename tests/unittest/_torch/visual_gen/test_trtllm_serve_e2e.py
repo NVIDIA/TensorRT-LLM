@@ -229,7 +229,7 @@ class TestWanTextToVideo:
         assert resp.status_code == 200
 
     @pytest.mark.parametrize(
-        "output_format,expected_content_type",
+        "format_,expected_content_type",
         [
             pytest.param("avi", "video/x-msvideo", id="avi"),
             pytest.param(
@@ -240,7 +240,7 @@ class TestWanTextToVideo:
             ),
         ],
     )
-    def test_t2v_sync(self, server, output_format, expected_content_type):
+    def test_t2v_sync(self, server, format_, expected_content_type):
         """Synchronous text-to-video via POST /v1/videos/generations."""
         resp = requests.post(
             server.url_for("v1", "videos", "generations"),
@@ -251,7 +251,7 @@ class TestWanTextToVideo:
                 "fps": 8,
                 "num_inference_steps": 4,
                 "seed": 42,
-                "output_format": output_format,
+                "format": format_,
             },
         )
         assert resp.status_code == 200, resp.text
@@ -259,7 +259,7 @@ class TestWanTextToVideo:
         assert len(resp.content) > 1000, "Video file too small"
 
     @pytest.mark.parametrize(
-        "output_format,expected_content_type",
+        "format_,expected_content_type",
         [
             pytest.param("avi", "video/x-msvideo", id="avi"),
             pytest.param(
@@ -270,7 +270,7 @@ class TestWanTextToVideo:
             ),
         ],
     )
-    def test_t2v_async_lifecycle(self, server, output_format, expected_content_type):
+    def test_t2v_async_lifecycle(self, server, format_, expected_content_type):
         """Async video generation: create job → poll → download → delete."""
         base = server.url_for("v1", "videos")
 
@@ -284,7 +284,7 @@ class TestWanTextToVideo:
                 "fps": 8,
                 "num_inference_steps": 4,
                 "seed": 42,
-                "output_format": output_format,
+                "format": format_,
             },
         )
         assert create_resp.status_code == 202, create_resp.text
@@ -349,7 +349,7 @@ class TestWanImageToVideo:
         assert resp.status_code == 200
 
     @pytest.mark.parametrize(
-        "output_format,expected_content_type",
+        "format_,expected_content_type",
         [
             pytest.param("avi", "video/x-msvideo", id="avi"),
             pytest.param(
@@ -360,7 +360,7 @@ class TestWanImageToVideo:
             ),
         ],
     )
-    def test_ti2v_sync(self, server, output_format, expected_content_type):
+    def test_ti2v_sync(self, server, format_, expected_content_type):
         """Synchronous image-to-video via multipart POST /v1/videos/generations."""
         with open(_REF_IMAGE_PATH, "rb") as f:
             resp = requests.post(
@@ -372,7 +372,7 @@ class TestWanImageToVideo:
                     "fps": "8",
                     "num_inference_steps": "4",
                     "seed": "42",
-                    "output_format": output_format,
+                    "format": format_,
                 },
                 files={
                     "input_reference": ("cat_piano.png", f, "image/png"),
@@ -383,7 +383,7 @@ class TestWanImageToVideo:
         assert len(resp.content) > 1000, "Video file too small"
 
     @pytest.mark.parametrize(
-        "output_format,expected_content_type",
+        "format_,expected_content_type",
         [
             pytest.param("avi", "video/x-msvideo", id="avi"),
             pytest.param(
@@ -394,7 +394,7 @@ class TestWanImageToVideo:
             ),
         ],
     )
-    def test_ti2v_async_lifecycle(self, server, output_format, expected_content_type):
+    def test_ti2v_async_lifecycle(self, server, format_, expected_content_type):
         """Async i2v: create job with image → poll → download → delete."""
         base = server.url_for("v1", "videos")
 
@@ -409,7 +409,7 @@ class TestWanImageToVideo:
                     "fps": "8",
                     "num_inference_steps": "4",
                     "seed": "42",
-                    "output_format": output_format,
+                    "format": format_,
                 },
                 files={
                     "input_reference": ("cat_piano.png", f, "image/png"),
