@@ -6674,6 +6674,35 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("attention_dp", [False, True])
+    def test_bf16_trtllm_gen_moe_backend(self, attention_dp):
+
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="float32")
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=32, enable_padding=True))
+
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+                kv_cache_config=kv_cache_config,
+                max_batch_size=32,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                enable_attention_dp=attention_dp,
+                moe_config=MoeConfig(backend="TRTLLM"),
+                **pytorch_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
     def _run_nvfp4_4gpus_eplb(self, moe_backend, eplb_config, model_path):
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
