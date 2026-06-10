@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -715,6 +715,12 @@ void initRequestBindings(nb::module_& m)
         nb::arg("disagg_request_id") = nb::none()
     )         // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
+        // Cheap token count that avoids materializing the full input_token_ids
+        // Python list. getInputTokenIds() returns VecTokens by value, so reading
+        // `input_token_ids` just to call len() builds a fresh ~ISL-sized Python
+        // list (one PyObject per token) on every access -- hot in the ADP router
+        // load-balancing path at high concurrency. This returns only the size.
+        .def_prop_ro("num_input_tokens", [](tle::Request const& self) { return self.getInputTokenIds().size(); })
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
         .def_prop_rw("sampling_config", &tle::Request::getSamplingConfig, &tle::Request::setSamplingConfig)

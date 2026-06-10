@@ -17,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     DefaultADPRouter,
     KVCacheAwareADPRouter,
     RankState,
+    _num_input_tokens,
 )
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -988,3 +989,38 @@ class TestKVCacheAwareADPRouterRouting:
         )
         assert len(result_strict[0]) == 2
         assert sum(len(result_strict[r]) for r in range(1, tp_size)) == 6
+
+
+class TestNumInputTokens:
+    """The cheap token-count accessor used by the routers (avoids copying the
+    full input_token_ids list just to count it)."""
+
+    def test_none_request(self):
+        assert _num_input_tokens(None) == 0
+
+    def test_prefers_num_input_tokens_without_touching_token_list(self):
+        """When num_input_tokens is available it must be used, and the heavy
+        input_token_ids getter must NOT be accessed."""
+
+        class _Req:
+            num_input_tokens = 1234
+
+            @property
+            def input_token_ids(self):  # materializing it would be a regression
+                raise AssertionError("input_token_ids must not be materialized")
+
+        assert _num_input_tokens(_Req()) == 1234
+
+    def test_falls_back_to_len_when_accessor_absent(self):
+        """Objects predating the binding (no int num_input_tokens) fall back to
+        len(input_token_ids) so the result is unchanged."""
+        request = Mock(spec=["input_token_ids"])  # no num_input_tokens attribute
+        request.input_token_ids = [1, 2, 3, 4, 5]
+        assert _num_input_tokens(request) == 5
+
+    def test_ignores_non_int_accessor(self):
+        """A non-int (e.g. a bare MagicMock auto-attr) is treated as absent."""
+        request = MagicMock()
+        request.num_input_tokens = MagicMock()  # not an int
+        request.input_token_ids = [1, 2, 3]
+        assert _num_input_tokens(request) == 3

@@ -36,6 +36,27 @@ if TYPE_CHECKING:
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
 
+def _num_input_tokens(request) -> int:
+    """Input token count without materializing the token list.
+
+    The executor Request's ``input_token_ids`` is a C++ getter that returns
+    ``VecTokens`` by value, so reading it just to call ``len()`` builds a fresh
+    ~ISL-sized Python list (one PyObject per token) on every access -- done for
+    every new request, on every rank (routing is symmetric), under the GIL.
+    Prefer the cheap ``num_input_tokens`` accessor that returns only the size.
+
+    Falls back to ``len(input_token_ids)`` when the accessor is absent (e.g. a
+    Python-only deploy whose C++ bindings predate it, or test mocks), so the
+    routing result is unchanged either way.
+    """
+    if request is None:
+        return 0
+    count = getattr(request, "num_input_tokens", None)
+    if isinstance(count, int):
+        return count
+    return len(getattr(request, "input_token_ids", []))
+
+
 @dataclass
 class RankState:
     """Per-rank state information shared via allgather before request assignment.
@@ -312,15 +333,13 @@ class DefaultADPRouter(ADPRouter):
 
         new_requests = sorted(
             new_requests,
-            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
+            key=lambda x: _num_input_tokens(x.request),
             reverse=True,
         )
 
         for req_item in new_requests:
             val = heapq.heappop(all_ranks_new_requests_heap)
-            token_count = (
-                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
-            )
+            token_count = _num_input_tokens(req_item.request)
             val = val._replace(
                 num_tokens=val.num_tokens + token_count,
                 num_requests=val.num_requests + 1,
@@ -497,9 +516,7 @@ class KVCacheAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _req_tokens(req_item) -> int:
-        if req_item.request is None:
-            return 0
-        return len(getattr(req_item.request, "input_token_ids", []))
+        return _num_input_tokens(req_item.request)
 
     def _match_len(self, rank: int, req_id: int) -> int:
         matches = self._all_ranks_prefix_matches
