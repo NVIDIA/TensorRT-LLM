@@ -5734,11 +5734,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             enable_warp_parallel_reduce: bool,
             compress_ratio: int,
             return_output_values: bool,
+            cluster_size: int,
         ) -> None:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
                    num_threads_per_block, enable_warp_parallel_reduce,
-                   compress_ratio, return_output_values)
+                   compress_ratio, return_output_values, cluster_size)
             if key in cls.kernel_cache:
                 return
             n_rows = cute.sym_int()
@@ -5785,6 +5786,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 enable_warp_parallel_reduce=enable_warp_parallel_reduce,
                 compress_ratio=compress_ratio,
                 return_output_values=return_output_values,
+                cluster_size=cluster_size,
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -5809,6 +5811,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: int = 1,
             compress_ratio: int = 1,
             max_seq_len: Optional[int] = None,
+            cluster_size: Optional[int] = None,
         ) -> None:
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
@@ -5893,6 +5896,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     min_blocks_per_mp = 1
 
+            # ---- cluster_size auto-dispatch ----
+            # Synth-bundle sweep (commit 513890fee1) on B200 SXM5 picks
+            # the cluster size by (N, BS):
+            #   N < 65K              -> 1 (cluster sync overhead unrecouped)
+            #   BS * cs > num_sms    -> 1 (multi-wave penalty, cs=4 can crash)
+            #   N >= 65K, BS <= 16,
+            #     BS*4 <= num_sms    -> 4 (single-wave, up to 42% win)
+            #   N >= 65K, BS*2 <= num_sms -> 2
+            #   else                 -> 1
+            # Caller can pin a value (1..16); auto only when None.
+            if cluster_size is None:
+                if N_dec < 65536:
+                    cluster_size = 1
+                elif num_rows <= 16 and num_rows * 4 <= num_sms:
+                    cluster_size = 4
+                elif num_rows * 2 <= num_sms:
+                    cluster_size = 2
+                else:
+                    cluster_size = 1
+
             cls._compile(
                 cute_dtype,
                 top_k,
@@ -5906,12 +5929,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 enable_warp_parallel_reduce,
                 compress_ratio,
                 return_output_values,
+                cluster_size,
             )
             key = (cute_dtype, top_k, next_n, enable_unroll_4,
                    enable_phase3_unroll, use_constant_hint, min_blocks_per_mp,
                    use_256bit_load, num_threads_per_block,
                    enable_warp_parallel_reduce, compress_ratio,
-                   return_output_values)
+                   return_output_values, cluster_size)
             # TVM FFI: pass raw torch tensors directly, env stream picked
             # up automatically (no from_dlpack, no stream argument).
             # ``output_values=None`` matches the kernel's compile-time
@@ -5931,6 +5955,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
+        cluster_size: Optional[int] = None,
     ) -> None:
         """CuTe DSL GVR (Guess-Verify-Refine) Top-K decode for Blackwell.
 
@@ -5992,6 +6017,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n=next_n,
             compress_ratio=compress_ratio,
             max_seq_len=max_seq_len,
+            cluster_size=cluster_size,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_decode")
@@ -6004,6 +6030,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
+        cluster_size: Optional[int] = None,
     ) -> None:
         return None
 
