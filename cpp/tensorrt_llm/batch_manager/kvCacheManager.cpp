@@ -2076,7 +2076,7 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
     for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
     {
         blockKeys.emplace_back(blockKey.usesExtraIds, blockKey.loraTaskId, blockedUniqueTokensList, blockKey.extraKeys,
-            blockKey.cacheSaltID);
+            blockKey.cacheSalt);
     }
     return searchReuseTree(blockKeys);
 }
@@ -4453,7 +4453,7 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
 
     bool const usesExtraIds = llmRequest.getInputTokensExtraIds().has_value();
     auto const loraTaskId = llmRequest.getLoraTaskId();
-    auto const cacheSaltID = llmRequest.getCacheSaltID();
+    auto const cacheSalt = llmRequest.getCacheSalt();
 
     std::vector<executor::IdType> hashes;
     hashes.reserve(static_cast<size_t>(limit));
@@ -4469,7 +4469,7 @@ std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
             SizeType32 const tokenEnd = tokenStart + tokensPerBlock;
             auto extraKeys = generateBlockHashExtraKeys(llmRequest, tokenStart, tokenEnd);
             VecUniqueTokens blockTokens(uniqueTokens.begin() + tokenStart, uniqueTokens.begin() + tokenEnd);
-            BlockKey blockKey(usesExtraIds, loraTaskId, std::move(blockTokens), std::move(extraKeys), cacheSaltID);
+            BlockKey blockKey(usesExtraIds, loraTaskId, std::move(blockTokens), std::move(extraKeys), cacheSalt);
             block->setBlockKey(blockKey, /*isFull=*/true);
             // setHash() chains through mPrevBlockInSeq, which was wired in addBlockToBeam. The
             // loop walks blocks in allocation order, so by the time we reach block b its
