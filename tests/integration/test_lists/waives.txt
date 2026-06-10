@@ -28,7 +28,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[latency_d
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[baseline] SKIP (https://nvbugs/6185196)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[baseline_mtp1] SKIP (https://nvbugs/6185196)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[fp4_indexer_dsl_mtp2] SKIP (https://nvbugs/6241842)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[fp4_indexer_dsl_mtp3] SKIP (https://nvbugs/6241845)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_chunked_prefill[latency] SKIP (https://nvbugs/6276981)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_piecewise_cuda_graph[baseline] SKIP (https://nvbugs/6185196)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_piecewise_cuda_graph[mtp3_fp8kv_chunked] SKIP (https://nvbugs/5989920)
