@@ -1,4 +1,4 @@
-# Sparse Attention Development
+# Sparse Attention Development Guide
 
 This guide is for contributors adding a new sparse attention algorithm
 to TensorRT LLM. It walks through the framework hooks each algorithm
