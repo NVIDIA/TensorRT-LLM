@@ -28,12 +28,15 @@ suite matures.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -46,6 +49,10 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+_STRESS_MODE_LOG_ONLY = "log_only"
+_STRESS_MODE_FULL_CANCEL_POISON = "full_cancel_poison"
+_STRESS_MODES = (_STRESS_MODE_LOG_ONLY, _STRESS_MODE_FULL_CANCEL_POISON)
+
 
 # ---------------------------------------------------------------------------
 # Config dataclasses
@@ -57,7 +64,8 @@ logger = logging.getLogger(__name__)
 # simply aren't passed to the constructor, so the field defaults
 # apply automatically and are not duplicated here.
 _STRESS_CONFIG_COERCERS: dict[str, Callable[[Any], Any]] = {
-    "duration_min": int,
+    "mode": str,
+    "duration_min": float,
     "kv_cache_manager": str,
     "transceiver": str,
     "base_concurrency": int,
@@ -75,7 +83,8 @@ class StressConfig:
     pass them around without re-parsing.
     """
 
-    duration_min: int = 120
+    mode: str = _STRESS_MODE_LOG_ONLY
+    duration_min: float = 120.0
     kv_cache_manager: str = "v1"  # v1 | v2  (v2 + CPP is invalid)
     transceiver: str = "cpp"  # cpp | python
     base_concurrency: int = 64
@@ -136,6 +145,8 @@ class StressConfig:
                 supplied (the C++ transceiver only supports the V1
                 KV cache manager).
         """
+        if self.mode not in _STRESS_MODES:
+            raise ValueError(f"mode must be one of {_STRESS_MODES}, got {self.mode!r}")
         if self.kv_cache_manager == "v2" and self.transceiver == "cpp":
             # The C++ transceiver (BindKvCacheTransceiver) only supports
             # the V1 KV cache manager. V2 must be paired with the Python
@@ -150,6 +161,16 @@ class StressConfig:
             )
         if self.transceiver not in ("cpp", "python"):
             raise ValueError(f"transceiver must be 'cpp' or 'python', got {self.transceiver!r}")
+
+    @property
+    def is_log_only(self) -> bool:
+        """True when the harness should run the regular CI guardrail mode."""
+        return self.mode == _STRESS_MODE_LOG_ONLY
+
+    @property
+    def is_full_cancel_poison(self) -> bool:
+        """True when the harness should run the full cancellation/poison marathon."""
+        return self.mode == _STRESS_MODE_FULL_CANCEL_POISON
 
 
 _INJECTION_TARGET_RE = re.compile(r"^(ctx|gen)_worker_(\d+)$")
@@ -587,6 +608,228 @@ def _fetch_kv_cache_utilization(
 
 
 # ---------------------------------------------------------------------------
+# Canary helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_canary_prompts(path: Path) -> list[dict[str, Any]]:
+    """Load and validate the canary prompts JSON.
+
+    Schema (Step 6 reference generator):
+        {"prompts": [{"prompt": str,
+                      "reference_token_ids": [int, ...]?,
+                      "reference_text": str?}, ...]}
+
+    Strict validation here keeps a malformed reference from raising
+    `TypeError` inside the daemon canary thread (which would
+    silently freeze `_canary_records`).
+
+    Raises:
+        OSError: If the file cannot be opened.
+        ValueError: On malformed JSON, top-level not a mapping,
+            missing/non-list `prompts`, entry without a string
+            `prompt`, or `reference_token_ids` present but not a
+            list of ints.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        try:
+            doc = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"canary prompts file {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict) or "prompts" not in doc:
+        raise ValueError(f"canary prompts file {path} must be an object with a 'prompts' list")
+    prompts = doc["prompts"]
+    if not isinstance(prompts, list):
+        raise ValueError(f"canary prompts file {path}: 'prompts' must be a list")
+    for i, entry in enumerate(prompts):
+        if not isinstance(entry, dict) or not isinstance(entry.get("prompt"), str):
+            raise ValueError(
+                f"canary prompts file {path}: prompts[{i}] must be an object with a string 'prompt'"
+            )
+        ref = entry.get("reference_token_ids")
+        if ref is not None and (
+            not isinstance(ref, list) or not all(isinstance(t, int) for t in ref)
+        ):
+            raise ValueError(
+                f"canary prompts file {path}: prompts[{i}].reference_token_ids "
+                "must be a list of ints (or omitted)"
+            )
+    return prompts
+
+
+def _send_canary_request(
+    server_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    seed: int,
+    timeout_s: float,
+) -> tuple[Optional[list[int]], Optional[str], Optional[str]]:
+    """POST a greedy, deterministic completion to `/v1/completions`.
+
+    Requests `detokenize=False` so the response carries generated
+    `token_ids` on `choices[0]` (see
+    `CompletionResponseChoice.token_ids` in
+    `tensorrt_llm/serve/openai_protocol.py`); `temperature=0.0` and
+    a fixed `seed` request greedy determinism.
+
+    Returns:
+        `(token_ids, text, error)`. On success `error is None`. Any
+        failure — HTTP error, connection refused, timeout, malformed
+        body, or a 200 response that omits `token_ids` — folds into
+        a short `error` string so the canary thread records and
+        continues (only the log scanner is fail-fast).
+    """
+    url = f"{server_url.rstrip('/')}/v1/completions"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "seed": seed,
+        "stream": False,
+        "detokenize": False,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        # HTTPError subclasses URLError — catch it first.
+        return None, None, f"http_error: {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, None, f"url_error: {exc.reason}"
+    except (TimeoutError, OSError) as exc:
+        return None, None, f"io_error: {exc}"
+    try:
+        obj = json.loads(body)
+        choice = obj["choices"][0]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        return None, None, f"parse_error: {exc}"
+    token_ids = choice.get("token_ids") if isinstance(choice, dict) else None
+    text = choice.get("text") if isinstance(choice, dict) else None
+    if token_ids is None:
+        return None, text, "missing_token_ids"
+    return token_ids, text, None
+
+
+def _tokens_equivalent(returned: Optional[list[int]], reference: Optional[list[int]]) -> bool:
+    """True iff `returned` exactly matches `reference`; `None` on either side is non-equivalent."""
+    if returned is None or reference is None:
+        return False
+    return list(returned) == list(reference)
+
+
+# ---------------------------------------------------------------------------
+# Load-thread helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_token_range(raw: Any, default: tuple[int, int], label: str) -> tuple[int, int]:
+    """Parse a YAML ``input_length`` mapping into a `(min_tokens, max_tokens)` tuple."""
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError(f"{label} must be a mapping with min_tokens/max_tokens, got {raw!r}")
+    try:
+        min_tokens = int(raw.get("min_tokens", default[0]))
+        max_tokens = int(raw.get("max_tokens", default[1]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} min_tokens/max_tokens must be integers: {raw!r}") from exc
+    if min_tokens <= 0 or max_tokens < min_tokens:
+        raise ValueError(
+            f"{label} must satisfy 0 < min_tokens <= max_tokens, got {min_tokens}/{max_tokens}"
+        )
+    return min_tokens, max_tokens
+
+
+def _parse_cancel_after_range(raw: Any) -> tuple[float, float]:
+    """Parse optional ``cancel_after_range`` config; default to existing test values."""
+    default = (0.01, 0.1)
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError(f"cancel_after_range must be a mapping, got {raw!r}")
+    try:
+        min_s = float(raw.get("min_s", raw.get("min", default[0])))
+        max_s = float(raw.get("max_s", raw.get("max", default[1])))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"cancel_after_range min/max must be numbers: {raw!r}") from exc
+    if min_s < 0.0 or max_s < min_s:
+        raise ValueError(f"cancel_after_range must satisfy 0 <= min <= max, got {min_s}/{max_s}")
+    return min_s, max_s
+
+
+def _load_iteration_shape(config: StressConfig, elapsed_s: float) -> dict[str, Any]:
+    """Return the load shape that should run at ``elapsed_s``.
+
+    Bursts start after the first full ``bursts.interval_min`` period,
+    then repeat every interval. This keeps the marathon from starting
+    immediately in burst mode and preserves a steady-state baseline at
+    T+0.
+    """
+    steady_prompt_range = _parse_token_range(
+        config.raw.get("input_length"), (4096, 12288), "stress_config.input_length"
+    )
+    if config.base_concurrency <= 0:
+        raise ValueError(
+            f"stress_config.base_concurrency must be positive, got {config.base_concurrency}"
+        )
+    shape: dict[str, Any] = {
+        "mode": "steady",
+        "requests_per_burst": config.base_concurrency,
+        "prompt_len_range": steady_prompt_range,
+    }
+
+    bursts = config.raw.get("bursts")
+    if bursts is None:
+        return shape
+    if not isinstance(bursts, dict):
+        raise ValueError("stress_config.bursts must be a mapping")
+
+    try:
+        interval_s = float(bursts.get("interval_min", 0.0)) * 60.0
+        duration_s = float(bursts.get("duration_s", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stress_config.bursts interval_min/duration_s must be numbers") from exc
+
+    if interval_s <= 0.0:
+        raise ValueError(
+            "stress_config.bursts.interval_min must be positive, got "
+            f"{bursts.get('interval_min')!r}"
+        )
+    if duration_s <= 0.0:
+        raise ValueError(
+            f"stress_config.bursts.duration_s must be positive, got {bursts.get('duration_s')!r}"
+        )
+    if elapsed_s < interval_s:
+        return shape
+
+    offset_s = elapsed_s % interval_s
+    if offset_s >= duration_s:
+        return shape
+
+    try:
+        requests_per_burst = int(bursts.get("concurrency", config.base_concurrency))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stress_config.bursts.concurrency must be an integer") from exc
+    if requests_per_burst <= 0:
+        raise ValueError(
+            f"stress_config.bursts.concurrency must be positive, got {requests_per_burst}"
+        )
+    return {
+        "mode": "burst",
+        "requests_per_burst": requests_per_burst,
+        "prompt_len_range": _parse_token_range(
+            bursts.get("input_length"), steady_prompt_range, "stress_config.bursts.input_length"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
 
@@ -607,10 +850,12 @@ class DisaggCancellationStressHarness:
       wind down promptly.
 
     Thread-based composition (rather than asyncio) keeps the
-    subprocess-control injector, the file-tailing log scanner, and
-    the HTTP/Prometheus metrics scraper failure-isolated and debugged
-    independently. The load and canary threads each run their own
-    asyncio event loops internally for HTTP I/O.
+    subprocess-control injector, the file-tailing log scanner, the
+    HTTP/Prometheus metrics scraper, and the HTTP canary client
+    failure-isolated and debugged independently. The metrics and
+    canary threads use blocking `urllib` for their low-rate request
+    streams; the load thread runs its own asyncio event loop
+    internally (wrapping `run_cancel_stress_test`).
     """
 
     def __init__(
@@ -621,6 +866,10 @@ class DisaggCancellationStressHarness:
         metrics_scrape_interval_s: float = 30.0,
         metrics_scrape_timeout_s: float = 5.0,
         injector_poll_interval_s: float = 1.0,
+        canary_request_timeout_s: float = 10.0,
+        canary_interval_s: Optional[float] = None,
+        load_duration_s: Optional[float] = None,
+        load_iteration_pause_s: float = 0.05,
     ) -> None:
         """Construct a marathon harness.
 
@@ -645,6 +894,21 @@ class DisaggCancellationStressHarness:
                 injector thread while waiting for the next scheduled
                 event. Tests pass a smaller value to keep wall-clock
                 latency bounded.
+            canary_request_timeout_s: Per-request HTTP timeout for
+                one canary completion; a slow/hung request becomes
+                an error rather than blocking the canary stream.
+            canary_interval_s: Optional override (seconds) for the
+                gap between requests. `None` derives from
+                `canary.rate_per_min` (`60 / rate_per_min`); tests
+                pass a small value.
+            load_duration_s: Optional override (seconds) for the load
+                loop duration. `None` derives from `duration_min`;
+                tests pass a small value.
+            load_iteration_pause_s: Minimum pause between load
+                generator calls. Keeps the wrapper from busy-spinning
+                when the injected load runner returns immediately in
+                unit tests; the production generator already spends
+                most of its time in HTTP requests.
 
         Raises:
             ValueError: If the YAML is malformed or its
@@ -664,15 +928,27 @@ class DisaggCancellationStressHarness:
         self._metrics_scrape_interval_s: float = metrics_scrape_interval_s
         self._metrics_scrape_timeout_s: float = metrics_scrape_timeout_s
         self._injector_poll_interval_s: float = injector_poll_interval_s
+        self._canary_request_timeout_s: float = canary_request_timeout_s
+        self._canary_interval_s: Optional[float] = canary_interval_s
+        self._load_duration_s: Optional[float] = load_duration_s
+        self._load_iteration_pause_s: float = load_iteration_pause_s
 
         # Cluster + worker tracking (populated by setup()).
         self._cluster: Any = None  # tuple returned by setup_disagg_cluster
         self._worker_specs: list[WorkerLaunchSpec] = []
         self._tracked_workers: list[_TrackedWorker] = []
+        self._server_log_path: Optional[str] = None
         self._marathon_start_monotonic: float = 0.0
+
+        # Disagg-server front-end the canary targets; populated by
+        # setup() or bind_server_endpoint(). None until then — the
+        # canary thread warns and exits.
+        self._server_url: Optional[str] = None
+        self._model_name: Optional[str] = None
 
         # Thread handles (populated by start()).
         self._load_thread: Optional[threading.Thread] = None
+        self._log_only_thread: Optional[threading.Thread] = None
         self._canary_thread: Optional[threading.Thread] = None
         self._injector_thread: Optional[threading.Thread] = None
         self._log_scanner_thread: Optional[threading.Thread] = None
@@ -682,6 +958,7 @@ class DisaggCancellationStressHarness:
         self._canary_records: list[dict[str, Any]] = []
         self._kv_utilization_samples: list[dict[str, Any]] = []
         self._injection_events: list[dict[str, Any]] = []
+        self._load_records: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -690,13 +967,256 @@ class DisaggCancellationStressHarness:
     def setup(self) -> None:
         """Launch the disagg cluster from the YAML and record launch specs.
 
-        Stub: real implementation delegates to ``setup_disagg_cluster``
-        in ``tests/integration/defs/disaggregated/test_disaggregated.py``
+        Delegates the process launch to ``setup_disagg_cluster`` in
+        ``tests/integration/defs/disaggregated/test_disaggregated.py``
         and shadow-tracks per-worker ``WorkerLaunchSpec`` so the
         injector thread can later relaunch a SIGKILLed worker without
-        modifying shared infrastructure.
+        modifying shared infrastructure. The harness-only
+        ``stress_config`` block is stripped from the temporary YAML
+        passed to the shared launcher so worker config validation only
+        sees normal ``trtllm-serve`` settings.
         """
-        logger.info("[harness] setup() — stub: cluster not actually launched")
+        from test_disaggregated import (
+            build_worker_config,
+            get_default_disagg_cluster_config,
+            get_ucx_tls,
+            setup_disagg_cluster,
+        )
+
+        cluster_config = self._load_sanitized_cluster_config()
+        raw_model_name = str(cluster_config.get("model") or "")
+        if not raw_model_name:
+            raise ValueError(f"YAML at {self.yaml_path} is missing top-level model")
+        model_name = self._resolve_model_name(raw_model_name)
+
+        server_start_timeout_s = int(self.config.raw.get("server_start_timeout_s", 1200))
+        run_env = os.environ.copy()
+        run_env["UCX_TLS"] = get_ucx_tls()
+
+        setup_yaml_path = self._write_sanitized_cluster_yaml(cluster_config)
+        try:
+            self._cluster = setup_disagg_cluster(
+                setup_yaml_path,
+                model_name=model_name,
+                env=run_env,
+                server_start_timeout=server_start_timeout_s,
+                save_log=True,
+            )
+        finally:
+            try:
+                os.unlink(setup_yaml_path)
+            except OSError:
+                logger.debug("[harness] could not unlink %s; ignoring", setup_yaml_path)
+
+        config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = self._cluster
+        server_host = config.get("hostname", "localhost")
+        server_url = f"http://{server_host}:{server_port}"
+
+        disagg_cluster = get_default_disagg_cluster_config()
+        disagg_cluster["cluster_uri"] = server_url
+        ctx_servers = config.get("context_servers", {})
+        gen_servers = config.get("generation_servers", {})
+        disagg_cluster["minimal_instances"] = {
+            "context_servers": ctx_servers.get("num_instances", 1),
+            "generation_servers": gen_servers.get("num_instances", 1),
+        }
+        ctx_worker_config = build_worker_config(config, ctx_servers, disagg_cluster)
+        gen_worker_config = build_worker_config(config, gen_servers, disagg_cluster)
+        ctx_specs, gen_specs = self._build_worker_launch_specs(
+            ctx_workers=ctx_workers,
+            gen_workers=gen_workers,
+            ctx_worker_config=ctx_worker_config,
+            gen_worker_config=gen_worker_config,
+            ctx_servers=ctx_servers,
+            gen_servers=gen_servers,
+            model_name=model_name,
+            work_dir=work_dir,
+            env=run_env,
+            host=server_host,
+        )
+        self._refresh_worker_ports_from_cluster_info(server_url, ctx_specs, gen_specs)
+        self.bind_tracked_workers(ctx_workers, gen_workers, ctx_specs, gen_specs)
+        self.bind_server_endpoint(server_url, model_name)
+        self._server_log_path = getattr(disagg_server, "log_path", None)
+        logger.info(
+            "[harness] setup() launched %d ctx worker(s), %d gen worker(s), server=%s",
+            len(ctx_workers),
+            len(gen_workers),
+            server_url,
+        )
+
+    def _load_sanitized_cluster_config(self) -> dict[str, Any]:
+        """Load YAML and remove harness-only fields before cluster launch."""
+        with self.yaml_path.open("r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f)
+        if not isinstance(doc, dict):
+            raise ValueError(f"YAML at {self.yaml_path} must be a mapping")
+        cluster_config = dict(doc)
+        cluster_config.pop("stress_config", None)
+        return cluster_config
+
+    def _write_sanitized_cluster_yaml(self, cluster_config: dict[str, Any]) -> str:
+        """Write the launcher-facing YAML to a temporary file."""
+        fd, path = tempfile.mkstemp(prefix="disagg_cancel_cluster_", suffix=".yaml")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cluster_config, f)
+        return path
+
+    def _resolve_model_name(self, model_name: str) -> str:
+        """Resolve relative model names against ``LLM_MODELS_ROOT`` when set."""
+        path = Path(model_name).expanduser()
+        if path.is_absolute() or path.exists():
+            return str(path)
+        models_root = os.environ.get("LLM_MODELS_ROOT")
+        if models_root:
+            return str(Path(models_root).expanduser() / model_name)
+        return model_name
+
+    def _build_worker_launch_specs(
+        self,
+        *,
+        ctx_workers: list[Any],
+        gen_workers: list[Any],
+        ctx_worker_config: dict[str, Any],
+        gen_worker_config: dict[str, Any],
+        ctx_servers: dict[str, Any],
+        gen_servers: dict[str, Any],
+        model_name: str,
+        work_dir: str,
+        env: dict[str, str],
+        host: str,
+    ) -> tuple[list[WorkerLaunchSpec], list[WorkerLaunchSpec]]:
+        """Reconstruct worker launch metadata for log scanning and respawn."""
+        import torch
+
+        num_gpus = torch.cuda.device_count()
+        if num_gpus <= 0:
+            raise RuntimeError("setup_disagg_cluster returned, but torch reports no CUDA devices")
+
+        gpus_per_ctx = (
+            int(ctx_servers.get("tensor_parallel_size", 1))
+            * int(ctx_servers.get("pipeline_parallel_size", 1))
+            * int(ctx_servers.get("context_parallel_size", 1))
+        )
+        gpus_per_gen = (
+            int(gen_servers.get("tensor_parallel_size", 1))
+            * int(gen_servers.get("pipeline_parallel_size", 1))
+            * int(gen_servers.get("context_parallel_size", 1))
+        )
+
+        ctx_specs: list[WorkerLaunchSpec] = []
+        gen_specs: list[WorkerLaunchSpec] = []
+        next_device = 0
+        for index, wrapper in enumerate(ctx_workers):
+            device = self._format_device_ids(next_device, gpus_per_ctx, num_gpus)
+            next_device += gpus_per_ctx
+            ctx_specs.append(
+                self._make_worker_launch_spec(
+                    role="ctx",
+                    index=index,
+                    wrapper=wrapper,
+                    worker_config=ctx_worker_config,
+                    model_name=model_name,
+                    work_dir=work_dir,
+                    device=device,
+                    env=env,
+                    host=host,
+                )
+            )
+        for index, wrapper in enumerate(gen_workers):
+            device = self._format_device_ids(next_device, gpus_per_gen, num_gpus)
+            next_device += gpus_per_gen
+            gen_specs.append(
+                self._make_worker_launch_spec(
+                    role="gen",
+                    index=index,
+                    wrapper=wrapper,
+                    worker_config=gen_worker_config,
+                    model_name=model_name,
+                    work_dir=work_dir,
+                    device=device,
+                    env=env,
+                    host=host,
+                )
+            )
+        return ctx_specs, gen_specs
+
+    def _format_device_ids(self, first_device: int, count: int, num_gpus: int) -> str:
+        """Return the CUDA_VISIBLE_DEVICES string used by setup_disagg_cluster."""
+        return ",".join(
+            str(d) for d in dict.fromkeys((first_device + j) % num_gpus for j in range(count))
+        )
+
+    def _make_worker_launch_spec(
+        self,
+        *,
+        role: str,
+        index: int,
+        wrapper: Any,
+        worker_config: dict[str, Any],
+        model_name: str,
+        work_dir: str,
+        device: str,
+        env: dict[str, str],
+        host: str,
+    ) -> WorkerLaunchSpec:
+        """Create one shadow launch spec from the shared ProcessWrapper."""
+        return WorkerLaunchSpec(
+            role=role,
+            index=index,
+            model_name=model_name,
+            worker_config=worker_config,
+            work_dir=work_dir,
+            port=int(getattr(wrapper, "port", 0) or 0),
+            device=device,
+            env=env.copy(),
+            log_path=getattr(wrapper, "log_path", None),
+            host=host,
+        )
+
+    def _refresh_worker_ports_from_cluster_info(
+        self,
+        server_url: str,
+        ctx_specs: list[WorkerLaunchSpec],
+        gen_specs: list[WorkerLaunchSpec],
+    ) -> None:
+        """Populate worker host/port from disagg ``/cluster_info`` when available."""
+        try:
+            with urllib.request.urlopen(f"{server_url}/cluster_info", timeout=5.0) as response:
+                info = json.loads(response.read().decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, TimeoutError, OSError, urllib.error.URLError) as exc:
+            logger.warning("[harness] could not read cluster_info for worker ports: %s", exc)
+            return
+
+        current_workers = info.get("current_workers") or {}
+        for specs, key in (
+            (ctx_specs, "context_servers"),
+            (gen_specs, "generation_servers"),
+        ):
+            workers = current_workers.get(key) or []
+            if len(workers) != len(specs):
+                logger.warning(
+                    "[harness] cluster_info %s count mismatch: %d worker(s), %d spec(s)",
+                    key,
+                    len(workers),
+                    len(specs),
+                )
+            for spec, worker_info in zip(specs, workers):
+                if not isinstance(worker_info, dict):
+                    continue
+                host = worker_info.get("host")
+                port = worker_info.get("port")
+                if isinstance(host, str) and host:
+                    spec.host = host
+                try:
+                    spec.port = int(port)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[harness] cluster_info %s worker %d has invalid port %r",
+                        key,
+                        spec.index,
+                        port,
+                    )
 
     def bind_tracked_workers(
         self,
@@ -722,32 +1242,59 @@ class DisaggCancellationStressHarness:
         ]
         self._worker_specs = list(ctx_specs) + list(gen_specs)
 
-    def start(self) -> None:
-        """Spawn the five worker threads. Returns immediately.
+    def bind_server_endpoint(self, server_url: str, model_name: str) -> None:
+        """Register the disagg server front-end for the canary client.
 
-        Stub stage: each thread body is a no-op that returns
-        immediately. The load-thread stub signals ``stop_event`` on
-        exit so the lifecycle smoke ``start() -> wait_until_done() ->
-        stop()`` completes cleanly without waiting out the
-        ``wait_until_done`` timeout.
+        Called by `setup()` (or tests). Until called, the canary
+        thread warns and exits — the lifecycle smoke has no live
+        server. `model_name` goes in the OpenAI envelope only; the
+        disagg server routes regardless.
+        """
+        self._server_url = server_url
+        self._model_name = model_name
+
+    def start(self) -> None:
+        """Spawn the mode-specific worker threads. Returns immediately.
+
+        ``log_only`` mode runs the regular CI guardrail: a normal
+        non-cancel probe loop plus log-pattern fail-fast. It
+        intentionally avoids the cancellation load, fault injector,
+        poison canary, and KV-growth gates until those runtime fixes
+        are present.
+
+        ``full_cancel_poison`` mode runs all five full-stress threads.
         """
         self._marathon_start_monotonic = time.monotonic()
-        logger.info("[harness] start() — spawning worker threads")
-        self._load_thread = threading.Thread(
-            target=self._load_thread_body, name="stress-load", daemon=True
-        )
-        self._canary_thread = threading.Thread(
-            target=self._canary_thread_body, name="stress-canary", daemon=True
-        )
-        self._injector_thread = threading.Thread(
-            target=self._injector_thread_body, name="stress-injector", daemon=True
-        )
-        self._log_scanner_thread = threading.Thread(
-            target=self._log_scanner_thread_body, name="stress-log-scanner", daemon=True
-        )
-        self._metrics_thread = threading.Thread(
-            target=self._metrics_thread_body, name="stress-metrics", daemon=True
-        )
+        logger.info("[harness] start() — mode=%s", self.config.mode)
+        if self.config.is_log_only:
+            self._log_only_thread = threading.Thread(
+                target=self._log_only_thread_body,
+                name="stress-log-only-probe",
+                daemon=True,
+            )
+            self._log_scanner_thread = threading.Thread(
+                target=self._log_scanner_thread_body,
+                name="stress-log-scanner",
+                daemon=True,
+            )
+        elif self.config.is_full_cancel_poison:
+            self._load_thread = threading.Thread(
+                target=self._load_thread_body, name="stress-load", daemon=True
+            )
+            self._canary_thread = threading.Thread(
+                target=self._canary_thread_body, name="stress-canary", daemon=True
+            )
+            self._injector_thread = threading.Thread(
+                target=self._injector_thread_body, name="stress-injector", daemon=True
+            )
+            self._log_scanner_thread = threading.Thread(
+                target=self._log_scanner_thread_body,
+                name="stress-log-scanner",
+                daemon=True,
+            )
+            self._metrics_thread = threading.Thread(
+                target=self._metrics_thread_body, name="stress-metrics", daemon=True
+            )
         for t in self._all_threads():
             t.start()
 
@@ -861,6 +1408,7 @@ class DisaggCancellationStressHarness:
             for the caller to mutate without affecting the harness):
 
             - ``canary_records``: per-canary request outcomes.
+            - ``load_records``: per-load-generator call outcomes.
             - ``kv_utilization_samples``: timestamped KV-cache
               utilization scrapes from the metrics thread.
             - ``injection_events``: SIGSTOP / SIGCONT / SIGKILL
@@ -871,38 +1419,342 @@ class DisaggCancellationStressHarness:
         """
         return {
             "canary_records": list(self._canary_records),
+            "load_records": list(self._load_records),
             "kv_utilization_samples": list(self._kv_utilization_samples),
             "injection_events": list(self._injection_events),
             "failure_reason": self.failure_reason,
         }
 
     # ------------------------------------------------------------------
-    # Thread bodies (stubs — implemented incrementally)
+    # Thread bodies
     # ------------------------------------------------------------------
+
+    def _configured_duration_s(self) -> float:
+        """Return the active run duration, honoring unit-test overrides."""
+        if self._load_duration_s is not None:
+            return self._load_duration_s
+        return float(self.config.duration_min) * 60.0
+
+    def _log_only_thread_body(self) -> None:
+        """Run regular CI protection without cancellation or poison gates.
+
+        This mode still launches the real disaggregated cluster and
+        sends normal completion probes through the front-end. It fails
+        the test on probe errors and runs concurrently with
+        ``log_scanner_thread`` so UAF, broken-promise, and segfault
+        signatures in worker/server logs remain hard-zero failures.
+        """
+        if not self._server_url:
+            self.mark_failed("log_only mode requires setup() to bind a server endpoint")
+            self.stop_event.set()
+            return
+
+        duration_s = self._configured_duration_s()
+        if duration_s <= 0.0:
+            logger.info("[log_only] non-positive duration %.3fs; exiting", duration_s)
+            self.stop_event.set()
+            return
+
+        probe_cfg = self.config.raw.get("log_only_probe") or {}
+        try:
+            interval_s = float(probe_cfg.get("interval_s", 30.0))
+            max_tokens = int(probe_cfg.get("max_tokens", 32))
+            seed = int(probe_cfg.get("seed", 42))
+            timeout_s = float(probe_cfg.get("request_timeout_s", self._canary_request_timeout_s))
+            prompt = str(
+                probe_cfg.get(
+                    "prompt",
+                    "Write one sentence about reliable distributed inference.",
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            self.mark_failed(f"log_only_probe config error: {exc}")
+            self.stop_event.set()
+            return
+        if interval_s <= 0.0:
+            self.mark_failed(f"log_only_probe.interval_s must be positive, got {interval_s}")
+            self.stop_event.set()
+            return
+
+        deadline = time.monotonic() + duration_s
+        logger.info(
+            "[log_only] probing %s every %.1fs for %.1fs",
+            self._server_url,
+            interval_s,
+            duration_s,
+        )
+
+        while (
+            time.monotonic() < deadline
+            and not self.stop_event.is_set()
+            and not self.failed_event.is_set()
+        ):
+            send_start = time.monotonic()
+            token_ids, _, err = self._send_log_only_probe(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                seed=seed,
+                timeout_s=timeout_s,
+            )
+            success = err is None
+            self._canary_records.append(
+                {
+                    "timestamp": time.time(),
+                    "elapsed_s": time.monotonic() - self._marathon_start_monotonic,
+                    "mode": _STRESS_MODE_LOG_ONLY,
+                    "prompt_index": 0,
+                    "success": success,
+                    "token_equivalent": None,
+                    "latency_s": time.monotonic() - send_start,
+                    "error": err,
+                    "token_count": len(token_ids or []),
+                }
+            )
+            if not success:
+                self.mark_failed(f"log_only probe failed: {err}")
+                break
+
+            remaining = min(interval_s, max(0.0, deadline - time.monotonic()))
+            if remaining > 0.0:
+                self.stop_event.wait(timeout=remaining)
+
+        if not self.failed_event.is_set() and not any(
+            record.get("success") for record in self._canary_records
+        ):
+            self.mark_failed("log_only mode completed without a successful probe")
+        if not self.failed_event.is_set():
+            logger.info("[log_only] completed; signalling stop_event")
+            self.stop_event.set()
+
+    def _send_log_only_probe(
+        self,
+        *,
+        prompt: str,
+        max_tokens: int,
+        seed: int,
+        timeout_s: float,
+    ) -> tuple[Optional[list[int]], Optional[str], Optional[str]]:
+        """Send one normal completion request for ``log_only`` mode."""
+        if self._server_url is None:
+            return None, None, "missing_server_url"
+        return _send_canary_request(
+            self._server_url,
+            self._model_name or "log-only-probe",
+            prompt,
+            max_tokens,
+            seed,
+            timeout_s,
+        )
 
     def _load_thread_body(self) -> None:
         """Wrap ``run_cancel_stress_test`` in a duration-bounded loop.
 
-        Stub: no-op that immediately signals end-of-marathon via
-        ``stop_event``. The real implementation loops until either
-        ``duration_min`` elapses or ``stop_event`` is set, calling
-        ``run_cancel_stress_test`` repeatedly; at end-of-marathon it
-        sets ``stop_event`` so the other four threads wind down.
-        Setting ``stop_event`` here in the stub preserves that
-        downstream contract and lets ``wait_until_done`` return
-        cleanly from the lifecycle smoke.
+        Loops until ``duration_min`` elapses or a stop/fail-fast
+        event is set. Each loop iteration picks the current steady
+        or burst load shape from ``stress_config``, runs one burst of
+        the existing disagg cancellation load generator, and appends
+        a record to ``_load_records`` for later correlation with
+        canary/metrics/injection observations.
+
+        At normal end-of-marathon, the load thread sets
+        ``stop_event`` so the other four threads wind down.
         """
-        logger.debug("[load_thread] stub — exiting and signalling stop_event")
-        self.stop_event.set()
+        if not self._server_url:
+            logger.warning("[load_thread] no server endpoint bound (setup() not wired); exiting")
+            self.stop_event.set()
+            return
+
+        duration_s = self._configured_duration_s()
+        if duration_s <= 0.0:
+            logger.info("[load_thread] non-positive duration %.3fs; exiting", duration_s)
+            self.stop_event.set()
+            return
+
+        try:
+            cancel_after_range = _parse_cancel_after_range(
+                self.config.raw.get("cancel_after_range")
+            )
+        except ValueError as exc:
+            self.mark_failed(f"load_thread config error: {exc}")
+            return
+
+        deadline = time.monotonic() + duration_s
+        logger.info(
+            "[load_thread] running for %.1fs against %s (base_concurrency=%d)",
+            duration_s,
+            self._server_url,
+            self.config.base_concurrency,
+        )
+
+        try:
+            while (
+                time.monotonic() < deadline
+                and not self.stop_event.is_set()
+                and not self.failed_event.is_set()
+            ):
+                iteration_start = time.monotonic()
+                elapsed_s = iteration_start - self._marathon_start_monotonic
+                try:
+                    shape = _load_iteration_shape(self.config, elapsed_s)
+                except ValueError as exc:
+                    self.mark_failed(f"load_thread config error: {exc}")
+                    break
+
+                record: dict[str, Any] = {
+                    "timestamp": time.time(),
+                    "elapsed_s": elapsed_s,
+                    "mode": shape["mode"],
+                    "num_bursts": 1,
+                    "requests_per_burst": shape["requests_per_burst"],
+                    "prompt_len_range": shape["prompt_len_range"],
+                    "cancel_after_range": cancel_after_range,
+                    "success": False,
+                    "error": None,
+                }
+                try:
+                    self._run_cancel_stress_iteration(
+                        server_url=self._server_url,
+                        num_bursts=1,
+                        requests_per_burst=shape["requests_per_burst"],
+                        prompt_len_range=shape["prompt_len_range"],
+                        cancel_after_range=cancel_after_range,
+                    )
+                    record["success"] = True
+                except Exception as exc:
+                    record["error"] = f"{type(exc).__name__}: {exc}"
+                    self.mark_failed(f"load_thread runner failed: {record['error']}")
+                    break
+                finally:
+                    record["duration_s"] = time.monotonic() - iteration_start
+                    self._load_records.append(record)
+
+                pause_s = min(self._load_iteration_pause_s, max(0.0, deadline - time.monotonic()))
+                if pause_s > 0.0:
+                    self.stop_event.wait(timeout=pause_s)
+        finally:
+            if not self.failed_event.is_set():
+                logger.info("[load_thread] completed; signalling stop_event")
+                self.stop_event.set()
+
+    def _run_cancel_stress_iteration(
+        self,
+        *,
+        server_url: str,
+        num_bursts: int,
+        requests_per_burst: int,
+        prompt_len_range: tuple[int, int],
+        cancel_after_range: tuple[float, float],
+    ) -> None:
+        """Run one call to the shared disaggregated cancellation load generator.
+
+        Kept as a method so unit tests can monkeypatch it without
+        importing the heavyweight disaggregated integration module.
+        """
+        from test_disaggregated import run_cancel_stress_test
+
+        run_cancel_stress_test(
+            server_url,
+            num_bursts=num_bursts,
+            requests_per_burst=requests_per_burst,
+            prompt_len_range=prompt_len_range,
+            cancel_after_range=cancel_after_range,
+        )
 
     def _canary_thread_body(self) -> None:
-        """Send greedy-decode canaries, check token-equivalence.
+        """Send greedy canaries and append per-request records to `_canary_records`.
 
-        Stub: no-op. Real implementation loads
-        ``stress_canary_prompts.json``, sends 5 reqs/min, asserts
-        token IDs match the recorded reference.
+        Each record: `{timestamp, elapsed_s, prompt_index, success,
+        token_equivalent, latency_s, error}`. `token_equivalent` is
+        True/False when a reference is recorded and the check is
+        enabled, else None. Failures are recorded — not fail-fast —
+        because errors during bursts/injections are expected; the
+        end-of-marathon gates (error rate, recovery time) are
+        computed from these records later.
+
+        Exits on `stop_event` or `failed_event`. The between-request
+        wait only observes `stop_event`, so `failed_event` is acted
+        on at the next request boundary (max lag = one interval);
+        the metrics thread has the same gap, a shared `wait_for_any`
+        helper is deferred to a follow-up PR. Warns and exits if the
+        server endpoint or prompts file is absent.
         """
-        logger.debug("[canary_thread] stub — exiting immediately")
+        canary_cfg = self.config.raw.get("canary") or {}
+        if not self._server_url:
+            logger.warning("[canary] no server endpoint bound (setup() not wired); exiting")
+            return
+        prompts_file = canary_cfg.get("prompts_file")
+        if not prompts_file:
+            logger.warning("[canary] no canary.prompts_file in config; exiting")
+            return
+        prompts_path = Path(prompts_file)
+        if not prompts_path.is_absolute():
+            prompts_path = self.yaml_path.parent / prompts_path
+        try:
+            prompts = _load_canary_prompts(prompts_path)
+        except (OSError, ValueError) as exc:
+            logger.warning("[canary] cannot load prompts %s: %s; exiting", prompts_path, exc)
+            return
+        if not prompts:
+            logger.warning("[canary] prompts file %s has no prompts; exiting", prompts_path)
+            return
+
+        if self._canary_interval_s is not None:
+            interval_s = self._canary_interval_s
+        else:
+            rate_per_min = float(canary_cfg.get("rate_per_min") or 0)
+            if rate_per_min <= 0:
+                logger.warning(
+                    "[canary] canary.rate_per_min is missing/zero/negative; defaulting to 5/min"
+                )
+                rate_per_min = 5.0
+            interval_s = 60.0 / rate_per_min
+        max_tokens = int(canary_cfg.get("max_tokens", 128))
+        seed = int(canary_cfg.get("seed", 42))
+        check_token_equiv = bool(canary_cfg.get("check_token_equivalent", True))
+        model = self._model_name or "canary"
+
+        logger.info(
+            "[canary] interval %.2fs over %d prompt(s) to %s",
+            interval_s,
+            len(prompts),
+            self._server_url,
+        )
+
+        idx = 0
+        while not self.stop_event.is_set() and not self.failed_event.is_set():
+            send_start = time.monotonic()
+            prompt_index = idx % len(prompts)
+            entry = prompts[prompt_index]
+            idx += 1
+            reference = entry.get("reference_token_ids")
+            token_ids, _, err = _send_canary_request(
+                self._server_url,
+                model,
+                entry["prompt"],
+                max_tokens,
+                seed,
+                self._canary_request_timeout_s,
+            )
+            success = err is None
+            token_equivalent: Optional[bool] = None
+            if success and check_token_equiv and reference is not None:
+                token_equivalent = _tokens_equivalent(token_ids, reference)
+            self._canary_records.append(
+                {
+                    "timestamp": time.time(),
+                    "elapsed_s": time.monotonic() - self._marathon_start_monotonic,
+                    "prompt_index": prompt_index,
+                    "success": success,
+                    "token_equivalent": token_equivalent,
+                    "latency_s": time.monotonic() - send_start,
+                    "error": err,
+                }
+            )
+            remaining = interval_s - (time.monotonic() - send_start)
+            if remaining > 0.0:
+                self.stop_event.wait(timeout=remaining)
+
+        logger.debug("[canary] exiting; %d record(s)", len(self._canary_records))
 
     def _injector_thread_body(self) -> None:
         """Fire SIGSTOP / SIGCONT / SIGKILL+respawn on the configured schedule.
@@ -1114,6 +1966,19 @@ class DisaggCancellationStressHarness:
             return
 
         sources: list[_LogSource] = []
+        if self._server_log_path is not None:
+            server_spec = WorkerLaunchSpec(
+                role="server",
+                index=0,
+                model_name=self._model_name or "disagg-server",
+                worker_config={},
+                work_dir="",
+                port=0,
+                device="",
+                env={},
+                log_path=self._server_log_path,
+            )
+            sources.append(_LogSource(spec=server_spec, path=Path(self._server_log_path)))
         for spec in self._worker_specs:
             if spec.log_path is None:
                 logger.warning(
@@ -1133,7 +1998,7 @@ class DisaggCancellationStressHarness:
             return
 
         logger.info(
-            "[log_scanner] tailing %d worker log(s) against %d hard_zero pattern(s)",
+            "[log_scanner] tailing %d log source(s) against %d hard_zero pattern(s)",
             len(sources),
             len(patterns),
         )
@@ -1226,6 +2091,7 @@ class DisaggCancellationStressHarness:
             t
             for t in (
                 self._load_thread,
+                self._log_only_thread,
                 self._canary_thread,
                 self._injector_thread,
                 self._log_scanner_thread,
@@ -1235,10 +2101,17 @@ class DisaggCancellationStressHarness:
         ]
 
     def _teardown_cluster(self) -> None:
-        """Best-effort cluster shutdown via ``terminate()``.
-
-        Stub: no-op since ``setup()`` doesn't actually launch yet.
-        """
+        """Best-effort cluster shutdown via ``terminate()``."""
         if self._cluster is None:
             return
-        logger.info("[harness] _teardown_cluster — stub")
+        from disagg_test_utils import terminate
+
+        config, ctx_workers, gen_workers, disagg_server, _server_port, work_dir = self._cluster
+        del config
+        logger.info("[harness] tearing down disagg cluster work_dir=%s", work_dir)
+        try:
+            terminate(*ctx_workers, *gen_workers, disagg_server)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            self._cluster = None
+            self._server_log_path = None

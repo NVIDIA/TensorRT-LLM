@@ -379,6 +379,78 @@ accuracy_dict = {
 }
 
 
+@pytest.mark.parametrize(
+    "sm_version,expected_path",
+    [
+        (90, "cached_kv"),
+        (99, "cached_kv"),
+        (100, "chunked_prefill"),
+    ],
+)
+def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
+                                            monkeypatch):
+    import tensorrt_llm._torch.modules.attention as attention_module
+
+    class FakeTrtllmAttention:
+
+        @staticmethod
+        def has_cached_kv_for_mla_context_warmup(_metadata):
+            return False
+
+        @staticmethod
+        def is_chunked_prefill_for_mla_context(_metadata):
+            return True
+
+        @staticmethod
+        def has_cached_kv_for_mla_context(_metadata):
+            return False
+
+    class FakeMetadata:
+        pass
+
+    class FakeAttention:
+
+        def __init__(self):
+            self.mha = FakeTrtllmAttention()
+
+        @staticmethod
+        def forward_context_with_chunked_prefill(*_args, **_kwargs):
+            return "chunked_prefill"
+
+        @staticmethod
+        def forward_context_with_cached_kv(*_args, **_kwargs):
+            return "cached_kv"
+
+        @staticmethod
+        def forward_context_default(*_args, **_kwargs):
+            return "default"
+
+    monkeypatch.setattr(attention_module, "TrtllmAttention",
+                        FakeTrtllmAttention)
+    monkeypatch.setattr(attention_module, "TrtllmAttentionMetadata",
+                        FakeMetadata)
+    monkeypatch.setattr(attention_module, "get_sm_version", lambda: sm_version)
+
+    q = torch.empty((1, 8), dtype=torch.float16)
+    compressed_kv = torch.empty((1, 4), dtype=torch.float16)
+    k_pe = torch.empty((1, 4), dtype=torch.float16)
+    position_ids = torch.zeros((1, ), dtype=torch.int64)
+    output = torch.empty((1, 8), dtype=torch.float16)
+    latent_cache = torch.empty((1, 1, 8), dtype=torch.float16)
+
+    result = attention_module.MLA.forward_context(
+        FakeAttention(),
+        q,
+        compressed_kv,
+        k_pe,
+        position_ids,
+        FakeMetadata(),
+        output,
+        latent_cache,
+    )
+    assert result == expected_path
+
+
 # Convert parameterized tests to pytest parametrize
 @pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"scenario: {x}")
 @pytest.mark.parametrize("context_sequence_lengths",

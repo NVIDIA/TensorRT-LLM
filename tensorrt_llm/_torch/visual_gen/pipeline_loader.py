@@ -2,7 +2,7 @@
 Model loader for diffusion pipelines.
 
 Flow:
-1. Load config via DiffusionModelConfig.from_pretrained()
+1. Load config via DiffusionPipelineConfig.from_pretrained()
 2. Create pipeline via AutoPipeline.from_config() with MetaInit
 3. Load weights with on-the-fly quantization if dynamic_weight_quant=True
 4. Call pipeline.post_load_weights()
@@ -31,7 +31,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig, apply_skip_softmax_overrides
 
-from .config import DiffusionModelConfig
+from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
@@ -143,7 +143,7 @@ class PipelineLoader:
             )
         return {**entry.defaults, **user_pipeline_config}
 
-    def _setup_visual_gen_mapping(self, config: DiffusionModelConfig) -> None:
+    def _setup_visual_gen_mapping(self, config: DiffusionPipelineConfig) -> None:
         ws = dist.get_world_size() if dist.is_initialized() else 1
         rk = dist.get_rank() if dist.is_initialized() else 0
         attn2d_row, attn2d_col = self.args.parallel_config.attn2d_size
@@ -158,8 +158,12 @@ class PipelineLoader:
             tp_size=self.args.parallel_config.tp_size,
             parallel_vae_size=self.args.parallel_config.parallel_vae_size,
         )
+        llm_mapping = vgm.to_llm_mapping()
         config.visual_gen_mapping = vgm
-        config.mapping = vgm.to_llm_mapping()
+        config.mapping = llm_mapping
+        for model_config in config.model_configs.values():
+            model_config.visual_gen_mapping = vgm
+            model_config.mapping = llm_mapping
 
     def load(
         self,
@@ -172,7 +176,7 @@ class PipelineLoader:
 
         Flow:
         1. Resolve checkpoint_dir (local path or HuggingFace Hub model ID)
-        2. Load config via DiffusionModelConfig.from_pretrained()
+        2. Load config via DiffusionPipelineConfig.from_pretrained()
         3. Create pipeline via AutoPipeline.from_config() with MetaInit
         4. Load transformer weights via pipeline.load_transformer_weights()
         5. Load auxiliary components (VAE, text_encoder)
@@ -210,7 +214,7 @@ class PipelineLoader:
         # Merge pretrained checkpoint config with user-provided VisualGenArgs
         # =====================================================================
         logger.info(f"Loading config from {checkpoint_dir}")
-        config = DiffusionModelConfig.from_pretrained(
+        config = DiffusionPipelineConfig.from_pretrained(
             checkpoint_dir,
             args=self.args,
             pipeline_config=resolved_pipeline_config,

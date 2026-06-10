@@ -3,6 +3,7 @@
 
 import copy
 import enum
+import hashlib
 import math
 import os
 from abc import ABC, abstractmethod
@@ -33,7 +34,7 @@ from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
+    DiskCacheTierConfig, GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManager as KVCacheManagerPy
@@ -161,6 +162,8 @@ def _ensure_int64_cpu_tensor(
 
 def _resolve_multimodal_run_metadata(
         req: LlmRequest) -> Optional[_MmRunMetadata]:
+    # TODO(perf): cache per request; block-reuse invokes this once per block,
+    # repeatedly rebuilding identical tensors for the same request metadata.
     # Worked example for one logical multimodal item split by text:
     #
     #   prompt index: 0    1      2      3    4      5
@@ -1501,6 +1504,31 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.get_num_front_blocks_removed(request_id,
                                                       window_size=window_size)
 
+    def commit_and_get_block_hashes(
+            self,
+            request: LlmRequest,
+            window_size: Optional[int] = None) -> List[int]:
+        """Commit and return the chain of stored block hashes for ``request``.
+
+        Wraps ``BaseKVCacheManager::commitAndGetBlockHashesForRequest``. The C++
+        side sets each block's ``mBlockKey`` and ``mHash`` on first call so the
+        hash matches what ``storeBlocks`` would later compute. Beam-width-1
+        only; the connector enforces this at startup.
+        """
+        if window_size is None:
+            # ``is_vswa`` (distinct window sizes) is the real VSWA signal; a
+            # uniform per-layer vector such as ``[4096, 4096, ...]`` has
+            # ``len > 1`` yet a single effective window, so keying off the
+            # length would spuriously reject it for connector callers that omit
+            # ``window_size``.
+            if self.is_vswa:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
+        return list(
+            self.impl.commit_and_get_block_hashes_for_request(
+                request, window_size))
+
     def unpin_blocks_by_id(self, kv_cache_block_id: int):
         self.impl.unpin_blocks_by_id(kv_cache_block_id)
 
@@ -2517,6 +2545,16 @@ class KVCacheManagerV2(BaseResourceManager):
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
+        disk_cache_size = kv_cache_config.disk_cache_size
+        if disk_cache_size is not None and disk_cache_size > 0:
+            disk_cache_path = kv_cache_config.disk_cache_path
+            assert disk_cache_path is not None
+            cache_tiers.append(
+                DiskCacheTierConfig(quota=disk_cache_size,
+                                    path=disk_cache_path))
+            logger.info(
+                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
+            )
 
         self.vocab_size = vocab_size
 
@@ -2959,11 +2997,10 @@ class KVCacheManagerV2(BaseResourceManager):
                         all_tokens, req, end=len(all_tokens) - 1)
                 else:
                     tokens = None
-                kv_cache = self._create_kv_cache(
-                    req.py_request_id,
-                    req.lora_task_id,
-                    tokens,
-                    cache_salt_id=req.cache_salt_id)
+                kv_cache = self._create_kv_cache(req.py_request_id,
+                                                 req.lora_task_id,
+                                                 tokens,
+                                                 cache_salt=req.cache_salt)
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
@@ -3051,6 +3088,18 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
 
+    def resume_request(self, req: LlmRequest) -> bool:
+        """Resume a previously-suspended KV cache for *req*.
+
+        Returns True if the cache is (or becomes) active on GPU, False if
+        resume was refused (e.g. GPU pressure above max_util_for_resume)
+        or no cache exists for the request.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        return self._resume_and_restore(req.py_request_id, kv_cache)
+
     # ---- prepare_resources ----
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
@@ -3074,11 +3123,10 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
-                    kv_cache = self._create_kv_cache(
-                        req.py_request_id,
-                        req.lora_task_id,
-                        None,
-                        cache_salt_id=req.cache_salt_id)
+                    kv_cache = self._create_kv_cache(req.py_request_id,
+                                                     req.lora_task_id,
+                                                     None,
+                                                     cache_salt=req.cache_salt)
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -3246,7 +3294,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if prepare_resource:
                 # Dummy/warmup request. ``stop_committing()`` below blocks all
                 # writes to the radix tree, so the choice of branch does not
-                # affect committed state. ``cache_salt_id`` is left defaulted
+                # affect committed state. ``cache_salt`` is left defaulted
                 # to None to avoid coupling synthetic data to any salted branch.
                 kv_cache = self._create_kv_cache(req.py_request_id,
                                                  req.lora_task_id, input_tokens)
@@ -3625,7 +3673,7 @@ class KVCacheManagerV2(BaseResourceManager):
                          request_id: int,
                          lora_task_id: int | None,
                          input_tokens: Sequence[TokenIdExt] | None,
-                         cache_salt_id: int | None = None):
+                         cache_salt: str | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
@@ -3634,8 +3682,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Skipping KV cache creation; request will retry next iteration.",
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
+        # ReuseScope.salt is int|None; derive a deterministic int from the
+        # cache_salt string so the same string yields the same reuse namespace
+        # across processes (matches C++ blockKey hashing on cacheSalt).
+        salt_int = (int.from_bytes(
+            hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
+                    if cache_salt is not None else None)
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
+            ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
         )
         self.kv_cache_map[request_id] = kv_cache

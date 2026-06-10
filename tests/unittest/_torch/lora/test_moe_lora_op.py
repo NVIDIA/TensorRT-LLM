@@ -163,6 +163,54 @@ def test_moe_per_expert_lora_changes_output():
 
 
 @requires_cuda_and_op
+def test_moe_lora_rejects_overlong_context_lengths():
+    """A per-request expansion whose host_context_lengths sum past the op's token
+    count must raise cleanly instead of overrunning the fixed-capacity pinned
+    expansion buffer.
+
+    The per-token (rank, A, B) tables are written into buffers sized for
+    num_tokens; a context request claiming more tokens than the op actually has
+    would, without the bounds guard in expandPerRequestLoraTo, scribble past the
+    end of pinned memory. Here a single context request declares 2 * num_tokens,
+    so the expansion must fail fast.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    fc1_adapter = make_per_expert_lora(
+        num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=10
+    )
+    fc2_adapter = make_per_expert_lora(
+        num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=11
+    )
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+    )
+    # Single context request (host_request_types == 0) whose declared context
+    # length exceeds the op's token count, so the expansion overruns by design.
+    lora_kwargs["host_request_types"] = torch.zeros(1, dtype=torch.int32, device="cpu")
+    lora_kwargs["host_context_lengths"] = torch.tensor(
+        [2 * num_tokens], dtype=torch.int32, device="cpu"
+    )
+
+    with pytest.raises((RuntimeError, ValueError)):
+        _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=lora_kwargs
+        )
+
+
+@requires_cuda_and_op
 def test_moe_lora_rejected_in_min_latency_mode():
     device = torch.device("cuda")
     dtype = torch.bfloat16

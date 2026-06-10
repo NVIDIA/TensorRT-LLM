@@ -25,7 +25,7 @@ from tensorrt_llm._torch.models.modeling_mistral_large3 import (
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderOutput, MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    _MULTIMODAL_ENV_NAME, _is_disagg)
+    _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
@@ -567,7 +567,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         model_config: ModelConfig[Mistral3Config],
     ):
-        if _is_disagg():
+        # No MM E/P handoff here yet. Fail before partial model setup.
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Mistral3VLM does not support disaggregated inference yet. Please unset "
                 f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."

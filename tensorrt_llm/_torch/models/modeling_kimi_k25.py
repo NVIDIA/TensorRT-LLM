@@ -49,7 +49,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -290,23 +290,6 @@ _MEDIA_PLACEHOLDER_TOKEN_ID = 163605
 
 # Default vocabulary size for K2.5
 _VOCAB_SIZE = 163840
-
-# K2.5 special token markers that the transformers 5.5.x Rust fast tokenizer
-# BPE-splits instead of mapping to canonical IDs. When any of these appear in
-# a prompt, we must route tokenization through the slow ``TikTokenTokenizer``.
-# Pure text (no markers and no multimodal data) keeps the fast tokenizer.
-# See NVBug 6182617 (correctness) and NVBug 6248987 (perf).
-_K25_SPECIAL_TOKEN_MARKERS = (
-    "<|media_begin|>",
-    "<|media_content|>",
-    "<|media_pad|>",
-    "<|media_end|>",
-    "<|im_user|>",
-    "<|im_assistant|>",
-    "<|im_system|>",
-    "<|im_end|>",
-    "<|im_middle|>",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -1069,16 +1052,6 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
         )
 
-        # transformers 5.5.x ``AutoTokenizer`` may route K2.5 to the Rust
-        # fast backend, which BPE-splits ``<|media_pad|>`` / ``<|im_user|>``
-        # / etc. instead of mapping them to their canonical IDs. The slow
-        # ``TikTokenTokenizer`` preserves them. Swap is deferred until we
-        # actually see an input that needs it (multimodal data or a K2.5
-        # special token marker in the prompt) — the text-only thinking
-        # path keeps the fast tokenizer to avoid a GIL-bound 9x TPOT
-        # regression. See NVBug 6182617 (correctness) / 6248987 (perf).
-        self._slow_tokenizer_active = False
-
     @property
     def config(self) -> PretrainedConfig:
         return self._config
@@ -1195,51 +1168,6 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 total_tokens += self.get_num_tokens_per_image(image=chunk[0])
         return total_tokens
 
-    @staticmethod
-    def _input_needs_slow_tokenizer(text: Optional[str]) -> bool:
-        """Return True iff ``text`` contains any K2.5 special token marker
-        that the Rust fast tokenizer would BPE-split incorrectly."""
-        if not text:
-            return False
-        return any(marker in text for marker in _K25_SPECIAL_TOKEN_MARKERS)
-
-    def _ensure_k25_slow_tokenizer(self) -> None:
-        """Override ``self._tokenizer`` and ``self._processor.tokenizer``
-        with the model's slow ``TikTokenTokenizer``.
-
-        Idempotent: callers invoke this lazily, on the first request that
-        actually requires correct mapping of K2.5 special tokens. Done this
-        way (instead of unconditionally in ``__init__``) so text-only
-        prompts keep the fast Rust tokenizer — running the slow Python
-        ``TikTokenTokenizer`` on the orchestrator GIL adds ~100 ms per
-        ``_fetch_new_requests`` / ``broadcast_requests`` step at 8 K-token
-        prompts, an order-of-magnitude TPOT regression. The slow class'
-        ``tokens_trie`` always splits the special tokens correctly.
-        See NVBug 6182617 (correctness) and NVBug 6248987 (perf).
-        """
-        if self._slow_tokenizer_active:
-            return
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-        slow_cls = get_class_from_dynamic_module(
-            "tokenization_kimi.TikTokenTokenizer",
-            self._model_path,
-        )
-        slow_tok = slow_cls.from_pretrained(self._model_path, trust_remote_code=True)
-
-        logger.info(
-            "K2.5 InputProcessor swapping in slow TikTokenTokenizer "
-            "(originally %s). See NVBug 6182617.",
-            type(self._tokenizer).__name__,
-        )
-
-        self._tokenizer = slow_tok
-        # Image-only path uses ``self._processor.tokenizer`` (an
-        # independent instance from ``AutoProcessor``); swap it too.
-        if getattr(self._processor, "tokenizer", None) is not None:
-            self._processor.tokenizer = slow_tok
-        self._slow_tokenizer_active = True
-
     @torch.inference_mode()
     def call_with_text_prompt(
         self,
@@ -1271,17 +1199,8 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
 
         # Text-only path
         if not images and not videos:
-            # Fast tokenizer is fine unless the prompt itself carries K2.5
-            # special tokens (rare on the thinking perf path); only fall
-            # back to the slow ``TikTokenTokenizer`` then. See NVBug 6248987.
-            if self._input_needs_slow_tokenizer(text_prompt):
-                self._ensure_k25_slow_tokenizer()
             token_ids = self._tokenizer(text_prompt, return_tensors="pt").input_ids[0]
             return token_ids.to(torch.int32).tolist(), {}
-
-        # Multimodal path: prompt is rewritten with media placeholders that
-        # the fast tokenizer would BPE-split, so we always need the slow one.
-        self._ensure_k25_slow_tokenizer()
 
         # Build the ``medias`` list expected by KimiK25Processor.
         # The HF processor accepts either ``messages`` (chat format) or
@@ -1492,12 +1411,12 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             "multimodal_data": multimodal_data,
         }
 
-    def get_prompt_token_ids(
+    def build_disagg_prefill_multimodal_inputs(
         self,
         inputs: TextPrompt,
         mm_handles: List[Dict[str, Any]],
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Build token IDs with multimodal placeholders expanded for disaggregated serving.
+    ) -> DisaggPrefillMultimodalInputs:
+        """Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container.
@@ -1505,7 +1424,9 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 context phase, each containing ``tensor_size``.
 
         Returns:
-            Tuple of (expanded_ids, mm_token_lengths, mm_token_offsets).
+            DisaggPrefillMultimodalInputs containing expanded token IDs,
+            prompt-side MM positions/lengths, exact runs, and encoder-output
+            embedding lengths.
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
@@ -1521,9 +1442,6 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                     f"must match model hidden size {expected_hidden_size}"
                 )
 
-        # Disagg-serving multimodal path: prompt has media placeholders that
-        # must map to canonical IDs, so the slow tokenizer is required.
-        self._ensure_k25_slow_tokenizer()
         input_ids = self._tokenizer(text_prompt, return_tensors="pt").input_ids[0]
 
         placeholder_id = self._media_placeholder_token_id
@@ -1556,7 +1474,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 expanded_ids[write_pos] = input_ids[read_pos]
                 write_pos += 1
 
-        return (expanded_ids.to(torch.int32).tolist(), mm_token_length, mm_token_offsets)
+        return DisaggPrefillMultimodalInputs(
+            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+            multimodal_lengths=mm_token_length,
+            multimodal_positions=mm_token_offsets,
+            multimodal_embedding_lengths=[mm_handle["tensor_size"][0] for mm_handle in mm_handles],
+            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) + 1)),
+            multimodal_run_positions=mm_token_offsets,
+            multimodal_run_lengths=mm_token_length,
+        )
 
 
 # ---------------------------------------------------------------------------
