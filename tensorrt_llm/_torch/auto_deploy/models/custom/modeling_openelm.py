@@ -141,10 +141,10 @@ class OpenELMConfig(PretrainedConfig):
         self.share_input_output_layers = share_input_output_layers
         self.rope_freq_constant = rope_freq_constant
         self.rope_max_length = rope_max_length
-        self.num_query_heads = (
-            _compute_heads(model_dim, head_dim) if num_query_heads is None else num_query_heads
-        )
         self.initializer_range = initializer_range
+        # NOTE: the `num_query_heads` parameter stays accepted for config.json schema
+        # fidelity (published checkpoints carry the precomputed list), but the
+        # per-layer derivation below is the source of truth, same as Apple's original.
 
         # --- per-layer derivation (inlined from Apple's __post_init__) ---
         head_multiple_of = self.num_gqa_groups if self.num_gqa_groups is not None else 2
@@ -552,13 +552,7 @@ class OpenELMForCausalLM(OpenELMPreTrainedModel, GenerationMixin):
 # code. Because this class's module is not under `transformers.`, transformers treats
 # it as `explicit_local_code` and uses it even when trust_remote_code=True and the
 # checkpoint's config.json declares an auto_map.
-try:
-    AutoConfig.register("openelm", OpenELMConfig, exist_ok=True)
-except TypeError:
-    try:
-        AutoConfig.register("openelm", OpenELMConfig)
-    except ValueError:
-        pass
+AutoConfig.register("openelm", OpenELMConfig, exist_ok=True)
 
 # Register with AutoModelForCausalLMFactory (keyed by config class name "OpenELMConfig")
 AutoModelForCausalLMFactory.register_custom_model_cls("OpenELMConfig", OpenELMForCausalLM)

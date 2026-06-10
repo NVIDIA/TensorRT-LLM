@@ -535,7 +535,7 @@ def test_openelm_config_derivation_matches_apple():
     # per-layer FFN multipliers are a linspace(0.5, 4.0, 16)
     assert config.ffn_multipliers[0] == 0.5 and config.ffn_multipliers[-1] == 4.0
     # GQA divisibility holds for every layer
-    assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads))
+    assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads, strict=True))
 
 
 def test_openelm_config_derivation_matches_apple_3b():
@@ -550,14 +550,46 @@ def test_openelm_config_derivation_matches_apple_3b():
     # ffn multipliers expand to a length-36 linspace(0.5, 4.0)
     assert len(config.ffn_multipliers) == 36
     assert config.ffn_multipliers[0] == 0.5 and config.ffn_multipliers[-1] == 4.0
-    assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads))
+    assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads, strict=True))
 
 
-def test_openelm_config_tolerates_unknown_kwargs():
+def test_openelm_config_fulfills_config_subclass_contract():
+    """Pin the two duties of a PreTrainedConfig subclass.
+
+    Real OpenELM config.json files carry keys outside this class's named
+    parameters (``architectures``, ``auto_map``, ``transformers_version``, ...),
+    so surplus kwargs are the steady-state input, not an edge case — and a
+    config class mishandling a forwarded kwarg is exactly the failure mode
+    behind issue 14672.
+
+    Duty 1 — accept ``**kwargs`` and pass them to ``super().__init__`` (HF's
+    documented rule for custom configs:
+    https://huggingface.co/docs/transformers/en/custom_models, "Configuration"
+    rule 2).
+
+    Duty 2 — leave ``__post_init__`` to the base class: the strict-dataclass
+    machinery routes leftover kwargs to ``self.__post_init__(**kwargs)``
+    (huggingface_hub ``dataclasses.py``), which must resolve to
+    ``PreTrainedConfig.__post_init__`` — the funnel that pops generation params
+    and absorbs unknown keys (transformers ``configuration_utils.py``).
+    Shadowing that hook with a legacy zero-kwarg method is what crashed
+    Apple's original class.
+    """
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import OpenELMConfig
 
-    # extra/unknown kwargs (as forwarded by transformers) must not raise
     config = OpenELMConfig(use_cache=True, some_future_field=123, **_OPENELM_270M)
+
+    # Duty 1 + Duty 2 end-to-end: an unknown key can only become an attribute by
+    # traveling __init__ -> super().__init__ -> base __post_init__ -> setattr.
+    assert config.some_future_field == 123
+    # The funnel's discard step ran: use_cache is a generation param in 5.x and
+    # gets popped (not stored on the config) — the canonical handling Apple's
+    # shadowed hook prevented.
+    assert not hasattr(config, "use_cache")
+    # Structural tripwire: nobody reintroduces a __post_init__ on this class
+    # (the Apple pattern that caused issue 14672).
+    assert "__post_init__" not in OpenELMConfig.__dict__
+    # Construction stayed healthy alongside the surplus kwargs.
     assert len(config.num_query_heads) == 16
 
 
