@@ -84,7 +84,7 @@ class TestPublicApi:
                 "algorithm": "skip_softmax",
                 "threshold_scale_factor": 5000.0,
                 "target_sparsity": 0.5,
-                "disabled_layers": ["blocks.0.*", "*.attn2"],
+                "exclude_modules": ["blocks.0.*", "*.attn2"],
                 "initial_disabled_steps": 2,
             },
         )
@@ -93,7 +93,7 @@ class TestPublicApi:
         assert isinstance(sparse_config, SkipSoftmaxAttentionConfig)
         assert sparse_config.threshold_scale_factor == 5000.0
         assert sparse_config.target_sparsity == 0.5
-        assert sparse_config.disabled_layers == ["blocks.0.*", "*.attn2"]
+        assert sparse_config.exclude_modules == ["blocks.0.*", "*.attn2"]
         assert sparse_config.initial_disabled_steps == 2
         assert AttentionConfig(**config.model_dump()).model_dump() == config.model_dump()
 
@@ -153,10 +153,10 @@ class TestPublicApi:
 
         assert _prefill_threshold(config.to_sparse_params()) == 5000.0
 
-    def test_user_disabled_layers_use_fnmatch_and_component_relative_names(self):
+    def test_user_exclude_modules_use_fnmatch_and_component_relative_names(self):
         config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor=5000.0,
-            disabled_layers=["blocks.0.attn1", "*.attn2"],
+            exclude_modules=["blocks.0.attn1", "*.attn2"],
         )
 
         assert config.to_sparse_params(module_name="transformer.blocks.0.attn1") is None
@@ -310,7 +310,7 @@ class TestCheckpointMetadata:
             "algorithm": "skip_softmax",
             "threshold_scale_factor": None,
             "target_sparsity": 0.5,
-            "disabled_layers": None,
+            "exclude_modules": None,
             "initial_disabled_steps": 1,
         }
 
