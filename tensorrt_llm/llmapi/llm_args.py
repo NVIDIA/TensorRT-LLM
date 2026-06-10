@@ -2340,6 +2340,55 @@ class PrometheusMetricsConfig(StrictBaseModel):
         return v
 
 
+class SelfBenchmarkConfig(StrictBaseModel):
+    """Configuration for startup self-benchmarking."""
+
+    mode: Literal["prefill", "decode", "agg"] = Field(
+        default="agg",
+        description=
+        "Self-benchmark mode. 'prefill' sweeps input sequence lengths, "
+        "'decode' sweeps decode context lengths and batch sizes, and 'agg' "
+        "runs both sweeps.",
+        status="prototype")
+
+    prefill_isl_granularity: PositiveInt = Field(
+        default=16,
+        description=
+        "Number of input sequence length sample points in the prefill sweep.",
+        status="prototype")
+
+    decode_context_granularity: PositiveInt = Field(
+        default=6,
+        description=
+        "Number of context length sample points in the decode sweep.",
+        status="prototype")
+
+    decode_batch_granularity: PositiveInt = Field(
+        default=6,
+        description=
+        "Number of batch size sample points for each decode context length.",
+        status="prototype")
+
+    warmup_iterations: NonNegativeInt = Field(
+        default=5,
+        description=
+        "Number of synthetic warmup iterations to run before collecting "
+        "self-benchmark results.",
+        status="prototype")
+
+    output_path: str = Field(
+        default="/tmp/trtllm_self_benchmark.json",
+        description="Path to write self-benchmark results JSON.",
+        status="prototype")
+
+    timeout_s: PositiveInt = Field(
+        default=300,
+        description=
+        "Maximum number of seconds external callers should wait for "
+        "self-benchmark output.",
+        status="prototype")
+
+
 class RayPlacementConfig(StrictBaseModel):
     """Configuration for Ray GPU workers placement.
     Currently, this config is only used with AsyncLLM for RL scenarios.
@@ -4430,6 +4479,15 @@ class TorchLlmArgs(BaseLlmArgs):
         "scheduler is disabled.",
         status="prototype")
 
+    self_benchmark_config: Optional[SelfBenchmarkConfig] = Field(
+        default=None,
+        description=
+        "Configuration for startup self-benchmarking. When set, the PyTorch "
+        "executor runs synthetic prefill and/or decode benchmark points before "
+        "serving normal requests and writes the collected iteration metrics to "
+        "the configured JSON output path.",
+        status="prototype")
+
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
@@ -4861,6 +4919,23 @@ class TorchLlmArgs(BaseLlmArgs):
                 "aggregated workloads; disabling it because "
                 "cache_transceiver_config is configured.")
             self.enable_early_first_token_response = False
+        return self
+
+    @model_validator(mode="after")
+    def validate_self_benchmark_config(self) -> 'TorchLlmArgs':
+        if self.self_benchmark_config is None:
+            return self
+        if self.encode_only or self.mm_encoder_only:
+            raise ValueError(
+                "self_benchmark_config is only supported for decoder generation "
+                "workloads. Disable encode_only/mm_encoder_only to use "
+                "startup self-benchmarking.")
+        if self.enable_attention_dp:
+            raise ValueError(
+                "self_benchmark_config is not supported with attention data "
+                "parallelism yet. Disable enable_attention_dp to use startup "
+                "self-benchmarking.")
+        self.enable_iter_perf_stats = True
         return self
 
     @model_validator(mode="after")

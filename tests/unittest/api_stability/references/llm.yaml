@@ -183,6 +183,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig]
         default: null
         status: prototype
+      self_benchmark_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SelfBenchmarkConfig]
+        default: null
+        status: prototype
       enable_energy_metrics:
         annotation: bool
         default: False

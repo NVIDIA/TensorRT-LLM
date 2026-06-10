@@ -35,7 +35,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
+from tensorrt_llm.llmapi.llm_args import (SelfBenchmarkConfig, TorchLlmArgs,
+                                          TrtLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -56,6 +57,18 @@ _child_p_global: Optional[subprocess.Popen] = None
 
 # Bound gRPC messages while leaving room for multimodal image payloads.
 _GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
+_SELF_BENCHMARK_PREFILL_GRANULARITY = SelfBenchmarkConfig.model_fields[
+    "prefill_isl_granularity"].default
+_SELF_BENCHMARK_DECODE_LENGTH_GRANULARITY = SelfBenchmarkConfig.model_fields[
+    "decode_context_granularity"].default
+_SELF_BENCHMARK_DECODE_BATCH_GRANULARITY = SelfBenchmarkConfig.model_fields[
+    "decode_batch_granularity"].default
+_SELF_BENCHMARK_WARMUP_ITERATIONS = SelfBenchmarkConfig.model_fields[
+    "warmup_iterations"].default
+_SELF_BENCHMARK_OUTPUT_PATH = SelfBenchmarkConfig.model_fields[
+    "output_path"].default
+_SELF_BENCHMARK_TIMEOUT = SelfBenchmarkConfig.model_fields[
+    "timeout_s"].default
 
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
@@ -209,6 +222,16 @@ def get_llm_args(
         telemetry: bool = True,
         agent_percentage: float = 0.0,
         agent_types: Optional[str] = None,
+        self_benchmark_mode: Optional[str] = None,
+        self_benchmark_prefill_granularity: int = (
+            _SELF_BENCHMARK_PREFILL_GRANULARITY),
+        self_benchmark_decode_length_granularity: int = (
+            _SELF_BENCHMARK_DECODE_LENGTH_GRANULARITY),
+        self_benchmark_decode_batch_granularity: int = (
+            _SELF_BENCHMARK_DECODE_BATCH_GRANULARITY),
+        self_benchmark_warmup_iterations: int = _SELF_BENCHMARK_WARMUP_ITERATIONS,
+        self_benchmark_output_path: str = _SELF_BENCHMARK_OUTPUT_PATH,
+        self_benchmark_timeout: int = _SELF_BENCHMARK_TIMEOUT,
         explicit_cli_keys: Optional[Set[str]] = None,
         **llm_args_extra_dict: Any):
 
@@ -302,6 +325,16 @@ def get_llm_args(
         agent_percentage,
         "agent_types":
         agent_types,
+        "self_benchmark_config":
+        SelfBenchmarkConfig(
+            mode=self_benchmark_mode,
+            prefill_isl_granularity=self_benchmark_prefill_granularity,
+            decode_context_granularity=self_benchmark_decode_length_granularity,
+            decode_batch_granularity=self_benchmark_decode_batch_granularity,
+            warmup_iterations=self_benchmark_warmup_iterations,
+            output_path=self_benchmark_output_path,
+            timeout_s=self_benchmark_timeout,
+        ) if self_benchmark_mode is not None else None,
     }
 
     llm_args = {
@@ -858,6 +891,54 @@ class ChoiceWithAlias(click.Choice):
                   "Applied by Efficient Video Sampling (EVS). "
                   "None disables EVS, values in [0, 1) enable pruning.",
                   "prototype"))
+@click.option(
+    "--self_benchmark_mode",
+    type=click.Choice(["prefill", "decode", "agg"]),
+    default=None,
+    help=help_info_with_stability_tag(
+        "Run scheduler-local self-benchmarking on startup and write JSON "
+        "results to --self_benchmark_output_path.", "prototype"))
+@click.option(
+    "--self_benchmark_prefill_granularity",
+    type=int,
+    default=_SELF_BENCHMARK_PREFILL_GRANULARITY,
+    help=help_info_with_stability_tag(
+        "Number of input sequence length sample points for startup "
+        "self-benchmark prefill sweep.", "prototype"))
+@click.option(
+    "--self_benchmark_decode_length_granularity",
+    type=int,
+    default=_SELF_BENCHMARK_DECODE_LENGTH_GRANULARITY,
+    help=help_info_with_stability_tag(
+        "Number of context length sample points for startup self-benchmark "
+        "decode sweep.", "prototype"))
+@click.option(
+    "--self_benchmark_decode_batch_granularity",
+    type=int,
+    default=_SELF_BENCHMARK_DECODE_BATCH_GRANULARITY,
+    help=help_info_with_stability_tag(
+        "Number of batch size sample points for each startup self-benchmark "
+        "decode context length.", "prototype"))
+@click.option(
+    "--self_benchmark_warmup_iterations",
+    type=int,
+    default=_SELF_BENCHMARK_WARMUP_ITERATIONS,
+    help=help_info_with_stability_tag(
+        "Number of synthetic warmup iterations before startup "
+        "self-benchmark collection.", "prototype"))
+@click.option(
+    "--self_benchmark_output_path",
+    type=str,
+    default=_SELF_BENCHMARK_OUTPUT_PATH,
+    help=help_info_with_stability_tag(
+        "Path to write startup self-benchmark results JSON.", "prototype"))
+@click.option(
+    "--self_benchmark_timeout",
+    type=int,
+    default=_SELF_BENCHMARK_TIMEOUT,
+    help=help_info_with_stability_tag(
+        "Maximum seconds external launchers should wait for startup "
+        "self-benchmark output.", "prototype"))
 @click.option("--chat_template",
               type=str,
               default=None,
@@ -927,6 +1008,13 @@ def serve(
         enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
         media_io_kwargs: Optional[str], agent_percentage: float,
         agent_types: Optional[str], video_pruning_rate: Optional[float],
+        self_benchmark_mode: Optional[str],
+        self_benchmark_prefill_granularity: int,
+        self_benchmark_decode_length_granularity: int,
+        self_benchmark_decode_batch_granularity: int,
+        self_benchmark_warmup_iterations: int,
+        self_benchmark_output_path: str,
+        self_benchmark_timeout: int,
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
         served_model_name: Optional[str], visual_gen_args: Optional[str]):
@@ -989,6 +1077,20 @@ def serve(
 
     explicit_cli_keys = collect_explicit_cli_keys(
         exclude=("extra_llm_api_options", "config"))
+    self_benchmark_cli_keys = {
+        "self_benchmark_prefill_granularity",
+        "self_benchmark_decode_length_granularity",
+        "self_benchmark_decode_batch_granularity",
+        "self_benchmark_warmup_iterations",
+        "self_benchmark_output_path",
+        "self_benchmark_timeout",
+    }
+    if (self_benchmark_mode is None
+            and explicit_cli_keys.intersection(self_benchmark_cli_keys)):
+        raise click.BadParameter(
+            "--self_benchmark_mode must be set when any other "
+            "--self_benchmark_* option is provided.",
+            param_hint="--self_benchmark_mode")
 
     def _serve_llm():
         nonlocal server_role
@@ -1022,6 +1124,13 @@ def serve(
             telemetry=telemetry,
             agent_percentage=agent_percentage,
             agent_types=agent_types,
+            self_benchmark_mode=self_benchmark_mode,
+            self_benchmark_prefill_granularity=self_benchmark_prefill_granularity,
+            self_benchmark_decode_length_granularity=self_benchmark_decode_length_granularity,
+            self_benchmark_decode_batch_granularity=self_benchmark_decode_batch_granularity,
+            self_benchmark_warmup_iterations=self_benchmark_warmup_iterations,
+            self_benchmark_output_path=self_benchmark_output_path,
+            self_benchmark_timeout=self_benchmark_timeout,
             explicit_cli_keys=explicit_cli_keys)
 
         llm_args_extra_dict = {}

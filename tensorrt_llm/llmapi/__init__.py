@@ -21,6 +21,7 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
                        SADecodingConfig, SAEnhancerConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
+                       SelfBenchmarkConfig,
                        SkipSoftmaxAttentionConfig, TorchCompileConfig,
                        TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
@@ -87,6 +88,7 @@ __all__ = [
     'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
     'PrometheusMetricsConfig',
+    'SelfBenchmarkConfig',
     'ThinkingBudgetLogitsProcessor',
     'add_thinking_budget_logits_processor',
 ]
