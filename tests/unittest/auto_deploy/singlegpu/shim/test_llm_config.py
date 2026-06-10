@@ -112,6 +112,8 @@ def test_speculative_flashinfer_fallback_disables_piecewise():
 
     assert args.compile_backend == "torch-simple"
     assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
 def test_cache_transceiver_rejects_unmanaged_persistent_caches():
     """Cache transceiver rejects unmanaged persistent cache resources."""
     args = LlmArgs(
