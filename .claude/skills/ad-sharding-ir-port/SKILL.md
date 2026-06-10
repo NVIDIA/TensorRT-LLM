@@ -33,7 +33,7 @@ You MAY introduce ONLY the following changes:
   - `nn.Linear(...)` / `F.linear(...)` → `torch.ops.auto_deploy.torch_linear_simple(...)`
   - `tensor.view(...)` / `tensor.reshape(...)` → `torch.ops.auto_deploy.view(...)` (only when the shape contains a TP-scaled dim)
   - `torch.split(...)` / `torch.split_with_sizes(...)` → `torch.ops.auto_deploy.split_with_sizes(...)`
-- **A2. Sharding-hint kwargs added** to call sites of: `torch_moe`, `torch_ssm`, `torch_gated_delta_rule`, `torch_causal_conv1d`, `torch_rmsnorm_gated`, `torch_mla`, `torch_linear_simple`, `auto_deploy.split_with_sizes`, `auto_deploy.view`. Allowed kwargs: `tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`.
+- **A2. Sharding-hint kwargs added** to call sites of: `torch_moe`, `torch_ssm`, `torch_gated_delta_rule`, `torch_causal_conv1d`, `torch_rmsnorm_gated`, `torch_mla`, `torch_attention`, `torch_linear_simple`, `auto_deploy.split_with_sizes`, `auto_deploy.view`. Allowed kwargs: `tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`.
 - **A3. Inserting `torch.ops.auto_deploy.all_reduce(..., layer_type=...)`** after rowwise projections / at MoE merge points (single all_reduce after routed + shared sums).
 - **A4. Docstring updates:**
   - Module-level: a single-line header noting the file uses sharding IR, followed by the existing source-of-truth / HF link block. Example: `"""Llama 3 model (sharding IR)."""`.
@@ -134,15 +134,15 @@ Do not report success until a run completes successfully.
 
 ### Step 10b — Sharding equivalence test (MANDATORY)
 
-Run the offline sharding-IR equivalence test ([`tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py)) against the modeling file you just edited, under **every** parallelism configuration the test exposes. The port is **not** complete until every configuration passes. Skipping this step or treating a partial pass (e.g. only `tep`) as success is not allowed.
+Run the offline sharding-IR equivalence test ([`tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py)) against the modeling file you just edited, under **every** parallelism configuration the test exposes. The port is **not** complete until every configuration passes. Skipping this step or treating a partial pass (e.g. only `tep`) as success is not allowed.
 
-The test compares a sharded prefill against the unsharded eager reference on a tiny (4-layer, hidden_size=64) instance of the model and asserts `rel_rmse < tol`, where `tol` is the test-defined relative-RMSE tolerance (`REL_RMSE_TOL` constant in [`test_sharding_ir_equivalence.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py); overridable per invocation via the `SHARDING_IR_REL_RMSE_TOL` env var). It uses no PyExecutor / no compile / no checkpoint download, so each cell runs in ~30s on 4xGPU.
+The test compares a sharded prefill against the unsharded eager reference on a tiny (4-layer, hidden_size=64) instance of the model and asserts `rel_rmse < tol`, where `tol` is the test-defined relative-RMSE tolerance (`REL_RMSE_TOL` constant in [`test_sharding_num_correctness.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py); overridable per invocation via the `SHARDING_IR_REL_RMSE_TOL` env var). It uses no PyExecutor / no compile / no checkpoint download, so each cell runs in ~30s on 4xGPU.
 
 **Run the matrix:**
 
 ```bash
 MODEL=tensorrt_llm/_torch/auto_deploy/models/custom/modeling_<name>.py
-TEST=tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py
+TEST=tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py
 
 for CFG in tp-only ep-only tep attn-dp; do
   pytest "$TEST" --sharding-ir-modeling-file "$MODEL" --sharding-ir-dist-config "$CFG" -s -v \
@@ -225,6 +225,8 @@ You are NOT done until every row in the table is a yes-allowed category.
 
 **MLA (DeepSeek):** `layer_type="mla"`: keep `torch_mla` intact with `shardable=True`—do **not** decompose into separate linears + `torch_attention` (introduces bad `expand`/`view` with concrete head counts). q_a/kv_a latent: `tp_mode="none"`; q_b colwise; `o_proj` rowwise + `all_reduce`.
 
+**Per-head free Parameters on `torch_attention` (GPT-OSS-style sinks):** when an attention block has a learnable `nn.Parameter` indexed by Q-head count that flows DIRECTLY into `torch_attention` (not through a Linear) — e.g. GPT-OSS's `self.sinks = nn.Parameter(torch.empty(num_heads))` passed as `sinks=self.sinks` — pass `enable_sharding=True` to the `torch_attention(...)` call. The IR's `WeightedParamShardableNode` is registered for `torch_attention` and will slice every direct `get_attr` arg along dim 0 (= head dim) per rank. Q/K/V/O projection weights are unaffected (they belong to the preceding `torch_linear_simple` nodes and are sharded by `LinearShardableNode`). Models with no such head-wise Parameter (qwen3, llama, smollm3, ...) leave `enable_sharding` at its default `False` and the handler no-ops for them.
+
 ## Common pitfalls
 
 1. **Missing `auto_deploy::view` for head reshapes** — concrete shapes from export break after sharding.
@@ -235,7 +237,7 @@ You are NOT done until every row in the table is a yes-allowed category.
 6. **Decomposing ops that absorb weights** (e.g. `torch_mla`) — use `shardable` + handler instead of splitting into plain linears.
 7. **Interleaved vs contiguous fused weights** — interleaved per-head groups: colwise only; contiguous Q|K|V blocks: require `output_sizes`.
 8. **Omitting `layer_type` when using `shard_layers`** — `"unknown"` nodes are skipped; set hints explicitly on sharding-aware ops.
-9. **`layer_type` on non-hint ops** — do **not** pass `layer_type` to ops that are not designed for sharding hints (e.g. `torch_attention`, `torch_l2norm`, `torch_rope_*`); extra positional args break calls. Confirm in `custom_ops/` docstrings which ops accept hints.
+9. **`layer_type` on non-hint ops** — do **not** pass `layer_type` to ops that are not designed for sharding hints (e.g. `torch_l2norm`, `torch_rope_*`); extra positional args break calls. Note: `torch_attention` DOES accept `layer_type` (and `enable_sharding`) — see the per-head Parameters paragraph in "Layer-specific sharding patterns" above. Confirm in `custom_ops/` docstrings which ops accept hints.
 10. **Conditional hint values** — no `if _s else "none"`; use unconditional hints and rely on `shard_layers` / transform config.
 11. **Replacing `torch.ops.trtllm.*` ops** — `noaux_tc_op`, `dsv3_router_gemm_op`, fused norm/MLP kernels are TP-replicated and must be kept verbatim (rule F1). AD has no fusion pass to recover them from vanilla PyTorch.
 

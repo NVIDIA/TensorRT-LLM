@@ -8,14 +8,19 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 """Local conftest for multigpu/transformations/library tests.
 
-``test_sharding_ir_equivalence`` is parametrized intrinsically (one invocation
+``test_sharding_num_correctness`` is parametrized intrinsically (one invocation
 per modeling file × dist config). The two CLI options pin a single value
 to that axis for per-file debugging; when omitted, the test auto-discovers
 every ``modeling_*.py`` under ``tensorrt_llm/_torch/auto_deploy/models/custom/``
-and runs the cheapest dist config across all of them. Legacy (non-IR-marked)
-modeling files pass as a no-op identity (``apply_sharding_hints`` finds no
-markers and leaves the graph unchanged, so sharded == unsharded by
-construction); IR-marked files exercise the full equivalence path.
+and runs the cheapest dist config across all of them.
+
+IR-marked files (graph carries ``torch.ops.auto_deploy.all_reduce`` per skill
+rule A3) run ``apply_sharding_hints`` + ``strip_sharding_hints``. Legacy
+(non-IR-marked) files run ``detect_sharding`` + ``sharding_transform_executor``
+with ``HEURISTIC`` source only -- the standalone-export harness has no
+``ModelFactory`` or per-model YAML to feed FACTORY / MANUAL. Models for
+which the legacy heuristic inserts zero collectives ``pytest.skip`` cleanly
+(rather than rubber-stamping a trivial identity pass).
 """
 
 from pathlib import Path
@@ -43,7 +48,7 @@ def pytest_addoption(parser):
         default=None,
         help=(
             "Path to a single modeling file to verify with "
-            "test_sharding_ir_equivalence. Accepts an absolute path, a path "
+            "test_sharding_num_correctness. Accepts an absolute path, a path "
             "relative to cwd or repo root, or a bare module short name "
             "(resolved under tensorrt_llm._torch.auto_deploy.models.custom). "
             "When omitted, the test auto-discovers and parametrizes over "
@@ -56,8 +61,8 @@ def pytest_addoption(parser):
         default=None,
         choices=_DIST_CONFIG_CHOICES,
         help=(
-            "Parallelism config to exercise in test_sharding_ir_equivalence. "
-            "See test_sharding_ir_equivalence._DIST_CONFIGS for grids: "
+            "Parallelism config to exercise in test_sharding_num_correctness. "
+            "See test_sharding_num_correctness._DIST_CONFIGS for grids: "
             "'tp-only' (2 ranks), 'ep-only' (2 ranks), 'tep' (4 ranks), "
             "'attn-dp' (4 ranks, attention-DP + MoEAllToAll). "
             f"Defaults: {_DIST_CONFIG_DEFAULT_CLI!r} when "
@@ -84,7 +89,7 @@ def _modeling_id(path: str) -> str:
     """Compact pytest id: strip ``modeling_`` prefix and ``.py`` suffix.
 
     e.g. ``.../modeling_qwen3_next.py`` -> ``qwen3_next``. Keeps parametrize
-    output readable (``test_sharding_ir_equivalence[qwen3_next-tp-only]``).
+    output readable (``test_sharding_num_correctness[qwen3_next-tp-only]``).
     """
     name = Path(path).name
     if name.startswith("modeling_"):

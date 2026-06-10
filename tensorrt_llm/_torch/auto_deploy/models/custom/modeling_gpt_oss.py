@@ -343,17 +343,61 @@ class GptOssAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout).
-        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        # Project Q/K/V (colwise; tp_min_local_shape=head_dim keeps at least one
+        # full head per rank under GQA).
+        q = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        # Reshape to [B, S, N, head_dim]; tp_scaled_dim=2 (head count) makes IR
+        # rewrite the literal num_heads to num_heads/TP per rank.
+        q = torch.ops.auto_deploy.view(
+            q,
+            [bsz, q_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.view(
+            k,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.view(
+            v,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         cos, sin = position_embeddings  # [B, S, head_dim]
         # Apply RoPE with unsqueeze_dim=2 for BSND layout.
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
 
-        # ``torch_attention`` handles GQA natively; sinks/sliding_window are
-        # per-call kwargs. Causal mask is applied internally for prefill.
+        # ``torch_attention`` handles GQA natively. ``enable_sharding=True``
+        # triggers WeightedParamShardableNode to slice the per-head ``sinks``
+        # Parameter along dim 0 (head dim) per rank, matching the post-shard
+        # head count from Q/K/V's colwise sharding.
         attn_output = torch.ops.auto_deploy.torch_attention(
             q,
             k,
@@ -365,10 +409,26 @@ class GptOssAttention(nn.Module):
             sinks=self.sinks,
             sliding_window=self.sliding_window,
             layout="bsnd",
+            layer_type="mha",
+            enable_sharding=True,
         )
-        # [B, S, N, D] -> [B, S, N*D]
-        attn_output = attn_output.reshape(bsz, q_len, -1)
-        return self.o_proj(attn_output)
+        # [B, S, N, D] -> [B, S, N*D]; tp_scaled_dim=2 rewrites the fused dim.
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        # Single merge-point all_reduce: rowwise o_proj produces per-rank
+        # partial sums; reduce here to obtain the full attention output.
+        return torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
 
 # ---------------------------------------------------------------------------

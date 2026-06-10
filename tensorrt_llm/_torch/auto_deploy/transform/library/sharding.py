@@ -15,7 +15,7 @@
 """Transformations to support graph sharding.
 
 Heuristic-detection fallback for modeling files not yet ported to sharding IR.
-The auto-detect dispatcher in ``sharding_ir.py::has_sharding_ir_markers`` routes
+The auto-detect dispatcher in ``sharding_ir.py::is_shardingIR_enabled`` routes
 FX graphs without ``torch.ops.auto_deploy.all_reduce`` markers here; graphs
 authored against the sharding IR are handled by ``apply_sharding_hints`` instead.
 New modeling-file work should target the sharding IR (see
