@@ -263,7 +263,6 @@ def test_cute_kernel_matches_ref_with_independent_indices():
     block_size = 64
     topk = num_cubes // 2
     seq_len = num_cubes * block_size
-    assert num_cubes % 2 == 0, "num_cubes must be even for the paired-block kernel"
 
     q = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
     k = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
