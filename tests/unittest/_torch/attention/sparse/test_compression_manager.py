@@ -204,6 +204,16 @@ class TestFactories:
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
             mock_logger.warning.assert_not_called()
 
+    def test_dispatch_warns_for_unregistered_algorithm(self):
+        # "Same for others": the cache-manager / backend dispatchers warn too.
+        from tensorrt_llm._torch.attention_backend.sparse import utils
+
+        cfg = MagicMock()
+        cfg.algorithm = "made_up_method"
+        with patch.object(utils, "logger") as mock_logger:
+            assert utils.get_sparse_attn_kv_cache_manager(cfg) is None
+            mock_logger.warning.assert_called_once()
+
 
 # ---------------------------------------------------------------------- #
 # 5. Canonical name imports (post-rename; old coordinator/Executor gone)  #
