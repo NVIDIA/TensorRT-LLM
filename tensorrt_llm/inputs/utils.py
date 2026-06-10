@@ -663,10 +663,6 @@ def apply_chat_template(
             return tokenizer.encode(prompt)
         return prompt
 
-    # Special handling of Mistral native processor (duck-typed to avoid circular import)
-    if getattr(processor, "is_mistral_native_processor", False):
-        model_type = "mistral_common"
-
     # Check for PASSTHROUGH early — before we need tokenizer/processor/template.
     # The registry may already know this model skips chat templates entirely.
     registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(

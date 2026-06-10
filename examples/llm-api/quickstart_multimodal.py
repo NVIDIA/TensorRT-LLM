@@ -137,13 +137,6 @@ def add_multimodal_args(parser):
                         default=None,
                         help="Pruning rate for video frames (EVS). "
                         "None disables EVS, values in [0, 1) enable pruning.")
-    parser.add_argument(
-        "--input_processor",
-        type=str,
-        default=None,
-        help="Override the automatically selected input processor. "
-        "Must be a registered model_type. None (default) selects automatically."
-    )
     return parser
 
 
@@ -195,14 +188,11 @@ def main():
 
     llm, sampling_params = setup_llm(args,
                                      lora_config=lora_config,
-                                     video_pruning_rate=args.video_pruning_rate,
-                                     input_processor=args.input_processor)
+                                     video_pruning_rate=args.video_pruning_rate)
 
     image_format = args.image_format
     if args.model_type is not None:
         model_type = args.model_type
-    elif hasattr(llm.input_processor, '_registered_model_type'):
-        model_type = llm.input_processor._registered_model_type
     else:
         model_type = json.load(
             open(os.path.join(str(llm._hf_model_dir),

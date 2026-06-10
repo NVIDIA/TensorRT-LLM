@@ -4820,13 +4820,6 @@ class TorchLlmArgs(BaseLlmArgs):
         "None (default) disables EVS, values in [0, 1) enable pruning.",
         status="prototype")
 
-    input_processor: Optional[str] = Field(
-        default=None,
-        description="Override the automatically selected input processor. "
-        "Must be a registered model_type string. "
-        "None (default) selects the processor automatically based on checkpoint_format.",
-        status="prototype")
-
     @property
     def quant_config(self) -> QuantConfig:
         if self._quant_config is None:
