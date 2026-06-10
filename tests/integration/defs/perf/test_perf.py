@@ -1044,9 +1044,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
         build_cmd = [
-            self._build_script, f"--log_level=info",
-            f"--workspace={engine_dir}", f"--model={model_name}",
-            f"--model_path={model_dir}", "build",
+            self._build_script, "--log_level=info", f"--workspace={engine_dir}",
+            f"--model={model_name}", f"--model_path={model_dir}", "build",
             f"--tp_size={self._config.tp_size}",
             f"--pp_size={self._config.pp_size}"
         ]
