@@ -15,7 +15,7 @@ from ...inputs import (
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
-from .modeling_multimodal_utils import _is_disagg
+from .modeling_multimodal_utils import _is_mm_disagg
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import (
     Qwen3VisionModel,
@@ -464,7 +464,7 @@ class Qwen3_5MoeVLModel(Qwen3VLModelBase):
         ]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        if not _is_disagg():
+        if not _is_mm_disagg():
             self.mm_encoder.load_weights(weights)
 
         weight_mapper = Qwen3_5MoeHfWeightMapper()
