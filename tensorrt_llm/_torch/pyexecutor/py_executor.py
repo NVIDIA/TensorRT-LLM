@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import functools
+import json
 import os
 import threading
 import time
@@ -80,6 +81,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
+from .self_benchmark import SelfBenchmark
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -594,6 +596,8 @@ class PyExecutor:
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
             waiting_queue_policy)
+        self.self_benchmark = SelfBenchmark(
+            self) if self.llm_args.self_benchmark_config is not None else None
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -1384,7 +1388,8 @@ class PyExecutor:
                 self._latest_kv_iter_stats = None
 
         def is_stats_dummy_request(req) -> bool:
-            return bool(getattr(req, "is_dummy", False))
+            return bool(getattr(req, "is_dummy", False)) and not bool(
+                getattr(req, "is_self_benchmark_request", False))
 
         # Attention-DP may add dummy requests to keep ranks aligned during
         # distributed scheduling. CUDA graph padding can add dummies too.
@@ -1750,6 +1755,19 @@ class PyExecutor:
                                         len(finished_requests),
                                         batch_state.scheduled_requests,
                                         micro_batch_id)
+        if self.self_benchmark is not None and self.self_benchmark.active:
+            stats_dict = json.loads(stats.to_json_str())
+            if host_step_time_ms is not None:
+                stats_dict["hostStepTimeMS"] = host_step_time_ms
+            if prev_device_step_time_ms is not None:
+                stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+            is_overlap_like = (not self.disable_overlap_scheduler
+                               or self.dist.pp_size > 1)
+            stats_dict["schedulerMode"] = (
+                "overlap" if is_overlap_like else "non_overlap")
+            if self.self_benchmark.observe_iteration(
+                    batch_state.scheduled_requests, stats_dict):
+                return
         if self.enable_attention_dp:
             self._adp_iter_stats.queue(
                 stats,
@@ -3465,18 +3483,24 @@ class PyExecutor:
         else:
             timeout = datetime.timedelta(0)
 
-        # Fetch requests from rank 0
         new_requests = []
-        if self.dist.rank == 0:
-            # Process accumulated requests that were queued during control request handling.
-            if len(self.request_accumulated) != 0:
-                new_requests.extend(self.request_accumulated)
-                self.request_accumulated.clear()
-                # Reset timeout to 0 to avoid hanging when no new requests are available
-                timeout = datetime.timedelta(0)
-            with self.hang_detector.pause():
+        if self.self_benchmark is not None and self.self_benchmark.active:
+            if self.dist.rank == 0:
                 new_requests.extend(
-                    self.executor_request_queue.get_from_request_queue(timeout))
+                    self.self_benchmark.make_prefill_queue_items(
+                        self.active_requests, waiting_queue))
+        else:
+            # Fetch requests from rank 0
+            if self.dist.rank == 0:
+                # Process accumulated requests that were queued during control request handling.
+                if len(self.request_accumulated) != 0:
+                    new_requests.extend(self.request_accumulated)
+                    self.request_accumulated.clear()
+                    # Reset timeout to 0 to avoid hanging when no new requests are available
+                    timeout = datetime.timedelta(0)
+                with self.hang_detector.pause():
+                    new_requests.extend(
+                        self.executor_request_queue.get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
@@ -3666,6 +3690,11 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        if self.self_benchmark is not None and self.self_benchmark.active:
+            benchmark_requests = self.self_benchmark.make_decode_requests(
+                self.active_requests, self.waiting_queue)
+            self.active_requests.extend(benchmark_requests)
+            validated_requests.extend(benchmark_requests)
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -4737,6 +4766,13 @@ class PyExecutor:
             req_id = request.py_request_id
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
+                requests_to_terminate.append(request)
+                continue
+            if getattr(request, "is_self_benchmark_request", False):
+                self.perf_manager.append_step_metrics(
+                    request,
+                    self.iter_counter,
+                    batch_token_time=batch_token_time)
                 requests_to_terminate.append(request)
                 continue
 
