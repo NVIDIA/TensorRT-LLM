@@ -822,6 +822,7 @@ class BaseWorker(GenerationExecutor):
         host_step_time_ms = stats[4] if len(stats) > 4 else None
         prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
         scheduler_mode = stats[6] if len(stats) > 6 else None
+        gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -880,6 +881,11 @@ class BaseWorker(GenerationExecutor):
         # comment in PyExecutor._profiler for the design rationale.
         if prev_device_step_time_ms is not None:
             stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+        # Batch-matched GPU forward time measured from the CUDA events around
+        # this record's _forward_step. This is the preferred field for
+        # ForwardPassMetrics wall_time.
+        if gpu_forward_time_ms is not None:
+            stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
         # Scheduler mode for this record. "overlap" means iterLatencyMS
         # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
         # "non_overlap" means iterLatencyMS is itself the clean per-loop

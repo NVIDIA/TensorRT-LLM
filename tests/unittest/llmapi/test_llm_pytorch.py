@@ -610,7 +610,8 @@ def test_nemotron_nas_lora(cuda_graph_config) -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-        cuda_graph_config=cuda_graph_config)
+        cuda_graph_config=cuda_graph_config,
+        trust_remote_code=True)
 
     prompts = [
         "Hello, how are you?",
