@@ -19,6 +19,8 @@
 #include <NvInferRuntime.h>
 #include <cuda_fp16.h>
 
+#include "decoderXQARunnerResource.h"
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -36,41 +38,6 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-
-template <typename T, typename KVCacheBuffer>
-struct XQADispatchHelper
-{
-    static constexpr bool CanSupport = false;
-};
-
-template <>
-struct XQADispatchHelper<__half, KVLinearBuffer>
-{
-    static constexpr bool CanSupport = true;
-};
-
-template <>
-struct XQADispatchHelper<__half, KVBlockArray>
-{
-    static constexpr bool CanSupport = true;
-};
-
-#ifdef ENABLE_BF16
-template <>
-struct XQADispatchHelper<__nv_bfloat16, KVLinearBuffer>
-{
-    static constexpr bool CanSupport = true;
-};
-
-template <>
-struct XQADispatchHelper<__nv_bfloat16, KVBlockArray>
-{
-    static constexpr bool CanSupport = true;
-};
-#endif
-
-class DecoderXQARunnerResource;
-class DecoderXQAImplJIT;
 
 class DecoderXQARunner
 {
@@ -119,41 +86,6 @@ private:
     DecoderXQAImpl* getImpl();
 
     friend DecoderXQAImplJIT;
-};
-
-class DecoderXQARunnerResource
-{
-public:
-    DecoderXQARunnerResource();
-    DecoderXQARunnerResource(DecoderXQARunnerResource const& other);
-    DecoderXQARunnerResource& operator=(DecoderXQARunnerResource const& other);
-    DecoderXQARunnerResource(DecoderXQARunnerResource&& other) = default;
-    DecoderXQARunnerResource& operator=(DecoderXQARunnerResource&& other) = default;
-    // Construct from a serialized buffer.
-    DecoderXQARunnerResource(void const* buffer, size_t buffer_size);
-    ~DecoderXQARunnerResource() = default;
-
-    // When initialize is true, initialize cubins.
-    void merge(DecoderXQARunnerResource const& other, bool initialize)
-    {
-        getCubinObjRegistry()->merge(*other.getCubinObjRegistry(), initialize);
-    }
-
-    jit::CubinObjRegistry* getCubinObjRegistry()
-    {
-        return mCubinObjRegistry.get();
-    }
-
-    jit::CubinObjRegistry const* getCubinObjRegistry() const
-    {
-        return mCubinObjRegistry.get();
-    }
-
-    size_t getSerializationSize() const noexcept;
-    void serialize(void* buffer, size_t buffer_size) const noexcept;
-
-private:
-    std::unique_ptr<jit::CubinObjRegistry> mCubinObjRegistry;
 };
 
 } // namespace kernels

@@ -52,23 +52,6 @@ DecoderXQARunner::DecoderXQARunner(
 
 DecoderXQARunner::~DecoderXQARunner() = default;
 
-namespace
-{
-
-template <typename T>
-constexpr inline T divUp(T a, T b)
-{
-    return (a + b - 1) / b;
-}
-
-template <typename T>
-constexpr inline T roundUp(T a, T b)
-{
-    return divUp(a, b) * b;
-}
-
-} // namespace
-
 DecoderXQAImpl* DecoderXQARunner::getImpl()
 {
     return mJITImpl.get();
@@ -110,42 +93,6 @@ template void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream);
 template void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream);
-
-//// DecoderXQARunner::Resource
-DecoderXQARunnerResource::DecoderXQARunnerResource()
-    : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>())
-{
-}
-
-DecoderXQARunnerResource::DecoderXQARunnerResource(DecoderXQARunnerResource const& other)
-    : mCubinObjRegistry(other.mCubinObjRegistry->clone())
-{
-}
-
-DecoderXQARunnerResource& DecoderXQARunnerResource::operator=(DecoderXQARunnerResource const& other)
-{
-    if (this == &other)
-    {
-        return *this;
-    }
-    mCubinObjRegistry = other.mCubinObjRegistry->clone();
-    return *this;
-}
-
-DecoderXQARunnerResource::DecoderXQARunnerResource(void const* buffer, size_t buffer_size)
-    : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>(buffer, buffer_size))
-{
-}
-
-size_t DecoderXQARunnerResource::getSerializationSize() const noexcept
-{
-    return mCubinObjRegistry->getSerializationSize();
-}
-
-void DecoderXQARunnerResource::serialize(void* buffer, size_t buffer_size) const noexcept
-{
-    mCubinObjRegistry->serialize(buffer, buffer_size);
-}
 
 } // namespace kernels
 
