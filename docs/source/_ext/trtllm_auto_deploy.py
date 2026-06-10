@@ -12,11 +12,19 @@ import yaml
 from docutils import nodes
 from docutils.statemachine import StringList
 from sphinx.application import Sphinx
+from sphinx.util import logging
 from sphinx.util.docutils import SphinxDirective
 from sphinx.util.nodes import nested_parse_with_titles
 
-AUTO_DEPLOY_TRANSFORM_LIBRARY_PACKAGE = "tensorrt_llm._torch.auto_deploy.transform.library"
+LOGGER = logging.getLogger(__name__)
+
+AUTO_DEPLOY_TRANSFORM_PACKAGE = "tensorrt_llm._torch.auto_deploy.transform"
+AUTO_DEPLOY_TRANSFORM_LIBRARY_PACKAGE = f"{AUTO_DEPLOY_TRANSFORM_PACKAGE}.library"
 AUTO_DEPLOY_TRANSFORM_LIBRARY_PATH = Path("tensorrt_llm/_torch/auto_deploy/transform/library")
+AUTO_DEPLOY_TRANSFORM_PIPELINE_CACHE_PACKAGE = f"{AUTO_DEPLOY_TRANSFORM_PACKAGE}.pipeline_cache"
+AUTO_DEPLOY_TRANSFORM_PIPELINE_CACHE_PATH = Path(
+    "tensorrt_llm/_torch/auto_deploy/transform/pipeline_cache"
+)
 AUTO_DEPLOY_TRANSFORM_CONFIGS = (
     ("graph", Path("tensorrt_llm/_torch/auto_deploy/config/default.yaml")),
     (
@@ -67,31 +75,31 @@ TITLE_REPLACEMENTS = {
 @dataclass(frozen=True)
 class RegisteredTransform:
     key: str
+    package_name: str
     module_name: str
     class_name: str
     config_class_name: str
+    config_package_name: str | None
     config_module_name: str | None
 
     @property
     def qualified_class_name(self) -> str:
-        return f"{AUTO_DEPLOY_TRANSFORM_LIBRARY_PACKAGE}.{self.module_name}.{self.class_name}"
+        return f"{self.package_name}.{self.module_name}.{self.class_name}"
 
     @property
     def qualified_module_name(self) -> str:
-        return f"{AUTO_DEPLOY_TRANSFORM_LIBRARY_PACKAGE}.{self.module_name}"
+        return f"{self.package_name}.{self.module_name}"
 
     @property
     def qualified_config_class_name(self) -> str | None:
         if self.config_module_name is None:
             return None
-        return (
-            f"{AUTO_DEPLOY_TRANSFORM_LIBRARY_PACKAGE}.{self.config_module_name}"
-            f".{self.config_class_name}"
-        )
+        return f"{self.config_package_name}.{self.config_module_name}.{self.config_class_name}"
 
 
 @dataclass(frozen=True)
 class ParsedClass:
+    package_name: str
     module_name: str
     class_name: str
     base_class_names: tuple[str, ...]
@@ -114,6 +122,16 @@ def _repo_root_from_source_dir(source_dir: str) -> Path:
             return path
     raise FileNotFoundError(
         f"Could not find repository root containing {AUTO_DEPLOY_TRANSFORM_LIBRARY_PATH}"
+    )
+
+
+def _transform_sources(repo_root: Path) -> tuple[tuple[str, Path], ...]:
+    return (
+        (AUTO_DEPLOY_TRANSFORM_LIBRARY_PACKAGE, repo_root / AUTO_DEPLOY_TRANSFORM_LIBRARY_PATH),
+        (
+            AUTO_DEPLOY_TRANSFORM_PIPELINE_CACHE_PACKAGE,
+            repo_root / AUTO_DEPLOY_TRANSFORM_PIPELINE_CACHE_PATH,
+        ),
     )
 
 
@@ -179,6 +197,7 @@ def _get_config_class_name(node: ast.ClassDef) -> str | None:
 
 
 def _parse_transform_classes(
+    package_name: str,
     library_path: Path,
 ) -> tuple[list[ParsedClass], dict[str, list[ParsedClass]]]:
     parsed_classes: list[ParsedClass] = []
@@ -193,6 +212,7 @@ def _parse_transform_classes(
                 continue
 
             parsed_class = ParsedClass(
+                package_name=package_name,
                 module_name=module_name,
                 class_name=node.name,
                 base_class_names=tuple(
@@ -215,6 +235,7 @@ def _parse_transform_classes(
 
 def _get_library_class(
     class_name: str,
+    package_name: str,
     module_name: str,
     classes_by_name: dict[str, list[ParsedClass]],
 ) -> ParsedClass | None:
@@ -222,7 +243,7 @@ def _get_library_class(
     if len(classes) == 1:
         return classes[0]
     for parsed_class in classes:
-        if parsed_class.module_name == module_name:
+        if parsed_class.package_name == package_name and parsed_class.module_name == module_name:
             return parsed_class
     return None
 
@@ -238,6 +259,7 @@ def _resolve_config_class(
             return None
         return _get_library_class(
             parsed_class.config_class_name,
+            parsed_class.package_name,
             parsed_class.module_name,
             classes_by_name,
         )
@@ -255,10 +277,19 @@ def _resolve_config_class(
     return None
 
 
-def _discover_registered_transforms(library_path: Path) -> dict[str, RegisteredTransform]:
+def _discover_registered_transforms(repo_root: Path) -> dict[str, RegisteredTransform]:
     """Discover registered transform classes without importing transform modules."""
     registered_transforms: dict[str, RegisteredTransform] = {}
-    parsed_classes, classes_by_name = _parse_transform_classes(library_path)
+    parsed_classes: list[ParsedClass] = []
+    classes_by_name: dict[str, list[ParsedClass]] = {}
+
+    for package_name, library_path in _transform_sources(repo_root):
+        source_classes, source_classes_by_name = _parse_transform_classes(
+            package_name, library_path
+        )
+        parsed_classes.extend(source_classes)
+        for class_name, class_entries in source_classes_by_name.items():
+            classes_by_name.setdefault(class_name, []).extend(class_entries)
 
     for parsed_class in parsed_classes:
         config_class = _resolve_config_class(parsed_class, classes_by_name)
@@ -268,13 +299,16 @@ def _discover_registered_transforms(library_path: Path) -> dict[str, RegisteredT
                 raise ValueError(
                     f"Transform {transform_key!r} is registered by both "
                     f"{previous.qualified_class_name} and "
-                    f"{parsed_class.module_name}.{parsed_class.class_name}"
+                    f"{parsed_class.package_name}.{parsed_class.module_name}."
+                    f"{parsed_class.class_name}"
                 )
             registered_transforms[transform_key] = RegisteredTransform(
                 key=transform_key,
+                package_name=parsed_class.package_name,
                 module_name=parsed_class.module_name,
                 class_name=parsed_class.class_name,
                 config_class_name=config_class.class_name if config_class else "TransformConfig",
+                config_package_name=config_class.package_name if config_class else None,
                 config_module_name=config_class.module_name if config_class else None,
             )
 
@@ -366,10 +400,10 @@ def _transform_section(
 
 
 def _note_auto_deploy_dependencies(directive: SphinxDirective, repo_root: Path) -> None:
-    library_path = repo_root / AUTO_DEPLOY_TRANSFORM_LIBRARY_PATH
-    directive.env.note_dependency(str(library_path))
-    for path in sorted(library_path.glob("*.py")):
-        directive.env.note_dependency(str(path))
+    for _, library_path in _transform_sources(repo_root):
+        directive.env.note_dependency(str(library_path))
+        for path in sorted(library_path.glob("*.py")):
+            directive.env.note_dependency(str(path))
     for _, config_path in AUTO_DEPLOY_TRANSFORM_CONFIGS:
         directive.env.note_dependency(str(repo_root / config_path))
 
@@ -386,7 +420,7 @@ class AutoDeployTransformStageDirective(SphinxDirective):
         library_path = repo_root / AUTO_DEPLOY_TRANSFORM_LIBRARY_PATH
         _note_auto_deploy_dependencies(self, repo_root)
 
-        registered_transforms = _discover_registered_transforms(library_path)
+        registered_transforms = _discover_registered_transforms(repo_root)
         configured_transforms = [
             transform
             for transform in _load_configured_transforms(repo_root)
@@ -402,18 +436,37 @@ class AutoDeployTransformStageDirective(SphinxDirective):
             ]
 
         generated_lines = StringList()
+        rendered_count = 0
+        missing_transforms: list[str] = []
         for configured_transform in configured_transforms:
             registered_transform = registered_transforms.get(configured_transform.key)
             if registered_transform is None:
-                raise ValueError(
-                    f"Configured transform {configured_transform.key!r} is not registered"
+                missing_transforms.append(configured_transform.key)
+                LOGGER.warning(
+                    "Configured AutoDeploy transform %r is not discoverable by the docs "
+                    "extension; skipping autodoc for it.",
+                    configured_transform.key,
                 )
+                continue
             for line in _transform_section(
                 configured_transform.key,
                 registered_transform,
                 configured_transform.modes,
             ):
                 generated_lines.append(line, source=str(library_path))
+            rendered_count += 1
+
+        if rendered_count == 0:
+            title = STAGE_TITLES.get(stage, stage)
+            if missing_transforms:
+                return [
+                    nodes.paragraph(
+                        text=(
+                            f"No discoverable AutoDeploy transforms are documented for the "
+                            f"{title} stage."
+                        )
+                    )
+                ]
 
         container = nodes.container()
         nested_parse_with_titles(self.state, generated_lines, container)
@@ -430,7 +483,7 @@ class AutoDeployAdditionalTransformsDirective(SphinxDirective):
         library_path = repo_root / AUTO_DEPLOY_TRANSFORM_LIBRARY_PATH
         _note_auto_deploy_dependencies(self, repo_root)
 
-        registered_transforms = _discover_registered_transforms(library_path)
+        registered_transforms = _discover_registered_transforms(repo_root)
         configured_keys = {transform.key for transform in _load_configured_transforms(repo_root)}
         additional_transforms = [
             registered_transform
