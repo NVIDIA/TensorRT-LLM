@@ -407,7 +407,6 @@ unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async S
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
 unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0" SKIP (https://nvbugs/5348958)
-unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1 SKIP (https://nvbugs/6109745)
 unittest/llmapi/test_memory_profiling.py::test_profile_kvcache SKIP (https://nvbugs/5580781)
 unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP (https://nvbugs/6127669)
 unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1] SKIP (https://nvbugs/6153575)
