@@ -1,4 +1,5 @@
 import base64
+import gc
 import pickle
 import re
 from typing import Callable, List, Optional, Tuple
@@ -14,7 +15,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
-from utils.util import skip_pre_blackwell
+from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
@@ -22,7 +23,8 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
     _quantize_nvfp4,
 )
 from tensorrt_llm._torch.utils import get_device_uuid
-from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm.evaluate import GSM8K, MMLU
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 
 
 @pytest.mark.part0
@@ -579,3 +581,195 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
         compare_logits(llm_logits, ref_logits, threshold=0.8)
+
+
+@pytest.mark.part4
+@skip_pre_hopper
+def test_llm_partial_update_weights_nemotron_h_bf16_accuracy():
+    """Partial update_weights + MMLU/GSM8K for the full Nemotron-H 30B BF16 model.
+
+    End-to-end accuracy check on the RLHF update_weights path:
+    1. Load HF on cuda:0 + replicate to cuda:1..3 (full 52 layers, no truncation).
+    2. Bring up TRT-LLM with load_format="dummy".
+    3. Apply update_weights once per weight-name suffix (mimics the streaming
+       RLHF pattern); finalize once at the end.
+    4. Free HF + replicas to recover memory before evaluation.
+    5. Run GSM8K (exercises long decode) and MMLU (short-answer).
+
+    Compared with `compare_logits`, this is robust to numerical reordering of
+    low-probability tokens: only the argmax of each step matters for task-level
+    accuracy. Needs 4x >=180GB GPUs (e.g., GB200).
+    """
+    model_dir = str(llm_models_root() /
+                    "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    # Full model — read num_hidden_layers from the on-disk config so nothing is truncated.
+    src_config = AutoConfig.from_pretrained(model_dir)
+    num_hidden_layers = src_config.num_hidden_layers
+    hf_model = RefHFModelWithIPCHandles(model_dir,
+                                        num_hidden_layers=num_hidden_layers)
+    # DEBUG: temporarily drop mamba_ssm_cache_dtype="float32" to verify whether
+    # the default (bf16) SSM cache still passes accuracy.
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    free_gpu_memory_fraction=0.25)
+    moe_config = MoeConfig(backend="CUTLASS")
+    llm = LLM(
+        model=model_dir,
+        ray_worker_extension_cls=
+        "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=4,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        kv_cache_config=kv_cache_config,
+        moe_config=moe_config,
+        max_batch_size=32,
+    )
+
+    with llm:
+        # Group weights by trailing suffix (e.g. "input_layernorm.weight",
+        # "mamba.A"); send one filtered batch per suffix.
+        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
+        filter_set = set()
+        for name, _ in hf_model.all_weights[hf_model.device_id]:
+            filter_set.add(layer_prefix_pattern.sub("", name))
+        filter_list = sorted(filter_set)
+
+        def common_filter(filter_name: str) -> Callable[[str], bool]:
+            def filter_fn(name: str) -> bool:
+                return name.endswith(filter_name)
+            return filter_fn
+
+        for fname in filter_list:
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                weight_filter=common_filter(fname))
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize once to trigger post_load_weights on all modules.
+        llm._collective_rpc("update_weights", (None,))
+
+        # Free HF + replicas to make room for evaluation activations.
+        del hf_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        chat_template_kwargs = dict(enable_thinking=False)
+
+        # GSM8K — long-form generation exercises the decode path.
+        gsm8k = GSM8K(
+            dataset_path=str(llm_models_root() / "datasets/openai/gsm8k"),
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        gsm8k_sp = SamplingParams(max_tokens=1024,
+                                  truncate_prompt_tokens=4094,
+                                  temperature=0)
+        gsm8k_acc = gsm8k.evaluate(llm, sampling_params=gsm8k_sp)
+        # Use the same hypothesis-testing threshold as the official
+        # TestNemotronV3Nano accuracy test: ref=69.370, threshold=66.167
+        # (alpha=0.05, beta=0.2, sigma=50, N=4096).
+        assert gsm8k_acc >= 66.167, (
+            f"GSM8K accuracy after partial update_weights = {gsm8k_acc:.2f} "
+            f"is below threshold 66.167 (reference 69.370)")
+
+        # MMLU — short-answer single-token classification.
+        mmlu = MMLU(
+            dataset_path=str(llm_models_root() / "datasets/mmlu"),
+            random_seed=0,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        mmlu_sp = SamplingParams(max_tokens=2,
+                                 truncate_prompt_tokens=4094,
+                                 temperature=0)
+        mmlu_acc = mmlu.evaluate(llm, sampling_params=mmlu_sp)
+        # Use the same hypothesis-testing threshold as the official
+        # TestNemotronV3Nano accuracy test: ref=73.850, threshold=72.033
+        # (alpha=0.05, beta=0.2, sigma=50, N=4096).
+        assert mmlu_acc >= 72.033, (
+            f"MMLU accuracy after partial update_weights = {mmlu_acc:.2f} "
+            f"is below threshold 72.033 (reference 73.850)")
+
+
+@pytest.mark.part4
+@skip_pre_hopper
+def test_llm_update_weights_nemotron_h_full():
+    """Nemotron-H 30B partial update_weights test on a 7-layer slice.
+
+    Nemotron-H is a hybrid model. With the on-disk hybrid_override_pattern
+    "MEMEM*EMEMEM*...", the first 7 layers are M E M E M * E — covering all
+    three layer flavors (3x Mamba, 3x MoE, 1x Attention) so the partial-update
+    code path is exercised on every block type.
+
+    Streams weights to the LLM one suffix-bucket at a time (mimics the RLHF
+    streaming pattern), then finalizes once. Exercises the CUDA-graph decode
+    path on Mamba layers: max_tokens=32 forces multiple decode steps so
+    _A_expanded / _dt_bias_expanded / _D_expanded are actually read by the
+    captured graph after update_weights.
+    """
+    model_dir = str(llm_models_root() /
+                    "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    num_hidden_layers = 7
+    hf_model = RefHFModelWithIPCHandles(model_dir,
+                                        num_hidden_layers=num_hidden_layers)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    # Nemotron-H's Mamba state dominates the cache budget; 0.25 of free memory
+    # leaves enough room for HF (resident on cuda:0 + replicas on cuda:1..3)
+    # plus the TRT-LLM model shard. BF16 model -> CUTLASS MoE backend.
+    # mamba_ssm_cache_dtype="float32" matches the official Nemotron-Nano
+    # accuracy test (TestNemotronV3Nano::test_auto_dtype) — BF16 SSM cache
+    # loses precision in long-decode selective_state_update.
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True,
+                                    free_gpu_memory_fraction=0.25,
+                                    mamba_ssm_cache_dtype="float32")
+    moe_config = MoeConfig(backend="CUTLASS")
+    with LLM(
+            model=model_dir,
+            ray_worker_extension_cls=
+            "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+            tensor_parallel_size=4,
+            load_format="dummy",
+            pipeline_parallel_size=1,
+            kv_cache_config=kv_cache_config,
+            moe_config=moe_config,
+            max_batch_size=4,
+            model_kwargs={"num_hidden_layers": num_hidden_layers},
+    ) as llm:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(p) for p in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(temperature=0,
+                                         return_generation_logits=True,
+                                         max_tokens=32)
+
+        # Warm the KV-cache prefix reuse store with the *dummy* weights before
+        # update_weights. If update_weights' finalize path fails to invalidate
+        # the prefix cache, the second generation would reuse cached KV blocks
+        # produced by random weights and the logits comparison would fail —
+        # a stricter check of enable_block_reuse=True correctness than just
+        # running once after update_weights.
+        llm.generate(prompts, sampling_params)
+
+        # Group weights by trailing suffix (e.g. "input_layernorm.weight",
+        # "mixer.A_log"); send one filtered batch per suffix.
+        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
+        filter_set = set()
+        for name, _ in hf_model.all_weights[hf_model.device_id]:
+            filter_set.add(layer_prefix_pattern.sub("", name))
+        filter_list = sorted(filter_set)
+
+        def common_filter(filter_name: str) -> Callable[[str], bool]:
+            def filter_fn(name: str) -> bool:
+                return name.endswith(filter_name)
+            return filter_fn
+
+        for fname in filter_list:
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                weight_filter=common_filter(fname))
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize once to trigger post_load_weights on all modules.
+        llm._collective_rpc("update_weights", (None,))
+
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts,
+                                              sampling_params)
+        compare_logits(llm_logits, ref_logits)
