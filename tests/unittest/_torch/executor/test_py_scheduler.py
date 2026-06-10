@@ -2292,6 +2292,7 @@ class TestSimpleUnifiedScheduler:
         assert hasattr(output, "paused_requests")
         assert hasattr(output, "fitting_disagg_gen_init_requests")
         assert hasattr(output, "num_fitting_requests")
+        assert len(output.recompute_paused_requests) == 0
         assert len(output.context_requests) == 1
         assert len(output.generation_requests) == 1
         assert output.context_requests[0].request_id == 0
