@@ -789,6 +789,7 @@ class PyExecutor:
             response = request.create_response(False, self.dist.rank)
             if response:
                 response.result.cached_tokens = request.cached_tokens
+                self._maybe_attach_ctx_usage(request, response)
                 # Buffer the response instead of enqueueing immediately.
                 # With ADP, _enqueue_responses does a tp_gather collective.
                 # Calling it here would deadlock because only the owning DP
@@ -4321,6 +4322,22 @@ class PyExecutor:
         cum_log_probs[seq_slot, :beam_width].copy_(values)
         return True
 
+    @staticmethod
+    def _maybe_attach_ctx_usage(request: LlmRequest, response):
+        """Carry context-worker usage onto the generation response.
+
+        In gen-first disaggregated scheduling the context and generation
+        requests run concurrently, so the context worker's usage cannot be
+        injected into the request as in the context-first path. Instead it is
+        delivered to the generation worker through the KV-transfer aux buffer
+        (see RxSession.unpack_aux) and stored on
+        ``py_disaggregated_params.ctx_usage``. Surface it on the response so the
+        postprocessor can adopt the context-side prompt/cached token accounting.
+        """
+        disagg_params = getattr(request, 'py_disaggregated_params', None)
+        if disagg_params is not None and disagg_params.ctx_usage is not None:
+            response.result.ctx_usage = disagg_params.ctx_usage
+
     def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
         """Prepend logprobs and generation logits for first_gen_tokens
         if transferred from prefill."""
@@ -4980,6 +4997,7 @@ class PyExecutor:
             if response is None:
                 continue
             response.result.cached_tokens = request.cached_tokens
+            self._maybe_attach_ctx_usage(request, response)
             if logits_snapshot is not None:
                 response.result.generation_logits = logits_snapshot
             new_responses.append((request.py_request_id, response))
@@ -5067,6 +5085,7 @@ class PyExecutor:
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
+                    self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
                     new_responses.append((req_id, response))

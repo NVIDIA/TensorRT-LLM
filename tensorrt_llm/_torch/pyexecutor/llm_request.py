@@ -578,6 +578,12 @@ class LlmResult:
         self._py_result = py_result
         self.is_final = is_final
         self.cached_tokens = 0
+        # Context-worker usage propagated to the generation worker via the
+        # KV-transfer aux buffer in gen-first disaggregated scheduling. Carried
+        # on the response so the postprocessor can adopt the context-side
+        # prompt/cached token accounting (the gen worker treats the whole
+        # transferred prompt as cached and would otherwise over-report).
+        self.ctx_usage = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
