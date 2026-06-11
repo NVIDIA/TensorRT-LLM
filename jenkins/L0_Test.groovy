@@ -88,9 +88,9 @@ BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "4"
 
-SLURM_CORES_REQUEST = "1"
+SLURM_CORES_REQUEST = "0.5"
 SLURM_CORES_LIMIT = "1"
-SLURM_MEMORY_REQUEST = "8Gi"
+SLURM_MEMORY_REQUEST = "0.5Gi"
 SLURM_MEMORY_LIMIT = "12Gi"
 
 TESTER_CORES = "12"
@@ -2149,6 +2149,9 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         """
     }
 
+    def jnlpCpuRequest = type == "slurm" ? "0.5" : "2"
+    def jnlpMemoryRequest = type == "slurm" ? "512Mi" : "10Gi"
+
     def podConfig = [
         cloud: targetCloud,
         namespace: "sw-tensorrt",
@@ -2184,8 +2187,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 10Gi
+                        cpu: '${jnlpCpuRequest}'
+                        memory: ${jnlpMemoryRequest}
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
