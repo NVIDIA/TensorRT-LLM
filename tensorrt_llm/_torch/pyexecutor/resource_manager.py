@@ -931,6 +931,8 @@ class KVCacheManager(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
         self.blocks_per_window = blocks_per_window
+        self._has_secondary_pool = any(
+            secondary > 0 for _, secondary in blocks_per_window.values())
 
     def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
         """Probe the KV cache radix tree for prefix match length.
@@ -989,6 +991,12 @@ class KVCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
+            # Drain in-flight forward kernels before V1 KVCM mutates pool
+            # ownership: with overlap scheduler + host secondary pool, the
+            # C++ BufferManager event sync is insufficient and offload/onboard
+            # cudaMemcpyAsync can race with live attention kernels (nvbug 6293536).
+            if self._has_secondary_pool:
+                self._stream.synchronize()
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
