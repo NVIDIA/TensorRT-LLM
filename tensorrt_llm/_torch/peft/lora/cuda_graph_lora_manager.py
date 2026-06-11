@@ -80,6 +80,37 @@ class CudaGraphLoraManager:
             max_tokens_per_seq=self.max_tokens_per_seq,
         )
 
+        # Pre-size routed-expert MoE-LoRA scratch on every MoE layer so the
+        # capture-safe device path never (re)allocates during graph capture.
+        # See CutlassFusedMoE.reserve_moe_lora_cuda_graph_workspace.
+        self._reserve_moe_lora_workspaces(model)
+
+    def _reserve_moe_lora_workspaces(self, model: torch.nn.Module) -> None:
+        """Reserve routed-expert MoE-LoRA scratch for all MoE layers up front.
+
+        Walks the model for MoE modules exposing
+        reserve_moe_lora_cuda_graph_workspace (duck-typed to avoid importing
+        backend-specific classes) and reserves their worst-case buffers. Must
+        happen before any CUDA graph capture so the buffer addresses baked into
+        the graph remain valid across replays.
+        """
+        # Worst-case tokens in a single captured forward.
+        max_num_tokens = self.max_batch_size * self.max_tokens_per_seq
+        reserved = 0
+        for _, module in model.named_modules():
+            reserve_fn = getattr(module, "reserve_moe_lora_cuda_graph_workspace", None)
+            if reserve_fn is None:
+                continue
+            reserve_fn(max_num_tokens, self.max_lora_rank, self.max_lora_size)
+            reserved += 1
+        if reserved:
+            logger.info(
+                f"Reserved routed-expert MoE-LoRA CUDA-graph workspace for "
+                f"{reserved} MoE layer(s) (max_num_tokens={max_num_tokens}, "
+                f"max_lora_rank={self.max_lora_rank}, "
+                f"max_lora_size={self.max_lora_size})."
+            )
+
     def _initialize_from_model(self, model: torch.nn.Module):
         """
         Initialize LoRALayerInfo from model.

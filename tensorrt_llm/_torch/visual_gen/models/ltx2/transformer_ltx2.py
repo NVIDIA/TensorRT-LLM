@@ -150,7 +150,6 @@ class LTX2Attention(Attention):
             config=config,
             layer_idx=layer_idx,
             enable_sequence_parallel=enable_sp,
-            enable_ulysses=use_ulysses,
             async_ulysses=self._use_async_ulysses,
         )
 
