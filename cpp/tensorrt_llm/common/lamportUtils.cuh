@@ -163,7 +163,14 @@ inline __device__ VolatilePackedLoad<float2> loadPackedVolatile<float2>(void con
 template <typename PackedType>
 inline __device__ bool isLamportDirty(VolatilePackedLoad<PackedType> const& value)
 {
-    return value.words[0] == kNEGZERO_FP32;
+    // The dirty sentinel is a raw word; typed fp compares can flush nearby bit patterns.
+    bool dirty = false;
+#pragma unroll
+    for (int i = 0; i < sizeof(PackedType) / sizeof(uint32_t); i++)
+    {
+        dirty |= value.words[i] == kNEGZERO_FP32;
+    }
+    return dirty;
 }
 
 // A helper class to get the correct base pointer for a given layout
@@ -255,10 +262,12 @@ public:
         {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
             cg::cluster_group cluster = cg::this_cluster();
-            // We update the atomic counter per cluster.
-            int tid = cluster.thread_rank();
-            cluster.sync();
-            arriveCounter(tid);
+            __cluster_barrier_arrive();
+            if (cluster.block_rank() == 0 && threadIdx.x < kWARP_SIZE)
+            {
+                __cluster_barrier_wait();
+                arriveCounter(threadIdx.x);
+            }
 #else
             __syncthreads();
             arriveCounter(threadIdx.x);

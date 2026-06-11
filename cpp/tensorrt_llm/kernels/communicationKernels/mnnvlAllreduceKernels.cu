@@ -899,10 +899,6 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
     T* broadcastBufR
         = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::BROADCAST));
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-
     // =============================== Scatter ===============================
 
     // Load vectorized data
@@ -917,6 +913,10 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
             &scatterBufDest[destTokenOffset * params.tokenDim * WorldSize + params.rank * params.tokenDim])[packedIdx]
             = val.packed;
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 
     flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::SCATTER);
 
