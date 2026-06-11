@@ -264,7 +264,9 @@ class DeepSeekV3MoEGate(nn.Module):
     ``torch.ops.trtllm.dsv3_router_gemm_op`` and
     ``torch.ops.trtllm.noaux_tc_op`` calls are kept verbatim from the non-IR
     base -- AD has no transform that recovers these kernels from a vanilla
-    PyTorch rewrite.
+    PyTorch rewrite. The gate weight is left at the model's bf16 default (see
+    ``__init__``) so forward() exports the bf16 ``dsv3_router_gemm_op`` path
+    directly; no dedicated lowering transform is needed.
     """
 
     def __init__(self, config):
@@ -276,9 +278,13 @@ class DeepSeekV3MoEGate(nn.Module):
         self.n_group = config.n_group
         self.topk_group = config.topk_group
 
-        self.weight = nn.Parameter(
-            torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
-        )
+        # Do NOT set dtype=torch.float32 here. The model is built under HF's
+        # set_default_dtype(bfloat16) context; an explicit float32 keeps the gate
+        # weight in fp32, forcing the slow F.linear branch in forward() and a
+        # dedicated lowering transform. Inheriting the bf16 default lets forward
+        # export the trtllm.dsv3_router_gemm_op path directly (register_fake makes
+        # it meta-safe), so the values are byte-identical to the bf16 checkpoint.
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
         self.register_buffer(
             "e_score_correction_bias",
             torch.zeros(self.n_routed_experts, dtype=torch.float32),

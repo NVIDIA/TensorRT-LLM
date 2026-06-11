@@ -39,8 +39,6 @@ transforms:
   # to the trtllm dsv3 min-latency kernel (op-level, no extra transform).
   fuse_gemms:
     enabled: true
-  fuse_dsv3_router_gemm:
-    enabled: true
 
   multi_stream_mla_attn:
     enabled: true
