@@ -127,9 +127,10 @@ Notes:
 - One encoder model per server instance (mirrors the per-model launch mode of
   vLLM/SGLang). Generation and embedding modes are not mixed in one server.
 - **Single-GPU only.** The encode path runs in-process and does not use the multi-GPU
-  worker proxy, so the server rejects `--tensor_parallel_size > 1` (and pipeline
-  parallelism) with an error. Multi-GPU embeddings is planned as a follow-up; for now,
-  scale out with multiple single-GPU server instances behind a load balancer.
+  worker proxy, so the `embeddings` command does not expose tensor/pipeline parallelism
+  flags (if a `--config` file sets them, startup fails with a clear error). Multi-GPU
+  embeddings is planned as a follow-up; for now, scale out with multiple single-GPU server
+  instances behind a load balancer.
 - A single in-server worker drives the GPU (no `num_workers` knob): the GPU serializes
   forwards and the underlying executor is not safe for concurrent calls. Increase
   throughput with `--max_batch_size` / `--max_queue_delay`, not more workers.

@@ -1313,11 +1313,6 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               type=float,
               default=0.9,
               help="Free GPU memory fraction reserved after model weights.")
-@click.option("--tensor_parallel_size",
-              "--tp_size",
-              type=int,
-              default=1,
-              help="Tensor parallelism size.")
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -1325,17 +1320,19 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
 @click.option("--telemetry/--no-telemetry",
               default=True,
               help="Enable or disable anonymous usage telemetry collection.")
-def serve_embedding(
-        model: str, host: str, port: int, log_level: str, max_batch_size: int,
-        max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
-        gpus_per_node: Optional[int], trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], revision: Optional[str],
-        free_gpu_memory_fraction: float, tensor_parallel_size: int,
-        metadata_server_config_file: Optional[str], telemetry: bool):
+def serve_embedding(model: str, host: str, port: int, log_level: str,
+                    max_batch_size: int, max_num_tokens: int,
+                    max_queue_delay: float, max_queue_size: int,
+                    gpus_per_node: Optional[int], trust_remote_code: bool,
+                    extra_llm_api_options: Optional[str],
+                    revision: Optional[str], free_gpu_memory_fraction: float,
+                    metadata_server_config_file: Optional[str],
+                    telemetry: bool):
     """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
 
     Coalesces concurrent requests with a dynamic batcher and serves them through
     the synchronous llm.encode() fast path (no KV cache / sampler / scheduler).
+    Single-GPU only: the command does not expose tensor/pipeline parallelism.
 
     MODEL: model name | HF checkpoint path
     """
@@ -1343,6 +1340,9 @@ def serve_embedding(
 
     explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
 
+    # Single-GPU only: tensor_parallel_size is fixed to 1 and not exposed as a flag
+    # (the encode-only path builds the engine in-process and has no multi-GPU worker
+    # proxy). Multi-GPU embeddings is a planned follow-up.
     llm_args, _ = get_llm_args(
         model=model,
         max_batch_size=max_batch_size,
@@ -1351,7 +1351,7 @@ def serve_embedding(
         trust_remote_code=trust_remote_code,
         revision=revision,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
-        tensor_parallel_size=tensor_parallel_size,
+        tensor_parallel_size=1,
         telemetry=telemetry,
         explicit_cli_keys=explicit_cli_keys)
 
@@ -1362,19 +1362,16 @@ def serve_embedding(
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
 
-    # The embeddings server is single-GPU only for now: the encode-only path builds
-    # the engine in-process (create_encoder_executor) and does NOT use the multi-GPU
-    # worker proxy that the generation path relies on, so TP/PP > 1 would hang or
-    # fail rather than shard. Fail fast with a clear message. Multi-GPU embeddings is
-    # a planned follow-up.
+    # The CLI does not expose TP/PP, but a --config YAML could still set them. Reject
+    # that explicitly rather than hang: the in-process encode-only path cannot shard.
     effective_tp = llm_args.get("tensor_parallel_size") or 1
     effective_pp = llm_args.get("pipeline_parallel_size") or 1
     if effective_tp > 1 or effective_pp > 1:
         raise click.BadParameter(
             "The embeddings server is single-GPU only; multi-GPU (TP/PP) is not "
             f"supported yet. Got tensor_parallel_size={effective_tp}, "
-            f"pipeline_parallel_size={effective_pp}.",
-            param_hint="tensor_parallel_size/pipeline_parallel_size")
+            f"pipeline_parallel_size={effective_pp} from --config.",
+            param_hint="config")
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
