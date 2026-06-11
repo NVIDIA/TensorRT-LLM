@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from typing import Optional, Union
 
@@ -5,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -129,6 +131,39 @@ class GatedMLP(nn.Module):
             [LoraModuleType.MLP_GATE_UP],
             [2 * self.intermediate_size // mapping.tp_size])
 
+        # Lazily resolved on first forward (down_proj weights must be created
+        # before has_nvfp4 / input_scale can be inspected). None = not yet
+        # checked.
+        self._can_fuse_swiglu_nvfp4_quant: Optional[bool] = None
+
+    def _swiglu_nvfp4_quant_eligible(self, *, has_lora: bool) -> bool:
+        """Whether to fuse the post-SwiGLU NVFP4 input-quant of down_proj into
+        the activation kernel.
+
+        Eligible iff down_proj is statically-quantized NVFP4 (calibrated
+        input_scale, not forced dynamic, no AWQ pre_quant_scale) on SM100+ --
+        the same static-NVFP4 condition NVFP4LinearMethod._input_prepare uses, so
+        the fused path's quant semantics match the unfused path. LoRA is excluded
+        (its activation must stay bf16/fp16 for the LoRA grouped GEMM); resolved
+        lazily since weights must exist first.
+        """
+        if self._can_fuse_swiglu_nvfp4_quant is None:
+            down = self.down_proj
+            # Opt-out gate for A/B benchmarking: fusion is on by default; set
+            # TRTLLM_DISABLE_SWIGLU_NVFP4_FUSION=1 to fall back to the unfused
+            # swiglu -> fp4_quantize path on the same wheel.
+            disabled = os.environ.get("TRTLLM_DISABLE_SWIGLU_NVFP4_FUSION",
+                                      "0") == "1"
+            self._can_fuse_swiglu_nvfp4_quant = (
+                not disabled
+                and hasattr(torch.ops.trtllm, 'silu_and_mul_nvfp4_quantize')
+                and getattr(down, 'has_nvfp4', False)
+                and getattr(down, 'input_scale', None) is not None
+                and not getattr(down, 'force_dynamic_quantization', False)
+                and getattr(down, 'pre_quant_scale', None) is None
+                and get_sm_version() >= 100)
+        return self._can_fuse_swiglu_nvfp4_quant and not has_lora
+
     def _apply_activation(self, x, *, has_lora: bool = False):
         if self.activation == F.silu:
             if self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8:
@@ -144,6 +179,14 @@ class GatedMLP(nn.Module):
                     return swiglu(x,
                                   quant_scale=self.down_proj.input_scale,
                                   quant_type=torch.float8_e4m3fn)
+            if self._swiglu_nvfp4_quant_eligible(has_lora=has_lora):
+                x = x if x.is_contiguous() else x.contiguous()
+                act_fp4, act_sf = torch.ops.trtllm.silu_and_mul_nvfp4_quantize(
+                    x, self.down_proj.input_scale,
+                    self.down_proj.scaling_vector_size)
+                return Fp4QuantizedTensor(fp4_tensor=act_fp4,
+                                          scaling_factor=act_sf,
+                                          is_sf_swizzled=True)
             else:
                 return swiglu(x)
         elif callable(self.activation):

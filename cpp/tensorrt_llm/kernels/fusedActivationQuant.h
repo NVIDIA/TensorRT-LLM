@@ -28,6 +28,12 @@ template <typename T>
 void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
     int m, int n, int sfVecSize, cudaStream_t stream);
 
+// Fused SwiGLU (silu(gate) * up) + NVFP4 quantization. Input is [m, 2n] (gate half
+// in [0, n), up half in [n, 2n)); outputs the NVFP4-quantized [m, n] activation.
+template <typename T>
+void invokeFusedSiluMulQuantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
+    int m, int n, int sfVecSize, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
