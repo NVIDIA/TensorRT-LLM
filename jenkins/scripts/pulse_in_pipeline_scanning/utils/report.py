@@ -20,10 +20,10 @@ def dedup_vulns(vulns):
 
 
 def dedup_licenses(contents):
-    """Deduplicate by (package, version, type), merging license lists."""
+    """Deduplicate by (package, type), merging license lists."""
     seen = {}
     for e in contents:
-        key = e["package"]
+        key = (e["package"], e["type"])
         if key not in seen:
             seen[key] = dict(e)
             seen[key]["licenses"] = sorted(set(e["licenses"]))
@@ -45,9 +45,25 @@ def get_preapproved_deps_map(scan_type):
     preapproved_deps = get_latest_license_preapproved_container_deps(scan_type)
     map_preapproved_deps = {}
     for item in preapproved_deps:
-        map_preapproved_deps[item["s_package_name"]] = True
+        # Key by (name, type) so approvals are type-specific.
+        # Entries without s_package_type (approved before this field existed) use None
+        # and act as a wildcard: is_preapproved() treats (name, None) as matching any type.
+        key = (item["s_package_name"], item.get("s_package_type"))
+        map_preapproved_deps[key] = True
 
     return map_preapproved_deps
+
+
+def is_preapproved(map_preapproved_deps, package_name, package_type):
+    """Return True if (package_name, package_type) is covered by the preapproval map.
+
+    Checks exact (name, type) match first, then falls back to (name, None) for
+    legacy approvals recorded before the type field was added.
+    """
+    return (package_name, package_type) in map_preapproved_deps or (
+        package_name,
+        None,
+    ) in map_preapproved_deps
 
 
 def diff_licenses(scan_type, release_path, base_path=None):
@@ -64,7 +80,7 @@ def diff_licenses(scan_type, release_path, base_path=None):
     introduced_licenses = [
         v
         for k, v in release_pkgs.items()
-        if ((k not in base_pkgs) and (k not in map_preapproved_deps))
+        if (k not in base_pkgs) and not is_preapproved(map_preapproved_deps, k[0], k[1])
     ]
 
     introduced_licenses.sort(key=lambda e: (e["package"], e["version"]))

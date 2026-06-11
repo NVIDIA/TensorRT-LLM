@@ -366,6 +366,9 @@ pipeline {
         string(name: 'postMergePipelineName', defaultValue: '', description: 'Optional: post-merge pipeline job name to associate with this scan')
         string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
         choice(name: 'scanMode', choices: ['monitor','release'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
+        booleanParam(name: 'runSourceCodeScanning', defaultValue: true, description: 'Run Source Code OSS Scanning (lock file generation + Pulse OSS scan)')
+        booleanParam(name: 'runContainerScanning', defaultValue: true, description: 'Run Container Scanning (Pulse container scan)')
+        booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
     }
     options {
         skipDefaultCheckout()
@@ -399,6 +402,9 @@ pipeline {
         stage('Run TRT-LLM PLC Jobs') {
             parallel {
                 stage("Source Code OSS Scanning") {
+                    when {
+                        expression { return params.runSourceCodeScanning }
+                    }
                     steps {
                         script {
                             generateLockFiles(env.LLM_REPO, env.REF)
@@ -407,6 +413,9 @@ pipeline {
                     }
                 }
                 stage("Container Scanning") {
+                    when {
+                        expression { return params.runContainerScanning }
+                    }
                     steps {
                         script {
                             pulseScanContainer(env.LLM_REPO, env.REF)
@@ -414,6 +423,9 @@ pipeline {
                     }
                 }
                 stage("SonarQube Code Analysis") {
+                    when {
+                        expression { return params.runSonarQube }
+                    }
                     steps {
                         script {
                             sonarScan()
