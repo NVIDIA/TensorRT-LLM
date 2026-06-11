@@ -156,8 +156,8 @@ def submit_source_code_licenses(
                 "s_component_type": component.get("type"),
                 "b_is_new": is_new,
             }
-            if (is_new or not only_report_new_risk) and is_preapproved(
-                map_preapproved, package_name, component.get("type").lower()
+            if (is_new or not only_report_new_risk) and not is_preapproved(
+                map_preapproved, package_name, (component.get("type") or "").lower()
             ):
                 risks_to_report.append(doc)
                 sbom_documents.append(doc)
@@ -293,7 +293,7 @@ def submit_container_licenses(
             "b_is_new": is_new,
         }
         if (is_new or not only_report_new_risk) and not is_preapproved(
-            map_preapproved, package_name, v.get("type").lower()
+            map_preapproved, package_name, (v.get("type") or "").lower()
         ):
             risks_to_report.append(doc)
             docs.append(doc)
