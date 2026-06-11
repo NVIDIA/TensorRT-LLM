@@ -14,11 +14,13 @@
 # limitations under the License.
 """Transformations to support graph sharding.
 
-.. deprecated::
-    The heuristic-based sharding infrastructure in this module (``detect_sharding``,
-    ``sharding_transform_executor``, and all ``ShardingInfo`` classes) is being replaced
-    by the hint-driven IR sharding system in ``sharding_ir.py``.  New development should
-    target ``sharding_ir.py``; this module will be removed once the transition is complete.
+Heuristic-detection fallback for modeling files not yet ported to sharding IR.
+The auto-detect dispatcher in ``sharding_ir.py::is_shardingIR_enabled`` routes
+FX graphs without ``torch.ops.auto_deploy.all_reduce`` markers here; graphs
+authored against the sharding IR are handled by ``apply_sharding_hints`` instead.
+New modeling-file work should target the sharding IR (see
+``.claude/skills/ad-sharding-ir-port``); this module remains the fallback while
+the long-tail of unported modeling files is brought across.
 
 Our sharding algorithm for tensor parallelism (TP) is based on the following steps:
 
@@ -310,8 +312,7 @@ class ShardingTransformConfig(TransformConfig):
         Production path builds ``DistConfig`` in ``LlmArgs.init_dist_config`` and
         passes it through ``SharedConfig.dist_config``.  This fallback is only
         entered when ``shared_config.dist_config is None`` (tests constructing
-        ``InferenceOptimizer`` directly without a ``dist_config`` kwarg).  Will
-        be removed together with the legacy sharding pipeline.
+        ``InferenceOptimizer`` directly without a ``dist_config`` kwarg).
         """
         self.dist_config = DistConfig.from_sharding_params(
             rank=self.rank,
@@ -1187,6 +1188,19 @@ class Sharding(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+        # Honor the auto-detect dispatcher in apply_sharding_hints. When the
+        # IR pipeline has already sharded this graph, the heuristic-detection
+        # fallback would either re-shard the same nodes or build a stale plan.
+        if gm.meta.get("sharding_ir_applied"):
+            ad_logger.info(
+                "detect_sharding: sharding IR already applied to this graph; "
+                "skipping heuristic-detection fallback."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         _is_draft = getattr(gm, "is_draft", False)
         config = self.config
         config.factory_config = factory.get_sharding_config() if factory else {}
@@ -1308,6 +1322,19 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Honor the auto-detect dispatcher: when apply_sharding_hints handled
+        # this graph, detect_sharding was skipped and no transform plan was
+        # built. Mirror that here so we don't attempt to read an absent
+        # _sharding_transform_container.
+        if gm.meta.get("sharding_ir_applied"):
+            ad_logger.info(
+                "sharding_transform_executor: sharding IR already applied; "
+                "no heuristic plan to execute."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 
