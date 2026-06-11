@@ -897,7 +897,6 @@ quantize_with_block_size(
             }
         }
     }
-    // Fix for nvbugs/5970614 (https://nvbugspro.nvidia.com/bug/5970614).
     // PDL completion is reported when every CTA has either exited or called
     // this function at least once (per CUDA Programming Guide). Without a
     // CTA-wide barrier, an early-finishing warp can trigger completion while
