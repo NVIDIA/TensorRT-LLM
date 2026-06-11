@@ -928,7 +928,7 @@ public:
 
     [[nodiscard]] SizeType32 getNumAllocatedBlocks() const
     {
-        return getMaxNumBlocks() - getNumFreeBlocks();
+        return getNumPrimaryBlocks() - getNumFreeBlocks();
     }
 
     [[nodiscard]] SizeType32 getNumMissedBlocks() const noexcept
@@ -2214,7 +2214,7 @@ public:
     [[nodiscard]] KvCacheStats getKvCacheStats() const override
     {
         KvCacheStats kvCacheStats;
-        kvCacheStats.maxNumBlocks = getMaxNumBlocks();
+        kvCacheStats.maxNumBlocks = mBlockManager.getNumPrimaryBlocks();
         kvCacheStats.freeNumBlocks = getNumFreeBlocks();
         kvCacheStats.usedNumBlocks = getUsedNumBlocks();
         kvCacheStats.toksPerBlock = getTokensPerBlock();

@@ -720,6 +720,65 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
     EXPECT_EQ(prev1->getPrevBlock(), nullptr);
 }
 
+TEST_F(KVCacheManagerTest, KvCacheStatsExcludesSecondaryPoolBlocks)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 6;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        0, stream, maxAttentionWindow, true);
+    kvCacheManager.allocatePools(false);
+
+    auto kvCacheStats = kvCacheManager.getKvCacheStats();
+    EXPECT_EQ(kvCacheStats.maxNumBlocks, blocksInPrimaryPool);
+    EXPECT_EQ(kvCacheStats.freeNumBlocks, blocksInPrimaryPool);
+    EXPECT_EQ(kvCacheStats.usedNumBlocks, 0);
+    EXPECT_EQ(kvCacheStats.toksPerBlock, tokensPerBlock);
+    EXPECT_EQ(kvCacheStats.allocTotalBlocks, 0);
+    EXPECT_EQ(kvCacheStats.allocNewBlocks, 0);
+    EXPECT_EQ(kvCacheStats.reusedBlocks, 0);
+    EXPECT_EQ(kvCacheStats.missedBlocks, 0);
+    EXPECT_FLOAT_EQ(kvCacheStats.cacheHitRate, 0.0F);
+    EXPECT_EQ(kvCacheStats.numFreeBlocksPerWindowSize.at(maxAttentionWindow), blocksInPrimaryPool);
+    EXPECT_GT(kvCacheStats.allocatedBytes, 0);
+    auto const allocatedBytes = kvCacheStats.allocatedBytes;
+
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    SizeType32 constexpr expectedContextBlocks{3};
+    LlmRequest::RequestIdType const requestId{0};
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequenceBatch(
+        {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+
+    kvCacheStats = kvCacheManager.getKvCacheStats();
+    EXPECT_EQ(kvCacheStats.maxNumBlocks, blocksInPrimaryPool);
+    EXPECT_EQ(kvCacheStats.freeNumBlocks, blocksInPrimaryPool - expectedContextBlocks);
+    EXPECT_EQ(kvCacheStats.usedNumBlocks, expectedContextBlocks);
+    EXPECT_EQ(kvCacheStats.toksPerBlock, tokensPerBlock);
+    EXPECT_EQ(kvCacheStats.allocTotalBlocks, expectedContextBlocks);
+    EXPECT_EQ(kvCacheStats.allocNewBlocks, expectedContextBlocks);
+    EXPECT_EQ(kvCacheStats.reusedBlocks, 0);
+    EXPECT_EQ(kvCacheStats.missedBlocks, expectedContextBlocks);
+    EXPECT_FLOAT_EQ(kvCacheStats.cacheHitRate, 0.0F);
+    EXPECT_EQ(
+        kvCacheStats.numFreeBlocksPerWindowSize.at(maxAttentionWindow), blocksInPrimaryPool - expectedContextBlocks);
+    EXPECT_EQ(kvCacheStats.allocatedBytes, allocatedBytes);
+}
+
 #ifdef ENABLE_FP4
 TEST_F(KVCacheManagerTest, FP4BlockScaleManagementTest)
 {
@@ -3984,12 +4043,12 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     llmRequest->addNewToken(1019, beamIdx);
     kvCacheManager.addToken(requestId);
     auto numTokens = llmRequest->getNumTokens(beamIdx);
-    auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
+    auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks();
     EXPECT_THAT(seq0.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3, 4}));
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
-    numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
+    numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks();
     EXPECT_EQ(numAllocatedPrimaryBlocks, 0);
     // store blocks 0, 1, 2, 3, 4  for reuse ([1000,1001,1002,1003], [1004,1005,1006,1007], [1008,1009,1010,1011],
     // [1012,1013,1014,1015], [1016,1017])
@@ -4220,11 +4279,11 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     llmRequest->addNewToken(1011, beamIdx);
     kvCacheManager.addToken(requestId);
     assertBlocks(seq0, {0, 1, 2}, {0, 1, 2});
-    auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPoolPerWindow * numWindows;
+    auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks();
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
-    numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPoolPerWindow * numWindows;
+    numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks();
     EXPECT_EQ(numAllocatedPrimaryBlocks, 0);
     // For both windows, store blocks 0, 1, 2  for reuse ([1000,1001,1002,1003], [1004,1005,1006,1007],
     // [1008,1009,1010,1011])
