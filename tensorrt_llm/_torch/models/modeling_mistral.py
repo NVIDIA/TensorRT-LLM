@@ -360,57 +360,6 @@ class MistralCommonImageProcessor:
         return processed
 
 
-class MistralInputProcessorBase(BaseMultimodalInputProcessor,
-                                BaseMultimodalDummyInputsBuilder):
-    """Shared logic for HF and native Mistral VLM input processors."""
-
-    @property
-    def config(self) -> PretrainedConfig:
-        return self._config
-
-    @property
-    def tokenizer(self) -> AutoTokenizer:
-        return self._tokenizer
-
-    @property
-    def model_path(self) -> str:
-        return self._model_path
-
-    @property
-    def processor(self) -> AutoProcessor:
-        return self._processor
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._dtype
-
-    def get_vocab_size(self) -> int:
-        return self.config.text_config.vocab_size
-
-    def get_mm_token_ids(self) -> torch.Tensor:
-        return torch.tensor([
-            self.processor.image_token_id,
-            self.processor.image_break_token_id,
-            self.processor.image_end_token_id,
-        ])
-
-    def get_mm_special_token_ids(self) -> torch.Tensor:
-        return torch.tensor([
-            self.processor.image_break_token_id,
-            self.processor.image_end_token_id,
-        ])
-
-    @staticmethod
-    def _extract_extra_processed_inputs(
-            processed) -> ExtraProcessedInputs | None:
-        pixel_values = processed.get("pixel_values")
-        if pixel_values is None:
-            return None
-        processed.pop("attention_mask", None)
-        processed["image_sizes"] = processed["image_sizes"].tolist()
-        return {"multimodal_data": {"image": {**processed}}}
-
-
 class MistralHFInputProcessor(BaseMultimodalInputProcessor,
                               BaseMultimodalDummyInputsBuilder):
     """Input processor for Mistral VLM checkpoints in HuggingFace format."""
@@ -513,7 +462,8 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         return input_ids, extra_processed_inputs
 
 
-class MistralNativeInputProcessor(MistralInputProcessorBase):
+class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
+                                  BaseMultimodalDummyInputsBuilder):
     """Input processor for Mistral VLM checkpoints in mistral-native format."""
 
     def __init__(
@@ -539,6 +489,42 @@ class MistralNativeInputProcessor(MistralInputProcessorBase):
             f"[mistral] native processor={type(self._processor).__name__} "
             f"tokenizer={type(self._tokenizer).__name__}")
 
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    def get_vocab_size(self) -> int:
+        return self.config.text_config.vocab_size
+
+    def get_mm_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            self.processor.image_token_id,
+            self.processor.image_break_token_id,
+            self.processor.image_end_token_id,
+        ])
+
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            self.processor.image_break_token_id,
+            self.processor.image_end_token_id,
+        ])
+
     @torch.inference_mode()
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -548,7 +534,12 @@ class MistralNativeInputProcessor(MistralInputProcessorBase):
         # the mistral-common chat template internally.
         processed = self.processor(text=inputs["prompt"], images=images)
         input_ids = processed.pop("input_ids").tolist()[0]
-        return input_ids, self._extract_extra_processed_inputs(processed)
+        pixel_values = processed.get("pixel_values")
+        if pixel_values is None:
+            return input_ids, None
+        processed.pop("attention_mask", None)
+        processed["image_sizes"] = processed["image_sizes"].tolist()
+        return input_ids, {"multimodal_data": {"image": {**processed}}}
 
 
 # Register the native processor's content-format metadata.  We do this
