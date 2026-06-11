@@ -283,3 +283,221 @@ def test_profile_control_pinned_to_single_owner_thread(tmp_path):
         f"Owner thread name {owner.name!r} does not match the expected "
         "'proxy_profile_control' prefix."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Strengthened regression tests for QiJune's PR review §2.
+#
+# pyzmq sockets are not thread-safe — concurrent access from multiple threads
+# (even one writer + one reader) is undefined behavior in libzmq. The fix
+# routes ALL profile-control ZMQ ops through ``_profile_control_executor``
+# (max_workers=1) so the FastAPI thread-pool worker never touches the socket.
+# These tests pin that contract under stress.
+# --------------------------------------------------------------------------- #
+
+
+class _ThreadSafetyRecorder:
+    """Records every queue access plus a peak concurrency counter.
+
+    Threads call ``record()`` on enter and increment a counter under a lock;
+    any peak value > 1 violates the single-owner-thread contract.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active = 0
+        self.peak_concurrency = 0
+        self.events = []  # list of ("op", thread)
+
+    def record(self, op):
+        with self._lock:
+            self._active += 1
+            self.peak_concurrency = max(self.peak_concurrency, self._active)
+            self.events.append((op, threading.current_thread()))
+        try:
+            # Hold the "inside-the-socket" window briefly so any
+            # concurrent caller has a chance to be observed.
+            time.sleep(0.001)
+        finally:
+            with self._lock:
+                self._active -= 1
+
+
+def test_profile_ops_serialized_under_concurrent_callers(tmp_path):
+    """N concurrent callers must not produce concurrent ZMQ access.
+
+    Mirrors what FastAPI would do under load: many request handlers each
+    schedule a /start_profile or /stop_profile via ``asyncio.to_thread``
+    simultaneously. If the proxy ever directly touched ZMQ sockets from
+    those threads we would see ``peak_concurrency > 1``. The fix routes
+    every op through ``_profile_control_executor`` (max_workers=1), so
+    peak concurrency MUST stay at 1.
+    """
+    proxy = _bare_proxy()
+    recorder = _ThreadSafetyRecorder()
+
+    n_callers = 16
+    # Track the kind of each put so the corresponding get returns a
+    # matching ack — _wait_profile_ack uses the kind to detect stale acks
+    # and may discard mismatched ones, which would otherwise exhaust a
+    # pre-baked ack list.
+    put_kinds = []
+    state_lock = threading.Lock()
+
+    def record_put(req):
+        recorder.record("put")
+        with state_lock:
+            put_kinds.append("start" if isinstance(req, StartProfileRequest) else "stop")
+
+    def record_get(timeout=None):
+        recorder.record("get")
+        with state_lock:
+            # Pop the oldest pending put kind — guaranteed to be present
+            # since the executor serializes put→get pairs.
+            kind = put_kinds.pop(0)
+        return (kind, None)
+
+    proxy.request_queue.put.side_effect = record_put
+    proxy.profile_ack_queue.get.side_effect = record_get
+
+    def caller(idx):
+        proxy.start_profile(output_dir=str(tmp_path), num_steps=1)
+        proxy.stop_profile()
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=n_callers,
+        thread_name_prefix="fake_fastapi_to_thread",
+    ) as pool:
+        futures = [pool.submit(caller, i) for i in range(n_callers)]
+        for f in futures:
+            f.result()
+
+    # 4 ops per caller (start put, start get, stop put, stop get).
+    assert len(recorder.events) == 4 * n_callers, recorder.events
+
+    # The crucial contract: ZMQ queue is never accessed by 2 threads
+    # at the same time.
+    assert recorder.peak_concurrency == 1, (
+        f"Peak concurrent ZMQ queue access was "
+        f"{recorder.peak_concurrency} — pyzmq is NOT thread-safe and "
+        f"this would corrupt the socket. (See PR review §2.)"
+    )
+
+    owner_threads = {th for _, th in recorder.events}
+    assert len(owner_threads) == 1, (
+        f"Profile-control ZMQ ops touched {len(owner_threads)} threads "
+        f"({[t.name for t in owner_threads]}) — must be exactly one."
+    )
+
+    (owner,) = owner_threads
+    assert owner.name.startswith("proxy_profile_control"), (
+        f"Owner thread {owner.name!r} is not the dedicated executor."
+    )
+
+
+def test_profile_control_thread_name_is_stable_across_calls(tmp_path):
+    """The same single owner thread serves *every* call, not just one.
+
+    A pool with ``max_workers=1`` reuses its worker thread across submitted
+    callables, so even with thousands of calls we should only ever see one
+    owner thread name. This guards against an accidental future change to
+    ``max_workers > 1`` (which would still pass under serialized tests but
+    break the contract under concurrency).
+    """
+    proxy = _bare_proxy()
+    seen_owners = []
+    seen_lock = threading.Lock()
+    put_kinds = []
+
+    def record_put(req):
+        with seen_lock:
+            seen_owners.append(threading.current_thread())
+            put_kinds.append("start" if isinstance(req, StartProfileRequest) else "stop")
+
+    def record_get(timeout=None):
+        with seen_lock:
+            seen_owners.append(threading.current_thread())
+            kind = put_kinds.pop(0)
+        return (kind, None)
+
+    proxy.request_queue.put.side_effect = record_put
+    proxy.profile_ack_queue.get.side_effect = record_get
+
+    n_calls = 25
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for _ in range(n_calls):
+            pool.submit(proxy.start_profile, output_dir=str(tmp_path), num_steps=1).result()
+            pool.submit(proxy.stop_profile).result()
+
+    # 2 ops per call * 2 calls per iter * n_calls = 4 * n_calls ops.
+    assert len(seen_owners) == 4 * n_calls
+
+    owner_set = set(seen_owners)
+    assert len(owner_set) == 1, (
+        f"Owner thread changed across calls: "
+        f"{sorted(t.name for t in owner_set)}. "
+        f"max_workers may have been bumped > 1."
+    )
+
+
+def test_caller_thread_never_touches_zmq_queue(tmp_path):
+    """The HTTP-handler thread is never the owner of a queue op.
+
+    This is exactly what QiJune's review asked for: ``request_queue.put`` and
+    ``profile_ack_queue.get`` must NOT run on the ``asyncio.to_thread``
+    worker thread. We verify by capturing the caller's thread identity and
+    asserting it is disjoint from the set of owner threads observed inside
+    the queue mocks.
+    """
+    proxy = _bare_proxy()
+
+    queue_op_threads = []
+    queue_lock = threading.Lock()
+    put_kinds = []
+
+    def record_put(req):
+        with queue_lock:
+            queue_op_threads.append(threading.current_thread())
+            put_kinds.append("start" if isinstance(req, StartProfileRequest) else "stop")
+
+    def record_get(timeout=None):
+        with queue_lock:
+            queue_op_threads.append(threading.current_thread())
+            kind = put_kinds.pop(0)
+        return (kind, None)
+
+    proxy.request_queue.put.side_effect = record_put
+    proxy.profile_ack_queue.get.side_effect = record_get
+
+    caller_threads = []
+    caller_lock = threading.Lock()
+
+    def caller():
+        with caller_lock:
+            caller_threads.append(threading.current_thread())
+        proxy.start_profile(output_dir=str(tmp_path), num_steps=1)
+        proxy.stop_profile()
+
+    threads = [threading.Thread(target=caller, name=f"fake_to_thread_{i}") for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    caller_set = set(caller_threads)
+    queue_owner_set = set(queue_op_threads)
+
+    # The intersection MUST be empty — caller threads must never touch
+    # the ZMQ socket directly.
+    leaked = caller_set & queue_owner_set
+    assert not leaked, (
+        f"Caller threads {[t.name for t in leaked]} appeared as ZMQ "
+        f"queue-op owners — pyzmq socket leaked into the FastAPI "
+        f"thread-pool worker. (See PR review §2.)"
+    )
+
+    # And every owner is the dedicated executor worker.
+    for th in queue_owner_set:
+        assert th.name.startswith("proxy_profile_control"), (
+            f"Unexpected owner thread {th.name!r}; expected 'proxy_profile_control*'."
+        )
