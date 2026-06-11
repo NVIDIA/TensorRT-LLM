@@ -14,5 +14,8 @@
 # limitations under the License.
 """AutoDeploy's modular graph transform + inference optimizer pipeline."""
 
-from . import library  # noqa: F401 - ensure all transforms are registered
+from . import (
+    library,  # noqa: F401 - ensure all transforms are registered
+    pipeline_cache,  # noqa: F401 - ensure the cache transform is registered
+)
 from .interface import *

@@ -579,6 +579,63 @@ class DecoderModelForCausalLM(nn.Module,
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
 
+    def setup_aliases(self) -> None:
+        """Wire structural Python references between modules.
+
+        This stage is for module-tree structure only, such as assigning
+        cross-layer module references or shared module aliases. It must not
+        read or mutate tensor values, so callers may run it before weight bytes
+        are available, materialized, or transformed.
+
+        The method is intentionally idempotent. Reassigning the same module
+        reference should preserve the same module graph, matching
+        ``torch.nn.Module.__setattr__`` semantics.
+
+        Returns:
+            None.
+        """
+
+    def transform_weights(self) -> None:
+        """Apply one-shot post-load transformations to weight tensors.
+
+        This stage is for irreversible or layout-changing tensor operations,
+        such as fusing weights or converting quantized weight representations.
+        Subclasses that migrate transform logic here should return early when
+        ``_weights_transformed`` is already true, and set it only after the
+        transform succeeds. Orchestrators that replace the underlying tensors
+        with fresh, untransformed bytes are responsible for resetting that flag.
+
+        Returns:
+            None.
+        """
+
+    def cache_derived_state(self) -> None:
+        """Recompute Python-side state derived from currently loaded weights.
+
+        This stage is reserved for idempotent recomputation from real tensors,
+        such as cached scalars, validation results, or fingerprints. It should
+        not perform one-shot weight transforms. Callers may run it after weight
+        bytes arrive from any loading or sharing mechanism.
+
+        Returns:
+            None.
+        """
+
+    def post_load_weights(self) -> None:
+        """Run the default staged post-load hook sequence.
+
+        Existing model-loading paths continue to call this method for backward
+        compatibility. More specialized loaders can call individual stages when
+        they need a subset of alias setup, tensor transformation, or derived
+        state recomputation.
+
+        Returns:
+            None.
+        """
+        self.setup_aliases()
+        self.transform_weights()
+        self.cache_derived_state()
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -698,12 +755,13 @@ def register_vision_encoder(
     """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
+        registered = False
         for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
-            if registered_cls.__name__ == model_cls.__name__:
+            if registered_cls is model_cls:
                 MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
                     vision_encoder_cls, vlm_base_model)
-                break
-        else:
+                registered = True
+        if not registered:
             raise ValueError(
                 f"register_vision_encoder: model class {model_cls.__name__} is not registered "
                 f"via register_auto_model; decorator order must ensure registration occurs first."

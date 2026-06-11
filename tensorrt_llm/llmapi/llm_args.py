@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import ast
 import functools
 import json
@@ -107,8 +122,8 @@ def Field(default: Any = ...,
     return PydanticField(default, **kwargs)
 
 
-class CudaGraphConfig(StrictBaseModel):
-    """Configuration for CUDA graphs."""
+class BaseCudaGraphConfig(StrictBaseModel):
+    """Common configuration for CUDA graphs."""
     # List of batch sizes to create CUDA graphs for.
     batch_sizes: Optional[List[int]] = Field(
         default=None,
@@ -124,7 +139,7 @@ class CudaGraphConfig(StrictBaseModel):
     )
 
     @model_validator(mode='after')
-    def validate_cuda_graph_config(self) -> 'CudaGraphConfig':
+    def validate_base_cuda_graph_config(self) -> 'BaseCudaGraphConfig':
         """Validate CUDA graph configuration.
 
         Ensures that:
@@ -149,7 +164,7 @@ class CudaGraphConfig(StrictBaseModel):
                     f"CudaGraphConfig.max_batch_size: {self.max_batch_size}")
         else:
             max_batch_size = self.max_batch_size or 128
-            generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            generated_sizes = self._generate_cuda_graph_batch_sizes(
                 max_batch_size, self.enable_padding)
             self.batch_sizes = generated_sizes
             self.max_batch_size = max_batch_size
@@ -191,11 +206,17 @@ class CudaGraphConfig(StrictBaseModel):
 
         return batch_sizes
 
+
+class DecodeCudaGraphConfig(BaseCudaGraphConfig):
+    """CUDA graph configuration for decode requests."""
+
+    mode: Literal["decode"] = Field(
+        default="decode", description="CUDA graph configuration mode.")
+
     @staticmethod
     def _merge_schedule_keys(batch_sizes: List[int],
                              schedule: dict[int, int]) -> List[int]:
-        """Merge draft_len_schedule keys into batch_sizes so that each
-        schedule threshold has a corresponding CUDA graph.
+        """Merge draft_len_schedule keys into batch_sizes so that each schedule threshold has a corresponding CUDA graph.
 
         e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300
         into batch_sizes.
@@ -231,6 +252,165 @@ class CudaGraphConfig(StrictBaseModel):
         return merged
 
 
+class EncodeCudaGraphConfig(BaseCudaGraphConfig):
+    """CUDA graph configuration for encode-only requests."""
+
+    mode: Literal["encode"] = Field(
+        default="encode", description="CUDA graph configuration mode.")
+
+    num_tokens: Optional[List[PositiveInt]] = Field(
+        default=None,
+        min_length=1,
+        description=
+        "List of total token counts (sum of all per-request sequence lengths "
+        "in a batch) to create encoder CUDA graphs for.")
+
+    max_num_token: NonNegativeInt = Field(
+        default=0,
+        description="Maximum total number of tokens for encoder CUDA graphs. If "
+        "`num_tokens` is provided, must equal max(num_tokens); otherwise "
+        "`num_tokens` is generated from this value.")
+
+    seq_lens: Optional[List[PositiveInt]] = Field(
+        default=None,
+        min_length=1,
+        description=
+        "List of max per-request sequence lengths to create encoder CUDA "
+        "graphs for.")
+
+    max_seq_len: NonNegativeInt = Field(
+        default=0,
+        description=
+        "Maximum per-request sequence length for encoder CUDA graphs. If "
+        "`seq_lens` is provided, must equal max(seq_lens); otherwise "
+        "`seq_lens` is generated from this value.")
+
+    @model_validator(mode='after')
+    def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
+        # Encoder fields — only generate defaults when the user opted in by
+        # setting at least one of num_tokens / max_num_token. Leaving both at
+        # the defaults keeps encoder CUDA graphs disabled. Same for seq_lens / max_seq_len.
+        if self.num_tokens:
+            self.num_tokens = sorted(self.num_tokens)
+            derived_max_nt = max(self.num_tokens)
+            if self.max_num_token == 0:
+                self.max_num_token = derived_max_nt
+            elif self.max_num_token != derived_max_nt:
+                raise ValueError(
+                    "CudaGraphConfig.max_num_token is incompatible with "
+                    "CudaGraphConfig.num_tokens. When both are provided, "
+                    "max_num_token must equal max(num_tokens).\n"
+                    f"CudaGraphConfig.num_tokens: {self.num_tokens}, "
+                    f"max(num_tokens): {derived_max_nt}, "
+                    f"CudaGraphConfig.max_num_token: {self.max_num_token}")
+        elif self.max_num_token > 0:
+            self.num_tokens = self._generate_cuda_graph_num_tokens(
+                self.max_num_token, self.enable_padding)
+
+        if self.seq_lens:
+            self.seq_lens = sorted(self.seq_lens)
+            derived_max_sl = max(self.seq_lens)
+            if self.max_seq_len == 0:
+                self.max_seq_len = derived_max_sl
+            elif self.max_seq_len != derived_max_sl:
+                raise ValueError(
+                    "CudaGraphConfig.max_seq_len is incompatible with "
+                    "CudaGraphConfig.seq_lens. When both are provided, "
+                    "max_seq_len must equal max(seq_lens).\n"
+                    f"CudaGraphConfig.seq_lens: {self.seq_lens}, "
+                    f"max(seq_lens): {derived_max_sl}, "
+                    f"CudaGraphConfig.max_seq_len: {self.max_seq_len}")
+        elif self.max_seq_len > 0:
+            self.seq_lens = self._generate_cuda_graph_seq_lens(
+                self.max_seq_len, self.enable_padding)
+
+        return self
+
+    @staticmethod
+    def _generate_cuda_graph_num_tokens(max_num_token: int,
+                                        enable_padding: bool) -> List[int]:
+        """Generate a list of total token counts for encoder CUDA graphs.
+
+        Args:
+            max_num_token: Maximum total tokens to generate up to.
+            enable_padding: Whether padding is enabled, which affects the
+                size distribution.
+
+        Returns:
+            List of total token counts to create encoder CUDA graphs for.
+        """
+        if enable_padding:
+            # Coarser: aligned with piecewise CUDA graph capture sizes.
+            sizes = [2**i for i in range(8)]  # 1, 2, 4 .. 128
+            sizes += list(range(256, 3073, 256))  # 256, 512, ..., 3072
+        else:
+            # Finer: progressively coarser steps.
+            sizes = [2**i for i in range(5)]  # 1, 2, 4 .. 16
+            sizes += list(range(16, 65, 16))  # 16, 32, ..., 64
+            sizes += list(range(96, 257, 32))  # 96, 128, ..., 256
+            sizes += list(range(384, 1025, 128))  # 384, 512, ..., 1024
+            sizes += list(range(1280, 3073, 256))  # 1280, 1536, ..., 3072
+
+        # Beyond the base range: powers of 2 up to max_num_token.
+        p = 4096
+        while p < max_num_token:
+            sizes.append(p)
+            p *= 2
+
+        sizes = sorted(set(s for s in sizes if s <= max_num_token))
+        if not sizes or sizes[-1] != max_num_token:
+            sizes.append(max_num_token)
+
+        return sizes
+
+    @staticmethod
+    def _generate_cuda_graph_seq_lens(max_seq_len: int,
+                                      enable_padding: bool) -> List[int]:
+        """
+        Generate a list of max per-request sequence lengths for encoder CUDA graphs.
+
+        Args:
+            max_seq_len: Maximum per-request sequence length to generate up to.
+            enable_padding: Whether padding is enabled, which affects the
+                size distribution.
+
+        Returns:
+            List of max sequence lengths to create encoder CUDA graphs for.
+        """
+        if enable_padding:
+            # Coarser buckets for rounding up.
+            sizes = [2**i for i in range(7)]  # 1, 2, 4 .. 64
+            sizes += list(range(128, 1025, 128))  # 128, 256, ..., 1024
+        else:
+            # Finer: progressive steps for exact matching.
+            sizes = list(range(1, 9))  # 1 .. 8
+            sizes += list(range(16, 65, 8))  # 16, 24, ..., 64
+            sizes += list(range(96, 257, 32))  # 96, 128, ..., 256
+            sizes += list(range(320, 513, 64))  # 320, 384, 448, 512
+            sizes += list(range(640, 1025, 128))  # 640, 768, 896, 1024
+
+        # Beyond the base range: powers of 2 up to max_seq_len.
+        p = 2048
+        while p < max_seq_len:
+            sizes.append(p)
+            p *= 2
+
+        sizes = sorted(set[Any | int](s for s in sizes if s <= max_seq_len))
+        if not sizes or sizes[-1] != max_seq_len:
+            sizes.append(max_seq_len)
+
+        return sizes
+
+
+# For CudaGraphConfig's backward compatibility
+CudaGraphConfig = DecodeCudaGraphConfig
+
+CudaGraphConfigType: TypeAlias = Annotated[
+    Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
+    Field(discriminator="mode"),
+]
+
+
 class GuidedDecodingConfig(StrictBaseModel):
 
     class GuidedDecodingBackend(Enum):
@@ -262,8 +442,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     )
 
     def supports_backend(self, backend: str) -> bool:
-        """
-        Override if the sparse attention algorithm does not support
+        """Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -272,8 +451,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         return 1
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """
-        Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
+        """Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
         If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).
         If False, capture a single unified CUDA graph for all sequences regardless of length.
         The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
@@ -389,8 +567,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """
-        Whether to capture separate CUDA graphs for short and long sequences.
+        """Whether to capture separate CUDA graphs for short and long sequences.
         Use seq_len_threshold to determine the threshold for separating short and long sequences.
         """
         self.seq_len_threshold = self.index_topk
@@ -477,8 +654,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
-    """
-    Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
+    """Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
 
     This model holds configuration data (`num_slots`, etc.) as well as
     runtime state (`_ep_rank`, `_ep_size`) which must be set via the
@@ -497,8 +673,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
     # --- Methods ---
 
     def setup(self, ep_rank: int, ep_size: int) -> None:
-        """
-        Initializes the runtime state of the configuration.
+        """Initializes the runtime state of the configuration.
         This must be called before accessing properties like `num_local_slots`.
         """
         self._ep_rank = ep_rank
@@ -1005,8 +1180,7 @@ class DecodingBaseConfig(StrictBaseModel):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        """
-        Override if the speculation algorithm does not support
+        """Override if the speculation algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -1035,8 +1209,7 @@ class DecodingBaseConfig(StrictBaseModel):
 
 
 class KvCacheConnectorConfig(StrictBaseModel):
-    """
-    Configuration for the KV Cache Connector.
+    """Configuration for the KV Cache Connector.
 
     Can be configured either by specifying a named preset via ``connector``
     (e.g. ``"lmcache"``), or by providing explicit ``connector_module``,
@@ -1314,8 +1487,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
-        """
-        Returns the number of layers to capture of the target model.
+        """Returns the number of layers to capture of the target model.
         If eagle3_layers_to_capture is not None, return the length of the set.
         Otherwise, assume Eagle3 base set and return 3.
         """
@@ -1431,8 +1603,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self):
-        """
-        Returns the number of layers to save.
+        """Returns the number of layers to save.
         The following hidden states are saved:
         - If eagle3_layers_to_capture is None, save the eagle3 base set plus
         the post norm last hidden state.
@@ -1598,13 +1769,13 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "Enable relaxed acceptance during thinking phase for reasoning models. Accepts draft tokens matching any top-K candidate instead of exact top-1."
     )
-    relaxed_topk: int = Field(
+    relaxed_topk: PositiveInt = Field(
         default=1,
         description=
         "Number of top candidate tokens to consider for relaxed acceptance. Draft token is accepted if it matches any of these."
     )
-    relaxed_delta: float = Field(
-        default=0.,
+    relaxed_delta: NonNegativeFloat = Field(
+        default=0.0,
         description=
         "Probability threshold for relaxed acceptance. Only candidates with prob >= (top-1 prob - delta) are kept."
     )
@@ -1635,12 +1806,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "Auto-populated from the model's pretrained config. Do not set manually."
     )
 
-    begin_thinking_phase_token: int = Field(
+    begin_thinking_phase_token: NonNegativeInt = Field(
         default=128798,
         description=
         "Token ID marking start of thinking phase. Relaxed acceptance only applies within this phase."
     )
-    end_thinking_phase_token: int = Field(
+    end_thinking_phase_token: NonNegativeInt = Field(
         default=128799,
         description=
         "Token ID marking end of thinking phase. Strict acceptance resumes after this."
@@ -1663,14 +1834,15 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        # Default max_draft_len to 1 if not set by the user.
-        # For vanilla MTP, update_spec_config_from_model_config will override this
-        # with the actual num_nextn_predict_layers from the model.
-        if self.max_draft_len is None:
-            self.max_draft_len = 1
-        elif self.max_draft_len <= 0:
-            raise ValueError("max_draft_len must be > 0 for MTP")
-        self.max_total_draft_tokens = self.max_draft_len  # Current MTP only supports linear tree
+        # Leave max_draft_len as None ("use the model's num_nextn_predict_layers")
+        # when the user doesn't set it; update_spec_config_from_model_config
+        # resolves it from the checkpoint before the model runs. When the user
+        # does set it, validate and mirror to max_total_draft_tokens (current MTP
+        # only supports a linear tree).
+        if self.max_draft_len is not None:
+            if self.max_draft_len <= 0:
+                raise ValueError("max_draft_len must be > 0 for MTP")
+            self.max_total_draft_tokens = self.max_draft_len
         return self
 
     @model_validator(mode="after")
@@ -1686,6 +1858,14 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def num_capture_layers(self) -> int:
+        # MTP_EAGLE (two-model) feeds captured target hidden states into the
+        # separate draft engine, so the shared Eagle3ResourceManager must
+        # allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes
+        # the target model's hidden_states straight to the MTP layer
+        # (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,
+        # both gated on self.is_mtp_eagle), so no capture buffer is needed
+        # and we should skip allocation to avoid disabling post-MLP/MoE
+        # fusion via the layer-capture hook.
         return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
 
     @property
@@ -1807,8 +1987,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for auto speculative decoding.
+    """Configuration for auto speculative decoding.
 
     This config will automatically select a good, draft-model free
     speculation algorithm with some heuristic.
@@ -1828,8 +2007,7 @@ class AutoDecodingConfig(DecodingBaseConfig):
 
 
 class PrometheusMetricsConfig(StrictBaseModel):
-    """
-    Configuration for Prometheus metrics collection.
+    """Configuration for Prometheus metrics collection.
 
     Groups all Prometheus-related parameters including custom histogram bucket
     boundaries for latency metrics.
@@ -1909,8 +2087,7 @@ class PrometheusMetricsConfig(StrictBaseModel):
 
 
 class RayPlacementConfig(StrictBaseModel):
-    """
-    Configuration for Ray GPU workers placement.
+    """Configuration for Ray GPU workers placement.
     Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
@@ -1976,8 +2153,8 @@ class RayPlacementConfig(StrictBaseModel):
 class ExecutorMemoryType(StrEnum):
     """Types of GPU memory used by executor.
 
-     These are used by the sleep/wakeup feature to target specific type of memory.
-     """
+    These are used by the sleep/wakeup feature to target specific type of memory.
+    """
     SAMPLER = "sampler"
     DRAFTER = "drafter"
     GUIDED_DECODER = "guided_decoder"
@@ -2097,9 +2274,9 @@ class SleepConfig(StrictBaseModel):
 
 
 class PybindMirror(ABC):
-    ''' A class containing the utilities for mirroring Python classes to
+    """A class containing the utilities for mirroring Python classes to
     pybind classes.
-    '''
+    """
 
     @abstractmethod
     def _to_pybind(self):
@@ -2115,8 +2292,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def mirror_pybind_fields(pybind_class):
-        """
-        Class decorator that ensures Python class fields mirror those of a C++ class.
+        """Class decorator that ensures Python class fields mirror those of a C++ class.
 
         Args:
             pybind_class: The C++ class whose fields should be mirrored
@@ -2145,7 +2321,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def get_pybind_enum_fields(pybind_class):
-        ''' Get all the enum fields from the pybind class. '''
+        """Get all the enum fields from the pybind class."""
         return [
             f for f in pybind_class.__members__.keys()
             if not f.startswith('_') and not callable(getattr(pybind_class, f))
@@ -2153,7 +2329,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def mirror_pybind_enum(pybind_class):
-        ''' Mirror the enum fields from the pybind class to the Python class. '''
+        """Mirror the enum fields from the pybind class to the Python class."""
 
         def decorator(cls):
             assert issubclass(cls, Enum)
@@ -2171,7 +2347,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def get_pybind_variable_fields(config_cls):
-        ''' Get all the variable fields from the pybind class. '''
+        """Get all the variable fields from the pybind class."""
         return [
             f for f in dir(config_cls)
             if not f.startswith('_') and not callable(getattr(config_cls, f))
@@ -2179,7 +2355,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def pybind_equals(obj0, obj1):
-        ''' Check if two pybind objects are equal. '''
+        """Check if two pybind objects are equal."""
         assert type(obj0) is type(obj1)
         for field in PybindMirror.get_pybind_variable_fields(type(obj0)):
             if getattr(obj0, field) != getattr(obj1, field):
@@ -2272,7 +2448,7 @@ class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
 
 @PybindMirror.mirror_pybind_enum(_ContextChunkingPolicy)
 class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
-    ''' Context chunking policy. '''
+    """Context chunking policy."""
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
     FORCE_CHUNK = "FORCE_CHUNK"
@@ -2558,6 +2734,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used."
     )
+    disk_cache_size: Optional[NonNegativeInt] = Field(
+        default=None,
+        description=
+        "Size of the disk cache in bytes. Only used by KV cache manager v2 in the PyTorch backend."
+    )
+    disk_cache_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
+    )
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -2666,6 +2852,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
     )
 
+    enable_kv_pool_rebalance: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for "
+        "rebalancing pool-group ratios between iterations. When True the "
+        "PyExecutor calls ``adjust()`` opportunistically; the auto-tuner "
+        "itself remains gated by V2's internal 2000-sample / 120s cooldown. "
+        "When False (default) the rebalance hook is skipped entirely and "
+        "pool ratios remain at their warmup-derived values. Beta: enable at "
+        "your own risk. Only used when using KV cache manager v2 "
+        "(experimental).")
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -2713,6 +2912,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.max_gpu_total_bytes must be non-negative")
         return v
+
+    @model_validator(mode='after')
+    def validate_disk_cache_config(self):
+        if self.disk_cache_size is not None and self.disk_cache_size > 0:
+            if not self.disk_cache_path:
+                raise ValueError(
+                    "kv_cache_config.disk_cache_path must be set when disk_cache_size is positive"
+                )
+            if not os.path.isdir(self.disk_cache_path):
+                raise ValueError(
+                    f"kv_cache_config.disk_cache_path {self.disk_cache_path} does not exist or is not a directory"
+                )
+        return self
 
     @field_validator('max_attention_window')
     @classmethod
@@ -2887,11 +3099,13 @@ class DwdpConfig(StrictBaseModel):
     DWDP accelerates the context (prefill) phase of disaggregated MoE serving
     by combining data parallelism with NVLink-based expert weight sharing.
     Each worker holds a subset of experts locally and asynchronously prefetches
-    the remaining experts from peer workers via CUDA IPC, enabling fully
-    asynchronous execution across ranks without synchronization barriers.
+    the remaining experts from peer workers via CUDA VMM + MNNVL fabric
+    handles (composite virtual-address layout with zero-copy local mapping and
+    double-buffered P2P remote regions), enabling fully asynchronous execution
+    across ranks without synchronization barriers.
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
-    on NVLink-connected multi-GPU systems.
+    on MNNVL-connected multi-GPU systems (e.g., GB200).
     """
     dwdp_size: int = Field(default=1,
                            description="The number of GPUs per DWDP group.")
@@ -3596,12 +3810,11 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_model_format_misc(self):
-        '''
-        Load the model format, and do the following:
+        """Load the model format, and do the following:
 
         1. Load the build_config if got an engine.
         2. Load the parallel_config if got a checkpoint.
-        '''
+        """
         model_obj = _ModelWrapper(self.model)
 
         if model_obj.is_local_model and self.backend not in [
@@ -3698,6 +3911,8 @@ class LoadFormat(Enum):
     DUMMY = 1
     # Only load the multimodal(vision) encoder weights
     VISION_ONLY = 2
+    # Load weights through GPU Memory Service.
+    GMS = 3
 
 
 class ModelExpressConfig(StrictBaseModel):
@@ -3741,6 +3956,77 @@ class ModelExpressConfig(StrictBaseModel):
                 "mx_config.preshard_strategy='global' requires "
                 "LoadFormat.PRESHARDED, which is not yet available in "
                 "TRT-LLM main. Use preshard_strategy='per_module' instead.")
+        return self
+
+
+class GmsConfig(StrictBaseModel):
+    """Prototype configuration for GPU Memory Service (GMS) weight sharing.
+
+    Composes orthogonally with ``checkpoint_format`` on ``TorchLlmArgs``:
+    GMS controls *where* weights live (a node-shared GPU memory pool
+    so multiple TRT-LLM instances zero-copy share the same bytes),
+    while ``checkpoint_format`` controls *how* they get there (HF disk,
+    MX P2P, etc.). Effective only when ``TorchLlmArgs.load_format ==
+    LoadFormat.GMS``; setting any non-default field here without that
+    load_format triggers a warning via :meth:`TorchLlmArgs.validate_gms_config`.
+
+    Two roles are decided at connect time by the GMS daemon, not by
+    config:
+
+    - **RW (writer)**: the first instance loads weights into the pool
+      via the normal checkpoint-loader pipeline, then commits them.
+    - **RO (reader)**: subsequent instances zero-copy materialize the
+      already-committed layout — no disk I/O, no per-instance copies.
+
+    See :class:`tensorrt_llm._torch.memory.gpu_memory_backend.GMSBackend`
+    for the integration adapter and the ``LoadFormat.GMS`` branch in
+    ``ModelLoader.load`` for orchestration.
+    """
+
+    socket_path: Optional[str] = Field(
+        default=None,
+        description="Unix domain socket path of the GPU Memory Service. "
+        "When unset, the GMS library resolves its default per-device path.",
+        status="prototype",
+    )
+
+    mode: Literal["auto", "rw", "ro"] = Field(
+        default="auto",
+        description="GMS operating mode: 'auto' requests RW or RO, 'rw' "
+        "requires writer mode, and 'ro' requires read-only mode.",
+        status="prototype",
+    )
+
+    tag: str = Field(
+        default="weights",
+        description="Tag identifying the model weight set in the GMS memory "
+        "pool. Defaults to 'weights' to match the GMS library convention. "
+        "The tag must uniquely identify a compatible model/parallelism "
+        "layout for a given GMS daemon; reusing a tag for different weights "
+        "can make RO readers attach to the wrong pool.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def validate_gms_config(self) -> 'GmsConfig':
+        """Enforce non-empty :attr:`tag`.
+
+        :attr:`mode` is enforced by its ``Literal`` type annotation —
+        Pydantic rejects out-of-set values at field validation, before
+        this validator runs, so the JSON schema/docs are self-describing
+        (enum) without a duplicated whitelist here.  This validator only
+        enforces the non-empty / non-whitespace contract on :attr:`tag`,
+        which the type system can't express.
+
+        Raises:
+            ValueError: If ``tag`` is empty / whitespace-only.
+
+        Returns:
+            ``self`` (Pydantic ``model_validator`` contract).
+        """
+        if not self.tag or not self.tag.strip():
+            raise ValueError(
+                f"gms_config.tag must be a non-empty string, got {self.tag!r}.")
         return self
 
 
@@ -3804,7 +4090,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.",
         status="beta")
 
-    cuda_graph_config: Optional[CudaGraphConfig] = Field(
+    cuda_graph_config: Optional[CudaGraphConfigType] = Field(
         default_factory=CudaGraphConfig,
         description="CUDA graph config. If true, use CUDA graphs for decoding. \
         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, \
@@ -3813,6 +4099,18 @@ class TorchLlmArgs(BaseLlmArgs):
         since the input shapes are a function of the sequence lengths).\
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
+
+    @field_validator('cuda_graph_config', mode='before')
+    @classmethod
+    def infer_cuda_graph_config_mode(cls, v):
+        if isinstance(v, dict) and "mode" not in v:
+            encoder_keys = {
+                "num_tokens", "max_num_token", "seq_lens", "max_seq_len"
+            }
+            v = dict(v)
+            v["mode"] = "encode" if any(k in v and v[k] not in (None, 0)
+                                        for k in encoder_keys) else "decode"
+        return v
 
     attention_dp_config: Optional[AttentionDpConfig] = Field(
         default=None,
@@ -3996,6 +4294,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    gms_config: GmsConfig = Field(
+        default_factory=GmsConfig,
+        description="GPU Memory Service (GMS) weight sharing config.",
+        status="prototype",
+    )
+
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
@@ -4138,6 +4442,16 @@ class TorchLlmArgs(BaseLlmArgs):
     def convert_load_format(cls, v):
         if isinstance(v, LoadFormat):
             return v
+        # ``bool`` is a subclass of ``int`` in Python, so without an
+        # explicit bool check ``load_format=True/False`` would silently
+        # coerce to ``LoadFormat(1) == LoadFormat.DUMMY`` /
+        # ``LoadFormat(0) == LoadFormat.AUTO``. Reject early so callers
+        # who pass a misread boolean flag get an actionable error
+        # instead of a silently wrong checkpoint-load mode.
+        if isinstance(v, bool):
+            raise ValueError(f"Invalid LoadFormat: {v}")
+        if isinstance(v, int):
+            return LoadFormat(v)
         load_format = v.upper()
         if load_format not in LoadFormat.__members__:
             raise ValueError(f"Invalid LoadFormat: {v}")
@@ -4162,6 +4476,26 @@ class TorchLlmArgs(BaseLlmArgs):
     @model_validator(mode="after")
     def set_model_format(self):
         self._model_format = _ModelFormatKind.HF
+        return self
+
+    @model_validator(mode="after")
+    def validate_encoder_modes(self) -> 'TorchLlmArgs':
+        if self.encode_only and self.mm_encoder_only:
+            raise ValueError(
+                "encode_only and mm_encoder_only are mutually exclusive. "
+                "Use encode_only=True for LLM.encode(), or use "
+                "MultimodalEncoder/mm_encoder_only for multimodal encoder "
+                "execution.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_encode_only_torch_compile_config(self) -> 'TorchLlmArgs':
+        if (self.encode_only and self.torch_compile_config is not None
+                and self.torch_compile_config.enable_piecewise_cuda_graph):
+            raise ValueError(
+                "encode_only does not support piecewise CUDA graph in "
+                "TorchCompileConfig. Use cuda_graph_config for encoder CUDA "
+                "graphs or disable enable_piecewise_cuda_graph.")
         return self
 
     @model_validator(mode="after")
@@ -4322,6 +4656,79 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_gms_config(self) -> 'TorchLlmArgs':
+        """Warn when GMS settings are provided without enabling GMS load.
+
+        Catches the most common misconfiguration: a user customizes
+        :attr:`gms_config` (e.g. sets a custom ``socket_path`` or
+        ``mode``) but forgets to set ``load_format='GMS'``, in which
+        case the entire GMS config is silently ignored. We emit a
+        warning so the user notices at config time instead of
+        debugging "why are my workers not zero-copy sharing weights?"
+        afterwards.
+
+        Detection is by deviation from defaults: any of
+        ``socket_path != None``, ``mode != 'auto'``, or
+        ``tag != 'weights'`` triggers the warning when
+        ``load_format != LoadFormat.GMS``. This is intentionally a
+        warning (not an error) so callers that pre-populate config
+        objects from templates aren't broken.
+
+        Returns:
+            ``self`` (Pydantic ``model_validator`` contract).
+        """
+        gms_config_is_non_default = (self.gms_config.socket_path is not None
+                                     or self.gms_config.mode != "auto"
+                                     or self.gms_config.tag != "weights")
+        if gms_config_is_non_default and self.load_format != LoadFormat.GMS:
+            logger.warning(
+                "gms_config is set but load_format is '%s', not 'GMS'. "
+                "The GMS config will be ignored. Set load_format='GMS' to "
+                "enable GPU Memory Service.", self.load_format.name)
+        return self
+
+    @model_validator(mode="after")
+    def validate_gms_moe_compat(self) -> 'TorchLlmArgs':
+        """Reject ``LoadFormat.GMS`` combined with a MoE load balancer.
+
+        The ``MoeLoadBalancer``'s ``register_weight_slots_after_to_cuda``
+        and ``finalize_model`` run AFTER the GMS RW pool is closed and
+        ``finalize_write`` has committed, so any CUDA allocations they
+        make land in non-GMS memory and are NOT part of the committed
+        layout that RO peers receive. The result is "wrong inference,
+        no error" on RO peers (broken MoE routing state). Failing at
+        config-validation time is strictly better than that silent
+        miscompute.
+
+        The fix for this gap (running the MoE finalize work INSIDE
+        ``mem_pool_scope`` and BEFORE ``finalize_write`` so MoE
+        allocations are part of the committed layout) is tracked as
+        the (MoE, GMS) follow-up; see ``model_loader.py``'s
+        ``TODO(GMS-MOE-LB)`` comment.
+
+        Returns:
+            ``self`` (Pydantic ``model_validator`` contract).
+
+        Raises:
+            ValueError: When ``load_format == LoadFormat.GMS`` and
+                ``moe_config.load_balancer`` is set.
+        """
+        if (self.load_format == LoadFormat.GMS and self.moe_config is not None
+                and self.moe_config.load_balancer is not None):
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with moe_config.load_balancer "
+                "in this PR. The MoE load balancer's "
+                "register_weight_slots_after_to_cuda and finalize_model run "
+                "after the GMS pool closes and finalize_write commits, so "
+                "their allocations land outside the committed layout. RO "
+                "peers would receive a broken MoE routing state. Either "
+                "disable moe_config.load_balancer or use LoadFormat.AUTO. "
+                "Tracked as the (MoE, GMS) follow-up at "
+                "tensorrt_llm/_torch/pyexecutor/model_loader.py "
+                "(see TODO(GMS-MOE-LB)).")
+        return self
+
+    @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
         if isinstance(self.moe_config.load_balancer, str):
             if not os.path.exists(self.moe_config.load_balancer):
@@ -4408,7 +4815,7 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
-                f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+                "ray_worker_extension_cls is only supported with orchestrator_type='ray'"
             )
         return self
 
@@ -4455,23 +4862,56 @@ class TorchLlmArgs(BaseLlmArgs):
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
-        extra_llm_api_options: Optional[str] = None) -> Dict:
+        extra_llm_api_options: Optional[str] = None,
+        explicit_cli_keys: Optional[Set[str]] = None) -> Dict:
+    """Merge YAML overrides into a CLI-derived llm_args dict.
+
+    If `explicit_cli_keys` is provided, those CLI flag names override any
+    conflicting YAML values. CLI flags whose name does not match the
+    LlmArgs field name (e.g. `--free_gpu_memory_fraction` constructs
+    `kv_cache_config.free_gpu_memory_fraction`) are mapped to the nested
+    field they target.
+
+    If `explicit_cli_keys` is None, YAML wins on conflicts.
+    """
+    # CLI scalar -> nested KvCacheConfig field. Callers add the CLI scalar
+    # name to `explicit_cli_keys` to make it win over YAML's same-named
+    # field inside `kv_cache_config:`.
+    cli_to_kv_cache_field = {
+        "free_gpu_memory_fraction": "free_gpu_memory_fraction",
+        "kv_cache_dtype": "dtype",
+        "enable_block_reuse": "enable_block_reuse",
+    }
+    # Scalars that live both at the top level of LlmArgs and inside
+    # `build_config`. The build_config patch propagates the winning source
+    # to the nested location.
+    build_config_dual_loc_keys = (
+        "max_batch_size",
+        "max_num_tokens",
+        "max_beam_width",
+        "max_seq_len",
+    )
+
+    explicit_cli_keys = explicit_cli_keys or set()
 
     if 'hf_revision' in llm_args_dict:
         llm_args_dict.setdefault('revision', llm_args_dict.pop('hf_revision'))
 
     # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
     if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:
-        # Convert KvCacheConfig object to dict if necessary
         base_kv_config = llm_args['kv_cache_config']
         if isinstance(base_kv_config, KvCacheConfig):
             base_kv_config = base_kv_config.model_dump(exclude_unset=True)
-        llm_args_dict['kv_cache_config'] = base_kv_config | llm_args_dict[
-            'kv_cache_config']
+        merged = base_kv_config | llm_args_dict['kv_cache_config']
+        for cli_name, kv_field in cli_to_kv_cache_field.items():
+            if cli_name in explicit_cli_keys and kv_field in base_kv_config:
+                merged[kv_field] = base_kv_config[kv_field]
+        llm_args_dict['kv_cache_config'] = merged
 
     # Deep merge telemetry_config: YAML can override fields like `disabled`,
     # but `usage_context` is determined by the CLI entry point and must not
-    # be overridden by user config.
+    # be overridden by user config. When `--telemetry/--no-telemetry` was
+    # typed explicitly, CLI's `disabled` wins over YAML.
     if 'telemetry_config' in llm_args and 'telemetry_config' in llm_args_dict:
         yaml_tc = llm_args_dict['telemetry_config']
         if not isinstance(yaml_tc, (dict, TelemetryConfig)):
@@ -4485,7 +4925,27 @@ def update_llm_args_with_extra_dict(
             if isinstance(yaml_tc, TelemetryConfig):
                 yaml_tc = yaml_tc.model_dump(exclude_unset=True)
             yaml_tc.pop('usage_context', None)
-            llm_args_dict['telemetry_config'] = base_tc | yaml_tc
+            merged = base_tc | yaml_tc
+            if "telemetry" in explicit_cli_keys and 'disabled' in base_tc:
+                merged['disabled'] = base_tc['disabled']
+            llm_args_dict['telemetry_config'] = merged
+
+    # Drop YAML keys claimed by explicit CLI flags so the outer merge below
+    # cannot overwrite them. Warn only when the CLI value actually differs from
+    # the YAML value, so users who relied on the previous "YAML wins" behavior
+    # are notified that CLI now takes precedence.
+    if explicit_cli_keys:
+        overridden = sorted(
+            k for k in llm_args_dict
+            if k in explicit_cli_keys and llm_args.get(k) != llm_args_dict[k])
+        if overridden:
+            logger.warning(
+                f"Explicit CLI flag(s) {overridden} override the value(s) set "
+                f"in the YAML config; CLI takes precedence.")
+        llm_args_dict = {
+            k: v
+            for k, v in llm_args_dict.items() if k not in explicit_cli_keys
+        }
 
     field_mapping = {
         "quant_config": QuantConfig,
@@ -4505,8 +4965,9 @@ def update_llm_args_with_extra_dict(
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
             llm_args_dict[field_name] = field_type(**llm_args_dict[field_name])
-            extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
-            logger.warning(f"Overriding {field_name} {extra_llm_str}")
+            if field_name in llm_args:
+                extra_llm_str = f" because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
+                logger.info(f"YAML overrides {field_name}{extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
 
@@ -4516,34 +4977,51 @@ def update_llm_args_with_extra_dict(
         if isinstance(llm_args["build_config"], dict):
             llm_args["build_config"] = BuildConfig(**llm_args["build_config"])
 
-        for key in [
-                "max_batch_size",
-                "max_num_tokens",
-                "max_beam_width",
-                "max_seq_len",
-        ]:
-            if key in llm_args_dict:
-                logger.info(
-                    f"Overriding {key} from build_config to {llm_args_dict[key]}"
-                )
+        # Propagate dual-location scalars into build_config: explicit CLI flag
+        # wins; otherwise YAML's top-level scalar; otherwise leave alone. Warn
+        # only when the explicit CLI value actually differs from the YAML
+        # build_config value being replaced (a genuine override).
+        for key in build_config_dual_loc_keys:
+            if key in explicit_cli_keys and key in llm_args:
+                # Warn only on a genuine override of a YAML build_config value;
+                # otherwise just record where the value came from.
+                if getattr(llm_args["build_config"], key) != llm_args[key]:
+                    logger.warning(
+                        f"Explicit CLI flag --{key}={llm_args[key]} overrides "
+                        f"the value set in the YAML build_config; CLI takes "
+                        f"precedence.")
+                else:
+                    logger.info(
+                        f"build_config.{key} set to {llm_args[key]} from explicit CLI flag"
+                    )
+                setattr(llm_args["build_config"], key, llm_args[key])
+            elif key in llm_args_dict:
                 setattr(llm_args["build_config"], key, llm_args_dict[key])
+                logger.info(
+                    f"build_config.{key} set to {llm_args_dict[key]} from YAML top-level scalar"
+                )
 
     return llm_args
 
 
-def update_llm_args_with_extra_options(llm_args: Dict,
-                                       extra_llm_api_options: str) -> Dict:
+def update_llm_args_with_extra_options(
+        llm_args: Dict,
+        extra_llm_api_options: str,
+        explicit_cli_keys: Optional[Set[str]] = None) -> Dict:
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
-                                                       extra_llm_api_options)
+            llm_args = update_llm_args_with_extra_dict(
+                llm_args,
+                llm_args_dict,
+                extra_llm_api_options,
+                explicit_cli_keys=explicit_cli_keys)
     return llm_args
 
 
 def get_model_format(model_dir: str,
                      trust_remote_code: bool = False) -> _ModelFormatKind:
-    ''' Get the format of the model.  '''
+    """Get the format of the model."""
     if not (Path(model_dir) / 'config.json').exists():
         raise ValueError(
             f"Failed to infer model format because no config.json exists in {model_dir}"

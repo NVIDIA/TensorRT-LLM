@@ -9,11 +9,12 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -26,7 +27,6 @@ except ImportError:
     # Removed in transformers>=5
     def get_parameter_device(module):
         return next(module.parameters()).device
-
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -129,6 +129,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
         self.ff_out = Linear(
             in_features,
@@ -143,6 +144,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
 
         self.norm2 = LayerNorm(
@@ -201,6 +203,7 @@ class WanTimeTextImageEmbedding(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         self.text_embedder = PixArtAlphaTextProjection(text_embed_dim, dim, act_fn="gelu_tanh")
 
@@ -281,19 +284,36 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
-        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h, 14B 40h)
-        # fit the default fused_dit_qk_norm_rope op's full-dim template now that
-        # the num_heads cap is 64 (post-survey 2026-05).
+        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h,
+        # 14B 40h) fit the default fused_dit_qk_norm_rope op's full-dim
+        # template now that the num_heads cap is 64 (post-survey 2026-05).
+        # However, this kernel does not support TP due to the cross-head
+        # normalization being a collective op. Thus, we must disable it if
+        # using TP.
+        # When ulysses_size > 1 AND parallel.async_ulysses is set, switch
+        # to SEPARATE_QKV so V/Q/K projections can stream-pipeline through
+        # the async ulysses A2A path.
+        tp_size = model_config.mapping.tp_size if model_config.mapping else 1
+        vgm_self = model_config.visual_gen_mapping
+        ulysses_size_self = vgm_self.ulysses_size if vgm_self is not None else 1
+        _async_a2a = model_config.parallel.async_ulysses if model_config is not None else False
+        self._use_async_ulysses = bool(ulysses_size_self > 1) and _async_a2a
+        _qkv_mode_self = QKVMode.SEPARATE_QKV if self._use_async_ulysses else QKVMode.FUSE_QKV
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=_qkv_mode_self,
             qk_norm=True,
             eps=eps,
-            fuse_qk_norm_rope=True,
+            # fuse_qk_norm_rope=True drives the packed kernel on sync (FUSE_QKV)
+            # and the split kernel on async (SEPARATE_QKV via forward_async).
+            # Disabled when TP>1 since the fused kernel lacks cross-rank
+            # all-reduce for the cross-head RMSNorm variance.
+            fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
+            async_ulysses=self._use_async_ulysses,
         )
 
         # Cross-attention with separate Q, K, V
@@ -306,7 +326,7 @@ class WanBlock(nn.Module):
             eps=eps,
             config=model_config,
             layer_idx=_layer_idx,
-            enable_ulysses=False,
+            enable_sequence_parallel=False,
         )
 
         if cross_attn_norm:
@@ -331,13 +351,14 @@ class WanBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
-            reduce_output=False,
+            reduce_output=(tp_size != 1),
         )
 
-        # I2V: Additional K/V projections for image embeddings
+        # I2V: Additional K/V projections for image embeddings.
         self.add_k_proj = self.add_v_proj = None
         self.norm_added_k = None
         if added_kv_proj_dim is not None:
+            tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
             self.add_k_proj = Linear(
                 added_kv_proj_dim,
                 hidden_size,
@@ -346,6 +367,8 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
             )
             self.add_v_proj = Linear(
                 added_kv_proj_dim,
@@ -355,9 +378,16 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
             )
-            self.norm_added_k = RMSNorm(
-                hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True
+            self.norm_added_k = RMSNormTPAware(
+                hidden_size=hidden_size,
+                eps=eps,
+                dtype=dtype,
+                has_weights=True,
+                enable_tp=(tp_size > 1),
+                mapping=model_config.mapping,
             )
 
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
@@ -397,15 +427,15 @@ class WanBlock(nn.Module):
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
 
-        # Self-attention with RoPE
-        x = (
-            x.float()
-            + self.attn1(
-                normed,
-                freqs=freqs,
-            ).float()
-            * gate_msa
-        ).to(x.dtype)
+        # Self-attention with RoPE. Async-ulysses dispatches to forward_async
+        # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
+        # side stream; both paths return 3D [B, S, H*D].
+        if self._use_async_ulysses:
+            attn1_out = self.attn1.forward_async(normed, freqs=freqs)
+        else:
+            attn1_out = self.attn1(normed, freqs=freqs)
+
+        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
         norm_x = self.norm2(x.float()).to(x.dtype)
 
@@ -457,20 +487,16 @@ class WanBlock(nn.Module):
         return x
 
 
-class WanTransformer3DModel(nn.Module):
+class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
 
     def __init__(
         self,
         model_config: DiffusionModelConfig,
     ):
-        super().__init__()
-
-        self.model_config = model_config
+        super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
-        if vgm is not None and vgm.tp_size > 1:
-            raise ValueError(f"WAN does not support tensor parallelism. Got tp_size={vgm.tp_size}")
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
         self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
@@ -571,6 +597,7 @@ class WanTransformer3DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
         self.scale_shift_table = nn.Parameter(
@@ -772,6 +799,9 @@ class WanTransformer3DModel(nn.Module):
                     loader.load_linear_weights(module, name, weight_dicts)
                 elif "add_k_proj" in name or "add_v_proj" in name:
                     logger.info(f"[Weight Loading] No weights found for I2V module: {name}")
+            elif isinstance(module, RMSNormTPAware):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():

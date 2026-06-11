@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Slimmed down PyTorch Qwen3 MoE model implementation for auto_deploy export.
+"""Qwen3 MoE model (sharding IR).
 
 Source:
 https://huggingface.co/Qwen/Qwen3-30B-A3B
@@ -95,7 +95,16 @@ class Qwen3MoeRotaryEmbedding(RotaryEmbeddingBase):
 
 
 class Qwen3MoeMLP(nn.Module):
-    """MLP layer for Qwen3 MoE (SwiGLU activation)."""
+    """MLP layer for Qwen3 MoE (SwiGLU activation).
+
+    Used as the dense MLP in non-MoE layers; for MoE layers each expert is a
+    separate instance whose weights are consumed directly by ``torch_moe``
+    (this ``forward`` is not invoked then).
+
+    Sharding strategy (when used as a dense MLP):
+      ``gate_proj`` / ``up_proj`` -> ``tp_mode="colwise"``.
+      ``down_proj`` -> ``tp_mode="rowwise"`` + ``all_reduce(layer_type="mlp")``.
+    """
 
     def __init__(self, config: Qwen3MoeConfig, intermediate_size: Optional[int] = None):
         super().__init__()
@@ -110,7 +119,29 @@ class Qwen3MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias,
+            tp_mode="colwise",
+            layer_type="mlp",
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.up_proj.weight,
+            self.up_proj.bias,
+            tp_mode="colwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
+        return down
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -118,6 +149,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     Uses softmax top-k routing with optional probability normalization.
     Expert computation is handled by the torch_moe canonical op.
+
+    Sharding strategy:
+      Router ``gate`` is TP-replicated (unsharded ``nn.Linear``); routing
+      decisions are identical on every rank.
+      Expert weights are sharded by ``apply_sharding_hints`` via the
+      ``torch_moe`` op carrying ``layer_type="moe"`` (EP/TP).
+      A single ``all_reduce(layer_type="moe")`` follows ``torch_moe``.
     """
 
     def __init__(self, config: Qwen3MoeConfig):
@@ -206,6 +244,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             w1_weight=[expert.gate_proj.weight for expert in self.experts],
             w2_weight=[expert.down_proj.weight for expert in self.experts],
             w3_weight=[expert.up_proj.weight for expert in self.experts],
+            layer_type="moe",
+        )
+        final_hidden_states = torch.ops.auto_deploy.all_reduce(
+            final_hidden_states, layer_type="moe"
         )
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
@@ -218,6 +260,15 @@ class Qwen3MoeAttention(nn.Module):
     Qwen3 MoE applies RMSNorm to query and key states after projection and reshaping,
     but before RoPE application. This per-head normalization on head_dim is a key
     architectural feature shared with the dense Qwen3 model.
+
+    Sharding strategy:
+      ``q_proj`` -> ``tp_mode="colwise"`` (sharded by ``num_heads``).
+      ``k_proj`` / ``v_proj`` -> ``tp_mode="colwise"`` with
+      ``tp_min_local_shape=head_dim`` (GQA-safe).
+      Q/K/V reshape -> ``auto_deploy.view`` with ``tp_scaled_dim=2`` (head
+      count dim scales with TP).
+      Post-attention reshape -> ``auto_deploy.view`` with ``tp_scaled_dim=2``.
+      ``o_proj`` -> ``tp_mode="rowwise"`` + ``all_reduce(layer_type="mha")``.
     """
 
     def __init__(self, config: Qwen3MoeConfig, layer_idx: Optional[int] = None):
@@ -258,10 +309,49 @@ class Qwen3MoeAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout)
-        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout).
+        # Head-count dim (2) scales with TP, so use auto_deploy.view.
+        q = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            layer_type="mha",
+        )
+        q = torch.ops.auto_deploy.view(
+            q,
+            [bsz, q_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.view(
+            k,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.view(
+            v,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         # Apply per-head Q/K normalization (Qwen3-specific, on head_dim dimension)
         q = self.q_norm(q)
@@ -294,9 +384,22 @@ class Qwen3MoeAttention(nn.Module):
             "bsnd",  # layout
         )
 
-        # Reshape [B, S, N, head_dim] -> [B, S, N * head_dim] and project
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
-        attn_output = self.o_proj(attn_output)
+        # Reshape [B, S, N, head_dim] -> [B, S, N * head_dim] and project.
+        # Collapsed dim scales with TP via num_heads.
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 

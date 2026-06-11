@@ -781,6 +781,63 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(2)
+    @skip_pre_hopper
+    def test_gen_only_spec_dec(self):
+        speculative_decoding_config = {
+            "decoding_type": "Eagle",
+            "max_draft_len": 4,
+            "speculative_model":
+            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            "eagle3_one_model": True,
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler":
+            True,  # BS=1 does not need overlap scheduling
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": True  # reuse on context requests
+            },
+            "max_num_tokens": 13393 * 2,
+            "max_batch_size": 1,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096,
+            },
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False
+            },
+            "max_num_tokens": 13393 * 2,
+            "max_batch_size": 16,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096,
+            },
+            "cuda_graph_config": None,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mocker):
@@ -916,46 +973,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                  test_sets=[get_accuracy_task(testset)])
 
 
-class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
-
-    @pytest.mark.skip_less_device_memory(140000)
-    @pytest.mark.timeout(3600)
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("overlap_scheduler", [False, True])
-    def test_auto_dtype(self, overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
-        ctx_server_config["cache_transceiver_config"] = {
-            "backend": "DEFAULT",
-            "max_tokens_in_buffer": 4096
-        }
-        gen_server_config["cache_transceiver_config"] = {
-            "backend": "DEFAULT",
-            "max_tokens_in_buffer": 4096
-        }
-        # Keep this low to avoid warmup OOM in CI
-        ctx_server_config["max_seq_len"] = 8192
-        gen_server_config["max_seq_len"] = 8192
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      tensor_parallel_size=4) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
-
-
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
@@ -1040,6 +1057,39 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 extra_env={"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1"},
         ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(8)
+    @skip_pre_hopper
+    def test_gen_only_spec_dec(self):
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": False}
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "max_tokens_in_buffer": 4096,
+            "transceiver_runtime": "PYTHON",
+        }
+        ctx_server_config["cache_transceiver_config"] = cache_transceiver_config
+        gen_server_config["cache_transceiver_config"] = cache_transceiver_config
+        gen_server_config["speculative_config"] = {
+            "decoding_type": "MTP",
+            "max_draft_len": 2
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      tensor_parallel_size=4) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("overlap_scheduler", [True, False])

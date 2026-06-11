@@ -29,6 +29,7 @@ try:
         create_attention_metadata_state,
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+    from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.rope import LTXRopeType
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, TorchCompileConfig
@@ -95,35 +96,33 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, *fn_args):
 # Small AudioVideo config. ulysses_size=2 needs:
 # - num_attention_heads % 2 == 0 (video heads sharded by Ulysses)
 # - audio_num_attention_heads % 2 == 0 (audio heads sharded by Ulysses)
-# - head_dim ∈ {64, 128} to exercise the fused FA4 / vanilla rope path
+# - head_dim ∈ {64, 128} so LTX2Attention.forward() takes the fused-rope
+#   branch (otherwise eager fallback masks the cos/num_tokens check that
+#   exposes the audio-pad seq_dim regression).
 # cross_attention_dim must equal inner_dim (=num_heads * head_dim) because
 # caption_projection projects caption_channels → inner_dim and the result is
 # fed straight into block.attn2.to_k whose input dim = cross_attention_dim.
 # Same constraint applies to audio_*.
-# head_dim=32 deliberately falls outside {64, 128} so LTX2Attention.forward()
-# takes ``_forward_unfused`` and ``project_kv`` skips ``fused_dit_split_norm``.
-# That keeps the test runnable in dev images without the LTX-2 C++ extensions
-# while still exercising the v2a Ulysses + key_padding_mask code paths under
-# both VANILLA and FLASH_ATTN4 backends.
 _AV_CONFIG = dict(
     num_attention_heads=4,
-    attention_head_dim=32,
+    attention_head_dim=64,
     in_channels=16,
     out_channels=16,
     num_layers=2,
-    cross_attention_dim=128,  # = num_attention_heads * attention_head_dim
+    cross_attention_dim=256,  # = num_attention_heads * attention_head_dim
     caption_channels=64,
     norm_eps=1e-6,
     positional_embedding_max_pos=[4, 32, 32],
     timestep_scale_multiplier=1000,
     use_middle_indices_grid=True,
     audio_num_attention_heads=4,
-    audio_attention_head_dim=32,
+    audio_attention_head_dim=64,
     audio_in_channels=16,
     audio_out_channels=16,
-    audio_cross_attention_dim=128,  # = audio_num_attention_heads * audio_attention_head_dim
+    audio_cross_attention_dim=256,  # = audio_num_attention_heads * audio_attention_head_dim
     audio_positional_embedding_max_pos=[64],
     av_ca_timestep_scale_multiplier=1,
+    rope_type=LTXRopeType.SPLIT,
 )
 
 

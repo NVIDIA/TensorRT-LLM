@@ -8,7 +8,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import safetensors.torch
 import torch
@@ -17,6 +17,7 @@ from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
+from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
@@ -151,6 +152,23 @@ def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -
         )
 
 
+_LTX2_PREFETCHED_SAFETENSORS: Set[str] = set()
+
+
+def _prefetch_ltx2_safetensors_files(file_names: List[str]) -> bool:
+    """Warm LTX-2 safetensors files in the host page cache.
+
+    For distributed runs, local ranks split the file list and synchronize before
+    weight loading so ranks do not duplicate the prefetch work on the same node.
+    """
+    return prefetch_files_to_host_cache(
+        file_names,
+        description="LTX-2 checkpoint",
+        prefetched_paths=_LTX2_PREFETCHED_SAFETENSORS,
+        ignore_errors=True,
+    )
+
+
 def _load_ltx2_transformer_weights(
     checkpoint_dir: str,
     prefix: str,
@@ -177,6 +195,8 @@ def _load_ltx2_transformer_weights(
 
     if not sft_paths:
         raise ValueError(f"No safetensors files found in {checkpoint_dir}")
+
+    _prefetch_ltx2_safetensors_files(sft_paths)
 
     exclude_prefixes = tuple(exclude_prefixes) if exclude_prefixes else ()
 
@@ -609,7 +629,7 @@ class LTX2Pipeline(BasePipeline):
             logger.info(f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled; forcing one-stage LTX2 pipeline.")
             return cls
 
-        checkpoint_path = getattr(config.pretrained_config, "_name_or_path", "")
+        checkpoint_path = getattr(config.primary_pretrained_config, "_name_or_path", "")
         if checkpoint_path:
             config.extra_attrs.update(
                 resolve_ltx2_pipeline_extra_attrs(Path(checkpoint_path), config.extra_attrs)
@@ -624,7 +644,7 @@ class LTX2Pipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def default_warmup_resolutions(self):
@@ -713,13 +733,14 @@ class LTX2Pipeline(BasePipeline):
         the reference ``LTXModelConfigurator.from_config()``.  Missing keys
         fall back to the same defaults the reference uses.
         """
-        attn_cfg = getattr(self.model_config, "attention", None)
+        attn_cfg = getattr(self.pipeline_config, "attention", None)
         if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
             raise NotImplementedError(
                 "Quantized attention is not yet supported for the LTX-2 pipeline."
             )
 
-        cfg = self.model_config.pretrained_config
+        model_config = self.pipeline_config.model_configs["transformer"]
+        cfg = model_config.pretrained_config
 
         rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
         freq_prec = getattr(cfg, "frequencies_precision", False)
@@ -760,7 +781,7 @@ class LTX2Pipeline(BasePipeline):
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
-            model_config=self.model_config,
+            model_config=model_config,
         )
         self.transformer._transformer_config = vars(cfg)
 
@@ -786,11 +807,11 @@ class LTX2Pipeline(BasePipeline):
         iterations (WARMUP_STEPS=2), so the captured graph contains the
         optimized compiled kernels.
         """
-        if not self.model_config.cuda_graph.enable:
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
         runner = _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
-        compile_note = " (with torch.compile)" if self.model_config.torch_compile.enable else ""
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
             f"CUDA graph runner: wrapping transformer.forward (Modality-aware){compile_note}"
         )
@@ -829,7 +850,7 @@ class LTX2Pipeline(BasePipeline):
                 tokenizer files, and ``preprocessor_config.json``.
         """
         skip_components = skip_components or []
-        dtype = self.model_config.torch_dtype
+        dtype = self.pipeline_config.torch_dtype
 
         needs_text = (
             PipelineComponent.TOKENIZER not in skip_components
@@ -858,8 +879,9 @@ class LTX2Pipeline(BasePipeline):
             ).to(device)
 
         # --- Resolve native config ----------------------------------------
-        native_config = self.model_config.extra_attrs.get("monolithic_safetensors_config")
+        native_config = self.pipeline_config.extra_attrs.get("monolithic_safetensors_config")
         sft_paths = _find_safetensors_files(checkpoint_dir)
+        _prefetch_ltx2_safetensors_files(sft_paths)
 
         if native_config is None and sft_paths:
             native_config = _read_safetensors_config(sft_paths[0])
@@ -999,7 +1021,7 @@ class LTX2Pipeline(BasePipeline):
         # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
 
         # Cache-DiT
-        if self.transformer is not None and self.model_config.cache_backend == "cache_dit":
+        if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
             self._setup_cache_acceleration(self.transformer, coefficients=None)
 
         # Compression ratios from native scale factors
@@ -1253,7 +1275,6 @@ class LTX2Pipeline(BasePipeline):
             "max_sequence_length": 1024,
             "num_frames": 121,
             "frame_rate": 24.0,
-            "image_cond_strength": 1.0,
         }
 
     @property
@@ -1268,6 +1289,11 @@ class LTX2Pipeline(BasePipeline):
                 type="float",
                 default=0.0,
                 description="Guidance rescale factor to prevent overexposure.",
+            ),
+            "image_cond_strength": ExtraParamSchema(
+                type="float",
+                default=1.0,
+                description="Image conditioning strength for I2V (1.0 = fully conditioned first frame).",
             ),
             "stg_scale": ExtraParamSchema(
                 type="float",
@@ -1318,7 +1344,7 @@ class LTX2Pipeline(BasePipeline):
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
             image=req.params.image,
-            image_cond_strength=req.params.image_cond_strength,
+            image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
@@ -1331,7 +1357,7 @@ class LTX2Pipeline(BasePipeline):
     # Prompt enhancement
     # ------------------------------------------------------------------
 
-    def _enhance_prompt(self, prompt: str, seed: int = 42) -> str:
+    def _enhance_prompt(self, prompt: str, seed: int) -> str:
         """Use Gemma3 as an LLM to enhance the prompt for video generation."""
         system_prompt = (
             "You are a helpful assistant that enhances text prompts for video generation. "
@@ -1370,6 +1396,7 @@ class LTX2Pipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 512,
         width: int = 768,
@@ -1378,7 +1405,6 @@ class LTX2Pipeline(BasePipeline):
         num_inference_steps: int = 40,
         guidance_scale: float = 4.0,
         guidance_rescale: float = 0.0,
-        seed: int = 42,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
         image: Optional[Union[str, torch.Tensor]] = None,
@@ -1445,10 +1471,9 @@ class LTX2Pipeline(BasePipeline):
         # CFG parallel for multi-modal guidance: each GPU handles one
         # CFG pass (cond or uncond), results are all-gathered, then
         # STG/modality passes run on every GPU before the guidance formula.
-        vgm = self.model_config.visual_gen_mapping
+        vgm = self.pipeline_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
-        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else (vgm.ulysses_size if vgm else 1)
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
         if do_cfg_parallel_mm and cfg_size != 2:
             raise ValueError(
