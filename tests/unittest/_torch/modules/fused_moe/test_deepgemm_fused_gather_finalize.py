@@ -140,7 +140,7 @@ def test_fused_gather_finalize_matches_unfused(shape: GatherFinalizeShape) -> No
     assert permuted_data_tensor.shape[0] == num_expanded
 
     _masked_m, token_to_expert_map = preprocess_after_permute(
-        expert_first_token_offset_tensor, permuted_data_tensor
+        expert_first_token_offset_tensor, permuted_data_tensor.shape[0]
     )
 
     # Synthesize the expert GEMM output h3: [num_experts, max_tokens_per_expert,

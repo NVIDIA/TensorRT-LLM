@@ -29,7 +29,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 # Enable TRTLLM-Gen attention backend by default. Set
 # TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
+    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1") == "1")
 
 # ``AttentionForwardArgs`` fields that this backend does not consume.
 # Sync test (test_attention_op_sync.py) requires every other field to map to a
@@ -123,6 +123,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
+
+    # TRTLLM-Gen FMHA JIT warmup controls.
+    trtllm_gen_jit_warmup: bool = False
 
     # Flag to enable helix parallelism.
     enable_helix: bool = False
@@ -1513,30 +1516,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
-        helix_active = metadata.helix_position_offsets is not None
-        use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
-                         or forward_args.sage_attn_num_elts_per_blk_k > 0
-                         or forward_args.sage_attn_num_elts_per_blk_v > 0)
-
         use_trtllm_gen = False
         if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
             trtllm_gen_backend = self._get_trtllm_gen_backend()
             use_trtllm_gen = trtllm_gen_backend.is_supported(
                 q,
-                metadata=metadata,
-                forward_args=forward_args,
-                mask_type=int(forward_args.mask_type),
-                active_helix=helix_active,
-                use_sage_attn=use_sage_attn,
+                k,
+                v,
+                attn=self,
+                meta=metadata,
+                fwd=forward_args,
             )[0]
 
         if use_trtllm_gen:
-            trtllm_gen_backend.attention(
+            trtllm_gen_backend.forward(
                 q,
-                metadata=metadata,
-                forward_args=forward_args,
-                mask_type=int(forward_args.mask_type),
-                use_paged_context_fmha=metadata.use_paged_context_fmha,
+                k,
+                v,
+                attn=self,
+                meta=metadata,
+                fwd=forward_args,
             )
         else:
             # Every kwarg sources from ``self`` / ``metadata`` /
@@ -1591,6 +1590,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 max_context_length=metadata.max_context_length,
+                max_seq_len=metadata.max_seq_len,
+                trtllm_gen_jit_warmup=metadata.trtllm_gen_jit_warmup,
 
                 # --- Per-call (AttentionForwardArgs) ---
                 out_scale=forward_args.out_scale,

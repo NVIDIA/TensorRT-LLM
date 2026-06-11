@@ -26,6 +26,8 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### API Changes
 
+- `trtllm-serve`, `trtllm-eval`, `trtllm-bench`: explicit CLI flags now take precedence over values in `--config` / `--extra_llm_api_options` YAML files (was: YAML overrode CLI). Un-set CLI flags continue to fall back to the YAML, then to model-specific and built-in defaults.
+
 ### Fixed Issues
 
 ### Known Issues

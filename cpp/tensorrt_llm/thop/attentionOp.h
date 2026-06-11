@@ -59,9 +59,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool const is_fused_qkv, bool const update_kv_cache, int64_t const predicted_tokens_per_seq,
     int64_t const local_layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
     std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
-    int64_t const attention_window_size, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rope_dim, double const rope_base,
-    int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
+    int64_t const max_seq_len, int64_t const attention_window_size, int64_t const beam_width, int64_t const mask_type,
+    int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type, int64_t const rope_dim,
+    double const rope_base, int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
     double const rope_long_m_scale, int64_t const rope_max_positions, int64_t const rope_original_max_positions,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
@@ -89,7 +89,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata = std::nullopt,
     std::optional<torch::Tensor> flash_mla_num_splits = std::nullopt, int64_t sage_attn_num_elts_per_blk_q = 0,
     int64_t sage_attn_num_elts_per_blk_k = 0, int64_t sage_attn_num_elts_per_blk_v = 0, bool sage_attn_qk_int8 = false,
-    int64_t num_contexts = 0, int64_t num_ctx_tokens = 0,
+    int64_t num_contexts = 0, int64_t num_ctx_tokens = 0, bool trtllm_gen_jit_warmup = false,
     std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt);
 
 struct KvCachePoolPointers
