@@ -4,6 +4,7 @@
 """Tests for VisualGenArgs construction, validation, and serialization."""
 
 import itertools
+import json
 import pickle
 from unittest.mock import MagicMock, patch
 
@@ -137,6 +138,90 @@ class TestPipelineRegistryUnique:
 
         ids = VisualGen.supported_models()
         assert len(ids) == len(set(ids)), f"VisualGen.supported_models() returned duplicates: {ids}"
+
+
+class TestWanPipelineConfig:
+    def test_wan_vae_has_no_user_visible_config_default(self):
+        from tensorrt_llm.visual_gen import VisualGen
+
+        config = VisualGen.pipeline_config("WanPipeline")
+
+        assert "vae_backend" not in config
+
+    def test_wan_i2v_vae_has_no_user_visible_config_default(self):
+        from tensorrt_llm.visual_gen import VisualGen
+
+        config = VisualGen.pipeline_config("WanImageToVideoPipeline")
+
+        assert "vae_backend" not in config
+
+    def test_wan_pipeline_config_is_available_to_runtime_config(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+
+        checkpoint_dir = tmp_path / "wan"
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "model_index.json").write_text(json.dumps({"_class_name": "WanPipeline"}))
+        transformer_dir = checkpoint_dir / "transformer"
+        transformer_dir.mkdir()
+        (transformer_dir / "config.json").write_text(
+            json.dumps({"_class_name": "WanTransformer3DModel"})
+        )
+
+        args = VisualGenArgs(
+            model=str(checkpoint_dir),
+        )
+        resolved = PipelineLoader(args)._resolve_pipeline_config(str(checkpoint_dir))
+        config = DiffusionPipelineConfig.from_pretrained(
+            str(checkpoint_dir),
+            args=args,
+            pipeline_config=resolved,
+        )
+
+        assert config.pipeline_config == {}
+
+    def test_wan_pipeline_config_still_rejects_unknown_keys(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+
+        checkpoint_dir = tmp_path / "wan"
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "model_index.json").write_text(json.dumps({"_class_name": "WanPipeline"}))
+
+        args = VisualGenArgs(
+            model=str(checkpoint_dir),
+            pipeline_config={"unknown_wan_key": True},
+        )
+        with pytest.raises(ValueError, match="Unknown pipeline_config keys"):
+            PipelineLoader(args)._resolve_pipeline_config(str(checkpoint_dir))
+
+    def test_wan_vae_default_selection_is_single_gpu_only(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.wan import vae_loader
+
+        single_gpu_mapping = MagicMock(world_size=1, parallel_vae_size=1)
+        multi_gpu_mapping = MagicMock(world_size=2, parallel_vae_size=1)
+        parallel_vae_mapping = MagicMock(world_size=2, parallel_vae_size=2)
+
+        monkeypatch.delenv(vae_loader.TRTLLM_WAN_VAE_BACKEND_FALLBACK_ENV, raising=False)
+        assert vae_loader._should_use_wan_vae(single_gpu_mapping)
+        assert not vae_loader._should_use_wan_vae(multi_gpu_mapping)
+        assert not vae_loader._should_use_wan_vae(parallel_vae_mapping)
+
+    @pytest.mark.parametrize("fallback_value", ["1", "2", "-1"])
+    def test_wan_vae_backend_fallback_forces_diffusers(self, monkeypatch, fallback_value):
+        from tensorrt_llm._torch.visual_gen.models.wan import vae_loader
+
+        single_gpu_mapping = MagicMock(world_size=1, parallel_vae_size=1)
+
+        monkeypatch.setenv(vae_loader.TRTLLM_WAN_VAE_BACKEND_FALLBACK_ENV, fallback_value)
+        assert not vae_loader._should_use_wan_vae(single_gpu_mapping)
+
+    def test_wan_vae_zero_backend_fallback_keeps_wan_vae(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.wan import vae_loader
+
+        single_gpu_mapping = MagicMock(world_size=1, parallel_vae_size=1)
+
+        monkeypatch.setenv(vae_loader.TRTLLM_WAN_VAE_BACKEND_FALLBACK_ENV, "0")
+        assert vae_loader._should_use_wan_vae(single_gpu_mapping)
 
 
 class TestVisualGenArgsCacheBackend:
