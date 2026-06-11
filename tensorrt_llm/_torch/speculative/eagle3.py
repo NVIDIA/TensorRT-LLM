@@ -862,16 +862,22 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                                 d2t,
                                                                 draft_step=i)
 
+                # When ADP+LM-head-TP pads logits to max_num_requests, the
+                # padded rows are zero-filled placeholders only required so
+                # every TP rank produces logits of identical shape for the
+                # LM-head-TP all-gather. Drop them *before* sampling: the
+                # per-request sampling params (temperatures/top_k/top_p) are
+                # sized to token_count (== batch_size), so the padded logits
+                # would otherwise fail to broadcast in apply_temperature. This
+                # also keeps next_draft_tokens and the draft_probs buffer
+                # token_count-sized without a post-hoc trim.
+                if use_lm_head_tp_in_adp:
+                    logits = logits[:token_count]
                 new_draft_token = self.draft_decoder(logits,
                                                      draft_model,
                                                      spec_metadata,
                                                      batch_size,
                                                      draft_step=i)
-                # When ADP+LM-head-TP pads logits to max_num_requests, the
-                # sampler returns max_num_requests tokens; trim back to the
-                # actual token_count so next_draft_tokens has the right shape.
-                if use_lm_head_tp_in_adp:
-                    new_draft_token = new_draft_token[:token_count]
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
