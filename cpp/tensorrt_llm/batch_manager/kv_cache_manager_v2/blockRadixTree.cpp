@@ -727,10 +727,10 @@ BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> m
     // SWA sink blocks must all be available.
     for (auto [lcId, attn] : swaLcs)
     {
-        int sinkBlocks = attn->numSinkBlocks;
-        int limit = std::min(sinkBlocks, static_cast<int>(matched.size()));
-        int n = findIndex(
-            matched.begin(), matched.begin() + limit, [&](auto const& match) { return !hasPage(*match.block, lcId); });
+        int const sinkBlocks = attn->numSinkBlocks;
+        int const limit = std::min(sinkBlocks, static_cast<int>(matched.size()));
+        int n = findIndex(matched.begin(), matched.begin() + limit,
+            [&, lcId = lcId](auto const& match) { return !hasPage(*match.block, lcId); });
         if (n < sinkBlocks)
         {
             matched.resize(static_cast<size_t>(n));
@@ -763,8 +763,8 @@ BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> m
         bool trimmed = false;
         for (auto [lcId, attn] : swaLcs)
         {
-            int n = findIndex(
-                matched.rbegin(), matched.rend(), [&](auto const& match) { return hasPage(*match.block, lcId); });
+            int n = findIndex(matched.rbegin(), matched.rend(),
+                [&, lcId = lcId](auto const& match) { return hasPage(*match.block, lcId); });
             if (n != 0)
             {
                 matched.resize(matched.size() - static_cast<size_t>(n));
@@ -778,7 +778,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> m
             {
                 auto tailBegin = matched.begin() + static_cast<ptrdiff_t>(toSizeT(staleEnd));
                 int nMissing = findIndex(matched.rbegin(), std::make_reverse_iterator(tailBegin),
-                    [&](auto const& match) { return !hasPage(*match.block, lcId); });
+                    [&, lcId = lcId](auto const& match) { return !hasPage(*match.block, lcId); });
                 if (BlockOrdinal{static_cast<int>(matched.size()) - nMissing} > staleEnd)
                 {
                     matched.resize(matched.size() - static_cast<size_t>(nMissing) - 1);
