@@ -473,6 +473,8 @@ class BlockRadixTree:
                 block = block.next[key]
                 if token_block:
                     assert isinstance(block, Block)
+                    if not enable_partial_match and len(token_block) < self._tokens_per_block:
+                        break
                     yield block, len(token_block)
             else:
                 mismatched_token_block = token_block

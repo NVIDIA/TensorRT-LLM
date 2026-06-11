@@ -44,8 +44,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     gen_multimodal_cache_key_tokens
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
-                                                              GPU_LEVEL)
+                                                              GPU_LEVEL,
+                                                              BeamIndex)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
                                                              typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -2362,7 +2364,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self.is_disagg = is_disagg
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
-        assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
         assert not (mapping.cp_config.get('cp_type') == CpType.STAR), \
             "Star attention is not supported for KVCacheManagerV2"
 
@@ -2748,11 +2749,15 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
 
+        enable_partial_reuse = (kv_cache_config.enable_partial_reuse
+                                and self.max_beam_width == 1)
+
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
+            enable_partial_reuse=enable_partial_reuse,
             layers=[
                 AttentionLayerConfig(
                     layer_id=layer_id,
@@ -2888,6 +2893,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
+        if not self._ensure_generation_beam_width(req, kv_cache):
+            return False
+
         draft_len = get_draft_token_length(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
         return kv_cache.resize(
@@ -2947,7 +2955,33 @@ class KVCacheManagerV2(BaseResourceManager):
         if pre_cap > 0:
             kv_cache.suspend()
 
-    def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
+    def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
+        assert kv_cache.beam_width <= self.max_beam_width
+        index = self.index_mapper.get_index(request_id)
+        for i in range(int(kv_cache.beam_width)):
+            for pool_idx in range(self.num_pools):
+                buffer: torch.Tensor = self.host_kv_cache_block_offsets[
+                    pool_idx, index * self.max_beam_width + i, 0]
+                kv_cache.set_base_page_index_buf(BeamIndex(i), pool_idx,
+                                                 memoryview(buffer.numpy()))
+
+    def _ensure_generation_beam_width(self, req: LlmRequest,
+                                      kv_cache: _KVCache) -> bool:
+        target_beam_width = BeamIndex(req.py_beam_width)
+        assert 1 <= target_beam_width <= self.max_beam_width
+        if kv_cache.beam_width == target_beam_width:
+            return True
+
+        try:
+            kv_cache.beam_width = target_beam_width
+        except OutOfPagesError:
+            return False
+
+        self._set_page_index_bufs(req.py_request_id, kv_cache)
+        return True
+
+    def _restore_page_index_bufs(self, request_id: int,
+                                 kv_cache: _KVCache) -> None:
         """Re-connect host page-index buffers after resume().
 
         suspend() clears the base_page_index_buf pointers (sets them to
@@ -2957,13 +2991,7 @@ class KVCacheManagerV2(BaseResourceManager):
         must re-connect the buffers to avoid stale/zero page indices that
         would cause illegal memory accesses during the forward pass.
         """
-        index = self.index_mapper.get_index(request_id)
-        for i in range(self.max_beam_width):
-            for pool_idx in range(self.num_pools):
-                buffer: torch.Tensor = self.host_kv_cache_block_offsets[
-                    pool_idx, index * self.max_beam_width + i, 0]
-                kv_cache.set_base_page_index_buf(i, pool_idx,
-                                                 memoryview(buffer.numpy()))
+        self._set_page_index_bufs(request_id, kv_cache)
 
     def _resume_and_restore(self, req_id: int, kv_cache) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
@@ -3153,6 +3181,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
+                if not self._ensure_generation_beam_width(req, kv_cache):
+                    raise RuntimeError(
+                        f"Failed to expand draft KV cache beam width for request {req.py_request_id}"
+                    )
                 new_cap = self._required_gen_capacity(req, kv_cache.capacity)
                 # Pad the resize up to _kv_reserve_draft_tokens (see __init__);
                 # no-op when reserve == draft_token_length.
@@ -3335,6 +3367,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
+                    if not self._ensure_generation_beam_width(req, kv_cache):
+                        release_resources(req,
+                                          free_draft_resources=draft_kv_cache
+                                          is not None)
+                        return None
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity,
                                               history_length=history_hint)
@@ -3344,6 +3381,10 @@ class KVCacheManagerV2(BaseResourceManager):
                                           is not None)
                         return None
                     if draft_kv_cache is not None:
+                        if not draft_kv_cache_manager._ensure_generation_beam_width(
+                                req, draft_kv_cache):
+                            release_resources(req, free_draft_resources=True)
+                            return None
                         success = draft_kv_cache.resize(new_capacity)
                         if not success:
                             release_resources(req, free_draft_resources=True)
@@ -3366,7 +3407,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 request,
                 start=kv_cache.num_committed_tokens,
                 end=request.context_current_position)
-            kv_cache.commit(tokens)
+            if tokens:
+                kv_cache.commit(tokens)
             kv_cache.stop_committing()
 
     def release_index_slot(self, request_id: int) -> None:
@@ -3659,7 +3701,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
                                  num_contexts: int, num_seqs: int):
-        assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
+        assert beam_width <= self.max_beam_width
 
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts,
                                                     beam_width)
@@ -3688,13 +3730,8 @@ class KVCacheManagerV2(BaseResourceManager):
             input_tokens,
         )
         self.kv_cache_map[request_id] = kv_cache
-        index = self.index_mapper.add_new_sequence(request_id)
-        for i in range(self.max_beam_width):
-            for pool_idx in range(self.num_pools):
-                buffer: torch.Tensor = self.host_kv_cache_block_offsets[
-                    pool_idx, index * self.max_beam_width + i, 0]
-                kv_cache.set_base_page_index_buf(i, pool_idx,
-                                                 memoryview(buffer.numpy()))
+        self.index_mapper.add_new_sequence(request_id)
+        self._set_page_index_bufs(request_id, kv_cache)
         return kv_cache
 
     def reset_reuse_state(self):
