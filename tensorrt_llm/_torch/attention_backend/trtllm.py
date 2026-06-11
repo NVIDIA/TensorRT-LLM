@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
+from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -1429,15 +1429,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         forward_args: AttentionForwardArgs,
     ) -> None:
         if metadata.is_cross:
-            forward_args.update_kv_cache = k is not None and v is not None
             if k is not None and v is not None:
                 k_flat = k.contiguous().view(k.shape[0], -1)
                 v_flat = v.contiguous().view(v.shape[0], -1)
                 forward_args.cross_kv = torch.cat([k_flat, v_flat],
                                                   dim=1).contiguous()
-            else:
-                forward_args.cross_kv = None
-            forward_args.encoder_input_lengths = metadata.kv_lens_cuda_runtime
 
             q_hidden_size = self.num_heads * self.head_dim
             kv_hidden_size = self.num_kv_heads * self.head_dim
@@ -1451,14 +1447,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             k = None
             v = None
             forward_args.is_fused_qkv = True
-        else:
-            forward_args.cross_kv = None
-            forward_args.encoder_input_lengths = None
-
-        forward_args.position_embedding_type = (
-            int(PositionEmbeddingType.relative)
-            if forward_args.relative_attention_bias is not None else
-            self.position_embedding_type)
 
         attention_input_type = forward_args.attention_input_type
         if not self.is_mla_enable:
@@ -1558,7 +1546,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.num_contexts == metadata.num_seqs
 
         use_trtllm_gen = False
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not metadata.is_cross:
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
             trtllm_gen_backend = self._get_trtllm_gen_backend()
             use_trtllm_gen = trtllm_gen_backend.is_supported(
                 q,
@@ -1633,6 +1621,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 max_context_length=metadata.max_context_length,
                 max_seq_len=metadata.max_seq_len,
                 trtllm_gen_jit_warmup=metadata.trtllm_gen_jit_warmup,
+                is_cross=metadata.is_cross,
 
                 # --- Per-call (AttentionForwardArgs) ---
                 out_scale=forward_args.out_scale,
@@ -1664,6 +1653,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sage_attn_qk_int8=forward_args.sage_attn_qk_int8,
                 is_fused_qkv=forward_args.is_fused_qkv,
                 update_kv_cache=forward_args.update_kv_cache,
+                cross_kv=forward_args.cross_kv,
+                relative_attention_bias=forward_args.relative_attention_bias,
+                relative_attention_max_distance=forward_args.
+                relative_attention_max_distance,
+                position_embedding_type=self.position_embedding_type,
 
                 # --- Module config (TrtllmAttention) ---
                 rotary_inv_freq=self.rotary_inv_freq,
@@ -1675,7 +1669,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 head_size=self.head_dim,
                 quant_mode=self.quant_mode,
                 q_scaling=self.q_scaling,
-                position_embedding_type=forward_args.position_embedding_type,
                 rope_dim=self.rope_dim,
                 rope_base=self.rope_base,
                 rope_scale_type=self.rope_scale_type,
@@ -1711,12 +1704,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # stay as literal ``None`` until DeepSeek V4 sparse-MLA lands.
                 sparse_mla_topk_lens=None,
                 compressed_kv_cache_pool_ptr=None,
-                cross_attention=metadata.is_cross,
-                cross_kv=forward_args.cross_kv,
-                encoder_input_lengths=forward_args.encoder_input_lengths,
-                relative_attention_bias=forward_args.relative_attention_bias,
-                relative_attention_max_distance=forward_args.
-                relative_attention_max_distance,
             )
 
         if self.print_skip_softmax_stat:
@@ -1776,11 +1763,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         forward_args.is_fused_qkv = not metadata.is_cross and k is None
         forward_args.update_kv_cache = not metadata.is_cross or k is not None
-        assert (forward_args.is_fused_qkv and k is None and v is None) or (
-            not forward_args.is_fused_qkv and k is not None
-            and v is not None) or (metadata.is_cross
-                                   and not forward_args.update_kv_cache
-                                   and k is None and v is None)
 
         # ``SkipSoftmax`` configs contribute nothing here — their thresholds
         # are read via the ``skip_softmax_threshold_scale_factor_*``

@@ -174,10 +174,9 @@ void initBindings(nb::module_& m)
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
         nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
-        nb::arg("cross_attention") = false, nb::arg("cross_kv") = std::nullopt,
-        nb::arg("encoder_input_lengths") = std::nullopt, nb::arg("relative_attention_bias") = std::nullopt,
-        nb::arg("relative_attention_max_distance") = 0, "Multi-head attention operation",
-        nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
+        nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
+        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",

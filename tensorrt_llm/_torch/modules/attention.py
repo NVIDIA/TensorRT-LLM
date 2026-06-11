@@ -614,7 +614,10 @@ class Attention(nn.Module):
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
-            pos_embd_params=self.pos_embd_params if self.rope_fusion else None,
+            pos_embd_params=(self.pos_embd_params if self.rope_fusion or
+                             (self.pos_embd_params is not None
+                              and not self.pos_embd_params.type.is_rope()) else
+                             None),
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,

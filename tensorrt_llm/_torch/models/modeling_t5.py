@@ -38,8 +38,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import T5Config
 
+from tensorrt_llm.functional import PositionEmbeddingType
+
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PredefinedAttentionMask
+from ..attention_backend.interface import PositionalEmbeddingParams, PredefinedAttentionMask
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.cross_attention import CrossAttention
@@ -245,7 +247,7 @@ class T5Attention(Attention):
             num_key_value_heads=num_kv_heads,
             max_position_embeddings=512,
             bias=False,
-            pos_embd_params=None,
+            pos_embd_params=PositionalEmbeddingParams(type=PositionEmbeddingType.relative),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,

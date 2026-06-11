@@ -819,9 +819,7 @@ class AttentionForwardArgs:
     attention_sinks: Optional[torch.Tensor] = None
     relative_attention_bias: Optional[torch.Tensor] = None
     relative_attention_max_distance: int = 0
-    position_embedding_type: int = 0
     cross_kv: Optional[torch.Tensor] = None
-    encoder_input_lengths: Optional[torch.Tensor] = None
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
