@@ -95,7 +95,7 @@ def test_yaml_compile_backend_disables_default_piecewise(tmp_path):
     assert args.transforms["compile_model"]["piecewise_enabled"] is False
 
 
-def test_speculative_flashinfer_fallback_disables_piecewise():
+def test_speculative_flashinfer_torch_simple_disables_piecewise():
     from tensorrt_llm.llmapi import EagleDecodingConfig
 
     spec_config = EagleDecodingConfig(
@@ -108,6 +108,7 @@ def test_speculative_flashinfer_fallback_disables_piecewise():
         model="test-model",
         attn_backend="flashinfer",
         speculative_config=spec_config,
+        compile_backend="torch-simple",
     )
 
     assert args.compile_backend == "torch-simple"
