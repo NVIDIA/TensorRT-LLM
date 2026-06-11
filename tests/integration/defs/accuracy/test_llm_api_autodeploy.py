@@ -1014,6 +1014,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
     MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
     GSM8K_MAX_OUTPUT_LEN = 512
+    MIN_MTP_ACCEPTANCE_RATE = 0.20
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
         fewshot_as_multiturn=True,
@@ -1084,6 +1085,38 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("world_size", [4])
+    def test_nvfp4_mtp(self, world_size, mocker):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME_NVFP4)
+        yaml_paths = [
+            str(_AD_CONFIGS_DIR / cfg) for cfg in (
+                "dashboard_default.yaml",
+                "world_size_4.yaml",
+                "qwen3.5_moe_400b_mtp.yaml",
+                "enable_sharder_ir.yaml",
+            )
+        ]
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=yaml_paths,
+                           enable_iter_perf_stats=True,
+                           **kwargs) as llm:
+            _set_quant_config(llm, "nvfp4")
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            _check_acceptance_rate_stats(
+                llm.get_stats(),
+                min_acceptance_rate=self.MIN_MTP_ACCEPTANCE_RATE)
 
     @staticmethod
     def _load_small_config():

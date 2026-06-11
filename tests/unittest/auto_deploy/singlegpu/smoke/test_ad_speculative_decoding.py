@@ -14,13 +14,21 @@
 # limitations under the License.
 
 
+from types import SimpleNamespace
+
 import torch
+import torch.nn as nn
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle import (
+    DraftModelExportInfo,
+    EagleOneModelFactory,
+    TargetModelExportInfo,
+)
+from tensorrt_llm._torch.auto_deploy.models.factory import FullModelExportInfo
 from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
     DetectHiddenStatesForCapture,
@@ -43,6 +51,44 @@ def get_extra_seq_len_for_kv_cache(llm_args) -> int:
         extra += get_num_extra_kv_tokens(spec_config)
 
     return extra
+
+
+def test_eagle_one_model_factory_export_infos_use_eagle_io_contract():
+    class TargetFactory:
+        def get_export_infos(self, model):
+            return [FullModelExportInfo()]
+
+    factory = EagleOneModelFactory(
+        model="test-model",
+        skip_loading_weights=True,
+        max_seq_len=64,
+        speculative_config=MTPDecodingConfig(
+            max_draft_len=1,
+            mtp_eagle_one_model=True,
+            speculative_model="test-model",
+        ),
+    )
+    draft_model = nn.Module()
+    draft_model.config = SimpleNamespace(
+        load_embedding_from_target=True,
+        load_lm_head_from_target=True,
+    )
+    wrapper = SimpleNamespace(target_model=nn.Module(), draft_model=draft_model)
+    factory.target_factory = TargetFactory()
+
+    export_infos = factory.get_export_infos(wrapper)
+
+    assert len(export_infos) == 2
+    assert isinstance(export_infos[0], TargetModelExportInfo)
+    assert isinstance(export_infos[1], DraftModelExportInfo)
+    assert export_infos[0].submodule_name == "target_model"
+    assert set(export_infos[0].dynamic_shape_lookup) == {"inputs_embeds", "position_ids"}
+    assert export_infos[1].submodule_name == "draft_model"
+    assert set(export_infos[1].dynamic_shape_lookup) == {
+        "hidden_states",
+        "inputs_embeds",
+        "position_ids",
+    }
 
 
 def test_super_mtp_smoke():
@@ -159,6 +205,53 @@ def test_super_mtp_ssm_replay_smoke():
     assert len(prompts_and_outputs) == 1
 
 
+def test_qwen3_5_moe_mtp_smoke():
+    """Test one-model MTP/Eagle runtime with a tiny Qwen3.5 MoE VLM target."""
+    test_prompt = "What is the capital of France?"
+    model_hub_id = "Qwen/Qwen3.5-35B-A3B"
+    model_path = hf_id_to_local_model_dir(model_hub_id)
+
+    experiment_config = get_small_model_config(
+        model_hub_id,
+        transforms={
+            "insert_cached_causal_conv": {"backend": "triton_causal_conv"},
+            "initialize_mrope_delta_cache": {"enabled": True},
+        },
+    )
+    experiment_config["args"]["model"] = model_path
+    experiment_config["args"]["tokenizer"] = model_path
+    experiment_config["args"]["runtime"] = "trtllm"
+    experiment_config["args"]["world_size"] = 1
+    experiment_config["args"]["model_factory"] = "Qwen3_5MoeForConditionalGeneration"
+    experiment_config["args"]["speculative_config"] = MTPDecodingConfig(
+        max_draft_len=1,
+        mtp_eagle_one_model=True,
+        speculative_model=model_path,
+    )
+    experiment_config["args"]["speculative_model_kwargs"] = experiment_config["args"][
+        "model_kwargs"
+    ]
+    experiment_config["args"]["attn_backend"] = "flashinfer"
+    experiment_config["args"]["disable_overlap_scheduler"] = True
+    experiment_config["args"]["compile_backend"] = "torch-simple"
+    experiment_config["args"]["max_num_tokens"] = 256
+    experiment_config["prompt"]["batch_size"] = 1
+    experiment_config["prompt"]["queries"] = test_prompt
+
+    cfg = ExperimentConfig(**experiment_config)
+    cfg.prompt.sp_kwargs = {
+        "max_tokens": 64,
+        "top_k": None,
+        "temperature": 0.0,
+        "seed": 42,
+    }
+
+    results = main(cfg)
+
+    prompts_and_outputs = results["prompts_and_outputs"]
+    assert len(prompts_and_outputs) == 1
+
+
 def test_kv_cache_extra_seq_len_for_spec_dec():
     """Test that get_extra_seq_len_for_kv_cache computes correct extra capacity."""
     from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
@@ -218,6 +311,7 @@ def test_mtp_autodeploy_uses_eagle_one_model_capture():
 
     assert isinstance(args.speculative_config, MTPDecodingConfig)
     assert args.model_factory == "eagle_one_model"
+    assert args.target_model_factory == "AutoModelForCausalLM"
     assert args.transforms["detect_hidden_states_for_capture"]["enabled"] is True
     assert args.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] == {-1}
 
