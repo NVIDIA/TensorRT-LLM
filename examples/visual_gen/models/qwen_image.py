@@ -56,6 +56,36 @@ def parse_args() -> argparse.Namespace:
         help="Optional negative prompt.",
     )
     parser.add_argument(
+        "--height",
+        type=int,
+        help="Output height in pixels. Defaults to the model setting.",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        help="Output width in pixels. Defaults to the model setting.",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        help="Number of denoising steps. Defaults to the model setting.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        help="Classifier-free guidance scale. Defaults to the model setting.",
+    )
+    parser.add_argument(
+        "--max_sequence_length",
+        type=int,
+        help="Maximum prompt token length. Defaults to the model setting.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Random seed for reproducible generation.",
+    )
+    parser.add_argument(
         "--num_images_per_prompt",
         type=int,
         default=1,
@@ -66,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         default="qwen_image_output.png",
         help="Image output path. Multiple images append an index before the suffix.",
     )
+    parser.add_argument(
+        "--skip_warmup",
+        action="store_true",
+        help="Skip model warmup after loading. Useful for quick smoke tests.",
+    )
     return parser.parse_args()
 
 
@@ -73,10 +108,30 @@ def main() -> None:
     args = parse_args()
     if args.num_images_per_prompt < 1:
         raise ValueError("--num_images_per_prompt must be >= 1")
+    for name in ("height", "width", "num_inference_steps", "max_sequence_length"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            raise ValueError(f"--{name} must be >= 1")
 
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
+    if args.skip_warmup:
+        extra_args = extra_args or VisualGenArgs()
+        compilation_config = extra_args.compilation_config.model_copy(update={"skip_warmup": True})
+        extra_args = extra_args.model_copy(update={"compilation_config": compilation_config})
+
     visual_gen = VisualGen(model=args.model, args=extra_args)
     params = visual_gen.default_params
+    for name in (
+        "height",
+        "width",
+        "num_inference_steps",
+        "guidance_scale",
+        "max_sequence_length",
+        "seed",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            setattr(params, name, value)
     params.num_images_per_prompt = args.num_images_per_prompt
     if args.negative_prompt is not None:
         params.negative_prompt = args.negative_prompt
