@@ -119,6 +119,24 @@ class TestDomainActionPresets:
         assert len(cfg["warnings"]) == 1
         assert "raw_action_dim=9" in cfg["warnings"][0]
 
+    def test_action_fps_defaults_to_frame_rate(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+            resolve_domain_action_config,
+        )
+
+        cfg = resolve_domain_action_config(domain_name="av")
+        assert cfg["frame_rate"] == 10.0
+        assert cfg["action_fps"] == 10.0
+
+    def test_explicit_action_fps_overrides_default(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+            resolve_domain_action_config,
+        )
+
+        cfg = resolve_domain_action_config(domain_name="av", action_fps=5.0, frame_rate=24.0)
+        assert cfg["frame_rate"] == 24.0
+        assert cfg["action_fps"] == 5.0
+
     def test_alias_maps_to_canonical_preset(self):
         from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import get_domain_preset
 
