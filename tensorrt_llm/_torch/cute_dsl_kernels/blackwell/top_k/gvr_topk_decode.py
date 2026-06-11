@@ -2092,6 +2092,17 @@ class GvrTopKKernel:
                                 local_iscalars_ptr, cutlass.Int32(peer)
                             )
                             peer_cnt = ld_shared_cluster_i32(peer_iscalars_addr)
+                            # Defense-in-depth: cap to kC (peer's allocation
+                            # upper bound). Phase 3's stream-write guards
+                            # writes at ``dst < kC`` so peer.smem_keys /
+                            # smem_vals are only valid in [0, kC), but
+                            # s_iscalars[5] is uncapped and could exceed
+                            # kC in the done==2 bracket-exhaustion path
+                            # (not reached in V4 production data, but a
+                            # cheap guard vs. an OOB DSMEM read). Mirrors
+                            # the single-CTA path's cand_count_p4 = min(
+                            # s_iscalars[0], kC) downstream.
+                            peer_cnt = min(peer_cnt, cutlass.Int32(self.kC))
                             # Each thread copies one entry at a time, strided
                             # by num_threads, until the peer's chunk is drained.
                             i_gather = tidx
@@ -2120,9 +2131,7 @@ class GvrTopKKernel:
                         cute.arch.barrier()
 
                     # ---- Phase 4: histogram snap + writeback (leader only) ----
-                    cand_count_p4 = s_iscalars[0]
-                    if cand_count_p4 > cutlass.Int32(self.kC):
-                        cand_count_p4 = cutlass.Int32(self.kC)
+                    cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
 
                     self.phase4_histogram_snap(
                         smem_keys,
