@@ -166,12 +166,11 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
-    parser.add_argument(
-        '--custom_tokenizer',
-        type=str,
-        default=None,
-        help='Override the tokenizer. Accepts a built-in alias '
-        "(e.g. 'mistral') or a fully-qualified class import path.")
+    parser.add_argument('--custom_tokenizer',
+                        type=str,
+                        default=None,
+                        help='Override the tokenizer. Accepts a built-in alias '
+                        " or a fully-qualified class import path.")
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
