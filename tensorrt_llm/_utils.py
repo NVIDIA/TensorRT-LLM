@@ -1212,6 +1212,8 @@ class KVCacheEventSerializer:
                 for token in data.tokens
             ],
             # "lora_id": data.lora_id, # TODO (shreyasm): enable serialization of lora_id
+            "cache_salt":
+            data.cache_salt,
             "cache_level":
             data.cache_level,
             "priority":

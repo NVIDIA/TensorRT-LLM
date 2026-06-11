@@ -3942,6 +3942,7 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=8,
                  kv_cache_config=kv_cache_config,
+                 trust_remote_code=True,
                  **pytorch_config) as llm:
 
             task = CnnDailymail(self.MODEL_NAME)
@@ -6130,6 +6131,47 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @skip_pre_hopper
+    def test_fp8_moe_dflash(self, mocker):
+        # Covers DFlash speculative decoding on the Qwen3.5 FP8 MoE variant,
+        # which combines GDN linear attention + m-RoPE + MoE. See https://nvbugs/6140226.
+        target_model_path = f"{llm_models_root()}/Qwen3.5-35B-A3B-FP8"
+        dflash_model_path = f"{llm_models_root()}/Qwen3.5-35B-A3B-DFlash"
+        if not os.path.exists(target_model_path) or not os.path.exists(
+                dflash_model_path):
+            pytest.skip("Qwen3.5-35B-A3B FP8 target or DFlash draft model "
+                        "directory does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=8)
+        # DEEPGEMM FP8-block-scale MoE is Blackwell-only (UE8M0 packed scale
+        # layout); fall back to CUTLASS on Hopper.
+        moe_config = MoeConfig(
+            backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS")
+        spec_config = DFlashDecodingConfig(max_draft_len=4,
+                                           speculative_model=dflash_model_path)
+
+        with LLM(target_model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=4096,
+                 max_batch_size=8,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=moe_config,
+                 speculative_config=spec_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            assert llm.args.speculative_config.decoding_type == 'DFlash'
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
 
 class TestQwen3_5_9B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-9B"
@@ -6665,6 +6707,35 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 tensor_parallel_size=tp_size,
                 moe_expert_parallel_size=ep_size,
                 enable_attention_dp=attention_dp,
+                **pytorch_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("attention_dp", [False, True])
+    def test_bf16_trtllm_gen_moe_backend(self, attention_dp):
+
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="float32")
+        pytorch_config = dict(disable_overlap_scheduler=False,
+                              cuda_graph_config=CudaGraphConfig(
+                                  max_batch_size=32, enable_padding=True))
+
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+                kv_cache_config=kv_cache_config,
+                max_batch_size=32,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                enable_attention_dp=attention_dp,
+                moe_config=MoeConfig(backend="TRTLLM"),
                 **pytorch_config,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -7338,10 +7409,9 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
+    @parametrize_with_ids("mtp_nextn", [0, 3])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
-    def test_nvfp4(self, tp_size, ep_size):
-        # The NVFP4 export does not ship MTP weights, so this checkpoint is only
-        # exercised without speculative decoding (unlike the FP8/BF16 ones).
+    def test_nvfp4(self, tp_size, ep_size, mtp_nextn):
         model_path = f"{llm_models_root()}/Step-3.7-Flash-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         use_kv_cache_manager_v2=True)
@@ -7351,12 +7421,17 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend="TRTLLM"),
         )
 
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  max_seq_len=8192,
                  attn_backend="TRTLLM",
+                 speculative_config=mtp_config,
                  trust_remote_code=True,
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4

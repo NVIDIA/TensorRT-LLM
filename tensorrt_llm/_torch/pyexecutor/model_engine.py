@@ -20,6 +20,7 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
+                                            _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
@@ -67,7 +68,8 @@ from .cuda_graph_runner import (CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunnerConfig)
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import LlmRequest, get_draft_token_length
+from .llm_request import (LlmRequest, get_draft_token_length,
+                          get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -960,6 +962,12 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
+            # Release the autotuner's exploration-mode intermediates. The
+            # exploration leftovers are pure waste that hide tens of GiB from
+            # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
+            # NVSHMEM).
+            gc.collect()
+            torch.cuda.empty_cache()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
@@ -4694,41 +4702,63 @@ class PyTorchModelEngine(ModelEngine):
         multimodal_params = inputs.get("multimodal_params", [])
         if not multimodal_params or len(multimodal_params) == 0:
             # Return empty embeddings if no multimodal data
-            return {'mm_embeddings': []}
-        # TODO(TRTLLM-12175): split encoder outputs by explicit per-request
-        # encoder-output embedding lengths. multimodal_lengths is a
-        # prompt-side MM-token count and may include non-embedding
-        # special/framing tokens.
-        if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
-                   None) is None:
-            multimodal_chunks = None
-        else:
-            multimodal_chunks = [
-                sum(request.multimodal_lengths)
-                for request in scheduled_requests.context_requests
-                if request.multimodal_lengths is not None
-            ]
+            return {
+                'mm_embeddings': [],
+                'mm_embedding_request_indices': [],
+                'mm_embedding_lengths': [],
+            }
+        # Some ctx requests carry only mrope metadata (no actual vision
+        # content). Skip them so the encoder only runs on real image payloads.
+        mm_context_requests = [(request_idx, request) for request_idx, request
+                               in enumerate(scheduled_requests.context_requests)
+                               if request.py_multimodal_data is not None]
+        if len(mm_context_requests) != len(multimodal_params):
+            raise ValueError(
+                "mm_encoder_only expects one multimodal payload per context "
+                "request carrying py_multimodal_data")
+        mm_request_indices_with_payload = []
+        mm_params_with_payload = []
+        mm_embedding_lengths = []
+        for (request_idx,
+             request), multimodal_param in zip(mm_context_requests,
+                                               multimodal_params):
+            if not _has_mm_payload_keys(request.py_multimodal_data):
+                # mrope-only warmup request (no actual vision content) -> skip.
+                continue
+            multimodal_embedding_lengths = get_multimodal_embedding_lengths(
+                request)
+            if multimodal_embedding_lengths is None:
+                # Vision payload keys present but no pre-computed embedding
+                # lengths — skip to avoid a downstream sum(None) TypeError.
+                continue
+            mm_request_indices_with_payload.append(request_idx)
+            mm_params_with_payload.append(multimodal_param)
+            mm_embedding_lengths.append(multimodal_embedding_lengths)
+        if not mm_params_with_payload:
+            return {
+                'mm_embeddings': [],
+                'mm_embedding_request_indices': [],
+                'mm_embedding_lengths': [],
+            }
         # For mm_encoder_only mode, we only run the vision encoder part
         # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
-        mm_embeddings = self.model.forward(multimodal_params)
+        mm_embeddings = self.model.forward(mm_params_with_payload)
         assert len(
             mm_embeddings
         ) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
 
-        if multimodal_chunks is None or len(multimodal_chunks) != len(
-                multimodal_params):
-            mm_embeddings = list(
-                torch.chunk(mm_embeddings[0],
-                            scheduled_requests.num_context_requests,
-                            dim=0))
-        else:
-            mm_embeddings = list(
-                torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
+        split_lengths = [sum(lengths) for lengths in mm_embedding_lengths]
+        mm_embeddings = list(torch.split(mm_embeddings[0], split_lengths,
+                                         dim=0))
+        if len(mm_embeddings) != len(mm_embedding_lengths):
+            raise ValueError(
+                "mm_encoder_only produced an embedding batch that does not "
+                "match mm_embedding_lengths")
 
         # Extract mrope position data from multimodal_params if available
         mrope_position_ids_list = []
         mrope_position_deltas_list = []
-        for multimodal_param in multimodal_params:
+        for multimodal_param in mm_params_with_payload:
             mrope_config = multimodal_param.multimodal_data.get(
                 'mrope_config', {})
             mrope_position_ids = mrope_config.get('mrope_position_ids')
@@ -4738,7 +4768,21 @@ class PyTorchModelEngine(ModelEngine):
             if mrope_position_deltas is not None:
                 mrope_position_deltas_list.append(mrope_position_deltas)
 
-        result = {'mm_embeddings': mm_embeddings, 'logits': None}
+        # mrope lists must align 1:1 with multimodal_params (or be empty);
+        # the sampler indexes them by per-MM-result position into mm_embeddings.
+        assert (len(mrope_position_ids_list) == len(mrope_position_deltas_list)
+                and len(mrope_position_ids_list)
+                in (0, len(mm_params_with_payload))), (
+                    f"mrope alignment: got {len(mrope_position_ids_list)} ids, "
+                    f"{len(mrope_position_deltas_list)} deltas, "
+                    f"{len(mm_params_with_payload)} mm params")
+
+        result = {
+            'mm_embeddings': mm_embeddings,
+            'logits': None,
+            'mm_embedding_request_indices': mm_request_indices_with_payload,
+            'mm_embedding_lengths': mm_embedding_lengths,
+        }
         if mrope_position_ids_list:
             result['mrope_position_ids'] = mrope_position_ids_list
         if mrope_position_deltas_list:
