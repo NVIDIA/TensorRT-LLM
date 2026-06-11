@@ -51,7 +51,6 @@ Before running these examples, ensure you have:
    ```
    For LTX-2, you need to provide a proper text_encoder_path in `./configs/ltx2.yml`.
 
-   **TeaCache:** Example YAML files set `enable_teacache` and `teacache_thresh` only. Omit `coefficients` to use each pipeline’s **built-in** coefficient table (checkpoint path matching). Add `coefficients: [ ... ]` under `teacache` only when you need to override those defaults.
 
 ## Examples
 
