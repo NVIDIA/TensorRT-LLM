@@ -201,7 +201,7 @@ class TestVisualGenArgsFromDict:
 
     def test_quant_config_dict_passthrough(self):
         """ModelOpt-format dicts are accepted as-is — they parse in PipelineLoader."""
-        from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 
         raw = {"quant_algo": "FP8", "dynamic": True}
         args = VisualGenArgs(model="/tmp/model", quant_config=raw)
@@ -210,13 +210,13 @@ class TestVisualGenArgsFromDict:
         assert isinstance(args.quant_config, dict)
         assert args.quant_config["quant_algo"] == "FP8"
         # The same dict is the source of truth for the derived flags; verify
-        # the parser DiffusionModelConfig.from_pretrained will run on it.
-        qc, _, dwq, daq = DiffusionModelConfig.load_diffusion_quant_config(args.quant_config)
+        # the pipeline-config parser will run on it.
+        qc, _, dwq, _ = DiffusionPipelineConfig.load_diffusion_quant_config(args.quant_config)
         assert qc.quant_algo is not None
         assert dwq is True
 
     def test_quant_config_dict_does_not_leak_dynamic_flags(self):
-        """AC-5: dynamic flags are not part of the VisualGenArgs schema."""
+        """Dynamic quant flags are not part of the VisualGenArgs schema."""
         args = VisualGenArgs(
             model="/tmp/model",
             quant_config={"quant_algo": "FP8", "dynamic": True},
@@ -413,15 +413,24 @@ class TestVisualGenInputParsing:
         req = call_args[0]
         assert req.prompt == ["a sunset", "a city"]
 
-    def test_params_default_none(self):
-        """Omitting params passes None; executor materializes defaults later."""
+    def test_params_default_materializes_visual_gen_params(self):
+        """Omitting params materializes a fresh ``VisualGenParams`` at the
+        enqueue site, so the executor never sees ``params is None``."""
+        from tensorrt_llm.visual_gen import VisualGenParams
+
         vg = self._make_visual_gen_with_mock_executor()
 
         vg.generate_async(inputs="a cat")
 
         call_args = vg.executor.enqueue_requests.call_args[0][0]
         req = call_args[0]
-        assert req.params is None
+        assert isinstance(req.params, VisualGenParams)
+        # ``seed`` is materialized at the public Python boundary so every
+        # downstream layer sees a concrete int; the other universal fields
+        # stay ``None`` until the executor applies pipeline defaults in
+        # ``DiffusionExecutor._merge_defaults``.
+        assert isinstance(req.params.seed, int)
+        assert req.params.height is None
 
     def test_negative_prompt_via_params(self):
         """negative_prompt is passed through params, not inputs."""

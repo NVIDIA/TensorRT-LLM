@@ -29,6 +29,7 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 
@@ -734,7 +735,7 @@ class QwenImageTransformerBlock(nn.Module):
 # ===========================================================================
 
 
-class QwenImageTransformer2DModel(nn.Module):
+class QwenImageTransformer2DModel(BaseDiffusionModel):
     """Qwen-Image 20B MMDiT transformer.
 
     Mirrors ``diffusers.models.transformers.transformer_qwenimage.QwenImageTransformer2DModel``
@@ -756,8 +757,8 @@ class QwenImageTransformer2DModel(nn.Module):
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
         attn_backend: str = "sdpa",
     ):
-        super().__init__()
-        self.model_config = model_config or DiffusionModelConfig()
+        model_config = model_config or DiffusionModelConfig()
+        super().__init__(model_config)
         self.attn_backend = attn_backend
 
         self.patch_size = patch_size

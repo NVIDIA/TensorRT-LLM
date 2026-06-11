@@ -57,18 +57,18 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
     hf_ids=[
         "nvidia/Cosmos3-Nano",
         "nvidia/Cosmos3-Super",
-        "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Image2Video",
+        "nvidia/Cosmos3-Super-Text2Image",
     ],
     doc="Cosmos3 Omnimodal world models.",
 )
 class Cosmos3OmniMoTPipeline(BasePipeline):
-    def __init__(self, model_config):
-        super().__init__(model_config)
+    def __init__(self, pipeline_config):
+        super().__init__(pipeline_config)
 
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
-        self.transformer = Cosmos3VFMTransformer(self.model_config)
+        self.transformer = Cosmos3VFMTransformer(self.pipeline_config.model_configs["transformer"])
 
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
@@ -443,6 +443,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
         height: int = COSMOS3_720P_PARAMS["height"],
@@ -450,7 +451,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         num_frames: int = COSMOS3_720P_PARAMS["num_frames"],
         num_inference_steps: int = COSMOS3_720P_PARAMS["num_inference_steps"],
         guidance_scale: float = COSMOS3_720P_PARAMS["guidance_scale"],
-        seed: int = 42,
         max_sequence_length: int = COSMOS3_720P_PARAMS["max_sequence_length"],
         frame_rate: float = COSMOS3_720P_PARAMS["frame_rate"],
         use_duration_template: bool = COSMOS3_EXTRA_SPECS["use_duration_template"].default,
