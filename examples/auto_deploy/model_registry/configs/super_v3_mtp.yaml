@@ -46,10 +46,9 @@ transforms:
         # MoLE: latent projections: simple shard
         "fc1_latent_proj": "gather"
         "fc2_latent_proj": "gather"
-  # multi_stream_moe disabled - creates NaNs in target's sampled logits. TODO: investigate + fix
   multi_stream_moe:
     stage: compile
-    enabled: false
+    enabled: true
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
