@@ -6009,6 +6009,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_seq_len: Graph-safe hint for peak ``logits.shape[1]`` at replay.
                 Pass under CUDA graph capture so the heuristic picks the
                 large-N kernel; leave ``None`` in eager mode.
+            cluster_size: Thread-block cluster size for the GVR kernel
+                (1 = single-CTA per row; 2/4/8 = N CTAs cooperatively
+                processing one row via DSMEM + cluster sync). ``None``
+                (default) delegates to the wrapper's auto-dispatch heuristic
+                based on (N, BS); pass an explicit int to pin the choice.
         """
         if not is_sm_100f():
             raise ValueError(
