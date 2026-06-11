@@ -111,6 +111,7 @@ disaggregated/test_ad_disagg.py::test_disaggregated_logits[tinyllama] SKIP (http
 disaggregated/test_ad_disagg.py::test_reduced_layer_handoff_matches_aggregate[deepseek_v3_mla] SKIP (https://nvbugs/6306936)
 disaggregated/test_ad_disagg.py::test_reduced_layer_handoff_matches_aggregate[tinyllama] SKIP (https://nvbugs/6306936)
 disaggregated/test_ad_disagg.py::test_tinyllama_batch_handoff_semantic_slots SKIP (https://nvbugs/6306936)
+disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion SKIP (https://nvbugs/6306936)
 disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6105768)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6162322)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6162322)
