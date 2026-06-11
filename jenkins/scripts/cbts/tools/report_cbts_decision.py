@@ -31,8 +31,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # jenkins/scripts/
 
-from open_search_db import CBTS_PROJECT_NAME, OpenSearchDB  # noqa: E402
-
 logger = logging.getLogger("report_cbts_decision")
 
 
@@ -115,6 +113,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decision", default=None, help="Path to cbts/main.py decision JSON.")
     parser.add_argument("--repo-root", default=".", help="Repo root (for the case-rate counts).")
     args = parser.parse_args(argv)
+
+    # Lazy import: a missing dependency (e.g. requests) surfaces here and is
+    # caught by the __main__ guard, so telemetry never blocks CI.
+    from open_search_db import CBTS_PROJECT_NAME, OpenSearchDB
 
     decision = json.loads(Path(args.decision).read_text()) if args.decision else {}
     cbts_cases, total_cases = _case_counts(
