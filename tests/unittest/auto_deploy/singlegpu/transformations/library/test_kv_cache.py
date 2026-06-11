@@ -26,7 +26,10 @@ import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 
 # Initialize resources first (KVPagedResourceHandler is used within tests below)
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import KVPagedResourceHandler
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+    AttentionType,
+    KVPagedResourceHandler,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
@@ -553,7 +556,8 @@ def test_initialize_cache_transform_calls_initialize_resources(dummy_cached_inte
     )
 
     dummy_cached_interface.add_resource(
-        "kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16)
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
     )
 
     # Mock the factory and shared_config
@@ -574,7 +578,8 @@ def test_initialize_cache_transform_calls_initialize_resources(dummy_cached_inte
 def test_resize_kv_cache_transform_skipped_when_not_needed(dummy_cached_interface):
     """Verify ResizeKVCache transform is skipped when resize not needed."""
     dummy_cached_interface.add_resource(
-        "kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16)
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
     )
     dummy_cached_interface.initialize_resources()
 
@@ -615,7 +620,10 @@ def test_resize_kv_cache_transform_runs_when_needed():
         kv_cache_config=kv_cache_config,
     )
 
-    cm.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    cm.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha),
+    )
     cm.initialize_resources()
 
     # Create the transform with a proper config
@@ -1207,3 +1215,81 @@ def test_sequence_info_register_window_groups():
 
     # Group 0 names should NOT appear with _g0 suffix
     assert "cache_loc_g0" not in seq_info.available_args
+
+
+# ============================================================================
+# Speculative-only resource gating in the kvcache insert transform
+# ============================================================================
+# This is the core of nvbug 6261164: when spec decoding is off, the transform must drop
+# speculative-only handlers (intermediate SSM/conv state + replay buffers) to the None
+# sentinel BEFORE registering them, otherwise they leak an unmanaged per-layer allocation.
+# These CPU-only tests pin the gate decision directly so a regression (e.g. inverting the
+# spec_config check, or narrowing the set back to a hard-coded type tuple that misses the
+# replay family) is caught without the slow weights-dependent e2e smoke.
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (  # noqa: E402
+    CausalConvResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
+    ReplayCacheBufIdxHandler,
+    ReplayOldBHandler,
+    ReplayOldDAcumsumHandler,
+    ReplayOldDtHandler,
+    ReplayOldXHandler,
+    ReplayPrevNumAcceptedHandler,
+    SSMResourceHandler,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (  # noqa: E402
+    _InsertCachedOperator,
+)
+
+
+def _speculative_only_handlers():
+    """Fresh instances of every speculative-only handler (intermediate state + replay)."""
+    return [
+        IntermediateSSMStateHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+        IntermediateConvStateHandler(conv_dim=128, d_conv=4, dtype=torch.float32),
+        ReplayOldXHandler(num_heads=4, head_dim=64, dtype=torch.bfloat16),
+        ReplayOldBHandler(n_groups=2, d_state=16, dtype=torch.bfloat16),
+        ReplayOldDtHandler(num_heads=4),
+        ReplayOldDAcumsumHandler(num_heads=4),
+        ReplayCacheBufIdxHandler(),
+        ReplayPrevNumAcceptedHandler(),
+    ]
+
+
+def _non_speculative_handlers():
+    """Fresh instances of base (non-speculative) handlers that must never be dropped."""
+    return [
+        SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+        CausalConvResourceHandler(conv_dim=128, d_conv=4, dtype=torch.float32),
+        KVPagedResourceHandler(
+            num_kv_heads=4, head_dim=64, dtype=torch.bfloat16, attention_type=AttentionType.mha
+        ),
+    ]
+
+
+def test_gate_when_spec_off():
+    """Spec decoding off: speculative-only handlers are dropped to None; base handlers are kept."""
+    # Dropped: every speculative-only handler becomes the None sentinel (never registered).
+    for handler in _speculative_only_handlers():
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, None)
+        assert result is None, f"{type(handler).__name__} should be dropped when spec is off"
+
+    # Kept: base (non-speculative) handlers pass through unchanged.
+    for handler in _non_speculative_handlers():
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, None)
+        assert result is handler, f"{type(handler).__name__} should be kept when spec is off"
+
+    # An existing None sentinel passes through unchanged.
+    assert _InsertCachedOperator._suppress_spec_handlers_maybe(None, None) is None
+
+
+def test_gate_when_spec_on():
+    """Spec decoding on: nothing is dropped — speculative-only AND base handlers are all kept."""
+    spec_config = object()  # any non-None spec config
+    for handler in _speculative_only_handlers() + _non_speculative_handlers():
+        result = _InsertCachedOperator._suppress_spec_handlers_maybe(handler, spec_config)
+        assert result is handler, f"{type(handler).__name__} should be kept when spec is on"
+
+    # The None sentinel passes through unchanged regardless of spec state.
+    assert _InsertCachedOperator._suppress_spec_handlers_maybe(None, spec_config) is None

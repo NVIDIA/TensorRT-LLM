@@ -28,6 +28,7 @@ from ..._compat import KvCacheConfig
 from ..attention_interface import (
     AttentionRegistry,
     BatchInfo,
+    IntermediateSSMStateHandler,
     MHACallable,
     ReplayCacheBufIdxHandler,
     ReplayOldBHandler,
@@ -36,7 +37,6 @@ from ..attention_interface import (
     ReplayOldXHandler,
     ReplayPrevNumAcceptedHandler,
     ResourceHandlerDict,
-    SpecSSMResourceHandler,
 )
 from .mamba_backend_common import (
     BaseBackendSSM,
@@ -419,7 +419,7 @@ class FlashinferBackendSSM(BaseBackendSSM):
             ret["replay_cache_buf_idx"] = ReplayCacheBufIdxHandler()
             ret["replay_prev_num_accepted"] = ReplayPrevNumAcceptedHandler()
         else:
-            ret["intermediate_ssm_state_cache"] = SpecSSMResourceHandler.from_base(ssm_h)
+            ret["intermediate_ssm_state_cache"] = IntermediateSSMStateHandler.from_base(ssm_h)
             ret["replay_old_x"] = None
             ret["replay_old_b"] = None
             ret["replay_old_dt"] = None

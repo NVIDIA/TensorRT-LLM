@@ -183,9 +183,7 @@ def resolve_moe_cls(
     has_quant = (effective_quant_config is not None
                  and effective_quant_config.layer_quant_mode.has_any_quant(
                      exclude_kv_cache=True))
-    if (moe_cls == TRTLLMGenFusedMoE and not has_quant
-            and not TRTLLMGenFusedMoE._supports_flashinfer_bf16_routing_method(
-                routing_method)):
+    if (moe_cls == TRTLLMGenFusedMoE and not has_quant):
         moe_cls = CutlassFusedMoE
 
     # Routed-expert LoRA is supported only on CutlassFusedMoE with unquantized
