@@ -5,7 +5,7 @@ compile_backend: torch-cudagraph
 max_batch_size: 64
 max_seq_len: 8192 # tunable
 max_num_tokens: 2048
-enable_chunked_prefill: false # TODO: Support chunked prefill w/ spec dec
+enable_chunked_prefill: true
 attn_backend: trtllm
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false

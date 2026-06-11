@@ -1102,6 +1102,71 @@ def test_sequence_info_set_capture_batch_max_draft_len_gt_0_builds_extend_only_b
     assert tuple(input_ids.shape) == (2, 4)
 
 
+def test_sequence_info_overlap_mixed_mtp_offset_does_not_need_device_seq_len():
+    """Overlap MTP updates use the packed batch layout instead of device seq_len.
+
+    The batch is two prefill requests followed by one overlap-carried MTP extend
+    request and one overlap-carried decode request.  ``offset_with_new_lens_``
+    receives the new-token lengths for the overlap requests in ``_gather_slot_idx``
+    order and converts each to a position/cache increment with ``new_len - 1``.
+    """
+    max_draft_len = 3
+    num_prefill_tokens = 5
+    num_extend_tokens = 1 + max_draft_len
+    num_decode_tokens = 1
+    extend_new_len = 3
+    decode_new_len = 4
+    expected_extend_increment = extend_new_len - 1
+    expected_decode_increment = decode_new_len - 1
+
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=16,
+        tokens_per_block=32,
+    )
+    seq_info.batch_info.update_max_draft_len(max_draft_len)
+    seq_info.nest_sequences(
+        input_ids=[1] * (num_prefill_tokens + num_extend_tokens + num_decode_tokens),
+        # Packed tokens: prefill lengths 3 and 2, then one fixed-width MTP extend
+        # request containing the target token plus max_draft_len draft tokens, then
+        # one single-token decode request.
+        cu_seqlen=[0, 3, 5, 9, 10],
+        # Prefill offsets are zero. The extend and decode requests are the only
+        # requests offset_with_new_lens_ should advance.
+        input_pos=[0, 0, 10, 20],
+        batch_info=[2, num_prefill_tokens, 1, num_extend_tokens, 1, num_decode_tokens],
+        slot_idx=[0, 1, 2, 3],
+        # Two overlap-carried requests; consume new_lens_ungathered[0] for extend
+        # and new_lens_ungathered[1] for decode.
+        _gather_slot_idx=[0, 1],
+    )
+
+    position_ids_before = seq_info.get_arg("position_ids", truncate=True, unflatten=False).clone()
+
+    # If offset_with_new_lens_ falls back to tensor-valued repeat_interleave(seq_len), this
+    # corrupted device value gives the wrong output size. The static MTP path must not read it.
+    seq_info.copy_("seq_len", torch.tensor([99, 99, 99, 99], dtype=torch.int))
+
+    seq_info.offset_with_new_lens_(
+        torch.tensor([extend_new_len, decode_new_len], dtype=torch.int32)
+    )
+
+    position_ids_after = seq_info.get_arg("position_ids", truncate=True, unflatten=False)
+    expected = position_ids_before.clone()
+    extend_token_end = num_prefill_tokens + num_extend_tokens
+    expected[num_prefill_tokens:extend_token_end] += expected_extend_increment
+    expected[extend_token_end:] += expected_decode_increment
+
+    assert torch.equal(position_ids_after, expected)
+    assert seq_info.get_arg("input_pos", truncate=True).tolist() == [
+        0,
+        0,
+        10 + expected_extend_increment,
+        20 + expected_decode_increment,
+    ]
+
+
 # =============================================================================
 # Typed State Resource Handler Tests
 # =============================================================================
