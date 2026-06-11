@@ -214,6 +214,17 @@ async def async_load_video(video: str,
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
 
+def load_base64_audio(parsed_url) -> BytesIO:
+    data_spec, data = parsed_url.path.split(",", 1)
+    _, data_type = data_spec.split(";", 1)
+
+    if data_type != "base64":
+        msg = "Only base64 data URLs are supported for now."
+        raise NotImplementedError(msg)
+
+    return BytesIO(base64.b64decode(data))
+
+
 def load_audio(
     audio: str,
     format: str = "pt",
@@ -223,6 +234,8 @@ def load_audio(
     if parsed_url.scheme in ["http", "https"]:
         resp = _safe_request_get(audio, stream=False)
         audio = BytesIO(resp.content)
+    elif parsed_url.scheme == "data":
+        audio = load_base64_audio(parsed_url)
     elif parsed_url.scheme in ("", "file"):
         audio = _normalize_file_uri(
             audio) if parsed_url.scheme == "file" else audio
@@ -249,6 +262,8 @@ async def async_load_audio(
         session = await _get_aiohttp_session()
         audio_data = await _safe_aiohttp_get(audio, session=session)
         audio = BytesIO(audio_data)
+    elif parsed_url.scheme == "data":
+        audio = await asyncio.to_thread(load_base64_audio, parsed_url)
     elif parsed_url.scheme in ("", "file"):
         audio = _normalize_file_uri(
             audio) if parsed_url.scheme == "file" else audio
