@@ -1787,12 +1787,13 @@ class TestPipelineCache(LlmapiAccuracyTestHarness):
         print(f"[pipeline_cache:{label}] elapsed = {elapsed:.1f}s")
         return elapsed
 
-    def _run_cold_warm_and_report(self, model_name, model_path, world_size,
-                                  cache_root):
+    def _run_cold_warm_and_report(self, model_name, model_path, cache_root):
+        # world_size is taken from the model registry (the ``world_size_N.yaml``
+        # in the model's yaml_extra) so it cannot drift from the registry default.
+        yaml_paths, world_size = _get_registry_yaml_extra(model_name)
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
 
-        yaml_paths, _ = _get_registry_yaml_extra(model_name)
         cache_root = Path(cache_root)
         cache_root.mkdir(parents=True, exist_ok=True)
 
@@ -1822,7 +1823,6 @@ class TestPipelineCache(LlmapiAccuracyTestHarness):
         self._run_cold_warm_and_report(
             model_name="openai/gpt-oss-120b",
             model_path=f"{llm_models_root()}/gpt_oss/gpt-oss-120b",
-            world_size=2,
             cache_root=tmp_path / "pipeline_cache",
         )
 
@@ -1834,6 +1834,5 @@ class TestPipelineCache(LlmapiAccuracyTestHarness):
         self._run_cold_warm_and_report(
             model_name=model_name,
             model_path=hf_id_to_local_model_dir(model_name),
-            world_size=8,
             cache_root=tmp_path / "pipeline_cache",
         )
