@@ -24,6 +24,11 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 
 #pragma once
 
+namespace tensorrt_llm::testing
+{
+class KVCacheTransferManagerTestAccess;
+} // namespace tensorrt_llm::testing
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
@@ -76,6 +81,8 @@ public:
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
 
 private:
+    friend class ::tensorrt_llm::testing::KVCacheTransferManagerTestAccess;
+
     //! \brief Get pointer to pool specified by cache block.
     static tr::ITensor::SharedPtr computeBlockPointer(
         BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
