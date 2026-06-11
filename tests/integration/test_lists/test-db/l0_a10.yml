@@ -32,6 +32,7 @@ l0_a10:
   - unittest/_torch/executor/test_scheduler_serializable_output.py
   - unittest/_torch/executor/test_kv_cache_estimation.py
   - unittest/_torch/executor/test_kv_cache_budget_split.py
+  - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
   - unittest/_torch/modules/dwdp/test_dwdp_manager.py
@@ -41,6 +42,7 @@ l0_a10:
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
+  - unittest/_torch/weight_sharing
   - unittest/inputs/test_chat_template_dispatch.py
   - unittest/inputs/test_content_format.py
   - unittest/inputs/test_url_validation.py
@@ -113,6 +115,7 @@ l0_a10:
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/visual_gen/test_output.py
   - unittest/media/test_encoding.py
+  - unittest/_torch/visual_gen/test_tensor_payload.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py

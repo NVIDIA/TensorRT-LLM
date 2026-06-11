@@ -35,7 +35,12 @@ from .ltx2_core.types import (
 )
 from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
-from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_files
+from .pipeline_ltx2 import (
+    LTX2Pipeline,
+    _assert_resolution,
+    _find_safetensors_files,
+    _prefetch_ltx2_safetensors_files,
+)
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -97,6 +102,7 @@ def _load_lora_deltas(
     sft_paths = _find_safetensors_files(lora_path)
     if not sft_paths:
         raise ValueError(f"No safetensors files found at {lora_path}")
+    _prefetch_ltx2_safetensors_files(sft_paths)
 
     raw: Dict[str, torch.Tensor] = {}
     alpha_dict: Dict[str, float] = {}
@@ -656,9 +662,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             **kwargs,
         )
 
-        dtype = self.model_config.torch_dtype
-        spatial_upsampler_path = self.model_config.extra_attrs.get("spatial_upsampler_path", "")
-        distilled_lora_path = self.model_config.extra_attrs.get("distilled_lora_path", "")
+        dtype = self.pipeline_config.torch_dtype
+        spatial_upsampler_path = self.pipeline_config.extra_attrs.get("spatial_upsampler_path", "")
+        distilled_lora_path = self.pipeline_config.extra_attrs.get("distilled_lora_path", "")
 
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
@@ -666,6 +672,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             sft_paths = _find_safetensors_files(spatial_upsampler_path)
             if not sft_paths:
                 raise ValueError(f"No safetensors files found at {spatial_upsampler_path}")
+            _prefetch_ltx2_safetensors_files(sft_paths)
 
             config: Dict[str, Any] = {}
             try:
@@ -728,7 +735,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
             image=req.params.image,
-            image_cond_strength=req.params.image_cond_strength,
+            image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
@@ -745,6 +752,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 512,
         width: int = 768,
@@ -753,7 +761,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         num_inference_steps: int = 40,
         guidance_scale: float = 3.0,
         guidance_rescale: float = 0.0,
-        seed: int = 42,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
         image: Optional[Union[str, torch.Tensor]] = None,

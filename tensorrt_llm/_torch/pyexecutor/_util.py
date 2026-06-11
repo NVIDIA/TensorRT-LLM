@@ -7,13 +7,11 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
-from tensorrt_llm._utils import (
-    confidential_compute_enabled,
-    get_sm_version,
-    str_dtype_to_binding,
-    torch_dtype_to_str,
-)
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
+from tensorrt_llm._torch.models.modeling_utils import \
+    MODEL_CLASS_VISION_ENCODER_MAPPING
+from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
+                                 str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off
@@ -24,55 +22,38 @@ from tensorrt_llm.llmapi.llm_args import (
     WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig, get_default_trtllm_modules_to_hf_modules
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
-from ..speculative import (
-    get_num_extra_kv_tokens,
-    get_num_spec_layers,
-    get_spec_decoder,
-    should_use_separate_draft_kv_cache,
-)
-from .config_utils import (
-    extract_mamba_kv_cache_params,
-    is_gemma4_hybrid,
-    is_hybrid_linear,
-    is_mla,
-    is_nemotron_hybrid,
-    is_qwen3_hybrid,
-)
+from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
+                           get_spec_decoder, should_use_separate_draft_kv_cache)
+from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
+                           is_hybrid_linear, is_mla, is_nemotron_hybrid,
+                           is_qwen3_hybrid)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .mamba_cache_manager import (
-    BaseMambaCacheManager,
-    CppMambaHybridCacheManager,
-    MixedMambaHybridCacheManager,
-    use_cpp_mamba_cache_manager,
-    use_py_mamba_cache_manager,
-)
+from .mamba_cache_manager import (BaseMambaCacheManager,
+                                  CppMambaHybridCacheManager,
+                                  MixedMambaHybridCacheManager,
+                                  use_cpp_mamba_cache_manager,
+                                  use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (
-    KVCacheManager,
-    KVCacheManagerV2,
-    PeftCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
-from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler, TRTLLMSampler
-from .scheduler import (
-    BindCapacityScheduler,
-    BindMicroBatchScheduler,
-    KVCacheV2Scheduler,
-    SimpleScheduler,
-    SimpleUnifiedScheduler,
-)
+from .resource_manager import (KVCacheManager, KVCacheManagerV2,
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
+from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
+                      TRTLLMSampler)
+from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
+                        KVCacheV2Scheduler, SimpleScheduler,
+                        SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -422,18 +403,8 @@ class KvCacheCreator:
                 multimodal_input = extra_processed_inputs.get(
                     'multimodal_input')
                 multimodal_data = extra_processed_inputs.get('multimodal_data')
-                req_mm_input = trtllm.MultimodalInput(
-                    multimodal_hashes=multimodal_input.multimodal_hashes,
-                    multimodal_positions=multimodal_input.multimodal_positions,
-                    multimodal_lengths=multimodal_input.multimodal_lengths,
-                    multimodal_uuids=multimodal_input.multimodal_uuids,
-                    multimodal_item_run_cu_offsets=multimodal_input.
-                    multimodal_item_run_cu_offsets,
-                    multimodal_run_positions=multimodal_input.
-                    multimodal_run_positions,
-                    multimodal_run_lengths=multimodal_input.
-                    multimodal_run_lengths,
-                ) if multimodal_input else None
+                req_mm_input = multimodal_input.to_binding(
+                    trtllm) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
                                          max_tokens=1,
@@ -475,9 +446,12 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(self._model_engine.model,
-                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                       self._model_engine.model.original_arch, None):
+        # Disaggregated workers receive multimodal embeddings instead of raw
+        # pixel inputs, so capacity probing must use the text-only fallback.
+        if (not _is_mm_disagg()
+                and hasattr(self._model_engine.model, "original_arch")
+                and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                    self._model_engine.model.original_arch, None)):
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case
@@ -1791,6 +1765,8 @@ def create_py_executor_instance(
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
         dwdp_manager=dwdp_manager,
+        enable_kv_pool_rebalance=llm_args.kv_cache_config.
+        enable_kv_pool_rebalance,
     )
 
 

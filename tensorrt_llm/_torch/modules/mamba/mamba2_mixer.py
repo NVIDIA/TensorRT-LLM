@@ -22,8 +22,10 @@ from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import use_cpp_mamba_cache_manager
+from tensorrt_llm._torch.modules.multi_stream_utils import \
+    maybe_execute_in_parallel
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -33,12 +35,15 @@ from ...peft.lora.layer import LoraLayer, LoraModuleType
 from ...speculative import SpecMetadata
 from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
-from .fuse_elementwise_ops import extract_transpose_xbc_prefill, fused_split_rearrange_after_conv1d
+from .causal_conv1d_triton import \
+    causal_conv1d_update as causal_conv1d_update_triton
+from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
+                                   fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
 from .replay_selective_state_update import replay_selective_state_update
-from .selective_state_update import selective_state_update as selective_state_update_native
+from .selective_state_update import \
+    selective_state_update as selective_state_update_native
 from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
 from .ssd_combined import mamba_chunk_scan_combined
 
@@ -369,6 +374,7 @@ class Mamba2Mixer(nn.Module):
 
             initial_states = None
             if mamba_metadata.use_initial_states:
+                # Rows without cached prefix state start SSM from zero.
                 initial_states = torch.where(
                     has_initial_states[:, None, None, None],
                     ssm_states[state_indices_p], 0)
@@ -412,9 +418,8 @@ class Mamba2Mixer(nn.Module):
                                      'use_replay_state_update', False)
                 draft_token_num = spec_metadata.runtime_draft_len + 1
                 if use_replay:
-                    replay_metadata = (
-                        attn_metadata.kv_cache_manager.
-                        get_replay_state_update_metadata())
+                    replay_metadata = (attn_metadata.kv_cache_manager.
+                                       get_replay_state_update_metadata())
                     assert replay_metadata is not None, (
                         "Mamba replay state update is enabled but replay "
                         "metadata was not allocated.")
