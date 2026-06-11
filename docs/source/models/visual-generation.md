@@ -216,7 +216,7 @@ args = VisualGenArgs(
 | `residual_diff_threshold` | float | `0.24` | L1-distance threshold for DBCache residual gating. Increase to cache more aggressively (higher speedup, potential quality loss); decrease for more conservative caching. |
 | `enable_taylorseer` | bool | `false` | Enable TaylorSeer calibration. Uses Taylor series expansion to approximate hidden states at cached steps, improving output quality over plain residual reuse. |
 | `taylorseer_order` | int | `1` | Polynomial order for TaylorSeer (1–4). Only used when `enable_taylorseer=true`. |
-| `scm_steps_mask_policy` | str \| None | `None` | Named step-computation mask policy from the `cache_dit` library (`"fast"`, `"medium"`, `"slow"`, `"ultra"`). Requires `num_inference_steps ∈ {4, 6}` or `≥ 8`; falls back to plain `refresh_context` otherwise. |
+| `scm_steps_mask_policy` | str \| None | `None` | Named step-computation mask policy from the `cache_dit` library (`"slow"`, `"medium"`, `"fast"`, `"ultra"`). |
 | `scm_steps_policy` | `"dynamic"` \| `"static"` | `"dynamic"` | Execution policy for the SCM mask; only active when `scm_steps_mask_policy` is set. |
 | `force_refresh_step_hint` | int \| None | `None` | Step index at which a forced full-compute pass is injected (useful for scheduled quality checkpoints). |
 | `force_refresh_step_policy` | `"once"` \| `"repeat"` | `"once"` | Whether `force_refresh_step_hint` fires only on the first call (`"once"`) or at that interval repeatedly (`"repeat"`). |
