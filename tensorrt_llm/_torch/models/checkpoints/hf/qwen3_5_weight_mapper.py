@@ -154,14 +154,21 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     def _split_qkv_scale_tensor(
         self, tensor: torch.Tensor, expected_q: int, expected_v: int
     ) -> tuple[torch.Tensor, ...]:
+        expected_per_channel_total = expected_q * 2 + expected_v
         expected_q_blocks = math.ceil(expected_q / 128)
         expected_v_blocks = math.ceil(expected_v / 128)
-        expected_total_blocks = expected_q_blocks * 2 + expected_v_blocks
-        assert tensor.shape[0] == expected_total_blocks, (
-            f"Expected packed qkv scale tensor with leading dim {expected_total_blocks}, "
-            f"got {tensor.shape}"
+        expected_block_total = expected_q_blocks * 2 + expected_v_blocks
+        if tensor.shape[0] == expected_per_channel_total:
+            return torch.split(tensor, [expected_q, expected_q, expected_v], dim=0)
+        if tensor.shape[0] == expected_block_total:
+            return torch.split(
+                tensor, [expected_q_blocks, expected_q_blocks, expected_v_blocks], dim=0
+            )
+        raise AssertionError(
+            "Expected packed qkv scale tensor with leading dim "
+            f"{expected_per_channel_total} (W4A16_AWQ) or "
+            f"{expected_block_total} (FP8 block), got {tensor.shape}"
         )
-        return torch.split(tensor, [expected_q_blocks, expected_q_blocks, expected_v_blocks], dim=0)
 
     def _dequantize_fp8_block_scale_weight(
         self, weight: torch.Tensor, weight_scale_inv: torch.Tensor
