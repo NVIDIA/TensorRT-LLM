@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1721,3 +1725,115 @@ class TestQwen3_5_MoE_IR(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+# =============================================================================
+# Pipeline Cache Timing Tests
+# =============================================================================
+
+# Snapshot manifest written per-rank under the pipeline_cache root; mirrors
+# MANIFEST_FILE_NAME in
+# tensorrt_llm/_torch/auto_deploy/transform/pipeline_cache/pipeline_cache.py.
+_PIPELINE_CACHE_MANIFEST = "manifest.json"
+
+
+class TestPipelineCache(LlmapiAccuracyTestHarness):
+    """Cold/warm timing for the AutoDeploy ``pipeline_cache`` transform.
+
+    Each test shells out to ``examples/auto_deploy/build_and_run_ad.py`` twice
+    against a *fresh* cache root:
+
+      * run 1 (cold) -- cache miss: the pre-sharding transform prefix runs in
+        full and the snapshot is written under the cache root.
+      * run 2 (warm) -- cache hit: ``pipeline_cache`` restores the snapshot and
+        the optimizer skips the transforms before the cache point.
+
+    No accuracy threshold is checked. The test asserts both runs exit cleanly
+    and that run 1 actually populated the cache, then reports per-run and total
+    wall time so the cross-process cache speedup is visible in the logs.
+
+    Blackwell-only (B200) per request.
+    """
+
+    # Per build_and_run_ad.py invocation. Cold runs include export + sharding +
+    # weight load for very large MoE checkpoints, so keep this generous.
+    _RUN_TIMEOUT_S = 7200
+
+    def _run_build_and_run_ad(self, model_path, yaml_paths, world_size,
+                              cache_root, label):
+        """Run build_and_run_ad.py once; return elapsed wall time in seconds."""
+        script = str(
+            Path(get_llm_root()) / "examples" / "auto_deploy" /
+            "build_and_run_ad.py")
+        cmd = [sys.executable, script, "--model", model_path]
+        for yaml_path in yaml_paths:
+            cmd += ["--args.yaml-extra", yaml_path]
+        cmd += [
+            f"--args.world-size={world_size}",
+            "--args.transforms.pipeline_cache.enabled=true",
+            f"--args.transforms.pipeline_cache.root={cache_root}",
+            "--prompt.batch-size=1",
+        ]
+
+        print(f"\n[pipeline_cache:{label}] $ {' '.join(cmd)}")
+        start = time.monotonic()
+        proc = subprocess.run(cmd,
+                              cwd=get_llm_root(),
+                              env=os.environ.copy(),
+                              timeout=self._RUN_TIMEOUT_S)
+        elapsed = time.monotonic() - start
+        assert proc.returncode == 0, (
+            f"build_and_run_ad.py ({label}) exited with {proc.returncode}")
+        print(f"[pipeline_cache:{label}] elapsed = {elapsed:.1f}s")
+        return elapsed
+
+    def _run_cold_warm_and_report(self, model_name, model_path, world_size,
+                                  cache_root):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        yaml_paths, _ = _get_registry_yaml_extra(model_name)
+        cache_root = Path(cache_root)
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+        cold_s = self._run_build_and_run_ad(model_path, yaml_paths, world_size,
+                                            cache_root, "cold")
+
+        # Run 1 must have written a snapshot (manifest.json under the root).
+        manifests = list(cache_root.rglob(_PIPELINE_CACHE_MANIFEST))
+        assert manifests, (
+            f"pipeline_cache did not populate {cache_root} after the cold run")
+
+        warm_s = self._run_build_and_run_ad(model_path, yaml_paths, world_size,
+                                            cache_root, "warm")
+
+        print(f"\n{'=' * 60}\n"
+              f"Pipeline cache timing: {model_name} (world_size={world_size})\n"
+              f"  cold (miss): {cold_s:.1f}s\n"
+              f"  warm (hit):  {warm_s:.1f}s\n"
+              f"  total:       {cold_s + warm_s:.1f}s\n"
+              f"  warm/cold:   {warm_s / cold_s:.2%}\n"
+              f"{'=' * 60}\n")
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_gpt_oss_120b(self, tmp_path):
+        self._run_cold_warm_and_report(
+            model_name="openai/gpt-oss-120b",
+            model_path=f"{llm_models_root()}/gpt_oss/gpt-oss-120b",
+            world_size=2,
+            cache_root=tmp_path / "pipeline_cache",
+        )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(120000)
+    def test_deepseek_r1(self, tmp_path):
+        model_name = "deepseek-ai/DeepSeek-R1-0528"
+        self._run_cold_warm_and_report(
+            model_name=model_name,
+            model_path=hf_id_to_local_model_dir(model_name),
+            world_size=8,
+            cache_root=tmp_path / "pipeline_cache",
+        )
