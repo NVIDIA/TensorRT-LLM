@@ -37,6 +37,7 @@ from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
+from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
 from .mamba_cache_manager import (BaseMambaCacheManager,
@@ -46,7 +47,6 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .kv_cache_manager_v2 import KVCacheManagerV2
 from .resource_manager import (KVCacheManager, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,

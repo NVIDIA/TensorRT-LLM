@@ -3,14 +3,13 @@
 
 import copy
 import enum
-import hashlib
 import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional,
-                    Sequence, Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
+                    Union)
 
 import torch
 from mpi4py import MPI
@@ -18,13 +17,10 @@ from mpi4py import MPI
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
-                                 get_size_in_bytes, mpi_comm, mpi_disabled,
+from tensorrt_llm._utils import (get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm)
 from tensorrt_llm.bindings.internal.batch_manager import (
-    KvCacheStats, LinearAttentionMetadata, LinearCacheType)
-from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
-    IndexMapper, copy_batch_block_offsets_to_device)
+    LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
@@ -32,23 +28,7 @@ from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 
 # isort: off
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    DiskCacheTierConfig, GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
 # isort: on
-from tensorrt_llm.runtime.kv_cache_manager_v2 import \
-    KVCacheManager as KVCacheManagerPy
-from tensorrt_llm.runtime.kv_cache_manager_v2 import \
-    KVCacheManagerConfig as KVCacheManagerConfigPy
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
-                                                      _KVCache)
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    gen_multimodal_cache_key_tokens
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
-                                                              GPU_LEVEL)
-from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
-                                                             typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
