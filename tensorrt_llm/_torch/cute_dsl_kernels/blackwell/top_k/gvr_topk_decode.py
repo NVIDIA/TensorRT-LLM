@@ -844,9 +844,12 @@ class GvrTopKKernel:
             cute.arch.barrier()  # publish s_iscalars[0] to all threads of this CTA
             if tidx == cutlass.Int32(0):
                 s_cluster_partial[0] = s_iscalars[0]
-            # arrive_relaxed + wait: cheaper than full cluster.sync for
-            # "publish my SMEM, then read peers'".
-            cute.arch.cluster_arrive_relaxed()
+            # Non-relaxed arrive: pairs with the peer cluster_wait acquire
+            # to release s_cluster_partial writes so the DSMEM ld below
+            # observes them. cluster_arrive_relaxed would skip the release
+            # fence and risk stale peer reads on hardware that doesn't
+            # eagerly publish shared writes.
+            cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
             if tidx == cutlass.Int32(0):
                 total = cutlass.Int32(0)
@@ -2062,9 +2065,12 @@ class GvrTopKKernel:
 
                 # Cluster handoff #2: leader's gather of peer smem_keys /
                 # smem_vals into its own buffer. Peers' Phase 3 must have
-                # finished before this DSMEM read, so we sync first.
+                # finished AND their smem writes must be visible to the
+                # leader before this DSMEM read. Non-relaxed arrive pairs
+                # release with the wait acquire so the leader sees the
+                # final smem_keys/smem_vals each peer published.
                 if cutlass.const_expr(cluster_size > 1):
-                    cute.arch.cluster_arrive_relaxed()
+                    cute.arch.cluster_arrive()
                     cute.arch.cluster_wait()
 
                 if cluster_size == 1 or is_leader:
