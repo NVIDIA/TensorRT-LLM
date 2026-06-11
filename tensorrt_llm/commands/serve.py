@@ -34,7 +34,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
-                                              parse_metadata_server_config_file)
+                                              parse_metadata_server_config_file,
+                                              validate_config_bool)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
@@ -56,6 +57,10 @@ _child_p_global: Optional[subprocess.Popen] = None
 
 # Bound gRPC messages while leaving room for multimodal image payloads.
 _GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
+
+
+def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
+    return validate_config_bool(config.pop(key, False), key)
 
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
@@ -1006,7 +1011,7 @@ def serve(
         exclude=("extra_llm_api_options", "config"))
 
     def _serve_llm():
-        nonlocal server_role
+        nonlocal server_role, allow_request_chat_template
         llm_args, _ = get_llm_args(
             model=model,
             tokenizer=tokenizer,
@@ -1043,8 +1048,10 @@ def serve(
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
                 llm_args_extra_dict = yaml.safe_load(f) or {}
-        allow_request_chat_template = (allow_request_chat_template or bool(
-            llm_args_extra_dict.pop("allow_request_chat_template", False)))
+        extra_allow_request_chat_template = _pop_bool_config_option(
+            llm_args_extra_dict, "allow_request_chat_template")
+        allow_request_chat_template = (allow_request_chat_template
+                                       or extra_allow_request_chat_template)
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -1254,8 +1261,10 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     if extra_encoder_options is not None:
         with open(extra_encoder_options, 'r') as f:
             encoder_args_extra_dict = yaml.safe_load(f) or {}
-    allow_request_chat_template = (allow_request_chat_template or bool(
-        encoder_args_extra_dict.pop("allow_request_chat_template", False)))
+    extra_allow_request_chat_template = _pop_bool_config_option(
+        encoder_args_extra_dict, "allow_request_chat_template")
+    allow_request_chat_template = (allow_request_chat_template
+                                   or extra_allow_request_chat_template)
     encoder_args = update_llm_args_with_extra_dict(
         llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 

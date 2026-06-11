@@ -57,12 +57,11 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatMessage, CompletionRequest, CompletionResponse,
-    CompletionResponseChoice, ErrorResponse, ImageEditRequest,
-    ImageGenerationRequest, ImageGenerationResponse, ImageObject,
-    MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse, UpdateWeightsRequest,
-    UsageInfo, ensure_request_chat_template_allowed,
-    to_llm_disaggregated_params)
+    CompletionResponseChoice, ErrorResponse, ImageGenerationRequest,
+    ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
+    ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
+    ResponsesResponse, UpdateWeightsRequest, UsageInfo,
+    ensure_request_chat_template_allowed, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -1317,6 +1316,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
+        except ValueError as e:
+            return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
