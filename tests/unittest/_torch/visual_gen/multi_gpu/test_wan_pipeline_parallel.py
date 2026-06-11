@@ -178,7 +178,7 @@ def _build_parallel_args(checkpoint_path: str) -> "VisualGenArgs":
 
 
 def _build_cfg2_attn2d2x1_ulysses2_pvae8_args(checkpoint_path: str) -> "VisualGenArgs":
-    """Build VisualGenArgs with cfg=2, ulysses=2, attn2d=2×1, parallel_vae=8 (FA4)."""
+    """Build VisualGenArgs with cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 (FA4)."""
     return VisualGenArgs(
         model=checkpoint_path,
         torch_compile_config=TorchCompileConfig(enable=False),
@@ -187,6 +187,7 @@ def _build_cfg2_attn2d2x1_ulysses2_pvae8_args(checkpoint_path: str) -> "VisualGe
             cfg_size=2,
             ulysses_size=2,
             attn2d_size=(2, 1),
+            async_ulysses=True,
             parallel_vae_size=8,
             parallel_vae_split_dim="width",
         ),
@@ -341,7 +342,7 @@ def _logic_wan_cfg_ulysses_pvae(rank: int, world_size: int, *, checkpoint_path: 
 def _logic_wan_cfg2_attn2d2x1_ulysses2_pvae8(
     rank: int, world_size: int, *, checkpoint_path: str
 ) -> None:
-    """End-to-end pipeline: cfg=2, ulysses=2, attn2d=2×1, parallel_vae=8 (8 GPUs)."""
+    """End-to-end pipeline: cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 (8 GPUs)."""
     assert world_size == 8, f"This test is hardcoded to world_size=8, got {world_size}"
 
     trtllm_pipe = PipelineLoader(_build_cfg2_attn2d2x1_ulysses2_pvae8_args(checkpoint_path)).load(
@@ -391,7 +392,7 @@ def _logic_wan_cfg2_attn2d2x1_ulysses2_pvae8(
 
     cos_sim = _cosine_similarity(trtllm_video, hf_video)
     print(
-        "\n  Wan2.1-T2V-1.3B (cfg=2, ulysses=2, attn2d=2×1, parallel_vae=8) "
+        "\n  Wan2.1-T2V-1.3B (cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8) "
         f"cosine similarity: {cos_sim:.6f}"
     )
     assert cos_sim >= COS_SIM_THRESHOLD, (
@@ -426,7 +427,7 @@ class TestWanPipelineParallel:
         )
 
     def test_cfg2_attn2d2x1_ulysses2_pvae8(self):
-        """world=8, cfg=2, ulysses=2, attn2d=2×1, parallel_vae=8 vs HF reference."""
+        """world=8, cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 vs HF reference."""
         if not MODULES_AVAILABLE:
             pytest.skip("Required modules not available")
         if not _ATTN2D_AVAILABLE:
