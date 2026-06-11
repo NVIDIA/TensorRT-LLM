@@ -98,6 +98,7 @@ class FallbackFmha(Fmha):
             spec_decoding_bl_tree_mask_offset=metadata.spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
             spec_bl_tree_first_sparse_mask_offset_kv=metadata.spec_bl_tree_first_sparse_mask_offset_kv,
+            spec_decoding_target_max_draft_tokens=metadata.max_total_draft_tokens,
             num_sparse_topk=metadata.num_sparse_topk,
             flash_mla_tile_scheduler_metadata=metadata.flash_mla_tile_scheduler_metadata,
             flash_mla_num_splits=metadata.flash_mla_num_splits,
@@ -173,5 +174,4 @@ class FallbackFmha(Fmha):
             # stay as literal ``None`` until DeepSeek V4 sparse-MLA lands.
             sparse_mla_topk_lens=None,
             compressed_kv_cache_pool_ptr=None,
-            spec_decoding_target_max_draft_tokens=metadata.max_total_draft_tokens,
         )
