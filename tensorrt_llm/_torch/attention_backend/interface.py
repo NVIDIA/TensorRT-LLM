@@ -12,7 +12,6 @@ from typing_extensions import Self
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
-    from .sparse.kv_cache_compression_manager import BaseKVCacheCompressionManager
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -71,8 +70,6 @@ class AttentionMetadata:
     kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
     draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
-    # Compression manager whose per-attention hooks the attention backend fires.
-    compression_manager: Optional["BaseKVCacheCompressionManager"] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False

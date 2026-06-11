@@ -90,13 +90,8 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
-        # Legacy methods return their own cache manager; framework methods
-        # return None and fall through to the checks below (they use the
-        # standard manager).
-        cls = get_sparse_attn_kv_cache_manager(sparse_attn_config)
-        if cls is not None:
-            return cls
-    if is_hybrid_linear(config):
+        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+    elif is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
         if model_config.get_num_mamba_layers() == 0:
@@ -1649,14 +1644,13 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
-    # Register the compression manager (if the method provides one) with the
-    # other managers, before building ResourceManager. Created before
-    # PyExecutor.__init__/warmup so CUDA-graph capture sees the per-layer hooks.
-    if llm_args.sparse_attention_config is not None:
-        from ..attention_backend.sparse import \
-            create_kv_cache_compression_manager
+    # Register the compression manager (if one is configured) with the other
+    # managers, before building ResourceManager, so it is part of the manager
+    # set from the start. Reads its own config, not the sparse-attention one.
+    if llm_args.kv_cache_compression_config is not None:
+        from .resource_manager import create_kv_cache_compression_manager
         compression_manager = create_kv_cache_compression_manager(
-            llm_args.sparse_attention_config, kv_cache_manager)
+            llm_args.kv_cache_compression_config, kv_cache_manager)
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)

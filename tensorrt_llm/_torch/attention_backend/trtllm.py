@@ -1736,25 +1736,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # @property accessors directly on ``self``.
         if (self.sparse_attention_config is not None and not isinstance(
                 self.sparse_attention_config, SkipSoftmaxAttentionConfig)):
-            kv_idx, kv_off, at_idx, at_off = None, None, None, None
-            if metadata.compression_manager is not None:
-                # Fire the compression manager's per-layer attention hooks.
-                # A hook may return an (indices, offsets) sparse mask, or None
-                # to leave attention dense.
-                layer_idx = self.get_local_layer_idx(metadata)
-                ctx_result = metadata.compression_manager.on_context_attention(
-                    layer_idx, q, k, None, metadata)
-                if ctx_result is not None:
-                    kv_idx, kv_off = ctx_result
-                gen_result = metadata.compression_manager.on_generation_attention(
-                    layer_idx, q, k, None, metadata)
-                if gen_result is not None:
-                    at_idx, at_off = gen_result
-            else:
-                kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
-                                                        forward_args)
-                at_idx, at_off = self.sparse_attn_predict(
-                    q, k, metadata, forward_args)
+            kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
+                                                    forward_args)
+            at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
+                                                      forward_args)
             forward_args.sparse = AttentionSparseArgs(
                 sparse_kv_indices=kv_idx,
                 sparse_kv_offsets=kv_off,
@@ -1782,18 +1767,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.update_blackwell_first_sparse_mask_offset()
 
         self._run(q, k, v, metadata, forward_args)
-
-        # Post-attention hooks, fired after the output is computed, for a method
-        # that needs the attention result (e.g. to stash q/k/output for a later
-        # eviction).
-        if (self.sparse_attention_config is not None and not isinstance(
-                self.sparse_attention_config, SkipSoftmaxAttentionConfig)
-                and metadata.compression_manager is not None):
-            _post_layer_idx = self.get_local_layer_idx(metadata)
-            metadata.compression_manager.on_context_attention_end(
-                _post_layer_idx, q, k, forward_args.output, metadata)
-            metadata.compression_manager.on_generation_attention_end(
-                _post_layer_idx, q, k, forward_args.output, metadata)
 
         if forward_args.output_sf is None:
             return forward_args.output

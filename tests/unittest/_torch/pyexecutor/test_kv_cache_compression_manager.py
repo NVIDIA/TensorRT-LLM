@@ -2,32 +2,35 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Unit tests for the KV-cache compression manager framework
-(``kv_cache_compression_manager.py``) — the ``BaseResourceManager``-based
-single-manager design (no standalone coordinator).
+(``BaseKVCacheCompressionManager`` in ``resource_manager.py``) — the
+``BaseResourceManager``-based single-manager design.
 
 Covers:
-- :class:`BaseKVCacheCompressionManager` ABC contract: the 8 lifecycle hooks
-  default to no-op, zero resource counts, ``implements`` introspection, and
-  that it inherits :class:`BaseResourceManager` (so PyExecutor auto-drives it
-  once registered).
-- The resource-manager API -> semantic-hook translation, gated on PyExecutor's
+- :class:`BaseKVCacheCompressionManager` contract: the four lifecycle hooks
+  default to no-op, zero resource counts, and it inherits
+  :class:`BaseResourceManager` (so PyExecutor auto-drives it once registered).
+- The resource-manager API -> lifecycle-hook translation, gated on PyExecutor's
   own signals: ``prepare_resources`` fires ``on_request_init`` on each
   request's first prefill chunk (``is_first_context_chunk``);
   ``update_resources`` fires ``on_context_step_end`` for each request in
   ``context_requests_last_chunk`` + one ``on_generation_step_end`` per
   iteration; ``free_resources`` fires ``on_request_finish``.
 - :func:`create_kv_cache_compression_manager` factory.
+
+The framework lives in ``resource_manager.py`` (it is a resource manager, not a
+sparse-attention backend), so these imports come from there.
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm._torch.attention_backend.sparse import (
+from tensorrt_llm._torch.pyexecutor import resource_manager as rm_mod
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseKVCacheCompressionManager,
+    BaseResourceManager,
     create_kv_cache_compression_manager,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
 
 # ---------------------------------------------------------------------- #
 # Mock infra: in-memory managers / requests (avoid touching V2 / model).  #
@@ -47,8 +50,8 @@ class _RecordingMixin:
         self._record_list.append(f"{self._name}:{hook_name}")
 
 
-class _MockSparseManager(_RecordingMixin, BaseKVCacheCompressionManager):
-    """Mock sparse manager that records the four lifecycle hooks."""
+class _MockCompressionManager(_RecordingMixin, BaseKVCacheCompressionManager):
+    """Mock manager that records the four lifecycle hooks."""
 
     def on_request_init(self, request):
         self._record("on_request_init")
@@ -88,7 +91,7 @@ def _batch(context=(), generation=(), last_chunk=()):
 
 
 # ---------------------------------------------------------------------- #
-# 1. BaseKVCacheCompressionManager ABC contract                           #
+# 1. BaseKVCacheCompressionManager contract                               #
 # ---------------------------------------------------------------------- #
 
 
@@ -97,15 +100,11 @@ class TestBaseABC:
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
         assert issubclass(BaseKVCacheCompressionManager, BaseResourceManager)
 
-    def test_8_hooks_default_noop(self, fake_kv_cache_manager):
+    def test_four_hooks_default_noop(self, fake_kv_cache_manager):
         m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
         meta = MagicMock()
         assert m.on_request_init(MagicMock()) is None
-        assert m.on_context_attention(0, None, None, None, meta) is None
-        assert m.on_context_attention_end(0, None, None, None, meta) is None
         assert m.on_context_step_end(MagicMock(), meta) is None
-        assert m.on_generation_attention(0, None, None, None, meta) is None
-        assert m.on_generation_attention_end(0, None, None, None, meta) is None
         assert m.on_generation_step_end(MagicMock(), meta) is None
         assert m.on_request_finish(MagicMock()) is None
 
@@ -123,18 +122,9 @@ class TestBaseABC:
         assert m.get_max_resource_count() == 0
         assert m.get_needed_resource_to_completion(MagicMock()) == 0
 
-    def test_implements_introspection(self, fake_kv_cache_manager):
-        class PartialManager(BaseKVCacheCompressionManager):
-            def on_context_step_end(self, request, metadata):
-                pass
-
-        m = PartialManager(fake_kv_cache_manager)
-        assert m.implements("on_context_step_end") is True
-        assert m.implements("on_request_init") is False
-
 
 # ---------------------------------------------------------------------- #
-# 3. Resource-manager API -> semantic-hook translation                    #
+# 2. Resource-manager API -> lifecycle-hook translation                   #
 #    (gated on PyExecutor signals, no manager-side bookkeeping)            #
 # ---------------------------------------------------------------------- #
 
@@ -142,7 +132,7 @@ class TestBaseABC:
 class TestResourceManagerAPI:
     def test_prepare_fires_init_on_first_chunk_only(self, fake_kv_cache_manager):
         rec = []
-        m = _MockSparseManager(fake_kv_cache_manager, rec, "s")
+        m = _MockCompressionManager(fake_kv_cache_manager, rec, "s")
         # First prefill chunk -> init fires.
         m.prepare_resources(_batch(context=[_req(1, first_chunk=True)]))
         # A later (non-first) chunk of the same request -> no re-init.
@@ -151,94 +141,73 @@ class TestResourceManagerAPI:
 
     def test_update_fires_context_end_on_last_chunk(self, fake_kv_cache_manager):
         rec = []
-        m = _MockSparseManager(fake_kv_cache_manager, rec, "s")
+        m = _MockCompressionManager(fake_kv_cache_manager, rec, "s")
         req = _req(1)
-        # Request's final prefill chunk this iteration -> context_end fires.
+        # Request's final prefill chunk this iteration -> context_step_end fires.
         m.update_resources(_batch(generation=[req], last_chunk=[req]), attn_metadata=MagicMock())
         assert "s:on_context_step_end" in rec
         assert rec[-1] == "s:on_generation_step_end"
-        # Subsequent decode iteration (not in last_chunk) -> no context_end.
+        # Subsequent decode iteration (not in last_chunk) -> no context_step_end.
         rec.clear()
         m.update_resources(_batch(generation=[req]))
         assert rec == ["s:on_generation_step_end"]
 
     def test_step_end_fires_once_per_iteration(self, fake_kv_cache_manager):
         rec = []
-        m = _MockSparseManager(fake_kv_cache_manager, rec, "s")
+        m = _MockCompressionManager(fake_kv_cache_manager, rec, "s")
         m.update_resources(_batch(generation=[_req(1), _req(2)]))
         assert rec.count("s:on_generation_step_end") == 1
 
     def test_free_fires_finish(self, fake_kv_cache_manager):
         rec = []
-        m = _MockSparseManager(fake_kv_cache_manager, rec, "s")
+        m = _MockCompressionManager(fake_kv_cache_manager, rec, "s")
         m.free_resources(_req(1))
         assert rec == ["s:on_request_finish"]
 
 
 # ---------------------------------------------------------------------- #
-# 4. Factories                                                            #
+# 3. Factory                                                              #
 # ---------------------------------------------------------------------- #
 
 
-class TestFactories:
-    def test_factory_none_for_legacy_algorithm(self, fake_kv_cache_manager):
+class TestFactory:
+    def test_returns_none_when_no_algorithm_registered(self, fake_kv_cache_manager):
+        # Framework-only: no concrete algorithm ships, so any config -> None.
         cfg = MagicMock()
-        cfg.algorithm = "rocket"  # a legacy method (owns its own cache manager)
+        cfg.algorithm = "made_up_method"
         assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
 
     def test_warns_for_unregistered_algorithm(self, fake_kv_cache_manager):
-        from tensorrt_llm._torch.attention_backend.sparse import utils
-
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
-        with patch.object(utils, "logger") as mock_logger:
-            assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
-            mock_logger.warning.assert_called_once()
-
-    def test_no_warning_for_legacy_algorithm(self, fake_kv_cache_manager):
-        from tensorrt_llm._torch.attention_backend.sparse import utils
-
-        cfg = MagicMock()
-        cfg.algorithm = "rocket"
-        with patch.object(utils, "logger") as mock_logger:
+        with patch.object(rm_mod, "logger") as mock_logger:
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
-            mock_logger.warning.assert_not_called()
-
-    def test_dispatch_warns_for_unregistered_algorithm(self):
-        # "Same for others": the cache-manager / backend dispatchers warn too.
-        from tensorrt_llm._torch.attention_backend.sparse import utils
-
-        cfg = MagicMock()
-        cfg.algorithm = "made_up_method"
-        with patch.object(utils, "logger") as mock_logger:
-            assert utils.get_sparse_attn_kv_cache_manager(cfg) is None
             mock_logger.warning.assert_called_once()
 
 
 # ---------------------------------------------------------------------- #
-# 5. Canonical name imports (post-rename; old coordinator/Executor gone)  #
+# 4. Canonical names live in resource_manager, not in the sparse module   #
 # ---------------------------------------------------------------------- #
 
 
 class TestCanonicalImports:
-    def test_manager_names_importable(self):
+    def test_names_importable_from_resource_manager(self):
+        from tensorrt_llm._torch.pyexecutor import resource_manager
+
+        assert hasattr(resource_manager, "BaseKVCacheCompressionManager")
+        assert hasattr(resource_manager, "create_kv_cache_compression_manager")
+
+    def test_names_not_in_sparse_module(self):
+        # The framework moved out of attention_backend/sparse/ (it is not a
+        # sparse-attention backend); the sparse package no longer exports it.
         from tensorrt_llm._torch.attention_backend import sparse
 
-        assert hasattr(sparse, "BaseKVCacheCompressionManager")
-        assert hasattr(sparse, "create_kv_cache_compression_manager")
-
-    def test_old_coordinator_names_removed(self):
-        from tensorrt_llm._torch.attention_backend import sparse
-
-        assert not hasattr(sparse, "KVCacheBehaviorCoordinator")
-        assert not hasattr(sparse, "BaseKVCacheCompressionExecutor")
-        assert not hasattr(sparse, "SparseAttentionExecutor")
-        assert not hasattr(sparse, "create_behavior_coordinator")
-        assert not hasattr(sparse, "create_compression_manager")
+        assert not hasattr(sparse, "BaseKVCacheCompressionManager")
+        assert not hasattr(sparse, "create_kv_cache_compression_manager")
 
 
 # ---------------------------------------------------------------------- #
-# 6. Block-reuse guard + removed symbols                                  #
+# 5. Block-reuse guard                                                    #
 # ---------------------------------------------------------------------- #
 
 
@@ -257,14 +226,3 @@ class TestBlockReuseGuard:
 
     def test_ok_when_reuse_off(self):
         BaseKVCacheCompressionManager(self._mgr(enable_block_reuse=False))  # no raise
-
-
-class TestRemovedSymbols:
-    def test_pattern3_classvar_removed(self):
-        # The kv_cache_manager_class escape hatch is gone.
-        assert not hasattr(BaseKVCacheCompressionManager, "kv_cache_manager_class")
-
-    def test_sparse_attention_indices_removed(self):
-        from tensorrt_llm._torch.attention_backend.sparse import kv_cache_compression_manager as mod
-
-        assert not hasattr(mod, "SparseAttentionIndices")

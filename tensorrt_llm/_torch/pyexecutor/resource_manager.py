@@ -72,6 +72,7 @@ WorldConfig = tensorrt_llm.bindings.WorldConfig
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+    from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
 
 BlocksPerWindow = Dict[int, Tuple[
     int,
@@ -3819,6 +3820,148 @@ class BlockManager:
 
     def _free_blocks(self, block_list: list):
         self.free_blocks.extend(block_list)
+
+
+# --------------------------------------------------------------------- #
+# KV-cache compression framework (BaseResourceManager-based)             #
+# --------------------------------------------------------------------- #
+
+
+class BaseKVCacheCompressionManager(BaseResourceManager):
+    """Framework-level base class for all KV-cache compression managers.
+
+    Inherits :class:`BaseResourceManager` so PyExecutor's main loop
+    auto-invokes ``prepare_resources`` / ``update_resources`` /
+    ``free_resources`` each iteration without any PyExecutor code changes; the
+    base implementations below translate those callbacks into the lifecycle
+    hooks.
+
+    Concrete compression methods subclass this directly. All 4 hooks default to
+    no-op; subclasses override what they need. The manager never inherits from
+    any cache manager because this layer decides *how* the physical KV is used,
+    not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
+    """
+
+    def __init__(self, kv_cache_manager: "KVCacheManagerV2"):
+        self.kv_cache_manager = kv_cache_manager
+        # Compression evicts/rewrites stored keys and values, so a shared prefix
+        # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
+        if kv_cache_manager.enable_block_reuse:
+            raise ValueError(
+                f"{type(self).__name__} changes stored keys and values and cannot "
+                f"run with KV-cache block reuse. Set "
+                f"KvCacheConfig.enable_block_reuse to False.")
+
+    # ================================================================== #
+    # KV-cache lifecycle hooks (4, in temporal order).                   #
+    # Subclasses override what they need; all default to no-op.          #
+    # ================================================================== #
+
+    def on_request_init(self, request: "LlmRequest", **kwargs) -> None:
+        """Per-request init hook.
+
+        Override to allocate per-request accumulators (e.g. per-request
+        scoring buffers).
+        """
+
+    def on_context_step_end(
+        self,
+        request: "LlmRequest",
+        metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Fired once per request, when its prefill finishes (its final
+        chunk). Override for a one-shot prefill-end eviction.
+        """
+
+    def on_generation_step_end(
+        self,
+        scheduled_batch: "ScheduledRequests",
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Fired once per generation step, after every layer's forward
+        completes. Override for periodic or budget-triggered eviction.
+        """
+
+    def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
+        """Per-request finish / abort hook.
+
+        Override to release per-request state allocated in
+        ``on_request_init``. Underlying KV blocks are still freed by the
+        ``KVCacheManagerV2``; subclasses must not free them here.
+        """
+
+    # ================================================================== #
+    # BaseResourceManager interface — PyExecutor auto-invokes these each  #
+    # iteration; they translate into the semantic lifecycle hooks above.  #
+    # ================================================================== #
+
+    def get_max_resource_count(self) -> int:
+        """The compression manager does not own physical resources (the V2
+        cache manager does). Returns 0 so PyExecutor's scheduler does not gate
+        on us."""
+        return 0
+
+    def get_needed_resource_to_completion(self, request: "LlmRequest") -> int:
+        """The compression manager does not own physical resources (the V2
+        cache manager does). Returns 0 so PyExecutor's scheduler does not block
+        on us."""
+        return 0
+
+    def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
+        """Fire :meth:`on_request_init` once per request, on its first prefill
+        chunk -- the same ``is_first_context_chunk`` gate ``KVCacheManager``
+        uses, so no manager-side dedup bookkeeping is needed.
+        """
+        for req in scheduled_batch.context_requests:
+            if req.is_first_context_chunk:
+                self.on_request_init(req)
+
+    def update_resources(
+        self,
+        scheduled_batch: "ScheduledRequests",
+        attn_metadata: Optional["AttentionMetadata"] = None,
+        kv_cache_dtype_byte_size: Optional[float] = None,
+    ) -> None:
+        """Fire :meth:`on_context_step_end` once per request, on the iteration its
+        final prefill chunk runs, then :meth:`on_generation_step_end` once.
+
+        Uses the scheduler's ``context_requests_last_chunk`` split (computed at
+        schedule time from ``is_last_context_chunk``) rather than tracking
+        request-state transitions: it is iteration-exact and immune to a
+        short-output request going straight to ``GENERATION_TO_COMPLETE``
+        (which, under the overlap scheduler, never passes through
+        ``GENERATION_IN_PROGRESS``). Signature matches the other resource
+        managers so PyExecutor passes ``attn_metadata`` /
+        ``kv_cache_dtype_byte_size`` through transparently.
+        """
+        for req in scheduled_batch.context_requests_last_chunk:
+            self.on_context_step_end(req, attn_metadata)
+        self.on_generation_step_end(scheduled_batch, attn_metadata)
+
+    def free_resources(self, request: "LlmRequest") -> None:
+        """Fire :meth:`on_request_finish`."""
+        self.on_request_finish(request)
+
+
+def create_kv_cache_compression_manager(
+    config: "KvCacheCompressionConfig",
+    kv_cache_manager: "KVCacheManagerV2",
+) -> Optional[BaseKVCacheCompressionManager]:
+    """Build the KV-cache compression manager for ``config.algorithm``, or return
+    None if no algorithm matches.
+
+    Called from ``create_py_executor`` (``_util.py``) and registered as a
+    resource manager, like the KV cache manager itself. Concrete algorithms add
+    a dispatch branch here; the framework ships none.
+    """
+    logger.warning(
+        "KV-cache compression algorithm '%s' is not registered; running without "
+        "a compression manager.",
+        config.algorithm,
+    )
+    return None
 
 
 class ResourceManager:

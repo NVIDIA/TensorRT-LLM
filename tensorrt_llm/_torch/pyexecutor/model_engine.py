@@ -8,12 +8,7 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple,
-                    Union)
-
-if TYPE_CHECKING:
-    from ..attention_backend.sparse.kv_cache_compression_manager import \
-        BaseKVCacheCompressionManager
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch._dynamo.config
@@ -1634,12 +1629,10 @@ class PyTorchModelEngine(ModelEngine):
                     req.py_draft_tokens = []
 
     def _set_up_attn_metadata(
-            self,
-            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
-            draft_kv_cache_manager: Optional[Union[KVCacheManager,
-                                                   KVCacheManagerV2]] = None,
-            compression_manager: Optional[
-                "BaseKVCacheCompressionManager"] = None):
+        self,
+        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+        draft_kv_cache_manager: Optional[Union[KVCacheManager,
+                                               KVCacheManagerV2]] = None):
         enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
@@ -1678,8 +1671,7 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
                 sparse_attention_config=self.sparse_attention_config,
-                num_heads_per_kv=num_heads_per_kv,
-                compression_manager=compression_manager)
+                num_heads_per_kv=num_heads_per_kv)
             self.encoder_attn_metadata.block_ids_per_seq = None
             self.encoder_attn_metadata.kv_block_ids_per_seq = None
             return self.encoder_attn_metadata
@@ -1703,7 +1695,6 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=cache_indirection,
             sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
-            compression_manager=compression_manager,
         )
 
         return self.attn_metadata
@@ -4465,12 +4456,9 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
-        compression_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
-                                                   draft_kv_cache_manager,
-                                                   compression_manager)
+                                                   draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
             attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if self.enable_spec_decode:

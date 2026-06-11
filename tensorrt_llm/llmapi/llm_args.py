@@ -2658,6 +2658,18 @@ SparseAttentionConfig: TypeAlias = Annotated[
 ]
 
 
+class KvCacheCompressionConfig(StrictBaseModel):
+    """Config for KV-cache compression: a compression manager runs a KV-reduction
+    algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
+
+    Kept separate from SparseAttentionConfig by design -- compression changes
+    which KV is stored, not the attention computation. The manager is registered
+    as a resource manager in create_py_executor (_util.py), like the KV cache
+    manager itself. Concrete algorithms subclass this and add their parameters.
+    """
+    algorithm: str
+
+
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
 class AgentTreeConfig(StrictBaseModel, PybindMirror):
     """Configuration for agent tree scheduling.
@@ -3250,6 +3262,13 @@ class BaseLlmArgs(StrictBaseModel):
     sparse_attention_config: Optional[SparseAttentionConfig] = Field(
         default=None,
         description="Sparse attention config.",
+        status="prototype")
+
+    # KV cache compression config (separate from sparse attention: changes which
+    # KV is stored, not the attention computation)
+    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+        default=None,
+        description="KV-cache compression config; None disables compression.",
         status="prototype")
 
     # Speculative decoding parameters

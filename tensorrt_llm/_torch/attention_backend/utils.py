@@ -19,26 +19,19 @@ def get_attention_backend(
     sparse_attn_config: Optional["SparseAttentionConfig"] = None
 ) -> Type[AttentionBackend]:
     backend_name = backend_name.upper()
-
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
-            cls = get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
-            if cls is not None:
-                return cls
+            return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
         return VanillaAttention
     elif backend_name == "TRTLLM":
         if sparse_attn_config is not None:
-            cls = get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
-            if cls is not None:
-                return cls
+            return get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
         return TrtllmAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
         if sparse_attn_config is not None:
-            cls = get_flashinfer_sparse_attn_attention_backend(
+            return get_flashinfer_sparse_attn_attention_backend(
                 sparse_attn_config)
-            if cls is not None:
-                return cls
         return FlashInferAttention
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
