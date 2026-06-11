@@ -3157,6 +3157,7 @@ int AttentionOp::initialize() noexcept
         fixedParams.isSpecDecoding = mIsSpecDecodingEnabled;
         fixedParams.hasAlibi = isALiBi();
         fixedParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
+        fixedParams.specDecodingTargetMaxGenLen = mSpecDecodingTargetMaxGenLen;
 
         mXqaDispatcher.reset(new XqaDispatcher(fixedParams));
 
