@@ -1042,7 +1042,7 @@ class TestFillPhaseEndToEnd:
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = self.MAX_BATCH_SIZE
         ex.dist = Mock(rank=0, tp_size=self.TP_SIZE)
-        ex.dist.allreduce.return_value = 0
+        ex.dist.tp_allreduce.return_value = 0
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False

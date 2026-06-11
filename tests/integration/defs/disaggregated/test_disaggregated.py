@@ -2275,9 +2275,15 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     model_dir = f"{llm_models_root()}/{model_path}"
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    env = llm_venv._new_env.copy()
+    tiktoken_vocab = os.path.join(llm_models_root(), "datasets",
+                                  "tiktoken_vocab")
+    env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
+    env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
+
     run_disaggregated_test(disaggregated_example_root,
                            "gpt_oss_120b_harmony",
-                           env=llm_venv._new_env,
+                           env=env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
 

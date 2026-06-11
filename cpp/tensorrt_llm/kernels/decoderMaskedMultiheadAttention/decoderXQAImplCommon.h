@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -70,6 +70,11 @@ struct XQAKernelRuntimeHashKey
     bool multi_query_tokens;
     bool is_fp8_output;
     std::optional<PositionEmbeddingType> position_embedding_type;
+    // Rotary embedding dim (head elements RoPE is applied to). Only meaningful for the JIT path,
+    // where it selects between full- and partial-rotary cubins (which bake ROPE_ELEMS in). Left as
+    // std::nullopt for the precompiled path, whose kernels never apply RoPE in-kernel and are thus
+    // rotary-agnostic (RoPE handled by invokeQKVPreprocessing).
+    std::optional<int> rotary_embedding_dim;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
@@ -77,7 +82,8 @@ struct XQAKernelRuntimeHashKey
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
             && multi_query_tokens == other.multi_query_tokens && m_tilesize == other.m_tilesize
             && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache
-            && is_fp8_output == other.is_fp8_output && position_embedding_type == other.position_embedding_type;
+            && is_fp8_output == other.is_fp8_output && position_embedding_type == other.position_embedding_type
+            && rotary_embedding_dim == other.rotary_embedding_dim;
     }
 };
 
@@ -109,6 +115,8 @@ struct XQAKernelRuntimeHasher
         key ^= s.is_fp8_output;
         key <<= 8;
         key ^= static_cast<int8_t>(s.position_embedding_type.value_or(static_cast<PositionEmbeddingType>(-1)));
+        key <<= 9; // rotary dims are <= 256; 0 distinguishes the std::nullopt (precompiled) case
+        key ^= static_cast<size_t>(s.rotary_embedding_dim.value_or(0));
         return key;
     }
 };

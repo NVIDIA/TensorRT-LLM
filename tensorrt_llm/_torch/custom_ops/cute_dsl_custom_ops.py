@@ -529,6 +529,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self,
             inputs: List[torch.Tensor],
             tactic,
+            bias: Optional[torch.Tensor] = None,
             **kwargs,
         ) -> torch.Tensor:
             """
@@ -542,6 +543,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[3]: Weight scale tensor of shape (n, k//16), dtype: fp8.
                     inputs[4]: Alpha scaling factor. dtype: float32.
                 tactic: Tiling and cluster strategy, typically a tuple (mma_tiler_mn, cluster_shape_mn).
+                bias: Optional per-N bias [N]. Added post-GEMM inside the
+                    custom op (native CuTeDSL epilogue fusion is a follow-up).
 
             Returns:
                 torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
@@ -758,6 +761,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)
+            if bias is not None:
+                if bias.ndim != 1 or bias.shape[0] != c_tensor.shape[-1]:
+                    raise ValueError(
+                        f"bias must be a 1-D tensor of shape [N]={c_tensor.shape[-1]}, "
+                        f"got shape {tuple(bias.shape)}")
+                c_tensor = c_tensor + bias
             return c_tensor
 
     # a/b: fp4, scale: fp8, output: bf16
@@ -2136,7 +2145,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
-                    use_blkred=True,
                     raster_along_m=raster_along_m,
                 )
                 # Compute max active clusters on current device

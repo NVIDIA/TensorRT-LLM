@@ -89,6 +89,7 @@ from ...utils.node_utils import (
     shape,
     subgraph,
 )
+from ...utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
@@ -588,17 +589,16 @@ class QuantizationShardingMixin(ABC):
         for k, v in sharded_scales.items():
             submod.register_buffer(k, v)
 
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                self.shard_load_hook,
-                weight_name=weight_key,
-                weight_original_shape=weight_original_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
-                min_local_shape=min_local_shape,
-            )
+        hook = partial(
+            self.shard_load_hook,
+            weight_name=weight_key,
+            weight_original_shape=weight_original_shape,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
         )
+        gm._register_load_state_dict_pre_hook(hook)
 
 
 class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
@@ -919,14 +919,13 @@ class BMMShardingInfo(ShardingTransformInfo):
                 gm.get_submodule(modname).register_parameter(param_name, param_new)
 
                 # Register load state dict hook
-                gm._register_load_state_dict_pre_hook(
-                    partial(
-                        _load_hook,
-                        f_split=slice_tensor,
-                        param_key=weight_key,
-                        param_shape=param_new.shape,
-                    )
+                hook = partial(
+                    _load_hook,
+                    f_split=slice_tensor,
+                    param_key=weight_key,
+                    param_shape=param_new.shape,
                 )
+                gm._register_load_state_dict_pre_hook(hook)
             else:
                 # Handle dynamic tensor
                 with gm.graph.inserting_before(bmm_node):
@@ -1333,6 +1332,18 @@ class ShardingTransformExecutor(BaseTransform):
             f"BMM={len(transforms.bmm_transforms)}, "
             f"RMSNorm={len(transforms.rmsnorm_transforms)}"
         )
+
+        # If there are EP transforms and we have a CachedSequenceInterface, ensure
+        # batch_info_host is added to the graph as a placeholder and activated on
+        # the SequenceInfo so the runtime DP-aware max_num_tokens (slot 14) flows
+        # into the MoE all-to-all op as a kwarg. _add_or_retrieve_input is
+        # idempotent — safe even if another transform (e.g.
+        # gather_logits_before_lm_head) already added the placeholder.
+        # When cm is None (e.g., unit tests that drive the sharding transform
+        # standalone), skip — the MoE op falls back to max_num_tokens.
+        if transforms.ep_transforms and cm is not None:
+            self._add_or_retrieve_input(gm, cm, "batch_info_host", init_val=True)
+
         with WeightBiasInfoCache():
             for tp_transform in transforms.weight_sharding_transforms:
                 if check_and_apply(tp_transform):
@@ -1702,12 +1713,25 @@ def shard_weight_tensor(
     # the state_dict (e.g., unfusing fused MoE checkpoint weights into
     # individual expert keys). With the hook on gm, it would run before
     # unfusing and fail to find the individual expert keys.
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=param_name,
+        param_shape=sharded_shape,
+    )
     submod._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=param_name,
-            param_shape=sharded_shape,
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "shard_tp",
+                "param_key": param_name,
+                "param_shape": list(sharded_shape),
+                "dim": dim,
+                "rank": rank,
+                "world_size": world_size,
+                "min_local_shape": min_local_shape,
+                "fused_weight_dims": list(fused_weight_dims) if fused_weight_dims else None,
+            },
         )
     )
     param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
@@ -1955,14 +1979,13 @@ def _tp_shard_moe_scale(
 
     # Register load hook on the owning submodule so it runs after any
     # parent-level checkpoint format conversion hooks (e.g., fused MoE unfusing).
-    submod._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=attr_name,
-            param_shape=sharded_scale.shape,
-        )
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=attr_name,
+        param_shape=sharded_scale.shape,
     )
+    submod._register_load_state_dict_pre_hook(hook)
 
 
 def _insert_sharded_moe(
@@ -2138,11 +2161,23 @@ def _insert_sharded_moe(
     # (Will be used inside the op to determine enable_alltoall and workspace size)
     mapping_config = config.dist_config.serialize()
 
+    # Look up batch_info_host placeholder if present. ShardingTransformExecutor
+    # ensures it's added/activated when there are EP transforms; if it's missing
+    # (e.g., a different code path bypasses the executor), the MoE op falls back
+    # to max_num_tokens for runtime padding.
+    batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
+    batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
+
     # Write back weight/scale list updates (applied above) and inject mapping args.
     # set_op_args uses the op schema to place values into kwargs or the correct
     # positional slot, avoiding manual index arithmetic.
     node.args = tuple(args)
-    set_op_args(node, mapping_config=mapping_config, max_num_tokens=config.max_num_tokens)
+    set_op_args(
+        node,
+        mapping_config=mapping_config,
+        max_num_tokens=config.max_num_tokens,
+        batch_info_host=batch_info_host_node,
+    )
 
     if not enable_alltoall:
         # =====================================================================================

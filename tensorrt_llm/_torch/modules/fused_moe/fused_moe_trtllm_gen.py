@@ -107,6 +107,12 @@ class TRTLLMGenFusedMoE(MoE):
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
 
+    # Activations supported by the FlashInfer BF16 kernels: Swiglu and Relu2.
+    _BF16_SUPPORTED_ACTIVATIONS = {
+        ActivationType.Swiglu,
+        ActivationType.Relu2,
+    }
+
     @classmethod
     def can_implement(
         cls,
@@ -333,16 +339,12 @@ class TRTLLMGenFusedMoE(MoE):
         return self.quant_config is None or not self.quant_config.layer_quant_mode.has_any_quant(
             exclude_kv_cache=True)
 
-    @staticmethod
-    def _supports_flashinfer_bf16_routing_method(
-        routing_method: BaseMoeRoutingMethod, ) -> bool:
-        # FIXME: ban DeepSeekV3 FlashInfer trtllm_bf16_routed_moe() as it appears to have bug
-        return not isinstance(routing_method, DeepSeekV3MoeRoutingMethod)
-
     def _requires_separated_routing(self) -> bool:
-        """Whether this backend instance expects precomputed top-k routing."""
-        # FIXME: ban FlashInfer BF16 MoE direct routing as it appears to have accuracy bug
-        return self.use_flashinfer and self._is_unquantized_path()
+        """BF16 FlashInfer uses separated routing, except DeepSeekV3 which uses
+        the fused kernel (its separated variant has accuracy issues)."""
+        if not (self.use_flashinfer and self._is_unquantized_path()):
+            return False
+        return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
 
     def _check_flashinfer_backend_support(self) -> bool:
         # For BF16 (unquantized) path, we will use FlashInfer regardless whether
@@ -350,10 +352,7 @@ class TRTLLMGenFusedMoE(MoE):
         if self._is_unquantized_path():
             if not self._is_flashinfer_fused_moe_available():
                 return False
-            if self.activation_type != ActivationType.Swiglu:
-                return False
-            if not self._supports_flashinfer_bf16_routing_method(
-                    self.routing_method):
+            if self.activation_type not in self._BF16_SUPPORTED_ACTIVATIONS:
                 return False
             return True
 
@@ -451,8 +450,10 @@ class TRTLLMGenFusedMoE(MoE):
             "TRTLLMGenFusedMoE only supports bf16 (FlashInfer), fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
         if not self.has_any_quant:
-            assert self.activation_type == ActivationType.Swiglu, \
-                "TRTLLMGenFusedMoE BF16 path only supports Swiglu activation."
+            assert self.activation_type in self._BF16_SUPPORTED_ACTIVATIONS, \
+                ("TRTLLMGenFusedMoE BF16 path only supports "
+                 f"{[a.name for a in self._BF16_SUPPORTED_ACTIVATIONS]} activations, "
+                 f"got {self.activation_type.name}.")
             assert not self.bias and self.swiglu_alpha is None and self.swiglu_beta is None and self.swiglu_limit is None, \
                 "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
 
