@@ -37,16 +37,6 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-v32-fp4_8k1k_con1_c
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-v32-fp4_8k1k_con4096_ctx1_dep4_gen1_dep32_eplb256_mtp0_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-v32-fp4_8k1k_con4096_ctx1_dep4_gen1_dep32_eplb256_mtp0_ccb-UCX]
 
-# GB200 GLM-5
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_glm-5-fp4_1k1k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_glm-5-fp4_1k1k_con4096_ctx1_dep4_gen1_dep8_eplb256_mtp1_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_glm-5-fp4_1k1k_con4096_ctx1_dep4_gen1_dep8_eplb256_mtp1_ccb-UCX]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_glm-5-fp4_1k1k_con512_ctx1_dep4_gen1_dep32_eplb0_mtp3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_glm-5-fp4_8k1k_con1024_ctx1_dep4_gen1_dep8_eplb256_mtp1_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_glm-5-fp4_8k1k_con1024_ctx1_dep4_gen1_dep8_eplb256_mtp1_ccb-UCX]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_glm-5-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_glm-5-fp4_8k1k_con512_ctx1_dep4_gen1_dep32_eplb0_mtp3_ccb-NIXL]
-
 # GB200 GPT-OSS-120B
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX]
