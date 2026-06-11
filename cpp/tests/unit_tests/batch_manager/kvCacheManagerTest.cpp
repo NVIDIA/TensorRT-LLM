@@ -62,6 +62,25 @@ namespace tle = tensorrt_llm::executor;
 namespace tr = tensorrt_llm::runtime;
 namespace fs = std::filesystem;
 
+namespace tensorrt_llm::testing
+{
+namespace tbk = batch_manager::kv_cache_manager;
+
+class KVCacheTransferManagerTestAccess
+{
+public:
+    [[nodiscard]] static std::size_t pendingReadCount(tbk::KVCacheTransferManager const& transferManager)
+    {
+        return transferManager.mPendingReads.size();
+    }
+
+    [[nodiscard]] static std::size_t pendingWriteCount(tbk::KVCacheTransferManager const& transferManager)
+    {
+        return transferManager.mPendingWrites.size();
+    }
+};
+} // namespace tensorrt_llm::testing
+
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 
 using ParamType = bool;
@@ -5011,6 +5030,43 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     {
         EXPECT_EQ(tr::bufferCast<float>(*pool.secondaryPtr)[i], 0);
     }
+}
+
+TEST_F(KVCacheManagerTest, KVCacheTransferManagerPendingTransfersDistinguishPrimaryAndSecondarySlots)
+{
+    using tensorrt_llm::testing::KVCacheTransferManagerTestAccess;
+
+    auto constexpr kBlockSize = 1024;
+    auto constexpr kNumSlotsPerPool = 2;
+
+    auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
+    auto transferManager = KVCacheTransferManager(bufferManager);
+
+    auto pool = KVCacheBlockPool(0, 2, 0, 0, 0);
+    pool.primaryPtr
+        = bufferManager.gpu(tr::ITensor::makeShape({kNumSlotsPerPool, kBlockSize}), nvinfer1::DataType::kFLOAT);
+    bufferManager.setZero(*pool.primaryPtr);
+
+    pool.secondaryPtr
+        = tr::BufferManager::pinned(tr::ITensor::makeShape({kNumSlotsPerPool, kBlockSize}), nvinfer1::DataType::kFLOAT);
+
+    auto primarySlot0 = std::make_shared<KVCacheBlock>(0, tk::KVCacheIndex(0, false));
+    auto primarySlot1 = std::make_shared<KVCacheBlock>(1, tk::KVCacheIndex(1, false));
+    auto secondarySlot0 = std::make_shared<KVCacheBlock>(2, tk::KVCacheIndex(0, true));
+    auto secondarySlot1 = std::make_shared<KVCacheBlock>(3, tk::KVCacheIndex(1, true));
+
+    transferManager.offload(primarySlot0, secondarySlot1, {pool});
+
+    ASSERT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 1);
+    ASSERT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 1);
+
+    transferManager.onboard(secondarySlot0, primarySlot1, {pool});
+
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 2);
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 2);
+
+    transferManager.syncTransfers();
+    bufferManager.getStream().synchronize();
 }
 
 TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
