@@ -54,7 +54,6 @@ class Attention(nn.Module):
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
         enable_sequence_parallel: bool = True,
-        enable_ulysses: bool = True,
         async_ulysses: bool = False,
     ):
         super().__init__()
@@ -184,7 +183,6 @@ class Attention(nn.Module):
         use_ulysses = (
             ulysses_size > 1
             and enable_sequence_parallel
-            and enable_ulysses
             and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses)
         )
 
