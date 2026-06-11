@@ -305,13 +305,13 @@ class TeaCacheConfig(BaseCacheConfig):
     teacache_thresh: float = Field(0.2, gt=0.0, status="prototype")
     use_ret_steps: bool = Field(False, status="prototype")
 
-    coefficients: List[float] = Field(
-        default_factory=lambda: [1.0, 0.0],
+    coefficients: Optional[List[float]] = Field(
+        default=None,
         status="prototype",
         description=(
             "Polynomial coefficients used by the TeaCache decision function. "
-            "Variable-length (FLUX uses 5, Wan uses 4); the pipeline overrides "
-            "this per-checkpoint at load time."
+            "None (default) uses the pipeline's built-in per-checkpoint table; "
+            "an explicit list overrides the table entirely."
         ),
     )
 
@@ -327,7 +327,7 @@ class TeaCacheConfig(BaseCacheConfig):
     @model_validator(mode="after")
     def validate_teacache(self) -> "TeaCacheConfig":
         """Validate TeaCache configuration."""
-        if len(self.coefficients) == 0:
+        if self.coefficients is not None and len(self.coefficients) == 0:
             raise ValueError("TeaCache coefficients list cannot be empty")
         if self.coefficients_2 is not None and len(self.coefficients_2) == 0:
             raise ValueError("TeaCache coefficients_2 list cannot be empty")

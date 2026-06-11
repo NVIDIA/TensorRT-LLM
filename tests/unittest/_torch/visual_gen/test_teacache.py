@@ -334,6 +334,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
             cache=TeaCacheConfig(coefficients=None),
             skip_create_weights_in_init=True,
         )
+        pipe.pipeline_config = _PipelineConfigShim(pipe.model_config)
         with patch.object(BasePipeline, "post_load_weights", lambda self: None):
             with pytest.raises(ValueError, match="LTX-2 requires explicit teacache.coefficients"):
                 LTX2Pipeline.post_load_weights(pipe)
@@ -350,6 +351,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
             ),
             skip_create_weights_in_init=True,
         )
+        pipe.pipeline_config = _PipelineConfigShim(pipe.model_config)
         with patch.object(BasePipeline, "post_load_weights", lambda self: None):
             with patch(
                 "tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2.register_extractor"
@@ -365,9 +367,10 @@ class TestExplicitTeaCacheCoefficientsRequired:
         pipe.transformer = MagicMock()
         pipe.transformer_2 = MagicMock()
         pipe.is_wan22 = True
+        pipe.is_wan22_14b = True
         pipe.model_config = DiffusionModelConfig(
             pretrained_config=SimpleNamespace(
-                _name_or_path="/models/wan/snapshot", boundary_ratio=0.2
+                _name_or_path="/models/wan14b/snapshot", boundary_ratio=0.2
             ),
             cache=TeaCacheConfig(
                 coefficients=None,
@@ -375,6 +378,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
             ),
             skip_create_weights_in_init=True,
         )
+        pipe.pipeline_config = _PipelineConfigShim(pipe.model_config)
         with patch.object(BasePipeline, "post_load_weights", lambda self: None):
             with patch(
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.register_extractor_from_config"
@@ -391,9 +395,10 @@ class TestExplicitTeaCacheCoefficientsRequired:
         pipe.transformer = MagicMock()
         pipe.transformer_2 = MagicMock()
         pipe.is_wan22 = True
+        pipe.is_wan22_14b = True
         pipe.model_config = DiffusionModelConfig(
             pretrained_config=SimpleNamespace(
-                _name_or_path="/models/wan/snapshot", boundary_ratio=0.2
+                _name_or_path="/models/wan720p/snapshot", boundary_ratio=0.2
             ),
             cache=TeaCacheConfig(
                 coefficients=None,
@@ -401,6 +406,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
             ),
             skip_create_weights_in_init=True,
         )
+        pipe.pipeline_config = _PipelineConfigShim(pipe.model_config)
         with patch.object(BasePipeline, "post_load_weights", lambda self: None):
             with patch(
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v.register_extractor_from_config"
@@ -415,6 +421,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
         pipe.transformer = MagicMock()
         pipe.transformer_2 = MagicMock()
         pipe.is_wan22 = True
+        pipe.is_wan22_14b = True
         pipe.model_config = DiffusionModelConfig(
             pretrained_config=SimpleNamespace(_name_or_path="/wan/snapshot", boundary_ratio=0.2),
             cache=TeaCacheConfig(
@@ -423,6 +430,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
             ),
             skip_create_weights_in_init=True,
         )
+        pipe.pipeline_config = _PipelineConfigShim(pipe.model_config)
         mock_enable = MagicMock()
         backend_a = MagicMock()
         backend_a.enable = mock_enable
@@ -450,6 +458,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
         pipe.transformer = MagicMock()
         pipe.transformer_2 = MagicMock()
         pipe.is_wan22 = True
+        pipe.is_wan22_14b = True
         pipe.model_config = DiffusionModelConfig(
             pretrained_config=SimpleNamespace(_name_or_path="/wan/snapshot", boundary_ratio=0.2),
             cache=TeaCacheConfig(
@@ -458,6 +467,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
             ),
             skip_create_weights_in_init=True,
         )
+        pipe.pipeline_config = _PipelineConfigShim(pipe.model_config)
         with patch.object(BasePipeline, "post_load_weights", lambda self: None):
             with patch(
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.register_extractor_from_config"
@@ -483,6 +493,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
         pipe.transformer = MagicMock()
         pipe.transformer_2 = MagicMock()
         pipe.is_wan22 = True
+        pipe.is_wan22_14b = True
         pipe.model_config = DiffusionModelConfig(
             pretrained_config=SimpleNamespace(_name_or_path="/wan/snapshot", boundary_ratio=0.2),
             cache=TeaCacheConfig(
@@ -491,6 +502,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
             ),
             skip_create_weights_in_init=True,
         )
+        pipe.pipeline_config = _PipelineConfigShim(pipe.model_config)
         with patch.object(BasePipeline, "post_load_weights", lambda self: None):
             with patch(
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v.register_extractor_from_config"
