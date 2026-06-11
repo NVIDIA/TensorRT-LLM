@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,10 +66,12 @@ public:
     //! any block copies. This method must be called before the first call to KVCacheManager::addSequence in every step.
     void syncWithBufferManager();
 
-    //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode
-    //! kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method
-    //! must be called after last call to KVCacheManager::addSequence in every step.
-    void syncTransfers();
+    //! \brief Synchronize bufferManager stream with internal streams.
+    //! \details This method ensures that prefill and decode kernels for next step, or formatter work consuming primary
+    //! KV blocks, will wait for offloading and onboarding work that has already been scheduled. This method must be
+    //! called after last call to KVCacheManager::addSequence in every step.
+    //! \return true if a pending transfer dependency was inserted, false if there was no pending transfer work.
+    bool syncTransfers();
 
     //! \brief Get transfer stats accumulated since last call, and reset the counters.
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
@@ -102,12 +104,16 @@ private:
     [[nodiscard]] std::size_t computeBlockTransferBytes(
         std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy) const;
 
+    //! \brief Set the current host thread to the CUDA device that owns this manager's streams and events.
+    void setCudaDevice() const;
+
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;
     runtime::BufferManager mOffloadManager;
 
     // Track reads and writes for blocks. Note that it is the memory pool index that
     // identifies the raw memory blocks involved in I/O, not the block Id.
+    mutable std::mutex mPendingTransfersMutex;
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
     // Reference to parent loopback agent

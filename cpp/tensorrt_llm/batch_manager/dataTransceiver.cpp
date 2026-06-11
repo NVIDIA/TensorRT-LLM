@@ -34,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -418,8 +419,56 @@ public:
             session = std::addressof(it->second);
         }
         session->setLlmRequest(llmRequest);
-        mCacheTransferLayer.format(*session);
-        llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+        auto* cacheManager = mCacheTransferLayer.getCacheManager();
+        std::unordered_map<SizeType32, std::vector<kv_cache_manager::KVCacheBlock::IdType>> pinnedBlockIdsPerWindow;
+
+        auto unpinBlocks = [&]()
+        {
+            if (cacheManager != nullptr && !pinnedBlockIdsPerWindow.empty())
+            {
+                cacheManager->unpinBlocksById(pinnedBlockIdsPerWindow);
+                pinnedBlockIdsPerWindow.clear();
+            }
+        };
+
+        try
+        {
+            if (cacheManager != nullptr)
+            {
+                auto const& selfConfig = session->getSelfState().getCacheState().value();
+                auto const& destConfig = session->getOtherState().getCacheState().value();
+                auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
+                bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
+                auto blockRange = kv_cache_manager::getBlockRangeForSending(cacheManager, llmRequest,
+                    session->getLastBlockKey(), session->getIndexFromEnd(), recvSideHasCP, ppSize);
+
+                auto mode = executor::KvCacheTransferMode::DRAM;
+                std::string directory;
+                if (auto retentionConfig = llmRequest.getKvCacheRetentionConfig(); retentionConfig.has_value())
+                {
+                    mode = retentionConfig->getTransferMode();
+                    directory = retentionConfig->getDirectory();
+                }
+                if (mode != executor::KvCacheTransferMode::DRAM && directory.empty())
+                {
+                    TLLM_LOG_WARNING(
+                        "Falling back to DRAM KV-cache transfer for request %ld because directory is empty",
+                        llmRequest.mRequestId);
+                    mode = executor::KvCacheTransferMode::DRAM;
+                }
+                pinnedBlockIdsPerWindow = cacheManager->pinAndOnboardBlocksById(
+                    blockRange.getBlockIdsPerWindow(), llmRequest.mRequestId, mode, directory);
+            }
+
+            mCacheTransferLayer.format(*session);
+            llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            unpinBlocks();
+        }
+        catch (...)
+        {
+            unpinBlocks();
+            throw;
+        }
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)

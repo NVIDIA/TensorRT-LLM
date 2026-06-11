@@ -4810,10 +4810,35 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     auto primaryBlock = std::make_shared<KVCacheBlock>(0, tensorrt_llm::kernels::KVCacheIndex(0, false));
     auto secondaryBlock = std::make_shared<KVCacheBlock>(1, tensorrt_llm::kernels::KVCacheIndex(0, true));
 
+    EXPECT_FALSE(transferManager.syncTransfers());
+
+    transferManager.onboard(secondaryBlock, primaryBlock, {pool});
+    bool firstSyncResult{false};
+    bool secondSyncResult{false};
+    std::thread firstSyncThread([&transferManager, &firstSyncResult]() { firstSyncResult = transferManager.syncTransfers(); });
+    std::thread secondSyncThread(
+        [&transferManager, &secondSyncResult]() { secondSyncResult = transferManager.syncTransfers(); });
+    firstSyncThread.join();
+    secondSyncThread.join();
+    EXPECT_EQ(static_cast<int>(firstSyncResult) + static_cast<int>(secondSyncResult), 1);
+
+    auto primaryCopy = tr::BufferManager::pinned(tr::ITensor::makeShape({1, blockSize}), nvinfer1::DataType::kFLOAT);
+    bufferManager.copy(*pool.primaryPtr, *primaryCopy);
+    bufferManager.getStream().synchronize();
+    for (int i = 0; i < blockSize; i++)
+    {
+        ASSERT_EQ(tr::bufferCast<float>(*primaryCopy)[i], 1);
+    }
+
+    EXPECT_FALSE(transferManager.syncTransfers());
+
+    bufferManager.setZero(*pool.primaryPtr);
+    bufferManager.getStream().synchronize();
+
     transferManager.offload(primaryBlock, secondaryBlock, {pool});
     primaryBlock->swapMemoryPoolBlockOffset(secondaryBlock);
     transferManager.onboard(primaryBlock, secondaryBlock, {pool});
-    transferManager.syncTransfers();
+    EXPECT_TRUE(transferManager.syncTransfers());
 
     transferManager.offload(primaryBlock, secondaryBlock, {pool});
     bufferManager.getStream().synchronize();

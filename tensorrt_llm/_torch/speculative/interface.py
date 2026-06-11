@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import (TYPE_CHECKING, Iterator, List, Optional, Type, TypedDict,
+                    Union)
 
 import torch
 from torch import nn
@@ -12,10 +13,12 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
+from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import (BaseResourceManager,
+from ..pyexecutor.resource_manager import (BaseResourceManager, KVCacheManager,
+                                           KVCacheManagerV2,
                                            ResourceManagerType)
 
 if TYPE_CHECKING:
@@ -26,6 +29,15 @@ if IS_FLASHINFER_AVAILABLE:
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+
+KVCacheManagerType = Union[KVCacheManager, KVCacheManagerV2]
+
+
+class DraftReplaySavedState(TypedDict):
+    target_kv_cache_manager: Optional[KVCacheManagerType]
+    target_kv_cache_block_offsets: Optional[torch.Tensor]
+    target_host_kv_cache_block_offsets: Optional[torch.Tensor]
+    restore_dsa_metadata: bool
 
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
@@ -39,8 +51,35 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     return spec_config._allow_separate_draft_kv_cache
 
 
-def prepare_attn_metadata_for_draft_replay(attn_metadata,
-                                           draft_kv_cache_manager):
+def _refresh_dsa_draft_replay_metadata(
+        attn_metadata: AttentionMetadata) -> bool:
+    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                Indexer)
+
+    if not isinstance(attn_metadata, DSAtrtllmAttentionMetadata):
+        return False
+    kv_cache_manager = attn_metadata.kv_cache_manager
+    if kv_cache_manager is None or not hasattr(kv_cache_manager,
+                                               'index_head_dim'):
+        return False
+    if attn_metadata.num_seqs == 0:
+        return True
+
+    pool_indices = attn_metadata._get_pool_block_indices()
+    active_offsets = attn_metadata.host_indexer_k_cache_block_offsets[:
+                                                                      attn_metadata
+                                                                      .num_seqs]
+    active_offsets.copy_(pool_indices)
+    attn_metadata.indexer_k_cache_block_offsets[:attn_metadata.num_seqs].copy_(
+        active_offsets, non_blocking=True)
+    Indexer.recompute_slot_mappings(attn_metadata)
+    return True
+
+
+def prepare_attn_metadata_for_draft_replay(
+    attn_metadata: AttentionMetadata,
+    draft_kv_cache_manager: Optional[KVCacheManagerType],
+) -> Optional[DraftReplaySavedState]:
     """
     Prepare attention metadata for CUDA graph replay when using separate draft KV cache.
     Swaps to draft manager and (for DSA) re-prepares indexer slot mappings for the current
@@ -56,63 +95,29 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     if draft_block_offsets is None:
         return None
 
-    saved = {
-        'target_kv_cache_manager':
-        attn_metadata.kv_cache_manager,
-        'target_kv_cache_block_offsets':
-        attn_metadata.kv_cache_block_offsets,
+    saved: DraftReplaySavedState = {
+        'target_kv_cache_manager': attn_metadata.kv_cache_manager,
+        'target_kv_cache_block_offsets': attn_metadata.kv_cache_block_offsets,
         'target_host_kv_cache_block_offsets':
         attn_metadata.host_kv_cache_block_offsets,
+        'restore_dsa_metadata': False,
     }
     attn_metadata.kv_cache_manager = draft_kv_cache_manager
     attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
     attn_metadata.host_kv_cache_block_offsets = (
         draft_kv_cache_manager.host_kv_cache_block_offsets)
 
-    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                Indexer)
-    if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
-            and hasattr(draft_kv_cache_manager, 'index_head_dim')):
-        m = attn_metadata
-        saved['saved_dsa_state'] = {
-            'host_indexer_k_cache_block_offsets':
-            m.host_indexer_k_cache_block_offsets.clone(),
-            'indexer_k_cache_block_offsets':
-            m.indexer_k_cache_block_offsets.clone(),
-            'host_slot_mapping_fp8':
-            m.host_slot_mapping_fp8.clone(),
-            'host_slot_mapping_scale':
-            m.host_slot_mapping_scale.clone(),
-            'slot_mapping_fp8':
-            m.slot_mapping_fp8.clone(),
-            'slot_mapping_scale':
-            m.slot_mapping_scale.clone(),
-        }
-        # Derive pool indices from the draft manager's encoded block
-        # offsets (via _get_pool_block_indices) instead of using raw block
-        # IDs.  With host cache offload, block IDs can exceed
-        # blocks_in_primary_pool after offload swaps (the block keeps its
-        # original high ID even though its memory now lives in the primary
-        # GPU pool).  Using raw block IDs as pool indices causes OOB access
-        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
-        # decodes memPoolBlockIndex from the C++ encoded offsets.
-        # Note: kv_cache_manager was already swapped to draft above (line 67).
-        pool_indices = m._get_pool_block_indices()
-        num_blocks = pool_indices.shape[1]
-        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
-            pool_indices)
-        m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
-            m.host_indexer_k_cache_block_offsets[:m.num_seqs],
-            non_blocking=True)
-        # Safety clamp: sanitize stale padding entries beyond num_seqs
-        # that may contain negative or out-of-range values, matching the
-        # regular DSA prepare() flow.
-        m.indexer_k_cache_block_offsets.clamp_(min=0)
-        Indexer.recompute_slot_mappings(m)
+    # For DSA, rebuild active indexer metadata from the currently attached
+    # draft manager. This avoids cloning max-capacity target buffers.
+    saved['restore_dsa_metadata'] = _refresh_dsa_draft_replay_metadata(
+        attn_metadata)
     return saved
 
 
-def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
+def restore_attn_metadata_after_draft_replay(
+    attn_metadata: AttentionMetadata,
+    saved_state: Optional[DraftReplaySavedState],
+) -> None:
     """Restore attention metadata after draft replay. No-op if saved_state is None."""
     if saved_state is None:
         return
@@ -121,17 +126,8 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         saved_state['target_kv_cache_block_offsets'])
     attn_metadata.host_kv_cache_block_offsets = (
         saved_state['target_host_kv_cache_block_offsets'])
-    saved_dsa = saved_state.get('saved_dsa_state')
-    if saved_dsa is not None:
-        m = attn_metadata
-        m.host_indexer_k_cache_block_offsets.copy_(
-            saved_dsa['host_indexer_k_cache_block_offsets'], non_blocking=True)
-        m.indexer_k_cache_block_offsets.copy_(
-            saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
-        m.host_slot_mapping_fp8.copy_(saved_dsa['host_slot_mapping_fp8'])
-        m.host_slot_mapping_scale.copy_(saved_dsa['host_slot_mapping_scale'])
-        m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])
-        m.slot_mapping_scale.copy_(saved_dsa['slot_mapping_scale'])
+    if saved_state['restore_dsa_metadata']:
+        _refresh_dsa_draft_replay_metadata(attn_metadata)
 
 
 def get_force_num_accepted_tokens() -> int:
@@ -535,16 +531,16 @@ class SpecWorkerBase(nn.Module, ABC):
     ):
         """Skip spec dec for non-last rank (PP). Returns placeholder outputs."""
         batch_size = attn_metadata.num_seqs
-        accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
+        accepted_tokens = torch.zeros((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-        next_draft_tokens = torch.empty((batch_size, self.max_draft_len),
+        next_draft_tokens = torch.zeros((batch_size, self.max_draft_len),
                                         dtype=torch.int,
                                         device=logits.device)
-        next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
+        next_new_tokens = torch.zeros((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
         return {
@@ -643,6 +639,12 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens[num_contexts:] = force_total_tokens
         return num_accepted_tokens
 
+    @staticmethod
+    def _zero_negative_token_ids(tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.numel() == 0:
+            return tokens
+        return torch.where(tokens < 0, torch.zeros_like(tokens), tokens)
+
     def _sample_and_accept_draft_tokens_base(
         self,
         logits: torch.Tensor,
@@ -680,7 +682,7 @@ class SpecWorkerBase(nn.Module, ABC):
             logits = logits.unsqueeze(0)
 
         # Allocate return buffers
-        accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
+        accepted_tokens = torch.zeros((batch_size, runtime_draft_len + 1),
                                       dtype=torch.int,
                                       device=logits.device)
         num_accepted_tokens = torch.ones(batch_size,
@@ -690,6 +692,8 @@ class SpecWorkerBase(nn.Module, ABC):
         # Sample tokens using per-request sampling parameters
         target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
                                                       num_contexts, batch_size)
+        target_tokens = self._zero_negative_token_ids(target_tokens)
+        draft_tokens = self._zero_negative_token_ids(draft_tokens)
 
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -729,7 +733,8 @@ class SpecWorkerBase(nn.Module, ABC):
         if d2t is not None:
             draft_tokens = d2t[draft_tokens] + draft_tokens
 
-        return draft_tokens.type(torch.int32)
+        draft_tokens = draft_tokens.type(torch.int32)
+        return self._zero_negative_token_ids(draft_tokens)
 
     def _execute_guided_decoder_if_present(self, logits):
         """Execute guided decoder on target model logits if available."""
@@ -796,49 +801,27 @@ class SpecWorkerBase(nn.Module, ABC):
         return None
 
     @contextmanager
-    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+    def draft_kv_cache_context(
+            self, attn_metadata: AttentionMetadata,
+            draft_kv_cache_manager: Optional[KVCacheManagerType]
+    ) -> Iterator[None]:
         """
         Context manager to temporarily switch to draft KV cache manager in one-engine speculative decoding.
 
-        This swaps both the kv_cache_manager reference AND the block offset tensors,
-        since the target and draft KV caches have different block layouts.
+        This swaps both the KV cache manager reference and the block offset
+        tensors, since the target and draft KV caches have different block
+        layouts.
         """
-
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
-        if draft_kv_cache_manager is None:
+        saved_state = prepare_attn_metadata_for_draft_replay(
+            attn_metadata, draft_kv_cache_manager)
+        if saved_state is None:
             yield
             return
-
-        # Only TrtllmAttentionMetadata supports separate draft KV cache layouts
-        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
-            yield
-            return
-
-        # Check if draft KV cache block offsets are allocated
-        draft_block_offsets = getattr(attn_metadata,
-                                      'draft_kv_cache_block_offsets', None)
-        if draft_block_offsets is None:
-            # Draft KV cache block offsets not allocated, skip switching
-            yield
-            return
-
-        # Save main KV cache manager and block offsets
-        target_kv_cache_manager = attn_metadata.kv_cache_manager
-        target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
-        target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
-
-        # Switch to draft KV cache manager and its block offsets
-        attn_metadata.kv_cache_manager = draft_kv_cache_manager
-        attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-        attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
 
         try:
             yield
         finally:
-            # Restore main KV cache manager and block offsets
-            attn_metadata.kv_cache_manager = target_kv_cache_manager
-            attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
-            attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
+            restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
     def _sample_tokens_for_batch(
         self,
@@ -895,4 +878,4 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 
-        return sampled_tokens
+        return self._zero_negative_token_ids(sampled_tokens)

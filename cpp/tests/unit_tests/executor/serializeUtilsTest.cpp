@@ -1067,6 +1067,10 @@ TEST(SerializeUtilsTest, CacheTransceiverConfig)
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferTimeoutMs(), cacheTransceiverConfig2.getKvTransferTimeoutMs());
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(),
         cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
+
+    texec::CacheTransceiverConfig differentSenderFutureTimeout(
+        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024, 100, 2000);
+    EXPECT_FALSE(cacheTransceiverConfig == differentSenderFutureTimeout);
 }
 
 TEST(SerializeUtilsTest, BlockKeyBasic)

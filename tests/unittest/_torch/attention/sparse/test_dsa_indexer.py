@@ -2453,7 +2453,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
         return mgr
 
-    def test_prepare_swaps_and_restore_recovers(self):
+    def test_prepare_swaps_and_restore_recovers(self) -> None:
         """Test that prepare swaps KV manager and restore recovers original state."""
         from tensorrt_llm._torch.attention_backend.trtllm import \
             TrtllmAttentionMetadata
@@ -2475,6 +2475,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         assert saved['target_kv_cache_manager'] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
         assert 'saved_dsa_state' not in saved
+        assert saved['restore_dsa_metadata'] is False
 
         restore_attn_metadata_after_draft_replay(meta, saved)
 
@@ -2483,3 +2484,56 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
                                    original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets,
                                    original_host_offsets)
+
+    def test_dsa_prepare_restore_recomputes_without_buffer_snapshots(
+            self) -> None:
+        """Test DSA draft replay rebuilds active metadata instead of cloning snapshots."""
+        from tensorrt_llm._torch.attention_backend.trtllm import \
+            TrtllmAttentionMetadata
+
+        meta = self._make_mock_metadata()
+        target_mgr = meta.kv_cache_manager
+        target_mgr.index_head_dim = 128
+        target_mgr.pool_indices = torch.tensor([[1, 2], [3, 4]],
+                                               dtype=torch.int32)
+
+        draft_mgr = self._make_mock_draft_manager()
+        draft_mgr.index_head_dim = 128
+        draft_mgr.pool_indices = torch.tensor([[5, 6], [7, 8]],
+                                              dtype=torch.int32)
+
+        meta.num_seqs = 2
+        meta.host_indexer_k_cache_block_offsets = torch.zeros((2, 2),
+                                                              dtype=torch.int32)
+        meta.indexer_k_cache_block_offsets = torch.zeros((2, 2),
+                                                         dtype=torch.int32)
+        meta._get_pool_block_indices = (
+            lambda: meta.kv_cache_manager.pool_indices)
+
+        def fake_isinstance(obj: object, cls: type[object]) -> bool:
+            if cls is TrtllmAttentionMetadata:
+                return obj is meta
+            if cls.__name__ == 'DSAtrtllmAttentionMetadata':
+                return obj is meta
+            return builtins.isinstance(obj, cls)
+
+        with patch('tensorrt_llm._torch.speculative.interface.isinstance',
+                   side_effect=fake_isinstance), patch.object(
+                       Indexer, 'recompute_slot_mappings') as recompute:
+            saved = prepare_attn_metadata_for_draft_replay(meta, draft_mgr)
+            assert saved is not None
+            assert 'saved_dsa_state' not in saved
+            assert saved['restore_dsa_metadata'] is True
+            torch.testing.assert_close(meta.host_indexer_k_cache_block_offsets,
+                                       draft_mgr.pool_indices)
+            torch.testing.assert_close(meta.indexer_k_cache_block_offsets,
+                                       draft_mgr.pool_indices)
+
+            restore_attn_metadata_after_draft_replay(meta, saved)
+
+        assert recompute.call_count == 2
+        assert meta.kv_cache_manager is target_mgr
+        torch.testing.assert_close(meta.host_indexer_k_cache_block_offsets,
+                                   target_mgr.pool_indices)
+        torch.testing.assert_close(meta.indexer_k_cache_block_offsets,
+                                   target_mgr.pool_indices)

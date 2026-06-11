@@ -507,16 +507,16 @@ class MTPWorker(SpecWorkerBase):
     ):
         batch_size = attn_metadata.num_seqs
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
-        accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
+        accepted_tokens = torch.zeros((batch_size, (mtp_num_modules + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-        next_draft_tokens = torch.empty((batch_size, mtp_num_modules),
+        next_draft_tokens = torch.zeros((batch_size, mtp_num_modules),
                                         dtype=torch.int,
                                         device=logits.device)
-        next_new_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
+        next_new_tokens = torch.zeros((batch_size, (mtp_num_modules + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
         return {

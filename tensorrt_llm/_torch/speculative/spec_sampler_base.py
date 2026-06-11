@@ -110,6 +110,10 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
             new_tokens_lens=int_tensor((seq_slots,)),
         )
+        self.store.new_tokens.zero_()
+        self.store.next_new_tokens.zero_()
+        self.store.next_draft_tokens.zero_()
+        self.store.new_tokens_lens.zero_()
 
     def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
         """
@@ -136,6 +140,12 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         Override in subclasses. Default: True (needed for KV cache preparation).
         """
         return True
+
+    @staticmethod
+    def _zero_negative_token_ids(tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.numel() == 0:
+            return tokens
+        return torch.where(tokens < 0, torch.zeros_like(tokens), tokens)
 
     def _request_common_handling(
         self,
@@ -190,14 +200,15 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
+            num_accepted_draft_tokens = max(num_new_tokens - 1, 0)
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
                 if TorchSampler._handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break
-            req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            req.py_num_accepted_draft_tokens = num_accepted_draft_tokens
+            req.py_rewind_len = runtime_draft_len - num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(
@@ -224,19 +235,87 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """
         num_skip = len(scheduled_requests.context_requests_chunking)
         finished_context_requests = scheduled_requests.context_requests_last_chunk
-        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
-        num_sampling_requests = len(sampling_requests)
+        all_sampling_requests = finished_context_requests + scheduled_requests.generation_requests
 
-        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
+        # CUDA graph padding appends dummy requests as a suffix. Keep the common
+        # real-row path as a contiguous slice and only use advanced indexing for
+        # unexpected inner dummy rows.
+        num_real_prefix_rows = len(all_sampling_requests)
+        while num_real_prefix_rows > 0 and all_sampling_requests[num_real_prefix_rows - 1].is_dummy:
+            num_real_prefix_rows -= 1
+
+        has_inner_dummy = any(req.is_dummy for req in all_sampling_requests[:num_real_prefix_rows])
+        if has_inner_dummy:
+            sampling_row_indices = [
+                idx for idx, req in enumerate(all_sampling_requests) if not req.is_dummy
+            ]
+            sampling_requests = [all_sampling_requests[idx] for idx in sampling_row_indices]
+        else:
+            sampling_row_indices = list(range(num_real_prefix_rows))
+            sampling_requests = all_sampling_requests[:num_real_prefix_rows]
+        seq_slots = [req.py_seq_slot for req in sampling_requests]
+        max_seq_slots = self.store.new_tokens_lens.shape[0]
+        invalid_slots = [
+            (req.py_request_id, slot)
+            for req, slot in zip(sampling_requests, seq_slots)
+            if slot is None or slot < 0 or slot >= max_seq_slots
+        ]
+        if invalid_slots:
+            raise RuntimeError(
+                f"Invalid speculative sampler seq slots {invalid_slots}; "
+                f"max_seq_slots={max_seq_slots}"
+            )
+
+        slots = torch.as_tensor(seq_slots, dtype=torch.long)
         slots = slots.to(device="cuda", non_blocking=True)
 
-        o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
-        o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
-        o_next_draft_tokens = outputs["next_draft_tokens"][
-            num_skip : num_skip + num_sampling_requests
-        ]
-        o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
+        output_rows = outputs["new_tokens"].shape[0]
+        for output_name in ("new_tokens_lens", "next_draft_tokens", "next_new_tokens"):
+            if outputs[output_name].shape[0] != output_rows:
+                raise RuntimeError(
+                    "Speculative sampler output row mismatch: "
+                    f"new_tokens rows={output_rows}, "
+                    f"{output_name} rows={outputs[output_name].shape[0]}"
+                )
+
+        first_output_row = num_skip
+        row_indices = [first_output_row + idx for idx in sampling_row_indices]
+        if row_indices and max(row_indices) >= output_rows:
+            raise RuntimeError(
+                "Speculative sampler output row mismatch: "
+                f"row_indices={row_indices}, output_rows={output_rows}, "
+                f"num_skip={num_skip}, "
+                f"num_all_sampling_requests={len(all_sampling_requests)}"
+            )
+
+        if len(row_indices) == 0:
+            row_indexer = slice(first_output_row, first_output_row)
+        elif row_indices == list(range(first_output_row, first_output_row + len(row_indices))):
+            row_indexer = slice(first_output_row, first_output_row + len(row_indices))
+        else:
+            row_indexer = torch.as_tensor(
+                row_indices,
+                dtype=torch.long,
+                device=outputs["new_tokens"].device,
+            )
+
+        o_new_tokens = outputs["new_tokens"][row_indexer]
+        o_new_tokens_lens = outputs["new_tokens_lens"][row_indexer]
+        o_next_draft_tokens = outputs["next_draft_tokens"][row_indexer]
+        o_next_new_tokens = outputs["next_new_tokens"][row_indexer]
         runtime_draft_len = o_next_draft_tokens.shape[1]
+        o_new_tokens_lens = o_new_tokens_lens.clamp(min=0, max=o_new_tokens.shape[1])
+
+        if o_new_tokens.numel() > 0:
+            o_new_tokens = self._zero_negative_token_ids(o_new_tokens)
+            token_cols = torch.arange(
+                o_new_tokens.shape[1],
+                device=o_new_tokens.device,
+            ).unsqueeze(0)
+            accepted_mask = token_cols < o_new_tokens_lens.unsqueeze(1)
+            o_new_tokens = torch.where(accepted_mask, o_new_tokens, torch.zeros_like(o_new_tokens))
+        o_next_draft_tokens = self._zero_negative_token_ids(o_next_draft_tokens)
+        o_next_new_tokens = self._zero_negative_token_ids(o_next_new_tokens)
 
         # Pad to match fixed-size store buffers for index_copy_.
         if o_new_tokens.shape[1] < (self.draft_len + 1):

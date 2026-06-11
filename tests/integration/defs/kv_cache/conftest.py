@@ -20,5 +20,5 @@ def pytest_addoption(parser):
         "--verbose-stats",
         action="store_true",
         default=False,
-        help="Dump all 18 KV cache stat fields for every stats entry",
+        help="Dump all KV cache iteration stat fields for every stats entry",
     )
