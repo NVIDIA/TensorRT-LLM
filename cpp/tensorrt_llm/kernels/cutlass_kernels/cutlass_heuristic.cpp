@@ -547,9 +547,10 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x64B,
                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
         }
-        // Filter configs by device shared memory. SM121 (GB10) has 99 KiB vs
-        // SM120 (B200) 228 KiB. On constrained devices, keep only CtaShape128x128x64B
-        // which fits within 99 KiB including FINALIZE epilogue (~80 KiB total).
+        // Filter configs by device shared memory. SM100 (B200) has 228 KiB, but
+        // consumer Blackwell (SM120 RTX PRO 6000, SM121 GB10 / DGX Spark) has only
+        // 99 KiB. On these constrained devices, keep only CtaShape128x128x64B which
+        // fits within 99 KiB including FINALIZE epilogue (~80 KiB total).
         // CtaShape128x256x64B/256x128x64B overflow with FINALIZE (~100 KiB).
         // CtaShape128x128x128B also exceeds 99 KiB at typical stage counts.
         {
