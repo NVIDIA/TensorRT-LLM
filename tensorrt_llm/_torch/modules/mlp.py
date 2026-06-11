@@ -6,9 +6,10 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
+from ..._utils import get_sm_version
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import Fp4QuantizedTensor, relu2
+from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
@@ -104,6 +105,10 @@ class MLP(nn.Module):
 
         self._use_fused_relu2_quant = has_nvfp4 and has_kernel and has_scale and is_relu2
 
+    # Minimum M for the fp4out CuTe DSL GELU kernel; below this its SFC epilogue
+    # can write out-of-bounds (CTA tile height > output rows), so fall back to eager.
+    _FP4OUT_MIN_M = 128
+
     def forward(
         self,
         x: torch.Tensor,
@@ -111,6 +116,15 @@ class MLP(nn.Module):
     ) -> torch.Tensor:
         if lora_params is not None:
             return self.forward_lora(x, lora_params=lora_params)
+
+        # Fuse up_proj GEMM + bias + GELU(tanh) + NVFP4-quant into the GEMM
+        # epilogue (mirrors GatedMLP's SwiGLU fp4out path) when eligible.
+        if self._can_fuse_gelu_fp4out():
+            m = x.reshape(-1, x.shape[-1]).shape[0]
+            if m >= MLP._FP4OUT_MIN_M:
+                # Helper returns a rank-preserving Fp4QuantizedTensor; the NVFP4
+                # down_proj flattens/unflattens 3D inputs (see linear.py).
+                return self.down_proj(self._apply_fused_gelu_fp4out(x))
 
         x_up = self.up_proj(x)
 
@@ -122,6 +136,43 @@ class MLP(nn.Module):
         x_down = self.down_proj(x_act)
 
         return x_down
+
+    def _can_fuse_gelu_fp4out(self) -> bool:
+        """Eligible for the fused up-GEMM + bias + GELU(tanh) + NVFP4 epilogue op.
+
+        Mirrors GatedMLP._can_fuse_gate_up_swiglu_fp4out: needs NVFP4 up/down
+        projections, a static down_proj input_scale (the SFC norm_const), the
+        GELU(tanh) activation, the Blackwell CuteDSL op, and SM 100/103.
+        """
+        return (self.activation is gelu_tanh and hasattr(
+            torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
+                and get_sm_version() in (100, 103)
+                and getattr(self.up_proj, "has_nvfp4", False)
+                and getattr(self.down_proj, "has_nvfp4", False)
+                and not self.down_proj.force_dynamic_quantization
+                and self.down_proj.input_scale is not None)
+
+    def _apply_fused_gelu_fp4out(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        """Fused up-GEMM + bias + GELU(tanh) + NVFP4 quant -> down_proj input.
+
+        Preserves input rank: a [B, S, H] input returns a [B, S, H'/2]-packed
+        Fp4QuantizedTensor so the NVFP4 down_proj unflattens its output correctly.
+        """
+        module = self.up_proj
+        original_shape = None
+        if x.dim() > 2:
+            original_shape = x.shape
+            x = x.reshape(-1, x.shape[-1])
+
+        act_fp4, act_sf, alpha = module.quant_method._input_prepare(module, x)
+        fp4_output, out_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell(
+            act_fp4, module.weight, act_sf, module.weight_scale, alpha,
+            self.down_proj.input_scale, module.bias)
+
+        if original_shape is not None:
+            fp4_output = fp4_output.reshape(*original_shape[:-1],
+                                            fp4_output.shape[-1])
+        return Fp4QuantizedTensor(fp4_output, out_sf)
 
     def _fused_relu2_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
         x_flat = x.view(-1, x.shape[-1])
