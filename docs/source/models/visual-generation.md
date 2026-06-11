@@ -172,7 +172,7 @@ cache_config:
 |---|---|---|---|
 | `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for FLUX.2 and Wan 2.1. |
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
-| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Overridden per-checkpoint at load time (Wan: 4 coefficients, FLUX: 5). |
+| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
 
 #### Cache-DiT
 
