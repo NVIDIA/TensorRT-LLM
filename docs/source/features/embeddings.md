@@ -66,7 +66,7 @@ The endpoint accepts the standard OpenAI `/v1/embeddings` fields:
 | `user` | str (optional) | Ignored; accepted for compatibility. |
 | `add_special_tokens` | bool (default `true`) | TRT-LLM extension. Encoder models such as BERT generally need their special tokens (e.g. `[CLS]`/`[SEP]`) added during tokenization. |
 
-There are **no required TRT-LLM-specific request fields** — existing OpenAI/vLLM/SGLang
+There are **no required TRT-LLM-specific request fields** — existing OpenAI-compatible
 embeddings clients work by pointing at the `trtllm-serve` URL.
 
 ## Dynamic batching
@@ -124,16 +124,35 @@ Notes:
 - The embeddings path uses the synchronous `llm.encode()` fast path
   (`EncoderExecutor`): a single forward pass per batch, **no KV cache, sampler, or
   decode loop**.
-- One encoder model per server instance (mirrors the per-model launch mode of
-  vLLM/SGLang). Generation and embedding modes are not mixed in one server.
-- **Single-GPU only.** The encode path runs in-process and does not use the multi-GPU
-  worker proxy, so the `embeddings` command does not expose tensor/pipeline parallelism
-  flags (if a `--config` file sets them, startup fails with a clear error). Multi-GPU
-  embeddings is planned as a follow-up; for now, scale out with multiple single-GPU server
-  instances behind a load balancer.
+- One encoder model per server instance. Generation and embedding modes are not mixed
+  in one server.
+- **Single-GPU per server.** The encode path runs in-process and does not use the
+  multi-GPU worker proxy, so the `embeddings` command does not expose tensor/pipeline
+  parallelism flags (if a `--config` file sets them, startup fails with a clear error).
+  To scale out, see [Scaling out across GPUs](#scaling-out-across-gpus) below.
 - A single in-server worker drives the GPU (no `num_workers` knob): the GPU serializes
   forwards and the underlying executor is not safe for concurrent calls. Increase
   throughput with `--max_batch_size` / `--max_queue_delay`, not more workers.
+
+## Scaling out across GPUs
+
+Embedding / encoder-only models are usually small and fit comfortably on a single GPU.
+The recommended way to use more GPUs is therefore **data parallelism**: run one
+single-GPU `trtllm-serve embeddings` instance per GPU and put a load balancer in front
+of them. There is no cross-GPU communication, so throughput scales close to linearly
+with the number of replicas.
+
+```bash
+# One replica per GPU (8x B200 example), each on its own port.
+for i in $(seq 0 7); do
+  CUDA_VISIBLE_DEVICES=$i trtllm-serve embeddings <model> --port $((8000 + i)) &
+done
+# Then point any HTTP load balancer (nginx, k8s Service, etc.) at ports 8000-8007.
+```
+
+**Tensor / pipeline parallelism** (sharding a single model across GPUs) is only needed
+for an embedding model too large to fit on one GPU — uncommon for encoder-only models.
+It is **not yet supported** by the `embeddings` command and is planned as a follow-up.
 
 ## Relationship to `llm.encode()`
 
