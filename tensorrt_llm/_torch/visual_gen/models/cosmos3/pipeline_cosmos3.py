@@ -443,6 +443,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
         height: int = COSMOS3_720P_PARAMS["height"],
@@ -450,7 +451,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         num_frames: int = COSMOS3_720P_PARAMS["num_frames"],
         num_inference_steps: int = COSMOS3_720P_PARAMS["num_inference_steps"],
         guidance_scale: float = COSMOS3_720P_PARAMS["guidance_scale"],
-        seed: int = 42,
         max_sequence_length: int = COSMOS3_720P_PARAMS["max_sequence_length"],
         frame_rate: float = COSMOS3_720P_PARAMS["frame_rate"],
         use_duration_template: bool = COSMOS3_EXTRA_SPECS["use_duration_template"].default,

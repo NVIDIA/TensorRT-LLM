@@ -25,6 +25,10 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor._util import get_decoding_mode
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    AttentionTypeCpp,
+    create_kv_cache_transceiver,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
@@ -51,6 +55,7 @@ from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.mapping import Mapping
 
+from ..custom_ops.attention_interface import AttentionType
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -58,6 +63,11 @@ from ..utils.cuda_graph import BypassCapturedGraphs
 from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
+
+_ATTENTION_TYPE_TO_CPP = {
+    AttentionType.mha: AttentionTypeCpp.DEFAULT,
+    AttentionType.mla: AttentionTypeCpp.MLA,
+}
 
 # Non-model multimodal metadata consumed before the exported graph or ignored by AD.
 # These keys must NOT leak into the generic extra_args dict — entries there
@@ -390,6 +400,7 @@ class ADEngine(ModelEngine):
             vocab_size_padded=factory.vocab_size_padded,
             spec_config=ad_config.speculative_config,
             requires_uniform_kv_caches=ad_config.requires_uniform_kv_caches,
+            reject_unmanaged_persistent_caches=ad_config.reject_unmanaged_persistent_caches,
         )
 
         reporting_info = ReportingInfo(
@@ -457,6 +468,11 @@ class ADEngine(ModelEngine):
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
+            cache_transceiver_config = ad_config.cache_transceiver_config
+            self._cache_transceiver_enabled = (
+                cache_transceiver_config is not None
+                and cache_transceiver_config.backend is not None
+            )
             self.llm_args.max_stats_len = ad_config.max_stats_len
             self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
@@ -468,6 +484,7 @@ class ADEngine(ModelEngine):
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
+            self._cache_transceiver_enabled = False
             self.llm_args.max_stats_len = 1000
             self._enable_chunked_prefill = False
 
@@ -700,12 +717,23 @@ class ADEngine(ModelEngine):
         gather_context_logits: bool = False,
     ) -> None:
         """Prepare inputs for AD Model from scheduled requests."""
+        context_requests = scheduled_requests.context_requests
+        if (
+            context_requests
+            and self._cache_transceiver_enabled
+            and not self._disable_overlap_scheduler
+        ):
+            raise RuntimeError(
+                "AutoDeploy disaggregated context workers do not support overlap scheduling. "
+                "Set disable_overlap_scheduler=True, or use "
+                "examples/auto_deploy/model_registry/configs/disagg_ctx.yaml when starting "
+                "a context worker with cache_transceiver_config."
+            )
+
         # cache manager
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        # requests in order of context, generate
-        context_requests = scheduled_requests.context_requests
         extend_requests = [
             r for r in scheduled_requests.generation_requests if get_draft_token_length(r) > 0
         ]
@@ -720,6 +748,7 @@ class ADEngine(ModelEngine):
         assert len(extend_requests) == 0 or len(generation_requests) == 0
 
         gen_requests = extend_requests + generation_requests
+        # Requests in order of context, extend, generation.
         ordered_requests = context_requests + gen_requests
 
         # sequence information
@@ -776,8 +805,15 @@ class ADEngine(ModelEngine):
         num_prefill_tokens = len(input_ids)
 
         for request in gen_requests:
-            # check if need overlap and draft length
-            is_overlap = not self._disable_overlap_scheduler and not request.is_dummy
+            # Use overlap only for non-dummy requests with a previous batch slot.
+            # Dummy requests do not need sampled tokens from the previous iteration.
+            # First-step disagg decode requests have not appeared in a previous batch yet,
+            # so their py_batch_idx is None.
+            is_overlap = (
+                not self._disable_overlap_scheduler
+                and not request.is_dummy
+                and request.py_batch_idx is not None
+            )
 
             # check draft length
             draft_len = get_draft_token_length(request)
@@ -1207,6 +1243,42 @@ def create_autodeploy_executor(
         engine=engine,
     )
 
+    cache_transceiver_config = ad_config.cache_transceiver_config
+    kv_cache_transceiver = None
+    if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
+        if isinstance(kv_cache_manager, BaseMambaCacheManager):
+            # See https://github.com/NVIDIA/TensorRT-LLM/issues/14320.
+            raise RuntimeError(
+                "AutoDeploy disaggregated serving does not currently support Mamba/hybrid cache "
+                "managers. A prerequisite for disaggregated serving of hybrid models is to use "
+                "the C++ MambaCacheManager, which is currently not supported in AutoDeploy."
+            )
+        if cache_transceiver_config.max_tokens_in_buffer is None:
+            # The buffer must hold the prompt's KV state (full prefill length).
+            # We use max_seq_len as a safe upper bound on max ISL.
+            cache_transceiver_config.max_tokens_in_buffer = (
+                engine.cache_seq_interface.info.max_seq_len
+            )
+
+        cache_attention_type = engine.cache_seq_interface.attention_type
+        if cache_attention_type is None:
+            raise RuntimeError(
+                "Cache transceiver is enabled, but AutoDeploy did not find a managed paged KV "
+                "resource to provide attention_type."
+            )
+        if not isinstance(cache_attention_type, AttentionType):
+            raise TypeError(f"attention_type must be AttentionType, got {cache_attention_type!r}")
+        attention_type_cpp = _ATTENTION_TYPE_TO_CPP[cache_attention_type]
+
+        kv_cache_transceiver = create_kv_cache_transceiver(
+            dist_mapping,
+            dist,
+            kv_cache_manager,
+            attention_type_cpp,
+            cache_transceiver_config,
+            mamba_cache_manager=None,
+        )
+
     # Guided (structured) decoding.
     guided_decoder = None
     if (
@@ -1251,6 +1323,7 @@ def create_autodeploy_executor(
         max_batch_size=ad_config.max_batch_size,
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
+        kv_cache_transceiver=kv_cache_transceiver,
         resource_governor_queue=resource_governor_queue,
         garbage_collection_gen0_threshold=ad_config.garbage_collection_gen0_threshold,
     )

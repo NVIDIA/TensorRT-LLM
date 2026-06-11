@@ -394,7 +394,7 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         return;
     }
     setContextState(llmRequest.get());
-    auto future = mCacheSender->sendAsync(*llmRequest);
+    auto future = mCacheSender->sendAsync(llmRequest);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
@@ -410,7 +410,7 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mCacheSender->sendAsync(*llmRequest);
+        auto future = mCacheSender->sendAsync(llmRequest);
         mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
 }
@@ -419,7 +419,7 @@ void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequ
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
-        auto future = mCacheReceiver->receiveAsync(*llmRequest);
+        auto future = mCacheReceiver->receiveAsync(llmRequest);
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
@@ -438,7 +438,7 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
         return;
     }
 
-    auto future = mCacheReceiver->receiveAsync(*llmRequest);
+    auto future = mCacheReceiver->receiveAsync(llmRequest);
     auto* requestPtr = llmRequest.get();
     mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
     requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);

@@ -1902,10 +1902,10 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.top_k,
             hidden_size,
             self.intermediate_size,
-            self.valid_hidden_size or hidden_size,
-            self.valid_intermediate_size or self.intermediate_size,
             self.local_num_experts,
             num_tokens,
+            self.valid_hidden_size or hidden_size,
+            self.valid_intermediate_size or self.intermediate_size,
         )
 
         return tactics
