@@ -28,6 +28,9 @@ python models/wan_i2v.py --visual_gen_args configs/wan2.2-i2v-fp4-1gpu.yaml --im
 python models/ltx2.py --visual_gen_args configs/ltx2-t2v-fp8-1-gpu.yaml
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
+
+# With CPU offloading (text encoder, transformer blocks, and VAE)
+python models/wan_t2v.py --offload_stages text_encoder,denoising_transformer,denoising_transformer_2,vae
 ```
 
 Install deps from the repo root: `pip install -r requirements-dev.txt`.

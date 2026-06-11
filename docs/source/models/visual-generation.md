@@ -17,6 +17,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **TeaCache** — a runtime caching optimization that skips transformer steps when timestep embeddings change slowly.
+- CPU offloading for Wan text-to-video pipelines to reduce peak GPU memory usage.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
 ## Supported Models
@@ -42,15 +43,15 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
-|---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image** [^2] | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.2** | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.1** | Yes | Yes | Yes | T2V only | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | No | T2V only | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | Yes | Yes | No | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
+| **Qwen-Image** [^2] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -166,6 +167,10 @@ cache_config:
 
 The `teacache_thresh` parameter controls the similarity threshold. Cache-DiT is also supported via `cache_backend: cache_dit` with its own set of knobs (see `CacheDiTConfig`).
 
+### CPU Offloading (Wan T2V only)
+
+CPU offloading stages move selected Wan T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true` or `--enable_offloading` in the example script.
+
 ### Multi-GPU Parallelism
 
 Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
@@ -178,6 +183,7 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+
 ## Developer Guide
 
 ### Architecture Overview

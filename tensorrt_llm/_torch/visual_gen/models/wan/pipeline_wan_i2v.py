@@ -137,7 +137,7 @@ class WanImageToVideoPipeline(BasePipeline):
         return self.transformer.device
 
     @property
-    def transformer_components(self) -> list:
+    def transformer_components(self) -> list[str]:
         if self.transformer_2 is not None:
             return ["transformer", "transformer_2"]
         return ["transformer"]

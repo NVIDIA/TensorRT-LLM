@@ -84,6 +84,7 @@ WAN22_LPIPS_NUM_INFERENCE_STEPS = 4
 WAN22_LPIPS_GUIDANCE_SCALE = 4.0
 WAN22_LPIPS_SEED = 42
 WAN22_LPIPS_FRAME_RATE = 16.0
+
 # LTX-2 configuration
 LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
@@ -730,7 +731,7 @@ def wan_trtllm_video_path(_visual_gen_deps, llm_venv, llm_root):
     return _generate_wan_video(llm_venv, llm_root, WAN_T2V_MODEL_SUBPATH, "wan")
 
 
-def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
+def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir, extra_args=None):
     """Generate a video with examples/visual_gen/models/wan_t2v.py for a given checkpoint.
 
     The slim example hardcodes prompt/H/W/frames (matching WAN_T2V_* constants
@@ -783,6 +784,8 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
         "--output_path",
         output_path,
     ]
+    if extra_args is not None:
+        cmd.extend(extra_args)
     venv_check_call(llm_venv, cmd)
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
     return output_path
@@ -1024,6 +1027,19 @@ def test_vbench_dimension_score_wan(vbench_repo_root, wan_trtllm_video_path, llm
     )
 
 
+def test_wan_t2v_example_with_offloading(_visual_gen_deps, llm_root, llm_venv):
+    """Run the WAN T2V example end-to-end with CPU offloading enabled."""
+    output_path = _generate_wan_video(
+        llm_venv,
+        llm_root,
+        WAN_T2V_MODEL_SUBPATH,
+        "wan_offload",
+        extra_args=["--enable_offloading"],
+    )
+
+    assert os.path.isfile(output_path), "Offloaded WAN TRT-LLM video must exist"
+
+
 def _run_vbench_and_report(
     vbench_repo_root,
     videos_dir,
@@ -1261,11 +1277,14 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
 
     This is a core example test: it validates that the per-model example script
     and the shared YAML config work together as documented in the README.
-    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint and the shared
-    ``configs/wan2.2-t2v-fp4-1gpu.yaml`` (NVFP4 dynamic quant). The closest
-    overlapping test is ``test_vbench_dimension_score_wan22_a14b_nvfp4``,
-    which runs the same script but with a no-quant YAML synthesized at
-    runtime and additionally evaluates VBench scores.
+    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint.
+
+    NOTE: If a strict-duplicate test exists elsewhere (same model, same quant,
+    same resolution, same prompt, same script invocation), consider removing
+    it in favour of this one.  As of this writing, the closest test is
+    test_vbench_dimension_score_wan22_a14b_nvfp4 which uses the same checkpoint
+    with different resolution/prompt and additionally runs VBench scoring.
+    Not a strict duplicate.
     """
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)

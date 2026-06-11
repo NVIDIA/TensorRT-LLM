@@ -14,7 +14,8 @@
 # limitations under the License.
 
 import math
-from typing import Tuple
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,6 +33,11 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+
+def _noop_offload_context(_tower_name: str) -> ContextManager:
+    """Default offload context: no staging, used when callers don't offload."""
+    return nullcontext()
 
 
 class Qwen3VLTextRMSNorm(nn.Module):
@@ -850,6 +856,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         text_ids: torch.Tensor,
         text_mask: torch.Tensor,
         video_shape: Tuple[int, int, int],
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         **kwargs,
@@ -863,6 +870,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             text_ids: [B, S_text] tokenized text input
             text_mask: [B, S_text] attention mask for text (1=real, 0=pad)
             video_shape: (T, H, W) in latent space
+            offload_context: Callable supplied by the pipeline that maps a tower
+                name ("reasoner" for the understanding pathway, "generator" for
+                the generation pathway) to a context manager staging that tower's
+                weights onto the GPU for the duration of its execution. The
+                pipeline returns a no-op context for towers that are not being
+                offloaded, so the transformer itself stays offload-agnostic.
             fps: video frame rate; when provided, temporal mRoPE positions are
                  scaled to reflect real time (FPS modulation).
             noisy_frame_mask: Optional [B, 1, T, 1, 1] mask where 1=noisy (add
@@ -907,7 +920,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 hidden_states.device,
                 hidden_states.dtype,
             )
-            cached_kv_full = self.language_model(text_ids, text_mask, freqs_und)
+            with offload_context("reasoner"):
+                cached_kv_full = self.language_model(text_ids, text_mask, freqs_und)
             self.cached_freqs_gen = freqs_gen
 
             if self.sharder.is_active:
@@ -936,12 +950,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
         freqs_gen = (cos, sin)
 
-        for i, layer in enumerate(self.gen_layers):
-            k_und, v_und = self.cached_kv[i]
-            if not self.sharder.is_active:
-                k_und = k_und[:, :max_real_len]
-                v_und = v_und[:, :max_real_len]
-            hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
+        with offload_context("generator"):
+            for i, layer in enumerate(self.gen_layers):
+                k_und, v_und = self.cached_kv[i]
+                if not self.sharder.is_active:
+                    k_und = k_und[:, :max_real_len]
+                    v_und = v_und[:, :max_real_len]
+                hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
