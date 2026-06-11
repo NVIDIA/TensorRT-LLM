@@ -270,6 +270,27 @@ def generate_rope_embeddings(
 
 
 class TestSeparateQkvSequenceParallelGuard:
+    def test_trtllm_separate_qkv_without_quant_config_keeps_vanilla_fallback(self):
+        config = create_model_config(
+            hidden_size=64,
+            num_heads=4,
+            head_dim=16,
+            attn_backend="TRTLLM",
+            quant_attention_config=None,
+            skip_create_weights_in_init=True,
+        )
+
+        attn = Attention(
+            hidden_size=64,
+            num_attention_heads=4,
+            head_dim=16,
+            qkv_mode=QKVMode.SEPARATE_QKV,
+            config=config,
+        )
+
+        assert attn.attn_backend == "VANILLA"
+        assert isinstance(attn.attn, VanillaAttention)
+
     @pytest.mark.parametrize(
         "vgm_kwargs",
         [

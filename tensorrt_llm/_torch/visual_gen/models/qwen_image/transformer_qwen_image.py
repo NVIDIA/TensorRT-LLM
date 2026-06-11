@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
@@ -420,6 +421,89 @@ class QwenEmbedRope(nn.Module):
         return freqs.clone().contiguous()
 
 
+class QwenEmbedLayer3DRope(QwenEmbedRope):
+    """Layer-aware 3D RoPE used by Qwen-Image-Layered.
+
+    The layered checkpoint represents generated RGBA layers followed by
+    one conditioning image in ``img_shapes``. Generated layers use their
+    layer index as the frame-axis RoPE offset; the conditioning image uses
+    the negative frame index from diffusers' reference implementation.
+    """
+
+    def forward(
+        self,
+        video_fhw,
+        max_txt_seq_len: int | torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(video_fhw, list):
+            video_fhw = video_fhw[0]
+        if not isinstance(video_fhw, list):
+            video_fhw = [video_fhw]
+
+        vid_freqs = []
+        max_vid_index = 0
+        condition_index = len(video_fhw) - 1
+        for idx, fhw in enumerate(video_fhw):
+            frame, height, width = fhw
+            if idx == condition_index:
+                video_freq = self._compute_condition_freqs(frame, height, width, device)
+            else:
+                video_freq = self._compute_video_freqs(frame, height, width, idx, device)
+            vid_freqs.append(video_freq)
+
+            if self.scale_rope:
+                max_vid_index = max(height // 2, width // 2, max_vid_index)
+            else:
+                max_vid_index = max(height, width, max_vid_index)
+
+        max_vid_index = max(max_vid_index, condition_index)
+        max_txt_seq_len_int = int(max_txt_seq_len)
+        txt_freqs = self.pos_freqs.to(device)[
+            max_vid_index : max_vid_index + max_txt_seq_len_int, ...
+        ]
+        vid_freqs = torch.cat(vid_freqs, dim=0)
+        return vid_freqs, txt_freqs
+
+    @functools.lru_cache(maxsize=128)
+    def _compute_condition_freqs(
+        self,
+        frame: int,
+        height: int,
+        width: int,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        seq_lens = frame * height * width
+        pos_freqs = self.pos_freqs.to(device) if device is not None else self.pos_freqs
+        neg_freqs = self.neg_freqs.to(device) if device is not None else self.neg_freqs
+
+        freqs_pos = pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = freqs_neg[0][-1:].view(frame, 1, 1, -1).expand(frame, height, width, -1)
+        if self.scale_rope:
+            freqs_height = torch.cat(
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                dim=0,
+            )
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
+            freqs_width = torch.cat(
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                dim=0,
+            )
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
+        else:
+            freqs_height = (
+                freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
+            )
+            freqs_width = (
+                freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
+            )
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
+        return freqs.clone().contiguous()
+
+
 # ===========================================================================
 # Joint self-attention for MMDiT.
 # ===========================================================================
@@ -432,9 +516,9 @@ class QwenJointAttention(Attention):
     per-stream QK-norms, and the two output projections (to_out.0 for
     image, to_add_out for text) as direct submodules so the HF state_dict
     loads with the checkpoint remapping in ``load_weights``. The common
-    unmasked path uses the VisualGen attention backend; the masked path
-    falls back to torch SDPA because VisualGen's backend mask contract is
-    currently limited to predefined masks.
+    unmasked path uses the VisualGen attention backend. For masked Qwen
+    text padding, TRTLLM attention compacts valid text tokens per batch
+    item because the backend mask contract is limited to predefined masks.
     """
 
     def __init__(
@@ -462,6 +546,9 @@ class QwenJointAttention(Attention):
             fuse_qk_norm_rope=False,
             config=config,
             layer_idx=layer_idx,
+            # Qwen uses joint separate-QKV attention; keep it on the local
+            # backend instead of wrapping it with sequence-parallel adapters.
+            enable_sequence_parallel=False,
         )
         self.heads = num_attention_heads
         self.head_dim = attention_head_dim
@@ -520,6 +607,53 @@ class QwenJointAttention(Attention):
     @staticmethod
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
         return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
+
+    def _trtllm_masked_attention(
+        self,
+        txt_q: torch.Tensor,
+        txt_k: torch.Tensor,
+        txt_v: torch.Tensor,
+        img_q: torch.Tensor,
+        img_k: torch.Tensor,
+        img_v: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_txt = txt_q.shape[1]
+        seq_img = img_q.shape[1]
+        mask_bool = attention_mask.to(torch.bool)
+        expected_mask_len = seq_txt + seq_img
+        if mask_bool.shape[1] != expected_mask_len:
+            raise ValueError(
+                "QwenJointAttention attention_mask length mismatch: "
+                f"expected {expected_mask_len}, got {mask_bool.shape[1]}."
+            )
+        if not torch.all(mask_bool[:, seq_txt:]):
+            raise ValueError("QwenJointAttention requires all image tokens to be unmasked.")
+
+        outputs = []
+        for batch_idx in range(mask_bool.shape[0]):
+            txt_indices = torch.nonzero(mask_bool[batch_idx, :seq_txt], as_tuple=False).flatten()
+            batch_slice = slice(batch_idx, batch_idx + 1)
+            compact_q = torch.cat([txt_q[batch_slice, txt_indices], img_q[batch_slice]], dim=1)
+            compact_k = torch.cat([txt_k[batch_slice, txt_indices], img_k[batch_slice]], dim=1)
+            compact_v = torch.cat([txt_v[batch_slice, txt_indices], img_v[batch_slice]], dim=1)
+            compact_out = self._attn_impl(
+                compact_q.flatten(2),
+                compact_k.flatten(2),
+                compact_v.flatten(2),
+            )
+
+            valid_txt = txt_indices.numel()
+            output = torch.zeros(
+                (1, expected_mask_len, compact_out.shape[-1]),
+                device=compact_out.device,
+                dtype=compact_out.dtype,
+            )
+            output[:, txt_indices] = compact_out[:, :valid_txt]
+            output[:, seq_txt:] = compact_out[:, valid_txt:]
+            outputs.append(output)
+
+        return torch.cat(outputs, dim=0)
 
     def forward(
         self,
@@ -583,6 +717,10 @@ class QwenJointAttention(Attention):
                 joint_q.transpose(1, 2).flatten(2),
                 joint_k.transpose(1, 2).flatten(2),
                 joint_v.transpose(1, 2).flatten(2),
+            )
+        elif self.attn_backend == "TRTLLM":
+            out = self._trtllm_masked_attention(
+                txt_q, txt_k, txt_v, img_q, img_k, img_v, attention_mask
             )
         else:
             out = F.scaled_dot_product_attention(
@@ -755,6 +893,8 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         num_attention_heads: int = 24,
         joint_attention_dim: int = 3584,
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
+        use_additional_t_cond: bool = False,
+        use_layer3d_rope: bool = False,
         attn_backend: str = "sdpa",
     ):
         model_config = model_config or DiffusionModelConfig()
@@ -770,21 +910,36 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         self.joint_attention_dim = joint_attention_dim
         self.inner_dim = num_attention_heads * attention_head_dim
 
-        self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
-        self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
+        rope_cls = QwenEmbedLayer3DRope if use_layer3d_rope else QwenEmbedRope
+        self.pos_embed = rope_cls(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
+        self.time_text_embed = QwenTimestepProjEmbeddings(
+            embedding_dim=self.inner_dim,
+            use_additional_t_cond=use_additional_t_cond,
+        )
         self.txt_norm = RMSNorm(
             hidden_size=joint_attention_dim,
             eps=1e-6,
             dtype=self.model_config.torch_dtype,
             has_weights=True,
         )
+        quant_config = self.model_config.get_quant_config()
+        img_in_quant_config = quant_config
+        if in_channels < 128 and quant_config is not None and quant_config.quant_algo is not None:
+            # Qwen image-patch projection uses small K dimensions that are not
+            # supported by the FP8 Linear path. Keep only KV-cache quant fields.
+            img_in_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         linear_kwargs = {
             "dtype": self.model_config.torch_dtype,
-            "quant_config": self.model_config.get_quant_config(),
+            "quant_config": quant_config,
             "skip_create_weights_in_init": self.model_config.skip_create_weights_in_init,
             "force_dynamic_quantization": self.model_config.force_dynamic_quantization,
         }
-        self.img_in = Linear(in_channels, self.inner_dim, bias=True, **linear_kwargs)
+        self.img_in = Linear(
+            in_channels,
+            self.inner_dim,
+            bias=True,
+            **{**linear_kwargs, "quant_config": img_in_quant_config},
+        )
         self.txt_in = Linear(joint_attention_dim, self.inner_dim, bias=True, **linear_kwargs)
 
         self.transformer_blocks = nn.ModuleList(
@@ -833,6 +988,19 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             return torch.device("cuda", torch.cuda.current_device())
         return torch.device("cpu")
 
+    def apply_quant_config_exclude_modules(self) -> None:
+        quant_config = self.model_config.get_quant_config()
+        if quant_config is None or quant_config.exclude_modules is None:
+            return
+
+        no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+
+        for name, module in self.named_modules():
+            if not isinstance(module, Linear) or getattr(module, "quant_config", None) is None:
+                continue
+            if quant_config.is_module_excluded_from_quantization(name):
+                module.quant_config = no_quant_config
+
     @classmethod
     def from_config_dict(cls, cfg: Dict[str, Any], **kwargs) -> "QwenImageTransformer2DModel":
         """Build from a transformer/config.json dict."""
@@ -845,6 +1013,8 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             num_attention_heads=cfg.get("num_attention_heads", 24),
             joint_attention_dim=cfg.get("joint_attention_dim", 3584),
             axes_dims_rope=tuple(cfg.get("axes_dims_rope", [16, 56, 56])),
+            use_additional_t_cond=cfg.get("use_additional_t_cond", False),
+            use_layer3d_rope=cfg.get("use_layer3d_rope", False),
             **kwargs,
         )
 
@@ -875,6 +1045,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         weights = _remap_checkpoint_keys(weights)
 
         device = self._weight_loading_device()
+        self.apply_quant_config_exclude_modules()
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
@@ -882,11 +1053,26 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        missing = sorted(expected - provided)
+
+        def _is_dynamic_quant_aux(name: str) -> bool:
+            if not getattr(self.model_config, "dynamic_weight_quant", False):
+                return False
+            return name.rsplit(".", 1)[-1] in {
+                "alpha",
+                "input_scale",
+                "inv_input_scale",
+                "inv_kv_scales",
+                "kv_scales",
+                "pre_quant_scale",
+                "weight_scale",
+                "weight_scale_2",
+            }
+
+        missing = sorted(name for name in expected - provided if not _is_dynamic_quant_aux(name))
         unexpected = sorted(provided - expected)
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.
-        if missing and not self.model_config.dynamic_weight_quant:
+        if missing:
             raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
         if unexpected:
             raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
@@ -944,6 +1130,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         timestep: Optional[torch.Tensor] = None,
         img_shapes: Optional[list] = None,
         txt_seq_lens: Optional[list] = None,
+        additional_t_cond: Optional[torch.Tensor] = None,
         return_dict: bool = False,
         **kwargs,
     ):
@@ -967,7 +1154,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         text_seq_len = encoder_hidden_states.shape[1]
 
         # Timestep-conditioning vector.
-        temb = self.time_text_embed(timestep, hidden_states)
+        temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
         image_rotary_emb = self.pos_embed(
             img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device
