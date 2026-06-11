@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import array
 import asyncio
 import base64
 import json
@@ -47,12 +48,14 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.sampling_params import GuidedDecodingParams
+from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
+from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
+                                               QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -60,6 +63,9 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatMessage, CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
+                                                EmbeddingRequest,
+                                                EmbeddingResponse,
+                                                EmbeddingResponseData,
                                                 ErrorResponse,
                                                 ImageGenerationRequest,
                                                 ImageGenerationResponse,
@@ -197,9 +203,14 @@ class OpenAIServer(_VideoRoutesMixin):
             metadata_server_cfg: MetadataServerConfig,
             disagg_cluster_config: Optional[DisaggClusterConfig] = None,
             multimodal_server_config: Optional[MultimodalServerConfig] = None,
-            chat_template: Optional[str] = None):
+            chat_template: Optional[str] = None,
+            embedding_max_queue_delay: float = 0.005,
+            embedding_max_queue_size: int = 2048):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
+        self._embedding_max_queue_delay = embedding_max_queue_delay
+        self._embedding_max_queue_size = embedding_max_queue_size
+        self.embedding_batcher: Optional[EncodeBatcher] = None
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
@@ -299,7 +310,17 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
+            # Start the encode dynamic batcher (embedding server only). It must be
+            # started inside the running event loop, hence here rather than __init__.
+            if self.embedding_batcher is not None:
+                await self.embedding_batcher.start()
+                logger.info("Started encode dynamic batcher")
+
             yield
+
+            if self.embedding_batcher is not None:
+                await self.embedding_batcher.shutdown()
+                logger.info("Stopped encode dynamic batcher")
 
             # Stop background iteration stats collector
             if self._iteration_stats_collector_task is not None:
@@ -343,6 +364,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.generator, MultimodalEncoder
             ), "generator must be a MultimodalEncoder for multimodal encoder"
             self.register_mm_encoder_routes()
+        elif self.server_role is ServerRole.EMBEDDING:
+            assert getattr(self.generator.args, "encode_only", False), (
+                "generator must be an encode_only=True LLM for the embedding "
+                "server")
+            self._init_embedding_batcher()
+            self.register_embedding_routes()
         else:
             self.register_routes()
 
@@ -769,6 +796,114 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/update_weights",
                                self.update_weights,
                                methods=["POST"])
+
+    def _init_embedding_batcher(self):
+        """Create the encode dynamic batcher for the embedding server.
+
+        The batcher coalesces concurrent /v1/embeddings requests into a single
+        ``llm.encode()`` call. ``encode()`` is synchronous; the batcher runs it in
+        the default executor so the event loop stays responsive.
+        """
+        args = self.generator.args
+
+        def encode_fn(token_ids_batch):
+            # token_ids_batch: list of pre-tokenized token-id lists. encode()
+            # returns one EncoderOutput per item, in input order.
+            return self.generator.encode(token_ids_batch)
+
+        self.embedding_batcher = EncodeBatcher(
+            encode_fn,
+            max_batch_size=args.max_batch_size,
+            max_queue_delay=self._embedding_max_queue_delay,
+            max_queue_size=self._embedding_max_queue_size,
+            max_num_tokens=getattr(args, "max_num_tokens", None),
+            max_seq_len=getattr(args, "max_seq_len", None),
+        )
+
+    def register_embedding_routes(self):
+        self.app.add_api_route("/health", self.health, methods=["GET"])
+        self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        self.app.add_api_route("/v1/embeddings",
+                               self.openai_embedding,
+                               methods=["POST"])
+
+    @staticmethod
+    def _normalize_embedding_input(inp):
+        """Normalize EmbeddingRequest.input into a list of items.
+
+        Each item is either a string (to tokenize) or a pre-tokenized token-id
+        list. Mirrors the four OpenAI input forms: str | list[str] | list[int] |
+        list[list[int]].
+        """
+        if isinstance(inp, str):
+            return [inp]
+        if isinstance(inp, list):
+            if len(inp) == 0:
+                return []
+            if isinstance(inp[0], int):
+                return [inp]  # a single pre-tokenized input
+            return list(inp)  # list of strings or list of token-id lists
+        raise TypeError(f"Unsupported embedding input type: {type(inp)}")
+
+    async def openai_embedding(self, request: EmbeddingRequest,
+                               raw_request: Request) -> Response:
+        try:
+            items = self._normalize_embedding_input(request.input)
+            if not items:
+                return self.create_error_response("`input` must not be empty.")
+
+            # Tokenize strings via the same input processor used by /v1/completions,
+            # honoring add_special_tokens. Pre-tokenized inputs are used as-is. The
+            # batcher enforces seq-len / token-budget limits on the token ids.
+            sampling_params = SamplingParams(
+                add_special_tokens=request.add_special_tokens)
+            token_ids_list = []
+            for item in items:
+                if isinstance(item, str):
+                    token_ids, _ = await asyncio.to_thread(
+                        self.generator.input_processor, prompt_inputs(item),
+                        sampling_params)
+                else:
+                    token_ids = item
+                token_ids_list.append(token_ids)
+
+            try:
+                results = await asyncio.gather(*[
+                    self.embedding_batcher.submit(token_ids)
+                    for token_ids in token_ids_list
+                ])
+            except InputTooLongError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.BAD_REQUEST)
+            except QueueFullError as e:
+                return self.create_error_response(
+                    str(e), status_code=HTTPStatus.TOO_MANY_REQUESTS)
+
+            data = []
+            for idx, encoder_output in enumerate(results):
+                # Model-agnostic: serialize whatever per-request tensor encode()
+                # emits (classification logits, reward score, pooled vector, ...).
+                embedding = encoder_output.logits.flatten().tolist()
+                if request.dimensions is not None:
+                    embedding = embedding[:request.dimensions]
+                if request.encoding_format == "base64":
+                    embedding = base64.b64encode(
+                        array.array("f", embedding).tobytes()).decode("utf-8")
+                data.append(
+                    EmbeddingResponseData(index=idx, embedding=embedding))
+
+            num_prompt_tokens = sum(len(t) for t in token_ids_list)
+            usage = UsageInfo(prompt_tokens=num_prompt_tokens,
+                              total_tokens=num_prompt_tokens,
+                              completion_tokens=None)
+            response = EmbeddingResponse(model=self.model,
+                                         data=data,
+                                         usage=usage)
+            return JSONResponse(content=response.model_dump())
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(str(e))
 
     def register_visual_gen_routes(self):
         """Register routes for diffusion model serving."""

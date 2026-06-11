@@ -543,6 +543,33 @@ def launch_mm_encoder_server(
     asyncio.run(server(host, port))
 
 
+def launch_embedding_server(
+    host: str,
+    port: int,
+    llm_args: dict,
+    max_queue_delay: float,
+    max_queue_size: int,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+):
+    model = llm_args["model"]
+    llm_args.pop("build_config", None)
+    # encode_only is forced on below; drop any value coming from --config to avoid
+    # a duplicate keyword argument.
+    llm_args.pop("encode_only", None)
+    # Encoder-only (embedding) serving uses the synchronous llm.encode() fast path
+    # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
+    llm = PyTorchLLM(encode_only=True, **llm_args)
+
+    server = OpenAIServer(generator=llm,
+                          model=model,
+                          server_role=ServerRole.EMBEDDING,
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None,
+                          embedding_max_queue_delay=max_queue_delay,
+                          embedding_max_queue_size=max_queue_size)
+    asyncio.run(server(host, port))
+
+
 def launch_visual_gen_server(
         host: str,
         port: int,
@@ -1225,6 +1252,137 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
 
 
+@click.command("embeddings")
+@click.argument("model", type=str)
+@click.option("--host",
+              type=str,
+              default="localhost",
+              help="Hostname of the server.")
+@click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+@click.option("--max_batch_size",
+              type=int,
+              default=BuildConfig.model_fields["max_batch_size"].default,
+              help="Maximum batch size coalesced into a single encode() call.")
+@click.option(
+    "--max_num_tokens",
+    type=int,
+    default=8192,
+    help="Maximum number of batched input tokens in each encode() call.")
+@click.option(
+    "--max_queue_delay",
+    type=float,
+    default=0.005,
+    help="Dynamic-batching hold window in seconds: how long an incoming request "
+    "waits for others to join its batch before being dispatched (mirrors Triton's "
+    "max_queue_delay_microseconds).")
+@click.option(
+    "--max_queue_size",
+    type=int,
+    default=2048,
+    help="Maximum number of in-flight queued requests; further requests are "
+    "rejected with HTTP 429 (mirrors Triton's max_queue_size).")
+@click.option("--gpus_per_node",
+              type=int,
+              default=None,
+              help="Number of GPUs per node. Default to None, and it will be "
+              "detected automatically.")
+@click.option("--trust_remote_code",
+              is_flag=True,
+              default=False,
+              help="Flag for HF transformers.")
+@click.option(
+    "--config",
+    "--extra_llm_api_options",
+    "extra_llm_api_options",
+    type=str,
+    default=None,
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file.")
+@click.option("--hf_revision",
+              "--revision",
+              "revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--free_gpu_memory_fraction",
+              type=float,
+              default=0.9,
+              help="Free GPU memory fraction reserved after model weights.")
+@click.option("--tensor_parallel_size",
+              "--tp_size",
+              type=int,
+              default=1,
+              help="Tensor parallelism size.")
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
+def serve_embedding(
+        model: str, host: str, port: int, log_level: str, max_batch_size: int,
+        max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
+        gpus_per_node: Optional[int], trust_remote_code: bool,
+        extra_llm_api_options: Optional[str], revision: Optional[str],
+        free_gpu_memory_fraction: float, tensor_parallel_size: int,
+        metadata_server_config_file: Optional[str], telemetry: bool):
+    """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
+
+    Coalesces concurrent requests with a dynamic batcher and serves them through
+    the synchronous llm.encode() fast path (no KV cache / sampler / scheduler).
+
+    MODEL: model name | HF checkpoint path
+    """
+    logger.set_level(log_level)
+
+    explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
+
+    llm_args, _ = get_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        gpus_per_node=gpus_per_node,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        tensor_parallel_size=tensor_parallel_size,
+        telemetry=telemetry,
+        explicit_cli_keys=explicit_cli_keys)
+
+    extra_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            extra_dict = yaml.safe_load(f)
+    llm_args = update_llm_args_with_extra_dict(
+        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
+
+    # The embeddings server is single-GPU only for now: the encode-only path builds
+    # the engine in-process (create_encoder_executor) and does NOT use the multi-GPU
+    # worker proxy that the generation path relies on, so TP/PP > 1 would hang or
+    # fail rather than shard. Fail fast with a clear message. Multi-GPU embeddings is
+    # a planned follow-up.
+    effective_tp = llm_args.get("tensor_parallel_size") or 1
+    effective_pp = llm_args.get("pipeline_parallel_size") or 1
+    if effective_tp > 1 or effective_pp > 1:
+        raise click.BadParameter(
+            "The embeddings server is single-GPU only; multi-GPU (TP/PP) is not "
+            f"supported yet. Got tensor_parallel_size={effective_tp}, "
+            f"pipeline_parallel_size={effective_pp}.",
+            param_hint="tensor_parallel_size/pipeline_parallel_size")
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    launch_embedding_server(host, port, llm_args, max_queue_delay,
+                            max_queue_size, metadata_server_cfg)
+
+
 @click.command("disaggregated")
 @click.option("-c",
               "--config",
@@ -1577,7 +1735,8 @@ main = DefaultGroup(
         "serve": serve,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
-        "mm_embedding_serve": serve_encoder
+        "mm_embedding_serve": serve_encoder,
+        "embeddings": serve_embedding
     })
 
 if __name__ == "__main__":

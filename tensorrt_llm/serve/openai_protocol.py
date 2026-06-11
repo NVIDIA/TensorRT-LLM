@@ -234,6 +234,36 @@ class CompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
 
 
+class EmbeddingRequest(OpenAIBaseModel):
+    # OpenAI-compatible embeddings request.
+    # https://platform.openai.com/docs/api-reference/embeddings/create
+    model: str
+    input: Union[str, List[str], List[int], List[List[int]]]
+    encoding_format: Literal["float", "base64"] = "float"
+    dimensions: Optional[int] = None
+    user: Optional[str] = None
+    # TRT-LLM extension (optional; default matches llm.encode()). Encoder models
+    # such as BERT generally need their special tokens (e.g. [CLS]/[SEP]) added.
+    add_special_tokens: bool = True
+
+
+class EmbeddingResponseData(OpenAIBaseModel):
+    index: int
+    object: str = "embedding"
+    # A list of floats for encoding_format="float", or a base64 string of packed
+    # little-endian float32 values for encoding_format="base64".
+    embedding: Union[List[float], str]
+
+
+class EmbeddingResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"embd-{str(uuid.uuid4().hex)}")
+    object: str = "list"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    data: List[EmbeddingResponseData]
+    usage: UsageInfo
+
+
 def _response_format_to_guided_decoding_params(
     response_format: Optional[ResponseFormat],
     reasoning_parser: Optional[str] = None,

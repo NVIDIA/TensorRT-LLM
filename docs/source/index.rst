@@ -65,6 +65,7 @@ Welcome to TensorRT LLM's Documentation!
    features/feature-combination-matrix.md
    features/attention.md
    features/disagg-serving.md
+   features/embeddings.md
    features/kvcache.md
    features/long-sequence.md
    features/lora.md
