@@ -1088,7 +1088,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("world_size", [4])
+    @pytest.mark.parametrize("world_size", [4, 8])
     def test_nvfp4_mtp(self, world_size, mocker):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
@@ -1097,7 +1097,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         yaml_paths = [
             str(_AD_CONFIGS_DIR / cfg) for cfg in (
                 "dashboard_default.yaml",
-                "world_size_4.yaml",
+                f"world_size_{world_size}.yaml",
                 "qwen3.5_moe_400b_mtp.yaml",
                 "enable_sharder_ir.yaml",
             )
