@@ -76,7 +76,8 @@ jenkins/scripts/cbts/
 │   ├── spec_dec_rule.py
 │   └── out_of_scope_rule.py
 └── tools/
-    └── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
+    ├── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
+    └── report_cbts_decision.py  post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
 ```
 
 ## Lookup algorithms
@@ -195,22 +196,19 @@ Decision JSON:
 ## Cross-job seed for stage agents
 
 `cbts_test_db/` is written on the L0_MergeRequest agent and is not
-available to downstream `L0_Test-*` pods. To regenerate it per stage:
+available to downstream `L0_Test-*` pods. To deliver it per stage:
 
-1. `getCbtsResult` base64-encodes the input JSON and stores it in
-   `result.cbts_input_json_b64`, which rides along inside `testFilter`.
-   Encoding is mandatory: the raw payload contains PR diff text which can
-   include `${...}` or `{...}` fragments (Python f-strings, shell vars, etc.)
-   that the Jenkins tokenmacro plugin tries to evaluate when the parent
-   serializes `globalVars` for `Parameterized-Remote-Trigger`, raising
-   `MacroEvaluationException` and blocking test dispatch.
-2. `renderTestDB` on the stage agent decodes `cbts_input_json_b64`, writes
-   it to a temp file, and re-runs `main.py`. Output is deterministic, so
-   each agent gets the same `cbts_test_db/` as L0_MergeRequest produced.
+1. `getCbtsResult` tars `cbts_test_db/` and uploads it to Artifactory,
+   recording the path in `result.cbts_test_db_artifact_path` (rides along
+   inside `testFilter`).
+2. `renderTestDB` on the stage agent downloads and extracts that tarball
+   into `${llmSrc}/${test_db_dir_override}`; trt-test-db then renders from
+   the narrowed test-db.
 
-If `cbts_input_json_b64` exceeds 256 KB (post-encoding, the size that
-actually travels over the wire) the piggyback is dropped; Layer 3 falls
-back to the source test-db on each stage agent. Layer 2 still applies.
+If the upload or the download/extraction fails, the override directory is
+absent and `renderTestDB` falls back to the source test-db. Layer 2 still
+applies. The tarball carries only the narrowed YAMLs, so no PR diff text
+travels between jobs.
 
 ## Split-collapse heuristic (Layer 2.5)
 
@@ -285,7 +283,7 @@ CBTS defers to the existing filter chain when:
   YAML edit)
 - Combined scope is `None` (incompatible mix)
 - Layer 3 narrowing would empty a block — block keeps original tests
-- `cbts_input_json_b64` (post-encoding) exceeds 256 KB — Layer 3 falls back per stage
+- `cbts_test_db` tarball upload or download/extraction fails — renderTestDB falls back to source
 - Narrowed YAML missing/empty on a stage agent — renderTestDB falls back
 
 Every fallback emits an `echo` log line.
