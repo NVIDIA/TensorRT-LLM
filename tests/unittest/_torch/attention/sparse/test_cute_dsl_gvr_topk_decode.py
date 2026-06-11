@@ -200,8 +200,13 @@ def _tie_aware_check(
 @pytest.mark.parametrize(
     "dtype,top_k",
     [
+        # Production cells: (bf16, K=512/1024) and (fp32, K=2048) match
+        # the deployed K -> dtype mapping. (fp16, K=1024) is added to keep
+        # the fp16 convert-to-fp32 tail path under test even though it is
+        # not a current production cell.
         (torch.bfloat16, 512),
         (torch.bfloat16, 1024),
+        (torch.float16, 1024),
         (torch.float32, 2048),
     ],
 )
