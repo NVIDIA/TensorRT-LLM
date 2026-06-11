@@ -142,25 +142,23 @@ def _kv_b_proj_dequant_load_hook(
         del state_dict[scale_key]
 
 
-def is_gptj_layout(gm) -> bool:
-    """Return True if MLA RoPE weights are in GPTJ (interleaved) layout.
+# Model types whose MLA modeling skips _rope_deinterleave_load_hook and keeps
+# RoPE weights in native GPTJ layout end-to-end.  For these, the round-trip
+# (load-time de-interleave + fusion-time undo) is omitted, so
+# fuse_rope_into_trtllm_mla must NOT run _undo_rope_deinterleave.
+_GPTJ_LAYOUT_MODEL_TYPES: frozenset = frozenset({"deepseek_v3"})
 
-    Detected by the presence of ``torch_rope_with_qk_interleaving`` in the
-    graph: models that skip ``_rope_deinterleave_load_hook`` keep weights in
-    GPTJ layout and use this op in their forward.  Models that apply the hook
-    (GPTJ→NeoX at load time) use ``torch_rope_with_explicit_cos_sin`` instead,
-    and ``fuse_rope_into_trtllm_mla`` must undo the permutation before the
-    fused kernel runs.
+
+def is_gptj_layout(model_config) -> bool:
+    """Return True if MLA RoPE weights stay in native GPTJ layout (no de-interleave).
+
+    Models in _GPTJ_LAYOUT_MODEL_TYPES omit ``_rope_deinterleave_load_hook``;
+    their weights are never permuted, so ``fuse_rope_into_trtllm_mla`` skips the
+    undo.  Other MLA models apply the hook (GPTJ→NeoX) and need the undo.
+
+    NOTE: detection is by model_type, NOT by graph op.  The interleaving-aware
+    eager op (torch_rope_with_qk_interleaving) mis-pairs with the fused kernel's
+    is_neox=True rotation (~0.7 GSM8K loss), so these models use
+    torch_rope_with_explicit_cos_sin and cannot be distinguished by graph op.
     """
-    import torch
-
-    qk_interleaving = getattr(torch.ops.auto_deploy, "torch_rope_with_qk_interleaving", None)
-    if qk_interleaving is None:
-        return False
-    for node in gm.graph.nodes:
-        if node.op == "call_function" and node.target in (
-            qk_interleaving,
-            qk_interleaving.default,
-        ):
-            return True
-    return False
+    return getattr(model_config, "model_type", "") in _GPTJ_LAYOUT_MODEL_TYPES

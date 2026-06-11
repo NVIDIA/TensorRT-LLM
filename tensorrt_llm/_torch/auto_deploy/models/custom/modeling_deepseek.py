@@ -588,10 +588,13 @@ class DeepSeekV3Attention(nn.Module):
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 
-        # Weights are in GPTJ (interleaved) layout; use the interleaving-aware op
-        # so the eager path is numerically correct and fuse_rope_into_trtllm_mla
-        # can detect GPTJ layout from the graph pattern.
-        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
+        # Use torch_rope_with_explicit_cos_sin: this is the op fuse_rope_into_trtllm_mla
+        # matches and for which it builds the rotary_cos_sin table that pairs correctly
+        # with the fused kernel's is_neox=True rotation.  (The eager rotation output is
+        # discarded once RoPE is fused into trtllm_mla; only the op identity + cos/sin
+        # args matter.  The interleaving-aware op mis-pairs with is_neox=True and costs
+        # ~0.7 GSM8K, so do NOT use it here.)
+        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
             q_pe,
             k_pe,
             cos,
@@ -787,11 +790,11 @@ class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # The fused trtllm_mla path applies GPTJ-style rope internally, so
-        # de-interleaving weights to NeoX at load time and undoing at fusion
-        # time is a redundant round-trip.  We keep weights in GPTJ layout and
-        # use torch_rope_with_qk_interleaving in the forward (above), which the
-        # fusion transform detects to skip the undo.
+        # No _rope_deinterleave_load_hook: weights stay in native GPTJ layout.
+        # The fused trtllm_mla path applies the correct rotation directly, so the
+        # load-time de-interleave + fusion-time undo round-trip is omitted.
+        # fuse_rope_into_trtllm_mla skips the undo for this model_type
+        # (mla_rope_utils.is_gptj_layout / _GPTJ_LAYOUT_MODEL_TYPES).
 
         # Dequantize kv_b_proj FP8 weights at load time.
         # kv_b_proj.weight is passed directly to torch_mla (not via a quantized linear op)
