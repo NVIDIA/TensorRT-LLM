@@ -225,6 +225,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap_gen_first_pp4.yaml",
         "overlap_transceiver_runtime_python":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
+        "python_transceiver_host_offload":
+        f"{test_configs_root}/disagg_config_python_transceiver_host_offload.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
@@ -926,8 +928,7 @@ def test_disaggregated_benchmark_gen_only_trt_backend(
 def test_disaggregated_benchmark_gen_only_insufficient_kv(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         llama_model_root):
-    """Test that gen-only benchmark mode raises an error when KV cache is too
-    small to hold all benchmark requests, instead of hanging forever."""
+    """Test that gen-only benchmark mode raises an error when KV cache is too small to hold all benchmark requests, instead of hanging forever."""
     import openai
 
     setup_model_symlink(llm_venv, llama_model_root,
@@ -1126,6 +1127,166 @@ def test_disaggregated_overlap_transceiver_runtime_python(
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
+    """End-to-end check: Python transceiver + ctx-side host offload.
+
+    The fix translates logical block IDs to primary-pool slot indices in
+    `_CacheReuseAdapterV1.get_block_ids` before they reach the disagg
+    sender. Without that translation, once host offload moves blocks
+    around, the sender computes pool pointers from stale block IDs and
+    either reads garbage memory or aborts. This test stresses that path
+    end-to-end:
+
+      1. Send several distinct prompts to fill the (deliberately small)
+         ctx primary pool, committing each to the reuse radix tree.
+      2. Send more prompts, evicting earlier blocks to the host pool.
+      3. Re-issue the earlier prompts. Reuse hits force onboard from host
+         back to primary, and the disagg transfer must read primary slots
+         that no longer match the original block IDs. With the fix, this
+         succeeds; without it, the sender either crashes on a primary
+         assertion or returns nonsense tokens.
+
+    Assertions are deliberately content-agnostic (TinyLlama outputs vary
+    run-to-run): we check that responses are non-empty, the server stays
+    up across the eviction/onboard cycle, and `cached_tokens > 0` on
+    repeats so we know reuse actually fired.
+    """
+    timeout = aiohttp.ClientTimeout(total=180)
+    max_tokens = 16
+    # Workload sizing: ctx-side primary pool = max_tokens(1024) /
+    # tokens_per_block(64) = 16 blocks. Each prompt below tokenizes to
+    # ~200 tokens ≈ 4 KV blocks. We send 6 distinct prompts → ~24 blocks
+    # of primary demand > 16-block primary pool, forcing eviction of an
+    # earlier prefix to host. Replaying earlier prompts (Pass 2) then
+    # forces onboard from host back to primary, and onboard typically
+    # places the block in a *different* primary slot than its block_id.
+    # That divergence is exactly what the disagg pointer-arithmetic fix
+    # has to handle — without the fix, the sender computes
+    # `base + block_id * slot_bytes` and reads the wrong primary slot.
+    _filler = (
+        "This is filler context describing computer systems, distributed "
+        "inference, KV cache management, host memory offload policies, "
+        "block reuse via radix prefix trees, and the disaggregated serving "
+        "architecture used by modern large language model deployments. ")
+    _topics = [
+        "transformer KV cache management",
+        "the disaggregated prefill/decode split",
+        "host (CPU) memory offload trade-offs",
+        "block eviction and onboard cycles",
+        "primary versus secondary KV pools",
+        "radix prefix tree block reuse",
+    ]
+    distinct_prompts = [
+        f"Topic: {topic}. {_filler * 4} Now answer briefly:"
+        for topic in _topics
+    ]
+
+    async def send(session, prompt):
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "ignore_eos": True,
+        }
+        async with session.post(f"{server_url}/v1/completions",
+                                json=payload,
+                                timeout=timeout) as resp:
+            assert resp.status == 200, (
+                f"completions request failed with {resp.status}: "
+                f"{await resp.text()}")
+            return await resp.json()
+
+    def assert_sane(resp, label):
+        choices = resp.get("choices") or []
+        assert choices, f"{label}: response missing 'choices': {resp}"
+        text = choices[0].get("text") or ""
+        assert text.strip(), f"{label}: empty/whitespace text: {resp}"
+        usage = resp.get("usage") or {}
+        assert usage.get("completion_tokens") == max_tokens, (
+            f"{label}: completion_tokens != {max_tokens}; "
+            f"got {usage.get('completion_tokens')}")
+        return text
+
+    async def drive():
+        async with aiohttp.ClientSession() as session:
+            # Pass 1: prime the radix tree with each distinct prompt and
+            # capture the deterministic output (temperature=0).
+            first_texts = []
+            for idx, p in enumerate(distinct_prompts):
+                resp = await send(session, p)
+                first_texts.append(assert_sane(resp, f"pass1[{idx}]"))
+
+            # Pass 2: send all prompts CONCURRENTLY each replay. Concurrent
+            # in-flight prefills hold their KV blocks simultaneously; with
+            # primary capacity smaller than the union of in-flight prompts,
+            # this is the scenario that produces non-trivial alloc/free
+            # interleaving and onboard-to-different-slot for replayed
+            # prompts. Strict serial sends (Pass 1 above) typically alloc
+            # back to original slots and miss the bug.
+            for replay in range(5):
+                results = await asyncio.gather(
+                    *[send(session, p) for p in distinct_prompts])
+                for idx, resp in enumerate(results):
+                    text = assert_sane(resp,
+                                       f"pass2.replay{replay}.prompt{idx}")
+                    usage = resp["usage"]
+                    cached = (usage.get("prompt_tokens_details")
+                              or {}).get("cached_tokens", 0)
+                    print(f"[host_offload_e2e] replay={replay} prompt={idx} "
+                          f"prompt_tokens={usage.get('prompt_tokens')} "
+                          f"cached_tokens={cached}")
+                    # Reuse must hit — otherwise we never exercise onboard
+                    # back from host, which is the path the fix protects.
+                    assert cached > 0, (
+                        f"replay={replay} prompt={idx}: expected reuse "
+                        f"hit (cached_tokens > 0), got usage={usage}")
+                    # Primary regression check: deterministic decoding +
+                    # correct KV must reproduce Pass 1's output bit-for-bit.
+                    assert text == first_texts[idx], (
+                        f"replay={replay} prompt={idx}: output diverged "
+                        f"from Pass 1, indicating wrong KV was read after "
+                        f"offload/onboard.\n"
+                        f"  pass1: {first_texts[idx]!r}\n"
+                        f"  replay: {text!r}")
+
+    asyncio.run(drive())
+
+
+# Plain parametrize (not the `llama_model_root` indirect fixture) so the
+# test ID picks up the `[TinyLlama-1.1B-Chat-v1.0]` suffix that matches
+# the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access —
+# trtllm-serve resolves the HuggingFace id directly.
+@pytest.mark.parametrize("model_label", ["TinyLlama-1.1B-Chat-v1.0"])
+def test_disaggregated_python_transceiver_host_offload(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        model_label):  # noqa: ARG001 — used only for the parametrize label
+    """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
+
+    See `_verify_python_transceiver_under_host_offload` for what this
+    test proves. The setup pairs the Python transceiver runtime with a
+    ctx-side `host_cache_size` and a deliberately tight primary pool so
+    that prefix reuse is forced through an offload+onboard cycle before
+    each KV transfer.
+
+    Model resolution: trtllm-serve loads the HuggingFace id from the
+    config's `model:` field (TinyLlama/TinyLlama-1.1B-Chat-v1.0) via
+    huggingface_hub on first use. No LLM_MODELS_ROOT / NFS dependency.
+    """
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+
+    def post_client_test(server_url: str):
+        _verify_python_transceiver_under_host_offload(
+            server_url, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "python_transceiver_host_offload",
+                           env=env,
+                           cwd=llm_venv.get_working_directory(),
+                           post_client_test=post_client_test)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -2243,8 +2404,8 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
 def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                                disaggregated_example_root,
                                                llm_venv, model_path):
-    """
-    RCCA: https://nvbugspro.nvidia.com/bug/5555681
+    """RCCA: https://nvbugspro.nvidia.com/bug/5555681.
+
     Test to reproduce KV cache buffer overflow bug with long context.
     """
     models_root = llm_models_root()
@@ -2455,9 +2616,7 @@ def run_cancel_stress_test(server_url: str,
                            requests_per_burst: int = 32,
                            prompt_len_range: tuple = (2000, 8000),
                            cancel_after_range: tuple = (0.01, 0.1)):
-    """
-    Stress test that sends requests with large contexts and cancels them
-    during prefill to test resource cleanup under cancellation.
+    """Stress test that sends requests with large contexts and cancels them during prefill to test resource cleanup under cancellation.
 
     Args:
         server_url: The server URL (e.g., "http://localhost:8000")

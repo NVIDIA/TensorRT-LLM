@@ -2220,6 +2220,27 @@ public:
     {
         TLLM_THROW("commitAndGetBlockHashesForRequest is not implemented for this KV cache manager.");
     }
+
+    //! @brief Translate logical block IDs into memory-pool block indices.
+    //! @details A block ID is stable for the lifetime of a block, but its position inside the
+    //!          memory pool can change after offload/onboard cycles. This function performs
+    //!          that translation. The returned index is the value of `KVCacheBlock::getMemoryPoolBlockIndex()`
+    //!          for each input — the high bit encodes which pool the block currently lives in
+    //!          (primary or secondary), see `kernels::KVCacheIndex`.
+    //! @param blockIds  IDs to translate.
+    //! @param windowSize Attention window the IDs belong to (selects the WindowBlockManager).
+    //! @param requirePrimary If true, abort if any referenced block is currently in the
+    //!          secondary pool. Callers that intend to do primary-pool pointer arithmetic
+    //!          (e.g. the disaggregation cache transceiver) should set this to true. The
+    //!          parameter has no default: every call site must spell its policy out, because
+    //!          the returned value alone does not let the caller distinguish primary from
+    //!          secondary residency (`KVCacheBlock::getMemoryPoolBlockIndex()` strips the
+    //!          pool flag).
+    //! @throws Aborts via TLLM_CHECK_WITH_INFO if any referenced block is not found, or if
+    //!         `requirePrimary` is true and any referenced block is currently secondary.
+    [[nodiscard]] virtual std::vector<kernels::KVCacheIndex::UnderlyingType> getMemoryPoolBlockIndicesByBlockIds(
+        std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize, bool requirePrimary) const
+        = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -2541,6 +2562,9 @@ public:
 
     [[nodiscard]] std::vector<executor::IdType> commitAndGetBlockHashesForRequest(
         LlmRequest const& llmRequest, SizeType32 windowSize) override;
+
+    [[nodiscard]] std::vector<kernels::KVCacheIndex::UnderlyingType> getMemoryPoolBlockIndicesByBlockIds(
+        std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize, bool requirePrimary) const override;
 
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 

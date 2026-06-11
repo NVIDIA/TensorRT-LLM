@@ -3920,6 +3920,27 @@ tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType
     }
 }
 
+std::vector<kernels::KVCacheIndex::UnderlyingType> KVCacheManager::getMemoryPoolBlockIndicesByBlockIds(
+    std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize, bool requirePrimary) const
+{
+    std::vector<kernels::KVCacheIndex::UnderlyingType> indices;
+    indices.reserve(blockIds.size());
+    for (auto const blockId : blockIds)
+    {
+        BlockPtr const& block = mBlockManager.getBlockById(blockId, windowSize);
+        TLLM_CHECK_WITH_INFO(block != nullptr, "Block not found (blockId=%d, windowSize=%d)", blockId, windowSize);
+        if (requirePrimary)
+        {
+            TLLM_CHECK_WITH_INFO(block->isPrimary(),
+                "Block is not in the primary pool (blockId=%d, windowSize=%d) but the caller "
+                "requested primary residency",
+                blockId, windowSize);
+        }
+        indices.push_back(block->getMemoryPoolBlockIndex());
+    }
+    return indices;
+}
+
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
 {
     auto const& sequence = getSequence(requestId);
