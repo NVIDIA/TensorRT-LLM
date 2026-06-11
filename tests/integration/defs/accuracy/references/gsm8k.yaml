@@ -477,9 +477,9 @@ zai-org/GLM-5-FP8:
     accuracy: 78.0
 # Step-3.7-Flash text decoder (MoE) GSM8K, full 1319-sample split, TP4/EP4 with
 # TRTLLM attention + MoE backends. FP8 measured on the FP8 block-scale
-# checkpoint; NVFP4 measured on the modelopt NVFP4 export (FP8 KV cache). FP8
-# MTP (mtp_nextn=3) is lossless and reuses the non-spec baseline. The NVFP4
-# export does not ship MTP weights, so it is only graded without MTP.
+# checkpoint; NVFP4 measured on the modelopt NVFP4 export (FP8 KV cache). MTP
+# (mtp_nextn=3) is lossless for both FP8 and NVFP4 and reuses the non-spec
+# baseline accuracy.
 stepfun-ai/Step-3.7-Flash:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 88
@@ -488,4 +488,8 @@ stepfun-ai/Step-3.7-Flash:
     accuracy: 88
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
+    accuracy: 88
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
     accuracy: 88
