@@ -37,7 +37,11 @@ from tensorrt_llm._torch.auto_deploy.shim.interface import (
     CachedSequenceInterface,
     SpeculativeDecodingModelArgs,
 )
-from tensorrt_llm._torch.auto_deploy.transform.interface import Stages, TransformConfig
+from tensorrt_llm._torch.auto_deploy.transform.interface import (
+    SharedConfig,
+    Stages,
+    TransformConfig,
+)
 from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
     InitializeCache,
     InsertCachedMLAAttention,
@@ -642,7 +646,7 @@ def test_resize_kv_cache_transform_runs_when_needed():
     assert info.skipped is False
 
 
-def test_resize_kv_cache_passes_sa_manager_to_spec_dec_model():
+def test_resize_kv_cache_does_not_require_live_sa_manager():
     from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
     kv_cache_config = KvCacheConfig(
@@ -663,7 +667,7 @@ def test_resize_kv_cache_passes_sa_manager_to_spec_dec_model():
         spec_config=spec_config,
     )
     cm.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
-    cm.sa_manager = object()
+    sa_manager = object()
 
     transform = ResizeKVCache(config=TransformConfig(stage=Stages.PATTERN_MATCHER))
     mock_module = MagicMock(return_value=None)
@@ -675,14 +679,17 @@ def test_resize_kv_cache_passes_sa_manager_to_spec_dec_model():
         ),
         patch.object(cm, "resize_kv_cache_manager") as resize_kv_cache_manager,
     ):
-        result_mod, info = transform._apply_to_full_model(mock_module, cm, MagicMock(), MagicMock())
+        result_mod, info = transform._apply_to_full_model(
+            mock_module, cm, MagicMock(), SharedConfig(sa_manager=sa_manager)
+        )
 
     spec_dec_args = mock_module.call_args.kwargs["spec_dec_args"]
     assert result_mod is mock_module
     assert info.skipped is False
     assert isinstance(spec_dec_args, SpeculativeDecodingModelArgs)
     assert spec_dec_args.cache_seq_interface is cm
-    assert spec_dec_args.sa_manager is cm.sa_manager
+    assert spec_dec_args.sa_manager is None
+    assert spec_dec_args.require_sa_manager is False
     resize_kv_cache_manager.assert_called_once_with(0)
 
 

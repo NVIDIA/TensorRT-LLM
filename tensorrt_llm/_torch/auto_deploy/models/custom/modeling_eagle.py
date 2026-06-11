@@ -763,9 +763,8 @@ class EagleWrapper(nn.Module):
     SA draft-enhancement invariant:
         `self.sa_enhancer` is set at construction iff SA is configured (`config.sa_config` is not
         None); it is a stateless override policy. The suffix-automaton data structure it operates
-        on (`sa_manager`) is a per-iteration runtime object passed into `forward` and is only
-        available when executor inference passes speculative-decoding runtime args. If cached
-        inference reaches this wrapper with an SA enhancer but no manager, the executor/model
+        on (`sa_manager`) is passed into `forward` through speculative-decoding runtime args. If
+        cached inference reaches this wrapper with an SA enhancer but no manager, the executor/model
         contract has been broken and the wrapper fails loudly.
     """
 
@@ -864,7 +863,9 @@ class EagleWrapper(nn.Module):
         """
         if spec_dec_args is not None:
             return self._forward_with_kv_cache(
-                spec_dec_args.cache_seq_interface, sa_manager=spec_dec_args.sa_manager
+                spec_dec_args.cache_seq_interface,
+                sa_manager=spec_dec_args.sa_manager,
+                require_sa_manager=spec_dec_args.require_sa_manager,
             )
         else:
             return self._forward_prefill_only(**kwargs)
@@ -969,24 +970,30 @@ class EagleWrapper(nn.Module):
         next_new_tokens: torch.Tensor,
         num_prefill: int,
         sa_manager,
+        require_sa_manager: bool = True,
     ) -> None:
         if self.sa_enhancer is None:
             return
         if sa_manager is None:
+            if not require_sa_manager and num_prefill == next_new_tokens.shape[0]:
+                return
             raise RuntimeError("SA enhancer is enabled but no SA manager was provided.")
 
         # next_new_tokens is [batch, 1 + max_draft_len]: column 0 is the golden/bonus token and
         # columns 1: are the draft proposals. Slice to generation rows (num_prefill:) and to the
         # draft columns (1:) so the enhancer only sees and overrides draft tokens, leaving the
-        # golden token untouched. The PyTorch backend passes a separate pure-draft-token tensor
-        # (tensorrt_llm/_torch/speculative/eagle3.py), so the extra `1:` here only reflects AD
-        # packing the golden token alongside the drafts — it is not a behavioral difference.
+        # golden token untouched.
         next_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
             next_new_tokens[num_prefill:, 1:]
         )
         next_new_tokens[num_prefill:, 1:] = next_draft_tokens
 
-    def _forward_with_kv_cache(self, csi: CachedSequenceInterface, sa_manager=None):
+    def _forward_with_kv_cache(
+        self,
+        csi: CachedSequenceInterface,
+        sa_manager=None,
+        require_sa_manager: bool = True,
+    ):
         """Forward pass with KV cache (inference after graph transforms).
 
         Phases: target forward -> collect hidden states -> gather + sample + verify ->
@@ -995,7 +1002,7 @@ class EagleWrapper(nn.Module):
         Expected kwargs that are accessed directly are described in the required_kwargs property.
         Additional kwargs are forwarded to target/draft submodules (kv caches, etc.).
         """
-        if self.sa_enhancer is not None and sa_manager is None:
+        if self.sa_enhancer is not None and sa_manager is None and require_sa_manager:
             raise RuntimeError("SA enhancer is enabled but no SA manager was provided.")
 
         # ---- Phase 0: Check batch information ----
@@ -1005,6 +1012,11 @@ class EagleWrapper(nn.Module):
         num_prefill_tokens, num_extend_tokens, num_decode_tokens = batch_info.get_num_tokens()
         num_sequences = num_prefill + num_extend + num_decode
         num_total_tokens = num_prefill_tokens + num_extend_tokens + num_decode_tokens
+        skip_sa_enhancer = False
+        if self.sa_enhancer is not None and sa_manager is None:
+            if num_extend > 0:
+                raise RuntimeError("SA enhancer is enabled but no SA manager was provided.")
+            skip_sa_enhancer = True
 
         # some sanity checks on the batch
         assert num_decode == 0, "decode without drafting is not supported inside the eagle wrapper"
@@ -1093,15 +1105,11 @@ class EagleWrapper(nn.Module):
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
 
-        if self.sa_enhancer is not None:
+        if self.sa_enhancer is not None and not skip_sa_enhancer:
             self.sa_enhancer.extend_and_prepare(
                 sa_manager=sa_manager,
-                # extend_and_prepare takes request_ids but only consumes their count here: the
-                # real request->slot binding was already done by sa_manager.prepare() in the
-                # executor (with the actual IDs), so these values are unused. It is a small
-                # host-side Python list (not a device arange/tensor), so it is cheap even at
-                # batch=1. TODO: pass num_sequences instead of a dummy list once extend_and_prepare
-                # accepts a count (avoid touching the shared PyTorch enhancer signature in this PR).
+                # extend_and_prepare only needs the request count here; the real request->slot
+                # binding was already done by sa_manager.prepare() in the executor.
                 request_ids=list(range(num_sequences)),
                 accepted_tokens=new_tokens_2d,
                 num_accepted_tokens=new_tokens_lens,
@@ -1192,7 +1200,12 @@ class EagleWrapper(nn.Module):
                 csi.info.copy_("input_ids", draft_tokens)
                 csi.info.offset_pos_and_cache_(c_offset, active_args_override=draft_arg_names)
 
-        self._maybe_apply_sa_draft_override(next_new_tokens, num_prefill, sa_manager)
+        self._maybe_apply_sa_draft_override(
+            next_new_tokens,
+            num_prefill,
+            sa_manager,
+            require_sa_manager=require_sa_manager,
+        )
 
         # ---- Phase 6: Package output ----
         return EagleWrapperOutput(

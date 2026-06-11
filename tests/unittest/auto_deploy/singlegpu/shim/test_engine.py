@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import List, Optional, Type
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -821,6 +822,71 @@ def test_ad_engine_prepare_inputs_generation_with_hybrid_cache():
     actual_slot_idx = cache_seq_interface.info.get_arg("slot_idx_host", truncate=True)[0].item()
     assert actual_slot_idx == expected_slot_idx
 
+    cache_seq_interface.shutdown()
+
+
+def test_ad_engine_prepare_inputs_prepares_sa_manager_with_extend_request_ids():
+    """SA slot binding uses the real extend request IDs from the scheduler."""
+    device = torch.device("cuda")
+    max_seq_len = 64
+    max_batch_size = 8
+    max_draft_len = 3
+    tokens_per_block = 16
+
+    kv_cache_config = KvCacheConfig(tokens_per_block=tokens_per_block)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, max_batch_size),
+        device=device,
+        kv_cache_config=kv_cache_config,
+    )
+    cache_seq_interface.to(device)
+
+    engine = ADEngine(lambda _: nn.Module(), cache_seq_interface)
+    engine._disable_overlap_scheduler = True
+    engine.spec_config = Mock(max_draft_len=max_draft_len)
+    engine.sa_manager = Mock()
+
+    resource_manager = _DummyResourceManager(_DummyKVCacheManager(tokens_per_block))
+
+    prefill_scheduled = ScheduledRequests()
+    prefill_scheduled.context_requests_last_chunk.append(
+        _DummyRequest(tokens=[1, 2, 3], begin=0, size=3, seq_slot=0)
+    )
+    engine._prepare_inputs(prefill_scheduled, resource_manager, new_tokens=None)
+    engine.sa_manager.prepare.assert_not_called()
+
+    class _ExtendRequest:
+        def __init__(self, request_id: int, seq_slot: int, tokens: List[int]):
+            self.py_request_id = request_id
+            self.seq_slot = seq_slot
+            self.py_seq_slot = seq_slot
+            self.py_batch_idx = None
+            self.is_dummy = False
+            self.py_draft_tokens = [101, 102, 103]
+            self.py_prompt_len = len(tokens)
+            self.max_beam_num_tokens = len(tokens)
+            self._tokens = tokens
+
+        def get_token(self, _beam: int, idx: int) -> int:
+            return self._tokens[idx]
+
+        def get_num_tokens(self, _beam: int) -> int:
+            return len(self._tokens)
+
+        def get_last_tokens(self, beam: int) -> int:
+            return self.get_token(beam, self.get_num_tokens(beam) - 1)
+
+    extend_request_id = 17
+    extend_scheduled = ScheduledRequests()
+    extend_scheduled.generation_requests.append(
+        _ExtendRequest(request_id=extend_request_id, seq_slot=2, tokens=[1, 2, 3, 4])
+    )
+
+    engine._prepare_inputs(extend_scheduled, resource_manager, new_tokens=None)
+
+    engine.sa_manager.prepare.assert_called_once_with([extend_request_id], max_draft_len)
     cache_seq_interface.shutdown()
 
 

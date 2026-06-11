@@ -122,16 +122,17 @@ class CompileModel(BaseTransform):
     ) -> Tuple[nn.Module, TransformInfo]:
         cm.info.reset()
         spec_config = cm._spec_config
+        sa_manager = shared_config.sa_manager
 
         def _get_args_kwargs(bs: int) -> ArgsKwargs:
             if spec_config is not None:
                 cm.info.set_capture_batch(batch_size=bs, max_draft_len=spec_config.max_draft_len)
-                if cm.sa_manager is not None:
-                    cm.sa_manager.prepare(list(range(bs)), spec_config.max_draft_len)
+                if sa_manager is not None:
+                    sa_manager.prepare(list(range(bs)), spec_config.max_draft_len)
                 return (), {
                     **cm.named_args,
                     "spec_dec_args": SpeculativeDecodingModelArgs(
-                        cache_seq_interface=cm, sa_manager=cm.sa_manager
+                        cache_seq_interface=cm, sa_manager=sa_manager
                     ),
                 }
             cm.info.set_capture_batch(batch_size=bs)

@@ -776,10 +776,14 @@ class ResizeKVCache(BaseTransform):
         cm.info.set_max_num_tokens_sample()
         try:
             if cm._spec_config is not None:
+                # SA workspace is reserved before engine build. Resize only needs that memory to
+                # be unavailable to the KV-cache allocator, not the live SA manager object.
                 mod(
                     **cm.named_args,
                     spec_dec_args=SpeculativeDecodingModelArgs(
-                        cache_seq_interface=cm, sa_manager=cm.sa_manager
+                        cache_seq_interface=cm,
+                        sa_manager=None,
+                        require_sa_manager=False,
                     ),
                 )
             else:

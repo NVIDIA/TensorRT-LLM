@@ -75,16 +75,15 @@ class MockFactory:
 """Unit tests for create_autodeploy_executor function."""
 
 
-def test_ad_engine_passes_sa_manager_to_model_factory():
+def test_ad_engine_owns_sa_manager_without_mutating_cache_interface():
     cache_seq_interface = SimpleNamespace(
         info=SimpleNamespace(max_num_tokens=64, max_seq_len=32, max_batch_size=2),
-        sa_manager=None,
     )
     sa_manager = object()
     model_build_state = {}
 
     def get_inference_model(cache_seq_interface):
-        model_build_state["sa_manager"] = cache_seq_interface.sa_manager
+        model_build_state["has_sa_manager"] = hasattr(cache_seq_interface, "sa_manager")
         return Mock()
 
     engine = ADEngine(
@@ -93,8 +92,40 @@ def test_ad_engine_passes_sa_manager_to_model_factory():
         sa_manager=sa_manager,
     )
 
-    assert model_build_state["sa_manager"] is sa_manager
+    assert model_build_state["has_sa_manager"] is False
+    assert not hasattr(cache_seq_interface, "sa_manager")
     assert engine.sa_manager is sa_manager
+
+
+def test_ad_engine_build_from_config_forwards_sa_manager_to_optimizer():
+    ad_config = LlmArgs(
+        model="target-model",
+        max_batch_size=2,
+        max_seq_len=64,
+        max_num_tokens=128,
+        max_input_len=32,
+        backend="_autodeploy",
+        device="cpu",
+        cuda_graph_config={"max_batch_size": 2},
+    )
+    get_inference_model = Mock(return_value=Mock())
+    sa_manager = object()
+
+    with (
+        patch(
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
+            return_value=MockFactory(vocab_size_padded=1000),
+        ),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.InferenceOptimizer",
+            return_value=get_inference_model,
+        ) as optimizer_cls,
+    ):
+        engine = ADEngine.build_from_config(ad_config, sa_manager=sa_manager)
+
+    assert optimizer_cls.call_args.kwargs["sa_manager"] is sa_manager
+    assert engine.sa_manager is sa_manager
+    get_inference_model.assert_called_once_with(engine.cache_seq_interface)
 
 
 @pytest.mark.parametrize("guided_decoding_backend", ["xgrammar", "llguidance"])

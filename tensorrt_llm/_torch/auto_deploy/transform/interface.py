@@ -141,6 +141,7 @@ class SharedConfig(BaseModel):
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
     dist_config: Optional[DistConfig] = Field(default=None)
+    sa_manager: Optional[object] = Field(default=None)
 
 
 class TransformConfig(BaseModel):

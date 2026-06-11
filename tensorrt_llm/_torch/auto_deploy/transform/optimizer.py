@@ -43,6 +43,7 @@ class InferenceOptimizer:
         factory: ModelFactory,
         config: InferenceOptimizerConfig,
         dist_config: Optional[DistConfig] = None,
+        sa_manager: Optional[object] = None,
     ):
         self.factory = factory
         self.config = self._clean_config(config)
@@ -55,6 +56,7 @@ class InferenceOptimizer:
             local_rank=local_rank,
             world_size=world_size,
             dist_config=dist_config,
+            sa_manager=sa_manager,
         )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:

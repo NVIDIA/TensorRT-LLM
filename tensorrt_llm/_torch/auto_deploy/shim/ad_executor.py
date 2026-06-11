@@ -401,7 +401,10 @@ class ADEngine(ModelEngine):
         )
 
         build_and_optimize = InferenceOptimizer(
-            factory=factory, config=ad_config.transforms, dist_config=dist_config
+            factory=factory,
+            config=ad_config.transforms,
+            dist_config=dist_config,
+            sa_manager=sa_manager,
         )
 
         # construct engine
@@ -451,10 +454,6 @@ class ADEngine(ModelEngine):
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
-        # SA suffix-automaton manager, set at construction (not lazily fetched per-iteration). Its
-        # GPU workspace is reserved by create_autodeploy_executor before this engine builds, so the
-        # KV-cache resize pass (run below in get_inference_model) sizes the cache leaving room for
-        # the SA pool. None when SA is not enabled.
         self.sa_manager = sa_manager
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
@@ -494,7 +493,6 @@ class ADEngine(ModelEngine):
 
         # Store the cache sequence interface
         self.cache_seq_interface = cache_seq_interface
-        self.cache_seq_interface.sa_manager = self.sa_manager
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
@@ -1176,16 +1174,8 @@ def create_autodeploy_executor(
             "Guided decoding is not currently supported for speculative decoding in AutoDeploy."
         )
 
-    # Create the SA suffix-automaton manager (if enabled) and eagerly allocate its GPU workspace
-    # *before* building the engine, via a dummy empty-batch prepare() (which runs _ensure_workspace
-    # then no-ops on the empty request list). The engine build runs the KV-cache resize pass, which
-    # sizes the cache from the device's free GPU memory (resize_kv_cache_manager reads
-    # torch.cuda.mem_get_info). The SA pool is a live raw-CUDA allocation that torch.cuda.empty_cache
-    # cannot reclaim, so reserving it first reduces the free memory the resize sees and the cache is
-    # sized to leave room for it (otherwise the lazily-allocated pool would have to fit in the
-    # cache's leftover headroom and could OOM at first decode for large batch*context). Passing the
-    # manager in at build time also lets the engine hold it from construction rather than lazily
-    # fetching it every iteration; it is owned by the PyExecutor resource managers (registered below).
+    # Reserve SA workspace before engine build so resize_kv_cache sees less free GPU memory and
+    # sizes the KV cache with room for the SA pool.
     sa_manager = None
     if spec_config is not None and getattr(spec_config, "sa_config", None) is not None:
         sa_manager = SuffixAutomatonManager(

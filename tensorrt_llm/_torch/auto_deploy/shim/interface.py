@@ -16,7 +16,7 @@
 import copy
 import functools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union, final
+from typing import Callable, Dict, List, Optional, Tuple, Union, final
 
 import torch
 import torch.nn as nn
@@ -70,9 +70,6 @@ from ..distributed.common import all_gather_object, get_world_size
 from ..distributed.common import is_initialized as is_distributed_initialized
 from ..utils.cuda_mem_tracker import bytes_to, get_mem_info
 from ..utils.logger import ad_logger
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.speculative.suffix_automaton import SuffixAutomatonManager
 
 
 def with_pre_callback(method, callback):
@@ -160,9 +157,6 @@ class CachedSequenceInterface:
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
-        # Optional SA runtime resource. Populated by ADEngine before compile-time capture so
-        # spec-dec models see the same non-tensor resource object during capture and replay.
-        self.sa_manager: Optional["SuffixAutomatonManager"] = None
         self._requires_uniform_kv_caches = requires_uniform_kv_caches
 
         # Propagate spec-dec config into BatchInfo so attention backends can read it
@@ -1382,15 +1376,19 @@ class SpeculativeDecodingModelArgs:
         cache_seq_interface: Per-iteration sequence and KV-cache state. Always present whenever a
             spec-dec model forward runs with caches (inference and the resize transform).
         sa_manager: Suffix-automaton manager backing the SA draft enhancer. Owned by the
-            ``PyExecutor`` resource managers and held by the AutoDeploy engine/cache interface as
-            a reference. Set only when SA enhancement is enabled (``spec_config.sa_config`` is not
-            ``None``) and the managers exist; ``None`` otherwise (e.g. the resize transform, or
-            non-SA speculation).
+            ``PyExecutor`` resource managers and held by the AutoDeploy engine as a reference. Set
+            only when SA enhancement is enabled (``spec_config.sa_config`` is not ``None``) and the
+            manager exists; ``None`` otherwise (e.g. non-SA speculation).
+        require_sa_manager: Whether a configured SA draft enhancer must receive ``sa_manager``.
+            Runtime and CUDA graph capture use the default ``True``. The KV-cache resize pass sets
+            this to ``False`` after the SA workspace has already been reserved, because resize only
+            needs that memory to be unavailable to the KV-cache allocator.
     """
 
     cache_seq_interface: CachedSequenceInterface
-    sa_manager: Optional["SuffixAutomatonManager"] = None
+    sa_manager: Optional[object] = None
+    require_sa_manager: bool = True
 
     def __hash__(self) -> int:
         """Hash by resource identity so cudagraph static-arg checks survive wrapper recreation."""
-        return hash((id(self.cache_seq_interface), id(self.sa_manager)))
+        return hash((id(self.cache_seq_interface), id(self.sa_manager), self.require_sa_manager))

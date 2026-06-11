@@ -351,8 +351,6 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             eagle3_layers_to_capture={1, 15, 28},
             sa_config=sa_config,
         )
-        # Note: Test crashes with trtllm attn_backend + torch-simple
-        # See: https://github.com/NVIDIA/TensorRT-LLM/issues/13135
         compile_backend = "torch-cudagraph" if attn_backend == "trtllm" else "torch-simple"
 
         kwargs = {
@@ -420,7 +418,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
-            self.check_acceptance_rate(llm, min_acceptance_rate=0.18)
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.15)
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):

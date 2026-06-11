@@ -316,7 +316,8 @@ class TestSpeculativeConfigValidation:
         args = LlmArgs(model="test-model", max_seq_len=8192, speculative_config=spec_config)
         assert args.model_factory == "eagle_one_model"
 
-    def test_rejects_sa_enhancer_without_max_seq_len(self):
+    @pytest.mark.parametrize("max_seq_len", [None, 0, -1])
+    def test_rejects_sa_enhancer_without_positive_max_seq_len(self, max_seq_len):
         from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
 
         spec_config = Eagle3DecodingConfig(
@@ -327,8 +328,11 @@ class TestSpeculativeConfigValidation:
         )
         # SA sizes its GPU workspace from max_seq_len and is built before the factory can infer
         # it, so an unset max_seq_len must be rejected (not silently sized from None).
-        with pytest.raises(ValueError):
-            LlmArgs(model="test-model", speculative_config=spec_config)
+        kwargs = {}
+        if max_seq_len is not None:
+            kwargs["max_seq_len"] = max_seq_len
+        with pytest.raises(ValueError, match="requires a positive explicit max_seq_len"):
+            LlmArgs(model="test-model", speculative_config=spec_config, **kwargs)
 
     def test_rejects_standalone_sa(self):
         from tensorrt_llm.llmapi import SADecodingConfig

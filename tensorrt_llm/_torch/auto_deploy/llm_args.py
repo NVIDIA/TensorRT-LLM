@@ -215,10 +215,10 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if (
             spec_config is not None
             and getattr(spec_config, "sa_config", None) is not None
-            and self.max_seq_len is None
+            and (self.max_seq_len is None or self.max_seq_len <= 0)
         ):
             raise ValueError(
-                "AutoDeploy SA enhancer (speculative_config.sa_config) requires an explicit "
+                "AutoDeploy SA enhancer (speculative_config.sa_config) requires a positive explicit "
                 "max_seq_len: it sizes the suffix-automaton GPU workspace and is built before the "
                 "model factory can infer max_seq_len from the model config. Set max_seq_len to your "
                 "target context length."

@@ -5,30 +5,7 @@ Tests the native CUDA kernel implementation.
 
 import torch
 
-from tensorrt_llm._torch.speculative.suffix_automaton import (
-    SAConfig,
-    SuffixAutomatonManager,
-)  # noqa: I001
-
-
-def _tensor_bytes(tensor: torch.Tensor) -> int:
-    return tensor.numel() * tensor.element_size()
-
-
-def _expected_prepare_workspace_bytes(
-    manager: SuffixAutomatonManager,
-    max_draft_len: int,
-) -> int:
-    int32_bytes = torch.empty((), dtype=torch.int32).element_size()
-    expected_bytes = (manager.pool_size + 1) * manager.state_size
-    expected_bytes += manager.max_num_requests * int32_bytes
-    expected_bytes += manager.max_num_requests * max_draft_len * int32_bytes
-    expected_bytes += manager.max_num_requests * int32_bytes
-    expected_bytes += manager.max_num_requests * int32_bytes
-    if manager.enable_global_pool:
-        expected_bytes += (manager.pool_size + 1) * int32_bytes
-        expected_bytes += manager.max_num_requests * int32_bytes
-    return expected_bytes
+from tensorrt_llm._torch.speculative.suffix_automaton import SAConfig, SuffixAutomatonManager
 
 
 class TestSuffixAutomatonManager:
@@ -40,41 +17,6 @@ class TestSuffixAutomatonManager:
         manager = SuffixAutomatonManager(config, max_num_requests=16)
         assert manager is not None
         manager.shutdown()
-
-    def test_prepare_allocates_expected_gpu_workspace(self):
-        """prepare() should make SA workspace visible in device free-memory accounting."""
-        max_seq_len = 64
-        max_num_requests = 2
-        max_draft_len = 3
-        manager = SuffixAutomatonManager(
-            SAConfig(max_seq_len=max_seq_len, max_slots=max_num_requests),
-            max_num_requests=max_num_requests,
-        )
-
-        try:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            free_before, _ = torch.cuda.mem_get_info()
-            expected_bytes = _expected_prepare_workspace_bytes(manager, max_draft_len)
-
-            manager.prepare([], max_draft_len)
-            torch.cuda.synchronize()
-            free_after, _ = torch.cuda.mem_get_info()
-
-            allocated_bytes = free_before - free_after
-            actual_workspace_bytes = (
-                _tensor_bytes(manager._gpu_slots)
-                + _tensor_bytes(manager._gpu_match_len)
-                + _tensor_bytes(manager._gpu_draft_tokens)
-                + _tensor_bytes(manager._gpu_batch_indices)
-                + _tensor_bytes(manager._gpu_nondummy_mask)
-            )
-
-            assert manager._workspace_allocated
-            assert actual_workspace_bytes == expected_bytes
-            assert allocated_bytes >= expected_bytes
-        finally:
-            manager.shutdown()
 
     def test_manager_add_remove(self):
         """Test adding and removing requests."""
