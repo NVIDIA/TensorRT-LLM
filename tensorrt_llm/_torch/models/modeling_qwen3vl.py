@@ -43,7 +43,7 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
-    bypass_processor_output_validation,
+    _install_processor_output_validation_filter,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_attached_multimodal_embeddings,
@@ -162,6 +162,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         trust_remote_code: bool = True,
         **kwargs,
     ):
+        _install_processor_output_validation_filter()
         super().__init__(
             model_path=model_path,
             config=config,
@@ -387,20 +388,20 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
         # round-trip into the validator via tokenizer ``init_kwargs`` /
-        # ``model_input_names`` and trip it with ``TypeError:
+        # ``model_input_names`` and would trip ``TypeError:
         # merged_typed_dict.__init__() got an unexpected keyword argument
-        # 'video_grid_thw'``. Bypass the validator for our known output keys
-        # for the duration of the processor call.
-        with bypass_processor_output_validation():
-            return self.processor(
-                text=[text],
-                images=images,
-                videos=videos,
-                padding=True,
-                do_rescale=do_rescale,
-                return_tensors="pt",
-                **mm_processor_kwargs,
-            )
+        # 'video_grid_thw'``. ``_install_processor_output_validation_filter``
+        # (called from ``__init__``) installs a process-wide filter that drops
+        # those keys before the validator sees them.
+        return self.processor(
+            text=[text],
+            images=images,
+            videos=videos,
+            padding=True,
+            do_rescale=do_rescale,
+            return_tensors="pt",
+            **mm_processor_kwargs,
+        )
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         masks = (input_ids == self.config.image_token_id) | (

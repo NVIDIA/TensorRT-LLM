@@ -962,6 +962,12 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
+            # Release the autotuner's exploration-mode intermediates. The
+            # exploration leftovers are pure waste that hide tens of GiB from
+            # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
+            # NVSHMEM).
+            gc.collect()
+            torch.cuda.empty_cache()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
@@ -2687,15 +2693,19 @@ class PyTorchModelEngine(ModelEngine):
             position_ids.extend(
                 range(begin_compute, begin_compute + len(prompt_tokens)))
 
+            # Start offset of this request's (current-chunk) tokens within the
+            # flattened input_ids. Recorded on multimodal_params below so models
+            # that rewrite token IDs in place write into the request's own span
+            # rather than assuming a contiguous multimodal prefix.
+            context_start_idx = len(input_ids)
             # Track position for updating the inputs of draft model
             if self.is_draft_model and num_accepted_tokens_device is not None:
-                start_idx = len(input_ids)
                 input_ids.extend(prompt_tokens)
                 end_idx = len(input_ids)
                 slot_idx = req_id_to_old_request[
                     request.py_request_id].py_seq_slot
                 context_input_ids_positions.append(
-                    (start_idx, end_idx - 1,
+                    (context_start_idx, end_idx - 1,
                      slot_idx))  # end_idx-1 is the last token position
             else:
                 input_ids.extend(prompt_tokens)
@@ -2731,7 +2741,8 @@ class PyTorchModelEngine(ModelEngine):
 
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data,
-                multimodal_runtime=py_multimodal_runtime)
+                multimodal_runtime=py_multimodal_runtime,
+                input_ids_start_offset=context_start_idx)
             if multimodal_params.has_content():
                 if self.use_mrope:
                     mrope_pos_ids = multimodal_params.multimodal_data[
@@ -3529,6 +3540,9 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in scheduled_requests.context_requests:
             prompt_tokens = request.get_tokens(0)
+            # Start offset of this request's tokens within the flattened
+            # input_ids (see _prepare_tp_inputs for rationale).
+            context_start_idx = len(input_ids)
             input_ids.extend(prompt_tokens)
             request_ids.append(request.py_request_id)
             if request.position_ids is None:
@@ -3545,7 +3559,8 @@ class PyTorchModelEngine(ModelEngine):
             # Multimodal
             if request.py_multimodal_data is not None:
                 multimodal_params = MultimodalParams(
-                    multimodal_data=request.py_multimodal_data, )
+                    multimodal_data=request.py_multimodal_data,
+                    input_ids_start_offset=context_start_idx)
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
                                             pin_memory=prefer_pinned())
