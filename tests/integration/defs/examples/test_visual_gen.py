@@ -214,12 +214,6 @@ def _visual_gen_deps(llm_venv):
 
 
 @pytest.fixture(scope="session")
-def _visual_gen_image_deps(llm_venv):
-    """Install image-generation Python deps once per session."""
-    llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-
-
-@pytest.fixture(scope="session")
 def vbench_repo_root(llm_venv):
     """Clone VBench repo into workspace and install; return repo root path."""
     workspace = llm_venv.get_working_directory()
@@ -1461,7 +1455,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
-def test_qwen_image_example(_visual_gen_image_deps, llm_root, llm_venv):
+def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/qwen_image.py with NVFP4 config end-to-end.
 
     Validates that the Qwen-Image example script and
