@@ -78,6 +78,20 @@ public:
     {
         return transferManager.mPendingWrites.size();
     }
+
+    [[nodiscard]] static bool hasPendingReadForBlock(
+        tbk::KVCacheTransferManager const& transferManager, tbk::BlockPtr const& block)
+    {
+        return transferManager.mPendingReads.find(tbk::KVCacheTransferManager::getPendingTransferIndex(block))
+            != transferManager.mPendingReads.end();
+    }
+
+    [[nodiscard]] static bool hasPendingWriteForBlock(
+        tbk::KVCacheTransferManager const& transferManager, tbk::BlockPtr const& block)
+    {
+        return transferManager.mPendingWrites.find(tbk::KVCacheTransferManager::getPendingTransferIndex(block))
+            != transferManager.mPendingWrites.end();
+    }
 };
 } // namespace tensorrt_llm::testing
 
@@ -5057,13 +5071,19 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerPendingTransfersDistinguishPrim
 
     transferManager.offload(primarySlot0, secondarySlot1, {pool});
 
-    ASSERT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 1);
-    ASSERT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 1);
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 1);
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 1);
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingReadForBlock(transferManager, primarySlot0));
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingWriteForBlock(transferManager, secondarySlot1));
 
     transferManager.onboard(secondarySlot0, primarySlot1, {pool});
 
     EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 2);
     EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 2);
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingReadForBlock(transferManager, primarySlot0));
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingReadForBlock(transferManager, secondarySlot0));
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingWriteForBlock(transferManager, primarySlot1));
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingWriteForBlock(transferManager, secondarySlot1));
 
     transferManager.syncTransfers();
     bufferManager.getStream().synchronize();
