@@ -767,3 +767,53 @@ if __name__ == "__main__":
     #     nvfp4_gemm_perf_test(torch.bfloat16, m, 7168, 65792)
     #     nvfp4_gemm_perf_test(torch.bfloat16, m, 227368, 2560, test_ref=False)
     #     nvfp4_gemm_perf_test(torch.bfloat16, m, 2560, 113664)
+
+
+def _make_nvfp4_inputs_for_bias_test(m, n, k, dtype=torch.bfloat16):
+    """Quantize random bf16 act+weight; return (act_fp4, weight_fp4, act_sf, weight_sf, alpha)."""
+    torch.manual_seed(0)
+    act = torch.randn(m, k, dtype=dtype, device="cuda")
+    weight = torch.randn(n, k, dtype=dtype, device="cuda")
+    act_gs = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    w_gs = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(act, act_gs, 16, False,
+                                                    True)
+    w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(weight, w_gs, 16, False, True)
+    alpha = (1.0 / act_gs * 1.0 / w_gs).to(torch.float32).reshape(())
+    return act_fp4, w_fp4, act_sf, w_sf, alpha
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("backend", ["cutlass", "cublaslt", "cuda_core"])
+@pytest.mark.parametrize("mnk", [(8, 4096, 4096), (252, 2048, 2048),
+                                 (1024, 4096, 4096), (4096, 6144, 4096)])
+def test_fp4_gemm_bias_per_backend(backend, mnk):
+    """Per-backend numerical parity: nvfp4_gemm(bias=B) ≈ nvfp4_gemm(bias=None) + B."""
+    m, n, k = mnk
+    if backend == "cuda_core" and m > 8:
+        pytest.skip("cuda_core backend only supports M <= 8")
+
+    act_fp4, w_fp4, act_sf, w_sf, alpha = _make_nvfp4_inputs_for_bias_test(
+        m, n, k)
+    bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.5
+
+    out_no_bias = torch.ops.trtllm.nvfp4_gemm(act_fp4,
+                                              w_fp4,
+                                              act_sf,
+                                              w_sf,
+                                              alpha,
+                                              torch.bfloat16,
+                                              allowed_backends=backend)
+    ref = out_no_bias + bias
+
+    out_fused = torch.ops.trtllm.nvfp4_gemm(act_fp4,
+                                            w_fp4,
+                                            act_sf,
+                                            w_sf,
+                                            alpha,
+                                            torch.bfloat16,
+                                            allowed_backends=backend,
+                                            bias=bias)
+
+    # bf16 1-ULP at cast boundary (~0.0039) — fused vs gemm+add differs by ULP-level rounding.
+    torch.testing.assert_close(out_fused, ref, rtol=1e-2, atol=5e-3)

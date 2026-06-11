@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import os
 from typing import Optional
 
@@ -12,17 +13,12 @@ import triton.language as tl
 from torch import nn
 from transformers import Qwen3NextConfig
 
-# Default: FlashInfer GDN prefill ON. Set TLLM_USE_FLASHINFER_GDN_PREFILL=0 to
-# fall back to the vendored Triton chunk_gated_delta_rule.
-if os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1":
-    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
-else:
-    from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import use_cpp_mamba_cache_manager
+from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
 from tensorrt_llm.mapping import Mapping
 
 from ...attention_backend import AttentionMetadata
@@ -41,6 +37,29 @@ from .fuse_elementwise_ops import (
 )
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .mamba2_metadata import Mamba2Metadata
+
+
+# FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
+# to force the vendored Triton chunk_gated_delta_rule everywhere. FlashInfer only
+# ships the GDN prefill kernel for Hopper (SM90) and datacenter Blackwell
+# (SM100/SM103); on consumer Blackwell (SM120) and other archs it aborts at
+# launch, so we fall back to Triton there. Resolution is deferred to first call
+# (and cached) so importing this module never initializes CUDA.
+@functools.lru_cache(maxsize=1)
+def _resolve_chunk_gated_delta_rule():
+    if (
+        os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
+        and is_flashinfer_gdn_supported_arch()
+    ):
+        from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule as impl
+    else:
+        from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as impl
+    return impl
+
+
+@torch.compiler.disable
+def chunk_gated_delta_rule(*args, **kwargs):
+    return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
 
 
 def ensure_divisibility(numerator, denominator):

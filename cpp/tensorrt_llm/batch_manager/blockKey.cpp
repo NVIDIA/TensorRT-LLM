@@ -334,7 +334,7 @@ std::vector<BlockKey> buildBlockKeys(
         currentTokenIdx += uniqueTokens.size();
 
         blockKeys.emplace_back(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(),
-            std::move(uniqueTokens), std::move(extraKeys), llmRequest.getCacheSaltID());
+            std::move(uniqueTokens), std::move(extraKeys), llmRequest.getCacheSalt());
     }
     return blockKeys;
 }
@@ -342,7 +342,7 @@ std::vector<BlockKey> buildBlockKeys(
 bool BlockKey::operator==(BlockKey const& other) const noexcept
 {
     return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens
-        && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID);
+        && extraKeys == other.extraKeys && cacheSalt == other.cacheSalt);
 }
 
 BlockKey BlockKey::shorten(int newNumTokens) const
@@ -364,10 +364,10 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     // Constants provide very good distribution - each input bit affects each output bit with ~50% probability.
     size_t seed = blockKey.uniqueTokens.size() ^ parentHash * UINT64_C(0xbf58476d1ce4e5b9);
 
-    if (parentHash == 0 && blockKey.cacheSaltID)
+    if (parentHash == 0 && blockKey.cacheSalt)
     {
-        // Only hashing the cache salt ID for the first block in the sequence
-        uint64_t c = blockKey.cacheSaltID.value();
+        // Only mix the cache salt into the hash for the first block in the sequence.
+        uint64_t c = static_cast<uint64_t>(std::hash<std::string>{}(blockKey.cacheSalt.value()));
         seed = hash64Mix(c, seed);
     }
 

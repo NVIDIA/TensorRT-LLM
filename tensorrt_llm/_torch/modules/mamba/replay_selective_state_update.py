@@ -2321,7 +2321,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.57us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=1, score=6.57us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             32,
             "persistent_dynamic",
@@ -2341,7 +2341,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=2, score=7.0us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=2, score=7.0us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             64,
             "persistent_dynamic",
@@ -2427,7 +2427,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=32, score=12.66us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=32, score=12.66us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             1024,
             "persistent_main",
@@ -2579,7 +2579,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.59us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=1, score=6.59us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             32,
             "persistent_dynamic",
@@ -2711,7 +2711,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=64, score=18.51us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=64, score=18.51us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             2048,
             "persistent_main",
@@ -2737,7 +2737,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=128, score=28.72us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=128, score=28.72us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             4096,
             "persistent_main",
@@ -2837,7 +2837,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.46us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=1, score=6.46us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             32,
             "persistent_dynamic",
@@ -2989,7 +2989,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=128, score=24.5us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=128, score=24.5us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             4096,
             "persistent_main",
@@ -3015,7 +3015,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=256, score=40.04us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=256, score=40.04us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             8192,
             "persistent_main",
@@ -3041,7 +3041,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=69.44us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=512, score=69.44us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             16384,
             "persistent_main",
@@ -3067,7 +3067,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=1024, score=126.74us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=1024, score=126.74us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
     ],
     ("fp32", "RN"): [
         (
@@ -3089,7 +3089,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.64us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=1, score=6.64us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             32,
             "persistent_dynamic",
@@ -3215,7 +3215,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=64, score=20.05us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=64, score=20.05us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             2048,
             "persistent_main",
@@ -3241,7 +3241,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=128, score=31.39us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=128, score=31.39us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             4096,
             "persistent_main",
@@ -3267,7 +3267,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=256, score=51.27us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=256, score=51.27us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             8192,
             "persistent_main",
@@ -3293,7 +3293,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=88.87us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=512, score=88.87us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
         (
             16384,
             "persistent_main",
@@ -3319,7 +3319,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=1024, score=170.51us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        ),  # raw_batch=1024, score=170.51us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
     ],
 }
 _PD_TO_PM_SPLIT_MAP = {  # pd unsplit knob -> (pm_write_knob, pm_nowrite_knob)

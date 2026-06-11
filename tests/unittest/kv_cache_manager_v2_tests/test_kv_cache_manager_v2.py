@@ -15,6 +15,7 @@
 import array
 import functools
 import gc
+import hashlib
 import itertools
 import os
 import random
@@ -52,7 +53,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         TokenIdExt,
         _KVCache,
     )
-    from kv_cache_manager_v2._block_radix_tree import traverse_post_order
+    from kv_cache_manager_v2._block_radix_tree import Hasher, traverse_post_order
     from kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,
@@ -65,7 +66,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
     from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
-    from kv_cache_manager_v2._storage._core import CacheLevelStorage
+    from kv_cache_manager_v2._storage._core import CacheLevelStorage, SlotAllocator
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -105,7 +106,10 @@ else:
         TokenIdExt,
         _KVCache,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import traverse_post_order
+    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+        Hasher,
+        traverse_post_order,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,
@@ -118,7 +122,10 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import CacheLevelStorage
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
+        CacheLevelStorage,
+        SlotAllocator,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -2514,6 +2521,71 @@ class TestScratchReuse(TestKVCacheManagerV2):
         s.take_finish_event().synchronize()
         kv.close()
         self.manager.clear_reusable_blocks()
+
+
+class TestSlotAllocatorShrink(unittest.TestCase):
+    def test_shrink_underused_pool(self) -> None:
+        # Regression for NVBug 6225866: shrinking a pool whose new size is
+        # still above the slot-ID high-water mark used to assert because
+        # _num_active_slots - _target_capacity went negative.
+        allocator = SlotAllocator(capacity=184064)
+        slots = [allocator.allocate() for _ in range(2048)]
+        for s in slots:
+            allocator.release(s)
+        self.assertEqual(allocator._num_active_slots, 2048)
+
+        allocator.prepare_for_shrink(122624)
+        self.assertEqual(len(allocator._overflow_slots), 0)
+        self.assertTrue(allocator.finish_shrink())
+        self.assertEqual(allocator._capacity, 122624)
+        self.assertEqual(allocator._num_active_slots, 2048)
+        self.assertFalse(allocator.shrink_in_progress)
+
+    def test_shrink_touched_pool(self) -> None:
+        # Sanity-check that the non-trivial migration path still works:
+        # all ids are issued, half released, shrink to half.
+        allocator = SlotAllocator(capacity=16)
+        slots = [allocator.allocate() for _ in range(16)]
+        for s in slots[8:]:
+            allocator.release(s)
+        self.assertEqual(allocator._num_active_slots, 16)
+
+        allocator.prepare_for_shrink(8)
+        self.assertEqual(len(allocator._overflow_slots), 8)
+        self.assertTrue(allocator.finish_shrink())
+        self.assertEqual(allocator._capacity, 8)
+        self.assertEqual(allocator._num_active_slots, 8)
+
+        for s in slots[:8]:
+            allocator.release(s)
+
+
+class TestBlockKeyHashing(unittest.TestCase):
+    """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
+
+    @staticmethod
+    def _ref_update(seed: bytes, block: "list[int | bytes]") -> bytes:
+        h = hashlib.sha256()
+        h.update(seed)
+        for item in block:
+            h.update(item.to_bytes(8, "little") if type(item) is int else item)
+        return h.digest()
+
+    def test_update_int_block_matches_reference(self) -> None:
+        rng = random.Random(123)
+        seed = b"\xaa\xbb\xcc"
+        for n in (0, 1, 7, 32, 33, 257):
+            block = [rng.randint(0, (1 << 60)) for _ in range(n)]
+            self.assertEqual(
+                Hasher(seed).update(block).digest,
+                self._ref_update(seed, block),
+                f"int block of length {n}",
+            )
+
+    def test_update_mixed_multimodal_block(self) -> None:
+        block = [randbytes(32), 5, 6, randbytes(32)] + list(range(20))
+        seed = b"\x01"
+        self.assertEqual(Hasher(seed).update(block).digest, self._ref_update(seed, block))
 
 
 if __name__ == "__main__":

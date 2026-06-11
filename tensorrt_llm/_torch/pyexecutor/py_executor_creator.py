@@ -992,6 +992,7 @@ def create_py_executor(
 
         del py_executor  # free before constructing new
         gc.collect()
+        torch.cuda.empty_cache()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using

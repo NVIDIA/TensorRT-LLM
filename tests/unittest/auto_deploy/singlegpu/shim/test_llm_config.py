@@ -54,11 +54,76 @@ def test_custom_values():
 
 
 def test_requires_uniform_kv_caches_follows_attention_backend():
-    """TRTLLM requires stricter KV cache compatibility than FlashInfer."""
-    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is True
+    """No attention backend currently requires uniform KV caches.
+
+    The trtllm backend used to force a single KV pool, but it now supports
+    multiple KV cache memory pools for non-uniform sliding-window models, so the
+    flag defaults to False for all backends.
+    """
+    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is False
     assert (
         LlmArgs(model="test-model", attn_backend="flashinfer").requires_uniform_kv_caches is False
     )
+
+
+@pytest.mark.parametrize("compile_backend", ["torch-simple", "torch-compile"])
+def test_non_piecewise_compile_backend_disables_default_piecewise(compile_backend):
+    args = LlmArgs(model="test-model", compile_backend=compile_backend)
+
+    assert args.transforms["compile_model"]["backend"] == compile_backend
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+@pytest.mark.parametrize("compile_backend", ["torch-simple", "torch-compile"])
+def test_transform_compile_backend_disables_default_piecewise(compile_backend):
+    args = LlmArgs(
+        model="test-model",
+        transforms={"compile_model": {"backend": compile_backend}},
+    )
+
+    assert args.compile_backend == compile_backend
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+def test_yaml_compile_backend_disables_default_piecewise(tmp_path):
+    yaml_path = tmp_path / "ad.yaml"
+    yaml_path.write_text("compile_backend: torch-simple\n")
+
+    args = LlmArgs(model="test-model", yaml_extra=[yaml_path])
+
+    assert args.compile_backend == "torch-simple"
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+def test_speculative_flashinfer_fallback_disables_piecewise():
+    from tensorrt_llm.llmapi import EagleDecodingConfig
+
+    spec_config = EagleDecodingConfig(
+        max_draft_len=3,
+        speculative_model="some/model",
+        eagle3_one_model=True,
+    )
+
+    args = LlmArgs(
+        model="test-model",
+        attn_backend="flashinfer",
+        speculative_config=spec_config,
+    )
+
+    assert args.compile_backend == "torch-simple"
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+def test_cache_transceiver_rejects_unmanaged_persistent_caches():
+    """Cache transceiver rejects unmanaged persistent cache resources."""
+    args = LlmArgs(
+        model="test-model",
+        attn_backend="flashinfer",
+        cache_transceiver_config={"backend": "DEFAULT"},
+    )
+
+    assert args.requires_uniform_kv_caches is False
+    assert args.reject_unmanaged_persistent_caches is True
 
 
 # ================================
@@ -251,6 +316,73 @@ class TestSpeculativeConfigValidation:
         # Should not raise.
         args = LlmArgs(model="test-model", speculative_config=spec_config)
         assert args.model_factory == "eagle_one_model"
+
+    @pytest.mark.parametrize("compile_backend", ["torch-cudagraph", "torch-opt"])
+    def test_rejects_flashinfer_cuda_graph_backend(self, compile_backend):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+
+        with pytest.raises(pydantic.ValidationError):
+            LlmArgs(
+                model="test-model",
+                speculative_config=spec_config,
+                attn_backend="flashinfer",
+                compile_backend=compile_backend,
+            )
+
+    def test_accepts_flashinfer_torch_simple(self):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+
+        LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            attn_backend="flashinfer",
+            compile_backend="torch-simple",
+        )
+
+
+class TestSSMReplayValidation:
+    """The replay SSM kernel (ssm_replay) is only meaningful with speculative decoding.
+
+    Its replay state buffers are read on the speculative extend path and are only bound by
+    the Mamba cache manager when spec is enabled, so enabling replay without spec would leak
+    unmanaged allocations. LlmArgs must reject that combination.
+    """
+
+    def test_ssm_replay_without_spec_raises(self):
+        with pytest.raises(ValueError, match="requires speculative decoding"):
+            LlmArgs(
+                model="test-model",
+                transforms={"insert_cached_ssm_attention": {"ssm_replay": True}},
+            )
+
+    def test_ssm_replay_with_spec_ok(self):
+        from tensorrt_llm.llmapi import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(num_nextn_predict_layers=3, mtp_eagle_one_model=True)
+        # Replay + spec is valid and must not raise.
+        args = LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            transforms={"insert_cached_ssm_attention": {"ssm_replay": True}},
+        )
+        assert args.transforms["insert_cached_ssm_attention"]["ssm_replay"] is True
+
+    def test_no_ssm_replay_without_spec_ok(self):
+        # The default (replay off) with spec off is the common case and must not raise.
+        args = LlmArgs(model="test-model")
+        assert not args.transforms.get("insert_cached_ssm_attention", {}).get("ssm_replay", False)
 
 
 # ================================

@@ -142,6 +142,10 @@ transforms:
     stage: sharding
     run_shape_prop: true
     allreduce_strategy: NCCL
+  pipeline_cache:
+    stage: sharding
+    enabled: true
+    root: null
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
@@ -191,6 +195,9 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_mxfp4_moe:
+    stage: post_load_fusion
+    expect_mem_change: true  # adds padding for trtllm-gen kernel alignment during weight repack
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -326,5 +333,5 @@ transforms:
     expect_mem_change: true
     run_per_gm: false
     backend: torch-cudagraph
-    piecewise_enabled: false
+    piecewise_enabled: true
     piecewise_num_tokens: null
