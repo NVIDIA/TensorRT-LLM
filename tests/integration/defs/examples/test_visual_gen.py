@@ -28,9 +28,11 @@ import zipfile
 
 import pytest
 import torch
+import torch._inductor.config as inductor_config
 from defs import conftest
 from defs.common import venv_check_call
 from defs.trt_test_alternative import check_call
+from torch._inductor.async_compile import shutdown_compile_workers
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
@@ -360,11 +362,6 @@ def _ltx2_lpips_text_encoder_path():
 
 
 def _disable_inductor_compile_worker_quiesce():
-    try:
-        import torch._inductor.config as inductor_config
-    except ImportError:
-        return
-
     # The quiesce timer thread can outlive shutdown_compile_workers() long
     # enough for pytest-threadleak to report it as a leaked thread.
     if hasattr(inductor_config, "quiesce_async_compile_pool"):
@@ -379,10 +376,6 @@ def _cleanup_cuda():
     # attention backend's _concat_qkv) lazily spawn an InductorSubproc worker
     # pool the first time a compiled function runs. The pool's daemon threads
     # outlive the test and trip pytest-threadleak. Tear them down explicitly.
-    try:
-        from torch._inductor.async_compile import shutdown_compile_workers
-    except ImportError:
-        return
     shutdown_compile_workers()
 
 
