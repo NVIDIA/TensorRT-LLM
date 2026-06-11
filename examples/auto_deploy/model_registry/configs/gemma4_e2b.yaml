@@ -20,7 +20,9 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.8
 transforms:
   compile_model:
-    piecewise_enabled: true
+    # Gemma4 E2B uses VSWA cache pools; piecewise graph warmup currently
+    # creates a single-pool cache location and fails during capture.
+    piecewise_enabled: false
   mlir_elementwise_fusion:
     # MLIR elementwise kernels currently corrupt piecewise CUDA graph replay for Gemma4 E2B.
     enabled: false

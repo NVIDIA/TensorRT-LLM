@@ -36,7 +36,7 @@ from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
-                      create_input_processor_with_hash, get_cache_salt_id,
+                      create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -476,8 +476,6 @@ class BaseLLM:
 
         sampling_params = self._prepare_sampling_params(sampling_params)
 
-        cache_salt_id = get_cache_salt_id(
-            cache_salt) if cache_salt is not None else None
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         # TODO: Also support for trt backend
@@ -520,7 +518,7 @@ class BaseLLM:
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id,
+            cache_salt=cache_salt,
             arrival_time=arrival_time,
             priority=priority,
         )
