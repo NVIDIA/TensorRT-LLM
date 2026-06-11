@@ -30,8 +30,11 @@ cuda_graph_config:
 transforms:
   fuse_gemms_mixed_children:
     enabled: false
+  # Generic fuse_gemms merges MLA q_a + kv_a_with_mqa (kept replicated by
+  # exclude_shard_node_filter below) into a 2112x7168 bf16 GEMM; torch_linear_simple
+  # dispatches that shape to the trtllm dsv3 min-latency kernel (op-level).
   fuse_gemms:
-    enabled: false
+    enabled: true
   mlir_elementwise_fusion:
     enabled: true
   match_swiglu_pattern:
@@ -49,8 +52,6 @@ transforms:
   insert_cached_mla_attention:
     backend: trtllm_mla
   fuse_rope_into_trtllm_mla:
-    enabled: true
-  fuse_dsv3_router_gemm:
     enabled: true
   multi_stream_mla_attn:
     enabled: true
@@ -81,5 +82,3 @@ transforms:
     - 512
     - 1024
     - 2048
-  fuse_dsv3_a_gemm:
-    enabled: true
