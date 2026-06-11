@@ -139,8 +139,9 @@ Orthogonal flags (`--reuse-test`, `--disable-reuse-test`, `--debug`,
 
 - `post_merge=False` (default for `/bot run`): drop every stage whose name
   contains `Post-Merge`.
-- `post_merge=True` (`/bot run --post-merge`): keep only stages whose name
-  contains `Post-Merge`.
+- `post_merge=True` (`/bot run --post-merge`): keep all affected stages —
+  pre-merge plus `Post-Merge` (Post-Merge runs on top of pre-merge, matching
+  the non-CBTS baseline).
 
 Applied after rules union; rules see all stages so reasons report the
 pre-filter narrow. `_log_decision_to_stderr` prints the dropped set for
