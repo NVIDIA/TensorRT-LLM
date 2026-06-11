@@ -240,10 +240,11 @@ class GvrTopKLBKernel:
         )
         self._cluster_kernel = GvrTopKKernel(cluster_size=self.CLUSTER_SIZE, **common_kwargs)
         self._single_kernel = GvrTopKKernel(cluster_size=1, **common_kwargs)
-        self._prepare = GvrTopKLBPrepareKernel(
-            long_threshold=long_threshold,
-            num_threads=min(max_B, GvrTopKLBPrepareKernel.MAX_NUM_REQUESTS),
-        )
+        # NOTE: prepare kernel is intentionally NOT held here — it is
+        # decoupled from the main kernel so callers can run it once per
+        # decode step (``seq_lens`` is invariant across layers) and reuse
+        # the metadata across all per-layer GVR Top-K invocations. Use
+        # ``GvrTopKLBPrepareKernel`` directly.
 
         self.dtype = dtype
         self.top_k = top_k
@@ -290,58 +291,58 @@ class GvrTopKLBKernel:
 
         # Pre-init row_idx because CuTe DSL forbids first-defining a Python
         # variable inside one branch of a dynamic if/else and using it
-        # later (see ``spike_cross_instance_jit.py``).
+        # later. Also: dynamic ``return`` isn't allowed inside @cute.kernel
+        # bodies, so the dead-cluster / short-tail filters are written as
+        # ``if alive`` blocks with implicit fall-through to the end of the
+        # kernel rather than early exits.
         row_idx = cutlass.Int32(0)
 
-        if cluster_id >= total_clusters:
-            # Dead cluster (max-grid padding). All 4 CTAs of this cluster
-            # take this branch → no peer waiting on us.
-            return
-
-        if cluster_id < n_long_clusters:
-            # Long branch: 1 cluster cooperates on 1 long row.
-            long_row_idx = cluster_id  # 0 .. n_long_clusters - 1
-            if cutlass.const_expr(next_n == 1):
-                req_id = order_row[long_row_idx]
-                row_idx = req_id
+        if cluster_id < total_clusters:
+            if cluster_id < n_long_clusters:
+                # Long branch: 1 cluster cooperates on 1 long row.
+                long_row_idx = cluster_id  # 0 .. n_long_clusters - 1
+                if cutlass.const_expr(next_n == 1):
+                    req_id = order_row[long_row_idx]
+                    row_idx = req_id
+                else:
+                    req_offset = long_row_idx // cutlass.Int32(next_n)
+                    nn = long_row_idx % cutlass.Int32(next_n)
+                    req_id = order_row[req_offset]
+                    row_idx = req_id * cutlass.Int32(next_n) + nn
+                self._cluster_kernel.run_one_row(
+                    row_idx,
+                    input_data,
+                    pre_idx,
+                    seq_lens,
+                    output_values,
+                    output_indices,
+                )
             else:
-                req_offset = long_row_idx // cutlass.Int32(next_n)
-                nn = long_row_idx % cutlass.Int32(next_n)
-                req_id = order_row[req_offset]
-                row_idx = req_id * cutlass.Int32(next_n) + nn
-            self._cluster_kernel.run_one_row(
-                row_idx,
-                input_data,
-                pre_idx,
-                seq_lens,
-                output_values,
-                output_indices,
-            )
-        else:
-            # Short branch: cluster's 4 CTAs each handle 1 short row.
-            short_cluster_id = cluster_id - n_long_clusters
-            short_row_idx = short_cluster_id * cutlass.Int32(cluster_size) + pos_in_cluster
-            if short_row_idx >= n_short_rows:
-                # Cluster tail padding. Sibling CTAs in this cluster may
-                # have valid rows; that's fine — short-branch CTAs do not
-                # touch any cluster sync so a sibling early-exit is safe.
-                return
-            if cutlass.const_expr(next_n == 1):
-                req_id = order_row[n_long_req + short_row_idx]
-                row_idx = req_id
-            else:
-                req_offset = short_row_idx // cutlass.Int32(next_n)
-                nn = short_row_idx % cutlass.Int32(next_n)
-                req_id = order_row[n_long_req + req_offset]
-                row_idx = req_id * cutlass.Int32(next_n) + nn
-            self._single_kernel.run_one_row(
-                row_idx,
-                input_data,
-                pre_idx,
-                seq_lens,
-                output_values,
-                output_indices,
-            )
+                # Short branch: cluster's 4 CTAs each handle 1 short row.
+                short_cluster_id = cluster_id - n_long_clusters
+                short_row_idx = short_cluster_id * cutlass.Int32(cluster_size) + pos_in_cluster
+                # Short cluster tail (last cluster's trailing CTAs when
+                # n_short_rows isn't a multiple of cluster_size). Sibling
+                # CTAs in this cluster may have valid rows; that's fine —
+                # short-branch CTAs do not touch any cluster sync so the
+                # partial cluster is safe.
+                if short_row_idx < n_short_rows:
+                    if cutlass.const_expr(next_n == 1):
+                        req_id = order_row[n_long_req + short_row_idx]
+                        row_idx = req_id
+                    else:
+                        req_offset = short_row_idx // cutlass.Int32(next_n)
+                        nn = short_row_idx % cutlass.Int32(next_n)
+                        req_id = order_row[n_long_req + req_offset]
+                        row_idx = req_id * cutlass.Int32(next_n) + nn
+                    self._single_kernel.run_one_row(
+                        row_idx,
+                        input_data,
+                        pre_idx,
+                        seq_lens,
+                        output_values,
+                        output_indices,
+                    )
 
     @cute.jit
     def __call__(
@@ -355,16 +356,24 @@ class GvrTopKLBKernel:
         counters: cute.Tensor,
         stream,
     ):
-        # Step 1: prepare (1 block).
-        B = seq_lens.shape[0]
-        self._prepare(seq_lens, order_row, counters, cutlass.Int32(B), stream=stream)
+        """Launch the main kernel only.
 
-        # Step 2: main (fixed max grid, dead-cluster early-exit).
-        # Worst case: all rows are long -> n_long_clusters = max_B * next_n
-        # consumes the full ``_max_grid_ctas`` budget. Smaller batches see
-        # idle padding clusters early-exit on the ``cluster_id >= total``
-        # check at kernel entry; dead-CTA overhead is < 1 us on B200
-        # (verified via spike microbench).
+        ``order_row`` and ``counters`` MUST already be populated by a
+        prior call to ``GvrTopKLBPrepareKernel`` for the current
+        ``seq_lens``. They are decoupled because ``seq_lens`` is
+        invariant across the per-layer GVR Top-K calls within one decode
+        step, so the prepare cost (~1-2 us) can be amortized over many
+        layers. The caller is expected to:
+
+            prep(seq_lens, order_row, counters)   # once per decode step
+            for layer in layers:
+                main(logits[layer], pre_idx[layer], ..., order_row, counters)
+
+        Grid is fixed at the worst-case ``max_B * next_n`` long clusters
+        (each consuming ``cluster_size`` CTAs); smaller batches see idle
+        padding clusters early-exit on the ``cluster_id >= total_clusters``
+        check inside the kernel. Dead-CTA overhead is < 1 us on B200.
+        """
         self.main_kernel(
             input_data,
             pre_idx,
