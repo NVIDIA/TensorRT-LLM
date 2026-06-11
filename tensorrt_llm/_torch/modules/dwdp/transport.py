@@ -37,7 +37,9 @@ Design:
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import ctypes
+import os
+from typing import Dict, List, Tuple, Union
 
 import torch
 
@@ -61,6 +63,7 @@ from .vmm import (
     free_va,
     get_allocation_granularity,
     map_handle,
+    peer_handle_type,
     release_handle,
     reserve_va,
     set_access,
@@ -68,59 +71,70 @@ from .vmm import (
     unmap_va,
 )
 
+# Linux ``pidfd_open(2)`` and ``pidfd_getfd(2)`` syscall numbers (x86_64 /
+# aarch64 share the same numbers).  Used on the POSIX_FILE_DESCRIPTOR path
+# to dup an FD from a sibling DWDP MPI worker into the local fd table so
+# ``cuMemImportFromShareableHandle(fd, POSIX_FILE_DESCRIPTOR)`` accepts it.
+# Mirrors ``MnnvlMemory.open_mnnvl_memory`` in
+# ``tensorrt_llm/_mnnvl_utils.py``.
+_SYS_pidfd_open = 434
+_SYS_pidfd_getfd = 438
 
-def _export_fabric_handle(handle: int, device_id: int) -> bytes:
-    """Export an MNNVL fabric handle to shareable bytes.
 
-    Uses cuMemExportToShareableHandle with CU_MEM_HANDLE_TYPE_FABRIC to
-    produce a byte representation that can be sent to peer processes via
-    the DWDP MPI communicator.
+def _pidfd_open(pid: int) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.syscall(_SYS_pidfd_open, pid, 0)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise RuntimeError(f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}")
+    return fd
 
-    Args:
-        handle: CUDA memory handle (from create_fabric_handle).
-        device_id: CUDA device ordinal (used to build allocation properties).
 
-    Returns:
-        Byte representation of the fabric handle.
-
-    Raises:
-        RuntimeError: If the CUDA export call fails.
-    """
-    fabric_handle = check_cu_result(
-        cuda.cuMemExportToShareableHandle(
-            handle,
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
-            0,
+def _pidfd_getfd(pidfd: int, remote_fd: int) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    local_fd = libc.syscall(_SYS_pidfd_getfd, pidfd, remote_fd, 0)
+    if local_fd < 0:
+        err = ctypes.get_errno()
+        msg = (
+            f"pidfd_getfd(pidfd={pidfd}, fd={remote_fd}) failed with errno "
+            f"{err}: {os.strerror(err)}."
         )
-    )
-    # The returned fabric_handle is a CUmemFabricHandle struct.
-    # Convert to bytes for transmission via MPI.
-    if hasattr(fabric_handle, "data"):
-        return bytes(fabric_handle.data)
-    return bytes(fabric_handle)
+        if err == 1:  # EPERM
+            msg += (
+                " Permission denied. If running in a container, try adding "
+                "--cap-add=SYS_PTRACE to your docker run command."
+            )
+        else:
+            msg += " This may be due to kernel version (requires Linux 5.6+)."
+        raise RuntimeError(msg)
+    return local_fd
 
 
-def _import_fabric_handle(handle_bytes: bytes) -> int:
-    """Import a fabric handle from shareable bytes.
+def _export_handle(handle: int, htype: cuda.CUmemAllocationHandleType) -> Union[bytes, int]:
+    """Export a peer-shareable handle.
 
-    Uses cuMemImportFromShareableHandle with CU_MEM_HANDLE_TYPE_FABRIC to
-    reconstruct a CUDA memory handle from bytes received via MPI allgather.
-
-    Args:
-        handle_bytes: Byte representation produced by _export_fabric_handle.
-
-    Returns:
-        Imported CUDA memory handle as integer.
-
-    Raises:
-        RuntimeError: If the CUDA import call fails.
+    For ``CU_MEM_HANDLE_TYPE_FABRIC`` the result is a ``bytes`` blob holding
+    the ``CUmemFabricHandle`` struct.  For
+    ``CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`` the result is the local
+    file descriptor (``int``); the caller is responsible for closing it
+    after every peer has dup-ed it via ``pidfd_getfd``.
     """
-    imported_handle = check_cu_result(
-        cuda.cuMemImportFromShareableHandle(
-            handle_bytes,
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
-        )
-    )
+    exported = check_cu_result(cuda.cuMemExportToShareableHandle(handle, htype, 0))
+    if htype == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC:
+        if hasattr(exported, "data"):
+            return bytes(exported.data)
+        return bytes(exported)
+    # POSIX_FILE_DESCRIPTOR: ``exported`` is the FD as int.
+    return int(exported)
+
+
+def _import_handle(payload: Union[bytes, int], htype: cuda.CUmemAllocationHandleType) -> int:
+    """Import a peer-shareable handle previously produced by ``_export_handle``.
+
+    For FABRIC ``payload`` is the bytes blob; for POSIX_FD ``payload`` is a
+    *local* file descriptor (already dup-ed via ``pidfd_getfd``).
+    """
+    imported_handle = check_cu_result(cuda.cuMemImportFromShareableHandle(payload, htype))
     return int(imported_handle)
 
 
@@ -154,6 +168,7 @@ class DWDPTransport:
         "_local_handles",
         "_imported_handles",
         "_peer_va_mappings",
+        "_local_export_fds",
         "_released",
     )
 
@@ -169,6 +184,7 @@ class DWDPTransport:
         local_handles: List[int],
         imported_handles: List[int],
         peer_va_mappings: List[Tuple[int, int]],
+        local_export_fds: List[int],
     ) -> None:
         """Internal constructor. Use DWDPTransport.create() instead.
 
@@ -198,6 +214,7 @@ class DWDPTransport:
         self._local_handles = local_handles
         self._imported_handles = imported_handles
         self._peer_va_mappings = peer_va_mappings
+        self._local_export_fds = local_export_fds
         self._released = False
 
     @classmethod
@@ -260,6 +277,27 @@ class DWDPTransport:
             RuntimeError: If any CUDA operation fails.
         """
         granularity = get_allocation_granularity(device_id)
+        htype = peer_handle_type()
+        is_posix_fd = (
+            htype == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+
+        # POSIX_FD path: dup peer FDs into our fd table via pidfd_getfd.
+        # We open one pidfd per peer ≠ self once up front and close them
+        # after Phase 3 Barrier.  ``peer_pidfds`` is empty on the FABRIC
+        # path (aarch64 / GB200).
+        peer_pidfds: Dict[int, int] = {}
+        # FDs returned by ``cuMemExportToShareableHandle`` on this rank.
+        # Must outlive every peer's ``pidfd_getfd`` (Phase 2) but are
+        # closed right after the Phase 3 Barrier — at that point every
+        # peer has finished dup-ing them and the FDs no longer back
+        # anything we need.  ``cuMemImportFromShareableHandle`` dups the
+        # peer-side FD internally, so we do NOT have to track imported
+        # FDs across phases: each one is closed inline immediately after
+        # the import call returns, capping fd usage at ~num_handles
+        # rather than ``dwdp_size × num_handles``.  The list is empty on
+        # the FABRIC path (aarch64 / GB200).
+        local_export_fds: List[int] = []
 
         # Pick any spec to read the model's total expert count.  All layers
         # share the same ``num_experts`` (the gate-side global expert table).
@@ -297,11 +335,20 @@ class DWDPTransport:
         peer_va_mappings: List[Tuple[int, int]] = []
         peer_views: Dict[Tuple[int, int, str], torch.Tensor] = {}
 
-        # Per-pair allgather result cache: (layer_idx, name) -> list[bytes]
+        # Per-pair allgather result cache: (layer_idx, name) -> list[payload]
         # indexed by peer rank.  Populated in Phase 1, consumed in Phase 2.
-        all_exports: Dict[Tuple[int, str], List[bytes]] = {}
+        # Payload is ``bytes`` on FABRIC and ``int`` (FD) on POSIX_FD.
+        all_exports: Dict[Tuple[int, str], List[Union[bytes, int]]] = {}
 
         try:
+            # On POSIX_FD: open one pidfd per peer ≠ self before Phase 1.
+            if is_posix_fd:
+                all_pids = comm.allgather(os.getpid())
+                for peer_rank, peer_pid in enumerate(all_pids):
+                    if peer_rank == dwdp_rank:
+                        continue
+                    peer_pidfds[peer_rank] = _pidfd_open(peer_pid)
+
             # ----------------------------------------------------------
             # Phase 1: Allocate local handles and allgather bytes
             # ----------------------------------------------------------
@@ -373,10 +420,15 @@ class DWDPTransport:
                         free_va(temp_va, phys_size)
 
                     # (f) Export and allgather to all peers
-                    handle_bytes = _export_fabric_handle(handle, device_id)
+                    exported = _export_handle(handle, htype)
+                    if is_posix_fd:
+                        # Track local FD so it can be closed at release time.
+                        # It must remain open through Phase 2 so peers can
+                        # pidfd_getfd it.
+                        local_export_fds.append(int(exported))
                     # comm.allgather implicitly synchronizes all ranks on this
                     # (layer_idx, name) — no explicit barrier required.
-                    all_exports[key] = comm.allgather(handle_bytes)
+                    all_exports[key] = comm.allgather(exported)
 
                     logger.debug(
                         f"[DWDPTransport] Rank {dwdp_rank}: exported + allgathered "
@@ -414,11 +466,29 @@ class DWDPTransport:
                         phys_size = peer_page_end - peer_page_start
                         peer_data_offset = peer_start_bytes - peer_page_start
 
-                        # (a) Retrieve peer handle bytes from Phase 1 cache
-                        peer_handle_bytes = all_exports[(layer_idx, name)][peer_rank]
+                        # (a) Retrieve peer handle payload from Phase 1 cache.
+                        peer_payload = all_exports[(layer_idx, name)][peer_rank]
 
-                        # (b) Import the fabric handle
-                        imported_handle = _import_fabric_handle(peer_handle_bytes)
+                        # (b) Import the handle.  On POSIX_FD we first dup
+                        # the peer's FD into our fd table via pidfd_getfd;
+                        # cuMemImportFromShareableHandle then accepts that
+                        # local FD and dups it internally, so we close
+                        # ours immediately after the import returns.  On
+                        # FABRIC the bytes blob is consumed directly.
+                        if is_posix_fd:
+                            local_fd = _pidfd_getfd(peer_pidfds[peer_rank], int(peer_payload))
+                            try:
+                                imported_handle = _import_handle(local_fd, htype)
+                            finally:
+                                try:
+                                    os.close(local_fd)
+                                except OSError as e:
+                                    logger.warning(
+                                        f"[DWDPTransport] Failed to close "
+                                        f"imported FD {local_fd}: {e}"
+                                    )
+                        else:
+                            imported_handle = _import_handle(peer_payload, htype)
                         imported_handles.append(imported_handle)
 
                         # (c) Reserve VA, map, set access
@@ -449,6 +519,27 @@ class DWDPTransport:
             # ----------------------------------------------------------
             comm.Barrier()
 
+            # POSIX_FD: close the per-peer pidfds — they're no longer
+            # needed once every imported handle has been created.
+            for pidfd in peer_pidfds.values():
+                try:
+                    os.close(pidfd)
+                except OSError as e:
+                    logger.warning(f"[DWDPTransport] Failed to close pidfd {pidfd}: {e}")
+            peer_pidfds.clear()
+
+            # POSIX_FD: close our exported FDs.  They had to stay open
+            # through Phase 2 so peers could ``pidfd_getfd`` them, but
+            # the Barrier above guarantees every peer has finished doing
+            # so.  Closing here (instead of at ``release()``) caps peak
+            # fd usage during setup at ~num_handles per rank.
+            for fd in local_export_fds:
+                try:
+                    os.close(fd)
+                except OSError as e:
+                    logger.warning(f"[DWDPTransport] Failed to close local export FD {fd}: {e}")
+            local_export_fds.clear()
+
             logger.info(
                 f"[DWDPTransport] Rank {dwdp_rank}: setup complete. "
                 f"{len(handles)} local handles, "
@@ -468,6 +559,7 @@ class DWDPTransport:
                 local_handles=local_handles,
                 imported_handles=imported_handles,
                 peer_va_mappings=peer_va_mappings,
+                local_export_fds=local_export_fds,
             )
 
         except Exception as exc:
@@ -477,10 +569,16 @@ class DWDPTransport:
                 f"[DWDPTransport] Rank {dwdp_rank}: create() failed with {exc!r}; "
                 f"cleaning up partial allocations"
             )
+            for pidfd in peer_pidfds.values():
+                try:
+                    os.close(pidfd)
+                except OSError:
+                    pass
             _cleanup_resources(
                 local_handles=local_handles,
                 imported_handles=imported_handles,
                 peer_va_mappings=peer_va_mappings,
+                local_export_fds=local_export_fds,
             )
             raise
 
@@ -579,11 +677,13 @@ class DWDPTransport:
             local_handles=self._local_handles,
             imported_handles=self._imported_handles,
             peer_va_mappings=self._peer_va_mappings,
+            local_export_fds=self._local_export_fds,
         )
 
         self._local_handles.clear()
         self._imported_handles.clear()
         self._peer_va_mappings.clear()
+        self._local_export_fds.clear()
 
         logger.debug(f"[DWDPTransport] Rank {self._dwdp_rank}: released all resources")
 
@@ -608,17 +708,30 @@ def _cleanup_resources(
     local_handles: List[int],
     imported_handles: List[int],
     peer_va_mappings: List[Tuple[int, int]],
+    local_export_fds: List[int],
 ) -> None:
     """Best-effort cleanup of CUDA resources.
 
     Unmap and free all peer VA regions, release imported handles, then
-    release local handles. Errors are logged but not raised so that
+    release local handles.  Errors are logged but not raised so that
     cleanup proceeds as far as possible.
+
+    The POSIX_FD path releases its FDs eagerly during ``create()`` —
+    imported FDs are closed inline right after
+    ``cuMemImportFromShareableHandle`` (which dups them internally), and
+    local export FDs are closed right after the Phase 3 Barrier — so by
+    the time normal-path ``release()`` runs ``local_export_fds`` is
+    already empty.  This function still iterates it because the
+    error-path caller invokes us with whatever FDs were tracked at the
+    moment of failure, which may include in-flight export FDs that the
+    Phase 3 cleanup never reached.
 
     Args:
         local_handles: Local MNNVL handle integers.
         imported_handles: Imported MNNVL handle integers.
         peer_va_mappings: List of (va, size) for peer VA regions.
+        local_export_fds: POSIX FDs returned by cuMemExportToShareableHandle
+            that have not yet been closed (POSIX_FD path only).
     """
     # Step 1: Unmap and free peer VA regions
     for va, size in peer_va_mappings:
@@ -644,3 +757,12 @@ def _cleanup_resources(
             release_handle(h)
         except Exception as e:
             logger.warning(f"[DWDPTransport] Failed to release local handle {h}: {e}")
+
+    # Step 4: Defensively close any local export FDs still tracked (only
+    # populated on the POSIX_FD failure path; empty on the normal path
+    # since Phase 3 already closed them).
+    for fd in local_export_fds:
+        try:
+            os.close(fd)
+        except OSError as e:
+            logger.warning(f"[DWDPTransport] Failed to close local export FD {fd}: {e}")

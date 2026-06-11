@@ -230,12 +230,10 @@ class Attention(nn.Module):
 
         if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
             ring_size = vgm.ring_size
-            attn2d_size = vgm.attn2d_row_size * vgm.attn2d_col_size
-            if ring_size > 1 or attn2d_size > 1:
+            if ring_size > 1:
                 raise ValueError(
-                    "SEPARATE_QKV cross-attention does not support Ring or Attention2D "
-                    "sequence parallelism; use enable_sequence_parallel=False or Ulysses-only "
-                    f"(ring_size={ring_size}, attn2d_size={attn2d_size})."
+                    "SEPARATE_QKV cross-attention does not support Ring sequence "
+                    "parallelism; use enable_sequence_parallel=False or Ulysses/Attention2D."
                 )
 
         self.attn = wrap_parallel_attention(
