@@ -8,7 +8,12 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple,
+                    Union)
+
+if TYPE_CHECKING:
+    from ..attention_backend.sparse.kv_cache_compression_manager import \
+        BaseKVCacheCompressionManager
 
 import torch
 import torch._dynamo.config
@@ -1633,7 +1638,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
             draft_kv_cache_manager: Optional[Union[KVCacheManager,
                                                    KVCacheManagerV2]] = None,
-            compression_manager=None):
+            compression_manager: Optional[
+                "BaseKVCacheCompressionManager"] = None):
         enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
