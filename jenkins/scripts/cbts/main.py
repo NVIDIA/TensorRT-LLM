@@ -94,6 +94,9 @@ class SelectionResult:
     """Aggregated CBTS decision serialized to JSON for Groovy."""
 
     scope: Optional[str]
+    # Per-rule scopes of every fired rule incl noop (the combined `scope`
+    # rolls these up; noop gives way to actionable scopes there).
+    scopes: list[str] = field(default_factory=list)
     affected_stages: set[str] = field(default_factory=set)
     reasons: list[str] = field(default_factory=list)
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
@@ -110,6 +113,7 @@ class SelectionResult:
     def to_json(self) -> str:
         data = {
             "scope": self.scope,
+            "scopes": list(self.scopes),
             "affected_stages": sorted(self.affected_stages),
             "reasons": list(self.reasons),
             "test_db_dir_override": self.test_db_dir_override,
@@ -216,6 +220,7 @@ class Selector:
 
         return SelectionResult(
             scope=scope,
+            scopes=sorted({r.scope for _, r in pairs if r.scope}),
             affected_stages=affected_stages,
             reasons=reasons,
             block_filters=block_filters,

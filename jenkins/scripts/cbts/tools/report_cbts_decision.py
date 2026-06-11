@@ -47,7 +47,7 @@ def _case_counts(
     post_merge. Only meaningful when CBTS ran; returns (0, 0) otherwise or on
     any failure so the record still posts.
     """
-    if status not in ("pre_merge", "post_merge") or not affected:
+    if status not in ("pre_merge", "post_merge"):
         return 0, 0
     try:
         root = Path(repo_root)
@@ -102,7 +102,7 @@ def build_document(
         "l_total_cases": total_cases,
         "l_cbts_cases": cbts_cases,
         "d_case_skip_rate": round(case_skip_rate, 4),
-        "flat_detail": {"hit_stages": affected},
+        "flat_detail": {"hit_stages": affected, "scopes": list(decision.get("scopes") or [])},
     }
 
 
