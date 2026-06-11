@@ -238,6 +238,7 @@ def resolve_domain_action_config(
     action_chunk_size: Optional[int] = None,
     action_resolution: Optional[int] = None,
     frame_rate: Optional[float] = None,
+    action_fps: Optional[float] = None,
     num_frames: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Merge user action params with domain presets and generic fallbacks."""
@@ -284,12 +285,16 @@ def resolve_domain_action_config(
     resolved_num_frames = _resolve_field("num_frames", num_frames)
     if resolved_num_frames is None:
         resolved_num_frames = int(resolved_chunk) + 1
+    resolved_action_fps = (
+        float(action_fps) if action_fps is not None else float(resolved_frame_rate)
+    )
 
     return {
         "raw_action_dim": resolved_raw_action_dim,
         "action_chunk_size": int(resolved_chunk),
         "action_resolution": resolved_resolution,
         "frame_rate": float(resolved_frame_rate),
+        "action_fps": resolved_action_fps,
         "num_frames": int(resolved_num_frames),
         "preset_key": preset_key,
         "warnings": warnings,
@@ -375,6 +380,13 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             f"{list(COSMOS3_ACTION_RESOLUTIONS)}. Inferred from domain_name preset when omitted."
         ),
         range=(min(COSMOS3_ACTION_RESOLUTIONS), max(COSMOS3_ACTION_RESOLUTIONS)),
+    ),
+    "action_fps": ExtraParamSchema(
+        type="float",
+        default=None,
+        description=(
+            "Action-token temporal rate for mRoPE (Hz). Defaults to frame_rate when omitted."
+        ),
     ),
     "video": ExtraParamSchema(
         type="path_or_list",

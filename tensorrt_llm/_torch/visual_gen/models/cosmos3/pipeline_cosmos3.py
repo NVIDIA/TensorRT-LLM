@@ -303,6 +303,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             action=extra_params.get("action"),
             action_resolution=extra_params.get("action_resolution")
             or extra_params.get("image_size"),
+            action_fps=extra_params.get("action_fps"),
             video=extra_params.get("video"),
         )
 
@@ -756,6 +757,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         action_chunk_size: Optional[int] = None,
         action: Any = None,
         action_resolution: Optional[int] = None,
+        action_fps: Optional[float] = None,
         video: Any = None,
     ):
         pipeline_start = time.time()
@@ -779,6 +781,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # guidance interval, and an image (rather than video) output.
         is_t2i = str(output_type).lower() == "image"
         guidance_interval = None
+        resolved_action_fps: Optional[float] = None
         if is_t2i:
             if image is not None:
                 raise ValueError(
@@ -804,6 +807,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 action_chunk_size=action_chunk_size,
                 action_resolution=action_resolution,
                 frame_rate=frame_rate,
+                action_fps=action_fps,
                 num_frames=num_frames,
             )
             if self.rank == 0:
@@ -816,6 +820,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                         f"action_chunk_size={action_cfg['action_chunk_size']}, "
                         f"action_resolution={action_cfg['action_resolution']}, "
                         f"frame_rate={action_cfg['frame_rate']:.1f}, "
+                        f"action_fps={action_cfg['action_fps']:.1f}, "
                         f"num_frames={action_cfg['num_frames']}"
                     )
 
@@ -824,6 +829,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             action_resolution = action_cfg["action_resolution"]
             num_frames = action_cfg["num_frames"]
             frame_rate = action_cfg["frame_rate"]
+            resolved_action_fps = action_cfg["action_fps"]
             num_inference_steps = (
                 num_inference_steps or COSMOS3_ACTION_PARAMS["num_inference_steps"]
             )
@@ -845,6 +851,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
         if frame_rate is None:
             frame_rate = COSMOS3_720P_PARAMS["frame_rate"]
+        if resolved_action_fps is None:
+            resolved_action_fps = frame_rate
 
         action_ref_image = None
         if do_action:
@@ -865,6 +873,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 logger.info(
                     f"Cosmos3 action dims: action_chunk_size={action_chunk_size}, "
                     f"action_resolution={action_resolution}, "
+                    f"action_fps={resolved_action_fps:.1f}, "
                     f"input_aspect={action_ref_image.width / action_ref_image.height:.3f}"
                 )
 
@@ -1118,7 +1127,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 action_domain_ids=action_domain_ids,
                 action_noisy_mask=action_velocity_mask,
                 action_start_frame_offset=action_frame_offset,
-                action_fps=frame_rate,
+                action_fps=resolved_action_fps,
             )
 
             video_noise_pred = result.video

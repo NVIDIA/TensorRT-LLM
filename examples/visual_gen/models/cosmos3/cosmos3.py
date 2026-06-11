@@ -414,6 +414,12 @@ def main():
         help=("Resolution bucket for action image sizing. Defaults to the domain preset or 480."),
     )
     parser.add_argument(
+        "--action_fps",
+        type=float,
+        default=None,
+        help="Action-token temporal rate for mRoPE (Hz). Defaults to frame_rate.",
+    )
+    parser.add_argument(
         "--action_output_path",
         type=str,
         default=None,
@@ -481,6 +487,8 @@ def main():
         params.extra_params["raw_action_dim"] = args.raw_action_dim
     if args.action_chunk_size is not None:
         params.extra_params["action_chunk_size"] = args.action_chunk_size
+    if args.action_fps is not None:
+        params.extra_params["action_fps"] = args.action_fps
     if args.action_json is not None:
         with open(args.action_json, encoding="utf-8") as f:
             params.extra_params["action"] = json.load(f)
