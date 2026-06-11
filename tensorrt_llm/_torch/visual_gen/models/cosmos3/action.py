@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, List, Optional
 
 import numpy as np
+import PIL.Image
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
@@ -69,6 +72,26 @@ VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
         "9,16": (720, 1280),
     },
 }
+
+
+COSMOS3_ACTION_RESOLUTIONS = tuple(int(key) for key in sorted(VIDEO_RES_SIZE_INFO, key=int))
+
+
+def normalize_action_resolution(resolution: Any) -> int:
+    if resolution is None:
+        raise ValueError("Cosmos3 action_resolution is required for action generation.")
+    try:
+        bucket = int(resolution)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Cosmos3 action_resolution must be an int bucket, got {resolution!r}."
+        ) from exc
+    if bucket not in COSMOS3_ACTION_RESOLUTIONS:
+        raise ValueError(
+            f"Unknown Cosmos3 action_resolution={bucket}; "
+            f"expected one of {COSMOS3_ACTION_RESOLUTIONS}."
+        )
+    return bucket
 
 
 def normalize_action_mode(mode: Any) -> str | None:
@@ -219,3 +242,201 @@ def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int
             best_size = (cand_w, cand_h)
     assert best_size is not None
     return best_size
+
+
+ACTION_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
+ACTION_VIDEO_EXTENSIONS = frozenset({".mp4", ".avi"})
+
+
+def pil_to_rgb(value: Any) -> PIL.Image.Image:
+    if isinstance(value, str):
+        return PIL.Image.open(value).convert("RGB")
+    if isinstance(value, PIL.Image.Image):
+        return value.convert("RGB")
+    raise TypeError(
+        f"Cosmos3 action preprocessing expected PIL image or image path, got {type(value)!r}."
+    )
+
+
+def decode_action_video_file(path: Path, max_frames: Optional[int] = None) -> List[PIL.Image.Image]:
+    import torchvision.io as io
+
+    frames, _, _ = io.read_video(str(path), pts_unit="sec")
+    if frames.numel() == 0:
+        raise ValueError(f"Cosmos3 action video file contains no frames: {path}")
+    if max_frames is not None:
+        frames = frames[:max_frames]
+    return [PIL.Image.fromarray(frames[i].numpy()) for i in range(frames.shape[0])]
+
+
+def normalize_action_video_path(path: Path, max_frames: Optional[int] = None) -> List[Any]:
+    if not path.exists():
+        raise ValueError(f"Cosmos3 action video path does not exist: {path}")
+    if path.is_dir():
+        frames = sorted(p for p in path.iterdir() if p.suffix.lower() in ACTION_IMAGE_EXTENSIONS)
+        if not frames:
+            raise ValueError(f"No image frames found in Cosmos3 action video directory: {path}")
+        frame_paths = [str(p) for p in frames]
+        if max_frames is not None:
+            frame_paths = frame_paths[:max_frames]
+        return frame_paths
+
+    suffix = path.suffix.lower()
+    if suffix in ACTION_IMAGE_EXTENSIONS:
+        return [str(path)]
+    if suffix in ACTION_VIDEO_EXTENSIONS:
+        return decode_action_video_file(path, max_frames=max_frames)
+    raise ValueError(
+        "Cosmos3 action video path must be a frame directory, an image file "
+        f"{sorted(ACTION_IMAGE_EXTENSIONS)}, or a video file "
+        f"{sorted(ACTION_VIDEO_EXTENSIONS)}; got {path}"
+    )
+
+
+def normalize_action_video_input(video: Any, max_frames: Optional[int] = None) -> List[Any]:
+    """Normalize action video input to a frame list.
+
+    Accepts a list of PIL images / paths, a single image or video file path,
+    or a directory of frame images (sorted lexicographically).
+    """
+    if video is None:
+        return []
+    if isinstance(video, list):
+        if not video:
+            raise ValueError("Cosmos3 action video input must contain at least one frame.")
+        if max_frames is not None:
+            return video[:max_frames]
+        return video
+    if isinstance(video, (str, Path)):
+        return normalize_action_video_path(Path(video), max_frames=max_frames)
+    return [video]
+
+
+def resolve_action_size(
+    height: Optional[int],
+    width: Optional[int],
+    ref_image: PIL.Image.Image,
+    action_resolution: int,
+) -> tuple[int, int]:
+    """Fill unset action H/W from the action resolution bucket; honor explicit values."""
+    if height is not None and width is not None:
+        return height, width
+    target_w, target_h = find_closest_target_size(
+        ref_image.height, ref_image.width, action_resolution
+    )
+    return (
+        height if height is not None else target_h,
+        width if width is not None else target_w,
+    )
+
+
+def action_reference_image(
+    *,
+    action_mode: str,
+    image: Any,
+    video: Any,
+) -> PIL.Image.Image:
+    """Resolve the reference frame used for action sizing and conditioning."""
+    if action_mode == ACTION_MODE_INVERSE_DYNAMICS:
+        source = video if video is not None else image
+        frames = normalize_action_video_input(source, max_frames=1)
+        if not frames:
+            raise ValueError("Cosmos3 action_mode='inverse_dynamics' requires a video input.")
+        return pil_to_rgb(frames[0])
+
+    source = image if image is not None else video
+    if source is None:
+        raise ValueError(f"Cosmos3 action_mode={action_mode!r} requires an image or video input.")
+    if isinstance(source, PIL.Image.Image):
+        return source.convert("RGB")
+    if isinstance(source, str):
+        path = Path(source)
+        if path.is_file() and path.suffix.lower() in ACTION_IMAGE_EXTENSIONS:
+            return PIL.Image.open(source).convert("RGB")
+        frames = normalize_action_video_input(source, max_frames=1)
+        if not frames:
+            raise ValueError(
+                f"Cosmos3 action_mode={action_mode!r} requires an image or video input."
+            )
+        return pil_to_rgb(frames[0])
+    raise TypeError(
+        f"Cosmos3 action reference image must be PIL.Image or path, got {type(source)!r}."
+    )
+
+
+def resize_and_pad_action_image(
+    image: PIL.Image.Image, target_h: int, target_w: int
+) -> PIL.Image.Image:
+    scale = min(target_w / image.width, target_h / image.height, 1.0)
+    resize_w = max(1, int(scale * image.width + 0.5))
+    resize_h = max(1, int(scale * image.height + 0.5))
+    if (resize_w, resize_h) != image.size:
+        image = image.resize((resize_w, resize_h), PIL.Image.Resampling.BICUBIC)
+
+    array = np.asarray(image)
+    pad_h = target_h - resize_h
+    pad_w = target_w - resize_w
+    if pad_h < 0 or pad_w < 0:
+        raise ValueError(
+            f"Cosmos3 action image resize exceeded target size: resized={(resize_h, resize_w)}, "
+            f"target={(target_h, target_w)}."
+        )
+    if pad_h == 0 and pad_w == 0:
+        return image
+    pad_mode = "reflect" if pad_h < resize_h and pad_w < resize_w else "edge"
+    padded = np.pad(array, ((0, pad_h), (0, pad_w), (0, 0)), mode=pad_mode)
+    return PIL.Image.fromarray(padded)
+
+
+def prepare_action_latents(
+    *,
+    mode: str,
+    action_chunk_size: int,
+    raw_action_dim: Optional[int],
+    action_dim: int,
+    generator: torch.Generator,
+    device: torch.device,
+    dtype: torch.dtype,
+    action_input: Any = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    if mode == ACTION_MODE_FORWARD_DYNAMICS:
+        action = load_action_tensor(action_input)
+        if action.shape[0] < action_chunk_size:
+            pad = action[-1:].repeat(action_chunk_size - action.shape[0], 1)
+            action = torch.cat([action, pad], dim=0)
+        elif action.shape[0] > action_chunk_size:
+            action = action[:action_chunk_size]
+        if raw_action_dim is None:
+            raw_action_dim = int(action.shape[-1])
+        clean_action = pad_action_to_dim(action, action_dim)
+    else:
+        if raw_action_dim is None:
+            raise ValueError(
+                "Cosmos3 action_mode='policy' and 'inverse_dynamics' require raw_action_dim."
+            )
+        clean_action = torch.zeros(action_chunk_size, action_dim, dtype=torch.float32)
+
+    raw_action_dim = int(raw_action_dim)
+    if raw_action_dim <= 0 or raw_action_dim > action_dim:
+        raise ValueError(
+            f"Cosmos3 raw_action_dim must be in [1, {action_dim}], got {raw_action_dim}."
+        )
+
+    clean_action = clean_action.to(device=device, dtype=dtype).unsqueeze(0)
+    condition_mask = build_action_condition_mask(
+        mode,
+        action_chunk_size,
+        device=device,
+        dtype=dtype,
+    )
+    noise = randn_tensor(
+        (1, action_chunk_size, action_dim),
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
+    noise[:, :, raw_action_dim:] = 0
+    clean_action[:, :, raw_action_dim:] = 0
+    action_latents = condition_mask * clean_action + (1.0 - condition_mask) * noise
+    action_velocity_mask = 1.0 - condition_mask
+    return action_latents, action_velocity_mask, clean_action, raw_action_dim

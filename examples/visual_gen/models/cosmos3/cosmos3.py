@@ -129,7 +129,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_ACTION_PARAMS
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import VIDEO_RES_SIZE_INFO
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_ACTION_PARAMS,
+    get_domain_preset,
+    resolve_domain_action_config,
+)
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -224,25 +229,46 @@ def _validate_action_args(
                 f"{mode} requires --image_path, a prompt-file vision_path, or --video_path "
                 "for the first frame."
             )
-        if args.raw_action_dim is None:
-            raise SystemExit(f"{mode} requires --raw_action_dim.")
+        preset = get_domain_preset(args.domain_name, args.domain_id)
+        effective_raw_dim = args.raw_action_dim or (preset or {}).get("raw_action_dim")
+        if effective_raw_dim is None:
+            raise SystemExit(
+                f"{mode} requires --raw_action_dim or a known --domain_name with a preset."
+            )
     elif mode == "inverse_dynamics":
         if args.video_path is None:
-            raise SystemExit(f"{mode} requires --video_path (frame directory or image list).")
-        if args.raw_action_dim is None:
-            raise SystemExit(f"{mode} requires --raw_action_dim.")
+            raise SystemExit(
+                f"{mode} requires --video_path (frame directory, .mp4/.avi, or image)."
+            )
+        preset = get_domain_preset(args.domain_name, args.domain_id)
+        effective_raw_dim = args.raw_action_dim or (preset or {}).get("raw_action_dim")
+        if effective_raw_dim is None:
+            raise SystemExit(
+                f"{mode} requires --raw_action_dim or a known --domain_name with a preset."
+            )
 
 
 def _apply_action_generation_params(params, args: argparse.Namespace) -> None:
-    """Set 480p action defaults on the request before pipeline overrides."""
-    chunk = args.action_chunk_size or COSMOS3_ACTION_PARAMS["action_chunk_size"]
-    params.height = 480
-    params.width = 832
-    params.num_frames = chunk + 1
+    """Set action defaults on the request; domain presets override generic 480p."""
+    cfg = resolve_domain_action_config(
+        domain_name=args.domain_name,
+        domain_id=args.domain_id,
+        raw_action_dim=args.raw_action_dim,
+        action_chunk_size=args.action_chunk_size,
+        action_resolution=args.action_resolution,
+    )
+    bucket = str(cfg["action_resolution"])
+    width, height = VIDEO_RES_SIZE_INFO[bucket]["16,9"]
+    params.width = width
+    params.height = height
+    params.num_frames = cfg["num_frames"]
     params.num_inference_steps = COSMOS3_ACTION_PARAMS["num_inference_steps"]
     params.guidance_scale = COSMOS3_ACTION_PARAMS["guidance_scale"]
-    params.frame_rate = COSMOS3_ACTION_PARAMS["frame_rate"]
-    params.extra_params["action_chunk_size"] = chunk
+    params.frame_rate = cfg["frame_rate"]
+    params.extra_params["action_chunk_size"] = cfg["action_chunk_size"]
+    if cfg["raw_action_dim"] is not None:
+        params.extra_params["raw_action_dim"] = cfg["raw_action_dim"]
+    params.extra_params["action_resolution"] = cfg["action_resolution"]
 
 
 def _default_action_output_path(video_path: str) -> str:
@@ -378,14 +404,14 @@ def main():
         "--video_path",
         type=str,
         default=None,
-        help="Frame directory or image path for inverse_dynamics (or first-frame fallback)",
+        help="Frame directory, .mp4/.avi video, or image path for inverse_dynamics",
     )
     parser.add_argument(
         "--action_resolution",
         type=int,
-        default=480,
+        default=None,
         choices=[256, 480, 704, 720],
-        help="Resolution bucket for action image sizing",
+        help=("Resolution bucket for action image sizing. Defaults to the domain preset or 480."),
     )
     parser.add_argument(
         "--action_output_path",
