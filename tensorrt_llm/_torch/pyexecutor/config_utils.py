@@ -335,6 +335,10 @@ class _Qwen35ConfigCompat:
             modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(
                 text_config, modules)
             quantization_config["modules_to_not_convert"] = sorted(set(modules))
+        if "ignore" in quantization_config:
+            modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(
+                text_config, list(quantization_config["ignore"]))
+            quantization_config["ignore"] = sorted(set(modules))
         text_config["quantization_config"] = quantization_config
         return text_config
 

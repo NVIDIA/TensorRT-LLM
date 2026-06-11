@@ -51,46 +51,73 @@ def _translate_mtp_pattern(name, n_hidden_layers):
     return None
 
 
+def _normalize_qwen35_module_path(name, n_hidden_layers, translate_mtp):
+    if name.startswith(_LANG_PREFIX):
+        name = "model." + name[len(_LANG_PREFIX) :]
+    if name.startswith("model.visual."):
+        return None
+    if name.startswith("mtp."):
+        if not translate_mtp or n_hidden_layers is None:
+            return None
+        return _translate_mtp_pattern(name, n_hidden_layers)
+    name = re.sub(
+        r"(\.mlp\.shared_expert)\.(gate_proj|up_proj)(?=$|\.|\*)",
+        r"\1.gate_up_proj",
+        name,
+    )
+    name = re.sub(r"\.in_proj_[ab](?=$|\.|\*)", ".in_proj_ba", name)
+    name = re.sub(r"\.in_proj_(q|k|v|z|qkv)(?=$|\.|\*)", ".in_proj_qkvz", name)
+    return name
+
+
 def _normalize_qwen35_exclude_modules(model_config):
     """Normalize NVFP4/FP8 exclude_modules from HF naming to TRT-LLM naming.
 
     hf_quant_config.json stores exclude patterns in HF checkpoint namespace
     (e.g. ``model.language_model.layers.0.linear_attn*`` and ``mtp.layers.0*``),
-    but TRT-LLM modules use ``model.layers.0.linear_attn.in_proj_qkvz`` and
-    map the MTP layer to ``model.layers.<num_hidden_layers>.*``.  This
-    function translates the patterns so that
-    ``apply_quant_config_exclude_modules`` can match them.
+    and mixed-precision ``quantized_layers`` use the same namespace.  TRT-LLM
+    modules use ``model.layers.0.linear_attn.in_proj_qkvz`` and map the MTP
+    layer to ``model.layers.<num_hidden_layers>.*``.  This function translates
+    the patterns so that ``apply_quant_config_exclude_modules`` and
+    ``apply_layerwise_quant_config`` can match them.
     """
     qc = model_config.quant_config
-    if qc is None or qc.exclude_modules is None:
-        return
-
     n_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
 
-    normalized = set()
-    for name in qc.exclude_modules:
-        # Strip VLM prefix: model.language_model.X -> model.X
-        if name.startswith(_LANG_PREFIX):
-            name = "model." + name[len(_LANG_PREFIX) :]
-        # Drop vision tensors (not part of the language model graph)
-        if name.startswith("model.visual"):
-            continue
-        # Translate MTP-namespace patterns to TRT-LLM paths so the MTP
-        # layer (which the checkpoint stores unquantized) gets correctly
-        # excluded from the global NVFP4/FP8 quant_config.
-        if name.startswith("mtp."):
-            if n_hidden_layers is None:
-                continue
-            translated = _translate_mtp_pattern(name, n_hidden_layers)
-            if translated is not None:
-                normalized.add(translated)
-            continue
-        # Map split projection names to packed TRT-LLM names
-        name = re.sub(r"\.in_proj_[ab](\b|\*)", ".in_proj_ba*", name)
-        name = re.sub(r"\.in_proj_(q|k|v|z|qkv)(\b|\*)", ".in_proj_qkvz*", name)
-        normalized.add(name)
+    if qc is not None and qc.exclude_modules is not None:
+        normalized = set()
+        for name in qc.exclude_modules:
+            normalized_name = _normalize_qwen35_module_path(
+                name, n_hidden_layers, translate_mtp=True
+            )
+            if normalized_name is not None:
+                normalized.add(normalized_name)
+        qc.exclude_modules = sorted(normalized)
 
-    qc.exclude_modules = sorted(normalized)
+    if model_config.quant_config_dict is not None:
+        normalized_quant_config_dict = {}
+        for name, quant_config in model_config.quant_config_dict.items():
+            normalized_name = _normalize_qwen35_module_path(
+                name, n_hidden_layers, translate_mtp=False
+            )
+            if normalized_name is None:
+                continue
+            if normalized_name in normalized_quant_config_dict:
+                if normalized_quant_config_dict[normalized_name] != quant_config:
+                    raise ValueError(
+                        "Conflicting Qwen3.5 quant configs after normalizing "
+                        f"{name} to {normalized_name}"
+                    )
+                continue
+            normalized_quant_config_dict[normalized_name] = quant_config
+        was_frozen = getattr(model_config, "_frozen", False)
+        if was_frozen:
+            model_config._frozen = False
+        try:
+            model_config.quant_config_dict = normalized_quant_config_dict
+        finally:
+            if was_frozen:
+                model_config._frozen = True
 
 
 @register_auto_model("Qwen3_5MoeForCausalLM")

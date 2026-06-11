@@ -26,15 +26,31 @@ from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
 
+def _is_same_or_child_module_path(lhs: str, rhs: str) -> bool:
+    return lhs == rhs or lhs.startswith(f"{rhs}.") or rhs.startswith(f"{lhs}.")
+
+
+def _get_layer_quant_config(model_config: ModelConfig,
+                            layer_idx: Optional[int]) -> Optional[QuantConfig]:
+    if layer_idx is None or model_config.quant_config_dict is None:
+        return None
+
+    moe_module_name = f"model.layers.{layer_idx}.mlp.experts"
+    for name, quant_config in model_config.quant_config_dict.items():
+        if _is_same_or_child_module_path(name, moe_module_name):
+            return quant_config
+    return None
+
+
 def get_moe_cls(
     model_config: ModelConfig,
     override_quant_config: Optional[QuantConfig] = None,
     layer_idx: Optional[int] = None,
 ) -> Type[MoE]:
     moe_backend = model_config.moe_backend
-    quant_config = model_config.quant_config
-    if override_quant_config is not None:
-        quant_config = override_quant_config
+    quant_config = (override_quant_config
+                    or _get_layer_quant_config(model_config, layer_idx)
+                    or model_config.quant_config)
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
     if moe_backend.upper() == "CUTLASS":
         return CutlassFusedMoE
@@ -192,7 +208,8 @@ def resolve_moe_cls(
 ) -> Type[MoE]:
     moe_cls = get_moe_cls(model_config, override_quant_config, layer_idx)
 
-    effective_quant_config = override_quant_config or model_config.quant_config
+    effective_quant_config = (override_quant_config or _get_layer_quant_config(
+        model_config, layer_idx) or model_config.quant_config)
     has_quant = (effective_quant_config is not None
                  and effective_quant_config.layer_quant_mode.has_any_quant(
                      exclude_kv_cache=True))

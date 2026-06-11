@@ -73,9 +73,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 is_modelopt_ckpt = True
                 prefix = key[: -len(".weight_scale")]
                 if prefix not in nvfp4_prefixes:
-                    new_key = f"{key}_inv"
-                    # modelopt fp8_pb_wo has 2 extra singleton dimensions
-                    tensor = tensor.squeeze(1).squeeze(-1)
+                    # modelopt fp8_pb_wo stores per-block FP8 scales as (out, 1, 1).
+                    # MIXED_PRECISION checkpoints (e.g. Qwen3.6 NVFP4) also use
+                    # per-tensor scalar FP8 scales (0-D). Keep those under the
+                    # ModelOpt weight_scale key because FP8QDQLinearMethod
+                    # loads that spelling.
+                    if tensor.ndim != 0:
+                        new_key = f"{key}_inv"
+                    if tensor.ndim == 3 and tensor.shape[1] == 1 and tensor.shape[-1] == 1:
+                        tensor = tensor.squeeze(1).squeeze(-1)
             if new_key in remapped_weights:
                 raise ValueError(f"Duplicate remapped key found: {new_key}")
             remapped_weights[new_key] = tensor
@@ -191,6 +197,52 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             updated_weights.pop(scale_name, None)
         return updated_weights
 
+    def _dequantize_linear_attn_per_tensor_fp8(self, weights: dict) -> dict:
+        """Dequantize per-tensor FP8 linear-attn split projections to BF16.
+
+        MIXED_PRECISION checkpoints (e.g. Qwen3.6 NVFP4) store the linear-attn
+        ``in_proj_*`` split projections (in_proj_qkv, in_proj_z, in_proj_q/k/v,
+        etc.) as per-tensor FP8: scalar ``weight_scale`` or
+        ``weight_scale_inv`` (and matching scalar ``input_scale``). The packer
+        below assumes BF16 weights or per-block FP8 with block-shaped scales,
+        so dequantize here and drop the scale tensors. The packed BF16 tensor
+        is then concatenated with the already-BF16 ``in_proj_a`` /
+        ``in_proj_b`` / ``in_proj_z`` weights and TP-sharded by the standard
+        path.
+        """
+        target_dtype = getattr(self.config.pretrained_config, "torch_dtype", torch.bfloat16)
+        if target_dtype is None:
+            target_dtype = torch.bfloat16
+        updated = dict(weights)
+        drop = []
+        for name in list(weights):
+            if not name.endswith(".weight"):
+                continue
+            if self._SPLIT_PROJ_PATTERN.match(name) is None:
+                continue
+            prefix = name[: -len(".weight")]
+            scale_name = prefix + ".weight_scale_inv"
+            if scale_name not in weights:
+                scale_name = prefix + ".weight_scale"
+            if scale_name not in weights:
+                continue
+            scale = weights[scale_name]
+            # Per-tensor scalar scale → dequantize. Per-block (n-D) handled elsewhere.
+            if scale.ndim != 0:
+                continue
+            updated[name] = (
+                (weights[name].to(torch.float32) * scale.to(torch.float32))
+                .to(target_dtype)
+                .contiguous()
+            )
+            drop.append(scale_name)
+            input_scale_name = name[: -len(".weight")] + ".input_scale"
+            if input_scale_name in weights:
+                drop.append(input_scale_name)
+        for k in drop:
+            updated.pop(k, None)
+        return updated
+
     def _pack_split_projections(self, weights: dict) -> dict:
         config = self.config.pretrained_config
         num_k_groups = config.linear_num_key_heads
@@ -305,6 +357,12 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     def preprocess_weights(self, weights: dict) -> dict:
         normalized_weights = self._normalize_weight_names(weights)
         is_modelopt_ckpt, normalized_weights = self._preprocess_modelopt_ckpt(normalized_weights)
+
+        # MIXED_PRECISION modelopt checkpoints store the linear-attn split
+        # projections as per-tensor FP8 (scalar scales). Dequantize to BF16
+        # before packing so the packer can run its existing BF16 path.
+        if is_modelopt_ckpt:
+            normalized_weights = self._dequantize_linear_attn_per_tensor_fp8(normalized_weights)
 
         packed_weights = self._pack_split_projections(normalized_weights)
         if not is_modelopt_ckpt:

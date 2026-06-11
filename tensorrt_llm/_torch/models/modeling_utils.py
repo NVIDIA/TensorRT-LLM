@@ -51,6 +51,10 @@ class MetaInitException(RuntimeError):
     pass
 
 
+def _is_same_or_child_module_path(lhs: str, rhs: str) -> bool:
+    return lhs == rhs or lhs.startswith(f"{rhs}.") or rhs.startswith(f"{lhs}.")
+
+
 class MetaInitMode(TorchDispatchMode):
     """ Context for skip random parameter initialization
 
@@ -374,6 +378,11 @@ class DecoderModelForCausalLM(nn.Module,
                 in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4") and not config.
                 quant_config.is_module_excluded_from_quantization("lm_head")):
             lm_head_quant_config = config.quant_config
+        elif config.quant_config_dict is not None:
+            for name, quant_config in config.quant_config_dict.items():
+                if _is_same_or_child_module_path("lm_head", name):
+                    lm_head_quant_config = quant_config
+                    break
 
         if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
@@ -381,6 +390,7 @@ class DecoderModelForCausalLM(nn.Module,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 quant_config=lm_head_quant_config,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
             )
         else:
             if (hasattr(config, 'lora_config')
@@ -405,6 +415,7 @@ class DecoderModelForCausalLM(nn.Module,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
                 quant_config=lm_head_quant_config,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
             )
 
             if self.has_custom_lm_head:
@@ -425,6 +436,7 @@ class DecoderModelForCausalLM(nn.Module,
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
             self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head._weights_created = True
             if config.mapping.is_last_pp_rank():
                 self.model.keep_embed_tokens = True
 
@@ -454,7 +466,7 @@ class DecoderModelForCausalLM(nn.Module,
                 if isinstance(module, (MoE, VanillaMoE)):
                     for n, q in quant_config_dict.items():
                         # all linear layers inside FusedMoE share the same quant config
-                        if name in n:
+                        if _is_same_or_child_module_path(name, n):
                             module.quant_config = q
                             break
                 elif isinstance(module, Linear):

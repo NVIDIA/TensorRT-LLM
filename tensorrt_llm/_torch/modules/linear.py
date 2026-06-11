@@ -1927,8 +1927,6 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
         original_alpha = module.alpha
         had_scalar_alpha = hasattr(module, "scalar_alpha")
         original_scalar_alpha = getattr(module, "scalar_alpha", None)
-        has_weight_global_scale = bool(
-            getattr(module, "tmp_nvfp4_weight_scale_2_list", []))
 
         device = module.weight_scale_2.device
         module.input_scale = Parameter(torch.empty([1],
@@ -1945,8 +1943,6 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
                                  requires_grad=False)
         try:
             process_fn(module)
-            if has_weight_global_scale:
-                self._convert_weight_global_scale_to_dequant_scale(module)
         finally:
             module.input_scale = original_input_scale
             module.inv_input_scale = original_inv_input_scale
@@ -1955,14 +1951,6 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
                 module.scalar_alpha = original_scalar_alpha
             elif hasattr(module, "scalar_alpha"):
                 delattr(module, "scalar_alpha")
-
-    @staticmethod
-    def _convert_weight_global_scale_to_dequant_scale(module: Linear):
-        weight_scale_2 = module.weight_scale_2.data.float()
-        dequant_scale = torch.zeros_like(weight_scale_2)
-        nonzero = weight_scale_2 != 0
-        dequant_scale[nonzero] = weight_scale_2[nonzero].reciprocal()
-        copy_weight(module.weight_scale_2, dequant_scale)
 
     def process_weights_after_loading_vanilla(self, module: Linear):
         self._process_weights_without_static_activation_scale(

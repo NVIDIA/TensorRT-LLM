@@ -177,6 +177,22 @@ def test_get_moe_cls_cutedsl_selects_b12x_for_w4a16_nvfp4_on_supported_sm(sm_ver
     assert cls is CuteDslB12xFusedMoE
 
 
+@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_get_moe_cls_cutedsl_selects_b12x_for_layer_w4a16_nvfp4_on_supported_sm(sm_version):
+    """MIXED_PRECISION per-layer W4A16 must select the same backend that the
+    layer will use after apply_layerwise_quant_config().
+    """
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig()
+    cfg.quant_config_dict = {
+        "model.layers.0.mlp.experts": QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16),
+    }
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
+        cls = get_moe_cls(cfg, layer_idx=0)
+    assert cls is CuteDslB12xFusedMoE
+
+
 def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing(monkeypatch):
     """CUTEDSL + NVFP4 + SM120/121 + flashinfer NOT importable → CuteDslFusedMoE."""
     import builtins
@@ -336,11 +352,11 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     )
     assert torch.allclose(
         module._b12x_weights["w1_alpha"],
-        torch.tensor([2.0, 1.0], dtype=torch.float32),
+        torch.tensor([0.5, 1.0], dtype=torch.float32),
     )
     assert torch.allclose(
         module._b12x_weights["w2_alpha"],
-        torch.tensor([2.0, 1.0], dtype=torch.float32),
+        torch.tensor([0.5, 1.0], dtype=torch.float32),
     )
 
 

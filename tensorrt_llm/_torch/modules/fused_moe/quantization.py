@@ -3081,16 +3081,8 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             # W4A16 path: BF16/FP16 activations multiplied by FP4 weights.
             # FlashInfer's W4A16 packer expects the ModelOpt scale contract:
             # normalized FP8 block scales plus per-expert ``weight_global_scale``.
-            # TRT-LLM stores the reciprocal as ``weight_scale_2``; recover the
-            # ModelOpt value from the already computed dequant scale.
-            def _to_modelopt_global_scale(scale: torch.Tensor) -> torch.Tensor:
-                global_scale = torch.zeros_like(scale, dtype=torch.float32)
-                valid = scale > 0
-                global_scale[valid] = scale[valid].reciprocal()
-                return global_scale.contiguous()
-
-            w1_alpha_b12x = _to_modelopt_global_scale(w1_w_scale_2)
-            w2_alpha_b12x = _to_modelopt_global_scale(w2_w_scale_2)
+            w1_alpha_b12x = w1_w_scale_2.to(torch.float32).contiguous()
+            w2_alpha_b12x = w2_w_scale_2.to(torch.float32).contiguous()
             fc2_input_scale_b12x = None
         else:
             w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(

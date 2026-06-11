@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -6810,7 +6810,7 @@ def enumerate_kernels():
         enumerate_qmma_flash_kernels(specs,
                                      sm=120,
                                      dtype='e4m3_fp32',
-                                     head_sizes=[128, 192, 576],
+                                     head_sizes=[128, 192, 256, 576],
                                      output_dtype="bf16")
 
     if 'ENABLE_HMMA_FP32' in os.environ:

@@ -292,6 +292,7 @@ class ConfigurableMoE(MoE):
             routing_method,
             self.dtype,
             override_quant_config=override_quant_config,
+            layer_idx=self.layer_idx,
         )
 
         backend_model_config = model_config

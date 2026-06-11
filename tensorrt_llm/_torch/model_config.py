@@ -12,8 +12,8 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
-    load_pretrained_config)
+    get_qwen3_hybrid_layer_types, get_qwen3_hybrid_num_attention_layers,
+    is_nemotron_hybrid, is_qwen3_5, is_qwen3_hybrid, load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -313,14 +313,20 @@ class ModelConfig(Generic[TConfig]):
         return "CUTLASS"
 
     def resolve_moe_backend_after_quant_config(
-            moe_backend: str, architecture: str,
-            quant_config: QuantConfig) -> str:
+            moe_backend: str,
+            architecture: str,
+            quant_config: QuantConfig,
+            layer_quant_config: Optional[Dict[str, QuantConfig]] = None) -> str:
         """Resolve AUTO moe_backend after quantization metadata is known."""
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
         is_w4a16_nvfp4 = quant_config.quant_algo in (QuantAlgo.W4A16_NVFP4,
                                                      "W4A16_NVFP4")
+        if not is_w4a16_nvfp4 and layer_quant_config is not None:
+            is_w4a16_nvfp4 = any(config.quant_algo in (QuantAlgo.W4A16_NVFP4,
+                                                       "W4A16_NVFP4")
+                                 for config in layer_quant_config.values())
         if is_w4a16_nvfp4 and get_sm_version() in (120, 121):
             return "CUTEDSL"
 
@@ -407,12 +413,15 @@ class ModelConfig(Generic[TConfig]):
                 'group_size', quant_config.group_size)
             quant_config.exclude_modules = json_quant_configs.get(
                 'exclude_modules', quant_config.exclude_modules)
+            w4a16_nvfp4_group_size = None
             for layer in mixed_quant_configs:
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
                 config.quant_algo = QuantAlgo(layer_cfg['quant_algo'])
                 config.group_size = layer_cfg.get('group_size', None)
+                if config.quant_algo == QuantAlgo.W4A16_NVFP4:
+                    w4a16_nvfp4_group_size = config.group_size or 16
                 # AWQ-specific extras emitted by modelopt per-layer.
                 if 'has_zero_point' in layer_cfg:
                     config.has_zero_point = layer_cfg['has_zero_point']
@@ -420,6 +429,9 @@ class ModelConfig(Generic[TConfig]):
                     config.pre_quant_scale = layer_cfg['pre_quant_scale']
                 mixed_quant_configs[layer] = config
             layer_quant_config = mixed_quant_configs
+            if w4a16_nvfp4_group_size is not None:
+                quant_config.quant_algo = None
+                quant_config.group_size = w4a16_nvfp4_group_size
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
                 quant_config.group_size = 128
@@ -431,6 +443,24 @@ class ModelConfig(Generic[TConfig]):
                 "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
             ]
         return quant_config, layer_quant_config
+
+    @staticmethod
+    def _add_qwen35_qkvz_bf16_excludes(json_quant_configs,
+                                       pretrained_config) -> None:
+        """Keep packed Qwen3.5 linear-attention qkvz on the BF16 path."""
+        if pretrained_config is None or not is_qwen3_5(pretrained_config):
+            return
+        try:
+            layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
+        except (ValueError, AttributeError):
+            return
+
+        exclude_modules = list(json_quant_configs.get('exclude_modules') or [])
+        for layer_idx, layer_type in enumerate(layer_types):
+            if layer_type == "linear_attention":
+                exclude_modules.append(
+                    f"model.layers.{layer_idx}.linear_attn.in_proj_qkvz")
+        json_quant_configs['exclude_modules'] = sorted(set(exclude_modules))
 
     @staticmethod
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
@@ -726,6 +756,7 @@ class ModelConfig(Generic[TConfig]):
                                             'hf_quant_config.json'):
             with open(quant_config_file) as f:
                 normalized = read_modelopt_quant_config(json.load(f))
+            cls._add_qwen35_qkvz_bf16_excludes(normalized, pretrained_config)
             # The file is authoritative; warn if the inline copy disagrees.
             # Done before _build_modelopt_quant_config since the builder may
             # mutate ``normalized`` via ``.update`` from quant_cfg.json.
@@ -752,7 +783,8 @@ class ModelConfig(Generic[TConfig]):
                 quant_config_file, moe_backend_hint)
 
         kwargs['moe_backend'] = cls.resolve_moe_backend_after_quant_config(
-            requested_moe_backend, architecture, quant_config)
+            requested_moe_backend, architecture, quant_config,
+            layer_quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

@@ -64,6 +64,33 @@ def test_update_quant_config_from_compressed_tensors_parses_nvfp4():
     assert set(quant_config.exclude_modules) == {gate_exclude, "lm_head"}
 
 
+def test_update_quant_config_from_compressed_tensors_parses_w4a16_nvfp4():
+    quant_config = QuantConfig()
+    update_quant_config_from_compressed_tensors(
+        quant_config,
+        {
+            "quant_method": "compressed-tensors",
+            "format": "nvfp4-pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "float",
+                        "strategy": "tensor_group",
+                        "group_size": 16,
+                    },
+                    "input_activations": None,
+                },
+            },
+            "ignore": ["lm_head"],
+        },
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
+    assert quant_config.group_size == 16
+    assert quant_config.exclude_modules == ["lm_head"]
+
+
 def test_update_quant_config_from_compressed_tensors_parses_fp8_block_scales():
     quant_config = QuantConfig()
     update_quant_config_from_compressed_tensors(

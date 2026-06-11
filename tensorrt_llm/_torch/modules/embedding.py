@@ -38,6 +38,7 @@ class LMHead(Linear):
         reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
@@ -71,6 +72,7 @@ class LMHead(Linear):
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
             quant_config=quant_config,
+            skip_create_weights_in_init=skip_create_weights_in_init,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -81,7 +83,7 @@ class LMHead(Linear):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
 
-        if not self.has_any_quant:
+        if not skip_create_weights_in_init and not self.has_any_quant:
             weight_shape = (self.out_features, self.in_features)
             self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
             self.register_parameter("bias", None)
