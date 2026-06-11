@@ -4,9 +4,9 @@
 import pytest
 import torch
 
-import tensorrt_llm._torch.pyexecutor.resource_manager as resource_manager
+import tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 as resource_manager
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
     gen_multimodal_cache_key_tokens,
 )

@@ -46,9 +46,9 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, KVCacheManagerV2,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+from .kv_cache_manager_v2 import KVCacheManagerV2
+from .resource_manager import (KVCacheManager, PeftCacheManager,
+                               ResourceManager, ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,

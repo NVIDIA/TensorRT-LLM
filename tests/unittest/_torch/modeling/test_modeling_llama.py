@@ -17,8 +17,9 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, _update_kv_cache_draft_token_location)
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    _update_kv_cache_draft_token_location)
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import (SpecMetadata,
                                                        SpeculativeDecodingMode)

@@ -72,9 +72,10 @@ from .llm_request import (LlmRequest, get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .kv_cache_manager_v2 import KVCacheManagerV2
 from .resource_manager import (BaseResourceManager, KVCacheManager,
-                               KVCacheManagerV2, PeftCacheManager,
-                               ResourceManager, ResourceManagerType)
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
