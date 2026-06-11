@@ -55,10 +55,12 @@ public:
     template <typename T>
     using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
-    CreateNewDecoderRequests(bool speculativeDecodingFastLogits, bool isLeaderInOrchMode, bool isNormalizeLogProbs)
+    CreateNewDecoderRequests(bool speculativeDecodingFastLogits, bool isLeaderInOrchMode, bool isNormalizeLogProbs,
+        bool logitsPostProcessorReturnsLogProbs = false)
         : mSpeculativeDecodingFastLogits(speculativeDecodingFastLogits)
         , mIsLeaderInOrchMode(isLeaderInOrchMode)
         , mIsNormalizeLogProbs(isNormalizeLogProbs)
+        , mLogitsPostProcessorReturnsLogProbs(logitsPostProcessorReturnsLogProbs)
     {
     }
 
@@ -81,6 +83,11 @@ private:
     bool mSpeculativeDecodingFastLogits;
     bool mIsLeaderInOrchMode;
     bool mIsNormalizeLogProbs;
+    /// @brief Mirror of ``ExecutorConfig::LogitsPostProcessorConfig::getReturnsLogProbs()``,
+    /// stamped into each new request's ``SamplingConfig`` so the layer chain
+    /// can read it (see ``PenaltyLayer::setup``). See
+    /// ``SamplingConfig::logitsPostProcessorReturnsLogProbs`` for semantics.
+    bool mLogitsPostProcessorReturnsLogProbs;
 };
 
 } // namespace tensorrt_llm::batch_manager

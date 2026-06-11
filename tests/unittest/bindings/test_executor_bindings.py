@@ -1744,17 +1744,28 @@ def test_logits_post_processor_config():
     assert config.processor_map is None
     assert config.processor_batched is None
     assert config.replicate == True
+    # Default: TRT-LLM applies its own log_softmax to the post-processor's
+    # output before beam search. Set this true when the user's processor
+    # already returns full-vocab log-probs (e.g. mirroring HuggingFace's
+    # mask-after-log_softmax LogitsProcessor flow) so the runtime skips its
+    # in-place log_softmax.
+    assert config.returns_log_probs == False
 
     kwargs = {
         "processor_map": {
             "test_pp": None
         },
         "processor_batched": None,
-        "replicate": False
+        "replicate": False,
+        "returns_log_probs": True,
     }
     config = trtllm.LogitsPostProcessorConfig(**kwargs)
     for k, v in kwargs.items():
         assert getattr(config, k) == v
+
+    # Mutate via property setter, exercising both directions of the binding.
+    config.returns_log_probs = False
+    assert config.returns_log_probs == False
 
 
 def test_guided_decoding_config():

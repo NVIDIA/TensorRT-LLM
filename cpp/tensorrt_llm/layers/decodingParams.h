@@ -134,6 +134,14 @@ public:
     OptVec<float> presencePenalty;                  // [1] or [setupBatchSize]
     OptVec<float> frequencyPenalty;                 // [1] or [setupBatchSize]
     OptVec<runtime::SizeType32> promptIgnoreLength; // [1] or [setupBatchSize]
+
+    /// @brief When true, ``PenaltyLayer`` skips the in-place ``log_softmax``
+    /// it would otherwise apply to logits before beam search. Used when the
+    /// user-supplied ``LogitsPostProcessor`` already returns full-vocab
+    /// log-probabilities, so the C++ kernel must not re-normalize them. See
+    /// ``executor::LogitsPostProcessorConfig::getReturnsLogProbs`` for the
+    /// public-API entry point.
+    std::optional<bool> logitsPostProcessorReturnsLogProbs;
 };
 
 // Ban words layer

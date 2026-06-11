@@ -364,6 +364,17 @@ private:
     /// @param[in] genBufferId The id of the generation buffers for those requests.
     void copyCacheIndirectionFromOutputsToInputs(ScheduledRequests const& scheduledRequests, SizeType32 genBufferId);
 
+    /// @brief Build coherent per-beam token histories (one per request) and store them on
+    ///        `inputBuffers.gatheredBeamTokensForCallback`, in slot/index parallel with
+    ///        `decoderRequests`. Traces `parentIds` backward on the host so that beam `b`'s
+    ///        entry is the *ancestral* token path — i.e. what the engine's KV cache (via
+    ///        `cacheIndirection`) actually conditioned on — not the slot-accumulated
+    ///        `LlmRequest::mTokens` view, which is misaligned after any beam reorder.
+    ///        Skips requests with beamWidth==1, no LogitsPostProcessor registered, fewer
+    ///        than 2 generated tokens, or where parentIds tracing finds no reorder. Must be
+    ///        called immediately before invoking the LogitsPostProcessor.
+    void buildGatheredBeamTokensForCallback(DecoderInputBuffers& inputBuffers);
+
     [[nodiscard]] bool getGatherGenerationLogits() const override
     {
         return getModelConfig().computeGenerationLogits() || mGatherGenerationLogits;
