@@ -1724,15 +1724,58 @@ class GvrTopKKernel:
         output_values: cute.Tensor,  # [numRows, top_k] dtype
         output_indices: cute.Tensor,  # [numRows, top_k] int32
     ):
-        """One row per thread-block cluster; grid = (num_rows * cluster_size,).
+        """Thin entry: bidx → (row_idx, cta_in_cluster), then run_one_row.
 
+        grid = (num_rows * cluster_size,); 1 row per thread-block cluster.
         cluster_id == row index, cta_in_cluster ∈ [0, cluster_size). CTA r
-        scans row[r * N / cs : (r+1) * N / cs], so Phase 2's GE-count
-        scales as 1 / cs. At cluster_size == 1 this collapses to one CTA
-        per row scanning the whole row.
+        scans row[r * N / cs : (r+1) * N / cs] in Phase 2, so the per-row
+        GE-count scales as 1 / cs. At cluster_size == 1 this collapses to
+        one CTA per row scanning the whole row.
+
+        Body is extracted into :meth:`run_one_row` so other entries (e.g.
+        the LB load-balance variant) can resolve ``row_idx`` differently
+        from the static ``bidx // cluster_size`` mapping used here.
+        """
+        bidx, _, _ = cute.arch.block_idx()
+        cluster_size = cutlass.const_expr(self.cluster_size)
+        if cutlass.const_expr(cluster_size > 1):
+            row_idx = bidx // cluster_size
+        else:
+            row_idx = bidx
+        self.run_one_row(
+            row_idx,
+            input_data,
+            pre_idx,
+            seq_lens,
+            output_values,
+            output_indices,
+        )
+
+    @cute.jit
+    def run_one_row(
+        self,
+        row_idx,  # int32, owning row in [0, num_rows)
+        input_data: cute.Tensor,  # [numRows, stride0] dtype
+        pre_idx: cute.Tensor,  # [numRows / next_n, pre_idx_stride] int32
+        seq_lens: cute.Tensor,  # [numRows / next_n] int32
+        output_values: cute.Tensor,  # [numRows, top_k] dtype, optional
+        output_indices: cute.Tensor,  # [numRows, top_k] int32
+    ):
+        """Run the full GVR pipeline (Phase 1-4 + writeback) for one row.
+
+        Caller resolves ``row_idx`` from any bidx→row mapping (static,
+        load-balanced, etc.) and dispatches in. ``cta_in_cluster`` is
+        derived internally from ``block_idx_in_cluster()`` so callers
+        don't need to thread it through.
+
+        ``cluster_size`` is a constexpr on ``self``; callers MUST launch
+        with cluster=(cluster_size, 1, 1) when cluster_size > 1, and the
+        ``cluster_size`` neighbouring CTAs sharing a row must agree on
+        ``row_idx`` (computed identically per cluster) so the per-CTA
+        ``block_idx_in_cluster()`` yields the expected 0..cluster_size-1
+        coverage of the row.
         """
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
 
         next_n = cutlass.const_expr(self.next_n)
         top_k = cutlass.const_expr(self.top_k)
@@ -1745,13 +1788,10 @@ class GvrTopKKernel:
         warp_id = tidx // self.WARP_SIZE
         lane = tidx & (self.WARP_SIZE - 1)
 
-        # Cluster-aware row + slice resolution.
         if cutlass.const_expr(cluster_size > 1):
             cta_in_cluster = cute.arch.block_idx_in_cluster()
-            row_idx = bidx // cluster_size
         else:
             cta_in_cluster = cutlass.Int32(0)
-            row_idx = bidx
         is_leader = cta_in_cluster == cutlass.Int32(0)
         pre_idx_row_idx = row_idx // next_n
         # Temporal-shift offset, mirroring heuristicTopKDecode.cu PR #14219:
