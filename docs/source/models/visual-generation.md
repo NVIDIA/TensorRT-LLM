@@ -158,16 +158,6 @@ args = VisualGenArgs(
 
 Both caching backends are configured through `VisualGenArgs.cache_config`. The backend is selected by the `cache_backend` discriminator field.
 
-Per-model recommended defaults (also reflected in the example configs under `examples/visual_gen/serve/configs/`):
-
-| Model | Recommended backend | Notes |
-|---|---|---|
-| **FLUX.1** | `teacache` | `teacache_thresh: 0.6` |
-| **FLUX.2** | `teacache` | `teacache_thresh: 0.2` |
-| **Wan 2.1** | `teacache` | `teacache_thresh: 0.2` |
-| **Wan 2.2** | `cache_dit` | All `CacheDiTConfig` defaults; no per-model overrides |
-| **LTX-2** | `cache_dit` | All `CacheDiTConfig` defaults; no per-model overrides |
-
 #### TeaCache
 
 TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via `VisualGenArgs.cache_config` (YAML or programmatic):
@@ -180,13 +170,13 @@ cache_config:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). FLUX.1 ships tuned at `0.6`. |
+| `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for FLUX.2 and Wan 2.1. |
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
 | `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Overridden per-checkpoint at load time (Wan: 4 coefficients, FLUX: 5). |
 
 #### Cache-DiT
 
-Cache-DiT uses residual-difference gating (`DBCache`) to adaptively skip transformer blocks, with optional TaylorSeer polynomial prediction and step-computation masking (SCM). It is the recommended backend for **Wan 2.2** and **LTX-2**.
+Cache-DiT uses residual-difference gating (`DBCache`) to adaptively skip transformer blocks, with optional TaylorSeer polynomial prediction and step-computation masking (SCM).
 
 Requires the `cache-dit` package:
 
