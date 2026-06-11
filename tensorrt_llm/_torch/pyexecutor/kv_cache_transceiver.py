@@ -19,6 +19,23 @@ AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
 BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
+_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL"
+_disagg_inflight_cancel_enabled_cache: Optional[bool] = None
+
+
+def is_disagg_inflight_cancel_enabled() -> bool:
+    """Return whether disaggregated in-flight KV transfer cancellation is enabled."""
+    global _disagg_inflight_cancel_enabled_cache
+    if _disagg_inflight_cancel_enabled_cache is None:
+        _disagg_inflight_cancel_enabled_cache = (getenv(
+            _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0") == "1")
+        if _disagg_inflight_cancel_enabled_cache:
+            logger.warning(
+                f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1: disagg KV "
+                "transfer in-flight cancellation and fail-closed transfer "
+                "buffer quarantine are enabled.")
+    return _disagg_inflight_cancel_enabled_cache
+
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
@@ -122,6 +139,9 @@ class KvCacheTransceiver(ABC):
     @abstractmethod
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
+
+    def has_poisoned_transfer_buffer(self) -> bool:
+        return False
 
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):
@@ -227,6 +247,11 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def has_poisoned_transfer_buffer(self) -> bool:
+        if not is_disagg_inflight_cancel_enabled():
+            return False
+        return self.impl.has_poisoned_transfer_buffer()
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally
