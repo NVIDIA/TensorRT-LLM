@@ -1096,9 +1096,10 @@ def test_qwen_moe_shared_expert_lora():
         llm.shutdown()
 
 
-def _write_routed_expert_lora_adapter(save_dir, *, moe_layers, num_experts,
-                                      hidden_size, moe_intermediate_size, rank,
-                                      lora_alpha, seed):
+def _write_routed_expert_lora_adapter(save_dir: str, *, moe_layers: list[int],
+                                      num_experts: int, hidden_size: int,
+                                      moe_intermediate_size: int, rank: int,
+                                      lora_alpha: float, seed: int) -> None:
     """Fabricate a per-expert routed-expert HF LoRA adapter on disk.
 
     Current transformers stores Qwen2-MoE routed experts as fused 3D parameters
@@ -1160,7 +1161,7 @@ def _write_routed_expert_lora_adapter(save_dir, *, moe_layers, num_experts,
     "device_path_cudagraph",
 ])
 def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
-        moe_lora_mode, monkeypatch):
+        moe_lora_mode: str, monkeypatch) -> None:
     """Routed-expert MoE LoRA on Qwen1.5-MoE with the PyTorch CUTLASS backend.
 
     Five dummy adapters of varying rank target the routed experts (moe_h_to_4h,
@@ -1257,30 +1258,33 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
             sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
             prompt = "What is your name?"
 
-            base_out = llm.generate([prompt],
-                                    sampling_params,
-                                    lora_request=None)
-            base_tokens = list(base_out[0].outputs[0].token_ids)
+            base_tokens = list(
+                llm.generate([prompt], sampling_params,
+                             lora_request=None)[0].outputs[0].token_ids)
 
-            # Batch all five adapters in one call so multiple distinct adapters
-            # are routed through a single (captured, when enabled) decode graph.
             lora_requests = [
                 LoRARequest(f"moe-lora-{i}", i, path)
                 for i, path in enumerate(lora_paths)
             ]
-            outputs = llm.generate([prompt] * len(lora_requests),
-                                   sampling_params,
-                                   lora_request=lora_requests)
 
-            assert len(outputs) == len(lora_requests)
-            any_differs = False
-            for out in outputs:
-                assert out.outputs[0].text is not None
-                if list(out.outputs[0].token_ids) != base_tokens:
-                    any_differs = True
-            assert any_differs, (
-                "All routed-expert MoE LoRA adapters produced output identical "
-                "to the base model; routed-expert LoRA was likely not applied.")
+            # One batch mixes a no-LoRA (rank-0) request with every adapter so
+            # the rank-0 skip path and all adapters run through a single
+            # (captured, when enabled) decode graph.
+            requests = [None] + lora_requests
+            outputs = llm.generate([prompt] * len(requests),
+                                   sampling_params,
+                                   lora_request=requests)
+            out_tokens = [list(o.outputs[0].token_ids) for o in outputs]
+
+            # The no-LoRA row (index 0) must run (rank-0 skip path) and produce
+            # output.
+            assert out_tokens[0], (
+                "No-LoRA row in the mixed batch produced no tokens.")
+            # Every adapter -- not just one -- must change the output vs base.
+            for i in range(len(lora_requests)):
+                assert out_tokens[i + 1] != base_tokens, (
+                    f"Routed-expert MoE LoRA adapter {i} produced output "
+                    "identical to the base model; it was not applied.")
         finally:
             llm.shutdown()
 
