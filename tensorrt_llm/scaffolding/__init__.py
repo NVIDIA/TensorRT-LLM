@@ -6,6 +6,7 @@ from .controller import (BestOfNController, ChatWithMCPController, Controller,
                          ParallelProcess, PRMController)
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
+from .pytorch_worker import PyTorchWorker
 from .scaffolding_llm import ScaffoldingLlm
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    MCPCallTask, OpenAIToolDescription, RewardTask,
@@ -46,6 +47,7 @@ __all__ = [
     "OpenaiWorker",
     "TRTOpenaiWorker",
     "TRTLLMWorker",
+    "PyTorchWorker",
     "MCPWorker",
     "TaskStatus",
     "extract_answer_from_boxed",
