@@ -251,7 +251,7 @@ class SelfBenchmark:
 
     def _can_start_next_point(self, active_requests: list["LlmRequest"],
                               waiting_queue: WaitingQueue) -> bool:
-        if self._done or self._current is not None:
+        if self._done:
             return False
         if self.config is not None and (
                 time.monotonic() - self._started_at) >= self.config.timeout_s:
@@ -260,6 +260,8 @@ class SelfBenchmark:
                 "Self-benchmark timed out after %ds; writing partial results.",
                 self.config.timeout_s)
             self._finish()
+            return False
+        if self._current is not None:
             return False
         return not active_requests and len(waiting_queue) == 0
 

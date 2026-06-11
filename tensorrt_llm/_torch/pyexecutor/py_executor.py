@@ -364,7 +364,9 @@ class PyExecutor:
         self.max_stats_len = max(self.llm_args.max_stats_len, 1)
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
-        self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
+        self.enable_iter_perf_stats = (
+            self.llm_args.enable_iter_perf_stats
+            or self.llm_args.self_benchmark_config is not None)
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
@@ -524,21 +526,27 @@ class PyExecutor:
         # passes that require matching pp_recv on the later stages.
         self.dist.barrier()
 
-        # During warmup, we don't enable the profiler
-        # Run warmup on the execution_stream for proper synchronization with
-        # KVCacheTransferManager's onboard/offload operations.
-        self.is_warmup = True
+        # During warmup, we don't enable the profiler. Self-benchmarking runs
+        # its own synthetic startup points, so skip the normal warmup to avoid
+        # running an unmeasured pre-benchmark pass that can block startup.
+        if self.llm_args.self_benchmark_config is not None:
+            logger.info(
+                "Skipping PyExecutor startup warmup because self-benchmark is enabled.")
+        else:
+            # Run warmup on the execution_stream for proper synchronization with
+            # KVCacheTransferManager's onboard/offload operations.
+            self.is_warmup = True
 
-        self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
-            self.model_engine.warmup(self.resource_manager)
-            if self.draft_model_engine is not None:
-                self.draft_model_engine.warmup(self.resource_manager)
+            self.execution_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.execution_stream):
+                self.model_engine.warmup(self.resource_manager)
+                if self.draft_model_engine is not None:
+                    self.draft_model_engine.warmup(self.resource_manager)
 
-        # Ensure the default stream waits for execution_stream to complete
-        # before subsequent operations.
-        torch.cuda.current_stream().wait_stream(self.execution_stream)
-        self.is_warmup = False
+            # Ensure the default stream waits for execution_stream to complete
+            # before subsequent operations.
+            torch.cuda.current_stream().wait_stream(self.execution_stream)
+            self.is_warmup = False
 
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
