@@ -111,10 +111,14 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "gpus_per_node": params.get("gpus_per_node"),
     }
 
-    if params.get("max_batch_size") and params.get("max_num_tokens"):
-        logger.info("Use user-provided max batch size and max num tokens.")
-        max_batch_size, max_num_tokens = params.get(
-            "max_batch_size"), params.get("max_num_tokens")
+    user_max_batch_size = params.get("max_batch_size")
+    user_max_num_tokens = params.get("max_num_tokens")
+
+    if user_max_batch_size and user_max_num_tokens:
+        max_batch_size, max_num_tokens = user_max_batch_size, user_max_num_tokens
+        logger.info(
+            f"Initial settings: max_batch_size={max_batch_size} (user-provided), "
+            f"max_num_tokens={max_num_tokens} (user-provided).")
     else:
         model_config = get_model_config(model, model_path)
 
@@ -146,15 +150,26 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             enable_attention_dp=enable_attention_dp,
         )
 
-        logger.info(
-            f"Max batch size and max num tokens not provided. "
-            f"Using heuristics or pre-defined settings: max_batch_size={max_batch_size}, max_num_tokens={max_num_tokens}."
-        )
+        if user_max_batch_size:
+            max_batch_size = user_max_batch_size
+            logger.info(
+                f"Initial settings: max_batch_size={max_batch_size} (user-provided), "
+                f"max_num_tokens={max_num_tokens} (heuristic).")
+        elif user_max_num_tokens:
+            max_num_tokens = user_max_num_tokens
+            logger.info(
+                f"Initial settings: max_batch_size={max_batch_size} (heuristic), "
+                f"max_num_tokens={max_num_tokens} (user-provided).")
+        else:
+            logger.info(
+                f"Initial settings: max_batch_size={max_batch_size} (heuristic), "
+                f"max_num_tokens={max_num_tokens} (heuristic).")
 
         # If chunked prefill is disabled, we need to ensure that the max_num_tokens is at least the max_isl
         if not enable_chunked_prefill:
             logger.warning(
-                f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is less than the max ISL ({dataset_metadata.max_isl}). "
+                f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is "
+                f"less than the max ISL ({dataset_metadata.max_isl}). "
                 f"Forcing max_num_tokens to {dataset_metadata.max_isl + max_batch_size}."
             )
             max_num_tokens = max(max_num_tokens,

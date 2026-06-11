@@ -452,6 +452,9 @@ def throughput_command(
         if bench_env.telemetry_config is not None:
             kwargs["telemetry_config"] = bench_env.telemetry_config
 
+        runtime_config.settings_config.max_batch_size = kwargs["max_batch_size"]
+        runtime_config.settings_config.max_num_tokens = kwargs["max_num_tokens"]
+
         llm = get_llm(runtime_config, kwargs)
 
         sampler_args = {
