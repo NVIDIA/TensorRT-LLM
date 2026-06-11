@@ -978,6 +978,16 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         if self.sharder.is_active and text_seq_len % self.sharder.size != 0:
             padded_text_seq_len += self.sharder.size - (text_seq_len % self.sharder.size)
 
+        text_attention_mask = encoder_hidden_states_mask
+        if text_attention_mask is None and padded_text_seq_len != text_seq_len:
+            text_attention_mask = torch.ones(
+                (encoder_hidden_states.shape[0], text_seq_len),
+                dtype=torch.bool,
+                device=encoder_hidden_states.device,
+            )
+        elif text_attention_mask is not None and text_attention_mask.dtype != torch.bool:
+            text_attention_mask = text_attention_mask.to(torch.bool)
+
         hidden_states = self.sharder.shard(hidden_states, dim=1)
         encoder_hidden_states = self.sharder.shard(
             encoder_hidden_states,
@@ -1000,12 +1010,10 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         # Build joint attention mask [text_mask | all-ones image_mask] once.
         block_attention_mask = None
-        if encoder_hidden_states_mask is not None:
-            if encoder_hidden_states_mask.dtype != torch.bool:
-                encoder_hidden_states_mask = encoder_hidden_states_mask.to(torch.bool)
+        if text_attention_mask is not None:
             batch_size, image_seq_len = hidden_states.shape[:2]
-            encoder_hidden_states_mask = self.sharder.shard(
-                encoder_hidden_states_mask,
+            text_attention_mask = self.sharder.shard(
+                text_attention_mask,
                 dim=1,
                 pad_to_multiple=True,
             )
@@ -1014,7 +1022,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-            block_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+            block_attention_mask = torch.cat([text_attention_mask, image_mask], dim=1)
             if self.sharder.is_active:
                 block_attention_mask = self.sharder.gather(block_attention_mask, dim=1)
 

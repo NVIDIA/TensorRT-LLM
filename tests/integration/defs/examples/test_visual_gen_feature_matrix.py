@@ -54,6 +54,11 @@ QWEN_IMAGE_PRECISION_VARIANTS = [
     ("dynamic_fp4", {"quant_algo": "NVFP4", "dynamic": True}),
 ]
 QWEN_IMAGE_ATTENTION_BACKENDS = ["FA4", "CUTEDSL"]
+QWEN_IMAGE_ATTENTION_BACKEND_CLASSES = {
+    "VANILLA": "VanillaAttention",
+    "FA4": "FlashAttn4Attention",
+    "CUTEDSL": "CuTeDSLAttention",
+}
 
 
 def _qwen_image_model_path():
@@ -82,6 +87,22 @@ def _skip_if_qwen_attention_backend_unavailable(attention_backend):
             pytest.skip(f"CUTEDSL attention backend unavailable: {exc}")
         if _cute_dsl_import_error is not None:
             pytest.skip(f"CUTEDSL attention backend unavailable: {_cute_dsl_import_error}")
+
+
+def _iter_attention_backend_stack(attn):
+    seen = set()
+    while attn is not None and id(attn) not in seen:
+        seen.add(id(attn))
+        yield attn
+        attn = getattr(attn, "inner_backend", None) or getattr(attn, "inner", None)
+
+
+def _find_attention_backend(attn, attention_backend):
+    expected_class = QWEN_IMAGE_ATTENTION_BACKEND_CLASSES[attention_backend]
+    for backend in _iter_attention_backend_stack(attn):
+        if type(backend).__name__ == expected_class:
+            return backend
+    return None
 
 
 def _make_qwen_image_args(model_path, attention_backend, quant_config, parallel=None):
@@ -125,7 +146,26 @@ def _generate_qwen_image(
         f"precision={precision}, requested_backend={attention_backend}, parallel={parallel}"
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
+    backend_obj = None
+    original_backend_forward = None
     try:
+        attn_module = pipeline.transformer.transformer_blocks[0].attn
+        backend_stack = [
+            type(backend).__name__ for backend in _iter_attention_backend_stack(attn_module.attn)
+        ]
+        backend_obj = _find_attention_backend(attn_module.attn, attention_backend)
+        assert backend_obj is not None, (
+            f"Expected {attention_backend} backend in attention stack, got {backend_stack}"
+        )
+        backend_call_count = {"count": 0}
+        original_backend_forward = backend_obj.forward
+
+        def counted_backend_forward(*args, **kwargs):
+            backend_call_count["count"] += 1
+            return original_backend_forward(*args, **kwargs)
+
+        backend_obj.forward = counted_backend_forward
+
         with torch.no_grad():
             result = pipeline.forward(
                 prompt=QWEN_IMAGE_PROMPT,
@@ -134,15 +174,19 @@ def _generate_qwen_image(
                 num_inference_steps=QWEN_IMAGE_NUM_INFERENCE_STEPS,
                 true_cfg_scale=QWEN_IMAGE_TRUE_CFG_SCALE,
                 seed=QWEN_IMAGE_SEED,
-        )
+            )
         image = result.image[0].detach().cpu()
-        selected_backend = pipeline.transformer.transformer_blocks[0].attn.attn_backend
+        assert backend_call_count["count"] > 0, (
+            f"{attention_backend} backend forward was not called; stack={backend_stack}"
+        )
+        selected_backend = attn_module.attn_backend
         sharder = pipeline.transformer.sharder
-        uses_ulysses = pipeline.transformer.transformer_blocks[0].attn._uses_ulysses_attention
+        uses_ulysses = type(attn_module.attn).__name__ == "UlyssesAttention"
         print(
             "\n[Qwen-Image] "
             f"sharder_active={sharder.is_active}, sharder_size={sharder.size}, "
-            f"sharder_rank={sharder.rank}, uses_ulysses_attention={uses_ulysses}"
+            f"sharder_rank={sharder.rank}, uses_ulysses_attention={uses_ulysses}, "
+            f"backend_stack={backend_stack}, backend_calls={backend_call_count['count']}"
         )
         if expect_ulysses:
             assert sharder.is_active
@@ -152,6 +196,8 @@ def _generate_qwen_image(
             assert not sharder.is_active
             assert not uses_ulysses
     finally:
+        if backend_obj is not None and original_backend_forward is not None:
+            backend_obj.forward = original_backend_forward
         del pipeline
         _cleanup_cuda()
 
@@ -195,16 +241,15 @@ def _qwen_image_distributed_worker(rank: int, world_size: int, **kwargs) -> None
 def test_qwen_image_vanilla_precision_lpips_same_precision_repeat(
     tmp_path, precision, quant_config
 ):
+    if not MODULES_AVAILABLE:
+        pytest.skip("Required modules not available")
+
     model_path = _qwen_image_model_path()
     reference_path = tmp_path / f"qwen_image_{precision}_vanilla_reference.png"
     generated_path = tmp_path / f"qwen_image_{precision}_vanilla_repeat.png"
 
-    reference_backend = _generate_qwen_image(
-        model_path, reference_path, "VANILLA", quant_config
-    )
-    generated_backend = _generate_qwen_image(
-        model_path, generated_path, "VANILLA", quant_config
-    )
+    reference_backend = _generate_qwen_image(model_path, reference_path, "VANILLA", quant_config)
+    generated_backend = _generate_qwen_image(model_path, generated_path, "VANILLA", quant_config)
 
     assert reference_backend == "VANILLA"
     assert generated_backend == "VANILLA"
@@ -226,9 +271,7 @@ def test_qwen_image_vanilla_precision_lpips_same_precision_repeat(
     QWEN_IMAGE_ATTENTION_BACKENDS,
     ids=[backend.lower() for backend in QWEN_IMAGE_ATTENTION_BACKENDS],
 )
-def test_qwen_image_attention_backend_bf16_lpips_same_backend_repeat(
-    tmp_path, attention_backend
-):
+def test_qwen_image_attention_backend_bf16_lpips_same_backend_repeat(tmp_path, attention_backend):
     if not MODULES_AVAILABLE:
         pytest.skip("Required modules not available")
     _skip_if_qwen_attention_backend_unavailable(attention_backend)
@@ -277,9 +320,7 @@ def test_qwen_image_vanilla_ulysses2_lpips_against_single_gpu_same_precision(
     single_gpu_path = tmp_path / f"qwen_image_{precision}_single_gpu_vanilla.png"
     multi_gpu_path = tmp_path / f"qwen_image_{precision}_ulysses2_vanilla.png"
 
-    single_gpu_backend = _generate_qwen_image(
-        model_path, single_gpu_path, "VANILLA", quant_config
-    )
+    single_gpu_backend = _generate_qwen_image(model_path, single_gpu_path, "VANILLA", quant_config)
     assert single_gpu_backend == "VANILLA"
 
     run_test_in_distributed(
