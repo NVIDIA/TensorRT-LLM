@@ -8,7 +8,7 @@ from typing import NotRequired, TypedDict
 sys.path.append(os.path.abspath(".."))
 from utils.common import is_permissive, load_json
 from utils.es import es_post
-from utils.report import diff_licenses, get_preapproved_deps_map, get_vulns
+from utils.report import diff_licenses, get_preapproved_deps_map, get_vulns, is_preapproved
 
 ES_POST_URL = os.environ.get("TRTLLM_ES_POST_URL")
 if not ES_POST_URL:
@@ -156,7 +156,9 @@ def submit_source_code_licenses(
                 "s_component_type": component.get("type"),
                 "b_is_new": is_new,
             }
-            if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):
+            if (is_new or not only_report_new_risk) and is_preapproved(
+                map_preapproved, package_name, component.get("type").lower()
+            ):
                 risks_to_report.append(doc)
                 sbom_documents.append(doc)
         if sbom_documents:
@@ -290,7 +292,9 @@ def submit_container_licenses(
             "s_license_ids": ",".join(license_ids),
             "b_is_new": is_new,
         }
-        if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):
+        if (is_new or not only_report_new_risk) and not is_preapproved(
+            map_preapproved, package_name, v.get("type").lower()
+        ):
             risks_to_report.append(doc)
             docs.append(doc)
     if docs:
