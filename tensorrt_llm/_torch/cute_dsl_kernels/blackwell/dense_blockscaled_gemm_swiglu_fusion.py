@@ -55,10 +55,12 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from ...utils import ActivationType, is_gated_activation
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .utils import (
     TRTLLM_ENABLE_PDL,
     fmin,
+    gelu_tanh_f32,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
@@ -122,8 +124,12 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
         use_prefetch: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
-        """Initializes the configuration for a Blackwell dense GEMM kernel with SwiGLU fusion.
+        """Initializes the configuration for a Blackwell dense GEMM kernel with fused activation.
+
+        Supports a gated SwiGLU epilogue (``ActivationType.Swiglu``, default; output N/2) and a
+        non-gated GELU-tanh epilogue (``ActivationType.Gelu``; output N).
 
         This configuration includes several key aspects:
 
@@ -175,6 +181,8 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.vectorized_f32 = vectorized_f32
+        self.activation_type = activation_type
+        self.is_gated = is_gated_activation(activation_type)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -248,10 +256,10 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             self.mma_tiler_sfb[2],
         )
 
-        # SwiGLU: mma_tiler_c has N//2 since output is halved after fusion
+        # Gated (SwiGLU) halves output N (interleaved up/gate); non-gated keeps full N.
         self.mma_tiler_c = (
             self.mma_inst_shape_mnk[0],
-            self.mma_inst_shape_mnk[1] // 2,
+            self.mma_inst_shape_mnk[1] // 2 if self.is_gated else self.mma_inst_shape_mnk[1],
             self.mma_inst_shape_mnk[2] * mma_inst_tile_k,
         )
         self.cta_tile_shape_mnk_c = (
@@ -284,8 +292,8 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             self.cta_tile_shape_mnk_c[0] // self.epi_tile[0],
             self.cta_tile_shape_mnk_c[1] // self.epi_tile[1],
         )
-        # SwiGLU consumes 2 subtiles (up + gate) per output subtile
-        self.epi_tile_n_required = 2 * cute.size(self.epi_tile[1])
+        # Gated (SwiGLU) consumes 2 subtiles (up + gate) per output subtile; non-gated consumes 1.
+        self.epi_tile_n_required = (2 if self.is_gated else 1) * cute.size(self.epi_tile[1])
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
@@ -368,6 +376,7 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         epilogue_op: cutlass.Constexpr = lambda x: x,
         sfc_tensor: Optional[cute.Tensor] = None,
         norm_const_tensor: Optional[cute.Tensor] = None,
+        bias_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation with SwiGLU fusion in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -388,6 +397,10 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             epilogue_op (cutlass.Constexpr): Optional elementwise lambda function to apply to the output tensor
             sfc_tensor (Optional[cute.Tensor]): Scale factor tensor for C (for FP4 quantization)
             norm_const_tensor (Optional[cute.Tensor]): Norm constant tensor (for FP4 quantization)
+            bias_tensor (Optional[cute.Tensor]): Optional per-N bias tensor with layout
+                (m, n_out, l) and M-stride 0 (broadcast over rows). Added as
+                ``alpha * acc + bias`` before the activation. Only consumed by the
+                non-gated GELU path; None (default) leaves all paths unchanged.
 
         Raises:
             TypeError: If input data types are incompatible with the MMA instruction.
@@ -595,6 +608,7 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             tma_tensor_c,
             sfc_tensor,
             norm_const_tensor,
+            bias_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -635,6 +649,7 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         mC_mnl: cute.Tensor,
         mSFC_mnl: Optional[cute.Tensor],
         norm_const_tensor: Optional[cute.Tensor],
+        mBias_mnl: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -792,6 +807,13 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler_c, (None, None, 0)), (None, None, None)
         )
+        # (bM, bN, RestM, RestN, RestL) - bias tiled IDENTICALLY to C (M-stride 0
+        # broadcast); only present on the non-gated path with a supplied bias.
+        gBias_mnl = None
+        if cutlass.const_expr(mBias_mnl is not None):
+            gBias_mnl = cute.local_tile(
+                mBias_mnl, cute.slice_(self.mma_tiler_c, (None, None, 0)), (None, None, None)
+            )
         k_block_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
         #
@@ -809,6 +831,11 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        # Bias partitioned the SAME way as C so the epilogue partition yields a
+        # fragment matching tTR_rAcc_up; only when a bias was supplied.
+        tCgBias = None
+        if cutlass.const_expr(gBias_mnl is not None):
+            tCgBias = thr_mma.partition_C(gBias_mnl)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1325,9 +1352,18 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
                 tTR_tAcc_base,
                 tTR_rAcc_up,
                 tTR_rAcc_gate,
+                tTR_gBias_base,
             ) = self.epilog_tmem_copy_and_partition(
-                epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
+                epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs, tCgBias
             )
+
+            # Register fragment that receives the per-N bias slice for the current
+            # subtile (same shape as tTR_rAcc_up); only allocated when bias present.
+            # Use the bias source dtype (bf16/fp32) so the gmem->reg autovec_copy
+            # has matching element bit widths; converted to fp32 at add time.
+            tTR_rBias = None
+            if cutlass.const_expr(gBias_mnl is not None):
+                tTR_rBias = cute.make_rmem_tensor(tTR_rAcc_up.shape, gBias_mnl.element_type)
 
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc_up.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
@@ -1398,6 +1434,20 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
                     )
                 ]
 
+                # Per-tile bias slice (same RestM/RestN/RestL coord as C):
+                # (T2R, T2R_M, T2R_N, EPI_M, EPI_N).
+                if cutlass.const_expr(gBias_mnl is not None):
+                    tTR_gBias = tTR_gBias_base[
+                        (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            *mma_tile_coord_mnl,
+                        )
+                    ]
+
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
                     reverse_subtile = (
@@ -1430,6 +1480,10 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                # Group (EPI_M, EPI_N) so real_subtile_idx selects a subtile, just
+                # like tTR_tAcc -> (T2R, T2R_M, T2R_N, EPI).
+                if cutlass.const_expr(gBias_mnl is not None):
+                    tTR_gBias = cute.group_modes(tTR_gBias, 3, cute.rank(tTR_gBias))
 
                 #
                 # Process accumulator subtiles with SwiGLU fusion and store to global memory
@@ -1438,30 +1492,45 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
-                for subtile_idx in cutlass.range(0, subtile_cnt, 2):
-                    real_subtile_idx = subtile_idx // 2
+                for subtile_idx in cutlass.range(0, subtile_cnt, 2 if self.is_gated else 1):
+                    if cutlass.const_expr(self.is_gated):
+                        real_subtile_idx = subtile_idx // 2
+                    else:
+                        real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
                             real_subtile_idx = (
                                 self.cta_tile_shape_mnk[1] // self.epi_tile_n_required
                                 - 1
-                                - subtile_idx // 2
+                                - real_subtile_idx
                             )
                     #
                     # Load accumulator from tensor memory buffer to register
-                    # Load TWO subtiles: up (even) and gate (odd)
                     #
-                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
-                    tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
-
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+                    if cutlass.const_expr(self.is_gated):
+                        # Gated: load TWO subtiles: up (even) and gate (odd)
+                        tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
+                        tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+                    else:
+                        # Non-gated: load a single subtile
+                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc_up)
+                        # Load the per-N bias slice for this subtile (gmem -> reg).
+                        # tTR_gBias[..., real_subtile_idx] has the same layout as
+                        # tTR_rAcc_up; M-broadcast comes from the stride-0 source.
+                        if cutlass.const_expr(gBias_mnl is not None):
+                            cute.autovec_copy(
+                                tTR_gBias[(None, None, None, real_subtile_idx)],
+                                tTR_rBias,
+                            )
 
                     #
                     # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
                     if cutlass.const_expr(self.overlapping_accum):
-                        if subtile_idx // 2 == self.iter_acc_early_release_in_epilogue:
+                        if real_subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
                             with cute.arch.elect_one():
@@ -1469,66 +1538,19 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
                             acc_consumer_state.advance()
 
                     acc_vec_up = tTR_rAcc_up.load()
-                    acc_vec_gate = tTR_rAcc_gate.load()
-
-                    #
-                    # SwiGLU activation: output = up * silu(gate)
-                    # where silu(x) = x * sigmoid(x)
-                    # up and gate are extracted from interleaved accumulator subtiles
-                    #
-                    tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.vectorized_f32):
-                        # SwiGLU Packed Version: uses f32x2 packed operations for better performance
-                        # Computes: output = (alpha * up) * silu(alpha * gate)
-                        # where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-                        LOG2_E = cutlass.Float32(1.4426950408889634)
-                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_up), 2):
-                            acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
-                                (acc_vec_up[i], acc_vec_up[i + 1]),
-                                (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
-                            )
-                            acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
-                                (acc_vec_gate[i], acc_vec_gate[i + 1]),
-                                (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
-                            )
-                            tCompute_log2e = cute.arch.mul_packed_f32x2(
-                                (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]), (-LOG2_E, -LOG2_E)
-                            )
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.add_packed_f32x2(
-                                (
-                                    cute.math.exp2(tCompute_log2e[0], fastmath=True),
-                                    cute.math.exp2(tCompute_log2e[1], fastmath=True),
-                                ),
-                                (1.0, 1.0),
-                            )
-                            tCompute[i] = cute.arch.rcp_approx(tCompute[i])
-                            tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.mul_packed_f32x2(
-                                (tCompute[i], tCompute[i + 1]),
-                                (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
-                            )
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.mul_packed_f32x2(
-                                (tCompute[i], tCompute[i + 1]),
-                                (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
-                            )
+                    tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
+                    if cutlass.const_expr(self.is_gated):
+                        # SwiGLU: output = (alpha * up) * silu(alpha * gate)
+                        acc_vec_gate = tTR_rAcc_gate.load()
+                        self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     else:
-                        # SwiGLU Unpacked Version: scalar operations
-                        # Computes: output = (alpha * up) * silu(alpha * gate)
-                        for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                            acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
-                            acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
-                            tCompute[i] = acc_vec_up_alpha * silu_f32(
-                                acc_vec_gate_alpha, fastmath=True
-                            )
+                        # GELU (tanh approx): output = gelu_tanh(alpha * up + bias)
+                        bias_vec = None
+                        if cutlass.const_expr(gBias_mnl is not None):
+                            bias_vec = tTR_rBias.load()
+                        self._apply_gelu_epilogue(
+                            acc_vec_up, alpha_val, tCompute, bias_vec=bias_vec
+                        )
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
@@ -1770,6 +1792,133 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
 
         return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
 
+    @cute.jit
+    def _apply_swiglu_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+    ):
+        """SwiGLU: ``tCompute[i] = (alpha * up[i]) * silu(alpha * gate[i])``.
+
+        ``up`` and ``gate`` come from the two interleaved accumulator subtiles
+        loaded by the caller.
+        """
+        if cutlass.const_expr(self.vectorized_f32):
+            # Packed f32x2: silu via 1 / (1 + exp2(-log2_e * x))
+            LOG2_E = cutlass.Float32(1.4426950408889634)
+            for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+                acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
+                    (acc_vec_up[i], acc_vec_up[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+                acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
+                    (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+                tCompute_log2e = cute.arch.mul_packed_f32x2(
+                    (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                    (-LOG2_E, -LOG2_E),
+                )
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.add_packed_f32x2(
+                    (
+                        cute.math.exp2(tCompute_log2e[0], fastmath=True),
+                        cute.math.exp2(tCompute_log2e[1], fastmath=True),
+                    ),
+                    (1.0, 1.0),
+                )
+                tCompute[i] = cute.arch.rcp_approx(tCompute[i])
+                tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.mul_packed_f32x2(
+                    (tCompute[i], tCompute[i + 1]),
+                    (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                )
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.mul_packed_f32x2(
+                    (tCompute[i], tCompute[i + 1]),
+                    (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
+                )
+        else:
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+
+    @cute.jit
+    def _apply_gelu_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+        bias_vec: Optional[cute.Tensor] = None,
+    ):
+        """GELU (tanh approx): ``tCompute[i] = gelu_tanh(alpha * up[i] + bias[i])``.
+
+        gelu_tanh(x) = 0.5*x*(1 + tanh(c*(x + 0.044715 x^3)))
+                     = x * sigmoid(2c*(x + 0.044715 x^3)),  c = sqrt(2/pi)
+        Non-gated: only the single ``up`` accumulator subtile is used.
+
+        When ``bias_vec`` is provided it is a per-N register fragment (already
+        broadcast over M by the caller, in the bias source dtype bf16/fp32)
+        added to ``alpha * up`` BEFORE the GELU; each element is converted to
+        fp32 here. ``bias_vec`` is None by default -> behavior is byte-identical
+        to the bias-free path.
+        """
+        LOG2_E = cutlass.Float32(1.4426950408889634)
+        C2 = cutlass.Float32(1.5957691216057308)  # 2 * sqrt(2/pi)
+        K = cutlass.Float32(0.044715)
+        if cutlass.const_expr(self.vectorized_f32):
+            for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+                # x = alpha * acc
+                x = cute.arch.mul_packed_f32x2(
+                    (acc_vec_up[i], acc_vec_up[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+                # x = alpha * acc + bias  (per-N, broadcast over M)
+                if cutlass.const_expr(bias_vec is not None):
+                    x = cute.arch.add_packed_f32x2(
+                        (x[0], x[1]),
+                        (cutlass.Float32(bias_vec[i]), cutlass.Float32(bias_vec[i + 1])),
+                    )
+                # inner = C2 * (x + K * x^3)
+                x2 = cute.arch.mul_packed_f32x2((x[0], x[1]), (x[0], x[1]))
+                x3 = cute.arch.mul_packed_f32x2((x2[0], x2[1]), (x[0], x[1]))
+                kx3 = cute.arch.mul_packed_f32x2((x3[0], x3[1]), (K, K))
+                inner = cute.arch.add_packed_f32x2((x[0], x[1]), (kx3[0], kx3[1]))
+                w = cute.arch.mul_packed_f32x2((inner[0], inner[1]), (C2, C2))
+                # sigmoid(w) = 1 / (1 + exp2(-w * log2_e))
+                neg = cute.arch.mul_packed_f32x2((w[0], w[1]), (-LOG2_E, -LOG2_E))
+                denom = cute.arch.add_packed_f32x2(
+                    (
+                        cute.math.exp2(neg[0], fastmath=True),
+                        cute.math.exp2(neg[1], fastmath=True),
+                    ),
+                    (1.0, 1.0),
+                )
+                s0 = cute.arch.rcp_approx(denom[0])
+                s1 = cute.arch.rcp_approx(denom[1])
+                # out = x * sigmoid(w)
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.mul_packed_f32x2((s0, s1), (x[0], x[1]))
+        else:
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                x = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                # x = alpha * acc + bias  (per-N, broadcast over M)
+                if cutlass.const_expr(bias_vec is not None):
+                    x = x + cutlass.Float32(bias_vec[i])
+                tCompute[i] = gelu_tanh_f32(x, fastmath=True)
+
     def epilog_tmem_copy_and_partition(
         self,
         tidx: cutlass.Int32,
@@ -1777,7 +1926,8 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         gC_mnl: cute.Tensor,
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[cutlass.Boolean, bool],
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]:
+        tCgBias: Optional[cute.Tensor] = None,
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor, Optional[cute.Tensor]]:
         """
         Make tiledCopy for tensor memory load, then use it to partition tensor memory
         (source) and register array (destination).
@@ -1791,13 +1941,21 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             gC_mnl (cute.Tensor): The global tensor C
             epi_tile (cute.Tile): The epilogue tiler
             use_2cta_instrs (bool): Whether use_2cta_instrs is enabled
+            tCgBias (Optional[cute.Tensor]): Optional bias partitioned with
+                ``thr_mma.partition_C`` exactly like ``tCgC`` (broadcast over M
+                via stride 0). When provided it is further partitioned with the
+                SAME tiled copy as C so the resulting fragment matches
+                ``tTR_rAcc_up`` element-for-element.
 
         Returns:
-            A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate) where:
+            A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate,
+            tTR_gBias) where:
                 - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
                 - tTR_tAcc: The partitioned accumulator tensor
                 - tTR_rAcc_up: The register tensor for acc up subtile
                 - tTR_rAcc_gate: The register tensor for acc gate subtile
+                - tTR_gBias: The partitioned global bias tensor (same layout as the
+                  partitioned C), or None when no bias was supplied.
         """
         # Make tiledCopy for tensor memory load
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
@@ -1832,7 +1990,18 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         tTR_rAcc_gate = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
-        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate
+
+        # Partition the per-N bias EXACTLY like C (broadcast over M via stride 0).
+        # Same flat_divide + partition_D path -> tTR_gBias has the same layout as
+        # tTR_gC, so a bias fragment matches tTR_rAcc_up position-for-position.
+        tTR_gBias = None
+        if cutlass.const_expr(tCgBias is not None):
+            gBias_mnl_epi = cute.flat_divide(
+                tCgBias[((None, None), 0, 0, None, None, None)], epi_tile
+            )
+            tTR_gBias = thr_copy_t2r.partition_D(gBias_mnl_epi)
+
+        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc_up, tTR_rAcc_gate, tTR_gBias
 
     def epilog_smem_copy_and_partition(
         self,
@@ -2323,6 +2492,7 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         current_stream: cuda.CUstream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        bias_ptr: Optional[cute.Pointer] = None,
     ):
         """Executes the wrapped GEMM kernel with dynamically shaped tensors.
 
@@ -2345,6 +2515,10 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             current_stream (cuda.CUstream): CUDA stream for the operation.
             epilogue_op (cutlass.Constexpr, optional): Elementwise lambda
                 function for the epilogue. Defaults to identity.
+            bias_ptr (Optional[cute.Pointer]): Optional pointer to a per-N bias
+                vector [n_out]; broadcast over M (stride 0) and added before the
+                activation. Only consumed by the non-gated GELU path. None ->
+                no bias.
         """
 
         # m, k, l
@@ -2360,8 +2534,8 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
                 order=(1, 0, 2),
             ),
         )
-        # m, n//2, l (SwiGLU halves the N dimension)
-        n_out = n // 2
+        # Gated (SwiGLU) halves output N; non-gated keeps full N.
+        n_out = n // 2 if self.is_gated else n
         if cutlass.const_expr(swap_ab):
             c_tensor = cute.make_tensor(
                 c_ptr,
@@ -2394,6 +2568,13 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
                 order=(2, 1, 4, 0, 3, 5),
             ),
         )
+        # Optional per-N bias broadcast over M (and L): stride 0 on M/L, 1 on N.
+        bias_tensor = None
+        if cutlass.const_expr(bias_ptr is not None):
+            bias_tensor = cute.make_tensor(
+                bias_ptr,
+                layout=cute.make_layout((m, n_out, l), stride=(0, 1, 0)),
+            )
 
         self(
             a_tensor,
@@ -2405,6 +2586,7 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             max_active_clusters,
             current_stream,
             epilogue_op,
+            bias_tensor=bias_tensor,
         )
 
     @cute.jit
@@ -2429,6 +2611,7 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         norm_const_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         current_stream: cuda.CUstream,
+        bias_ptr: Optional[cute.Pointer] = None,
     ):
         """Wrapper for FP4 output mode with SFC quantization.
 
@@ -2440,6 +2623,9 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             c_ptr: Pointer to FP4 output tensor [m, n_out] (packed).
             sfc_ptr: Pointer to output scale factor tensor.
             norm_const_tensor: Normalization constant for SFC quantization.
+            bias_ptr: Optional pointer to a per-N bias vector [n_out]. When
+                provided, a broadcast (m, n_out, l) tensor with M-stride 0 is
+                built and added before the activation. None -> no bias.
         """
         # m, k, l
         a_tensor = cute.make_tensor(
@@ -2454,8 +2640,8 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
                 order=(1, 0, 2),
             ),
         )
-        # m, n//2, l (SwiGLU halves the N dimension) — FP4 output
-        n_out = n // 2
+        # Gated (SwiGLU) halves output N; non-gated keeps full N. — FP4 output
+        n_out = n // 2 if self.is_gated else n
         c_tensor = cute.make_tensor(
             c_ptr,
             layout=cute.make_ordered_layout(
@@ -2486,6 +2672,13 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
                 order=(2, 1, 4, 0, 3, 5),
             ),
         )
+        # Optional per-N bias broadcast over M (and L): stride 0 on M/L, 1 on N.
+        bias_tensor = None
+        if cutlass.const_expr(bias_ptr is not None):
+            bias_tensor = cute.make_tensor(
+                bias_ptr,
+                layout=cute.make_layout((m, n_out, l), stride=(0, 1, 0)),
+            )
 
         self(
             a_tensor,
@@ -2498,6 +2691,7 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             current_stream,
             sfc_tensor=sfc_tensor,
             norm_const_tensor=norm_const_tensor,
+            bias_tensor=bias_tensor,
         )
 
 
