@@ -670,7 +670,6 @@ class GvrTopKKernel:
         tidx,
         warp_id,
         lane,
-        do_cluster_aggregation: cutlass.Constexpr[bool] = True,
         smem_input=None,  # optional SMEM-cached slice (smem_input[i] == input_row[slice_start+i])
     ):
         """Count input[i] >= threshold across this CTA's row slice, then
@@ -840,11 +839,8 @@ class GvrTopKKernel:
                 s_iscalars[5] = s_iscalars[0]
             cute.arch.barrier()
 
-        # Cluster all-reduce of cand_count. Skipped at cluster_size==1
-        # AND when the caller opts out (Phase 3 leader-only path runs
-        # after peers exit; cluster sync against absent peers would
-        # deadlock at cluster_arrive_relaxed).
-        if cutlass.const_expr(cluster_size > 1 and do_cluster_aggregation):
+        # Cluster all-reduce of cand_count. Skipped at cluster_size==1.
+        if cutlass.const_expr(cluster_size > 1):
             cute.arch.barrier()  # publish s_iscalars[0] to all threads of this CTA
             if tidx == cutlass.Int32(0):
                 s_cluster_partial[0] = s_iscalars[0]
@@ -1051,9 +1047,9 @@ class GvrTopKKernel:
 
         # ---- Retry-shrink loop (only if P2 didn't converge cleanly) ----
         # Phase 3 runs cluster-parallel — every CTA shrinks against its own
-        # slice but must agree on the threshold update. block_count_ge here
-        # therefore keeps the default do_cluster_aggregation=True so every
-        # CTA sees the same cluster-wide cand_count; cs=1 makes it a no-op.
+        # slice but must agree on the threshold update. block_count_ge
+        # always aggregates across the cluster, so every CTA sees the same
+        # cluster-wide cand_count; cs=1 makes the aggregation a no-op.
         if s_iscalars[1] != cutlass.Int32(1):
             # Re-count with current threshold (may already have stale cand_count)
             cur_thr = s_thr[0]
