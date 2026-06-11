@@ -52,10 +52,6 @@ def parse_args() -> argparse.Namespace:
         help="Text prompt for image generation.",
     )
     parser.add_argument(
-        "--negative_prompt",
-        help="Optional negative prompt.",
-    )
-    parser.add_argument(
         "--height",
         type=int,
         help="Output height in pixels. Defaults to the model setting.",
@@ -133,9 +129,6 @@ def main() -> None:
         if value is not None:
             setattr(params, name, value)
     params.num_images_per_prompt = args.num_images_per_prompt
-    if args.negative_prompt is not None:
-        params.negative_prompt = args.negative_prompt
-
     output = visual_gen.generate(inputs=args.prompt, params=params)
     saved = output.save(_output_paths(args.output_path, args.num_images_per_prompt))
     print(f"Saved image(s) to {saved}")

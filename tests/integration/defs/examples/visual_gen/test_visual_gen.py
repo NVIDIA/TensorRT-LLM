@@ -214,6 +214,12 @@ def _visual_gen_deps(llm_venv):
 
 
 @pytest.fixture(scope="session")
+def _visual_gen_image_deps(llm_venv):
+    """Install image-generation Python deps once per session."""
+    llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
+
+
+@pytest.fixture(scope="session")
 def vbench_repo_root(llm_venv):
     """Clone VBench repo into workspace and install; return repo root path."""
     workspace = llm_venv.get_working_directory()
