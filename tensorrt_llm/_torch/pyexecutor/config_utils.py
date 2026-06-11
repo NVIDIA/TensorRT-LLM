@@ -362,10 +362,24 @@ def load_pretrained_config(model_name_or_path: str,
             and architectures[0] == "Qwen3_5MoeForConditionalGeneration"))):
         # Qwen3.5-MoE VLM: HF native composite config + model-side normalizer.
         from tensorrt_llm._torch.models.modeling_qwen3_5 import \
-            _normalize_qwen35_moe_vl_config
+            _normalize_qwen35_vl_config
         model_config = transformers.Qwen3_5MoeConfig.from_pretrained(
             model_name_or_path, **kwargs)
-        _normalize_qwen35_moe_vl_config(model_config)
+        _normalize_qwen35_vl_config(model_config,
+                                    inner_arch="Qwen3_5MoeForCausalLM")
+    elif (model_type == "qwen3_5" and
+          (("text_config" in config_dict and "vision_config" in config_dict) or
+           (architectures
+            and architectures[0] == "Qwen3_5ForConditionalGeneration"))):
+        # Qwen3.5 dense VLM: HF native composite config + model-side normalizer.
+        # Must precede the text-only `qwen3_5` branch below so the composite
+        # config isn't flattened and vision_config dropped.
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
+            _normalize_qwen35_vl_config
+        model_config = transformers.Qwen3_5Config.from_pretrained(
+            model_name_or_path, **kwargs)
+        _normalize_qwen35_vl_config(model_config,
+                                    inner_arch="Qwen3_5ForCausalLM")
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

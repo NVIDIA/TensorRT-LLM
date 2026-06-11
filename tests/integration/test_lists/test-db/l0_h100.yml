@@ -61,6 +61,8 @@ l0_h100:
   # test must run on Hopper-or-newer GPUs. Peer Qwen3-VL / Qwen3-VL-MoE
   # tests stay on L40s because they're pure attention and don't trigger the GDN kernel.
   - unittest/_torch/modeling/test_modeling_qwen3_5_vl_moe.py::TestQwen3_5MoeVL::test_all
+  # Dense Qwen3.5-VL is the same hybrid family (sm90+ GDN kernel), so it lands here too.
+  - unittest/_torch/modeling/test_modeling_qwen3_5_vl.py::TestQwen3_5VL::test_all
   - unittest/disaggregated/test_disagg_utils.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py

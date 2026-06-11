@@ -1103,6 +1103,8 @@ class Qwen3VLModelBase(PreTrainedModel):
             llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
         elif self.original_arch == "Qwen3_5MoeForConditionalGeneration":
             llm_model_config.pretrained_config.architectures = ["Qwen3_5MoeForCausalLM"]
+        elif self.original_arch == "Qwen3_5ForConditionalGeneration":
+            llm_model_config.pretrained_config.architectures = ["Qwen3_5ForCausalLM"]
         else:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
         # Qwen3ForCausalLM.

@@ -39,7 +39,7 @@ from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_5 import (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM,
-                               Qwen3_5MoeVLModel)
+                               Qwen3_5MoeVLModel, Qwen3_5VLModel)
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import Qwen3VLModel
@@ -96,6 +96,7 @@ __all__ = [
     "Qwen3_5ForCausalLM",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeVLModel",
+    "Qwen3_5VLModel",
     "Qwen3NextForCausalLM",
     "Qwen3MoeVLModel",
     "GptOssForCausalLM",
