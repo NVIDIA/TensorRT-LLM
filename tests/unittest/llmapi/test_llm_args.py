@@ -1,3 +1,4 @@
+import math
 import tempfile
 from collections import defaultdict
 from dataclasses import is_dataclass
@@ -41,6 +42,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           LookaheadDecodingConfig, MoeConfig,
                                           MTPDecodingConfig, PeftCacheConfig,
                                           PybindMirror, RayPlacementConfig,
+                                          SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
                                           TorchLlmArgs, TrtLlmArgs,
@@ -2360,140 +2362,318 @@ class TestPydanticBestPractices:
 
 
 class TestSkipSoftmaxAttentionConfig:
-    """Mirror the documented LLM skip-softmax API.
+    """Test LLM Skip Softmax Attention config behavior."""
 
-    See docs/source/features/sparse-attention.md — Skip Softmax Attention.
-    """
-
-    # Checkpoint calibration metadata lives under sparse_attention_config
-    # config groups. Skip-softmax reads the single matching group instead of
-    # assuming a fixed group name.
-    CHECKPOINT_CONFIG: ClassVar[dict] = {
-        "sparse_attention_config": {
-            "config_groups": {
-                "group_0": {
-                    "algorithm": "skip_softmax",
-                    "targets": ["Attention"],
-                    "threshold_scale_factor": {
-                        "formula": "a * exp(b * target_sparsity)",
-                        "prefill": {
-                            "a": 100.0,
-                            "b": 5.0
-                        },
-                        "decode": {
-                            "a": 0.05,
-                            "b": 10.0
-                        },
+    CHECKPOINT_SPARSE_ATTENTION_CONFIG: ClassVar[dict] = {
+        "config_groups": {
+            "group_0": {
+                "algorithm": "skip_softmax",
+                "threshold_scale_factor": {
+                    "formula": "a * exp(b * target_sparsity)",
+                    "prefill": {
+                        "a": 100.0,
+                        "b": 5.0
                     },
-                    "target_sparsity": {
-                        "prefill": 0.5,
-                        "decode": 0.5
+                    "decode": {
+                        "a": 0.05,
+                        "b": 10.0
                     },
+                },
+                "target_sparsity": {
+                    "prefill": 0.5,
+                    "decode": 0.3
                 },
             },
         },
     }
+    CHECKPOINT_CONFIG: ClassVar[dict] = {
+        "sparse_attention_config": CHECKPOINT_SPARSE_ATTENTION_CONFIG,
+    }
 
-    def test_direct_threshold_scale_factor_per_phase(self):
-        # Doc: set threshold_scale_factor directly, as a {prefill, decode} dict.
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+    @classmethod
+    def _checkpoint_config(cls) -> dict:
+        import copy
 
-        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor={
+        return copy.deepcopy(cls.CHECKPOINT_CONFIG)
+
+    @staticmethod
+    def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
+        sparse_params = config.to_sparse_params(**kwargs)
+        return sparse_params.scheduler.get_kernel_params()
+
+    def test_python_api_parses_skip_softmax_config(self):
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            sparse_attention_config={
+                "algorithm": "skip_softmax",
+                "threshold_scale_factor": {
+                    "prefill": 1000.0,
+                    "decode": 500.0,
+                },
+            },
+        )
+
+        config = args.sparse_attention_config
+
+        assert isinstance(config, SkipSoftmaxAttentionConfig)
+        assert config.threshold_scale_factor == {
             "prefill": 1000.0,
-            "decode": 500.0
-        })
-        sparse_params = cfg.to_sparse_params()
-        params = sparse_params.scheduler.get_kernel_params()
-        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
-        assert params.threshold_scale_factor_decode == pytest.approx(500.0)
+            "decode": 500.0,
+        }
 
-    def test_direct_threshold_scale_factor_scalar(self):
-        # Doc: a single scalar applies to both phases.
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+    def test_yaml_api_parses_skip_softmax_config(self):
+        config_dict = yaml.safe_load("""
+sparse_attention_config:
+  algorithm: skip_softmax
+  target_sparsity:
+    prefill: 0.5
+    decode: 0.3
+""")
 
-        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
-        sparse_params = cfg.to_sparse_params()
-        params = sparse_params.scheduler.get_kernel_params()
+        args = TorchLlmArgs(model="/tmp/dummy_model", **config_dict)
+
+        config = args.sparse_attention_config
+        assert isinstance(config, SkipSoftmaxAttentionConfig)
+        assert config.target_sparsity == {
+            "prefill": 0.5,
+            "decode": 0.3,
+        }
+
+    @pytest.mark.parametrize("target_sparsity", [-0.1, 1.1])
+    def test_target_sparsity_scalar_must_be_in_unit_interval(
+            self, target_sparsity):
+        with pytest.raises(ValidationError, match="target_sparsity"):
+            SkipSoftmaxAttentionConfig(target_sparsity=target_sparsity)
+
+    @pytest.mark.parametrize("target_sparsity", [
+        {
+            "prefill": -0.1,
+            "decode": 0.3,
+        },
+        {
+            "prefill": 0.5,
+            "decode": 1.1,
+        },
+    ])
+    def test_target_sparsity_phase_values_must_be_in_unit_interval(
+            self, target_sparsity):
+        with pytest.raises(ValidationError, match="target_sparsity"):
+            SkipSoftmaxAttentionConfig(target_sparsity=target_sparsity)
+
+    def test_direct_threshold_scale_factor_scalar_does_not_need_checkpoint(
+            self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        params = self._kernel_params(config)
+
         assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
         assert params.threshold_scale_factor_decode == pytest.approx(1000.0)
 
-    def test_resolve_target_sparsity_per_phase(self):
-        # Doc: target_sparsity resolved through the checkpoint formula.
-        import math
-
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
-            "prefill": 0.5,
-            "decode": 0.5
+    def test_direct_threshold_scale_factor_can_be_configured_per_phase(self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor={
+            "prefill": 1000.0,
+            "decode": 500.0,
         })
-        params = cfg.to_sparse_params(checkpoint_config=self.CHECKPOINT_CONFIG
-                                      ).scheduler.get_kernel_params()
-        assert params.threshold_scale_factor_prefill == pytest.approx(
-            100.0 * math.exp(5.0 * 0.5))
-        assert params.threshold_scale_factor_decode == pytest.approx(
-            0.05 * math.exp(10.0 * 0.5))
 
-    def test_resolve_target_sparsity_scalar(self):
-        import math
+        params = self._kernel_params(config)
 
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(500.0)
 
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
-        params = cfg.to_sparse_params(checkpoint_config=self.CHECKPOINT_CONFIG
-                                      ).scheduler.get_kernel_params()
+    def test_target_sparsity_scalar_uses_checkpoint_formula_for_each_phase(
+            self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
+
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
+
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.3))
         assert params.threshold_scale_factor_decode == pytest.approx(
             0.05 * math.exp(10.0 * 0.3))
 
-    def test_threshold_scale_factor_wins_over_target_sparsity(self):
-        # Doc: threshold_scale_factor takes precedence when both are set.
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+    def test_target_sparsity_can_be_configured_per_phase(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity={
+            "prefill": 0.5,
+            "decode": 0.3,
+        })
 
-        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0,
-                                         target_sparsity=0.5)
-        params = cfg.to_sparse_params(checkpoint_config=self.CHECKPOINT_CONFIG
-                                      ).scheduler.get_kernel_params()
-        assert params.threshold_scale_factor_prefill == 1000.0
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
 
-    def test_resolve_checkpoint_target_sparsity(self):
-        # Doc: checkpoint metadata may carry target_sparsity with the formula.
-        import math
-
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
-        cfg = SkipSoftmaxAttentionConfig()
-        params = cfg.to_sparse_params(checkpoint_config=self.CHECKPOINT_CONFIG
-                                      ).scheduler.get_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.5))
         assert params.threshold_scale_factor_decode == pytest.approx(
-            0.05 * math.exp(10.0 * 0.5))
+            0.05 * math.exp(10.0 * 0.3))
 
-    def test_multiple_skip_softmax_groups_raise(self):
-        import copy
+    def test_checkpoint_target_sparsity_default_is_used_when_user_omits_it(
+            self):
+        config = SkipSoftmaxAttentionConfig()
 
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
 
-        checkpoint_config = copy.deepcopy(self.CHECKPOINT_CONFIG)
-        groups = checkpoint_config["sparse_attention_config"]["config_groups"]
-        groups["group_1"] = copy.deepcopy(groups["group_0"])
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.3))
 
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
-        with pytest.raises(ValueError, match="multiple skip-softmax"):
-            cfg.to_sparse_params(checkpoint_config=checkpoint_config
-                                 ).scheduler.get_kernel_params()
+    def test_checkpoint_formula_can_be_shared_by_prefill_and_decode(self):
+        checkpoint_config = {
+            "sparse_attention_config": {
+                "config_groups": {
+                    "group_0": {
+                        "algorithm": "skip_softmax",
+                        "threshold_scale_factor": {
+                            "formula": "sqrt(a + target_sparsity)",
+                            "a": 0.75,
+                        },
+                        "target_sparsity": 0.25,
+                    },
+                },
+            },
+        }
+        config = SkipSoftmaxAttentionConfig()
 
-    def test_resolve_without_formula_raises(self):
-        # Doc: target_sparsity is unusable if the checkpoint ships no formula.
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+        params = self._kernel_params(config,
+                                     checkpoint_config=checkpoint_config)
 
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+        assert params.threshold_scale_factor_prefill == pytest.approx(1.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(1.0)
+
+    def test_user_target_sparsity_overrides_checkpoint_default(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity={
+            "prefill": 0.2,
+            "decode": 0.4,
+        })
+
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.2))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.4))
+
+    def test_threshold_scale_factor_wins_over_target_sparsity_without_checkpoint(
+            self):
+        config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": 1000.0,
+                "decode": 500.0,
+            },
+            target_sparsity=0.9,
+        )
+
+        params = self._kernel_params(config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(500.0)
+
+    def test_target_sparsity_requires_checkpoint_formula(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+
         with pytest.raises(ValueError, match="formula"):
-            cfg.to_sparse_params(checkpoint_config={
-                "prefill": {
-                    "a": 1.0,
-                    "b": 2.0
-                }
-            }).scheduler.get_kernel_params()
+            config.to_sparse_params(
+                checkpoint_config={
+                    "sparse_attention_config": {
+                        "config_groups": {
+                            "group_0": {
+                                "algorithm": "skip_softmax",
+                                "target_sparsity": 0.5,
+                            },
+                        },
+                    },
+                })
+
+    def test_other_checkpoint_groups_do_not_affect_skip_softmax_group_selection(
+            self):
+        checkpoint_config = self._checkpoint_config()
+        checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_1"] = {
+                "algorithm": "rocket",
+                "prompt_budget": 2048,
+            }
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+
+        params = self._kernel_params(config,
+                                     checkpoint_config=checkpoint_config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+
+    def test_checkpoint_ignore_patterns_disable_matching_module_name(self):
+        checkpoint_config = self._checkpoint_config()
+        group = checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_0"]
+        group["ignore"] = [
+            "model.layers.0.self_attn",
+            "model.layers.1.*",
+        ]
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        assert (config.to_sparse_params(
+            module_name="model.layers.0.self_attn",
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        assert (config.to_sparse_params(
+            module_name="model.layers.1.self_attn",
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        params = self._kernel_params(
+            config,
+            module_name="model.layers.2.self_attn",
+            checkpoint_config=checkpoint_config,
+        )
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+
+    def test_checkpoint_ignore_patterns_match_layer_idx_aliases(self):
+        checkpoint_config = self._checkpoint_config()
+        group = checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_0"]
+        group["ignore"] = ["model.layers.0.self_attn"]
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        assert (config.to_sparse_params(
+            layer_idx=0,
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        params = self._kernel_params(
+            config,
+            layer_idx=1,
+            checkpoint_config=checkpoint_config,
+        )
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+
+    def test_multiple_skip_softmax_checkpoint_groups_are_invalid(self):
+        checkpoint_config = self._checkpoint_config()
+        groups = checkpoint_config["sparse_attention_config"]["config_groups"]
+        groups["group_1"] = {
+            "algorithm": "rocket",
+            "prompt_budget": 2048,
+        }
+        groups["group_2"] = dict(groups["group_0"])
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+
+        with pytest.raises(ValueError, match="multiple skip-softmax"):
+            config.to_sparse_params(checkpoint_config=checkpoint_config)
+
+    def test_ckpt_sparse_attention_config_can_be_passed_directly(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+
+        params = self._kernel_params(
+            config,
+            ckpt_sparse_attention_config=self.
+            CHECKPOINT_SPARSE_ATTENTION_CONFIG,
+        )
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))

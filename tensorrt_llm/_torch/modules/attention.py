@@ -536,8 +536,8 @@ class Attention(nn.Module):
 
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (sparse_attn_cfg.to_sparse_params(
-            pretrained_config=config.pretrained_config)
-                         if sparse_attn_cfg is not None else None)
+            pretrained_config=config.pretrained_config,
+            layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
 
         attn_cls = get_attention_backend(
             self.attn_backend, sparse_attention_config=sparse_attn_cfg)
@@ -1296,9 +1296,10 @@ class MLA(nn.Module):
             self.register_to_config = True
 
         config = config or ModelConfig()
-        sparse_params = (config.sparse_attention_config.to_sparse_params(
-            pretrained_config=config.pretrained_config) if
-                         config.sparse_attention_config is not None else None)
+        sparse_attn_cfg = config.sparse_attention_config
+        sparse_params = (sparse_attn_cfg.to_sparse_params(
+            pretrained_config=config.pretrained_config,
+            layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
 
         # Currently only DSA sparse attention is supported.
         if getattr(sparse_params, "algorithm", None) == "dsa":
