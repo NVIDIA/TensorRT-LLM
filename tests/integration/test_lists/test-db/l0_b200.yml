@@ -214,8 +214,12 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_offloading.py
-  - unittest/_torch/visual_gen/test_wan22_t2v_offload.py
-  - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py
+  # Heavyweight offload accuracy tests (double pipeline load) run in post_merge;
+  # keep only lightweight smoke + error-path coverage in pre_merge.
+  - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_offload
+  - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWanT2VOffloadCudaGraphRaisesError::test_wan22_raises_if_cuda_graph_and_offload_enabled
+  - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_forward
+  - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3OffloadCudaGraphRaisesError::test_cosmos3_raises_if_cuda_graph_and_offload_enabled
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
@@ -225,7 +229,6 @@ l0_b200:
   - examples/test_visual_gen.py::test_ltx2_example
   - examples/test_visual_gen.py::test_wan_i2v_example
   - examples/test_visual_gen.py::test_cosmos3_example
-  - examples/test_visual_gen.py::test_wan_t2v_example_with_offloading
   # - examples/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
@@ -329,6 +332,12 @@ l0_b200:
   - examples/test_visual_gen.py::test_ltx2_lpips_against_golden
   - examples/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
   - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  # Heavyweight CPU-offload accuracy tests (each loads the full pipeline twice:
+  # offload + baseline). Kept in post_merge to bound the B200 pre_merge wall-time.
+  - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_offload_matches_baseline
+  - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_fp8_offload_matches_baseline
+  - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
+  - examples/test_visual_gen.py::test_wan_t2v_example_with_offloading
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
 # ------------- AutoDeploy Backend Stages ---------------
