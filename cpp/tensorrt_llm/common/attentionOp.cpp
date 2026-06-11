@@ -1129,7 +1129,15 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
-        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
+        // Override mMaxSeqLenKv with the max cache capacity so FMHA picks the same kernel as
+        // CUDA graph warmup and avoids the eager-mode JIT miss/recompile. The trtllm-gen FMHA
+        // JIT warmup grid added by PR #14851 does not cover the (HVPerCta256, MultiCtasKv-no-Cga)
+        // variant that the autotuner picks for DeepSeek-R1 MLA at runtime kv-len, so without this
+        // override an eager JIT miss costs ~20s mid-benchmark on every cache miss. Safe for PagedKv:
+        // strides do not depend on mMaxSeqLenKv, and extra KV CTAs exit early through seqLensKvPtr.
+        // TODO: mirror the is_swa + W+1 logic from xqaDispatcher.cpp when MLA gains SWA support
+        // (also requires adding Sliding cubins to the MLA gen kernel set).
+        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_attention_window_size;
         tllmRunnerParams.mJITWarmup = generation_params.trtllm_gen_jit_warmup;
         tllmRunnerParams.mJITWarmupMaxNumRequests = mMaxNumRequests;
         tllmRunnerParams.mJITWarmupMaxSeqLenQ = mMaxContextLength;
