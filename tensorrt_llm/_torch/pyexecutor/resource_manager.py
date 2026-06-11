@@ -3,6 +3,7 @@
 
 import copy
 import enum
+import hashlib
 import math
 import os
 from abc import ABC, abstractmethod
@@ -3085,11 +3086,10 @@ class KVCacheManagerV2(BaseResourceManager):
                         all_tokens, req, end=len(all_tokens) - 1)
                 else:
                     tokens = None
-                kv_cache = self._create_kv_cache(
-                    req.py_request_id,
-                    req.lora_task_id,
-                    tokens,
-                    cache_salt_id=req.cache_salt_id)
+                kv_cache = self._create_kv_cache(req.py_request_id,
+                                                 req.lora_task_id,
+                                                 tokens,
+                                                 cache_salt=req.cache_salt)
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
@@ -3212,11 +3212,10 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
-                    kv_cache = self._create_kv_cache(
-                        req.py_request_id,
-                        req.lora_task_id,
-                        None,
-                        cache_salt_id=req.cache_salt_id)
+                    kv_cache = self._create_kv_cache(req.py_request_id,
+                                                     req.lora_task_id,
+                                                     None,
+                                                     cache_salt=req.cache_salt)
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -3384,7 +3383,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if prepare_resource:
                 # Dummy/warmup request. ``stop_committing()`` below blocks all
                 # writes to the radix tree, so the choice of branch does not
-                # affect committed state. ``cache_salt_id`` is left defaulted
+                # affect committed state. ``cache_salt`` is left defaulted
                 # to None to avoid coupling synthetic data to any salted branch.
                 kv_cache = self._create_kv_cache(req.py_request_id,
                                                  req.lora_task_id, input_tokens)
@@ -3763,7 +3762,7 @@ class KVCacheManagerV2(BaseResourceManager):
                          request_id: int,
                          lora_task_id: int | None,
                          input_tokens: Sequence[TokenIdExt] | None,
-                         cache_salt_id: int | None = None):
+                         cache_salt: str | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
@@ -3772,8 +3771,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Skipping KV cache creation; request will retry next iteration.",
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
+        # ReuseScope.salt is int|None; derive a deterministic int from the
+        # cache_salt string so the same string yields the same reuse namespace
+        # across processes (matches C++ blockKey hashing on cacheSalt).
+        salt_int = (int.from_bytes(
+            hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
+                    if cache_salt is not None else None)
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
+            ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
         )
         self.kv_cache_map[request_id] = kv_cache

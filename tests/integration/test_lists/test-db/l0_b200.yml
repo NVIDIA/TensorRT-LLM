@@ -189,6 +189,7 @@ l0_b200:
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_visual_gen_params.py
+  - unittest/_torch/visual_gen/test_visual_gen_utils.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_cache_dit.py
@@ -217,6 +218,11 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - examples/test_visual_gen.py::test_wan_t2v_example
+  - examples/test_visual_gen.py::test_flux1_example
+  - examples/test_visual_gen.py::test_flux2_example
+  - examples/test_visual_gen.py::test_ltx2_example
+  - examples/test_visual_gen.py::test_wan_i2v_example
+  - examples/test_visual_gen.py::test_cosmos3_example
   # - examples/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]

@@ -714,8 +714,9 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
-    /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
     /// @param disaggRequestId Disaggregated request ID.
+    /// @param cacheSalt Optional cache salt string. If provided, KV cache blocks are tagged so reuse is limited to
+    /// requests with the same salt. The string is also surfaced in KV cache events. Defaults to std::nullopt.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -743,8 +744,7 @@ public:
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<IdType> disaggRequestId = std::nullopt);
+        std::optional<IdType> disaggRequestId = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -792,7 +792,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
-    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
+    [[nodiscard]] std::optional<std::string> getCacheSalt() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
     [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
 
@@ -829,7 +829,7 @@ public:
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
-    void setCacheSaltID(CacheSaltIDType cacheSaltID);
+    void setCacheSalt(std::optional<std::string> cacheSalt);
     void setDisaggRequestId(IdType disaggRequestId);
 
 private:
@@ -1729,13 +1729,14 @@ struct KVCacheStoredBlockData
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
         std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
-        std::vector<MmKey> mmKeys = {})
+        std::vector<MmKey> mmKeys = {}, std::optional<std::string> cacheSalt = std::nullopt)
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
         , mmKeys{std::move(mmKeys)}
+        , cacheSalt{std::move(cacheSalt)}
     {
     }
 
@@ -1751,6 +1752,8 @@ struct KVCacheStoredBlockData
     SizeType32 priority;
     /// @brief The multimodal keys of the block
     std::vector<MmKey> mmKeys;
+    /// @brief The original cache salt string of the block, if any
+    std::optional<std::string> cacheSalt;
 };
 
 struct KVCacheStoredData

@@ -785,7 +785,8 @@ accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_auto_dtype[tp_size=8-ep_size=8] TIMEOUT (90)
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=0] TIMEOUT (90)
 accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] TIMEOUT (90)
-accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4] TIMEOUT (90)
+accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4-mtp_nextn=0] TIMEOUT (90)
+accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4-mtp_nextn=3] TIMEOUT (90)
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-eager]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp]
@@ -812,11 +813,18 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_VL_7B::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL::test_auto_dtype[forced_chunked_prefill]
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL_MOE::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8]
-accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_fp8_block_scales TIMEOUT (120)
-accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4 TIMEOUT (120)
+accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_fp8_block_scales[mtp_nextn=0] TIMEOUT (120)
+accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_fp8_block_scales[mtp_nextn=3] TIMEOUT (120)
+accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4[mtp_nextn=0] TIMEOUT (120)
+accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4[mtp_nextn=3] TIMEOUT (120)
 accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
 unittest/disaggregated/test_openai_disagg_server.py
+disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff
+disaggregated/test_ad_disagg.py::test_async_generation_matches_aggregate
+disaggregated/test_ad_disagg.py::test_async_generation_no_overlap_matches_aggregate
+disaggregated/test_ad_disagg.py::test_async_sharded_generation_handoff
+disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
 disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin]

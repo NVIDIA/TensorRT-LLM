@@ -892,7 +892,17 @@ public:
                 enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask->data_ptr<int32_t>();
                 enqueue_params.spec_decoding_is_generation_length_variable = true;
                 TLLM_CHECK(spec_decoding_position_offsets_for_cpp->dim() == 2); // [batch_size, max_draft_len + 1]
-                enqueue_params.spec_decoding_max_generation_length = spec_decoding_position_offsets_for_cpp->sizes()[1];
+                if (useTllmGen)
+                {
+                    // Blackwell uses the padded packed-mask row dim as the mask stride.
+                    TLLM_CHECK(spec_decoding_packed_mask->dim() == 3);
+                    enqueue_params.spec_decoding_max_generation_length = spec_decoding_packed_mask->sizes()[1];
+                }
+                else
+                {
+                    enqueue_params.spec_decoding_max_generation_length
+                        = spec_decoding_position_offsets_for_cpp->sizes()[1];
+                }
             }
 
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
@@ -999,7 +1009,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
     std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-    std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance)
+    std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
+    std::optional<int64_t> spec_decoding_target_max_draft_tokens)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1146,6 +1157,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecodingEnabled = is_spec_decoding_enabled;
     op->mUseSpecDecoding = use_spec_decoding;
     op->mIsSpecDecTree = is_spec_dec_tree;
+    // Include static tree length in the AttentionOp cache key.
+    if (spec_decoding_target_max_draft_tokens.has_value() && op->mSpecDecodingTargetMaxGenLen == 0)
+    {
+        op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;
+    }
 
     op->mUseSparseAttention = false;
     op->mUseTllmGenSparseAttentionPaged = false;

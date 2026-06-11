@@ -997,6 +997,8 @@ private:
         options.mIsCustomSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && params.mIsSpecDecTree;
         options.mIsCausalSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && !params.mIsSpecDecTree;
         options.mNumSpecDecodingTokens = !isContext && params.mMaxSeqLenQ > 1 ? params.mMaxSeqLenQ : 0;
+        // Carry static tree length into FMHA kernel selection.
+        options.mSpecDecodingTargetMaxGenLen = params.mSpecDecodingTargetMaxGenLen;
 
         options.mIsTrtllmLayout = true;
     }
@@ -1020,9 +1022,24 @@ private:
         // loop. And the number of loops are not the same in different tasks.
         sstream << "\"checksTaskSchedules\": false,\n";
 
+        bool hasCompileDefs = false;
+        auto writeCompileDef = [&](char const* compileDef)
+        {
+            if (!hasCompileDefs)
+            {
+                sstream << "\"compileDefs\": [";
+                hasCompileDefs = true;
+            }
+            else
+            {
+                sstream << ", ";
+            }
+            sstream << "\"" << compileDef << "\"";
+        };
+
         if (options.mIsExportingCubin)
         {
-            sstream << "\"compileDefs\": [\"-DTLLM_EXPORT_CUBIN\"],\n";
+            writeCompileDef("-DTLLM_EXPORT_CUBIN");
         }
 
         // Set compile flags for E2M1 KV kernel benchmark.
@@ -1030,7 +1047,18 @@ private:
         if (options.mChecksResults == 0 && options.mDtypeKv == tg::Dtype::E2m1)
         {
             TLLM_LOG_INFO("Forcing -DTLLM_BENCHMARK_E2M1_KV_CACHE for E2m1 Kv. The results are not correct.");
-            sstream << "\"compileDefs\": [\"-DTLLM_BENCHMARK_E2M1_KV_CACHE\"],\n";
+            writeCompileDef("-DTLLM_BENCHMARK_E2M1_KV_CACHE");
+        }
+
+        // SwapsMmaAb NVRTC kernels already emit __launch_bounds__; avoid a CUDA 13 .reqntid/.maxntid conflict.
+        if (shouldUseNvrtc(options) && options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration)
+        {
+            writeCompileDef("-DTLLM_DISABLE_BLOCK_SIZE");
+        }
+
+        if (hasCompileDefs)
+        {
+            sstream << "],\n";
         }
 
         // Enable programmatic dependent launch.
