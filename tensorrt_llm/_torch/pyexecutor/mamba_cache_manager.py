@@ -29,16 +29,18 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
+from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
-    PoolConfiguration, get_pp_layers)
+    BaseResourceManager,
+    CacheTypeCpp,
+    DataType,
+    KVCacheManager,
+    PoolConfiguration,
+    get_pp_layers,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
-                                 torch_dtype_to_binding)
-from tensorrt_llm.bindings.internal.batch_manager import (
-    LinearAttentionMetadata, LinearCacheType)
+from tensorrt_llm._utils import nvtx_range, prefer_pinned, torch_dtype_to_binding
+from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata, LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -643,12 +645,15 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                        dtype=torch.int32,
                                                        device=device)
 
-        # Store max_batch_size for resource management
+        # Physical tensor rows include reserved dummy slots. Resource capacity
+        # is the number of real request slots remaining after those
+        # reservations.
         self._max_batch_size = max_batch_size
+        self._max_resource_count = len(self.mamba_cache_free_blocks)
 
     def get_max_resource_count(self) -> int:
-        """Return the maximum number of sequences that can be cached."""
-        return self._max_batch_size
+        """Return the maximum number of real requests that can be cached."""
+        return self._max_resource_count
 
     def filter_ctx_requests_by_capacity(self, context_requests: list) -> list:
         """Return the prefix of *context_requests* that fits in the
@@ -683,6 +688,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                self.mamba_cache.cache_buf_idx[block] = 0
             if self._mamba_ssm_rand_seed is not None:
                 # Deterministic per-slot rotation on fresh assignment.
                 # `block` is pulled from mamba_cache_free_blocks, which
@@ -708,8 +714,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         # cuda_graph_runner caches one dummy per runtime_draft_len value
         # (see _get_padded_batch), so any id in the range of dummy request IDs
         # may be live concurrently.
-        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-            CUDA_GRAPH_DUMMY_REQUEST_ID
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
         max_dl = self.speculative_num_draft_tokens or 0
         return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
                 CUDA_GRAPH_DUMMY_REQUEST_ID)
@@ -1479,8 +1484,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
         self.replay_step_width: Optional[int] = (
-            spec_config.max_draft_len +
-            1 if spec_config is not None and use_replay_state_update else None)
+            spec_config.tokens_per_gen_step
+            if spec_config is not None and use_replay_state_update else None)
         self.replay_history_size: Optional[int] = (
             max(MIN_REPLAY_HISTORY_SIZE, self.replay_step_width)
             if self.replay_step_width is not None else None)
@@ -1693,8 +1698,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         ``T = budget // bytes_per_token``.
         """
         # Lazy import to avoid pulling config_utils into module import order.
-        from tensorrt_llm._torch.pyexecutor.config_utils import \
-            extract_mamba_kv_cache_params
+        from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
 
         # Attention slope from the parent's existing formula.
         attention_slope = KVCacheManager.get_cache_size_per_token(

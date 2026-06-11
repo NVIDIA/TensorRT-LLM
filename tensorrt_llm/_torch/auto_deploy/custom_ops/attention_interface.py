@@ -2144,7 +2144,7 @@ class ReplayOldXHandler(StateResourceHandler):
 class ReplayOldBHandler(StateResourceHandler):
     """Per-layer old_B cache for the replay SSM kernel (double-buffered, bf16).
 
-    Shape: (max_batch, 2, T, n_groups, d_state) — T from manager.
+    Shape: (max_batch, 2, replay_history_size, n_groups, d_state).
     Routes to MambaHybridCacheManager via get_replay_old_B(layer_idx).
     """
 
@@ -2172,7 +2172,7 @@ class ReplayOldBHandler(StateResourceHandler):
 class ReplayOldDtHandler(StateResourceHandler):
     """Per-layer old_dt cache for the replay SSM kernel (double-buffered, fp32).
 
-    Shape: (max_batch, 2, num_heads, T) — T from manager.
+    Shape: (max_batch, 2, num_heads, replay_history_size).
     Routes to MambaHybridCacheManager via get_replay_old_dt(layer_idx).
     """
 
@@ -2194,7 +2194,7 @@ class ReplayOldDtHandler(StateResourceHandler):
 class ReplayOldDAcumsumHandler(StateResourceHandler):
     """Per-layer old_dA_cumsum cache for the replay SSM kernel (double-buffered, fp32).
 
-    Shape: (max_batch, 2, num_heads, T) — T from manager.
+    Shape: (max_batch, 2, num_heads, replay_history_size).
     Routes to MambaHybridCacheManager via get_replay_old_dA_cumsum(layer_idx).
     """
 

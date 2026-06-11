@@ -51,6 +51,20 @@ def _make_mgr(
 
 
 @skip_no_cuda
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_python_mamba_resource_count_excludes_reserved_dummy_slots(enable_attention_dp):
+    max_batch_size = 4
+    mgr = _make_mgr(
+        max_batch_size=max_batch_size,
+        max_draft_len=2,
+        enable_attention_dp=enable_attention_dp,
+    )
+
+    assert mgr.get_max_resource_count() == max_batch_size
+    assert len(mgr.mamba_cache_free_blocks) == max_batch_size
+
+
+@skip_no_cuda
 def test_padding_slot_not_held_by_parked_real():
     """Padding must not resolve to a slot owned by a parked real
     request outside the current batch."""
@@ -163,6 +177,33 @@ def test_replay_update_mamba_states_uses_history_window():
     assert mgr.mamba_cache.cache_buf_idx[slot_checkpointed].item() == 0
     assert torch.all(mgr.mamba_cache.conv[:, slot_appended] == 11.0)
     assert torch.all(mgr.mamba_cache.conv[:, slot_checkpointed] == 13.0)
+
+
+@skip_no_cuda
+def test_replay_update_mamba_states_skips_dummy_slots():
+    mgr = _make_mgr(max_batch_size=2, max_draft_len=5, use_replay_state_update=True)
+    mgr._prepare_mamba_cache_blocks([100])
+    mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
+
+    real_slot = mgr.mamba_cache_index[100]
+    dummy_slot = mgr.mamba_cache_index[CUDA_GRAPH_DUMMY_REQUEST_ID]
+    mgr.mamba_cache.prev_num_accepted_tokens[real_slot] = 13
+    mgr.mamba_cache.prev_num_accepted_tokens[dummy_slot] = 13
+    mgr.mamba_cache.cache_buf_idx[real_slot] = 1
+    mgr.mamba_cache.cache_buf_idx[dummy_slot] = 1
+
+    state_indices = torch.tensor([real_slot, dummy_slot], dtype=torch.int32, device="cuda")
+    attn = SimpleNamespace(num_seqs=2, num_contexts=0)
+    mgr.update_mamba_states(
+        attn,
+        torch.tensor([3, 3], dtype=torch.int32, device="cuda"),
+        state_indices=state_indices,
+    )
+
+    assert mgr.mamba_cache.prev_num_accepted_tokens[real_slot].item() == 3
+    assert mgr.mamba_cache.prev_num_accepted_tokens[dummy_slot].item() == 13
+    assert mgr.mamba_cache.cache_buf_idx[real_slot].item() == 0
+    assert mgr.mamba_cache.cache_buf_idx[dummy_slot].item() == 1
 
 
 @skip_no_cuda

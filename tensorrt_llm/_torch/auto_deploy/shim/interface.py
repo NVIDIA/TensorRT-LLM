@@ -927,6 +927,9 @@ class CachedSequenceInterface:
         )
         pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
         active_cache_buf_idx = cache_buf_idx[cache_slot_idx].to(torch.int32)
+
+        # Keep field order and write-first partitioning in sync with the
+        # PyTorch replay metadata path in mamba2_metadata.py.
         writes = pnat + replay_metadata.replay_step_width > replay_metadata.replay_history_size
         writes_i32 = writes.to(torch.int32)
         write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32

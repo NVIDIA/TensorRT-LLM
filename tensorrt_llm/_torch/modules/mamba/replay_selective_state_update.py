@@ -176,9 +176,8 @@ def _stochastic_round_int16_packed(x: tl.tensor, rand: tl.tensor, offs_n: tl.ten
     return tl.extra.cuda.libdevice.floor(x + rand01)
 
 
-# Precompute kernel: CB_scaled, decay_vec.  Writes new cache (old_B,
-# old_dt, old_dA_cumsum) to the WRITE buffer slot for next step's replay.
-# Grid: (batch, nheads // HEADS_PER_BLOCK).
+# Replay-style precompute body.  Computes CB_scaled/decay_vec in T-space and
+# writes this step's B/dt/dA_cumsum to the selected cache buffer.
 
 
 @triton.jit()
@@ -261,12 +260,12 @@ def _replay_precompute_impl(
     HEADS_PER_BLOCK: tl.constexpr,
     # Checkpoint write flag — selects target buffer + offset for new-token
     # cache writes.  See "Cache write semantics" block below.
-    # Runtime (not constexpr): the only WRITE_CHECKPOINT-dependent code in
+    # Runtime (not constexpr): the only checkpoint-dependent code in
     # this body is the write_buf/write_offset selection, which is plain
     # arithmetic — no constexpr-shaped tile or whole-block gate.  Letting
     # it be runtime lets the dynamic dispatch kernel call us once with the
     # per-slot needs_write flag instead of inlining two specializations.
-    write_checkpoint,
+    needs_checkpoint_write,
 ):
     pid_b = tl.program_id(axis=0)
     pid_hg = tl.program_id(axis=1)  # head-group index
@@ -289,7 +288,7 @@ def _replay_precompute_impl(
     #       before the caller flips to the staging buffer.
     buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
-    if write_checkpoint:
+    if needs_checkpoint_write:
         write_buf = 1 - buf_active
         write_offset = 0
     else:
@@ -305,11 +304,8 @@ def _replay_precompute_impl(
     causal_mask = offs_t[:, None] >= offs_t[None, :]
     valid_mask = causal_mask & t_mask[:, None] & t_mask[None, :]
 
-    # --- Vectorized pre-wait phase across HEADS_PER_BLOCK heads ---
-    # Compute dt, dA_cumsum, decay_vec as (H, T) tiles.  Pre-compute
-    # scale_combo = decay_matrix * dt[:, None, :] as an (H, T, T) tile that
-    # stays in registers across gdc_wait — eliminates the post-wait reload
-    # of dt + dA_cumsum and the per-head loop.
+    # --- Pre-wait phase across HEADS_PER_BLOCK heads ---
+    # Compute dt, dA_cumsum, decay_vec, and scale_combo as head-block tiles.
     offs_h = tl.arange(0, HEADS_PER_BLOCK)
     heads_block = first_head + offs_h  # (H,)
 
@@ -337,9 +333,9 @@ def _replay_precompute_impl(
     # this step's per-step-restarted cumsum before storing so the buffer
     # holds one continuous cumsum across N back-to-back nowrites.  Write path
     # (write_buf = 1 - buf_active, write_offset = 0) starts fresh, no prefix.
-    # Both branches are on scalar runtime values (write_checkpoint and PNAT),
-    # uniform across the block — use scalar if to short-circuit the load.
-    if write_checkpoint or prev_num_accepted_tokens == 0:
+    # Both branches are on scalar runtime values (checkpoint predicate and
+    # PNAT), uniform across the block — use scalar if to short-circuit the load.
+    if needs_checkpoint_write or prev_num_accepted_tokens == 0:
         prev_total = tl.zeros((HEADS_PER_BLOCK,), dtype=tl.float32)
     else:
         last_cumsum_ptrs = (
@@ -380,12 +376,10 @@ def _replay_precompute_impl(
     tl.store(decay_vec_addrs, decay_vec, mask=t_mask[None, :])
 
     # scale_combo (H, T, T) = exp(dA_cumsum[h, t1] - dA_cumsum[h, t2]) * dt[h, t2]
-    # Stays live across gdc_wait — used post-wait to compute CB_scaled.
     decay_matrix = tl.exp(dA_cumsum[:, :, None] - dA_cumsum[:, None, :])  # (H, T, T)
     scale_combo = decay_matrix * dt[:, None, :]  # (H, T, T)
 
-    # --- Wait for upstream kernel (external PDL) before loading B and C ---
-    # All dt processing above is independent of conv1d outputs.
+    # Wait for conv1d before loading this step's B/C.
     if LAUNCH_WITH_PDL:
         _gdc_wait_with_memory_clobber()
 
@@ -424,9 +418,9 @@ def _replay_precompute_impl(
             mask=t_mask[:, None] & n_mask[None, :],
         )
 
-    # --- Vectorized post-wait phase: scale_combo (H, T, T) is still live in
-    # registers from pre-wait; multiply by raw_CB (T, T), apply causal mask,
-    # store as one (H, T, T) tile. ---
+    # --- Post-wait CB precompute ---
+    # Combine raw_CB with scale_combo, apply the causal mask, and store one
+    # (H, T, T) tile.
     CB_scaled_block = tl.where(
         valid_mask[None, :, :],
         raw_CB[None, :, :] * scale_combo,
@@ -443,9 +437,8 @@ def _replay_precompute_impl(
     tl.store(cb_scaled_addrs, CB_scaled_block, mask=cb_store_mask)
 
 
-# Replay-style precompute kernel.  Thin wrapper around _replay_precompute_impl
-# that carries the @triton.heuristics for constexpr derivation; called from
-# the Python wrapper on the replay-style path (write or replay-nowrite).
+# Rectangle nowrite precompute body.  Builds a window-space CB tile with
+# history at [0, PNAT) and this step's values at [PNAT, PNAT + T).
 @triton.jit()
 def _rectangle_precompute_impl(
     # Input pointers
@@ -455,8 +448,8 @@ def _rectangle_precompute_impl(
     B_ptr,
     C_ptr,
     # Output pointers
-    cb_scaled_ptr,  # (batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_K) — rectangle window
-    decay_vec_ptr,  # (batch, nheads, BLOCK_SIZE_T) — total_decay * exp(cumAdt_new[t])
+    cb_scaled_ptr,  # rectangle window: (batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_K)
+    decay_vec_ptr,  # total_decay * exp(cumAdt_new[t]): (batch, nheads, BLOCK_SIZE_T)
     # Cache pointers (both buffers reachable via stride_*_dbuf).  Nowrite
     # path: read from buf_active at [0, PNAT), write new tokens at
     # [PNAT, PNAT+T) of buf_active (same buffer).
@@ -554,8 +547,6 @@ def _rectangle_precompute_impl(
     heads_block = first_head + offs_h
 
     # Precompute this step's (H, T) dt and continuous dA_cumsum tiles.
-    # Keep them in registers for the rectangle path below; reloading from
-    # global memory after storing would create a same-kernel write/read race.
     dt_addrs = (
         dt_ptr
         + pid_b * stride_dt_batch
@@ -607,9 +598,7 @@ def _rectangle_precompute_impl(
         mask=t_mask[None, :],
     )
 
-    # ---- Work independent of conv1d ----
-    # Load historical cache and build combo_block before gdc_wait so this
-    # work can overlap the upstream conv1d latency.
+    # Build the history side of combo_block from cached data.
     group_idx = first_head // nheads_ngroups_ratio
 
     # Group-level: history B from active buffer at [0, PNAT) of the window.
@@ -626,9 +615,6 @@ def _rectangle_precompute_impl(
         mask=is_history_position[:, None] & n_mask[None, :],
         other=0.0,
     )
-
-    # combo_block stays in registers across gdc_wait and is used directly
-    # after the wait to compute rect_CB_scaled.
 
     # Per-head read bases (H,) - broadcast with offs_window for 2D loads.
     old_dt_read_h = (
@@ -656,10 +642,7 @@ def _rectangle_precompute_impl(
         mask=history_mask_h,
         other=0.0,
     ).to(tl.float32)
-    # Use loop-1 registers for this step's newly appended tokens.  These are
-    # exactly the values stored above at [PNAT, PNAT+T); reloading them here
-    # would read bytes this same kernel just wrote, which Triton does not
-    # guarantee to fence.
+    # Combine cached history with this step's values at [PNAT, PNAT+T).
     ht_mask = t_mask[None, :]  # (1, T)
     dA_cumsum_new = dA_cumsum_step + dA_cumsum_prefix[:, None]  # (H, T)
 
@@ -719,11 +702,10 @@ def _rectangle_precompute_impl(
     exp_diff = tl.exp(neg_dA_cumsum_window[:, None, :] + dA_cumsum_new[:, :, None])
     combo_block = dt_factor_window[:, None, :] * exp_diff  # (H, T, window)
 
-    # ---- gdc_wait: from here on we depend on conv1d's outputs ----
+    # Wait for conv1d before loading this step's B/C.
     if LAUNCH_WITH_PDL:
         _gdc_wait_with_memory_clobber()
 
-    # Conv1d outputs: B and C
     C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
     step_B_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
 
@@ -775,9 +757,8 @@ def _rectangle_precompute_impl(
     )
     causal_combined = (is_history_position_2d | is_step_causal_2d) & t_mask[:, None]
 
-    # Post-wait vectorized: combo_block (H, T, window) is still live in registers.
-    # rect_CB_scaled = where(causal, raw_rect_CB * combo_block, 0); store as
-    # one (H, T, window) tile.
+    # rect_CB_scaled = where(causal, raw_rect_CB * combo_block, 0); store one
+    # (H, T, window) tile.
     rect_CB_scaled_block = tl.where(
         causal_combined[None, :, :],
         raw_rect_CB[None, :, :] * combo_block,
@@ -796,9 +777,9 @@ def _rectangle_precompute_impl(
     tl.store(cb_scaled_addrs, rect_CB_scaled_block, mask=cb_store_mask_3d)
 
 
-# Rectangle precompute kernel.  Thin wrapper around _rectangle_precompute_impl
-# that carries the @triton.heuristics for constexpr derivation; called from
-# the Python wrapper on the rectangle nowrite path.
+# Dynamic precompute kernel.  Carries constexpr heuristics and dispatches each
+# slot to the replay-style or rectangle precompute body.
+# Grid: (batch, nheads // HEADS_PER_BLOCK).
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.heuristics(
@@ -1021,8 +1002,8 @@ def _dynamic_precompute_kernel(
         )
 
 
-# Main kernel: tl.dot replay + precomputed CB output.
-# Grid: (cdiv(dim, M), batch, nheads).
+# Replay-style main body for one persistent work item.  Used by write and
+# replay-nowrite paths.
 
 
 @triton.jit()
@@ -1475,6 +1456,7 @@ def _persistent_main_impl(
         step_x,
         mask=t_mask[:, None] & m_mask[None, :],
     )
+    step_x_for_dot = step_x.to(tl.bfloat16)
     step_x = step_x.to(tl.float32)
 
     cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
@@ -1490,7 +1472,7 @@ def _persistent_main_impl(
     )
 
     init_out = tl.dot(C_tile.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
-    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), step_x.to(tl.bfloat16))
+    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), step_x_for_dot)
     output_tile = init_out + cb_out
 
     if HAS_D:
@@ -1510,12 +1492,8 @@ def _persistent_main_impl(
         tl.store(output_ptrs, output_tile, mask=t_mask[:, None] & m_mask[None, :])
 
 
-# `_persistent_rectangle_impl`: rectangle nowrite path for the persistent
-# kernel.  Body is a copy of `_rectangle_main_impl` with `pid_m`/`pid_b`/`pid_h`
-# lifted to args (same pattern as `_persistent_main_impl` vs `_replay_main_impl`).
-# Called only for nowrite slots when the kernel runs with RECTANGLE=True.
-# Dropped from the rect impl: LAUNCH_DEPENDENT_KERNELS / REVERSE_PERM
-# (kernel-level, signalled once at top); the wrapper resolves replay metadata.
+# Rectangle nowrite main body for one persistent work item.  Used only for
+# nowrite slots when the persistent kernel runs with RECTANGLE=True.
 @triton.jit()
 def _persistent_rectangle_impl(
     # Per-work-unit indices (computed by the persistent wrapper).
@@ -1652,8 +1630,6 @@ def _persistent_rectangle_impl(
             mask=m_mask,
             other=1.0,
         ).to(tl.float32)
-    else:
-        state = state.to(tl.float32)
 
     # Group / pointer offset setup
     group_idx = pid_h // nheads_ngroups_ratio
@@ -1679,14 +1655,14 @@ def _persistent_rectangle_impl(
             D_ptr + pid_h * stride_D_head + offs_m * stride_D_dim, mask=m_mask, other=0.0
         ).to(tl.float32)
 
-    # Hoist: history x doesn't depend on conv1d/precompute; load before gdc_wait.
+    # History x does not depend on conv1d/precompute.
     history_x = tl.load(
         old_x_read_base
         + safe_history_idx[:, None] * stride_old_x_T
         + offs_m[None, :] * stride_old_x_dim,
         mask=is_history_position[:, None] & m_mask[None, :],
         other=0.0,
-    ).to(tl.float32)
+    )
 
     if WAIT_FOR_PDL_PREDECESSOR:
         _gdc_wait_with_memory_clobber()
@@ -1709,16 +1685,14 @@ def _persistent_rectangle_impl(
         mask=is_step_position[:, None] & m_mask[None, :],
     )
 
-    step_x_in_window_f32 = step_x_in_window.to(tl.float32)
-    x_window = history_x + step_x_in_window_f32
+    step_x_in_window_for_dot = step_x_in_window.to(tl.bfloat16)
+    x_window_for_dot = (history_x.to(tl.bfloat16) + step_x_in_window_for_dot).to(tl.bfloat16)
 
-    if HAS_D or HAS_Z:
+    if HAS_D:
         step_in_window_selector = offs_t[:, None] == (
             offs_window[None, :] - prev_num_accepted_tokens
         )
-        step_x = tl.dot(step_in_window_selector.to(tl.bfloat16), step_x_in_window.to(tl.bfloat16))
-    else:
-        step_x = step_x_in_window_f32  # placeholder; unused
+        step_x = tl.dot(step_in_window_selector.to(tl.bfloat16), step_x_in_window_for_dot)
 
     cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
     CB_scaled = tl.load(
@@ -1738,7 +1712,7 @@ def _persistent_rectangle_impl(
     if QUANT_MAX > 0.0:
         state_out = state_out * decode_scale[None, :]
 
-    token_out = tl.dot(CB_scaled.to(tl.bfloat16), x_window.to(tl.bfloat16))
+    token_out = tl.dot(CB_scaled.to(tl.bfloat16), x_window_for_dot)
 
     output_tile = state_out + token_out
 
@@ -1759,8 +1733,8 @@ def _persistent_rectangle_impl(
         tl.store(output_ptrs, output_tile, mask=t_mask[:, None] & m_mask[None, :])
 
 
-# Persistent main kernel: 1D grid, persistent CTA loop.
-# Heuristics mirror those of the replay main kernel.
+# Persistent replay main kernel: 1D grid, persistent CTA loop.  Heuristics cover
+# both the replay-style and rectangle main bodies.
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
 @triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
@@ -1824,9 +1798,9 @@ def _persistent_main_kernel(
     # device memory keeps the pointer stable across CUDA graph replay while
     # allowing the value to change between iterations.
     # When IS_DYNAMIC=True the value is unused (Triton DCEs the load).
-    n_writes_ptr,  # int32 *: device-side count of write-mode slots
-    batch_total,  # int32: total slot count
-    nheads,  # int32: total head count (== _replay_main_impl's program_id axis 2 count)
+    n_writes_ptr,  # device-side count of write-mode slots
+    batch_total,  # total slot count
+    nheads,  # total head count
     # Dimensions
     T: tl.constexpr,
     MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
@@ -1919,7 +1893,7 @@ def _persistent_main_kernel(
     WARP_SPECIALIZE: tl.constexpr,
     IS_DYNAMIC: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr = MIN_REPLAY_TILE_SIZE,  # rectangle window dimension
-    RECTANGLE: tl.constexpr = False,  # when True, dispatch nowrite slots to _persistent_rectangle_impl
+    RECTANGLE: tl.constexpr = False,  # dispatch nowrite slots to _persistent_rectangle_impl when true
     # 3 TMA toggles per the 3 live paths per-compilation:
     #   USE_TMA_LOAD_WRITE   — SSM state load when is_write
     #   USE_TMA_LOAD_NOWRITE — nowrite-path state load (rect when RECTANGLE,
@@ -2112,8 +2086,8 @@ def _persistent_main_kernel(
                     USE_RS_ROUNDING,
                     PHILOX_ROUNDS,
                     QUANT_MAX,
-                    True,
-                    IS_DYNAMIC,  # WRITE_CHECKPOINT=True (write arm)
+                    True,  # WRITE_CHECKPOINT=True (write arm)
+                    IS_DYNAMIC,
                     True,  # WRITE_CHECKPOINT_IS_CONSTEXPR
                     USE_TMA_LOAD_WRITE,
                     USE_TMA_LOAD_NOWRITE,
@@ -2188,7 +2162,7 @@ def _persistent_main_kernel(
                     BLOCK_SIZE_K,
                     LAUNCH_WITH_PDL and (NUM_LOOP_STAGES == 1),  # WAIT_FOR_PDL_PREDECESSOR
                     QUANT_MAX,
-                    USE_TMA_LOAD_NOWRITE,  # rect-load TMA toggle
+                    USE_TMA_LOAD_NOWRITE,  # USE_TMA_LOAD
                 )
         else:
             _persistent_main_impl(
@@ -2330,38 +2304,32 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
     ("fp16", "SR"): [
         (
             16,
-            "persistent_main",
+            "persistent_dynamic",
             {
-                "_block_size_m_nowrite": 32,
-                "_block_size_m_write": 16,
-                "_cta_per_sm_nowrite": 7,
-                "_cta_per_sm_write": 10,
+                "_block_size_m": 8,
+                "_cta_per_sm": 6,
                 "_flatten": False,
-                "_heads_per_block": 1,
-                "_num_loop_stages_nowrite": 2,
-                "_num_loop_stages_write": 2,
-                "_num_stages_nowrite": 1,
-                "_num_stages_write": 3,
-                "_num_warps_nowrite": 4,
-                "_num_warps_write": 4,
-                "_precompute_num_warps": 8,
-                "_use_tma_rect_load": True,
+                "_heads_per_block": 4,
+                "_num_loop_stages": 1,
+                "_num_stages": 4,
+                "_num_warps": 1,
+                "_precompute_num_warps": 4,
+                "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
-                "_use_tma_replay_write_load": True,
-                "_use_tma_replay_write_store": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
-                "nowrite_first": False,
-                "rectangle_for_nowrite": True,
+                "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=9.66us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=1, score=6.57us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             32,
             "persistent_dynamic",
             {
-                "_block_size_m": 4,
-                "_cta_per_sm": 7,
+                "_block_size_m": 8,
+                "_cta_per_sm": 9,
                 "_flatten": False,
-                "_heads_per_block": 4,
+                "_heads_per_block": 2,
                 "_num_loop_stages": 1,
                 "_num_stages": 5,
                 "_num_warps": 1,
@@ -2373,7 +2341,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=2, score=7.12us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=2, score=7.0us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             64,
             "persistent_dynamic",
@@ -2440,14 +2408,14 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             {
                 "_block_size_m_nowrite": 64,
                 "_block_size_m_write": 32,
-                "_cta_per_sm_nowrite": 8,
-                "_cta_per_sm_write": 4,
+                "_cta_per_sm_nowrite": 5,
+                "_cta_per_sm_write": 9,
                 "_flatten": False,
                 "_heads_per_block": 8,
                 "_num_loop_stages_nowrite": 1,
                 "_num_loop_stages_write": 1,
                 "_num_stages_nowrite": 3,
-                "_num_stages_write": 2,
+                "_num_stages_write": 3,
                 "_num_warps_nowrite": 1,
                 "_num_warps_write": 2,
                 "_precompute_num_warps": 8,
@@ -2459,7 +2427,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=32, score=12.71us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=32, score=12.66us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             1024,
             "persistent_main",
@@ -2563,7 +2531,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=73.80us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=512, score=73.8us (B200 PDL-hoist default 5x200)
         (
             16384,
             "persistent_main",
@@ -2597,21 +2565,21 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             "persistent_dynamic",
             {
                 "_block_size_m": 8,
-                "_cta_per_sm": 2,
+                "_cta_per_sm": 9,
                 "_flatten": False,
-                "_heads_per_block": 8,
-                "_num_loop_stages": 2,
-                "_num_stages": 4,
-                "_num_warps": 2,
+                "_heads_per_block": 4,
+                "_num_loop_stages": 1,
+                "_num_stages": 3,
+                "_num_warps": 1,
                 "_precompute_num_warps": 4,
                 "_use_tma_rect_load": False,
-                "_use_tma_replay_nowrite_load": True,
-                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=8.60us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=1, score=6.59us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             32,
             "persistent_dynamic",
@@ -2723,53 +2691,53 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             "persistent_main",
             {
                 "_block_size_m_nowrite": 64,
-                "_block_size_m_write": 64,
-                "_cta_per_sm_nowrite": 6,
-                "_cta_per_sm_write": 3,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 3,
+                "_cta_per_sm_write": 10,
                 "_flatten": False,
-                "_heads_per_block": 16,
-                "_num_loop_stages_nowrite": 2,
-                "_num_loop_stages_write": 2,
-                "_num_stages_nowrite": 2,
-                "_num_stages_write": 1,
-                "_num_warps_nowrite": 2,
-                "_num_warps_write": 4,
-                "_precompute_num_warps": 16,
-                "_use_tma_rect_load": True,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 1,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 5,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": True,
-                "_use_tma_replay_write_store": True,
+                "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
-                "nowrite_first": False,
+                "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=64, score=22.26us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=64, score=18.51us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             2048,
             "persistent_main",
             {
                 "_block_size_m_nowrite": 64,
-                "_block_size_m_write": 64,
-                "_cta_per_sm_nowrite": 6,
-                "_cta_per_sm_write": 3,
+                "_block_size_m_write": 16,
+                "_cta_per_sm_nowrite": 8,
+                "_cta_per_sm_write": 8,
                 "_flatten": False,
-                "_heads_per_block": 4,
-                "_num_loop_stages_nowrite": 2,
-                "_num_loop_stages_write": 3,
-                "_num_stages_nowrite": 1,
-                "_num_stages_write": 1,
-                "_num_warps_nowrite": 2,
-                "_num_warps_write": 4,
-                "_precompute_num_warps": 1,
-                "_use_tma_rect_load": True,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 1,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 2,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": True,
-                "_use_tma_replay_write_store": False,
+                "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
-                "nowrite_first": False,
+                "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=128, score=34.03us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=128, score=28.72us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             4096,
             "persistent_main",
@@ -2855,21 +2823,21 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             "persistent_dynamic",
             {
                 "_block_size_m": 8,
-                "_cta_per_sm": 5,
+                "_cta_per_sm": 3,
                 "_flatten": False,
-                "_heads_per_block": 2,
-                "_num_loop_stages": 2,
-                "_num_stages": 2,
-                "_num_warps": 2,
-                "_precompute_num_warps": 8,
+                "_heads_per_block": 4,
+                "_num_loop_stages": 1,
+                "_num_stages": 5,
+                "_num_warps": 1,
+                "_precompute_num_warps": 2,
                 "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
-                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_load": False,
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=8.67us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=1, score=6.46us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             32,
             "persistent_dynamic",
@@ -2995,21 +2963,21 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=64, score=16.00us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=64, score=16.0us (B200 PDL-hoist default 5x200)
         (
             2048,
             "persistent_main",
             {
-                "_block_size_m_nowrite": 64,
+                "_block_size_m_nowrite": 32,
                 "_block_size_m_write": 32,
-                "_cta_per_sm_nowrite": 6,
+                "_cta_per_sm_nowrite": 10,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
                 "_heads_per_block": 16,
-                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_nowrite": 1,
                 "_num_loop_stages_write": 1,
-                "_num_stages_nowrite": 2,
-                "_num_stages_write": 4,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 5,
                 "_num_warps_nowrite": 2,
                 "_num_warps_write": 1,
                 "_precompute_num_warps": 8,
@@ -3021,21 +2989,21 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=128, score=26.19us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=128, score=24.5us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             4096,
             "persistent_main",
             {
-                "_block_size_m_nowrite": 64,
+                "_block_size_m_nowrite": 32,
                 "_block_size_m_write": 32,
-                "_cta_per_sm_nowrite": 6,
+                "_cta_per_sm_nowrite": 10,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
                 "_heads_per_block": 16,
-                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_nowrite": 1,
                 "_num_loop_stages_write": 1,
-                "_num_stages_nowrite": 2,
-                "_num_stages_write": 3,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 5,
                 "_num_warps_nowrite": 2,
                 "_num_warps_write": 1,
                 "_precompute_num_warps": 8,
@@ -3047,51 +3015,51 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=256, score=41.16us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=256, score=40.04us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             8192,
             "persistent_main",
             {
-                "_block_size_m_nowrite": 64,
+                "_block_size_m_nowrite": 32,
                 "_block_size_m_write": 32,
                 "_cta_per_sm_nowrite": 8,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
-                "_heads_per_block": 4,
-                "_num_loop_stages_nowrite": 3,
-                "_num_loop_stages_write": 2,
-                "_num_stages_nowrite": 2,
-                "_num_stages_write": 2,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 5,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 1,
                 "_num_warps_nowrite": 1,
                 "_num_warps_write": 1,
-                "_precompute_num_warps": 1,
+                "_precompute_num_warps": 2,
                 "_use_tma_rect_load": True,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": True,
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
-                "nowrite_first": True,
+                "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=77.62us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=512, score=69.44us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             16384,
             "persistent_main",
             {
                 "_block_size_m_nowrite": 64,
                 "_block_size_m_write": 32,
-                "_cta_per_sm_nowrite": 8,
+                "_cta_per_sm_nowrite": 6,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
                 "_heads_per_block": 8,
-                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_nowrite": 5,
                 "_num_loop_stages_write": 1,
                 "_num_stages_nowrite": 2,
-                "_num_stages_write": 4,
-                "_num_warps_nowrite": 1,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 2,
                 "_num_warps_write": 1,
                 "_precompute_num_warps": 1,
-                "_use_tma_rect_load": True,
+                "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": True,
                 "_use_tma_replay_write_store": False,
@@ -3099,7 +3067,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=1024, score=131.40us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=1024, score=126.74us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
     ],
     ("fp32", "RN"): [
         (
@@ -3107,13 +3075,13 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             "persistent_dynamic",
             {
                 "_block_size_m": 8,
-                "_cta_per_sm": 9,
+                "_cta_per_sm": 6,
                 "_flatten": False,
-                "_heads_per_block": 2,
-                "_num_loop_stages": 2,
-                "_num_stages": 4,
-                "_num_warps": 2,
-                "_precompute_num_warps": 8,
+                "_heads_per_block": 8,
+                "_num_loop_stages": 1,
+                "_num_stages": 2,
+                "_num_warps": 1,
+                "_precompute_num_warps": 4,
                 "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": True,
                 "_use_tma_replay_write_load": True,
@@ -3121,7 +3089,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=8.58us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=1, score=6.64us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             32,
             "persistent_dynamic",
@@ -3229,79 +3197,27 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_block_size_m_nowrite": 64,
                 "_block_size_m_write": 32,
                 "_cta_per_sm_nowrite": 4,
-                "_cta_per_sm_write": 8,
+                "_cta_per_sm_write": 6,
                 "_flatten": False,
-                "_heads_per_block": 8,
-                "_num_loop_stages_nowrite": 3,
+                "_heads_per_block": 16,
+                "_num_loop_stages_nowrite": 1,
                 "_num_loop_stages_write": 1,
                 "_num_stages_nowrite": 1,
-                "_num_stages_write": 4,
+                "_num_stages_write": 1,
                 "_num_warps_nowrite": 2,
                 "_num_warps_write": 2,
                 "_precompute_num_warps": 8,
-                "_use_tma_rect_load": True,
-                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": True,
                 "_use_tma_replay_write_load": True,
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "nowrite_first": True,
-                "rectangle_for_nowrite": True,
+                "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=64, score=21.92us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=64, score=20.05us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
             2048,
-            "persistent_main",
-            {
-                "_block_size_m_nowrite": 64,
-                "_block_size_m_write": 32,
-                "_cta_per_sm_nowrite": 5,
-                "_cta_per_sm_write": 9,
-                "_flatten": False,
-                "_heads_per_block": 16,
-                "_num_loop_stages_nowrite": 3,
-                "_num_loop_stages_write": 1,
-                "_num_stages_nowrite": 1,
-                "_num_stages_write": 1,
-                "_num_warps_nowrite": 2,
-                "_num_warps_write": 1,
-                "_precompute_num_warps": 8,
-                "_use_tma_rect_load": True,
-                "_use_tma_replay_nowrite_load": False,
-                "_use_tma_replay_write_load": True,
-                "_use_tma_replay_write_store": True,
-                "_warp_specialize": False,
-                "nowrite_first": True,
-                "rectangle_for_nowrite": True,
-            },
-        ),  # raw_batch=128, score=35.29us (B200 PDL-hoist default 5x200)
-        (
-            4096,
-            "persistent_main",
-            {
-                "_block_size_m_nowrite": 64,
-                "_block_size_m_write": 32,
-                "_cta_per_sm_nowrite": 9,
-                "_cta_per_sm_write": 8,
-                "_flatten": False,
-                "_heads_per_block": 8,
-                "_num_loop_stages_nowrite": 2,
-                "_num_loop_stages_write": 1,
-                "_num_stages_nowrite": 4,
-                "_num_stages_write": 1,
-                "_num_warps_nowrite": 2,
-                "_num_warps_write": 1,
-                "_precompute_num_warps": 8,
-                "_use_tma_rect_load": True,
-                "_use_tma_replay_nowrite_load": False,
-                "_use_tma_replay_write_load": True,
-                "_use_tma_replay_write_store": True,
-                "_warp_specialize": False,
-                "nowrite_first": True,
-                "rectangle_for_nowrite": True,
-            },
-        ),  # raw_batch=256, score=54.98us (B200 PDL-hoist default 5x200)
-        (
-            8192,
             "persistent_main",
             {
                 "_block_size_m_nowrite": 32,
@@ -3309,10 +3225,10 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_cta_per_sm_nowrite": 8,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
-                "_heads_per_block": 16,
-                "_num_loop_stages_nowrite": 2,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 3,
                 "_num_loop_stages_write": 1,
-                "_num_stages_nowrite": 2,
+                "_num_stages_nowrite": 3,
                 "_num_stages_write": 4,
                 "_num_warps_nowrite": 1,
                 "_num_warps_write": 1,
@@ -3325,24 +3241,24 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=93.58us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=128, score=31.39us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
         (
-            16384,
+            4096,
             "persistent_main",
             {
-                "_block_size_m_nowrite": 64,
+                "_block_size_m_nowrite": 32,
                 "_block_size_m_write": 32,
-                "_cta_per_sm_nowrite": 9,
+                "_cta_per_sm_nowrite": 8,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
                 "_heads_per_block": 8,
-                "_num_loop_stages_nowrite": 5,
+                "_num_loop_stages_nowrite": 4,
                 "_num_loop_stages_write": 1,
-                "_num_stages_nowrite": 1,
-                "_num_stages_write": 2,
-                "_num_warps_nowrite": 2,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 1,
                 "_num_warps_write": 1,
-                "_precompute_num_warps": 1,
+                "_precompute_num_warps": 8,
                 "_use_tma_rect_load": True,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": True,
@@ -3351,10 +3267,62 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=1024, score=180.18us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=256, score=51.27us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        (
+            8192,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 4,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 5,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 4,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "nowrite_first": True,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=512, score=88.87us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
+        (
+            16384,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 8,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 5,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "nowrite_first": True,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=1024, score=170.51us (B200 PDL-retune noise-cleaned 5x500)  # << RETUNED
     ],
 }
-_PD_TO_PM_SPLIT_MAP = {  # pd unsplit knob → (pm_write_knob, pm_nowrite_knob)
+_PD_TO_PM_SPLIT_MAP = {  # pd unsplit knob -> (pm_write_knob, pm_nowrite_knob)
     "_block_size_m": ("_block_size_m_write", "_block_size_m_nowrite"),
     "_num_warps": ("_num_warps_write", "_num_warps_nowrite"),
     "_num_stages": ("_num_stages_write", "_num_stages_nowrite"),
@@ -3469,7 +3437,6 @@ def replay_selective_state_update(
     state_scales: torch.Tensor | None = None,
     launch_with_pdl=False,
     use_internal_pdl=True,
-    write_checkpoint: bool = True,
     rectangle_for_nowrite: bool | None = None,
     nowrite_first: bool | None = None,
     mode: str | None = None,
@@ -3477,13 +3444,10 @@ def replay_selective_state_update(
     _num_warps: int | None = None,
     _num_stages: int | None = None,
     _precompute_num_warps: int | None = None,
-    _precompute_num_stages: int | None = None,
     _heads_per_block: int | None = None,
-    _maxnreg: int | None = None,
-    _num_ctas: int | None = None,
-    # Per-main knobs (override shared values for one half of the dl-family /
-    # persistent_main launches).  Default None = tied to the shared value
-    # (backward compat).  The two main kernels (write vs nowrite) have
+    # Per-main knobs override shared values for one half of the persistent_main
+    # launches.  Default None ties the half-specific value to the shared knob.
+    # The two main kernels (write vs nowrite) have
     # different per-slot work — write does a state shift + store, nowrite
     # just appends — so the optimum (M, W, S, H) can differ.  Precompute
     # knobs are intentionally NOT split: shared precompute wins (cheaper
@@ -3501,7 +3465,7 @@ def replay_selective_state_update(
     # TMA state-tensor toggles — 4 independent paths (see replay design notes
     # item #17 for measured perf profiles).  Each is False=raw load/store, True=
     # use a host-built TMA tensor_descriptor for that path.
-    _use_tma_rect_load: bool | None = None,  # rect kernel's state load (nowrite-only)
+    _use_tma_rect_load: bool | None = None,  # rectangle path state load (nowrite-only)
     _use_tma_replay_write_load: bool | None = None,  # SSM state load when WRITE_CHECKPOINT=True
     _use_tma_replay_write_store: bool | None = None,  # SSM state store when WRITE_CHECKPOINT=True
     _use_tma_replay_nowrite_load: bool | None = None,  # SSM state load when WRITE_CHECKPOINT=False
@@ -3554,10 +3518,10 @@ def replay_selective_state_update(
     Arguments:
         state: (cache, nheads, dim, dstate) in-place.  After the call, contains
             the state after replaying prev_num_accepted_tokens old tokens.
-        old_x: (cache, 2, T, nheads, dim) bf16 — double-buffered old x cache.
-        old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered old B cache.
-        old_dt: (cache, 2, nheads, T) fp32 — double-buffered processed dt.
-        old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered cumulative A*dt.
+        old_x: (cache, 2, max_window, nheads, dim) bf16 replay history cache.
+        old_B: (cache, 2, max_window, ngroups, dstate) bf16 replay history cache.
+        old_dt: (cache, 2, nheads, max_window) fp32 processed dt history.
+        old_dA_cumsum: (cache, 2, nheads, max_window) fp32 cumulative A*dt history.
         cache_buf_idx: (cache,) int32 — which buffer to read (0 or 1).
         prev_num_accepted_tokens: (cache,) int32.
         x: (batch, T, nheads, dim) new token inputs.
@@ -3566,10 +3530,14 @@ def replay_selective_state_update(
         B: (batch, T, ngroups, dstate).
         C: (batch, T, ngroups, dstate).
         out: (batch, T, nheads, dim) preallocated output.
+        n_writes: (1,) int32 device tensor with the write-mode count.
+        replay_work_items: (batch, 4) int32 device tensor, sorted write-first.
+            Persistent-main consumes all fields; persistent-dynamic only
+            requires the argument for a stable wrapper signature.
+        state_batch_indices: (batch,) int32 cache slot mapping.
         D: (nheads, dim) optional feed-through parameter.
         z: (batch, T, nheads, dim) optional silu gate.
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
-        state_batch_indices: (batch,) int32 cache slot mapping.
         rand_seed: optional (cache_size,) int64 CUDA tensor of per-cache-slot
             Philox PRNG seeds.  The caller bumps this tensor in-place for each
             replay invocation so CUDA graph replay still gets fresh draws.  The
@@ -3594,10 +3562,8 @@ def replay_selective_state_update(
             When None, use the tuning-table value if present.  When true,
             launch the nowrite half before the write half.
 
-        _-prefixed kwargs (_block_size_m, _num_warps, _num_stages,
-        _precompute_num_warps, _precompute_num_stages, _heads_per_block,
-        _maxnreg, _num_ctas) are benchmark-only overrides; production callers
-        should leave them None to use the tuning-table defaults.
+        _-prefixed kwargs are tuning overrides; production callers should
+        leave them None to use the tuning-table defaults.
     """
     sm_version = get_sm_version()
 
@@ -3612,14 +3578,15 @@ def replay_selective_state_update(
     #   mode="persistent_dynamic": single persistent-CTA kernel covering the
     #       full batch.  Each work-item dispatches via runtime PNAT check
     #       (is_write = (pnat + T) > MAX).  No write/nowrite split.
-    #       replay_work_items is ignored.  write_checkpoint is ignored.
+    #       The wrapper requires replay_work_items for a uniform signature, but
+    #       the dynamic kernel ignores its contents.
     #   mode="persistent_main": persistent-CTA kernel with two launches
     #       (write half + nowrite half).  Caller MUST pre-sort replay_work_items
     #       write-first; the n_writes tensor partitions the persistent loop
     #       into the two halves with the right WRITE_CHECKPOINT constexpr
     #       each time.  RECTANGLE constexpr (= rectangle_for_nowrite) picks
     #       rect vs replay for the nowrite half.  nowrite_first controls
-    #       launch order only.  write_checkpoint is ignored.
+    #       launch order only.
     # Note: mode-and-knob resolution from the default-tuning table happens
     # below, after we have `batch` and `nheads`.
 
@@ -3748,11 +3715,6 @@ def replay_selective_state_update(
             _precompute_num_warps
             if _precompute_num_warps is not None
             else _table_knobs.get("_precompute_num_warps")
-        )
-        _precompute_num_stages = (
-            _precompute_num_stages
-            if _precompute_num_stages is not None
-            else _table_knobs.get("_precompute_num_stages")
         )
         _block_size_m_write = (
             _block_size_m_write
@@ -3887,8 +3849,7 @@ def replay_selective_state_update(
         f"prev_num_accepted_tokens must be int32, got {prev_num_accepted_tokens.dtype}"
     )
     assert isinstance(state_batch_indices, torch.Tensor), (
-        f"state_batch_indices must be a torch.Tensor, "
-        f"got {type(state_batch_indices).__name__}"
+        f"state_batch_indices must be a torch.Tensor, got {type(state_batch_indices).__name__}"
     )
     assert state_batch_indices.device == device, (
         f"state_batch_indices must be on device {device}, got {state_batch_indices.device}"
@@ -3928,7 +3889,7 @@ def replay_selective_state_update(
     # so the launch sites can refer to it; only used on the rectangle path.
     # If this differs from BLOCK_SIZE_T, rectangle precompute uses a slower
     # one-hot fallback because tl.gather requires matching padded dimension sizes.
-    # Production uses matching padded T and window sizes; mismatches are for tests/debugging.
+    # Production uses matching padded T and window sizes.
     BLOCK_SIZE_K = max(triton.next_power_of_2(max_window), MIN_REPLAY_TILE_SIZE)
     rectangle_use_gather = BLOCK_SIZE_T == BLOCK_SIZE_K
 
@@ -4028,7 +3989,7 @@ def replay_selective_state_update(
             state_scales.stride(2),
         )
     else:
-        state_scales_arg = state  # any valid ptr — gated by QUANT_MAX==0
+        state_scales_arg = state  # any valid pointer; gated by QUANT_MAX == 0
         state_scales_strides = (0, 0, 0)
 
     # Per-path TMA descriptors for state — write-side and nowrite-side.  Each
@@ -4070,8 +4031,8 @@ def replay_selective_state_update(
                 block_shape=[BLOCK_SIZE_M_NOWRITE, _dstate_pow2],
             )
     else:
-        state_tma_descriptor_write = state  # dummy; all consuming constexprs False
-        state_tma_descriptor_nowrite = state  # dummy; all consuming constexprs False
+        state_tma_descriptor_write = state  # dummy; all consuming constexprs are false
+        state_tma_descriptor_nowrite = state  # dummy; all consuming constexprs are false
 
     # Work items are sorted write-first for persistent_main. Each row carries
     # decode-batch position, cache slot, PNAT, and active cache buffer index.
@@ -4104,7 +4065,7 @@ def replay_selective_state_update(
     # ---- Launch helpers (close over locals) -------------------------------
     # Each helper is a thin closure that calls one Triton kernel with the
     # full positional + kwarg argument list.  Mode-dependent constexprs
-    # (write_checkpoint, early_out, rectangle) are passed in.
+    # (write_checkpoint_mode, rectangle) are passed in.
 
     def launch_dynamic_precompute(rectangle: bool):
         _dynamic_precompute_kernel[precomp_grid](
@@ -4165,7 +4126,6 @@ def replay_selective_state_update(
             RECTANGLE=rectangle,
             RECTANGLE_USE_GATHER=rectangle_use_gather,
             num_warps=precompute_num_warps,
-            **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
             launch_pdl=launch_with_pdl,
         )
 
@@ -4192,22 +4152,26 @@ def replay_selective_state_update(
     # multiple tiles).  NUM_PERSISTENT is now a runtime int (see kernel def
     # docstring at _persistent_main_kernel) so changing cta_per_sm does NOT
     # trigger a new Triton compile — same kernel binary, different loop step.
-    # (Named UPPERCASE for historical Triton-style consistency only; not
-    # constexpr.)
+    # Runtime value, despite the Triton-style uppercase name.
     _num_pid_m = (dim + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
     def launch_persistent_main(
-        write_checkpoint: bool, *, launch_dependent_kernels: bool = False, rectangle: bool = False
+        write_checkpoint_mode: bool,
+        *,
+        launch_dependent_kernels: bool = False,
+        rectangle: bool = False,
     ):
         # `n_writes` is the (1,) int32 device tensor with the write count.
         # Both halves always launch; an empty half has a zero-length slot
         # range and the persistent loop does no work.
-        block_size_m = BLOCK_SIZE_M_WRITE if write_checkpoint else BLOCK_SIZE_M_NOWRITE
-        launch_num_warps = NUM_WARPS_WRITE if write_checkpoint else NUM_WARPS_NOWRITE
-        launch_num_stages = NUM_STAGES_WRITE if write_checkpoint else NUM_STAGES_NOWRITE
-        ctas_per_sm = CTA_PER_SM_WRITE if write_checkpoint else CTA_PER_SM_NOWRITE
+        block_size_m = BLOCK_SIZE_M_WRITE if write_checkpoint_mode else BLOCK_SIZE_M_NOWRITE
+        launch_num_warps = NUM_WARPS_WRITE if write_checkpoint_mode else NUM_WARPS_NOWRITE
+        launch_num_stages = NUM_STAGES_WRITE if write_checkpoint_mode else NUM_STAGES_NOWRITE
+        ctas_per_sm = CTA_PER_SM_WRITE if write_checkpoint_mode else CTA_PER_SM_NOWRITE
         ctas_per_sm = ctas_per_sm if ctas_per_sm else 1
-        num_loop_stages = NUM_LOOP_STAGES_WRITE if write_checkpoint else NUM_LOOP_STAGES_NOWRITE
+        num_loop_stages = (
+            NUM_LOOP_STAGES_WRITE if write_checkpoint_mode else NUM_LOOP_STAGES_NOWRITE
+        )
         num_loop_stages = num_loop_stages if num_loop_stages else 2
         num_persistent = ctas_per_sm * _num_sms
         num_pid_m_local = (dim + block_size_m - 1) // block_size_m
@@ -4219,7 +4183,7 @@ def replay_selective_state_update(
         grid = (min(num_persistent, total_work_launch),)
         # Per-path TMA descriptor — block_shape[0] must match block_size_m.
         selected_state_tma_descriptor = (
-            state_tma_descriptor_write if write_checkpoint else state_tma_descriptor_nowrite
+            state_tma_descriptor_write if write_checkpoint_mode else state_tma_descriptor_nowrite
         )
         _persistent_main_kernel[grid](
             state,
@@ -4303,7 +4267,7 @@ def replay_selective_state_update(
             LAUNCH_WITH_PDL=use_internal_pdl,
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
             QUANT_MAX=quant_max,
-            WRITE_CHECKPOINT=write_checkpoint,
+            WRITE_CHECKPOINT=write_checkpoint_mode,
             LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
             NUM_PERSISTENT=num_persistent,
             NUM_LOOP_STAGES=num_loop_stages,
@@ -4316,16 +4280,14 @@ def replay_selective_state_update(
             # NOWRITE_LOAD is dummy False; when WRITE_CHECKPOINT=False, WRITE_LOAD/STORE
             # dummy False.  NOWRITE_LOAD picks rect-load (RECTANGLE) or
             # replay-nowrite-load.
-            USE_TMA_LOAD_WRITE=bool(_use_tma_replay_write_load and write_checkpoint),
+            USE_TMA_LOAD_WRITE=bool(_use_tma_replay_write_load and write_checkpoint_mode),
             USE_TMA_LOAD_NOWRITE=bool(
                 (_use_tma_rect_load if rectangle else _use_tma_replay_nowrite_load)
-                and not write_checkpoint
+                and not write_checkpoint_mode
             ),
-            USE_TMA_STORE=bool(_use_tma_replay_write_store and write_checkpoint),
+            USE_TMA_STORE=bool(_use_tma_replay_write_store and write_checkpoint_mode),
             num_warps=launch_num_warps,
             **({"num_stages": launch_num_stages} if launch_num_stages else {}),
-            **({"num_ctas": _num_ctas} if _num_ctas else {}),
-            **({"maxnreg": _maxnreg} if _maxnreg else {}),
             launch_pdl=use_internal_pdl,
         )
 
@@ -4452,8 +4414,6 @@ def replay_selective_state_update(
             USE_TMA_STORE=bool(_use_tma_replay_write_store),
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
-            **({"num_ctas": _num_ctas} if _num_ctas else {}),
-            **({"maxnreg": _maxnreg} if _maxnreg else {}),
             launch_pdl=use_internal_pdl,
         )
 
@@ -4482,7 +4442,7 @@ def replay_selective_state_update(
             # pre-sorted write-first.
             def launch_nowrite(launch_dependent_kernels: bool):
                 launch_persistent_main(
-                    write_checkpoint=False,
+                    write_checkpoint_mode=False,
                     launch_dependent_kernels=launch_dependent_kernels,
                     rectangle=rectangle_for_nowrite,
                 )
@@ -4491,15 +4451,15 @@ def replay_selective_state_update(
             if nowrite_first:
                 launch_nowrite(launch_dependent_kernels=True)
                 launch_persistent_main(
-                    write_checkpoint=True,
+                    write_checkpoint_mode=True,
                     launch_dependent_kernels=False,
-                    rectangle=False,  # write always replay-style
+                    rectangle=False,  # write always uses the replay-style path
                 )
             else:
                 launch_persistent_main(
-                    write_checkpoint=True,
+                    write_checkpoint_mode=True,
                     launch_dependent_kernels=True,
-                    rectangle=False,  # write always replay-style
+                    rectangle=False,  # write always uses the replay-style path
                 )
                 launch_nowrite(launch_dependent_kernels=False)
         else:

@@ -329,6 +329,7 @@ class BaseResourceManager(ABC):
 
     @abstractmethod
     def get_max_resource_count(self) -> int:
+        """Return the maximum number of real requests this manager can admit."""
         raise NotImplementedError
 
     @abstractmethod
@@ -945,8 +946,7 @@ class KVCacheManager(BaseResourceManager):
             return 0
         from tensorrt_llm.bindings import SamplingConfig
         from tensorrt_llm.bindings.internal.batch_manager import BlockKey
-        from tensorrt_llm.bindings.internal.batch_manager import \
-            LlmRequest as CppLlmRequest
+        from tensorrt_llm.bindings.internal.batch_manager import LlmRequest as CppLlmRequest
         block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
         unique_tokens = block_key.unique_tokens
         dummy_req = CppLlmRequest(request_id=0,
