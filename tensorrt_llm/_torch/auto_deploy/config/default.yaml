@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # This is the set of transforms running in "graph" mode. In this mode, we capture the full graph
 # of the model and optimize it for inference.
 transforms:
@@ -127,6 +142,10 @@ transforms:
     stage: sharding
     run_shape_prop: true
     allreduce_strategy: NCCL
+  pipeline_cache:
+    stage: sharding
+    enabled: true
+    root: null
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
@@ -176,6 +195,9 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_mxfp4_moe:
+    stage: post_load_fusion
+    expect_mem_change: true  # adds padding for trtllm-gen kernel alignment during weight repack
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -202,6 +224,9 @@ transforms:
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  fuse_rmsnorm_quant_nvfp4:
+    stage: post_load_fusion
+    enabled: true
   fuse_gdn_gating:
     stage: post_load_fusion
   fuse_l2norm:
@@ -220,11 +245,6 @@ transforms:
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
     enabled: false
-  mlir_elementwise_fusion:
-    stage: post_load_fusion
-    enabled: false
-    run_shape_prop: false
-    bypass_ops: []
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
@@ -242,6 +262,11 @@ transforms:
     enabled: false
   optimize_rope:
     stage: post_load_fusion
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: false
+    run_shape_prop: false
+    bypass_ops: []
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
@@ -308,5 +333,5 @@ transforms:
     expect_mem_change: true
     run_per_gm: false
     backend: torch-cudagraph
-    piecewise_enabled: false
+    piecewise_enabled: true
     piecewise_num_tokens: null

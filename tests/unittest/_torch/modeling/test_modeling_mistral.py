@@ -18,6 +18,7 @@ from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.models import modeling_utils
@@ -152,6 +153,21 @@ def test_mistral_3_vlm_rejects_disagg(mistral_small_3_1_24b_config):
                 )
             ),
         )
+
+
+def test_mistral_3_vlm_constructs_under_meta_init(mistral_small_3_1_24b_config):
+    config_dict = mistral_small_3_1_24b_config
+    config_dict["text_config"]["num_hidden_layers"] = 1
+    config_dict["vision_config"]["num_hidden_layers"] = 1
+
+    mistral_3_config = transformers.Mistral3Config.from_dict(config_dict)
+    model_config = model_config_lib.ModelConfig(pretrained_config=mistral_3_config)
+
+    with MetaInitMode():
+        model = modeling_mistral.Mistral3VLM(model_config)
+
+    assert "_image_token_ids" in dict(model.named_buffers())
+    assert "_image_token_ids" not in model.state_dict()
 
 
 @pytest.mark.parametrize("quant_algo", [None, "FP8"])

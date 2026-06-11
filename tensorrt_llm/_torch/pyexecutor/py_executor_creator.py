@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -432,6 +432,24 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+
+    # Bridge DwdpConfig -> Mapping: ParallelConfig.to_mapping() doesn't know
+    # about dwdp_size/dwdp_rank, so inject them here (before anything reads
+    # mapping.dwdp_enabled / moe_ep_rank).
+    #
+    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
+    # in disaggregated serving each context worker is its own TP=1 instance
+    # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
+    # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
+    # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
+    if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
+        dwdp_size = llm_args.dwdp_config.dwdp_size
+        dwdp_rank = global_mpi_rank() % dwdp_size
+        mapping = Mapping(**{
+            **mapping.to_dict(), "dwdp_size": dwdp_size,
+            "dwdp_rank": dwdp_rank
+        })
+
     dist = Distributed.get(mapping)
 
     vm_pools = {}
@@ -446,9 +464,13 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        if hasattr(spec_config,
-                   'max_batch_size') and spec_config.max_batch_size is None:
-            spec_config.max_batch_size = max_batch_size
+        # Eagle3DecodingConfig._max_batch_size is internally managed: the
+        # dynamic-tree worker pre-allocates batch-indexed CUDA buffers sized
+        # by this value, and runtime indexes them with no bounds check. It
+        # MUST equal the global max_batch_size to avoid OOB; we populate it
+        # here as the single source of truth.
+        if hasattr(spec_config, '_max_batch_size'):
+            spec_config._max_batch_size = max_batch_size
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
@@ -469,7 +491,9 @@ def create_py_executor(
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
         assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
-        dwdp_manager = DwdpManager(config=llm_args.dwdp_config, dist=dist)
+        dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
+                                   dist=dist,
+                                   mapping=mapping)
         dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
@@ -621,9 +645,10 @@ def create_py_executor(
     config = model_engine.model.model_config.pretrained_config
     if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
             cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None):
+            and cache_transceiver_config.backend is not None
+            and cache_transceiver_config.transceiver_runtime == "PYTHON"):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when disagg is enabled"
+            "Disabling block reuse for MambaHybridCacheManager-based models when disagg + Python transceiver enabled"
         )
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
@@ -654,6 +679,8 @@ def create_py_executor(
                 f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "
                 f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
+            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                           False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         if kv_cache_config.enable_block_reuse and not (
@@ -664,6 +691,8 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
+            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                           False)
         if enable_chunked_context and sm_version not in [90, 100, 103, 120]:
             logger.warning(
                 "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
@@ -817,22 +846,26 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        # Use C++ MambaCacheManager by default for Disaggregated serving with hybrid model.
-        config = model_engine.model.model_config.pretrained_config
-
         is_disagg = (cache_transceiver_config is not None
                      and cache_transceiver_config.backend is not None)
-        is_hybrid = is_hybrid_linear(config)
+        is_hybrid = is_hybrid_linear(
+            model_engine.model.model_config.pretrained_config)
 
         if is_disagg and is_hybrid:
-            if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
-                    "TRTLLM_USE_CPP_MAMBA") == "1":
-                logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling C++ MambaCacheManager.")
-                os.environ["TRTLLM_USE_CPP_MAMBA"] = "1"
+            # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
+            # no effect in disagg. The disagg manager choice is driven solely
+            # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
+            # otherwise CppMambaCacheManager. Clear the var here so the
+            # mutual-exclusion check in use_cpp_mamba_cache_manager() does
+            # not fire after we force TRTLLM_USE_CPP_MAMBA=1 below.
+            if os.environ.pop("TRTLLM_USE_PY_MAMBA", "0") == "1":
+                logger.warning(
+                    "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
+                    "use cache_transceiver_config.transceiver_runtime='PYTHON' "
+                    "to select PythonMambaCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling Python MambaCacheManager.")
+                            "Enabling CppMambaHybridCacheManager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
@@ -873,10 +906,10 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
-    # Exchange IPC Handles and Initialize Dwdp Prefetch Buffer
+    # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
+    # weight manager + MoE backend fixup (single entry point).
     if dwdp_manager is not None:
-        dwdp_manager.exchange_all_handles()
-        dwdp_manager.initialize_prefetch_buffer()
+        dwdp_manager.setup(model_engine.model)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -959,6 +992,7 @@ def create_py_executor(
 
         del py_executor  # free before constructing new
         gc.collect()
+        torch.cuda.empty_cache()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using

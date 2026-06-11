@@ -15,6 +15,7 @@
 import array
 import functools
 import gc
+import hashlib
 import itertools
 import os
 import random
@@ -45,12 +46,14 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        ReuseScope,
         SsmLayerConfig,
+        SwaScratchReuseConfig,
         TokenId,
         TokenIdExt,
         _KVCache,
     )
-    from kv_cache_manager_v2._block_radix_tree import traverse_post_order
+    from kv_cache_manager_v2._block_radix_tree import Hasher, traverse_post_order
     from kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,
@@ -63,6 +66,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
     from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
+    from kv_cache_manager_v2._storage._core import CacheLevelStorage, SlotAllocator
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -95,12 +99,17 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        ReuseScope,
         SsmLayerConfig,
+        SwaScratchReuseConfig,
         TokenId,
         TokenIdExt,
         _KVCache,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import traverse_post_order
+    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+        Hasher,
+        traverse_post_order,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
         GPU_LEVEL,
@@ -113,6 +122,10 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
+        CacheLevelStorage,
+        SlotAllocator,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -183,6 +196,43 @@ def assert_no_ref_cycle(func):
         return result
 
     return wrapper
+
+
+class TestCacheLevelStorage(unittest.TestCase):
+    def test_grains_to_slots_refines_proportional_lower_bound(self) -> None:
+        granularity = 16 << 20
+        slot_size_list = [16_252_928, 4_063_232]
+        min_slots = 157
+
+        grains = CacheLevelStorage._grains_for_slots(min_slots, slot_size_list, granularity)
+        slots, used = CacheLevelStorage._grains_to_slots(grains, slot_size_list, granularity)
+
+        self.assertGreaterEqual(slots, min_slots)
+        self.assertLessEqual(used, grains)
+
+    def test_ratio_to_slot_count_list_preserves_min_slots(self) -> None:
+        granularity = 16 << 20
+        slot_size_lists = [
+            [16_252_928, 4_063_232],
+            [491_520, 126_720, 15_872],
+            [31_457_280, 7_864_320],
+        ]
+        min_slots = [157, 3907, 157]
+        total_min_grains = sum(
+            CacheLevelStorage._grains_for_slots(slots, sizes, granularity)
+            for slots, sizes in zip(min_slots, slot_size_lists)
+        )
+
+        slot_counts = CacheLevelStorage.ratio_to_slot_count_list(
+            total_min_grains * granularity,
+            slot_size_lists,
+            [0.2, 0.5, 0.3],
+            granularity,
+            min_slots,
+        )
+
+        for slot_count, min_slot in zip(slot_counts, min_slots):
+            self.assertGreaterEqual(slot_count, min_slot)
 
 
 def create_config(
@@ -295,11 +345,14 @@ class TestNoBatching(TestKVCacheManagerV2):
         self, req_id: int, lora_task_id: int | None, prompt_len: int, decode_len: int
     ) -> Request:
         prompt = [self.next_token() for _ in range(prompt_len)]
+        reuse_scope = ReuseScope(lora_id=lora_task_id)
         return self.Request(
-            req_id, self.manager.create_kv_cache(lora_task_id, prompt), prompt, decode_len
+            req_id, self.manager.create_kv_cache(reuse_scope, prompt), prompt, decode_len
         )
 
-    def run_request(self, req: Request, interval: int, refcheck: bool) -> float:
+    def run_request(
+        self, req: Request, interval: int, refcheck: bool, delay_commit: bool = False
+    ) -> float:
         req_id, kv_cache, prompt, decode_len = req
         assert kv_cache.status == _KVCache.Status.ACTIVE
         stream = kv_cache.cuda_stream
@@ -322,7 +375,8 @@ class TestNoBatching(TestKVCacheManagerV2):
         for _ in range(decode_len):
             required_capacity = len(history) + 1
             if required_capacity > capacity:
-                kv_cache.commit(history[kv_cache.history_length :])
+                if not delay_commit:
+                    kv_cache.commit(history[kv_cache.history_length :])
                 # workaround a mypyc bug: exception in property setter is not propagated
                 # kv_cache.capacity = round_up(required_capacity, interval)
                 if not kv_cache.resize(round_up(required_capacity, interval)):
@@ -347,6 +401,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         interval: int = 1,
         refcheck: bool = True,
         use_external_page_index_buf: bool = False,
+        delay_commit: bool = False,
     ) -> float:
         prompt_len = 1
         decode_len = seq_len - prompt_len
@@ -369,7 +424,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             kv_cache = req0.kv_cache
             success = kv_cache.resume(stream)
             assert success
-            time_taken = self.run_request(req0, interval, refcheck)
+            time_taken = self.run_request(req0, interval, refcheck, delay_commit)
 
         s.take_finish_event().synchronize()
         kv_cache.close()
@@ -491,9 +546,55 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         self.manager.clear_reusable_blocks()
 
-    @parameterized.expand(list(itertools.product([False, True], repeat=2)))
+    def test_reuse_scope_isolates_reuse(self) -> None:
+        self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
+        tokens = [TokenId(i) for i in range(64)]
+        capacity = 128
+        default_scope = ReuseScope()
+        scoped = ReuseScope(lora_id=7, salt=11)
+
+        def commit_for(reuse_scope: ReuseScope | None) -> None:
+            kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
+            self.assertEqual(kv_cache._reuse_scope, reuse_scope or default_scope)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertTrue(kv_cache.resize(capacity))
+                uncommitted = tokens[kv_cache.num_committed_tokens :]
+                if uncommitted:
+                    kv_cache.commit(uncommitted)
+                kv_cache.stop_committing()
+            kv_cache.close()
+
+        def num_reused(reuse_scope: ReuseScope | None) -> int:
+            probed = self.manager.probe_reuse(reuse_scope, tokens[:-1])
+            kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
+            self.assertEqual(kv_cache._reuse_scope, reuse_scope or default_scope)
+            ret = kv_cache.num_committed_tokens
+            kv_cache.close()
+            self.assertEqual(probed, ret)
+            return ret
+
+        commit_for(scoped)
+        self.assertGreater(num_reused(scoped), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=7, salt=12)), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=8, salt=11)), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=7)), 0)
+        self.assertEqual(num_reused(ReuseScope(salt=11)), 0)
+        self.assertEqual(num_reused(None), 0)
+
+        commit_for(None)
+        self.assertGreater(num_reused(None), 0)
+        self.assertGreater(num_reused(default_scope), 0)
+
+    @parameterized.expand(list(itertools.product([False, True], repeat=3)))
     # @assert_no_ref_cycle
-    def test_naive(self, use_external_page_index_buf: bool, use_block_quant: bool) -> None:
+    def test_naive(
+        self,
+        use_external_page_index_buf: bool,
+        use_block_quant: bool,
+        delay_commit: bool,
+    ) -> None:
         self.prepare(
             256 << 20,
             256 << 20,
@@ -503,7 +604,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             48,
             block_quant_buf_size=(1024 if use_block_quant else None),
         )
-        self.run_naive(512, 1, True, use_external_page_index_buf)
+        self.run_naive(512, 1, True, use_external_page_index_buf, delay_commit=delay_commit)
 
     @parameterized.expand([(2**i, False) for i in range(12)])
     # @parameterized.expand([(32, True)])
@@ -592,8 +693,9 @@ class TestBatching(TestKVCacheManagerV2):
             prompt = [next(token_id_gen) for _ in range(gen_length())]
         decode_len = gen_length()
         lora_task_id = None
+        reuse_scope = ReuseScope(lora_id=lora_task_id)
         kv_cache = self.manager.create_kv_cache(
-            lora_task_id, prompt[:-1] if self.enable_reuse else None, id=next(self.req_id_gen)
+            reuse_scope, prompt[:-1] if self.enable_reuse else None, id=next(self.req_id_gen)
         )
         DBG_PRINT and print(  # type: ignore[arg-type]
             f"created {kv_cache.id} with {kv_cache.num_committed_tokens} tokens reused"
@@ -741,7 +843,8 @@ class TestDisagg(TestKVCacheManagerV2):
         self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
         lora_task_id = None
         prompt = [self.next_token() for _ in range(prompt_len)]
-        kv_cache = self.manager.create_kv_cache(lora_task_id, prompt)
+        reuse_scope = ReuseScope(lora_id=lora_task_id)
+        kv_cache = self.manager.create_kv_cache(reuse_scope, prompt)
         assert kv_cache.num_committed_tokens == 0
         with TemporaryCudaStream([]) as stream:
             success = kv_cache.resume(cast(CudaStream, stream.handle))
@@ -1188,6 +1291,22 @@ class TestResizeQuota(TestKVCacheManagerV2):
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
 
+        def count_active_pages_by_level(kv_cache: _KVCache) -> list[int]:
+            counts = [0] * self.manager._storage.num_cache_levels
+            for ordinal, beam_idx, lc_idx in kv_cache._active_pages():
+                block_page = kv_cache._page(ordinal, beam_idx, lc_idx)
+                assert block_page is not None
+                counts[block_page.page.cache_level] += 1
+            return counts
+
+        def assert_prefetched_pages_are_evictable(kv_cache: _KVCache) -> None:
+            for ordinal, beam_idx, lc_idx in kv_cache._active_pages():
+                block_page = kv_cache._page(ordinal, beam_idx, lc_idx)
+                assert block_page is not None
+                page = block_page.page
+                if page.cache_level == HOST_LEVEL and self.manager._storage.is_evictable(page):
+                    self.assertTrue(page.scheduled_for_eviction)
+
         # First commit some blocks to fill all levels of cache. This helps test the case where shrinking
         # the quota will drop some pages from the last-level cache.
         for _ in range(11):
@@ -1242,6 +1361,19 @@ class TestResizeQuota(TestKVCacheManagerV2):
         assert success
         success = self.manager.resize(HOST_LEVEL, 128 << 20)
         assert success
+        prefetch_target = kv_cache_lst[1]
+        prefetch_counts_before = count_active_pages_by_level(prefetch_target)
+        self.assertGreater(prefetch_counts_before[DISK_LEVEL], 0)
+        success = prefetch_target.prefetch(HOST_LEVEL)
+        self.assertEqual(success, True)
+        prefetch_counts_after = count_active_pages_by_level(prefetch_target)
+        self.assertEqual(prefetch_counts_after[GPU_LEVEL], prefetch_counts_before[GPU_LEVEL])
+        self.assertEqual(prefetch_counts_after[DISK_LEVEL], 0)
+        self.assertEqual(
+            prefetch_counts_after[HOST_LEVEL],
+            prefetch_counts_before[HOST_LEVEL] + prefetch_counts_before[DISK_LEVEL],
+        )
+        assert_prefetched_pages_are_evictable(prefetch_target)
         # Now both requests can resume
         for kv_cache in kv_cache_lst:
             success = kv_cache.resume(stream)
@@ -1583,7 +1715,7 @@ class TestInitRatioConfig(unittest.TestCase):
         is non-trivial and constraint clamping is exercised.
 
         With num_windowed_layers / num_full_layers > 1 and
-        enable_swa_scratch_reuse=True, multiple layers per lifecycle give
+        scratch reuse enabled, multiple layers per lifecycle give
         frac_max < 1, making scratch savings visible in capacity planning.
         """
         cache_tiers: list = [GpuCacheTierConfig(quota=gpu_quota)]
@@ -1616,7 +1748,7 @@ class TestInitRatioConfig(unittest.TestCase):
             layers=layers,
             typical_step=typical_step,
             constraints=constraints or [],
-            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            swa_scratch_reuse=(SwaScratchReuseConfig() if enable_swa_scratch_reuse else None),
         )
 
     def test_default_init_ratio(self):
@@ -2004,6 +2136,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
         tokens_per_block: int = 32,
         gpu_quota: int = 64 << 20,
         sink_tokens: int = 0,
+        max_rewind_len: int = 0,
     ):
         """Prepare a manager with scratch reuse enabled."""
         kv_buf_size = 8192
@@ -2023,7 +2156,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
                 )
                 for i in range(num_layers)
             ],
-            enable_swa_scratch_reuse=True,
+            swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=max_rewind_len),
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -2198,13 +2331,20 @@ class TestScratchReuse(TestKVCacheManagerV2):
         kv3.close()
         self.manager.clear_reusable_blocks()
 
-    def test_scratch_shared_slot_ids(self):
+    @parameterized.expand([(0, 7), (64, 5)])
+    def test_scratch_shared_slot_ids(self, rewind_len: int, expected_scratch_blocks: int):
         """Verify that scratch blocks share coalesced slot IDs via ScratchDesc."""
         # 8 layers, window=32, tokens_per_block=32, prompt=256
         # num_sub_pages = 8 (all layers in one group)
-        # blocks 0-6 are scratch (7 blocks), block 7 is in-window (normal)
-        # 7 scratch blocks / 8 sub_pages = 1 scratch slot
-        self._prepare_scratch(num_layers=8, window_size=32, tokens_per_block=32, gpu_quota=16 << 20)
+        # rewind_len=0: blocks 0-6 are scratch, block 7 is in-window.
+        # rewind_len=64: blocks 5-7 are protected from scratch by the rewind tail.
+        self._prepare_scratch(
+            num_layers=8,
+            window_size=32,
+            tokens_per_block=32,
+            gpu_quota=16 << 20,
+            max_rewind_len=rewind_len,
+        )
 
         prompt = [self.next_token() for _ in range(256)]
         kv = self.manager.create_kv_cache(None, prompt)
@@ -2223,10 +2363,10 @@ class TestScratchReuse(TestKVCacheManagerV2):
             self.assertIsNotNone(scratch_desc)
 
             num_scratch_blocks = scratch_desc.range.end - scratch_desc.range.beg
-            self.assertEqual(num_scratch_blocks, 7)  # blocks 0-6
+            self.assertEqual(num_scratch_blocks, expected_scratch_blocks)
 
-            # 7 blocks / 8 sub_pages = ceil = 1 scratch slot
-            self.assertEqual(len(scratch_desc.slot_ids), 1)
+            expected_scratch_slots = div_up(expected_scratch_blocks, 8)
+            self.assertEqual(len(scratch_desc.slot_ids), expected_scratch_slots)
 
             # Verify scratch blocks have BAD_PAGE_INDEX in base_page_indices
             indices = kv.get_base_page_indices(lg_id)
@@ -2261,22 +2401,28 @@ class TestScratchReuse(TestKVCacheManagerV2):
         kv.close()
         self.manager.clear_reusable_blocks()
 
-    def test_scratch_chunk_size_variation(self):
+    @parameterized.expand([(0, (0, 6), (8, 9)), (32, (0, 5), None)])
+    def test_scratch_chunk_size_variation(
+        self,
+        rewind_len: int,
+        chunk1_scratch_range: tuple[int, int],
+        chunk2_scratch_range: tuple[int, int] | None,
+    ):
         """Verify scratch block allocation with changing chunk sizes and multiple window sizes.
 
         This ensures both positive and negative net_alloc_counts code paths are tested
-        simultaneously across different layers.
+        simultaneously across different layers. The rewind_len parameter verifies
+        that the protected rewind tail is kept out of scratch ranges.
 
         Layer 0: window_size = 64 (2 blocks)
         Layer 1: window_size = 256 (8 blocks)
 
         Chunk 1: resize(256) -> 8 blocks.
-          - Layer 0 (stale 0-6): needs 6 scratch blocks (net_alloc_counts = 6 > 0)
+          - Layer 0 needs 6 scratch blocks without rewind, or 5 with rewind_len=32.
           - Layer 1 (stale 0-0): needs 0 scratch blocks (net_alloc_counts = 8 > 0)
 
         Chunk 2: resize(352, 256) -> 11 blocks.
-          - Layer 0 (stale 0-9): needs 1 scratch block [8, 9). delta_scratch = -5. New normal = 2.
-            net_alloc_counts = -3 < 0
+          - Layer 0 needs 1 scratch block without rewind, or 0 with rewind_len=32.
           - Layer 1 (stale 0-3): needs 0 scratch blocks. delta_scratch = 0. New normal = 3.
             net_alloc_counts = 3 > 0
         """
@@ -2306,7 +2452,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
                     sliding_window_size=256,
                 ),
             ],
-            enable_swa_scratch_reuse=True,
+            swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=rewind_len),
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -2327,12 +2473,14 @@ class TestScratchReuse(TestKVCacheManagerV2):
             lg_id_0 = LayerGroupId(0)
             lg_id_1 = LayerGroupId(1)
 
-            # Layer 0 should have 6 scratch blocks: range [0, 6)
             scratch_desc_0 = kv.get_scratch_desc(lg_id_0)
             self.assertIsNotNone(scratch_desc_0)
-            self.assertEqual(scratch_desc_0.range.beg, 0)
-            self.assertEqual(scratch_desc_0.range.end, 6)
-            self.assertEqual(len(scratch_desc_0.slot_ids), 6)
+            self.assertEqual(scratch_desc_0.range.beg, chunk1_scratch_range[0])
+            self.assertEqual(scratch_desc_0.range.end, chunk1_scratch_range[1])
+            self.assertEqual(
+                len(scratch_desc_0.slot_ids),
+                chunk1_scratch_range[1] - chunk1_scratch_range[0],
+            )
 
             # Layer 1 should have 0 scratch blocks
             scratch_desc_1 = kv.get_scratch_desc(lg_id_1)
@@ -2347,16 +2495,17 @@ class TestScratchReuse(TestKVCacheManagerV2):
             success = kv.resume(stream)
             self.assertTrue(success)
             self.assertFalse(kv.has_scratch_slots)
-
-            # Chunk 2: resize to 352 with history_length=256
+            # Chunk 2: resize to 352 with history_length=256.
             success = kv.resize(352, 256)
             self.assertTrue(success)
 
-            # Layer 0 should have 1 scratch block: range [8, 9)
             scratch_desc_0 = kv.get_scratch_desc(lg_id_0)
-            self.assertIsNotNone(scratch_desc_0)
-            self.assertEqual(scratch_desc_0.range.beg, 8)
-            self.assertEqual(scratch_desc_0.range.end, 9)
+            if chunk2_scratch_range is None:
+                self.assertIsNone(scratch_desc_0)
+            else:
+                self.assertIsNotNone(scratch_desc_0)
+                self.assertEqual(scratch_desc_0.range.beg, chunk2_scratch_range[0])
+                self.assertEqual(scratch_desc_0.range.end, chunk2_scratch_range[1])
 
             # Layer 1 should still have 0 scratch blocks
             scratch_desc_1 = kv.get_scratch_desc(lg_id_1)
@@ -2372,6 +2521,71 @@ class TestScratchReuse(TestKVCacheManagerV2):
         s.take_finish_event().synchronize()
         kv.close()
         self.manager.clear_reusable_blocks()
+
+
+class TestSlotAllocatorShrink(unittest.TestCase):
+    def test_shrink_underused_pool(self) -> None:
+        # Regression for NVBug 6225866: shrinking a pool whose new size is
+        # still above the slot-ID high-water mark used to assert because
+        # _num_active_slots - _target_capacity went negative.
+        allocator = SlotAllocator(capacity=184064)
+        slots = [allocator.allocate() for _ in range(2048)]
+        for s in slots:
+            allocator.release(s)
+        self.assertEqual(allocator._num_active_slots, 2048)
+
+        allocator.prepare_for_shrink(122624)
+        self.assertEqual(len(allocator._overflow_slots), 0)
+        self.assertTrue(allocator.finish_shrink())
+        self.assertEqual(allocator._capacity, 122624)
+        self.assertEqual(allocator._num_active_slots, 2048)
+        self.assertFalse(allocator.shrink_in_progress)
+
+    def test_shrink_touched_pool(self) -> None:
+        # Sanity-check that the non-trivial migration path still works:
+        # all ids are issued, half released, shrink to half.
+        allocator = SlotAllocator(capacity=16)
+        slots = [allocator.allocate() for _ in range(16)]
+        for s in slots[8:]:
+            allocator.release(s)
+        self.assertEqual(allocator._num_active_slots, 16)
+
+        allocator.prepare_for_shrink(8)
+        self.assertEqual(len(allocator._overflow_slots), 8)
+        self.assertTrue(allocator.finish_shrink())
+        self.assertEqual(allocator._capacity, 8)
+        self.assertEqual(allocator._num_active_slots, 8)
+
+        for s in slots[:8]:
+            allocator.release(s)
+
+
+class TestBlockKeyHashing(unittest.TestCase):
+    """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
+
+    @staticmethod
+    def _ref_update(seed: bytes, block: "list[int | bytes]") -> bytes:
+        h = hashlib.sha256()
+        h.update(seed)
+        for item in block:
+            h.update(item.to_bytes(8, "little") if type(item) is int else item)
+        return h.digest()
+
+    def test_update_int_block_matches_reference(self) -> None:
+        rng = random.Random(123)
+        seed = b"\xaa\xbb\xcc"
+        for n in (0, 1, 7, 32, 33, 257):
+            block = [rng.randint(0, (1 << 60)) for _ in range(n)]
+            self.assertEqual(
+                Hasher(seed).update(block).digest,
+                self._ref_update(seed, block),
+                f"int block of length {n}",
+            )
+
+    def test_update_mixed_multimodal_block(self) -> None:
+        block = [randbytes(32), 5, 6, randbytes(32)] + list(range(20))
+        seed = b"\x01"
+        self.assertEqual(Hasher(seed).update(block).digest, self._ref_update(seed, block))
 
 
 if __name__ == "__main__":

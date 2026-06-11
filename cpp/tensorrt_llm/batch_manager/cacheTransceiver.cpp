@@ -206,6 +206,55 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_LOG_INFO("RNN cache transfer components initialized.");
     }
 
+    // Unified pool path (CppMambaHybridCacheManager): build RnnModelConfig from
+    // LinearAttentionMetadata. Detected by rnnLayerNumPerPP set but no RnnStateManager.
+    if (mRnnStateManager == nullptr && !rnnLayerNumPerPP.empty())
+    {
+        auto const& blockManager = cacheManager->getBlockManager();
+        auto const& linearMeta = blockManager.getLinearAttentionMetadata();
+        TLLM_CHECK_WITH_INFO(linearMeta.has_value(), "LinearAttentionMetadata not found for unified pool RNN config");
+
+        executor::kv_cache::CacheState::RnnModelConfig rnnModelCfg{};
+        rnnModelCfg.mNumHeads = linearMeta->rnnNumHeads;
+        rnnModelCfg.mHeadDim = linearMeta->rnnHeadDim;
+        rnnModelCfg.mDState = linearMeta->rnnDState;
+        rnnModelCfg.mDConv = linearMeta->rnnDConv;
+        rnnModelCfg.mNGroups = linearMeta->rnnNGroups;
+        rnnModelCfg.mHiddenSize = linearMeta->rnnHeadDim * linearMeta->rnnNumHeads;
+        rnnModelCfg.mConvSectionLayout = static_cast<executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout>(
+            linearMeta->rnnConvSectionLayout);
+
+        // Derive actual SSM and conv dtypes from metadata byte sizes.
+        // Pool dtype is UINT8 (raw byte storage), so we cannot use pool->getDataType().
+        // Only the byte size matters for split/concat kernel stride calculations — the actual
+        // dtype enum is not interpreted numerically, just used for getDTypeSize() dispatch.
+        auto dtypeFromSize = [](SizeType32 size) -> nvinfer1::DataType
+        {
+            switch (size)
+            {
+            case 4: return nvinfer1::DataType::kFLOAT;
+            case 2: return nvinfer1::DataType::kBF16;
+            case 1: return nvinfer1::DataType::kFP8;
+            default: TLLM_THROW("Unsupported RNN state dtype size: %d", size);
+            }
+        };
+        TLLM_CHECK_WITH_INFO(linearMeta->rnnSsmDtypeSize > 0, "rnnSsmDtypeSize not set in LinearAttentionMetadata");
+        TLLM_CHECK_WITH_INFO(linearMeta->rnnConvDtypeSize > 0, "rnnConvDtypeSize not set in LinearAttentionMetadata");
+        nvinfer1::DataType ssmDtype = dtypeFromSize(linearMeta->rnnSsmDtypeSize);
+        nvinfer1::DataType convDtype = dtypeFromSize(linearMeta->rnnConvDtypeSize);
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convDtype, ssmDtype);
+
+        // Create RnnCacheTransBufferManager for unified pool path.
+        mRnnCacheTransBufferManager
+            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(cacheManager, *mCacheState, maxNumTokens);
+
+        TLLM_LOG_INFO(
+            "Unified pool RNN config: numHeads=%d, headDim=%d, dState=%d, dConv=%d, "
+            "nGroups=%d, hiddenSize=%d, convSectionLayout=%d",
+            rnnModelCfg.mNumHeads, rnnModelCfg.mHeadDim, rnnModelCfg.mDState, rnnModelCfg.mDConv, rnnModelCfg.mNGroups,
+            rnnModelCfg.mHiddenSize, static_cast<int>(rnnModelCfg.mConvSectionLayout));
+    }
+
     mCacheTransBufferManagerPtrs.clear();
     mCacheTransBufferManagerPtrs.reserve(mCacheTransBufferManagers.size() + (mRnnCacheTransBufferManager ? 1 : 0));
     for (auto& manager : mCacheTransBufferManagers)
@@ -274,11 +323,17 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
     };
 
-    auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>
+    auto makeRnnFormatter = [this, cacheManager]() -> std::unique_ptr<RnnCacheFormatter>
     {
         if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
         {
+            // Slot-based path (CppMambaCacheManager)
             return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+        }
+        // Unified pool path (CppMambaHybridCacheManager)
+        if (mCacheState->hasRnnConfig() && mRnnCacheTransBufferManager != nullptr)
+        {
+            return std::make_unique<RnnCacheFormatter>(cacheManager, mRnnCacheTransBufferManager.get());
         }
         return nullptr;
     };
@@ -324,7 +379,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     }
 }
 
-void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
+void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
@@ -338,9 +393,9 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
         }
         return;
     }
-    setContextState(llmRequest);
-    auto future = mCacheSender->sendAsync(*llmRequest);
-    mSenderFutures.emplace_back(llmRequest, std::move(future));
+    setContextState(llmRequest.get());
+    auto future = mCacheSender->sendAsync(llmRequest);
+    mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -355,36 +410,38 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mCacheSender->sendAsync(*llmRequest);
-        mSenderFutures.emplace_back(llmRequest.get(), std::move(future));
+        auto future = mCacheSender->sendAsync(llmRequest);
+        mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
 }
 
-void CacheTransceiver::requestAndReceiveSync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
-        auto future = mCacheReceiver->receiveAsync(*llmRequest);
+        auto future = mCacheReceiver->receiveAsync(llmRequest);
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 }
 
-void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
 
+    auto const requestId = llmRequest->mRequestId;
     if (std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
-            [llmRequest](auto const& pair) { return pair.first->mRequestId == llmRequest->mRequestId; })
+            [requestId](auto const& pair) { return pair.first->mRequestId == requestId; })
         != mRequesterFutures.end())
     {
-        TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", llmRequest->mRequestId);
+        TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", requestId);
         return;
     }
 
-    auto future = mCacheReceiver->receiveAsync(*llmRequest);
-    mRequesterFutures.emplace_back(llmRequest, std::move(future));
-    llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto future = mCacheReceiver->receiveAsync(llmRequest);
+    auto* requestPtr = llmRequest.get();
+    mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
+    requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -491,6 +548,13 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     {
         senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
     }
+    // Observe-only: WARN per-request when the wall-clock transfer time exceeds
+    // kvTransferTimeoutMs. No cancellation, eviction, or state transition.
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
+    {
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+    }
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
@@ -547,6 +611,19 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(request->mRequestId).second)
+            {
+                TLLM_LOG_WARNING(
+                    "Context KV cache transfer for request %ld exceeded configured timeout: "
+                    "elapsed %ld ms > limit %d ms (observe-only).",
+                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+            }
+        }
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
             try
@@ -561,6 +638,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     {
                         request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
                     }
+                    mTimedOutSenderIds.erase(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
@@ -576,6 +654,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     requestsStatus.errorRequestIds.insert(request->mRequestId);
+                    mTimedOutSenderIds.erase(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
             }
@@ -585,6 +664,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                 requestsStatus.errorRequestIds.insert(request->mRequestId);
+                mTimedOutSenderIds.erase(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
@@ -710,40 +790,61 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
+    // Observe-only: gen-side mirror of the context-side timeout WARN.
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
+    {
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+    }
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
-        if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())
+        auto& request = it->first;
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutRequesterIds.insert(request->mRequestId).second)
+            {
+                TLLM_LOG_WARNING(
+                    "Generation KV cache transfer for request %ld exceeded configured timeout: "
+                    "elapsed %ld ms > limit %d ms (observe-only).",
+                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+            }
+        }
+        if (blockAll || toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end())
         {
             try
             {
                 it->second.get();
-                it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+                request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 
                 // Gather the kv cache transfer time from all workers and update to leader rank
                 if (!common::getEnvKVCacheTimeOutputPath().empty())
                 {
-                    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
-                    updateKVCacheTransferBW(syncComm, it->first);
+                    auto bwSyncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
+                    updateKVCacheTransferBW(bwSyncComm, request.get());
                 }
             }
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR(
-                    "Error occurred during generation transfer for request %ld: %s", it->first->mRequestId, e.what());
-                it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    "Error occurred during generation transfer for request %ld: %s", request->mRequestId, e.what());
+                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             }
             if (useMPI())
             {
                 TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                     "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
-                    it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
+                    request->mRequestId, request->getContextPhaseParams().value().getReqId());
             }
             else
             {
                 TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
                     "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
-                    it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
+                    request->mRequestId, request->getContextPhaseParams().value().getReqId());
             }
+            mTimedOutRequesterIds.erase(request->mRequestId);
             it = mRequesterFutures.erase(it);
         }
         else
@@ -758,7 +859,7 @@ bool CacheTransceiver::checkGenTransferComplete() const
     return mRequesterFutures.empty();
 }
 
-bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
+bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
 {
     if (llmRequest->isContextOnlyRequest())
     {

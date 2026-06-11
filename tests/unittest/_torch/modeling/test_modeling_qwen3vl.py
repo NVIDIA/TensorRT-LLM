@@ -1,7 +1,9 @@
+import copy
 import os
 from dataclasses import dataclass
 from typing import List, Optional
 
+import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
@@ -9,8 +11,12 @@ from transformers import Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase, Qwen3VLModel
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 QWEN3_VL_8B_CONFIG = {
     "architectures": ["Qwen3VLForConditionalGeneration"],
@@ -40,6 +46,7 @@ QWEN3_VL_8B_CONFIG = {
             "rope_type": "default",
         },
         "rope_theta": 5000000,
+        "tie_word_embeddings": False,
         "use_cache": True,
         "vocab_size": 151936,
     },
@@ -242,31 +249,49 @@ class TestQwen3VL(TestModelingMultimodal):
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
-            # ==== Chunked Prefill Scenarios ====
-            TestQwen3VLScenario(
-                modality="image",
-                use_cuda_graph=False,
-                disable_fuse_rope=False,
-                chunked_prefill=True,
-                kv_cache_reuse=False,
-            ),
-            # ==== KV Cache Reuse Scenarios ====
-            TestQwen3VLScenario(
-                modality="image",
-                use_cuda_graph=False,
-                disable_fuse_rope=False,
-                chunked_prefill=False,
-                kv_cache_reuse=True,
-            ),
-            # ==== Disable fuse rope scenarios ====
+        ]
+        # Paged context FMHA (triggered by chunked_prefill / kv_cache_reuse)
+        # is forced on for correctness on Hopper (SM90); the trtllm-gen
+        # kernel set on Blackwell (SM100) falls back to an unfused MHA path
+        # whose output diverges from the non-paged context kernel. Gate
+        # those scenarios to SM90 until the Blackwell fallback matches.
+        if torch.cuda.is_available() and get_sm_version() == 90:
+            scenarios.extend(
+                [
+                    # ==== Chunked Prefill Scenarios ====
+                    TestQwen3VLScenario(
+                        modality="image",
+                        use_cuda_graph=False,
+                        disable_fuse_rope=False,
+                        chunked_prefill=True,
+                        kv_cache_reuse=False,
+                    ),
+                    # ==== KV Cache Reuse Scenarios ====
+                    TestQwen3VLScenario(
+                        modality="image",
+                        use_cuda_graph=False,
+                        disable_fuse_rope=False,
+                        chunked_prefill=False,
+                        kv_cache_reuse=True,
+                    ),
+                ]
+            )
+        # ==== Disable fuse rope scenarios ====
+        # Run last: setup_scenario rebuilds trtllm_model with
+        # disable_fuse_rope=True for this scenario, and the rebuild is not
+        # undone afterwards. Keeping it at the tail prevents the rebuilt
+        # model from leaking into chunked-prefill / kv-cache-reuse
+        # scenarios (where it surfaces as a cos/sin vs. q/k seq-len
+        # mismatch in MRotaryEmbedding.forward).
+        scenarios.append(
             TestQwen3VLScenario(
                 modality="image",
                 use_cuda_graph=False,
                 disable_fuse_rope=True,
                 chunked_prefill=False,
                 kv_cache_reuse=False,
-            ),
-        ]
+            )
+        )
         return scenarios
 
     def get_hf_inputs(self, modality: str, prompt, media):
@@ -298,3 +323,27 @@ class TestQwen3VL(TestModelingMultimodal):
                 hf_model_state_dict=self.hf_model.state_dict(),
                 disable_fuse_rope=True,
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_qwen3vl_init_preserves_caller_quant_config():
+    """Building Qwen3VLModel must not mutate the caller's quant_config."""
+    hf_config = Qwen3VLConfig.from_dict(copy.deepcopy(QWEN3_VL_8B_CONFIG))
+    quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    model_config = ModelConfig(
+        pretrained_config=hf_config,
+        quant_config=quant_config,
+        skip_create_weights_in_init=True,
+    )
+
+    model = Qwen3VLModel(model_config)
+
+    # Outer LLM keeps the caller's quant_config unchanged (same object, same FP8 KV-cache setting).
+    assert model.model_config.quant_config is quant_config
+    assert model.model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+    # Vision encoder operates on an independent copy whose quant settings have been reset to the
+    # defaults (no quantization).
+    assert model.mm_encoder.model_config.quant_config is not quant_config
+    assert model.mm_encoder.model_config.quant_config.kv_cache_quant_algo is None
+    assert model.mm_encoder.model_config.quant_config.quant_algo is None

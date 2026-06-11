@@ -30,7 +30,7 @@ from tensorrt_llm.inputs.multimodal import (
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
 )
-from tensorrt_llm.inputs.utils import AudioData
+from tensorrt_llm.inputs.multimodal_data import AudioData
 
 
 def make_tiler(**overrides):
@@ -388,11 +388,35 @@ def vision_encoder():
     return encoder
 
 
+def _wire_bucket_helpers_to_extract_feature(vision_encoder):
+    """Make `_encode_*` buckets call `extract_feature*` once per non-empty bucket.
+
+    `forward` now delegates to per-modality bucket helpers, which `MagicMock(spec=...)`
+    auto-mocks alongside the encoder. Stub the buckets so they forward to the real
+    `extract_feature*` mocks the tests configure — keeping the original
+    "did we route through the dynamic/fixed path?" assertions valid.
+    """
+
+    def _dynamic(image_data_list):
+        return [vision_encoder.extract_feature_dynamic()] if image_data_list else []
+
+    def _fixed(image_data_list):
+        return [vision_encoder.extract_feature()] if image_data_list else []
+
+    def _video(video_data_list):
+        return []
+
+    vision_encoder._encode_dynamic_image.side_effect = _dynamic
+    vision_encoder._encode_fixed_tile.side_effect = _fixed
+    vision_encoder._encode_temporal_video.side_effect = _video
+
+
 def test_forward_dynamic_path(vision_encoder):
     fake_embeds = torch.randn(1, 10, 512)
     vision_encoder.extract_feature_dynamic = mock.MagicMock(return_value=fake_embeds)
     vision_encoder.extract_feature = mock.MagicMock()
-    vision_encoder.apply_evs = mock.MagicMock(return_value=(fake_embeds, []))
+    vision_encoder.apply_evs = mock.MagicMock(return_value=([fake_embeds], []))
+    _wire_bucket_helpers_to_extract_feature(vision_encoder)
 
     mm_data = {
         "modality_type": "image",
@@ -414,7 +438,8 @@ def test_forward_fixed_tile_path(vision_encoder):
     fake_embeds = torch.randn(2, 8, 512)
     vision_encoder.extract_feature = mock.MagicMock(return_value=fake_embeds)
     vision_encoder.extract_feature_dynamic = mock.MagicMock()
-    vision_encoder.apply_evs = mock.MagicMock(return_value=(fake_embeds, []))
+    vision_encoder.apply_evs = mock.MagicMock(return_value=([fake_embeds], []))
+    _wire_bucket_helpers_to_extract_feature(vision_encoder)
 
     mm_data = {
         "modality_type": "image",
@@ -508,6 +533,8 @@ class TestAudioInputProcessor:
         result = NanoV2VLInputProcessor._resample_audios([audio], target_sr=16000)
         np.testing.assert_array_equal(result[0], audio)
 
+    # `torch.compile` uses a thread pool to compile.
+    @pytest.mark.threadleak(enabled=False)
     def test_process_audio_returns_expected_keys(self):
         proc = _make_audio_processor()
         audio = np.random.randn(16000).astype(np.float32)
@@ -846,7 +873,7 @@ def _make_runtime(past_seen_token_num: int, chunk_end_pos: int, prompt_len: int)
     )
 
 
-def _make_mm_param(modality: str, evs_ids, runtime=None):
+def _make_mm_param(modality: str, evs_ids, runtime=None, input_ids_start_offset=0):
     """Build a MultimodalParams for merge_evs_mm_embeds."""
     return MultimodalParams(
         multimodal_data={
@@ -854,21 +881,12 @@ def _make_mm_param(modality: str, evs_ids, runtime=None):
             modality: {"evs_ids": evs_ids},
         },
         multimodal_runtime=runtime,
+        input_ids_start_offset=input_ids_start_offset,
     )
 
 
 class TestMergeEvsMMEmbeds:
     """Tests for `NemotronH_Nano_VL_V2.merge_evs_mm_embeds`."""
-
-    def test_evs_video_with_text_only_context_raises(self):
-        """Reject batches where text-only context chunks would shift EVS writes."""
-        params = [_make_mm_param("video", torch.tensor([_VIDEO_CTX_ID], dtype=torch.long))]
-
-        with pytest.raises(ValueError, match="text-only context requests"):
-            NemotronH_Nano_VL_V2._validate_evs_context_batch(
-                params,
-                num_context_requests=2,
-            )
 
     def test_single_video_two_tubelets(self):
         """Each video_context_token_id placeholder is replaced with the right count."""
@@ -923,9 +941,11 @@ class TestMergeEvsMMEmbeds:
             ],
             dtype=torch.long,
         )
+        # Video span = text + <start> img_ctx*4 <end> <start> img_ctx*2 <end> = 11
+        # tokens, so the image request starts at flattened offset 11.
         params = [
-            _make_mm_param("video", video_evs),
-            _make_mm_param("image", image_evs),
+            _make_mm_param("video", video_evs, input_ids_start_offset=0),
+            _make_mm_param("image", image_evs, input_ids_start_offset=11),
         ]
         num_tokens_in_videos = [torch.tensor([4, 2]), image_evs]
         input_ids = torch.zeros(20, dtype=torch.long)
@@ -964,9 +984,11 @@ class TestMergeEvsMMEmbeds:
             [_SOUND_START, _SOUND_CTX_ID, _SOUND_CTX_ID, _SOUND_END],
             dtype=torch.long,
         )
+        # Video span = text + <start> img_ctx*2 <end> = 5 tokens, so the audio
+        # request starts at flattened offset 5.
         params = [
-            _make_mm_param("video", video_evs),
-            _make_mm_param("audio", audio_evs),
+            _make_mm_param("video", video_evs, input_ids_start_offset=0),
+            _make_mm_param("audio", audio_evs, input_ids_start_offset=5),
         ]
         num_tokens_in_videos = [torch.tensor([2]), None]
         input_ids = torch.zeros(20, dtype=torch.long)
@@ -1096,6 +1118,142 @@ class TestMergeEvsMMEmbeds:
         assert runtime.num_cached_mm_tokens == 0
         assert runtime.num_mm_tokens_in_chunk == 2
         assert runtime.total_embeds_in_request == 9
+
+    def test_text_only_before_evs_video_no_clobber(self):
+        """A text-only context request before the EVS video must not be clobbered."""
+        model = _make_merge_model()
+        # Single tubelet placeholder -> [IMG_START, IMG_CTX*3, IMG_END] = 5 tokens.
+        evs_ids = torch.tensor([_IMG_START, _VIDEO_CTX_ID, _IMG_END], dtype=torch.long)
+        param = _make_mm_param("video", evs_ids, input_ids_start_offset=4)
+        num_tokens_in_videos = [torch.tensor([3])]
+        # batch: [A text-only(4)][B video chunk(5)][decode(2)]
+        text_prefix = torch.tensor([101, 102, 103, 104], dtype=torch.long)
+        decode_tail = torch.tensor([900, 901], dtype=torch.long)
+        input_ids = torch.cat(
+            [text_prefix.clone(), torch.zeros(5, dtype=torch.long), decode_tail.clone()]
+        )
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        expected_video = torch.tensor(
+            [_IMG_START] + [_IMG_CTX_ID] * 3 + [_IMG_END], dtype=torch.long
+        )
+        assert (result[:4] == text_prefix).all()
+        assert (result[4:9] == expected_video).all()
+        assert (result[9:] == decode_tail).all()
+
+    def test_text_only_after_evs_video_no_clobber(self):
+        """A text-only context request after the EVS video must not be clobbered."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor([_IMG_START, _VIDEO_CTX_ID, _IMG_END], dtype=torch.long)
+        param = _make_mm_param("video", evs_ids, input_ids_start_offset=0)
+        num_tokens_in_videos = [torch.tensor([3])]
+        # batch: [A video chunk(5)][B text-only(3)][decode(1)]
+        text_suffix = torch.tensor([201, 202, 203], dtype=torch.long)
+        decode_tail = torch.tensor([900], dtype=torch.long)
+        input_ids = torch.cat(
+            [torch.zeros(5, dtype=torch.long), text_suffix.clone(), decode_tail.clone()]
+        )
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        expected_video = torch.tensor(
+            [_IMG_START] + [_IMG_CTX_ID] * 3 + [_IMG_END], dtype=torch.long
+        )
+        assert (result[:5] == expected_video).all()
+        assert (result[5:8] == text_suffix).all()
+        assert (result[8:] == decode_tail).all()
+
+    def test_multiple_evs_requests_with_text_only_interspersed(self):
+        """Multimodal requests write their own spans with text-only requests between."""
+        model = _make_merge_model()
+        # B: video, single tubelet placeholder -> 5-token span after expansion.
+        video_evs = torch.tensor([_IMG_START, _VIDEO_CTX_ID, _IMG_END], dtype=torch.long)
+        # D: image, 4-token passthrough (distinct from any special token id).
+        image_evs = torch.tensor([60, 61, 62, 63], dtype=torch.long)
+        # batch: [A text-only(3)][B video(5)][C text-only(2)][D image(4)][decode(1)]
+        b_param = _make_mm_param("video", video_evs, input_ids_start_offset=3)
+        d_param = _make_mm_param("image", image_evs, input_ids_start_offset=10)
+        num_tokens_in_videos = [torch.tensor([3]), image_evs]
+        a_text = torch.tensor([1, 2, 3], dtype=torch.long)
+        c_text = torch.tensor([4, 5], dtype=torch.long)
+        decode = torch.tensor([900], dtype=torch.long)
+        input_ids = torch.cat(
+            [
+                a_text.clone(),
+                torch.zeros(5, dtype=torch.long),
+                c_text.clone(),
+                torch.zeros(4, dtype=torch.long),
+                decode.clone(),
+            ]
+        )
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [b_param, d_param], input_ids
+        )
+
+        expected_b = torch.tensor([_IMG_START] + [_IMG_CTX_ID] * 3 + [_IMG_END], dtype=torch.long)
+        assert (result[0:3] == a_text).all()
+        assert (result[3:8] == expected_b).all()
+        assert (result[8:10] == c_text).all()
+        assert (result[10:14] == image_evs).all()
+        assert (result[14:] == decode).all()
+
+    def test_chunked_prefill_with_preceding_text_only(self):
+        """Chunked prefill with a preceding text-only request writes only the chunk."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                88,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                77,
+            ],
+            dtype=torch.long,
+        )
+        full_context = torch.tensor(
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 3
+            + [_IMG_END, 88, _IMG_START]
+            + [_IMG_CTX_ID] * 2
+            + [_IMG_END, 77],
+            dtype=torch.long,
+        )
+        runtime = _make_runtime(
+            past_seen_token_num=4,
+            chunk_end_pos=9,
+            prompt_len=len(full_context),
+        )
+        # 3-token text-only context request precedes the video; the video's
+        # current chunk (full_context[4:9], 5 tokens) starts at flattened offset 3.
+        param = _make_mm_param("video", evs_ids, runtime=runtime, input_ids_start_offset=3)
+        num_tokens_in_videos = [torch.tensor([3, 2])]
+        text_prefix = torch.tensor([101, 102, 103], dtype=torch.long)
+        generation_tail = torch.tensor([700, 701], dtype=torch.long)
+        input_ids = torch.cat(
+            [text_prefix.clone(), torch.zeros(5, dtype=torch.long), generation_tail.clone()]
+        )
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        expected_chunk = full_context[4:9]
+        assert (result[:3] == text_prefix).all()
+        assert (result[3:8] == expected_chunk).all()
+        assert (result[8:] == generation_tail).all()
+        assert runtime.num_cached_mm_tokens == 2
+        assert runtime.num_mm_tokens_in_chunk == 2
+        assert runtime.total_embeds_in_request == 5
 
 
 class TestProcessVideoPromptsEvs:

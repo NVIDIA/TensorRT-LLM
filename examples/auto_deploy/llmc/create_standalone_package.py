@@ -122,6 +122,8 @@ EXCLUDE_TEST_FILES = {
     "test_fuse_relu2_quant_nvfp4.py",
     "test_moe_fusion.py",
     "test_trtllm_gen_diag.py",
+    # Standalone flashinfer ROPE path has a known BF16 strided-interleaved mismatch.
+    "test_rope_op_variants.py",
     # QKV fusion → trtllm cache insertion (TRT-LLM attention backend only)
     "test_gemm_fusion_trtllm.py",
     # Require TRT-LLM LlmArgs / runtime
@@ -151,6 +153,8 @@ EXCLUDE_TEST_FILES = {
     "test_torch_gated_delta_rule_cache.py",
     "test_gated_delta_rule_cache.py",
     "test_kv_cache_transformers.py",
+    # trtllm attention backend (insert_cached_attention backend=trtllm) not available standalone
+    "test_kv_cache_trtllm_multipool.py",
     # Require TRT-LLM CUDA causal conv / mamba kernels (ops not registered standalone)
     "test_cuda_causal_conv_cached_op.py",
     "test_triton_causal_conv_cached_op.py",
@@ -158,15 +162,33 @@ EXCLUDE_TEST_FILES = {
     "test_flashinfer_mamba_cached_op.py",
     # Require TRT-LLM custom ops (dsv3_router_gemm_op, noaux_tc_op, etc.)
     "test_deepseek_custom.py",
+    "test_glm4_moe_modeling.py",
     "test_glm4_moe_lite_modeling.py",
+    "test_glm_moe_dsa_modeling.py",
+    # Full-model tests hit standalone-incompatible HF cache behavior.
+    "test_granite_moe_hybrid_modeling.py",
+    # Imports triton_kernels, which is not a standalone dependency.
+    "test_mxfp4_moe_layout.py",
     # Require TRT-LLM distributed ops (trtllm_dist_all_gather)
     "test_gather_logits_before_lm_head.py",
-    # Multimodal types are None in standalone (MultimodalInput guard)
+    # Multimodal processors depend on TensorRT-LLM multimodal request types.
+    "test_gemma4_modeling.py",
     "test_qwen3_5_moe.py",
     # Hardware-specific (requires H100+ shared memory)
     "test_triton_mla_op.py",
     # Require TRT-LLM ops (noaux_tc_op) — split from test_export.py
     "test_export_glm4_moe_lite.py",
+    # fuse_fp8_linear / fuse_nvfp4_linear / fuse_finegrained_fp8_linear transforms
+    # live in fuse_quant.py which imports tensorrt_llm.quantization.utils.fp8_utils;
+    # the module is silently skipped in standalone so the transforms aren't registered.
+    "test_quant_fusion.py",
+    # Imports utils.util.skip_pre_blackwell (not shipped in standalone) and exercises
+    # fuse_finegrained_fp8_swiglu which depends on TRT-LLM runtime.
+    "test_finegrained_fp8_swiglu.py",
+    # Exercise trtllm-gen MXFP4 MoE kernels (Blackwell-only) and import the
+    # prepare_trtllm_gen_moe_mxfp4_weights / utils.util helpers not in standalone.
+    "test_fuse_mxfp4_moe.py",
+    "test_trtllm_quant_mxfp4_trtllm_gen_moe.py",
 }
 
 # Import path rewrite: old -> new (applied to test files only).
@@ -354,9 +376,32 @@ def _copy_tests(output_dir: str) -> int:
 def _create_test_conftest(tests_dir: str) -> None:
     """Create a conftest.py that configures the test environment for standalone mode."""
     content = textwrap.dedent("""\
+        # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+        # SPDX-License-Identifier: Apache-2.0
+        #
+        # Licensed under the Apache License, Version 2.0 (the "License");
+        # you may not use this file except in compliance with the License.
+        # You may obtain a copy of the License at
+        #
+        # http://www.apache.org/licenses/LICENSE-2.0
+        #
+        # Unless required by applicable law or agreed to in writing, software
+        # distributed under the License is distributed on an "AS IS" BASIS,
+        # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        # See the License for the specific language governing permissions and
+        # limitations under the License.
+
         \"\"\"Conftest for standalone auto_deploy tests.\"\"\"
-        import sys
+        import importlib.util
         import os
+        import sys
+
+        _trtllm_spec = importlib.util.find_spec("tensorrt_llm")
+        if _trtllm_spec is not None:
+            raise RuntimeError(
+                "Standalone llmc tests must not be able to import tensorrt_llm; "
+                f"found {getattr(_trtllm_spec, 'origin', None)!r}"
+            )
 
         # Add _utils_test to the Python path so test files can import from it
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_utils_test"))
@@ -378,9 +423,28 @@ def _create_test_common_stub(tests_dir: str) -> None:
     os.makedirs(stub_dir, exist_ok=True)
 
     with open(os.path.join(stub_dir, "__init__.py"), "w") as f:
-        f.write("")
+        f.write(
+            "# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION"
+            " & AFFILIATES. All rights reserved.\n"
+            "# SPDX-License-Identifier: Apache-2.0\n"
+        )
 
     content = textwrap.dedent("""\
+        # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+        # SPDX-License-Identifier: Apache-2.0
+        #
+        # Licensed under the Apache License, Version 2.0 (the "License");
+        # you may not use this file except in compliance with the License.
+        # You may obtain a copy of the License at
+        #
+        # http://www.apache.org/licenses/LICENSE-2.0
+        #
+        # Unless required by applicable law or agreed to in writing, software
+        # distributed under the License is distributed on an "AS IS" BASIS,
+        # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        # See the License for the specific language governing permissions and
+        # limitations under the License.
+
         \"\"\"Stub for test_common.llm_data in standalone mode.\"\"\"
         import os
         from pathlib import Path

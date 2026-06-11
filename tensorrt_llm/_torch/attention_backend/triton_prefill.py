@@ -150,6 +150,7 @@ def _fwd_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -194,11 +195,28 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     # ---- Stage 1: attend to prefix KV (paged cache, HND layout) ----
-    for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+    # Sliding-window: under v2 KV cache layout A' (linear page_table with
+    # BAD_PAGE_INDEX=-1 placeholders for evicted out-of-window blocks), clip
+    # the loop start so we never tl.load from a -1 page slot. The remaining
+    # tail tile is filtered by the per-row window_mask below.
+    if WINDOW_LEFT >= 0:
+        block_q_min = cur_seq_len_prefix + cur_block_m * BLOCK_M
+        prefix_loop_lo = block_q_min - WINDOW_LEFT
+        if prefix_loop_lo < 0:
+            prefix_loop_lo = 0
+        prefix_loop_lo = (prefix_loop_lo // BLOCK_N) * BLOCK_N
+    else:
+        prefix_loop_lo = 0
+
+    for start_n in range(prefix_loop_lo, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
         final_mask = mask_m[:, None] & mask_n[None, :]
+        if WINDOW_LEFT >= 0:
+            q_pos_s1 = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
+            k_pos_s1 = start_n + offs_n[None, :]
+            final_mask &= (q_pos_s1 - k_pos_s1) <= WINDOW_LEFT
         if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
             custom_mask = tl.load(
                 mask_ptr
@@ -223,19 +241,33 @@ def _fwd_kernel(
             page_ids = tl.load(
                 page_table + cur_seq_page_start + page_local_idx,
                 mask=mask_n,
-                other=0,
+                other=-1,
             )
+            # Under v2 KV cache layout A', evicted SWA slots carry
+            # BAD_PAGE_INDEX=-1. Per-row window_mask alone is too late: tl.load
+            # with mask=True still issues the memory access, so a -1 page_id
+            # would OOB into K_Buffer/V_Buffer (NaN propagation or illegal
+            # address fault). Filter at load and at qk merge.
+            valid_page = page_ids >= 0
+            safe_page_ids = tl.where(valid_page, page_ids, 0)
+            # Promote to int64 before multiplying by stride: with KV pools at
+            # production scale (e.g. shape [N, 2, 8, 32, 256] => stride 131072
+            # elements/page), page_id * stride overflows int32 once page_id
+            # exceeds ~16K and silently wraps to a negative offset, IMA-ing
+            # K_Buffer/V_Buffer.
+            safe_page_ids = safe_page_ids.to(tl.int64)
+            final_mask &= valid_page[None, :]
 
             # Load K from paged buffer (transposed for dot product)
             offs_buf_k = (
-                page_ids[None, :] * stride_buf_kpage
+                safe_page_ids[None, :] * stride_buf_kpage
                 + cur_kv_head * stride_buf_kh
                 + token_in_page[None, :] * stride_buf_ktoken
                 + offs_d[:, None] * stride_buf_kdim
             )
             k = tl.load(
                 K_Buffer + offs_buf_k,
-                mask=mask_n[None, :] & mask_d[:, None],
+                mask=mask_n[None, :] & mask_d[:, None] & valid_page[None, :],
                 other=0.0,
             )
 
@@ -257,14 +289,14 @@ def _fwd_kernel(
 
             # Load V from paged buffer
             offs_buf_v = (
-                page_ids[:, None] * stride_buf_vpage
+                safe_page_ids[:, None] * stride_buf_vpage
                 + cur_kv_head * stride_buf_vh
                 + token_in_page[:, None] * stride_buf_vtoken
                 + offs_dv[None, :] * stride_buf_vdim
             )
             v = tl.load(
                 V_Buffer + offs_buf_v,
-                mask=mask_n[:, None] & mask_dv[None, :],
+                mask=mask_n[:, None] & mask_dv[None, :] & valid_page[:, None],
                 other=0.0,
             )
             p = p.to(v.dtype)
@@ -301,6 +333,11 @@ def _fwd_kernel(
             final_mask &= mask_causal
         else:
             final_mask &= mask_m[:, None] & mask_n[None, :]
+
+        if WINDOW_LEFT >= 0:
+            q_pos_s2 = cur_block_m * BLOCK_M + offs_m[:, None]
+            k_pos_s2 = start_n + offs_n[None, :]
+            final_mask &= (q_pos_s2 - k_pos_s2) <= WINDOW_LEFT
 
         SKIP_TILE = False
         if USE_CUSTOM_MASK:
@@ -382,6 +419,7 @@ def _extend_attention_fwd(
     is_causal: bool = False,
     logit_cap: float = 0.0,
     skip_prefix_custom_mask: bool = False,
+    window_left: int = -1,
 ):
     """Launch the Triton extend attention kernel.
 
@@ -404,6 +442,8 @@ def _extend_attention_fwd(
         is_causal: Use causal masking for extend (stage 2)
         logit_cap: Logit soft-capping (0.0 = disabled)
         skip_prefix_custom_mask: Skip custom mask for prefix (stage 1)
+        window_left: Sliding window radius (inclusive), -1 to disable.
+            A query at position p attends to keys in [p - window_left, p].
     """
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
@@ -461,6 +501,7 @@ def _extend_attention_fwd(
         USE_CUSTOM_MASK=custom_mask is not None,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=skip_prefix_custom_mask,
+        WINDOW_LEFT=window_left,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -482,6 +523,7 @@ def triton_prefill_with_custom_mask(
     # Attention config
     custom_mask: Optional[torch.Tensor],
     sm_scale: float,
+    window_left: int = -1,
 ) -> None:
     """Triton prefill attention with optional custom mask and paged KV cache.
 
@@ -510,6 +552,10 @@ def triton_prefill_with_custom_mask(
                      Per-seq shape: [extend_len, prefix_len + extend_len].
                      None for causal attention.
         sm_scale: Softmax scale factor
+        window_left: Sliding window radius (inclusive), -1 to disable.
+            A query at position p attends to keys in [p - window_left, p].
+            Use (attention_window_size - 1) since TRTLLM window size is
+            exclusive while flashinfer/triton convention is inclusive.
     """
     device = q.device
     num_contexts = qo_indptr.shape[0] - 1
@@ -583,4 +629,5 @@ def triton_prefill_with_custom_mask(
         is_causal=False,
         logit_cap=0.0,
         skip_prefix_custom_mask=False,
+        window_left=window_left,
     )

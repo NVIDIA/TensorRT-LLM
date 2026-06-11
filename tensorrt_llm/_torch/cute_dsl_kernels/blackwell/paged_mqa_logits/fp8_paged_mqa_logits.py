@@ -64,10 +64,14 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float16, Int32
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, nvvm, vector
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+# CuTe DSL CUDA 13 validates rounding modes as string literals. The string
+# form is also accepted by older wrappers, so keep it version-independent.
+_RND_RN = "rn"
 
 
 @dsl_user_op
@@ -365,7 +369,6 @@ class FP8MQALogitsKernel:
         # Derive KV and Scale views from fused buffer using CuTE ops.
         # Fused layout per physical block: [KV data (phys_block_kv*head_dim)] [Scales (phys_block_kv*4)]
         phys_block_kv = self.phys_block_kv
-        phys_block_bytes = phys_block_kv * (self.head_dim + 4)
         scale_offset_elems = phys_block_kv * self.head_dim  # in FP8 elements
 
         # Recast fused buffer to FP8 (same 1-byte elements, needed for MMA type inference)
@@ -375,11 +378,20 @@ class FP8MQALogitsKernel:
         # recast back to FP8 so MMA type inference and TMA descriptors are correct.
         b = cute.recast_tensor(b, cutlass.Float8E4M3FN)
 
+        # Read the real per-block stride (bytes = FP8 elements) from the input.
+        # When KV is the indexer K-cache pool view, the pool is laid out as
+        # [num_blocks, num_layers, kvFactor, blockSize], so dim-0 stride =
+        # num_layers * kvFactor * phys_block_bytes (not phys_block_bytes).
+        # Using the input stride keeps both contiguous test path and the
+        # strided prod path correct. FP8 = 1 byte per element, so the byte
+        # stride is the same as the element stride after recast.
+        kv_block_stride = kv_fused.layout.stride[0]
+
         # KV view: [phys_block_kv, head_dim, num_phys_blocks] FP8
         # Each TMA loads one physical block; multiple TMAs fill a compute tile.
         kv_layout = cute.make_layout(
             (phys_block_kv, self.head_dim, num_phys_blocks),
-            stride=(self.head_dim, 1, phys_block_bytes),
+            stride=(self.head_dim, 1, kv_block_stride),
         )
         a = cute.make_tensor(kv_fp8.iterator, kv_layout)
 
@@ -387,7 +399,7 @@ class FP8MQALogitsKernel:
         # [phys_block_kv, num_phys_blocks] float32 (after recast)
         scale_fp8_layout = cute.make_layout(
             (phys_block_kv * 4, num_phys_blocks),
-            stride=(1, phys_block_bytes),
+            stride=(1, kv_block_stride),
         )
         scale_fp8 = cute.make_tensor(kv_fp8.iterator + scale_offset_elems, scale_fp8_layout)
         scales = cute.recast_tensor(scale_fp8, cutlass.Float32)
@@ -1409,10 +1421,10 @@ class FP8MQALogitsKernel:
                                     w2 = w_cache[r0 + 2]
                                     w3 = w_cache[r0 + 3]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                             # SMEM-path: weights from shared mem
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1448,10 +1460,10 @@ class FP8MQALogitsKernel:
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
                                     w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)
@@ -1625,10 +1637,10 @@ class FP8MQALogitsKernel:
                                     w2 = w_cache[r0 + 2]
                                     w3 = w_cache[r0 + 3]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                             # SMEM-path
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1664,10 +1676,10 @@ class FP8MQALogitsKernel:
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
                                     w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)

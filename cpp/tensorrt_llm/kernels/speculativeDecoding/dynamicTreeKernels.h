@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_runtime.h>
+#include <torch/extension.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -60,38 +61,105 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
     runtime::SizeType32 topK, runtime::SizeType32 depth, runtime::SizeType32 numDraftTokens, TreeMaskMode treeMaskMode,
     cudaStream_t stream, runtime::SizeType32 numInt32PerRow);
 
-//! \brief Verify dynamic tree using greedy strategy
-//! Verifies draft tokens against target model predictions using tree traversal.
-//! All index/token pointer parameters use int64.
-//! \param predicts output buffer [seqLensSum], on GPU. int64.
-//! Verified token predictions.
-//! \param acceptIndex output buffer [batchSize, numSpecStep], on GPU. int64.
-//! Indices of accepted tokens.
-//! \param acceptTokenNum output buffer [batchSize], on GPU. int64.
-//! Number of accepted tokens per request.
-//! \param acceptToken output buffer [batchSize, numSpecStep], on GPU. int64.
-//! Contiguous accepted token ids along the accepted path (root prediction,
-//! accepted draft predictions, bonus token). Entry count per request =
-//! acceptTokenNum + 1.
-//! \param candidates [batchSize, numDraftTokens], on GPU. int64.
-//! Candidate draft tokens.
-//! \param retrieveIndex [batchSize, numDraftTokens], on GPU. int32.
-//! Indices for retrieving tokens.
-//! \param retrieveNextToken [batchSize, numDraftTokens], on GPU. int32.
-//! Index of the first child token.
-//! \param retrieveNextSibling [batchSize, numDraftTokens], on GPU. int32.
-//! Index of the next sibling token.
-//! \param targetPredict [batchSize, numDraftTokens], on GPU. int64.
-//! Target model predictions.
+//! \brief Build tree-position -> unique draft-prob row mapping for rejection sampling.
+//! \param topkScoreIndices [batchSize, numDraftTokens], on GPU. int64.
+//! History-buffer indices selected for each final tree position.
+//! \param draftProbIndices output [batchSize, numDraftTokens + 1], on GPU. int32.
+//! Column 0 is reserved for the root and set to 0.
 //! \param batchSize runtime::SizeType32. Batch size.
-//! \param numDraftTokens runtime::SizeType32. Total number of draft tokens.
+//! \param topK runtime::SizeType32. Tree top-K branching factor.
+//! \param numDraftTokens runtime::SizeType32. Total number of non-root draft positions.
+//! \param stream cuda stream.
+void invokeBuildDraftProbIndices(int64_t const* topkScoreIndices, int32_t* draftProbIndices,
+    runtime::SizeType32 batchSize, runtime::SizeType32 topK, runtime::SizeType32 numDraftTokens, cudaStream_t stream);
+
+//! \brief Verify dynamic tree using greedy strategy with packed retrieve buffers.
+//! \param acceptIndex output buffer [batchSize, numSpecStep], on GPU. int32.
+//! \param acceptTokenNum output buffer [batchSize], on GPU. int32.
+//! \param acceptToken output buffer [batchSize, numSpecStep], on GPU. int32.
+//! \param candidates [batchSize, numDraftTokens], on GPU. int32.
+//! \param retrievePacked [batchSize, numDraftTokens, 3], on GPU. int32.
+//! \param targetPredict [batchSize, numDraftTokens], on GPU. int32.
+//! \param treeValid [batchSize], on GPU. bool.
+//! \param batchSize runtime::SizeType32. Batch size.
+//! \param numDraftTokens runtime::SizeType32. Total tree nodes per batch (including root).
 //! \param numSpecStep runtime::SizeType32. Number of speculative steps.
-//! \param stream cuda stream
-void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid,
+//! \param stream cuda stream.
+void invokeVerifyDynamicTreeGreedyPacked(int32_t* acceptIndex, int32_t* acceptTokenNum, int32_t* acceptToken,
+    int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict, bool const* treeValid,
     runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep,
     cudaStream_t stream);
+
+//! \brief Verify dynamic tree using rejection sampling.
+//! For each request, traverses the tree depth-by-depth. At each depth, siblings are tried
+//! in order; the first sibling accepted by rejection sampling (p_target/p_draft) continues
+//! the path. If all siblings are rejected, a correction token is sampled from (target-draft)_+.
+//! \param acceptIndex    output [batchSize, numSpecStep] int64 — tree positions of accepted tokens.
+//! \param acceptTokenNum output [batchSize] int64 — # accepted draft tokens (excl. root).
+//! \param acceptToken    output [batchSize, numSpecStep] int64 — accepted/correction token ids.
+//! \param candidates     [batchSize, numDraftTokens] int64; col 0 = root (target sample).
+//! \param draftProbs     [batchSize, numDraftProbRows, vocabSize] float32.
+//!        Unique draft probability rows per request; tree positions map into this
+//!        tensor via draftProbIndices.
+//! \param targetProbs    [batchSize, numDraftTokens, vocabSize] float32; index 0 = root.
+//! \param targetSupportIndices [batchSize, numDraftTokens, maxTargetSupportSize] int32; compact token ids that
+//!        survive top-k/top-p filtering for each row, padded with -1. May be empty when no filtering is active.
+//! \param targetSupportLengths [batchSize, numDraftTokens] int32; valid support length per row. May be empty when
+//!        no filtering is active.
+//! \param draftProbIndices [batchSize, numDraftTokens] int32; maps each tree position to the
+//!        corresponding row in draftProbs. Root is unused.
+//! \param retrieveNextToken   [batchSize, numDraftTokens] int32 first-child pointer, -1=none.
+//! \param retrieveNextSibling [batchSize, numDraftTokens] int32 next-sibling pointer, -1=none.
+//! \param treeValid      [batchSize] bool; false means no valid tree exists for this request.
+//! \param batchSize      runtime::SizeType32.
+//! \param numDraftProbRows runtime::SizeType32. Number of unique draft-prob rows per request.
+//! \param maxTargetSupportSize runtime::SizeType32. Third dim of targetSupportIndices. Can be zero.
+//! \param numDraftTokens runtime::SizeType32. Total tree nodes per request (including root).
+//! \param numSpecStep    runtime::SizeType32. Second dim of acceptIndex/acceptToken.
+//! \param vocabSize      runtime::SizeType32. Vocabulary size.
+//! \param seed           [1] int64 on GPU. Philox RNG seed.
+//! \param offset         [1] int64 on GPU. Philox RNG offset.
+//! \param stream         cudaStream_t.
+void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
+    int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* targetSupportIndices,
+    int32_t const* targetSupportLengths, int32_t const* draftProbIndices, int32_t const* retrieveNextToken,
+    int32_t const* retrieveNextSibling, bool const* treeValid, runtime::SizeType32 batchSize,
+    runtime::SizeType32 numDraftProbRows, runtime::SizeType32 maxTargetSupportSize, runtime::SizeType32 numDraftTokens,
+    runtime::SizeType32 numSpecStep, runtime::SizeType32 vocabSize, int64_t const* seed, int64_t const* offset,
+    cudaStream_t stream);
+
+//! \brief Compute draft probabilities for dynamic-tree rejection sampling from logits.
+//! \param draftLogits [batchSize * numDraftProbRows, draftVocabSize], on GPU.
+//! \param temperatures [batchSize], on GPU.
+//! \param numDraftProbRows runtime::SizeType32. Unique draft-prob rows per request.
+//! \param topK Optional [batchSize], on GPU.
+//! \param topP Optional [batchSize], on GPU.
+//! \param targetVocabSize runtime::SizeType32. Output vocabulary size after optional d2t expansion.
+//! \param d2t Optional [draftVocabSize], on GPU.
+//! \return [batchSize, numDraftProbRows, targetVocabSize] float32 probabilities.
+torch::Tensor computeDraftProbsForDynamicTreeRejection(torch::Tensor const& draftLogits,
+    torch::Tensor const& temperatures, runtime::SizeType32 numDraftProbRows, torch::optional<torch::Tensor> const& topK,
+    torch::optional<torch::Tensor> const& topP, runtime::SizeType32 targetVocabSize, bool skipTemperature,
+    torch::optional<torch::Tensor> const& d2t, runtime::SizeType32 kMax = 0, bool skipAllSamplingParams = false);
+
+//! \brief Compute target probabilities for dynamic-tree rejection sampling from logits.
+//! \param targetLogits [batchSize * numDraftTokens, targetVocabSize], on GPU.
+//! \param temperatures [batchSize], on GPU.
+//! \param numDraftTokens runtime::SizeType32. Total tree nodes per request (including root).
+//! \param topK Optional [batchSize], on GPU.
+//! \param topP Optional [batchSize], on GPU.
+//! \param kMax runtime::SizeType32. Max top-K value across the batch; enables the fast topk
+//!        path when > 0. Must be computed on CPU (e.g. topK.max().item()). Default 0 = fallback
+//!        to full sort.
+//! \return Tuple of:
+//!   1. [batchSize, numDraftTokens, targetVocabSize] float32 probabilities.
+//!   2. [batchSize, numDraftTokens, maxTargetSupportSize] int32 compact token ids that survive
+//!      top-k/top-p filtering for each row, padded with -1. Empty when no filtering is active.
+//!   3. [batchSize, numDraftTokens] int32 support lengths. Empty when no filtering is active.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDynamicTreeRejection(
+    torch::Tensor const& targetLogits, torch::Tensor const& temperatures, runtime::SizeType32 numDraftTokens,
+    torch::optional<torch::Tensor> const& topK, torch::optional<torch::Tensor> const& topP, bool skipTemperature,
+    runtime::SizeType32 kMax = 0, bool skipAllSamplingParams = false);
 
 } // namespace kernels::speculative_decoding
 

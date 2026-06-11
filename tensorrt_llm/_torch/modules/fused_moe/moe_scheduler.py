@@ -52,6 +52,7 @@ from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
+from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
@@ -91,6 +92,7 @@ class MoEScheduler(ABC):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         use_dp_padding: Optional[bool],
+        lora_params: Optional[Dict] = None,
     ) -> torch.Tensor: ...
 
 
@@ -130,6 +132,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         use_dp_padding: Optional[bool],
+        lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         moe = self.moe
 
@@ -147,6 +150,22 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 2: Determine communication method ==========
         num_chunks = moe.calculate_num_chunks(all_rank_num_tokens_padded)
 
+        # Routed-expert MoE LoRA carries per-request adapter metadata that is
+        # not re-sliced per token-chunk, so multi-chunk execution would mismatch
+        # the kernel's per-token expansion. Reject here with a clear message
+        # instead of failing inside the C++ op.
+        if (
+            num_chunks > 1
+            and moe.backend.__class__ == CutlassFusedMoE
+            and moe.backend._moe_lora_active(lora_params)
+        ):
+            raise NotImplementedError(
+                f"Routed-expert MoE LoRA does not support multi-chunk execution "
+                f"(num_chunks={num_chunks}). Reduce the per-forward token count "
+                f"or increase `moe_max_num_tokens` so the MoE runs in a single "
+                f"chunk."
+            )
+
         # May fall back AllToAll -> AllGather; this is the only sanctioned
         # mutation of ``moe.comm`` from a scheduler.
         moe.determine_communication_method(all_rank_num_tokens_padded, num_chunks)
@@ -160,6 +179,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 all_rank_num_tokens_padded,
                 use_dp_padding,
                 do_finalize,
+                lora_params=lora_params,
             )
         else:
             outputs = self._forward_multiple_chunks(
@@ -170,6 +190,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 all_rank_num_tokens_padded,
                 use_dp_padding,
                 do_finalize,
+                lora_params=lora_params,
             )
 
         # ========== Step 4: Truncate DP padding ==========
@@ -183,7 +204,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
     # NVLink-specific EPLB stat-gather paths)
     # ------------------------------------------------------------------
     def _is_using_nvlink_two_sided(self) -> bool:
-        return isinstance(self.moe.comm, NVLinkTwoSided)
+        return isinstance(self.moe.comm, (NVLinkTwoSided, NVLinkTwoSidedFlashinfer))
 
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
@@ -207,12 +228,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
         num_rows = x.shape[0]
         if moe.use_dp and moe.comm is not None:
             # Communication path padding: dispatch outputs are
-            # ``[ep_size * max_tokens_per_rank, ...]`` (or expert-major for
+            # ``[num_dp_ranks * max_tokens_per_rank, ...]`` (or expert-major for
             # DeepEPLowLatency). Workspace must cover that footprint.
             if isinstance(moe.comm, DeepEPLowLatency):
                 num_rows = moe.num_slots * max(all_rank_num_tokens)
             else:
-                num_rows = moe.mapping.moe_ep_size * max(all_rank_num_tokens)
+                num_rows = moe._dp_padded_num_rows(all_rank_num_tokens)
 
         workspaces = moe.backend.get_workspaces([num_rows])
         return workspaces[0]
@@ -239,7 +260,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # Mirror ``_prepare_workspace_deepgemm``: DeepEPLowLatency dispatches
         # expert-major outputs sized ``num_slots * max_tokens_per_rank`` per
         # rank (one shard per slot), while other comms produce
-        # ``ep_size * max_tokens_per_rank``. Using the wrong formula
+        # ``num_dp_ranks * max_tokens_per_rank``. Using the wrong formula
         # under-allocates the workspace for DeepEPLowLatency multi-chunk
         # runs and is caught by ``DeepGemmFusedMoE.run_moe``.
         if moe.use_dp and all_rank_num_tokens_list[0] is not None:
@@ -247,7 +268,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if isinstance(moe.comm, DeepEPLowLatency):
                 chunk_size_0 = moe.num_slots * max_tokens
             else:
-                chunk_size_0 = moe.mapping.moe_ep_size * max_tokens
+                chunk_size_0 = moe._dp_padded_num_rows(all_rank_num_tokens_list[0])
         else:
             chunk_size_0 = chunk_size_list[0]
         workspace_chunk_sizes = [chunk_size_0]
@@ -273,6 +294,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
+        lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -290,6 +312,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             is_last_call,
             do_finalize,
             workspace=workspace,
+            lora_params=lora_params,
         )
 
     def _forward_chunk_impl(
@@ -303,6 +326,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         is_last_call: bool,
         do_finalize: bool = True,
         workspace: Optional[dict] = None,
+        lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -473,7 +497,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
             token_final_scales=token_final_scales,
             x_sf=x_sf,
             **self._get_backend_kwargs(
-                router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
+                router_logits,
+                do_finalize,
+                all_rank_num_tokens,
+                output_dtype,
+                x,
+                workspace,
+                lora_params=lora_params,
             ),
         )
 
@@ -508,6 +538,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
+        lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         """Multiple-chunk path with optional aux-stream overlap."""
         moe = self.moe
@@ -593,6 +624,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                             is_last_call,
                             do_finalize,
                             workspace=workspace_0,
+                            lora_params=lora_params,
                         )
                 else:
                     outputs = self._forward_chunk_impl(
@@ -605,6 +637,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                         is_last_call,
                         do_finalize,
                         workspace=workspace_1,
+                        lora_params=lora_params,
                     )
             else:
                 outputs = self._forward_chunk_impl(
@@ -617,6 +650,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     do_finalize,
                     workspace=workspace_0,
+                    lora_params=lora_params,
                 )
 
             if chunked_used[idx_chunk]:
@@ -684,6 +718,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype] = None,
         x: Optional[torch.Tensor] = None,
         workspace: Optional[dict] = None,
+        lora_params: Optional[Dict] = None,
     ) -> Dict:
         """Backend-specific kwargs for ``backend.run_moe`` (external-comm only).
 
@@ -691,10 +726,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
         calls this helper, so all branches here are EXTERNAL_COMM backends.
 
         Backend-specific kwargs:
-            - Cutlass: is_sf_swizzled, enable_alltoall, tuner_*, moe_output
-            - CuteDSL: enable_alltoall, moe_output, dwdp_weight_view
+            - Cutlass: is_sf_swizzled, enable_alltoall, tuner_*, moe_output, lora_params
+            - CuteDSL: enable_alltoall, moe_output
             - DeepGemm: workspace
             - TRTLLMGen: router_logits, do_finalize, moe_output
+
+        Only CutlassFusedMoE.run_moe accepts lora_params (routed-expert MoE LoRA
+        is fused there), so it is set on the Cutlass branch alone.
         """
         moe = self.moe
         kwargs: Dict = {}
@@ -705,6 +743,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
             kwargs["is_sf_swizzled"] = not supports_post_quant
             kwargs["output_dtype"] = output_dtype
+            kwargs["lora_params"] = lora_params
 
             # Tuner sees pre-alltoall token shapes so cached tactics from the
             # warmup (no-alltoall) phase still apply at runtime.
@@ -727,11 +766,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
-
-            if moe.enable_dwdp:
-                kwargs["dwdp_weight_view"] = moe.dwdp_manager.build_weight_view(
-                    moe.layer_idx, moe.backend
-                )
 
         elif moe.backend.__class__ == DeepGemmFusedMoE:
             if workspace is not None:
@@ -790,6 +824,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         use_dp_padding: Optional[bool],
+        lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
 
@@ -800,6 +835,15 @@ class FusedCommMoEScheduler(MoEScheduler):
         kernel for the cross-rank barrier.
         """
         del use_dp_padding  # MegaMoE has no host-side cross-rank shape alignment.
+
+        # Fused-comm (MegaMoE) backends cannot carry LoRA adapters; routed-expert
+        # MoE LoRA is supported only on the CUTLASS backend. Reject rather than
+        # silently ignore.
+        if lora_params:
+            raise NotImplementedError(
+                "Routed-expert MoE LoRA is not supported by the fused-comm "
+                "(MegaMoE) scheduler; only the CUTLASS backend supports it."
+            )
 
         if isinstance(x, Fp4QuantizedTensor):
             raise NotImplementedError(

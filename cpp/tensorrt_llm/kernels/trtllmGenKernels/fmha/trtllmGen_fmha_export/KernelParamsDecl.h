@@ -151,6 +151,8 @@ struct KernelParams {
   int32_t mNumTokensPerCtaQ;
   // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
   int32_t mNumTokensPerPageLog2;
+  // The runtime K/V TMA box reshape factor selected by host descriptor setup.
+  int32_t mReshapeFactorKv;
   // The output scale for FP8 quantization.
   float mOutputScale;
   // The scaling factor for softmax (multiplied by log2 to use faster exp2).

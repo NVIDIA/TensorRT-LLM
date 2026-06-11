@@ -18,11 +18,7 @@ These examples show how to interact with the visual generation server using both
 
 Before running these examples, ensure you have:
 
-1. **Install modules**: Install required dependencies before running examples:
-
-   ```bash
-   pip install "diffusers>=0.37.0"
-   ```
+1. **Install modules**: Install optional dependency:
 
    **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
    ```bash
@@ -44,6 +40,7 @@ Before running these examples, ensure you have:
    trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
    trtllm-serve $LLM_MODEL_DIR/LTX-2/ --extra_visual_gen_options ./configs/ltx2.yml
+   trtllm-serve $LLM_MODEL_DIR/Qwen-Image --extra_visual_gen_options ./configs/qwen_image.yml
 
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan21.yml > /tmp/serve.log 2>&1 &
@@ -62,6 +59,7 @@ Current supported & tested models:
 2. FLUX.1 for image generation (t2i)
 3. FLUX.2 for image generation (t2i)
 4. LTX-2 for video generation with audio (t2v, ti2v)
+5. Qwen-Image for image generation (t2i)
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
@@ -69,7 +67,7 @@ Demonstrates synchronous text-to-image generation using the OpenAI SDK. Supports
 
 **Features:**
 - Generates images from text prompts
-- Supports configurable model, image size, and quality
+- Supports configurable model and image size
 - Returns base64-encoded images or URLs
 - Saves generated images to disk
 
@@ -271,20 +269,52 @@ You can customize these by:
 ## Common Parameters
 
 ### Image Generation
-- `model`: Model identifier (e.g., "flux1", "flux2")
-- `prompt`: Text description
+- `prompt`: Text description (required)
 - `n`: Number of images to generate
-- `size`: Image dimensions (e.g., "512x512", "1024x1024")
-- `quality`: "standard" or "hd"
-- `response_format`: "b64_json" or "url"
+- `size`: Image dimensions in `WxH` format (e.g., `"512x512"`, `"1024x1024"`) — or use the structured pair `width` + `height` (both required when sent)
+- `seed`: Random seed; `null` / omitted means the engine draws a fresh seed
+- `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls (override pipeline defaults when sent)
+- `extra_params`: model-specific overflow as a JSON object (see "Model-Specific `extra_params`" below). Unknown keys are rejected by the executor.
+- `response_format`: `"b64_json"` or `"url"`
+- `format`: Generation content encoding. Image encoders: `"png"`, `"webp"`, `"jpeg"`. Tensor formats: `"safetensors"`, `"pt"`.
+- Accept-and-warn OpenAI-shape fields (no engine semantic): `model`, `quality`, `style`, `user`. Sending `quality`/`style` logs a server-side WARNING; sending `model` warns on mismatch. None of these change generation behavior.
 
 ### Video Generation
-- `model`: Model identifier (e.g., "wan", "ltx2")
-- `prompt`: Text description
-- `size`: Video resolution (e.g., "256x256", "512x512", "1280x720")
-- `seconds`: Duration in seconds
-- `fps`: Frames per second
-- `input_reference`: Reference image file (for TI2V mode)
+- `prompt`: Text description (required)
+- `size` / `width` / `height`: same convention as image
+- `seconds`: Duration in seconds (engine multiplies by `frame_rate` to derive `num_frames` when the latter is absent)
+- `frame_rate` (canonical) or `fps` (alias): frames per second
+- `num_frames`: when set, wins over the `seconds * frame_rate` derivation
+- `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
+- `input_reference`: Reference image (TI2V mode); accepted as base64-encoded string in JSON or as a file in multipart form-data
+- `extra_params`: model-specific overflow (see below)
+- `response_format`: `"b64_json"` or `"url"`
+- `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
+
+#### Tensor-format consumer contract
+
+When `format="safetensors"` or `format="pt"`, the payload bundles every populated media tensor (`image` / `video` / `audio`) and the scalar metadata (`frame_rate`, `audio_sample_rate`) into one file.
+
+- **`pt`**: `torch.load(buf, weights_only=True)` returns a dict with the tensor keys and the scalars as native Python values.
+- **`safetensors`**: `safetensors.torch.load(bytes)` returns a dict with the tensor keys and each scalar as a 0-d tensor under the same key — call `.item()` to unbox (e.g. `loaded["frame_rate"].item()`). The same scalars are also written to the safetensors file header as strings; `safe_open(path, framework="pt").metadata()` exposes them in that form for consumers that prefer header access.
+
+#### Unknown-field policy
+
+The visual-gen endpoints reject unknown top-level fields with HTTP 422 (`extra="forbid"`). Anything model-specific belongs inside `extra_params`. Sending `output_format`, top-level `guidance_rescale`, or — for video — top-level `n` returns 422 with the offending field named in the error body.
+
+#### Model-specific `extra_params`
+
+Use the Python API to discover accepted keys for a loaded pipeline:
+
+```python
+generator = VisualGen(model="...")
+print(generator.extra_param_specs)   # {key: ExtraParamSchema(type=..., range=..., default=..., description=...)}
+```
+
+Examples:
+- **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
+- **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
+- **Wan 2.1 / Flux**: no model-specific `extra_params` declared
 
 > **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
 > `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).

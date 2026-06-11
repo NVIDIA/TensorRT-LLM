@@ -20,7 +20,7 @@ column_limit = 80
 [tool.codespell]
 skip = ".git,3rdparty,triton_kernels,tests/integration/test_input_files**,**.jsonl,**.json"
 exclude-file = "examples/models/core/whisper/tokenizer.py"
-ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw,dOut,indext,asend"
+ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw,dOut,indext,asend,medias"
 
 [tool.autoflake]
 in-place = true
@@ -1467,7 +1467,6 @@ follow_imports = "silent"
 explicit_package_bases = true
 namespace_packages = true
 strict = true
-warn_unused_ignores = false
 show_error_codes = true
 # NB:
 #   .   -> 'tensorrt_llm'

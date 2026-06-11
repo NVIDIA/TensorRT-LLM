@@ -1,18 +1,18 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from transformers import AutoConfig
 
 from tensorrt_llm.inputs import MultimodalDataTracker
-from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO, VideoMediaIO
+from tensorrt_llm.inputs.media_io import AudioMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.serve import chat_utils as _chat_utils
 from tensorrt_llm.serve.chat_utils import (
+    _make_media_io,
     load_chat_template,
     parse_chat_message_content,
     parse_chat_message_content_part,
     parse_chat_messages_coroutines,
-    resolve_media_io_kwargs,
 )
 
 
@@ -397,75 +397,127 @@ class TestMultimodalPlaceholderCounts:
         ],
     )
     def test_per_message_counts(self, messages, expected_mm_placeholder_counts):
-        mock_config = MagicMock(spec=AutoConfig)
-        mock_config.model_type = _MM_MODEL_TYPE
+        # Use a real class so that `type(config).model_type` (a class-attribute
+        # lookup in the production code) resolves correctly.
+        class _StubConfig:
+            model_type = _MM_MODEL_TYPE
+
+        mock_config = _StubConfig()
 
         _, _, mm_placeholder_counts = parse_chat_messages_coroutines(messages, mock_config, None)
 
         assert mm_placeholder_counts == expected_mm_placeholder_counts
 
 
-class CustomError(Exception):
-    pass
-
-
-class TestMultimodalLoadErrorPropagation:
-    """Verify that errors from multimodal loading propagate."""
+class TestParseChatMessageContentPart:
+    """Unit tests for parse_chat_message_content_part."""
 
     @pytest.fixture
     def mm_tracker(self):
         return MultimodalDataTracker(model_type="dummy")
 
+    def test_string_input_returned_directly(self, mm_tracker):
+        assert parse_chat_message_content_part("hello world", mm_tracker) == "hello world"
+
+    def test_text_part_returns_string(self, mm_tracker):
+        result = parse_chat_message_content_part({"type": "text", "text": "hello"}, mm_tracker)
+        assert result == "hello"
+
     @pytest.mark.parametrize(
-        "part, loader_path",
+        "part",
+        [
+            # Missing image_url key → url resolves to None.
+            {"type": "image_url"},
+            # Present but empty image_url dict → url resolves to None.
+            {"type": "image_url", "image_url": {}},
+            {"type": "video_url"},
+            {"type": "audio_url"},
+        ],
+    )
+    def test_missing_url_content_returns_none(self, mm_tracker, part):
+        """Parts whose URL resolves to None are skipped silently (no exception)."""
+        assert parse_chat_message_content_part(part, mm_tracker) is None
+
+    def test_non_string_type_raises_value_error(self, mm_tracker):
+        with pytest.raises(ValueError, match="Invalid 'type' field"):
+            parse_chat_message_content_part({"type": 42}, mm_tracker)
+
+    def test_unknown_string_type_raises_not_implemented(self, mm_tracker):
+        with pytest.raises(NotImplementedError):
+            parse_chat_message_content_part({"type": "future_modality"}, mm_tracker)
+
+    @pytest.mark.parametrize(
+        "part, expected_modality, expected_is_embedding",
         [
             (
-                {"type": "image_url", "image_url": {"url": "http://bad-url/img.png"}},
-                "tensorrt_llm.serve.chat_utils.async_load_image",
+                {"type": "image_url", "image_url": {"url": "http://x/img.png"}},
+                "image",
+                False,
             ),
             (
-                {"type": "video_url", "video_url": {"url": "http://bad-url/vid.mp4"}},
-                "tensorrt_llm.serve.chat_utils.async_load_video",
+                {"type": "video_url", "video_url": {"url": "http://x/vid.mp4"}},
+                "video",
+                False,
             ),
             (
-                {"type": "audio_url", "audio_url": {"url": "http://bad-url/aud.wav"}},
-                "tensorrt_llm.serve.chat_utils.async_load_audio",
+                {"type": "audio_url", "audio_url": {"url": "http://x/aud.wav"}},
+                "audio",
+                False,
             ),
             (
-                {"type": "image_embeds", "image_embeds": {"data": "notbase64"}},
-                "tensorrt_llm.serve.chat_utils.load_base64_image_embeds",
+                {"type": "image_embeds", "image_embeds": {"data": "AAAA"}},
+                "image",
+                True,
+            ),
+            (
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+                "audio",
+                False,
             ),
         ],
     )
-    @pytest.mark.asyncio
-    async def test_loader_exception_propagates(self, mm_tracker, part, loader_path):
-        """Exceptions from async loaders must propagate, not be swallowed."""
-        with patch(loader_path, side_effect=CustomError):
-            result = parse_chat_message_content_part(part, mm_tracker)
-            assert result is not None
-            with pytest.raises(CustomError):
-                await result["data"]
+    def test_media_part_returns_correct_multimodal_data(
+        self, mm_tracker, part, expected_modality, expected_is_embedding
+    ):
+        """Each media part type returns MultimodalData with the right modality and is_embedding."""
+        result = parse_chat_message_content_part(part, mm_tracker)
+        assert result is not None
+        assert result["modality"] == expected_modality
+        assert result["is_embedding"] == expected_is_embedding
+
+    @pytest.mark.parametrize(
+        "part",
+        [
+            # Missing data key entirely.
+            {"type": "input_audio", "input_audio": {"format": "wav"}},
+            # Explicit empty string.
+            {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}},
+            # Explicit None.
+            {"type": "input_audio", "input_audio": {"data": None, "format": "wav"}},
+        ],
+    )
+    def test_input_audio_bad_data_raises_value_error(self, mm_tracker, part):
+        with pytest.raises(ValueError, match="non-empty 'data' field"):
+            parse_chat_message_content_part(part, mm_tracker)
 
 
-class TestResolveMediaIoKwargs:
-    """Resolution of server defaults vs per-request media_io_kwargs."""
+class TestMakeMediaIo:
+    """_make_media_io constructs correctly-configured MediaIO instances."""
 
     def test_server_only_used_when_request_absent(self):
         server = MultimodalServerConfig(media_io_kwargs={"video": {"num_frames": 8, "fps": 1}})
-        assert resolve_media_io_kwargs(server, None, "video") == {
-            "num_frames": 8,
-            "fps": 1,
-        }
+        io = _make_media_io("video", server, None)
+        assert io._num_frames == 8
+        assert io._fps == 1
 
     def test_request_keys_shallow_merge_over_server(self):
         server = MultimodalServerConfig(
             media_io_kwargs={"image": {"format": "pil", "device": "cuda"}}
         )
         request = {"image": {"format": "pt"}}
-        assert resolve_media_io_kwargs(server, request, "image") == {
-            "format": "pt",
-            "device": "cuda",
-        }
+        io = _make_media_io("image", server, request)
+        assert io._format == "pt"
+        assert io._device == "cuda"
 
     def test_other_modalities_fall_back_to_server(self):
         server = MultimodalServerConfig(
@@ -475,44 +527,16 @@ class TestResolveMediaIoKwargs:
             }
         )
         request = {"video": {"num_frames": 32}}
-        assert resolve_media_io_kwargs(server, request, "image") == {"format": "pil"}
+        io = _make_media_io("image", server, request)
+        assert io._format == "pil"
 
     def test_video_num_frames_override_drops_server_fps(self):
         """Overriding only `num_frames` drops the server's `fps` so the loader's built-in is used."""
         server = MultimodalServerConfig(media_io_kwargs={"video": {"num_frames": 8, "fps": 1}})
         request = {"video": {"num_frames": 32}}
-        assert resolve_media_io_kwargs(server, request, "video") == {"num_frames": 32}
-
-
-class TestVideoMediaIOMergeInteraction:
-    """`VideoMediaIO.merge_kwargs` couples `fps` and `num_frames`."""
-
-    @pytest.mark.parametrize(
-        "runtime, expected",
-        [
-            ({"num_frames": 32}, {"num_frames": 32}),
-            ({"fps": 4}, {"fps": 4}),
-            ({"num_frames": 32, "fps": 4}, {"num_frames": 32, "fps": 4}),
-        ],
-    )
-    def test_overriding_one_drops_partner_unless_both_given(self, runtime, expected):
-        server = {"num_frames": 8, "fps": 1}
-        assert VideoMediaIO.merge_kwargs(server, runtime) == expected
-
-    def test_unrelated_request_key_does_not_trigger_drop(self):
-        merged = VideoMediaIO.merge_kwargs(
-            {"num_frames": 8, "fps": 1},
-            {"format": "pt"},
-        )
-        assert merged == {"num_frames": 8, "fps": 1, "format": "pt"}
-
-    @pytest.mark.parametrize("media_io_cls", [BaseMediaIO, ImageMediaIO, AudioMediaIO])
-    def test_non_video_classes_use_plain_shallow_merge(self, media_io_cls):
-        merged = media_io_cls.merge_kwargs(
-            {"num_frames": 8, "fps": 1},
-            {"num_frames": 32},
-        )
-        assert merged == {"num_frames": 32, "fps": 1}
+        io = _make_media_io("video", server, request)
+        assert io._num_frames == 32
+        assert io._fps == 30  # default, not the server's overridden value
 
 
 class TestMediaIoKwargsLoaderForwarding:
@@ -529,37 +553,135 @@ class TestMediaIoKwargsLoaderForwarding:
 
         return _make
 
-    def test_loader_called_with_resolved_kwargs(self, mm_tracker_factory):
+    def test_io_constructed_with_resolved_kwargs(self, mm_tracker_factory):
+        """Merged kwargs are baked into the MediaIO instance, not forwarded as call-time args."""
         tracker = mm_tracker_factory(
             server_kwargs={"image": {"format": "pil", "device": "cuda"}},
             request_kwargs={"image": {"format": "pt"}},
         )
         part = {"type": "image_url", "image_url": {"url": "i"}}
-        with patch(
-            "tensorrt_llm.serve.chat_utils.async_load_image", return_value=MagicMock()
-        ) as mock_loader:
+
+        captured = []
+        original = _chat_utils._make_media_io
+
+        def spy(*args, **kwargs):
+            io = original(*args, **kwargs)
+            captured.append(io)
+            return io
+
+        with patch.object(_chat_utils, "_make_media_io", side_effect=spy):
             parse_chat_message_content_part(part, tracker)
-        mock_loader.assert_called_once()
-        _, called_kwargs = mock_loader.call_args
-        assert called_kwargs == {"format": "pt", "device": "cuda"}
+
+        assert len(captured) == 1
+        assert captured[0]._format == "pt"
+        assert captured[0]._device == "cuda"
 
     @pytest.mark.asyncio
-    async def test_input_audio_bypasses_media_io_kwargs(self, mm_tracker_factory):
-        """`input_audio` is base64-decoded inline; merged `audio` kwargs must not reach the loader."""
+    async def test_input_audio_synthesizes_data_url(self, mm_tracker_factory):
+        """`input_audio` is rebuilt as a `data:` URL and routed through `async_load`."""
         tracker = mm_tracker_factory(
-            server_kwargs={"audio": {"format": "pil"}},
-            request_kwargs={"audio": {"format": "pt"}},
+            server_kwargs=None,
+            request_kwargs=None,
         )
         part = {
             "type": "input_audio",
             "input_audio": {"data": "AAAA", "format": "wav"},
         }
-        with patch(
-            "tensorrt_llm.serve.chat_utils.async_load_audio", new_callable=AsyncMock
-        ) as mock_loader:
+        with patch.object(AudioMediaIO, "async_load", new_callable=AsyncMock) as mock_load:
             result = parse_chat_message_content_part(part, tracker)
             await result["data"]
-        mock_loader.assert_called_once()
-        _, called_kwargs = mock_loader.call_args
-        assert "format" not in called_kwargs
-        assert called_kwargs.get("is_base64") is True
+        mock_load.assert_called_once_with("data:audio/wav;base64,AAAA")
+
+
+class TestChatCompletionRequestSchemaValidation:
+    """Tests that ChatCompletionRequest pydantic schema accepts valid payloads.
+
+    Regression tests for NVBUG 6143579: multi-turn messages with
+    reasoning_content and content: null were rejected by the schema.
+    """
+
+    def test_reasoning_content_with_null_content_and_tool_calls(self):
+        """Round-tripping an assistant message with reasoning_content.
+
+        content: null must be accepted (OpenAI spec allows null content
+        when tool_calls is present).
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        payload = {
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a coding assistant."},
+                {"role": "user", "content": "List files."},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "User wants me to list files.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": '{"path":"/tmp"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"},
+                {"role": "user", "content": "thanks"},
+            ],
+            "max_tokens": 16,
+        }
+
+        request = ChatCompletionRequest(**payload)
+        assert len(request.messages) == 5
+
+    def test_reasoning_field_with_null_content(self):
+        """The 'reasoning' field name (OpenAI SDK style) with content: null.
+
+        Should be accepted since CustomChatCompletionMessageParam allows
+        extra fields and content: null.
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        payload = {
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning": "Let me think about this.",
+                },
+            ],
+        }
+
+        request = ChatCompletionRequest(**payload)
+        assert len(request.messages) == 2
+
+    def test_null_content_without_reasoning_fields(self):
+        """Plain assistant message with content: null and no reasoning fields.
+
+        Valid per OpenAI spec for tool_calls messages.
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        payload = {
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "What's the weather?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": '{"city":"NYC"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "72F sunny"},
+            ],
+        }
+
+        request = ChatCompletionRequest(**payload)
+        assert len(request.messages) == 3

@@ -114,6 +114,8 @@ def worker_fn(
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    # Use 4 worker threads for KV transfer to exercise multi-thread code paths
+    os.environ["TRTLLM_KV_TRANSFER_NUM_THREADS"] = "4"
 
     # Initialize distributed (use gloo for single GPU compatibility)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)

@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for basic graph quantization."""
 
 from typing import List
@@ -14,6 +28,11 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
     ModelFactory,
     SubModuleExportInfo,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
+    FP8BMMQuantizationFromConfig,
+    FP8LinearQuantizationFromConfig,
+    Quantization,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -41,6 +60,11 @@ class DummyFactory(ModelFactory):
     @property
     def max_seq_len(self) -> int:
         return 512
+
+
+def test_quantization_base_does_not_register_noop_post_load_hook():
+    assert FP8LinearQuantizationFromConfig.post_load_hook is Quantization.post_load_hook
+    assert FP8BMMQuantizationFromConfig.post_load_hook is not Quantization.post_load_hook
 
 
 @pytest.mark.parametrize(

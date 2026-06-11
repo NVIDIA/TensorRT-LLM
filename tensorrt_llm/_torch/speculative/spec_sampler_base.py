@@ -94,6 +94,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             args: TorchSampler.Args with max_num_sequences, max_seq_len, etc.
             draft_len: Maximum number of draft tokens per iteration.
         """
+        self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.draft_len = draft_len
         self.max_seq_len = args.max_seq_len

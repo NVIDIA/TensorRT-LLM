@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from . import rawref
-from ._block_radix_tree import gen_multi_modal_tokens
+from ._block_radix_tree import ReuseScope, gen_multimodal_cache_key_tokens
 from ._common import (
     NDEBUG,
     CacheLevel,
@@ -39,6 +39,7 @@ from ._config import (
     KVCacheDesc,
     KVCacheManagerConfig,
     SsmLayerConfig,
+    SwaScratchReuseConfig,
 )
 from ._core import (
     DEFAULT_BEAM_INDEX,
@@ -63,12 +64,14 @@ __all__ = [
     "DEFAULT_BEAM_INDEX",
     "LayerId",
     "Priority",
+    "ReuseScope",
     "CacheLevel",
     "CacheTier",
     "CudaStream",
     "MemAddress",
     "NDEBUG",
     "KVCacheManagerConfig",
+    "SwaScratchReuseConfig",
     "AttentionLayerConfig",
     "SsmLayerConfig",
     "BufferConfig",
@@ -79,7 +82,7 @@ __all__ = [
     "BatchDesc",
     "CacheTierConfig",
     "KVCacheDesc",
-    "gen_multi_modal_tokens",
+    "gen_multimodal_cache_key_tokens",
     "rawref",
     "AggregatedPageDesc",
     "BufferId",

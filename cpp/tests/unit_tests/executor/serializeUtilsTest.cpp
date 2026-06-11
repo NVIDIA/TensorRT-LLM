@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <gtest/gtest.h>
 
+#include <array>
 #include <optional>
 #include <type_traits>
 #include <variant>
@@ -1096,7 +1097,7 @@ TEST(SerializeUtilsTest, BlockKeyWithExtras)
     VecUniqueTokens uniqueTokens{UniqueToken{10, 100}, UniqueToken{20, 200}};
     std::optional<LoraTaskIdType> loraTaskId = LoraTaskIdType{42};
 
-    // Note: cacheSaltID is intentionally not set since it is not serialized
+    // Note: cacheSalt is intentionally not set; round-tripping with it set is covered separately.
     BlockKey key(true, loraTaskId, uniqueTokens, extraKeys);
 
     testSerializeDeserialize(key);
@@ -1203,6 +1204,10 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
                 EXPECT_EQ((*origUuids)[i], (*deserUuids)[i]);
             }
         }
+
+        EXPECT_EQ(original.getMultimodalItemRunCuOffsets(), deserialized.getMultimodalItemRunCuOffsets());
+        EXPECT_EQ(original.getMultimodalRunPositions(), deserialized.getMultimodalRunPositions());
+        EXPECT_EQ(original.getMultimodalRunLengths(), deserialized.getMultimodalRunLengths());
     };
 
     // Test MultimodalInput with UUIDs
@@ -1217,6 +1222,12 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
     std::vector<std::optional<std::string>> uuids = {std::string("image-uuid-001"), std::string("image-uuid-002")};
     MultimodalInput inputWithUuids(hashes, positions, lengths, uuids);
     verifyMultimodalInput(inputWithUuids);
+
+    std::vector<SizeType32> itemRunCuOffsets = {0, 2, 3};
+    std::vector<SizeType32> runPositions = {0, 40, 100};
+    std::vector<SizeType32> runLengths = {20, 30, 75};
+    MultimodalInput inputWithRuns(hashes, positions, lengths, uuids, itemRunCuOffsets, runPositions, runLengths);
+    verifyMultimodalInput(inputWithRuns);
 
     // Test with partial UUIDs (mixed Some and None)
     std::vector<std::optional<std::string>> partialUuids = {std::string("uuid-a"), std::nullopt};
@@ -1238,6 +1249,67 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
             std::string("short")};
     MultimodalInput inputLongUuids(hashes, positions, lengths, longUuids);
     verifyMultimodalInput(inputLongUuids);
+}
+
+TEST(SerializeUtilsTest, MultimodalInputKeepsLegacyStreamAligned)
+{
+    std::vector<std::vector<SizeType32>> hashes = {{1, 2, 3, 4}};
+    std::vector<SizeType32> positions = {10};
+    std::vector<SizeType32> lengths = {20};
+    std::optional<std::vector<std::optional<std::string>>> uuids = std::nullopt;
+
+    std::ostringstream oss;
+    su::serialize(hashes, oss);
+    su::serialize(positions, oss);
+    su::serialize(lengths, oss);
+    su::serialize(uuids, oss);
+
+    std::array<char, 3> nextObjectPrefix{0, 0, 0};
+    oss.write(nextObjectPrefix.data(), nextObjectPrefix.size());
+    su::serialize(SizeType32{0x01020304}, oss);
+
+    auto bufferString = oss.str();
+    std::vector<char> buffer(bufferString.begin(), bufferString.end());
+    su::VectorWrapBuf<char> strbuf{buffer};
+    std::istream iss{&strbuf};
+    auto multimodalInput = texec::Serialization::deserializeMultimodalInput(iss);
+
+    EXPECT_EQ(multimodalInput.getMultimodalHashes(), hashes);
+    EXPECT_EQ(multimodalInput.getMultimodalPositions(), positions);
+    EXPECT_EQ(multimodalInput.getMultimodalLengths(), lengths);
+    EXPECT_EQ(multimodalInput.getMultimodalUuids(), uuids);
+    EXPECT_EQ(multimodalInput.getMultimodalItemRunCuOffsets(), std::nullopt);
+    EXPECT_EQ(multimodalInput.getMultimodalRunPositions(), std::nullopt);
+    EXPECT_EQ(multimodalInput.getMultimodalRunLengths(), std::nullopt);
+
+    std::array<char, 3> readPrefix{};
+    iss.read(readPrefix.data(), readPrefix.size());
+    EXPECT_EQ(readPrefix, nextObjectPrefix);
+    EXPECT_EQ(su::deserialize<SizeType32>(iss), SizeType32{0x01020304});
+}
+
+TEST(SerializeUtilsTest, MultimodalInputWithoutExactRunsUsesLegacyWireFormat)
+{
+    std::vector<std::vector<SizeType32>> hashes = {{1, 2, 3, 4}};
+    std::vector<SizeType32> positions = {10};
+    std::vector<SizeType32> lengths = {20};
+    std::optional<std::vector<std::optional<std::string>>> uuids = std::nullopt;
+    texec::MultimodalInput input{hashes, positions, lengths, uuids};
+
+    std::ostringstream oss;
+    texec::Serialization::serialize(input, oss);
+    std::array<char, 3> nextObjectPrefix{'N', 'E', 'X'};
+    oss.write(nextObjectPrefix.data(), nextObjectPrefix.size());
+
+    std::istringstream iss(oss.str());
+    EXPECT_EQ(su::deserialize<std::vector<std::vector<SizeType32>>>(iss), hashes);
+    EXPECT_EQ(su::deserialize<std::vector<SizeType32>>(iss), positions);
+    EXPECT_EQ(su::deserialize<std::vector<SizeType32>>(iss), lengths);
+    EXPECT_EQ(su::deserialize<std::optional<std::vector<std::optional<std::string>>>>(iss), uuids);
+
+    std::array<char, 3> readPrefix{};
+    iss.read(readPrefix.data(), readPrefix.size());
+    EXPECT_EQ(readPrefix, nextObjectPrefix);
 }
 
 // Connection notification tests

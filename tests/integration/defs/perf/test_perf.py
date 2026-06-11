@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +31,7 @@ from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from ..conftest import (get_device_count, get_llm_root, llm_models_root,
                         trt_environment)
+from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
@@ -43,226 +44,14 @@ if not hasattr(re, "Pattern"):
 ALLOWED_CONFIGS_CACHE = None  # Cache to avoid modifying sys.path many times.
 MAP_BY_SOCKET = None
 
-# Model PATH of local dir synced from internal LLM models repo
-MODEL_PATH_DICT = {
-    "llama_v2_7b": "llama-models-v2/llama-v2-7b-hf",  # not safetensors repo
-    "llama_v2_13b": "llama-models-v2/llama-v2-13b-hf",  # not safetensors repo
-    "llama_v2_70b": "llama-models-v2/llama-v2-70b-hf",  # not safetensors repo
-    "llama_v3.1_8b": "llama-3.1-model/Meta-Llama-3.1-8B",
-    "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
-    "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
-    "llama_v3.1_8b_instruct_fp4":
-    "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",
-    "llama_v3.1_70b": "llama-3.1-model/Meta-Llama-3.1-70B",
-    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
-    "llama_v3.1_70b_instruct_fp8": "llama-3.1-model/Llama-3.1-70B-Instruct-FP8",
-    "llama_v3.3_70b_instruct_fp8":
-    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
-    "llama_v3.3_70b_instruct_fp4":
-    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
-    "llama_v3.1_405b_instruct_fp8":
-    "llama-3.1-model/Llama-3.1-405B-Instruct-FP8",
-    "llama_v3.1_405b_instruct_fp4":
-    "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
-    "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
-    "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
-    "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
-    "llama_v3.1_nemotron_nano_8b_fp8": "Llama-3.1-Nemotron-Nano-8B-v1-FP8",
-    "llama_v3.3_nemotron_super_49b":
-    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
-    "llama_v3.3_nemotron_super_49b_fp8":
-    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
-    "llama_v3.3_nemotron_super_49b_v1.5_fp8":
-    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8",
-    "llama_v3.1_nemotron_ultra_253b":
-    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
-    "llama_v3.1_nemotron_ultra_253b_fp8":
-    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
-    "llama_v4_scout_17b_16e_instruct":
-    "llama4-models/Llama-4-Scout-17B-16E-Instruct",
-    "llama_v4_scout_17b_16e_instruct_fp8":
-    "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
-    "llama_v4_scout_17b_16e_instruct_fp4":
-    "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
-    "llama_v4_maverick_17b_128e_instruct":
-    "llama4-models/Llama-4-Maverick-17B-128E-Instruct",
-    "llama_v4_maverick_17b_128e_instruct_fp8":
-    "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
-    "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
-    "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
-    "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
-    "mixtral_8x7b_v0.1_instruct_fp4":
-    "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
-    "mistral_nemo_12b_base": "Mistral-Nemo-Base-2407",
-    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
-    "deepseek_r1_distill_llama_70b":
-    "DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B/",
-    "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
-    "mistral_7b_v0.1": "mistral-7b-v0.1",
-    "ministral_8b": "Ministral-8B-Instruct-2410",
-    "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
-    "gemma_3_1b_it": "gemma/gemma-3-1b-it",
-    "gemma_3_27b_it": "gemma/gemma-3-27b-it",
-    "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
-    "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
-    "gemma_3_12b_it": "gemma/gemma-3-12b-it",
-    "gemma_3_12b_it_fp8": "gemma/gemma-3-12b-it-fp8",
-    "gemma_3_12b_it_fp4": "gemma/gemma-3-12b-it-fp4",
-    "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
-    "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
-    "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
-    "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
-    "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
-    "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
-    "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
-    "qwen2_7b_instruct": "Qwen2-7B-Instruct",
-    "qwen_14b_chat": "Qwen-14B-Chat",
-    "qwen3_0.6b": "Qwen3/Qwen3-0.6B",
-    "qwen3_4b_eagle3": "Qwen3/Qwen3-4B",
-    "qwen3_8b": "Qwen3/Qwen3-8B",
-    "qwen3_8b_fp8": "Qwen3/nvidia-Qwen3-8B-FP8",
-    "qwen3_8b_fp4": "Qwen3/nvidia-Qwen3-8B-NVFP4",
-    "qwen3_14b": "Qwen3/Qwen3-14B",
-    "qwen3_14b_fp8": "Qwen3/nvidia-Qwen3-14B-FP8",
-    "qwen3_14b_fp4": "Qwen3/nvidia-Qwen3-14B-NVFP4",
-    "qwen3_30b_a3b": "Qwen3/Qwen3-30B-A3B",
-    "qwen3_30b_a3b_fp4": "Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",
-    "qwen3_32b": "Qwen3/Qwen3-32B",
-    "qwen3_32b_fp4": "Qwen3/nvidia-Qwen3-32B-NVFP4",
-    "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
-    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
-    "qwen3_235b_a22b_fp4_eagle3": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
-    "qwen2_5_vl_7b_instruct": "Qwen2.5-VL-7B-Instruct",
-    "qwen2_5_vl_7b_instruct_fp8": "multimodals/Qwen2.5-VL-7B-Instruct-FP8",
-    "qwen2_5_vl_7b_instruct_fp4": "multimodals/Qwen2.5-VL-7B-Instruct-FP4",
-    "starcoder2_3b": "starcoder2-3b",
-    "starcoder2_7b": "starcoder2-7b",
-    "starcoder2_15b": "starcoder2-15b",
-    "t5": "t5-small",  # not supported for trtllm-bench build config
-    "flan_t5_base":
-    "flan-t5-small",  # not supported for trtllm-bench build config
-    "flan_t5_large":
-    "flan-t5-xl",  # not supported for trtllm-bench build config
-    "whisper_large_v3":
-    "whisper-models/large-v3",  # not supported for trtllm-bench tokenizer
-    "bart_large_cnn": "bart-large-cnn",  # not safetensors repo
-    "mbart_large_50_many_to_one_mmt": "mbart-large-50-many-to-one-mmt",
-    "mamba_130m": "mamba/mamba-130m-hf",
-    "mamba_370m": "mamba/mamba-370m-hf",
-    "mamba_2.8b": "mamba/mamba-2.8b-hf",
-    "gpt_20b": "gpt-neox-20b",
-    "gpt_350m_moe": "gpt2-medium",
-    "phi_4_mini_instruct": "Phi-4-mini-instruct",
-    "phi_4_reasoning_plus": "Phi-4-reasoning-plus",
-    "phi_4_reasoning_plus_fp8": "nvidia-Phi-4-reasoning-plus-FP8",
-    "phi_4_reasoning_plus_fp4": "nvidia-Phi-4-reasoning-plus-NVFP4",
-    "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
-    "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
-    "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
-    "phi_4_multimodal_instruct_fp4":
-    "multimodals/Phi-4-multimodal-instruct-FP4",
-    "phi_4_multimodal_instruct_fp4_image":
-    "multimodals/Phi-4-multimodal-instruct-FP4",
-    "phi_4_multimodal_instruct_fp4_audio":
-    "multimodals/Phi-4-multimodal-instruct-FP4",
-    "phi_4_multimodal_instruct_fp8_image":
-    "multimodals/Phi-4-multimodal-instruct-FP8",
-    "phi_4_multimodal_instruct_fp8_audio":
-    "multimodals/Phi-4-multimodal-instruct-FP8",
-    "phi_4_multimodal_instruct_fp8":
-    "multimodals/Phi-4-multimodal-instruct-FP8",
-    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
-    "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
-    "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
-    "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
-    "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
-    "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b",
-    "gpt_oss_120b_eagle3_throughput": "gpt_oss/gpt-oss-120b",
-    "nemotron_nano_3_30b_fp8": "Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
-    "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
-    "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
-    "nemotron_3_super_120b_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-    "nemotron_3_super_120b_nvfp4_mtp":
-    "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-    "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
-    # MiniMax M2.5 (FP8 block-scale, ~230B MoE)
-    "minimax_m2.5_fp8": "MiniMax-M2.5",
-    # Qwen3.5 dense + MoE
-    "qwen3.5_9b": "Qwen3.5-9B",
-    "qwen3.5_27b": "Qwen3.5-27B",
-    "qwen3.5_35b_a3b_fp8": "Qwen3.5-35B-A3B-FP8",
-    "qwen3.5_122b_a10b": "Qwen3.5-122B-A10B",
-    "qwen3.5_397b_a17b_fp8": "Qwen3.5-397B-A17B-FP8",
-    "qwen3.5_397b_a17b_fp4": "Qwen3.5-397B-A17B-NVFP4",
-    # DeepSeek V3.2 (671B MoE)
-    "deepseek_v3.2_fp8": "DeepSeek-V3.2-hf",
-    "deepseek_v3.2_fp4": "DeepSeek-V3.2-NVFP4",
-    "deepseek_v3.2_exp_fp4_v2": "DeepSeek-V3.2-Exp-FP4-v2",
-    # GLM-5 FP8 (MoE)
-    "glm_5_fp8": "GLM-5-FP8",
-    # Kimi K2.5 NVFP4 (~1T MoE multimodal)
-    "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
-}
-# Model PATH of HuggingFace
-HF_MODEL_PATH = {
-    "llama_v2_7b_hf": "meta-llama/Llama-2-7b-hf",
-    "llama_v2_70b_hf": "meta-llama/Llama-2-70b-hf",
-    "falcon_180b_hf": "tiiuae/falcon-180B",
-    "gptj_6b_hf": "EleutherAI/gpt-j-6b",
-    "llama_v3_8b_hf": "meta-llama/Meta-Llama-3-8B",
-    "llama_v3.1_8b_hf": "meta-llama/Llama-3.1-8B",
-    "llama_v3.1_8b_instruct_hf": "nvidia/Llama-3.1-8B-Instruct-FP8",
-    "llama_v3.1_70b_instruct_hf": "meta-llama/Meta-Llama-3.1-70B-Instruct",
-    "llama_v3_70b_hf": "meta-llama/Meta-Llama-3-70B",
-    "llama_v3.1_70b_hf": "meta-llama/Llama-3.1-70B",
-    "llama_v3.1_405b_hf": "meta-llama/Llama-3.1-405B",
-    "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
-    "llama_v3.1_nemotron_nano_8b_fp8_hf":
-    "nvidia/Llama-3.1-Nemotron-Nano-8B-v1-FP8",
-    "llama_v3.3_nemotron_super_49b_hf":
-    "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
-    "llama_v3.3_nemotron_super_49b_fp8_hf":
-    "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
-    "llama_v3.1_nemotron_ultra_253b_fp8_hf":
-    "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
-    "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
-    "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
-    "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
-    "flan_t5_base_hf": "google/flan-t5-small",
-    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
-    "gemma_3_1b_it_hf": "google/gemma-3-1b-it",
-}
-LORA_MODEL_PATH = {
-    "llama_v2_13b":
-    "llama-models-v2/chinese-llama-2-lora-13b",
-    "mixtral_8x7b_v0.1":
-    "chinese-mixtral-lora",
-    "llama_v3.1_8b_instruct_fp8":
-    "lora/llama-3-chinese-8b-instruct-v2-lora/",
-    "ministral_8b":
-    "lora/ministral/Ministral-8B-Instruct-2410-Loras-Dummy",  # Dummy LoRA for Ministral
-    "gemma_3_1b_it":
-    "lora/gemma/gemma-3-1b-it-dummy-lora",  # Dummy LoRA for Gemma-3-1B-Instruct
-    "phi_4_multimodal_instruct_image":
-    "multimodals/Phi-4-multimodal-instruct/vision-lora",
-    "phi_4_multimodal_instruct_audio":
-    "multimodals/Phi-4-multimodal-instruct/speech-lora",
-    "phi_4_multimodal_instruct_fp4_image":
-    "multimodals/Phi-4-multimodal-instruct-FP4/vision-lora",
-    "phi_4_multimodal_instruct_fp4_audio":
-    "multimodals/Phi-4-multimodal-instruct-FP4/speech-lora",
-    "phi_4_multimodal_instruct_fp8_image":
-    "multimodals/Phi-4-multimodal-instruct-FP8/vision-lora",
-    "phi_4_multimodal_instruct_fp8_audio":
-    "multimodals/Phi-4-multimodal-instruct-FP8/speech-lora",
-}
-
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 
 NEMOTRON_SUPER_MODELS = {
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_ultra_550b_nvfp4",
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
@@ -273,12 +62,43 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "kimi_k2_nvfp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_ultra_550b_nvfp4",
     "glm_5_fp8",
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_nano_12b_v2",
+    "phi_4_multimodal_instruct",
+    "phi_4_multimodal_instruct_fp4",
+    "phi_4_multimodal_instruct_fp8",
+}
+
+# Models that use random_image dataset in serve mode benchmarks.
+# Maps model name to (width, height, num_images) tuple.
+SERVE_IMAGE_MODELS = {
+    "nemotron_3_nano_omni_nvfp4_image": (1526, 1024, 1),
+}
+
+# Models that require openai-chat backend for benchmark_serving
+# (e.g., reasoning / multimodal models that use chat completions API).
+OPENAI_CHAT_BACKEND_MODELS = {
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
 }
 
 # Spec-dec models real dataset in serve perf tests.
 SPEC_DEC_REAL_DATASET_MODELS = {
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
+}
+
+# All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
+# benchmark client commands: forcing generation past EOS produces unstable
+# acceptance rates for spec-dec.
+SPEC_DEC_MODELS = {
+    "qwen3_4b_eagle3",
+    "qwen3_235b_a22b_fp4_eagle3",
+    "gpt_oss_120b_eagle3",
+    "gpt_oss_120b_eagle3_throughput",
+    *SPEC_DEC_REAL_DATASET_MODELS,
 }
 
 # Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
@@ -288,13 +108,12 @@ AUTODEPLOY_MODEL_CONFIGS = {
 
 
 def get_model_dir(model_name: str):
-    model_dir = ""
+    # HF models use the repo id verbatim (downloaded at runtime, no LLM_MODELS_ROOT prefix).
+    if model_name in HF_MODEL_PATH.keys():
+        return HF_MODEL_PATH[model_name]
     if model_name in MODEL_PATH_DICT.keys():
-        model_dir = os.path.join(llm_models_root(), MODEL_PATH_DICT[model_name])
-    elif model_name in HF_MODEL_PATH.keys():
-        model_dir = os.path.join(llm_models_root(),
-                                 MODEL_PATH_DICT[model_name.split('_hf')[0]])
-    return model_dir
+        return os.path.join(llm_models_root(), MODEL_PATH_DICT[model_name])
+    return ""
 
 
 def get_dataset_path():
@@ -348,7 +167,7 @@ PERF_METRIC_LOG_QUERIES = {
     re.compile(r"\[BENCHMARK\].* avg_sequence_latency\(ms\) ([\d\.]+)"),
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"\[BENCHMARK\].* seq_throughput\(seq\/sec\) ([\d\.]+)"),
-    PerfMetricType.TOKEN_THROUGHPUT:
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT:
     re.compile(
         r"\[BENCHMARK\].* (?:token_throughput\(token\/sec\)|tokensPerSec|tokens_per_sec) ([\d\.]+)"
     ),
@@ -375,8 +194,10 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Engine generation completed in ([\d\.]+) seconds"),
     PerfMetricType.INFERENCE_TIME:
     re.compile(r"Total Latency \(ms\):\s+([\d\.]+)"),
-    PerfMetricType.TOKEN_THROUGHPUT:
-    re.compile(r"GPU Output Throughput \(tps\/gpu\):\s+([\d\.]+)"),
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT:
+    re.compile(r"Total Output Throughput \(tokens\/sec\):\s+([\d\.]+)"),
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT:
+    re.compile(r"Total Token Throughput \(tokens\/sec\):\s+([\d\.]+)"),
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"Request Throughput \(req\/sec\):\s+([\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
@@ -396,7 +217,7 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
 AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"Request throughput \(req\/s\):\s+(-?[\d\.]+)"),
-    PerfMetricType.TOKEN_THROUGHPUT:
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT:
     re.compile(r"Output token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT:
     re.compile(r"Total Token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
@@ -456,11 +277,13 @@ PERF_METRIC_THRESHOLD = {
     PerfMetricType.P99_INTER_TOKEN_TIME:
     (0.1, 50),  # Ignore p99 inter token time regression < 50ms
     PerfMetricType.SEQ_LATENCY: (0.1, 50),  # Ignore latency regression < 50ms
-    PerfMetricType.TOKEN_THROUGHPUT: (
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT: (
         -0.1, 10
     ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT: (-0.1, 10),
     PerfMetricType.USER_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT: (-0.1, 10),
     PerfMetricType.SEQ_THROUGHPUT: (
         -0.1, 10
     ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
@@ -492,7 +315,7 @@ PERF_METRIC_STRING = {
     PerfMetricType.MEDIAN_INTER_TOKEN_TIME: "median_itl",
     PerfMetricType.P99_INTER_TOKEN_TIME: "p99_itl",
     PerfMetricType.SEQ_LATENCY: "seq_latency",
-    PerfMetricType.TOKEN_THROUGHPUT: "token_throughput",
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT: "total_output_throughput",
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT: "total_token_throughput",
     PerfMetricType.USER_THROUGHPUT: "user_throughput",
     PerfMetricType.SEQ_THROUGHPUT: "seq_throughput",
@@ -519,7 +342,7 @@ INFERENCE_METRICS = [
 
 AGGR_SERVER_METRICS = [
     PerfMetricType.SEQ_THROUGHPUT,
-    PerfMetricType.TOKEN_THROUGHPUT,
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT,
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT,
     PerfMetricType.USER_THROUGHPUT,
     PerfMetricType.FIRST_TOKEN_TIME,
@@ -538,7 +361,10 @@ AGGR_SERVER_METRICS = [
 
 BENCH_INFERENCE_METRICS = [
     PerfMetricType.INFERENCE_TIME,
-    PerfMetricType.TOKEN_THROUGHPUT,
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT,
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT,
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT,
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT,
     PerfMetricType.SEQ_THROUGHPUT,
     PerfMetricType.KV_CACHE_SIZE,
 ]
@@ -1213,14 +1039,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_dir = self.get_trtllm_bench_model()
         if model_dir == "":
             pytest.skip("Model Name is not supported by trtllm-bench")
+        # Legacy "<name>_hf" label; weights load from --model_path.
         model_name = self._config.model_name
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
-        hf_model_name = HF_MODEL_PATH.get(model_name, "")
         build_cmd = [
-            self._build_script, f"--log_level=info",
-            f"--workspace={engine_dir}", f"--model={hf_model_name}",
-            f"--model_path={model_dir}", "build",
+            self._build_script, "--log_level=info", f"--workspace={engine_dir}",
+            f"--model={model_name}", f"--model_path={model_dir}", "build",
             f"--tp_size={self._config.tp_size}",
             f"--pp_size={self._config.pp_size}"
         ]
@@ -1252,8 +1077,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.model_name in HF_MODEL_PATH.keys():
             tokenizer_dir = HF_MODEL_PATH[self._config.model_name]
         else:
-            tokenizer_dir = os.path.join(llm_models_root(), "llama-models",
-                                         "llama-7b-hf")
+            tokenizer_dir = os.path.join(llm_models_root(), "llama-models-v2",
+                                         "TinyLlama-1.1B-Chat-v1.0")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
 
@@ -1345,11 +1170,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_name = self._config.model_name
         dataset_path = os.path.join(engine_dir, "synthetic_data.json")
         report_path = os.path.join(engine_dir, "report.json")
+        # Legacy "<name>_hf" label; weights load from --model_path.
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
-        hf_model_name = HF_MODEL_PATH.get(model_name, "")
         tp_pp_str = f"tp_{self._config.tp_size}_pp_{self._config.pp_size}"
-        engine_dir = os.path.join(engine_dir, hf_model_name, tp_pp_str)
+        engine_dir = os.path.join(engine_dir, tp_pp_str)
         benchmark_cmd = [
             self._benchmark_script,
             f"--model={model_name}",
@@ -1504,7 +1329,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             model_dir,
             trust_remote_code=self._config.model_name
             in TRUST_REMOTE_CODE_MODELS)
-        dataset = load_dataset("cnn_dailymail",
+        dataset = load_dataset(os.path.join(llm_models_root(), "datasets",
+                                            "cnn_dailymail"),
                                "3.0.0",
                                split="validation",
                                streaming=True,
@@ -1579,18 +1405,43 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             model_dir,
             "--num-prompts",
             str(self._config.num_reqs),
-            "--ignore-eos",
             "--tokenize-on-client",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        # --ignore-eos must be off for spec-decoding models: forcing generation
+        # past EOS produces unstable acceptance rates.
+        if self._config.model_name not in SPEC_DEC_MODELS:
+            client_cmd.append("--ignore-eos")
+        if self._config.model_name in OPENAI_CHAT_BACKEND_MODELS:
+            client_cmd += ["--backend", "openai-chat"]
         if real_dataset_path:
             client_cmd += [
                 "--dataset-name",
                 "trtllm_custom",
                 "--dataset-path",
                 real_dataset_path,
+            ]
+        elif self._config.model_name in SERVE_IMAGE_MODELS:
+            width, height, num_images = SERVE_IMAGE_MODELS[
+                self._config.model_name]
+            client_cmd += [
+                "--dataset-name",
+                "random_image",
+                "--random-ids",
+                "--random-input-len",
+                str(input_len),
+                "--random-output-len",
+                str(output_len),
+                "--random-range-ratio",
+                "0.0",
+                "--random-image-width",
+                str(width),
+                "--random-image-height",
+                str(height),
+                "--random-num-images",
+                str(num_images),
             ]
         else:
             client_cmd += [

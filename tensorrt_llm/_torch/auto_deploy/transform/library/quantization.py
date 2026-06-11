@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from functools import partial
 from typing import Dict, List, Tuple
@@ -190,13 +204,14 @@ class Quantization(BaseTransform):
 
             # when loading the state_dict, we need to convert input amax to input scale
             input_scale_name = self.scale_names()[0]
-            gm._register_load_state_dict_pre_hook(
-                partial(
-                    self.convert_amax_hook,
-                    scale_name=modname + "." + input_scale_name,
-                    amax_name=input_params.amax.target,
-                )
+            scale_name = modname + "." + input_scale_name
+            amax_name = input_params.amax.target
+            hook = partial(
+                self.convert_amax_hook,
+                scale_name=scale_name,
+                amax_name=amax_name,
             )
+            gm._register_load_state_dict_pre_hook(hook)
             # Note: canonicalize_graph() will remove input/weight/output quantizer
 
         for scale_name, scale in self.default_scales(lin_weight.tensor.shape).items():
@@ -205,7 +220,8 @@ class Quantization(BaseTransform):
         gm._register_load_state_dict_pre_hook(
             partial(self.load_hook, weight_name=lin_weight.node_key)
         )
-        if self.post_load_hook:
+        post_load_hook = getattr(type(self), "post_load_hook", None)
+        if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
             gm.register_load_state_dict_post_hook(
                 partial(self.post_load_hook, weight_name=lin_weight.node_key)
             )
@@ -261,11 +277,12 @@ class Quantization(BaseTransform):
             setattr(submod, attrname, new_param)
 
             # Register load state dict hook
-            gm._register_load_state_dict_pre_hook(partial(self.load_hook, weight_name=param_name))
-            if self.post_load_hook:
-                gm.register_load_state_dict_post_hook(
-                    partial(self.post_load_hook, weight_name=param_name)
-                )
+            hook = partial(self.load_hook, weight_name=param_name)
+            gm._register_load_state_dict_pre_hook(hook)
+            post_load_hook = getattr(type(self), "post_load_hook", None)
+            if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
+                hook = partial(self.post_load_hook, weight_name=param_name)
+                gm.register_load_state_dict_post_hook(hook)
 
             # Setup scale names and target module for parameter case
             def get_scale_name(scale_name):

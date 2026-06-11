@@ -49,10 +49,10 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 
 FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
-    // TRTLLM-GEN only supports power of 2 head sizes.
+    // TRTLLM-GEN only supports power of 2 head sizes (and 80 with padding).
     // The exception will fall back to fmha v2.
     // Please update fmha_v2/setup.py if you want to add more supported head sizes.
-    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 80 && fixedParams.headSize != 72)
+    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72)
 {
     if (mUseTllmGen)
     {
@@ -238,6 +238,10 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mChunkedAttentionSize = runnerParams.chunkedAttentionSize;
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
+        tllmRunnerParams.mJITWarmup = runnerParams.trtllmGenJITWarmup;
+        tllmRunnerParams.mJITWarmupMaxNumRequests = runnerParams.trtllmGenJITWarmupMaxNumRequests;
+        tllmRunnerParams.mJITWarmupMaxSeqLenQ = runnerParams.trtllmGenJITWarmupMaxSeqLenQ;
+        tllmRunnerParams.mJITWarmupMaxSeqLenKv = runnerParams.trtllmGenJITWarmupMaxSeqLenKv;
         tllmRunnerParams.mMaxNumPagesPerSeqKv = maxBlocksPerSeq;
         tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? numTokensPerBlock : 0;
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
@@ -267,6 +271,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.num_sparse_topk;
             tllmRunnerParams.ptrSparseMlaTopKLens = runnerParams.sparse_params.sparse_mla_topk_lens;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mUseGenKernelForPrefill = true;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);

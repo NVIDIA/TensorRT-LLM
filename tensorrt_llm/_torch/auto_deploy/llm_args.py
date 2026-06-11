@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Type, Union
@@ -110,40 +124,81 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return _check_for_default_value_only(cls, value, info, msg)
 
     @model_validator(mode="after")
+    def validate_supported_speculative_config(self):
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return self
+
+        if isinstance(spec_config, MTPDecodingConfig):
+            if not spec_config.mtp_eagle_one_model or spec_config.use_mtp_vanilla:
+                raise ValueError(
+                    "AutoDeploy only supports MTP speculative decoding with "
+                    "mtp_eagle_one_model=True and use_mtp_vanilla=False "
+                    f"(got mtp_eagle_one_model={spec_config.mtp_eagle_one_model}, "
+                    f"use_mtp_vanilla={spec_config.use_mtp_vanilla})."
+                )
+        elif isinstance(spec_config, EagleDecodingConfig):
+            if not spec_config.eagle3_one_model:
+                raise ValueError(
+                    "AutoDeploy only supports Eagle speculative decoding with "
+                    f"eagle3_one_model=True (got eagle3_one_model={spec_config.eagle3_one_model})."
+                )
+        else:
+            raise ValueError(
+                "AutoDeploy only supports speculative decoding via "
+                "MTPDecodingConfig(mtp_eagle_one_model=True) or "
+                "EagleDecodingConfig(eagle3_one_model=True)."
+            )
+
+        self.model_factory = "eagle_one_model"
+        return self
+
+    @model_validator(mode="after")
     def setup_hidden_state_capture(self):
         spec_config = self.speculative_config
         if spec_config is None:
             return self
 
         if isinstance(spec_config, MTPDecodingConfig):
-            if not spec_config.mtp_eagle_one_model:
-                return self
-            if spec_config.use_mtp_vanilla:
-                raise ValueError("mtp_eagle_one_model and use_mtp_vanilla cannot both be enabled")
             if spec_config.max_draft_len is None:
                 raise ValueError(
                     "MTPDecodingConfig.max_draft_len must not be None when mtp_eagle_one_model is "
                     "enabled. Ensure num_nextn_predict_layers is set in the model config."
                 )
             capture_layers = {-1}
-            self.model_factory = "eagle_one_model"
-        elif isinstance(spec_config, EagleDecodingConfig):
+        else:
+            assert isinstance(spec_config, EagleDecodingConfig)
             if spec_config.max_draft_len is None:
                 raise ValueError(
                     "EagleDecodingConfig.max_draft_len must not be None. "
                     "Provide a positive integer for max_draft_len."
                 )
             capture_layers = spec_config.eagle3_layers_to_capture
-            if spec_config.eagle3_one_model:
-                self.model_factory = "eagle_one_model"
-        else:
-            return self
 
         self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
             capture_layers
         )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_ssm_replay_requires_spec(self):
+        """Reject the replay SSM kernel when speculative decoding is off.
+
+        ``ssm_replay`` makes the SSM backend emit per-layer replay state buffers (``Replay*``
+        handlers), which are read only on the speculative extend (draft-verification) path.
+        Those handlers carry the ``SpeculativeOnly`` trait, so without ``speculative_config``
+        the kvcache insert transform drops them entirely and the ``ssm_replay`` flag becomes a
+        no-op. Reject the contradictory config here rather than silently ignoring the flag.
+        """
+        ssm_cfg = self.transforms.get("insert_cached_ssm_attention", {})
+        if ssm_cfg.get("ssm_replay", False) and self.speculative_config is None:
+            raise ValueError(
+                "transforms.insert_cached_ssm_attention.ssm_replay=True requires speculative "
+                "decoding (speculative_config must be set). Replay buffers are only used on the "
+                "speculative extend path."
+            )
         return self
 
     @model_validator(mode="after")
@@ -223,11 +278,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
-    draft_checkpoint_loader: Optional[object] = Field(
-        default=None,
-        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
-    )
-
     ### INFERENCE OPTIMIZER CONFIG #################################################################
     mode: Literal["graph", "transformers"] = Field(
         default="graph",
@@ -301,6 +351,35 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def extend_default_cuda_graph_config_to_max_batch_size(self):
+        """Auto-extend the default cuda_graph_config to cover the top-level max_batch_size.
+
+        ``CudaGraphConfig.validate_cuda_graph_config`` falls back to a hard-coded
+        max of 128 when neither ``cuda_graph_config.batch_sizes`` nor
+        ``cuda_graph_config.max_batch_size`` is set. This silently leaves any
+        ``LlmArgs.max_batch_size > 128`` running in eager mode for the larger
+        batches, which roughly doubles ITL at those batch sizes.
+
+        When the user hasn't explicitly set ``cuda_graph_config`` we rebuild it
+        with ``max_batch_size`` matching the top-level value so the heuristic
+        re-generates the batch_sizes list up to the actual max.
+        """
+        # Skip if the user explicitly configured cuda_graph_config (any field set).
+        if "cuda_graph_config" in self.model_fields_set:
+            return self
+        cg = self.cuda_graph_config
+        if cg is None or cg.max_batch_size >= self.max_batch_size:
+            return self
+        # Re-validate a fresh CudaGraphConfig with the correct max_batch_size to
+        # trigger heuristic regeneration of batch_sizes.
+        cg_cls = type(cg)
+        self.cuda_graph_config = cg_cls(
+            max_batch_size=self.max_batch_size,
+            enable_padding=cg.enable_padding,
+        )
+        return self
+
+    @model_validator(mode="after")
     def sync_cuda_graph_batch_sizes_to_compile_config(self):
         """Propagate cuda_graph_config.batch_sizes into compile_model transform config.
 
@@ -352,25 +431,48 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def disable_cudagraph_for_speculative_flashinfer(self):
+    def reject_cudagraph_for_speculative_flashinfer(self):
         if (
             self.speculative_config is not None
             and self.attn_backend == "flashinfer"
             and self.is_cuda_graph_enabled()
         ):
-            ad_logger.warning(
+            raise ValueError(
                 "Speculative decoding with FlashInfer attention does not currently support CUDA "
-                "graph replay in AutoDeploy; falling back to compile_backend='torch-simple'."
+                "graph replay in AutoDeploy. Use compile_backend='torch-simple' instead."
             )
-            self.compile_backend = "torch-simple"
-            self.update_transforms_with_shortcuts()
+        return self
+
+    @model_validator(mode="after")
+    def disable_piecewise_for_non_piecewise_backend(self):
+        compile_model = self.transforms.get("compile_model")
+        if compile_model is not None and not self.is_cuda_graph_enabled():
+            compile_model["piecewise_enabled"] = False
         return self
 
     ### UTILITY METHODS ############################################################################
     @property
     def requires_uniform_kv_caches(self) -> bool:
-        """Whether CachedSequenceInterface must enforce a uniform KV cache mapping."""
-        return self.attn_backend.lower() == "trtllm"
+        """Whether CachedSequenceInterface must enforce a uniform KV cache mapping.
+
+        No attention backend currently requires this. The trtllm backend used to
+        return ``True`` here to force a single KV pool, but it now supports
+        multiple KV cache memory pools for non-uniform sliding-window models
+        (e.g. gpt-oss) -- the kernel applies the sliding-window mask internally
+        via cyclic indexing, so per-window pools route correctly. The flag is
+        kept (defaulting to ``False``) so the uniformity enforcement in
+        ``CachedSequenceInterface`` remains available should a future backend
+        need it.
+        """
+        return False
+
+    @property
+    def reject_unmanaged_persistent_caches(self) -> bool:
+        """Whether unmanaged persistent cache resources should be rejected."""
+        return (
+            self.cache_transceiver_config is not None
+            and self.cache_transceiver_config.backend is not None
+        )
 
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.
@@ -402,7 +504,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return factory
 
     def is_cuda_graph_enabled(self) -> bool:
-        return self.compile_backend in ["torch-cudagraph", "torch-opt"]
+        cuda_graph_backends = {"torch-cudagraph", "torch-opt"}
+        return self.compile_backend in cuda_graph_backends
 
     def init_dist_config(self, rank: int, world_size: int) -> DistConfig:
         """Build DistConfig from YAML transform config and runtime MPI info.
