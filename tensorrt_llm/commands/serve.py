@@ -1285,11 +1285,6 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     default=2048,
     help="Maximum number of in-flight queued requests; further requests are "
     "rejected with HTTP 429 (mirrors Triton's max_queue_size).")
-@click.option("--gpus_per_node",
-              type=int,
-              default=None,
-              help="Number of GPUs per node. Default to None, and it will be "
-              "detected automatically.")
 @click.option("--trust_remote_code",
               is_flag=True,
               default=False,
@@ -1309,10 +1304,6 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               default=None,
               help="The revision to use for the HuggingFace model "
               "(branch name, tag name, or commit id).")
-@click.option("--free_gpu_memory_fraction",
-              type=float,
-              default=0.9,
-              help="Free GPU memory fraction reserved after model weights.")
 @click.option("--metadata_server_config_file",
               type=str,
               default=None,
@@ -1320,14 +1311,12 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
 @click.option("--telemetry/--no-telemetry",
               default=True,
               help="Enable or disable anonymous usage telemetry collection.")
-def serve_embedding(model: str, host: str, port: int, log_level: str,
-                    max_batch_size: int, max_num_tokens: int,
-                    max_queue_delay: float, max_queue_size: int,
-                    gpus_per_node: Optional[int], trust_remote_code: bool,
-                    extra_llm_api_options: Optional[str],
-                    revision: Optional[str], free_gpu_memory_fraction: float,
-                    metadata_server_config_file: Optional[str],
-                    telemetry: bool):
+def serve_embedding(
+        model: str, host: str, port: int, log_level: str, max_batch_size: int,
+        max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
+        trust_remote_code: bool, extra_llm_api_options: Optional[str],
+        revision: Optional[str], metadata_server_config_file: Optional[str],
+        telemetry: bool):
     """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
 
     Coalesces concurrent requests with a dynamic batcher and serves them through
@@ -1340,20 +1329,18 @@ def serve_embedding(model: str, host: str, port: int, log_level: str,
 
     explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
 
-    # Single-GPU only: tensor_parallel_size is fixed to 1 and not exposed as a flag
-    # (the encode-only path builds the engine in-process and has no multi-GPU worker
-    # proxy). Multi-GPU embeddings is a planned follow-up.
-    llm_args, _ = get_llm_args(
-        model=model,
-        max_batch_size=max_batch_size,
-        max_num_tokens=max_num_tokens,
-        gpus_per_node=gpus_per_node,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        free_gpu_memory_fraction=free_gpu_memory_fraction,
-        tensor_parallel_size=1,
-        telemetry=telemetry,
-        explicit_cli_keys=explicit_cli_keys)
+    # Single-GPU, encode-only: tensor_parallel_size is fixed to 1 and not exposed as a
+    # flag (the in-process encode path has no multi-GPU worker proxy). gpus_per_node is
+    # auto-detected by get_llm_args; free_gpu_memory_fraction is omitted because the
+    # encode path allocates no KV cache. All remain settable via --config if needed.
+    llm_args, _ = get_llm_args(model=model,
+                               max_batch_size=max_batch_size,
+                               max_num_tokens=max_num_tokens,
+                               trust_remote_code=trust_remote_code,
+                               revision=revision,
+                               tensor_parallel_size=1,
+                               telemetry=telemetry,
+                               explicit_cli_keys=explicit_cli_keys)
 
     extra_dict = {}
     if extra_llm_api_options is not None:
