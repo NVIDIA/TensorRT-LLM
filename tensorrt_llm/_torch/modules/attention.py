@@ -1917,6 +1917,46 @@ class MLA(nn.Module):
                     128,
                     self.inverse_rotary_emb.is_neox,
                 ))
+            # Fused o_proj (opt-in via DSV4_FUSE_OPROJ): o_a emits o_lora as fp8 e4m3
+            # + packed-UE8M0 1x128 scales directly, fed to DeepGEMM without the
+            # separate fp8_quantize_1x128 kernel + bf16 o_lora round-trip; the fused
+            # hidden is bit-identical to the o_b_proj Linear path. GATE: tp_size==1
+            # only — o_b_proj is row-parallel, so bypassing the Linear skips its
+            # all-reduce, a no-op only when groups are unsharded
+            # (n_local_groups==num_groups).
+            if (os.environ.get("DSV4_FUSE_OPROJ", "0") == "1"
+                    and self.n_local_groups == self.num_groups
+                    and getattr(self.o_b_proj, "tp_size", 1) == 1
+                    and self.o_b_proj.has_fp8_block_scales and not getattr(
+                        self.o_b_proj, "use_cute_dsl_blockscaling_mm", False)):
+                from tensorrt_llm import deep_gemm
+                _M, _L, _Ng = num_tokens, self.n_local_groups, self.o_lora_rank
+                _aligned_mn = ((_M + 3) // 4) * 4
+                _ntiles = (_Ng + 127) // 128
+                _nkb4 = (_L * _ntiles + 3) // 4
+                o_lora_fp8 = torch.empty([_M, _L, _Ng],
+                                         device=attn_out_latent.device,
+                                         dtype=torch.float8_e4m3fn)
+                _sf_storage = torch.zeros(_nkb4 * _aligned_mn,
+                                          device=attn_out_latent.device,
+                                          dtype=torch.int32)
+                sf_out = torch.as_strided(_sf_storage, (_M, _nkb4),
+                                          (1, _aligned_mn))
+                torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(
+                    attn_fp8, self.o_a_proj, attn_scale, self.o_a_proj_scale,
+                    o_lora_fp8.transpose(0, 1), sf_out)
+                o_lora_fp8 = o_lora_fp8.flatten(1)  # [M, L*Ng] contiguous
+                hidden = torch.empty([_M, self.hidden_size],
+                                     device=attn_out_latent.device,
+                                     dtype=self.dtype)
+                deep_gemm.fp8_gemm_nt(
+                    (o_lora_fp8, sf_out),
+                    (self.o_b_proj.weight, self.o_b_proj.weight_scale),
+                    hidden,
+                    c=None,
+                    disable_ue8m0_cast=False)
+                return hidden
+
             o_lora = torch.empty(
                 [num_tokens, self.n_local_groups, self.o_lora_rank],
                 device=attn_out_latent.device,

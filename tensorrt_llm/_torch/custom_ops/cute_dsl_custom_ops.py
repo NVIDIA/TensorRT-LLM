@@ -3849,6 +3849,111 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
 
+    # a/b: fp8, scale: fp32; output: fp8 e4m3 + packed-UE8M0 1x128 scale factors.
+    # Fused-o_proj producer: emits the FLATTENED [M, L*N] o_lora as fp8+sf directly,
+    # ready for deep_gemm.fp8_gemm_nt with no separate quantize kernel + bf16
+    # round-trip. The (fp8, sf) bytes are bit-identical to
+    # per_token_cast_to_fp8(use_ue8m0=True) + get_mn_major_tma_aligned_packed_ue8m0.
+    # Fixed (128,128)/1-CTA tactic, matching o_a's locked config.
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell_fp8out",
+                             mutates_args=("output_fp8", "sf_out"),
+                             device_types="cuda")
+    def cute_dsl_fp8_bmm_blackwell_fp8out(
+            input: torch.Tensor,  # [L, M, K] e4m3
+            weight: torch.Tensor,  # [L, N, K] e4m3  (per-group N = o_lora_rank)
+            input_scale: torch.
+        Tensor,  # fp32, same layout as cute_dsl_fp8_bmm_blackwell
+            weight_scale: torch.Tensor,  # fp32
+            output_fp8: torch.Tensor,  # [L, M, N] e4m3   (mutated)
+            sf_out: torch.
+        Tensor,  # [M, NKB4] int32, MN-major stride (1, aligned_mn) (mutated)
+    ) -> None:
+        if not is_sm_100f():
+            raise ValueError(
+                f"cute_dsl_fp8_bmm_blackwell_fp8out requires SM100 family, got {get_sm_version()}"
+            )
+        from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
+            Sm100BlockwiseGemmKernel
+        from ..cute_dsl_kernels.blackwell.utils import AddressSpace, make_ptr
+
+        L, M, K = input.shape[0], input.shape[1], input.shape[2]
+        N = weight.shape[1]
+        sf_m = pad_up(M, 4)
+        sf_k = ceil_div(K, 128)
+        sf_n = ceil_div(N, 128)
+        aligned_mn = pad_up(M, 4)  # == get_tma_aligned_size(M, 4) for int32
+        n_tiles_per_group = ceil_div(
+            N, 128)  # per-group N-tiles; global kblock = group*this + local
+
+        gemm = Sm100BlockwiseGemmKernel(
+            cutlass.Float32,
+            use_2cta_instrs=False,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+        )
+        max_active_clusters = cutlass.utils.HardwareInfo(
+        ).get_max_active_clusters(1)
+
+        a_ptr = make_ptr(cutlass.Float8E4M3FN,
+                         input.data_ptr(),
+                         AddressSpace.gmem,
+                         assumed_align=16)
+        b_ptr = make_ptr(cutlass.Float8E4M3FN,
+                         weight.data_ptr(),
+                         AddressSpace.gmem,
+                         assumed_align=16)
+        a_sf_ptr = make_ptr(cutlass.Float32,
+                            input_scale.data_ptr(),
+                            AddressSpace.gmem,
+                            assumed_align=16)
+        b_sf_ptr = make_ptr(cutlass.Float32,
+                            weight_scale.data_ptr(),
+                            AddressSpace.gmem,
+                            assumed_align=16)
+        c_tmp = output_fp8.permute(1, 2, 0)
+        c_cute = cute.runtime.from_dlpack(c_tmp).mark_layout_dynamic(
+            leading_dim=1)
+        sf_out_ptr = make_ptr(cutlass.Int32,
+                              sf_out.data_ptr(),
+                              AddressSpace.gmem,
+                              assumed_align=4)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        gemm.wrapper_fp8sf(
+            M,
+            N,
+            K,
+            sf_m,
+            sf_n,
+            sf_k,
+            L,
+            a_ptr,
+            b_ptr,
+            a_sf_ptr,
+            b_sf_ptr,
+            c_cute,
+            max_active_clusters,
+            stream,
+            sf_out_ptr,
+            aligned_mn,
+            n_tiles_per_group,
+        )
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_bmm_blackwell_fp8out")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_fp8: torch.Tensor,
+        sf_out: torch.Tensor,
+    ) -> None:
+        L, M, K = input.shape
+        N = weight.shape[1]
+        assert output_fp8.dtype == torch.float8_e4m3fn and output_fp8.shape == (
+            L, M, N)
+        assert sf_out.dtype == torch.int32
+
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
     # =============================================================================

@@ -90,20 +90,16 @@ def calculate_reference_deepseek_v4_o_proj(
     return output
 
 
-@skip_pre_blackwell
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("num_tokens", [1, 16, 128])
-@pytest.mark.parametrize("dtype_str", ["bf16", "fp8"])
-def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
-    """Test DeepSeek-V4 output projection (_deepseek_v4_o_proj)."""
-    print(
-        f"\n{'=' * 80}\nTesting: deepseek_v4_o_proj num_tokens={num_tokens} dtype={dtype_str}\n{'=' * 80}"
-    )
+def _build_dsv4_o_proj_case(num_tokens: int, dtype_str: str, device: torch.device):
+    """Build an MLA module, inputs, and reference-path tensors for the DeepSeek-V4
+    o_proj tests. Shared by the correctness test and the DSV4_FUSE_OPROJ fused
+    fp8-equivalence test so both exercise an identical setup.
 
-    if dtype_str == "fp8" and get_sm_version() < 100:
-        pytest.skip("FP8 is not supported on pre-Blackwell architectures")
-
-    device = torch.device("cuda")
+    Returns:
+        (mla, attn_out_latent, position_ids, refs) where ``refs`` is a namespace
+        carrying the dequantized weights / freqs_cis / dims the analytic
+        reference path consumes.
+    """
     dtype = torch.bfloat16
 
     # Model configuration matching the reference model
@@ -197,6 +193,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
     # Initialize weights
     nn_init_std = 0.02
+    fp8_a_weight = fp8_a_scale = o_a_proj_bf16 = fp8_b_weight_dequant = dim = None
     with torch.no_grad():
         # Initialize o_a_proj weights
         if dtype_str == "bf16":
@@ -254,17 +251,12 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     attn_out_latent = torch.randn(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
-    # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
-    # in-place, so clone before passing to preserve original for reference)
-    output = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
-
-    # Calculate reference output
+    # Reference weights: the FP8-native path consumes the quantized o_a_proj plus
+    # block scales (dequantized here), not the original BF16 weight.
     if dtype_str == "bf16":
         o_a_proj_ref = mla.o_a_proj.data
         o_b_proj_weight_ref = mla.o_b_proj.weight.data
     else:
-        # Match the FP8-native o_a_proj path: the runtime BMM consumes
-        # quantized o_a_proj plus block scales, not the original BF16 weight.
         o_a_proj_ref = (
             weight_dequant(
                 fp8_a_weight.reshape(-1, dim).contiguous(),
@@ -285,14 +277,48 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         rope_config.rope_scaling["beta_slow"],
     ).to(device)
 
-    reference_output = calculate_reference_deepseek_v4_o_proj(
-        attn_out_latent=attn_out_latent,
+    refs = SimpleNamespace(
         o_a_proj=o_a_proj_ref,
         o_b_proj_weight=o_b_proj_weight_ref,
-        freqs_cis=freqs_cis[0:num_tokens],
+        freqs_cis=freqs_cis,
         n_local_groups=n_local_groups,
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
+    )
+    return mla, attn_out_latent, position_ids, refs
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("num_tokens", [1, 16, 128])
+@pytest.mark.parametrize("dtype_str", ["bf16", "fp8"])
+def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
+    """Test DeepSeek-V4 output projection (_deepseek_v4_o_proj)."""
+    print(
+        f"\n{'=' * 80}\nTesting: deepseek_v4_o_proj num_tokens={num_tokens} dtype={dtype_str}\n{'=' * 80}"
+    )
+
+    if dtype_str == "fp8" and get_sm_version() < 100:
+        pytest.skip("FP8 is not supported on pre-Blackwell architectures")
+
+    device = torch.device("cuda")
+
+    mla, attn_out_latent, position_ids, refs = _build_dsv4_o_proj_case(
+        num_tokens, dtype_str, device
+    )
+
+    # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
+    # in-place, so clone before passing to preserve original for reference)
+    output = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+
+    reference_output = calculate_reference_deepseek_v4_o_proj(
+        attn_out_latent=attn_out_latent,
+        o_a_proj=refs.o_a_proj,
+        o_b_proj_weight=refs.o_b_proj_weight,
+        freqs_cis=refs.freqs_cis[0:num_tokens],
+        n_local_groups=refs.n_local_groups,
+        qk_nope_head_dim=refs.qk_nope_head_dim,
+        qk_rope_head_dim=refs.qk_rope_head_dim,
         device=device,
         is_fp8=dtype_str == "fp8",
     )
@@ -321,3 +347,71 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     else:
         torch.testing.assert_close(output, reference_output, rtol=0.1, atol=0.1)
         print(f"  ✓ Test passed for num_tokens={num_tokens}, dtype={dtype_str}\n")
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("num_tokens", [1, 16, 128, 256])
+def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
+    """The opt-in DSV4_FUSE_OPROJ fused fp8 epilogue must be numerically
+    equivalent to the default unfused path.
+
+    Fused (DSV4_FUSE_OPROJ=1): o_a's CuTe-DSL GEMM emits o_lora directly as fp8
+    e4m3 + packed-UE8M0 1x128 scale factors, fed straight to DeepGEMM.
+    Unfused (default): o_a emits bf16 o_lora, then ``o_b_proj`` runs the separate
+    1x128 quant + DeepGEMM. Since the fusion only folds the *same* quant into o_a's
+    epilogue, the two production paths must match far tighter than the fp8-vs-bf16
+    reference bar.
+    """
+    if get_sm_version() < 100:
+        pytest.skip("DSV4_FUSE_OPROJ fp8 fusion requires Blackwell (SM100+)")
+
+    device = torch.device("cuda")
+    mla, attn_out_latent, position_ids, refs = _build_dsv4_o_proj_case(num_tokens, "fp8", device)
+
+    # Guard: confirm the fused branch's static gates hold, so this test actually
+    # exercises the fused path instead of silently falling back to the unfused one.
+    assert mla.o_a_proj.dtype == torch.float8_e4m3fn
+    assert mla.n_local_groups == mla.num_groups
+    assert getattr(mla.o_b_proj, "tp_size", 1) == 1
+    assert mla.o_b_proj.has_fp8_block_scales
+    assert not getattr(mla.o_b_proj, "use_cute_dsl_blockscaling_mm", False)
+
+    # Unfused (default): DSV4_FUSE_OPROJ unset.
+    monkeypatch.delenv("DSV4_FUSE_OPROJ", raising=False)
+    out_unfused = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+
+    # Fused: opt in.
+    monkeypatch.setenv("DSV4_FUSE_OPROJ", "1")
+    out_fused = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+
+    assert out_fused.shape == out_unfused.shape, (
+        f"Shape mismatch: fused {out_fused.shape} vs unfused {out_unfused.shape}"
+    )
+    assert out_fused.dtype == out_unfused.dtype, (
+        f"Dtype mismatch: fused {out_fused.dtype} vs unfused {out_unfused.dtype}"
+    )
+    assert torch.isfinite(out_fused).all(), "Fused output contains non-finite values"
+
+    # Analytic reference (same correctness bar as the unfused correctness test).
+    reference_output = calculate_reference_deepseek_v4_o_proj(
+        attn_out_latent=attn_out_latent,
+        o_a_proj=refs.o_a_proj,
+        o_b_proj_weight=refs.o_b_proj_weight,
+        freqs_cis=refs.freqs_cis[0:num_tokens],
+        n_local_groups=refs.n_local_groups,
+        qk_nope_head_dim=refs.qk_nope_head_dim,
+        qk_rope_head_dim=refs.qk_rope_head_dim,
+        device=device,
+        is_fp8=True,
+    )
+
+    diff_vs_ref = _calc_diff(out_fused, reference_output)
+    diff_vs_unfused = _calc_diff(out_fused, out_unfused)
+    print(
+        f"\n  num_tokens={num_tokens}  diff(fused,ref)={diff_vs_ref:.3e}  "
+        f"diff(fused,unfused)={diff_vs_unfused:.3e}"
+    )
+
+    assert diff_vs_ref < FP8_O_PROJ_DIFF_TOL, f"fused vs reference {diff_vs_ref=}"
+    assert diff_vs_unfused < 1e-3, f"fused vs unfused {diff_vs_unfused=}"
