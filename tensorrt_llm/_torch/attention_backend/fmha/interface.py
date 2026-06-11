@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import weakref
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -31,7 +32,14 @@ class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
     def __init__(self, attn: "TrtllmAttention"):
-        self.attn = attn
+        self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
+
+    @property
+    def attn(self) -> "TrtllmAttention":
+        attn = self._attn_ref()
+        if attn is None:
+            raise RuntimeError("The owning TrtllmAttention instance has been garbage collected.")
+        return attn
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
