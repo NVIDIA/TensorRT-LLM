@@ -30,6 +30,9 @@ from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
+from .postprocessor_hook import (apply_post_processor_hook,
+                                 get_configured_post_processor_hook,
+                                 get_post_processor_hook)
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
 if TYPE_CHECKING:
@@ -887,9 +890,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         and the in-proxy path; the hook is configured per-process and read from
         the process-global set at startup.
         """
-        from .postprocessor_hook import (apply_post_processor_hook,
-                                         get_configured_post_processor_hook,
-                                         get_post_processor_hook)
         import_path = get_configured_post_processor_hook()
         if not import_path:
             return

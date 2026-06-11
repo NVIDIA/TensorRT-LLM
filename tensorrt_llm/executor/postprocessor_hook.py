@@ -204,6 +204,12 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
     worker or crash the serving loop. This is consistent across the in-proxy and
     postproc-worker paths.
     """
+    # ``is_final`` is request-level (``result._done``), not per-output: a
+    # ``terminate`` verdict on one output marks the whole request done. Under the
+    # locked 1:1 single-output scope (TRTLLM-12622 §15.1) this is exact; hooks key
+    # their per-request state on ``request_id`` and release it on ``is_final``, so
+    # request-level finality is the correct cleanup signal regardless of output
+    # count.
     is_final = result._done
     for output in result.outputs:
         chunk = PostProcChunk(

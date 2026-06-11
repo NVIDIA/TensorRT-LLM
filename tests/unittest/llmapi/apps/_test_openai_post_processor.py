@@ -115,11 +115,19 @@ async def test_completions_streaming(async_client: openai.AsyncOpenAI, model_nam
         stream=True,
     )
     text = ""
+    finish_reason = None
     async for chunk in stream:
         token = chunk.choices[0].text
         if token:
             text += token
+        if chunk.choices[0].finish_reason is not None:
+            finish_reason = chunk.choices[0].finish_reason
     _assert_text_matches_hook(hook, text)
+    if hook == "terminate":
+        # The hook (not an empty generation) must have stopped the stream.
+        assert finish_reason == "stop", (
+            f"expected finish_reason 'stop' from terminate, got {finish_reason!r}"
+        )
 
 
 def test_chat_non_streaming(client: openai.OpenAI, model_name: str, hook: str):
@@ -145,8 +153,16 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI, model_name: str,
         stream=True,
     )
     content = ""
+    finish_reason = None
     async for chunk in stream:
         delta = chunk.choices[0].delta.content
         if delta:
             content += delta
+        if chunk.choices[0].finish_reason is not None:
+            finish_reason = chunk.choices[0].finish_reason
     _assert_text_matches_hook(hook, content)
+    if hook == "terminate":
+        # The hook (not an empty generation) must have stopped the stream.
+        assert finish_reason == "stop", (
+            f"expected finish_reason 'stop' from terminate, got {finish_reason!r}"
+        )
