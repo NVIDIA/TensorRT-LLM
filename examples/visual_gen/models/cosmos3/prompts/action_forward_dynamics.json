@@ -1,0 +1,5 @@
+{
+    "model_mode": "image2video",
+    "prompt": "Robot manipulation rollout: the right arm extends to the fruit display, picks up a pear, and places it into the bag in the shopping cart.",
+    "vision_path": "https://github.com/nvidia-cosmos/cosmos-dependencies/raw/refs/heads/assets/cosmos3/inputs/vision/robot_153.jpg"
+}

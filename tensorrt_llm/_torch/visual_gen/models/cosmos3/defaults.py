@@ -35,10 +35,16 @@ COSMOS3_720P_PARAMS = {
     "frame_rate": 24.0,
 }
 
-# Text-to-image (``output_type="image"``) defaults. Applied by the pipeline when
-# the corresponding request field still carries the merged video default, since
-# the executor merges a single ``default_generation_params`` dict (the video
-# params above) into the request before ``infer()`` runs.
+# Fields merged by the executor for every request. Modality-specific sizing and
+# sampling defaults (height/width/num_frames/steps/guidance) stay ``None`` on the
+# request until ``forward()`` resolves them from T2V/T2I/action context.
+COSMOS3_PIPELINE_DEFAULTS = {
+    "max_sequence_length": COSMOS3_720P_PARAMS["max_sequence_length"],
+    "frame_rate": COSMOS3_720P_PARAMS["frame_rate"],
+}
+
+# Text-to-image (``output_type="image"``) defaults. Applied when the request
+# field is ``None``.
 COSMOS3_T2I_PARAMS = {
     "height": 1024,
     "width": 1024,
@@ -46,6 +52,15 @@ COSMOS3_T2I_PARAMS = {
     "guidance_scale": 7.0,
     "flow_shift": 3.0,
     "guidance_interval": (400.0, 1000.0),
+}
+
+COSMOS3_ACTION_PARAMS = {
+    "action_chunk_size": 16,
+    "num_frames": 17,
+    "num_inference_steps": 30,
+    "guidance_scale": 1.0,
+    "flow_shift": 5.0,
+    "frame_rate": 24.0,
 }
 
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
@@ -78,5 +93,45 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         type="Literal['video', 'image']",
         default="video",
         description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
+    ),
+    "action_mode": ExtraParamSchema(
+        type="str",
+        default=None,
+        description="Action generation mode: policy, forward_dynamics, or inverse_dynamics.",
+    ),
+    "domain_name": ExtraParamSchema(
+        type="str",
+        default=None,
+        description="Embodiment domain name for action generation.",
+    ),
+    "domain_id": ExtraParamSchema(
+        type="int",
+        default=None,
+        description="Embodiment domain id for action generation.",
+    ),
+    "raw_action_dim": ExtraParamSchema(
+        type="int",
+        default=None,
+        description="Raw action DOF count for policy/inverse_dynamics.",
+    ),
+    "action_chunk_size": ExtraParamSchema(
+        type="int",
+        default=COSMOS3_ACTION_PARAMS["action_chunk_size"],
+        description="Number of action tokens to generate.",
+    ),
+    "action": ExtraParamSchema(
+        type="list",
+        default=None,
+        description="Action trajectory [T, D] for forward_dynamics mode.",
+    ),
+    "action_resolution": ExtraParamSchema(
+        type="int",
+        default=480,
+        description="Resolution bucket for action image sizing (256/480/704/720).",
+    ),
+    "video": ExtraParamSchema(
+        type="list",
+        default=None,
+        description="Video frames (PIL images or paths) for inverse_dynamics mode.",
     ),
 }
