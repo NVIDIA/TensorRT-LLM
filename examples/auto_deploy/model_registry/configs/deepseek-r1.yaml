@@ -34,12 +34,10 @@ transforms:
     backend: trtllm_mla
   fuse_rope_into_trtllm_mla:
     enabled: true
-  # Generic fuse_gemms merges the MLA q_a + kv_a_with_mqa projections; the
-  # lower_dsv3_a_gemm backend selector then routes the fused 2112x7168 bf16
-  # node to the dsv3 min-latency kernel.
+  # Generic fuse_gemms merges the MLA q_a + kv_a_with_mqa projections into a
+  # 2112x7168 bf16 GEMM; torch_linear_simple then dispatches that exact shape
+  # to the trtllm dsv3 min-latency kernel (op-level, no extra transform).
   fuse_gemms:
-    enabled: true
-  lower_dsv3_a_gemm:
     enabled: true
   fuse_dsv3_router_gemm:
     enabled: true

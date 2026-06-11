@@ -46,7 +46,7 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 # At post_load_fusion, only the backend-agnostic torch_rope_* IR ops are
 # present (optimize_rope has not yet replaced them with flashinfer_rope).
 _ROPE_OP_TARGETS = []
-for _name in ("torch_rope_with_explicit_cos_sin", "torch_rope_with_qk_interleaving"):
+for _name in ("torch_rope_with_explicit_cos_sin",):
     try:
         _packet = getattr(torch.ops.auto_deploy, _name)
         _ROPE_OP_TARGETS.append(_packet)
@@ -122,12 +122,7 @@ def _build_rotary_cos_sin_from_buffers(
     Returns a ``[1, max_pos * rope_dim * 2]`` float32 CUDA tensor, or None
     if construction fails.
     """
-    _explicit_cos_sin_ops = (
-        torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
-        torch.ops.auto_deploy.torch_rope_with_qk_interleaving,
-    )
-    if any(is_op(rope_node, op) for op in _explicit_cos_sin_ops):
-        # Both ops share signature (q, k, cos, sin, unsqueeze_dim) and use
+    if is_op(rope_node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
         # NeoX-doubled cos/sin [max_pos, qk_rope_head_dim].
         cos_node = rope_node.args[2]
         sin_node = rope_node.args[3]
@@ -446,10 +441,13 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
             ad_logger.info("No torch_mla nodes found; skipping.")
             return gm, TransformInfo(skipped=True, detail="no MLA nodes")
 
-        # Detect GPTJ layout BEFORE the fusion consumes the rope nodes:
-        # torch_rope_with_qk_interleaving in the graph means weights stayed in
-        # GPTJ layout (no load-time de-interleave) so no undo is needed below.
-        already_gptj = is_gptj_layout(gm)
+        # Whether MLA RoPE weights are in native GPTJ layout (model skipped the
+        # de-interleave load hook) — if so, _undo_rope_deinterleave must NOT run.
+        try:
+            _model_config, _ = factory._get_model_config()
+            already_gptj = is_gptj_layout(_model_config)
+        except Exception:
+            already_gptj = False
 
         # Try to trace the RoPE pattern from the first MLA node.
         trace_result = _trace_rope_node(mla_nodes[0])
