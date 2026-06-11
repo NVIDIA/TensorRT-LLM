@@ -553,8 +553,7 @@ SharedPtr<T> makeShared(Args&&... args)
     // Wire up EnableSharedFromThis if T (or a base) derives from it.
     if constexpr (detail::hasEnable<T>)
     {
-        using Base = detail::EnableBase<T>;
-        result.mPtr->Base::mWeakThis = result;
+        result.mPtr->detail::template EnableBase<T>::mWeakThis = result;
     }
 
     return result;
