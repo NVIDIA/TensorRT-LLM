@@ -141,6 +141,10 @@ class EagleConfig(PretrainedConfig):
             "_checkpoint_conversion_mapping": {
                 r"^mtp\.": "model.",
             },
+            # Quantization excludes are glob patterns, so handle both mtp.* and mtp*.
+            "_quant_exclude_conversion_mapping": {
+                r"^mtp(?=\.|\*)": "model",
+            },
         },
     }
     # Some custom HF config classes expose backward-compatibility fields as properties instead of
@@ -609,9 +613,12 @@ class EagleDrafterForCausalLM(PreTrainedModel):
     def __init__(self, config, layers: Optional[Union[nn.ModuleList, nn.Module]] = None):
         super().__init__(config)
 
-        # Read checkpoint conversion mapping from config (set by EagleConfig based on model_type)
+        # Read conversion mappings from config (set by EagleConfig based on model_type)
         self._checkpoint_conversion_mapping = getattr(
             config, "_checkpoint_conversion_mapping", None
+        )
+        self._quant_exclude_conversion_mapping = getattr(
+            config, "_quant_exclude_conversion_mapping", None
         )
 
         self.load_embedding_from_target = getattr(config, "load_embedding_from_target", False)

@@ -599,6 +599,37 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 2,
         },
     },
+    "nvidia/Nemotron-Ultra-V3-NVFP4": {
+        "model_kwargs": {
+            "dtype": "bfloat16",
+            "num_hidden_layers": 3,
+            "hybrid_override_pattern": "M*E",
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "head_dim": 64,
+            "mamba_num_heads": 4,
+            "mamba_head_dim": 64,
+            # n_groups=1 keeps the gated-RMSNorm group_size (= mamba d_inner / n_groups
+            # = 256 / 1 = 256) at the NVFP4 fused_gated_rmsnorm_quant minimum of 256.
+            "n_groups": 1,
+            # ssm_state_size=64 satisfies the FlashInfer SSM decode-path constraint used by
+            # the flashinfer_ssm + ssm_replay smoke test.
+            "ssm_state_size": 64,
+            "conv_kernel": 4,
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 512,
+            "moe_shared_expert_intermediate_size": 512,
+            "moe_latent_size": 64,
+            "n_group": 1,
+            "topk_group": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "mtp_hybrid_override_pattern": "*E",
+            "num_nextn_predict_layers": 2,
+        },
+    },
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": {
         "model_kwargs": {
             "num_hidden_layers": 8,

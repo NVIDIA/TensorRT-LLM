@@ -405,5 +405,6 @@ l0_dgx_b200:
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[deepseek-ai_DeepSeek-R1-0528-True]
   - accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_nvfp4[8]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronUltraV3::test_accuracy[nvfp4-8]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronUltraV3::test_mtp[nvfp4-8]
   # ------------- AutoDeploy Perf Sanity ---------------
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp8_ad_blackwell-r1_fp8_ad_ws8_1k1k] TIMEOUT (120)
