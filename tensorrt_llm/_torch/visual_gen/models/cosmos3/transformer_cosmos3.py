@@ -190,10 +190,13 @@ class DomainAwareLinear(nn.Module):
         self.input_size = int(input_size)
         self.output_size = int(output_size)
         self.num_domains = int(num_domains)
+        self.dtype = dtype
         self.fc = nn.Embedding(self.num_domains, self.output_size * self.input_size, dtype=dtype)
         self.bias = nn.Embedding(self.num_domains, self.output_size, dtype=dtype)
-        nn.init.xavier_uniform_(self.fc.weight)
-        nn.init.zeros_(self.bias.weight)
+
+    def post_load_weights(self) -> None:
+        self.fc.to(self.dtype)
+        self.bias.to(self.dtype)
 
     def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
         if domain_id.ndim == 0:
@@ -1542,6 +1545,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         if self.action_gen:
             self.action_modality_embed.data = self.action_modality_embed.data.to(target_dtype)
+            self.action_proj_in.post_load_weights()
+            self.action_proj_out.post_load_weights()
 
         for _, module in self.named_modules():
             if isinstance(module, Linear) or isinstance(module, Qwen3VLTextRMSNorm):

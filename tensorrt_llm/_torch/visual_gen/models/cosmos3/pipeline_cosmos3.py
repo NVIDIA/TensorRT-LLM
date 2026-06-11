@@ -17,10 +17,8 @@ import json
 import math
 import os
 import time
-from pathlib import Path
 from typing import Any, List, Optional, Union
 
-import numpy as np
 import PIL.Image
 import torch
 from diffusers import AutoencoderKLWan, UniPCMultistepScheduler
@@ -37,15 +35,16 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
 from .action import (
-    ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
+    action_reference_image,
     action_start_frame_offset,
-    build_action_condition_mask,
     build_vision_condition_mask,
-    find_closest_target_size,
-    load_action_tensor,
     normalize_action_mode,
-    pad_action_to_dim,
+    normalize_action_video_input,
+    pil_to_rgb,
+    prepare_action_latents,
+    resize_and_pad_action_image,
+    resolve_action_size,
     resolve_domain_id,
 )
 from .defaults import (
@@ -54,6 +53,7 @@ from .defaults import (
     COSMOS3_EXTRA_SPECS,
     COSMOS3_PIPELINE_DEFAULTS,
     COSMOS3_T2I_PARAMS,
+    resolve_domain_action_config,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
@@ -176,6 +176,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 # (UniPC mutates internal correction buffers on every .step() call).
                 self.audio_scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
 
+            if self.action_gen:
+                # Action uses its own scheduler for the same reason as audio.
+                self.action_scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
+
         # Re-check the env var in case it was changed after initialization like in unit tests.
         guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
         global TRTLLM_DISABLE_COSMOS3_GUARDRAILS
@@ -220,6 +224,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self.scheduler = UniPCMultistepScheduler.from_config(
             self._base_scheduler_config, flow_shift=target
         )
+        if self.audio_gen:
+            self.audio_scheduler = UniPCMultistepScheduler.from_config(
+                self._base_scheduler_config, flow_shift=target
+            )
+        if self.action_gen:
+            self.action_scheduler = UniPCMultistepScheduler.from_config(
+                self._base_scheduler_config, flow_shift=target
+            )
         self._current_flow_shift = target
 
     @property
@@ -237,50 +249,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     @property
     def extra_param_specs(self):
         return dict(COSMOS3_EXTRA_SPECS)
-
-    @staticmethod
-    def _resolve_action_size(
-        height: Optional[int],
-        width: Optional[int],
-        ref_image: PIL.Image.Image,
-        action_resolution: int,
-    ) -> tuple[int, int]:
-        """Fill unset action H/W from the action resolution bucket; honor explicit values."""
-        if height is not None and width is not None:
-            return height, width
-        target_w, target_h = find_closest_target_size(
-            ref_image.height, ref_image.width, action_resolution
-        )
-        return (
-            height if height is not None else target_h,
-            width if width is not None else target_w,
-        )
-
-    def _action_reference_image(
-        self,
-        *,
-        action_mode: str,
-        image: Any,
-        video: Any,
-    ) -> PIL.Image.Image:
-        if action_mode == ACTION_MODE_INVERSE_DYNAMICS:
-            frames = self._normalize_action_video_input(video)
-            if not frames:
-                raise ValueError("Cosmos3 action_mode='inverse_dynamics' requires a video input.")
-            return self._pil_to_rgb(frames[0])
-
-        if image is None and video is not None:
-            frames = self._normalize_action_video_input(video)
-            return self._pil_to_rgb(frames[0])
-        if image is None:
-            raise ValueError(f"Cosmos3 action_mode={action_mode!r} requires an image input.")
-        if isinstance(image, str):
-            return PIL.Image.open(image).convert("RGB")
-        if isinstance(image, PIL.Image.Image):
-            return image.convert("RGB")
-        raise TypeError(
-            f"Cosmos3 action reference image must be PIL.Image or path, got {type(image)!r}."
-        )
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
@@ -334,8 +302,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             action_chunk_size=extra_params.get("action_chunk_size"),
             action=extra_params.get("action"),
             action_resolution=extra_params.get("action_resolution")
-            or extra_params.get("image_size")
-            or 480,
+            or extra_params.get("image_size"),
             video=extra_params.get("video"),
         )
 
@@ -492,7 +459,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
-    # -- I2V latent preparation -----------------------------------------------
+    # =========================================================================
+    # I2V latent preparation
+    # =========================================================================
 
     def _encode_conditioning_video(
         self,
@@ -648,72 +617,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         """
         return self.audio_tokenizer.decode(latent).float()  # [B, audio_channels, N_samples]
 
-    @staticmethod
-    def _normalize_action_video_input(video: Any) -> List[Any]:
-        """Normalize inverse-dynamics video input to a frame list.
-
-        Accepts a list of PIL images / paths, a single image path, or a
-        directory of frame images (sorted lexicographically).
-        """
-        if video is None:
-            return []
-        if isinstance(video, list):
-            if not video:
-                raise ValueError("Cosmos3 action video input must contain at least one frame.")
-            return video
-        if isinstance(video, str):
-            path = Path(video)
-            if not path.exists():
-                raise ValueError(f"Cosmos3 action video path does not exist: {video}")
-            if path.is_dir():
-                exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-                frames = sorted(p for p in path.iterdir() if p.suffix.lower() in exts)
-                if not frames:
-                    raise ValueError(
-                        f"No image frames found in Cosmos3 action video directory: {video}"
-                    )
-                return [str(p) for p in frames]
-            return [video]
-        return [video]
-
-    @staticmethod
-    def _pil_to_rgb(value: Any) -> PIL.Image.Image:
-        if isinstance(value, str):
-            return PIL.Image.open(value).convert("RGB")
-        if isinstance(value, PIL.Image.Image):
-            return value.convert("RGB")
-        raise TypeError(
-            f"Cosmos3 action preprocessing expected PIL image or image path, got {type(value)!r}."
-        )
-
-    @staticmethod
-    def _resize_and_pad_action_image(
-        image: PIL.Image.Image, target_h: int, target_w: int
-    ) -> PIL.Image.Image:
-        scale = min(target_w / image.width, target_h / image.height, 1.0)
-        resize_w = max(1, int(scale * image.width + 0.5))
-        resize_h = max(1, int(scale * image.height + 0.5))
-        if (resize_w, resize_h) != image.size:
-            image = image.resize((resize_w, resize_h), PIL.Image.Resampling.BICUBIC)
-
-        array = np.asarray(image)
-        pad_h = target_h - resize_h
-        pad_w = target_w - resize_w
-        if pad_h < 0 or pad_w < 0:
-            raise ValueError(
-                f"Cosmos3 action image resize exceeded target size: resized={(resize_h, resize_w)}, "
-                f"target={(target_h, target_w)}."
-            )
-        if pad_h == 0 and pad_w == 0:
-            return image
-        pad_mode = "reflect" if pad_h < resize_h and pad_w < resize_w else "edge"
-        padded = np.pad(array, ((0, pad_h), (0, pad_w), (0, 0)), mode=pad_mode)
-        return PIL.Image.fromarray(padded)
+    # =========================================================================
+    # Action generation
+    # =========================================================================
 
     def _preprocess_action_image(
         self, image: PIL.Image.Image, target_h: int, target_w: int
     ) -> torch.Tensor:
-        image = self._resize_and_pad_action_image(image, target_h, target_w)
+        image = resize_and_pad_action_image(image, target_h, target_w)
         return self.video_processor.preprocess(image, height=target_h, width=target_w)
 
     def _preprocess_action_video(
@@ -722,7 +633,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if not frames:
             raise ValueError("Cosmos3 action video input must contain at least one frame.")
         processed = [
-            self._preprocess_action_image(self._pil_to_rgb(frame), target_h, target_w).squeeze(0)
+            self._preprocess_action_image(pil_to_rgb(frame), target_h, target_w).squeeze(0)
             for frame in frames
         ]
         return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
@@ -801,48 +712,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         generator: torch.Generator,
         action_input: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        action_dim = int(getattr(self.transformer, "action_dim", 64))
-        if mode == ACTION_MODE_FORWARD_DYNAMICS:
-            action = load_action_tensor(action_input)
-            if action.shape[0] < action_chunk_size:
-                pad = action[-1:].repeat(action_chunk_size - action.shape[0], 1)
-                action = torch.cat([action, pad], dim=0)
-            elif action.shape[0] > action_chunk_size:
-                action = action[:action_chunk_size]
-            if raw_action_dim is None:
-                raw_action_dim = int(action.shape[-1])
-            clean_action = pad_action_to_dim(action, action_dim)
-        else:
-            if raw_action_dim is None:
-                raise ValueError(
-                    "Cosmos3 action_mode='policy' and 'inverse_dynamics' require raw_action_dim."
-                )
-            clean_action = torch.zeros(action_chunk_size, action_dim, dtype=torch.float32)
-
-        raw_action_dim = int(raw_action_dim)
-        if raw_action_dim <= 0 or raw_action_dim > action_dim:
-            raise ValueError(
-                f"Cosmos3 raw_action_dim must be in [1, {action_dim}], got {raw_action_dim}."
-            )
-
-        clean_action = clean_action.to(device=self.device, dtype=self.dtype).unsqueeze(0)
-        condition_mask = build_action_condition_mask(
-            mode,
-            action_chunk_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        noise = randn_tensor(
-            (1, action_chunk_size, action_dim),
+        return prepare_action_latents(
+            mode=mode,
+            action_chunk_size=action_chunk_size,
+            raw_action_dim=raw_action_dim,
+            action_dim=int(getattr(self.transformer, "action_dim", 64)),
             generator=generator,
             device=self.device,
             dtype=self.dtype,
+            action_input=action_input,
         )
-        noise[:, :, raw_action_dim:] = 0
-        clean_action[:, :, raw_action_dim:] = 0
-        action_latents = condition_mask * clean_action + (1.0 - condition_mask) * noise
-        action_velocity_mask = 1.0 - condition_mask
-        return action_latents, action_velocity_mask, clean_action, raw_action_dim
 
     # =========================================================================
     # Forward (main generation entry point)
@@ -875,7 +754,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         raw_action_dim: Optional[int] = None,
         action_chunk_size: Optional[int] = None,
         action: Any = None,
-        action_resolution: int = 480,
+        action_resolution: Optional[int] = None,
         video: Any = None,
     ):
         pipeline_start = time.time()
@@ -917,15 +796,38 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             guidance_interval = COSMOS3_T2I_PARAMS["guidance_interval"]
             self._set_flow_shift(COSMOS3_T2I_PARAMS["flow_shift"])
         elif do_action:
-            action_chunk_size = action_chunk_size or COSMOS3_ACTION_PARAMS["action_chunk_size"]
-            if num_frames is None:
-                num_frames = COSMOS3_ACTION_PARAMS["num_frames"]
+            action_cfg = resolve_domain_action_config(
+                domain_name=domain_name,
+                domain_id=domain_id,
+                raw_action_dim=raw_action_dim,
+                action_chunk_size=action_chunk_size,
+                action_resolution=action_resolution,
+                frame_rate=frame_rate,
+                num_frames=num_frames,
+            )
+            if self.rank == 0:
+                for warning in action_cfg["warnings"]:
+                    logger.warning(warning)
+                if action_cfg["preset_key"] is not None:
+                    logger.info(
+                        f"Cosmos3 action domain preset {action_cfg['preset_key']!r}: "
+                        f"raw_action_dim={action_cfg['raw_action_dim']}, "
+                        f"action_chunk_size={action_cfg['action_chunk_size']}, "
+                        f"action_resolution={action_cfg['action_resolution']}, "
+                        f"frame_rate={action_cfg['frame_rate']:.1f}, "
+                        f"num_frames={action_cfg['num_frames']}"
+                    )
+
+            raw_action_dim = action_cfg["raw_action_dim"]
+            action_chunk_size = action_cfg["action_chunk_size"]
+            action_resolution = action_cfg["action_resolution"]
+            num_frames = action_cfg["num_frames"]
+            frame_rate = action_cfg["frame_rate"]
             num_inference_steps = (
                 num_inference_steps or COSMOS3_ACTION_PARAMS["num_inference_steps"]
             )
             if guidance_scale is None:
                 guidance_scale = COSMOS3_ACTION_PARAMS["guidance_scale"]
-            frame_rate = frame_rate or COSMOS3_ACTION_PARAMS["frame_rate"]
             self._set_flow_shift(COSMOS3_ACTION_PARAMS["flow_shift"])
             enable_audio = False
         else:
@@ -945,33 +847,24 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         action_ref_image = None
         if do_action:
-            action_ref_image = self._action_reference_image(
+            action_ref_image = action_reference_image(
                 action_mode=normalized_action_mode,
                 image=image,
                 video=video,
             )
-            height, width = self._resolve_action_size(
-                height, width, action_ref_image, action_resolution
-            )
+            height, width = resolve_action_size(height, width, action_ref_image, action_resolution)
 
         if self.rank == 0:
             logger.info(
-                "Cosmos3 generation dims: %dx%d (WxH), num_frames=%d, "
-                "num_inference_steps=%d, guidance_scale=%.2f, frame_rate=%.1f",
-                width,
-                height,
-                num_frames,
-                num_inference_steps,
-                guidance_scale,
-                frame_rate,
+                f"Cosmos3 generation dims: {width}x{height} (WxH), num_frames={num_frames}, "
+                f"num_inference_steps={num_inference_steps}, guidance_scale={guidance_scale:.2f}, "
+                f"frame_rate={frame_rate:.1f}"
             )
             if do_action:
                 logger.info(
-                    "Cosmos3 action dims: action_chunk_size=%d, action_resolution=%s, "
-                    "input_aspect=%.3f",
-                    action_chunk_size,
-                    action_resolution,
-                    action_ref_image.width / action_ref_image.height,
+                    f"Cosmos3 action dims: action_chunk_size={action_chunk_size}, "
+                    f"action_resolution={action_resolution}, "
+                    f"input_aspect={action_ref_image.width / action_ref_image.height:.3f}"
                 )
 
         if isinstance(prompt, str):
@@ -1091,7 +984,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
             if normalized_action_mode == ACTION_MODE_INVERSE_DYNAMICS:
-                video = self._normalize_action_video_input(video)
+                inverse_video = video if video is not None else image
+                video = normalize_action_video_input(inverse_video, max_frames=num_frames)
                 video_tensor = self._preprocess_action_video(video, height, width)
                 latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
                     video_tensor,
@@ -1157,6 +1051,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 3. Set up scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        if do_action:
+            self.action_scheduler.set_timesteps(num_inference_steps, device=self.device)
 
         # 3b. Audio noise init — latent length matches diffusers Cosmos3OmniPipeline.prepare_latents.
         do_audio = enable_audio and self.audio_gen and hasattr(self, "audio_tokenizer")
@@ -1283,7 +1179,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         timer.mark_denoise_start()
         extra_streams = None
         if do_action:
-            extra_streams = {"action": (action_latents, self.scheduler)}
+            extra_streams = {"action": (action_latents, self.action_scheduler)}
         elif do_audio:
             extra_streams = {"audio": (audio_latents, self.audio_scheduler)}
         # FUTURE(action+audio): merge both keys; extend forward_fn return dict and post_step_fn.
