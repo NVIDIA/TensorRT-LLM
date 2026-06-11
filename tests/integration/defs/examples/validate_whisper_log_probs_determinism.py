@@ -76,7 +76,7 @@ def main():
     decoder_config = read_config("decoder", engine_dir)
 
     n_mels = encoder_config["n_mels"]
-    is_multilingual = decoder_config["vocab_size"] >= 51865
+    is_multilingual = decoder_config["vocab_size"] >= 51865  # multilingual vocab size threshold
 
     from tokenizer import get_tokenizer
     from whisper_utils import log_mel_spectrogram
@@ -138,6 +138,9 @@ def main():
     decoder_input_ids = torch.tensor(prompt_ids).unsqueeze(0).repeat(args.batch_size, 1)
 
     all_log_probs = []
+    ref_output_ids = None
+    ref_gen_logits = None
+    input_len = decoder_input_ids.shape[1]
     for run_idx in range(args.num_runs):
         with torch.no_grad():
             outputs = runner.generate(
@@ -156,6 +159,9 @@ def main():
             )
         torch.cuda.synchronize()
         all_log_probs.append(outputs["log_probs"][:, 0, :].cpu())
+        if run_idx == 0:
+            ref_output_ids = outputs["output_ids"].cpu()
+            ref_gen_logits = outputs["generation_logits"].cpu()
 
     for i in range(1, args.num_runs):
         if all_log_probs[i].shape != all_log_probs[0].shape:
@@ -169,15 +175,43 @@ def main():
         (all_log_probs[0] - all_log_probs[i]).abs().max().item() for i in range(1, args.num_runs)
     )
 
-    if max_diff < 1e-6:
-        print(
-            f"PASS: log_probs are deterministic across {args.num_runs} runs "
-            f"(max diff: {max_diff:.2e})"
-        )
-        sys.exit(0)
-    else:
+    if max_diff >= 1e-6:
         print(f"FAIL: log_probs are non-deterministic (max diff: {max_diff:.6f})")
         sys.exit(1)
+
+    # Correctness check: verify log_probs[b][t] matches log_softmax(generation_logits[b][t])[token]
+    # for every batch slot b (including b > 0, exercising the gatherTree batchSlot offset fix).
+    # Uses a loose tolerance because log_probs come from float32 beam search bookkeeping while
+    # generation_logits are the raw fp16->fp32 decoder outputs.
+    LOG_PROB_ATOL = 0.5
+    all_aligned = True
+    for b in range(args.batch_size):
+        gen_tokens = ref_output_ids[b, 0, input_len:]
+        eot_pos = (gen_tokens == eot_id).nonzero(as_tuple=True)[0]
+        gen_len = eot_pos[0].item() if len(eot_pos) > 0 else gen_tokens.shape[0]
+        if gen_len == 0:
+            continue
+        logits = ref_gen_logits[b, 0, :gen_len, :]
+        log_probs_from_logits = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+        expected = log_probs_from_logits.gather(1, gen_tokens[:gen_len].unsqueeze(1)).squeeze(1)
+        actual = all_log_probs[0][b, :gen_len]
+        max_lp_diff = (actual - expected).abs().max().item()
+        if max_lp_diff > LOG_PROB_ATOL:
+            print(
+                f"FAIL: log_probs[batch={b}] deviate from generation_logits "
+                f"(max diff: {max_lp_diff:.4f} > {LOG_PROB_ATOL}); "
+                "likely caused by wrong logProbsTiled batchSlot offset in gatherTree."
+            )
+            all_aligned = False
+
+    if not all_aligned:
+        sys.exit(1)
+
+    print(
+        f"PASS: log_probs are deterministic across {args.num_runs} runs "
+        f"(max diff: {max_diff:.2e}) and aligned with generation_logits for all batch slots."
+    )
+    sys.exit(0)
 
 
 if __name__ == "__main__":

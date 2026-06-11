@@ -789,6 +789,15 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     //   = base[step * maxBS * BM + batchSlot * BM + beamIdx]
     //   = logProbsTiled[step][batchSlot][beamIdx]  ✓
     auto const logProbsTiledMaxBatchSize = static_cast<SizeType32>(decodingOutput.logProbsTiled->getShape().d[1]);
+    auto const logProbsTiledBeamWidth = static_cast<SizeType32>(decodingOutput.logProbsTiled->getShape().d[2]);
+    TLLM_CHECK_WITH_INFO(batchSlot < logProbsTiledMaxBatchSize,
+        "batchSlot (%d) must be < logProbsTiled maxBatchSize (%d); "
+        "logProbsTiled would be accessed out of bounds.",
+        batchSlot, logProbsTiledMaxBatchSize);
+    TLLM_CHECK_WITH_INFO(beamWidth == logProbsTiledBeamWidth,
+        "beamWidth (%d) must equal logProbsTiled BM dimension (%d); "
+        "pointer offset batchSlot*beamWidth would be misaligned.",
+        beamWidth, logProbsTiledBeamWidth);
     bh.nMaxBatchSize = logProbsTiledMaxBatchSize;
     bh.nBatchSize = batchSize;
     bh.nBeamWidth = beamWidth;

@@ -219,7 +219,7 @@ def test_whisper_beam_search_generation_logits(llm_venv, engine_dir,
 @pytest.mark.parametrize("batch_size", [4],
                          ids=lambda batch_size: f'bs:{batch_size}')
 @pytest.mark.parametrize("whisper_model_root", ['large-v3'], indirect=True)
-def test_whisper_log_probs_determinism(llm_venv, engine_dir,
+def test_whisper_log_probs_determinism(llm_venv, engine_dir, llm_root,
                                        whisper_example_root, whisper_model_root,
                                        num_beams, batch_size,
                                        llm_datasets_root):
@@ -286,9 +286,13 @@ def test_whisper_log_probs_determinism(llm_venv, engine_dir,
         "--num_runs=5",
     ]
     env = {
+        # llm_root is listed first so the worktree's tensorrt_llm takes priority
+        # over any system-installed version when the validation subprocess runs.
         "PYTHONPATH":
         os.pathsep.join(
-            filter(None, [whisper_example_root,
-                          os.environ.get("PYTHONPATH")])),
+            filter(
+                None,
+                [llm_root, whisper_example_root,
+                 os.environ.get("PYTHONPATH")])),
     }
     venv_check_call(llm_venv, run_cmd, env=env)
