@@ -51,7 +51,6 @@ Before running these examples, ensure you have:
    ```
    For LTX-2, you need to provide a proper text_encoder_path in `./configs/ltx2.yml`.
 
-
 ## Examples
 
 Current supported & tested models:
