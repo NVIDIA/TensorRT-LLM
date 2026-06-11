@@ -5,7 +5,7 @@ metadata:
   supported_gpus:
   - GB200
   script_file: disaggr_torch.slurm
-  benchmark_type: 8k1k
+  benchmark_type: 1k1k
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -17,11 +17,11 @@ slurm:
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: false
-  multi_round: 10
+  multi_round: 5
   benchmark_ratio: 0.0
   streaming: true
-  concurrency_list: '512'
-  input_length: 8192
+  concurrency_list: '4096'
+  input_length: 1024
   output_length: 1024
   dataset_file: <dataset_file>
 hardware:
@@ -35,43 +35,46 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
 worker_config:
   gen:
     print_iter_log: true
-    max_batch_size: 16
-    max_num_tokens: 64
-    tensor_parallel_size: 32
-    moe_expert_parallel_size: 32
+    max_batch_size: 512
+    max_num_tokens: 1024
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
     pipeline_parallel_size: 1
     context_parallel_size: 1
     enable_attention_dp: true
     enable_lm_head_tp_in_adp: true
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 16
+      max_batch_size: 512
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.6
+      free_gpu_memory_fraction: 0.8
       dtype: fp8
     moe_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
+      load_balancer:
+        num_slots: 256
+        layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
     disable_overlap_scheduler: true
     speculative_config: &id001
       decoding_type: MTP
-      num_nextn_predict_layers: 3
+      num_nextn_predict_layers: 1
     num_postprocess_workers: 4
     stream_interval: 20
   ctx:
     print_iter_log: true
-    max_batch_size: 2
+    max_batch_size: 16
     max_num_tokens: 16384
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
