@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -357,6 +357,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         return;
     }
 
+    bool const hasPendingTransferDependency = mCacheManager->syncPendingTransfersToBufferManager();
     auto& blockManager = mCacheManager->getBlockManager();
     auto const& lastBlockKey = session.getLastBlockKey();
     auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
@@ -370,6 +371,10 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
     if (layerWise)
     {
+        if (hasPendingTransferDependency)
+        {
+            bufferManager.getStream().synchronize();
+        }
         auto& progress = llmRequest.getContextProgress();
         SizeType32 const numLayers = blockManager.getNumLayers();
         runtime::ITensor::Shape offset = runtime::ITensor::makeShape({0, 0});
@@ -456,6 +461,10 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
             TLLM_CHECK(pickUpConnections.size() == 1);
 
+            if (hasPendingTransferDependency)
+            {
+                bufferManager.getStream().synchronize();
+            }
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             for (size_t i = 0; i < pickUpConnections.size(); i++)
             {

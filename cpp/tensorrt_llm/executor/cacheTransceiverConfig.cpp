@@ -34,7 +34,8 @@ CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backen
 bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) const
 {
     return mMaxTokensInBuffer == other.mMaxTokensInBuffer && mBackendType == other.mBackendType
-        && mKvTransferTimeoutMs == other.mKvTransferTimeoutMs;
+        && mKvTransferTimeoutMs == other.mKvTransferTimeoutMs
+        && mKvTransferSenderFutureTimeoutMs == other.mKvTransferSenderFutureTimeoutMs;
 }
 
 void CacheTransceiverConfig::setBackendType(std::optional<BackendType> backendType)

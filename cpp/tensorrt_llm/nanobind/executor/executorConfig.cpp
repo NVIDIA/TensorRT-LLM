@@ -431,15 +431,19 @@ void initConfigBindings(nb::module_& m)
         .def("__setstate__", guidedDecodingConfigSetstate);
 
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
-    { return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getKvTransferTimeoutMs()); };
+    {
+        return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getKvTransferTimeoutMs(),
+            self.getKvTransferSenderFutureTimeoutMs());
+    };
     auto cacheTransceiverConfigSetstate = [](tle::CacheTransceiverConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 3 && state.size() != 4)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
         new (&self) tle::CacheTransceiverConfig(nb::cast<tle::CacheTransceiverConfig::BackendType>(state[0]),
-            nb::cast<std::optional<size_t>>(state[1]), nb::cast<std::optional<int>>(state[2]));
+            nb::cast<std::optional<size_t>>(state[1]), nb::cast<std::optional<int>>(state[2]),
+            state.size() == 4 ? nb::cast<std::optional<int>>(state[3]) : std::nullopt);
     };
 
     nb::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")

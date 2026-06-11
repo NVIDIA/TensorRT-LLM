@@ -14,7 +14,7 @@
 # limitations under the License.
 """Integration tests for per-iteration KV cache statistics (kvCacheIterationStats).
 
-Tests verify that the 18 stat fields are correctly populated across
+Tests verify that the 24 stat fields are correctly populated across
 different inference scenarios: cold start, block reuse (partial/full),
 shared prefix, batch generation, long context, and rapid-fire.
 
@@ -71,6 +71,13 @@ ALL_FIELDS = [
     # Intra-device (GPU → GPU) block copies
     "iterIntraDeviceCopyBlocks",
     "iterIntraDeviceCopyBytes",
+    # Transfer-prep leases and reservations
+    "iterTransferPinnedBlocks",
+    "iterTransferAlreadyPrimaryBlocks",
+    "iterTransferPrimaryBlockReservations",
+    "iterTransferOnboardedBlocks",
+    "iterTransferReservationFailures",
+    "iterTransferLeaseReleaseBlocks",
 ]
 
 TEST_NAMES = {
@@ -96,7 +103,7 @@ def _is_verbose(request):
 
 
 def print_kv_stats(label, stats_list):
-    """Print all 18 fields for every stats entry."""
+    """Print all KV cache iteration fields for every stats entry."""
     print(f"\n{'=' * 60}")
     print(f" {label}: {len(stats_list)} stats entries")
     print(f"{'=' * 60}")
@@ -383,7 +390,7 @@ class TestKvCacheIterationStats:
         assert total_alloc > 0, "iterAllocTotalBlocks = 0 across all entries"
 
     def test_field_completeness(self, llm_instance, all_collected, request):
-        """Field completeness — verify all 18 fields present across all collected stats."""
+        """Field completeness — verify all KV iteration fields are present."""
         # If running standalone (no prior tests), generate some traffic
         if not all_collected:
             llm_instance.generate(["Hello world"], SamplingParams(max_tokens=16))
@@ -429,7 +436,7 @@ def main():
         "--verbose",
         "-v",
         action="store_true",
-        help="Dump all 18 KV cache stat fields for every stats entry",
+        help="Dump all KV cache iteration stat fields for every stats entry",
     )
     parser.add_argument(
         "--test",

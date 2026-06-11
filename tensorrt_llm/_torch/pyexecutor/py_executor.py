@@ -31,6 +31,8 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.executor.stats_serialization import \
+    kv_cache_iteration_stats_to_dict
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -1226,33 +1228,9 @@ class PyExecutor:
                     _json.loads(r.to_json_str()) for r in req_stats
                 ]
             if self._latest_kv_iter_stats is not None:
-                local_dict["kvCacheIterationStats"] = {
-                    str(window_size): {
-                        "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                        "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                        "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                        "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                        "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                        "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                        "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                        "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                        "iterReusedBlocks": s.iter_reused_blocks,
-                        "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                        "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                        "iterMissedBlocks": s.iter_missed_blocks,
-                        "iterCacheHitRate": s.iter_cache_hit_rate,
-                        "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                        "iterOnboardBlocks": s.iter_onboard_blocks,
-                        "iterOnboardBytes": s.iter_onboard_bytes,
-                        "iterOffloadBlocks": s.iter_offload_blocks,
-                        "iterOffloadBytes": s.iter_offload_bytes,
-                        "iterIntraDeviceCopyBlocks":
-                        s.iter_intra_device_copy_blocks,
-                        "iterIntraDeviceCopyBytes":
-                        s.iter_intra_device_copy_bytes,
-                    }
-                    for window_size, s in self._latest_kv_iter_stats.items()
-                }
+                local_dict[
+                    "kvCacheIterationStats"] = kv_cache_iteration_stats_to_dict(
+                        self._latest_kv_iter_stats)
             local_dict["rank"] = self.dist.tp_rank
 
             gathered = self.dist.tp_allgather(local_dict)
@@ -1764,7 +1742,8 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
-                self._update_requests(executed_batch.sample_state)
+                if not self._update_requests(executed_batch.sample_state):
+                    return finished_requests
 
                 scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
@@ -1773,10 +1752,7 @@ class PyExecutor:
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
-                # Complete ctx send sessions AFTER responses are created so
-                # _handle_responses sees the request before it is terminated.
-                if self.kv_cache_transceiver:
-                    self._check_disagg_ctx_cache_transfer_status(0)
+                self._poll_disagg_ctx_cache_transfers()
                 sample_state_scheduled_requests = executed_batch.scheduled_requests
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
@@ -2266,16 +2242,15 @@ class PyExecutor:
                                 scheduled_batch, spec_metadata)
 
                     self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state, self.resource_manager)
+                    if not self._update_requests(sample_state,
+                                                 self.resource_manager):
+                        break
 
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
-                    # Complete ctx send sessions AFTER responses are created so
-                    # _handle_responses sees the request before it is terminated.
-                    if self.kv_cache_transceiver:
-                        self._check_disagg_ctx_cache_transfer_status(0)
+                    self._poll_disagg_ctx_cache_transfers()
                     # Compute GPU times after _handle_responses creates metric entries
                     # (safe in non-overlap mode: no next iteration to overwrite events)
                     self.perf_manager.compute_batch_gpu_times(
@@ -2511,7 +2486,9 @@ class PyExecutor:
                             num_accepted_tokens_device)
 
                 if self.previous_batch is not None and should_process_previous_batch:
-                    self._update_requests(self.previous_batch.sample_state)
+                    if not self._update_requests(
+                            self.previous_batch.sample_state):
+                        break
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
@@ -2678,6 +2655,7 @@ class PyExecutor:
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
+        self._poll_disagg_ctx_cache_transfers()
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
@@ -3421,6 +3399,15 @@ class PyExecutor:
                 f"Error in kv cache transfer for {error_msg_prefix}",
                 requests=error_requests)
 
+    def _poll_disagg_ctx_cache_transfers(self) -> None:
+        """Poll completed context sends after responses expose decode-side metadata."""
+        if not self.kv_cache_transceiver:
+            return
+
+        if self.async_transfer_manager.has_any_inflight_requests():
+            self._check_kv_transfer_timeout()
+        self._check_disagg_ctx_cache_transfer_status(0)
+
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
@@ -3626,16 +3613,19 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self,
-                         sample_state: SampleState,
-                         resource_manager: Optional[ResourceManager] = None):
+    def _update_requests(
+            self,
+            sample_state: SampleState,
+            resource_manager: Optional[ResourceManager] = None) -> bool:
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            return True
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+            return False
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,

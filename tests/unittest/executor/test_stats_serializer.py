@@ -72,6 +72,12 @@ def _make_mock_kv_iter_stats(
         iter_offload_bytes=0,
         iter_intra_device_copy_blocks=2,
         iter_intra_device_copy_bytes=8192,
+        iter_transfer_pinned_blocks=6,
+        iter_transfer_already_primary_blocks=4,
+        iter_transfer_primary_block_reservations=2,
+        iter_transfer_onboarded_blocks=2,
+        iter_transfer_reservation_failures=0,
+        iter_transfer_lease_release_blocks=6,
     )
     return {window_size: s}
 
@@ -129,6 +135,12 @@ class TestStatsSerializer:
         assert ws_stats["iterOffloadBytes"] == 0
         assert ws_stats["iterIntraDeviceCopyBlocks"] == 2
         assert ws_stats["iterIntraDeviceCopyBytes"] == 8192
+        assert ws_stats["iterTransferPinnedBlocks"] == 6
+        assert ws_stats["iterTransferAlreadyPrimaryBlocks"] == 4
+        assert ws_stats["iterTransferPrimaryBlockReservations"] == 2
+        assert ws_stats["iterTransferOnboardedBlocks"] == 2
+        assert ws_stats["iterTransferReservationFailures"] == 0
+        assert ws_stats["iterTransferLeaseReleaseBlocks"] == 6
         assert ws_stats["iterCacheHitRate"] == pytest.approx(5 / 8)
 
     def test_serializer_multiple_window_sizes(self):
