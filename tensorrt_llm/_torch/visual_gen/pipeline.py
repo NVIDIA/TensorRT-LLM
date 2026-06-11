@@ -443,7 +443,9 @@ class BasePipeline(nn.Module):
         if not coefficients:
             return
 
-        checkpoint_path = getattr(self.pipeline_config.primary_pretrained_config, "_name_or_path", "") or ""
+        checkpoint_path = (
+            getattr(self.pipeline_config.primary_pretrained_config, "_name_or_path", "") or ""
+        )
 
         for model_size, coeff_data in coefficients.items():
             # Match model size in path (case-insensitive, e.g., "1.3B", "14B", "dev")

@@ -234,5 +234,5 @@ class TestWan22_T2V_TeaCacheRaisesError:
             model=WAN22_A14B_PATH,
             cache_config=TeaCacheConfig(),
         )
-        with pytest.raises(ValueError, match=r"TeaCache is not supported for Wan 2\.2"):
+        with pytest.raises(ValueError, match=r"Wan 2\.2 TeaCache requires explicit"):
             PipelineLoader(args).load(skip_warmup=True)

@@ -345,7 +345,6 @@ class WanImageToVideoPipeline(BasePipeline):
         if (
             self.transformer is not None
             and self.transformer_2 is not None
-            and self.is_wan22
             and self.pipeline_config.cache_backend == "teacache"
         ):
             self._apply_teacache_coefficients(WAN_I2V_TEACACHE_COEFFICIENTS)
