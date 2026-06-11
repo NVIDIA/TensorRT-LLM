@@ -42,7 +42,7 @@ Then, you can run it with:
 ```
 sanity_perf_check.py <target_perf_csv_path> <base_perf_csv_path>
 ```
-** In the CI, `<base_perf_csv_path>` is the `base_perf_pytorch.csv` file path mentioned above.
+In the CI, `<base_perf_csv_path>` is the `base_perf_pytorch.csv` file path mentioned above.
 
 Running this print the diffs between both performance results. It presents only:
 1. Metrics that have a diff bigger than the accepted threshold.
