@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -253,7 +253,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(sendCancelFlag);
         BufferIndexHolder sendHolder(
             *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false);
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
@@ -339,48 +340,59 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             session.appendMeasure(startTime, endTime, outputSplitCaches.at(cacheIdx)->getSizeInBytes());
         };
 
-        if (pickUpConnections.size() > 1)
+        try
         {
-            if (!common::getEnvEnableReceiveKVCacheParallel())
+            if (pickUpConnections.size() > 1)
             {
-                TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
-                for (size_t i = 0; i < pickUpConnections.size(); i++)
+                if (!common::getEnvEnableReceiveKVCacheParallel())
                 {
-                    sendBufferFun(deviceId, pickUpConnections[i]);
+                    TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
+                    for (size_t i = 0; i < pickUpConnections.size(); i++)
+                    {
+                        sendBufferFun(deviceId, pickUpConnections[i]);
+                    }
+                }
+                else
+                {
+                    // concurrency num
+                    auto concurrencyNum
+                        = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
+
+                    auto remainSendNum = pickUpConnections.size();
+
+                    while (remainSendNum > 0)
+                    {
+                        auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
+                        std::vector<std::future<void>> futures;
+                        futures.reserve(sendConcurrencyNum);
+                        for (size_t i = 0; i < sendConcurrencyNum; i++)
+                        {
+                            size_t idx = i + (pickUpConnections.size() - remainSendNum);
+                            size_t connIdx = pickUpConnections[idx];
+                            TLLM_CHECK(idx < pickUpConnections.size());
+                            TLLM_CHECK(connIdx < session.getConnections().size());
+                            futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, connIdx));
+                        }
+                        for (auto& future : futures)
+                        {
+                            future.get();
+                        }
+                        remainSendNum -= sendConcurrencyNum;
+                    }
                 }
             }
             else
             {
-                // concurrency num
-                auto concurrencyNum
-                    = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
-
-                auto remainSendNum = pickUpConnections.size();
-
-                while (remainSendNum > 0)
-                {
-                    auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
-                    std::vector<std::future<void>> futures;
-                    futures.reserve(sendConcurrencyNum);
-                    for (size_t i = 0; i < sendConcurrencyNum; i++)
-                    {
-                        size_t idx = i + (pickUpConnections.size() - remainSendNum);
-                        size_t connIdx = pickUpConnections[idx];
-                        TLLM_CHECK(idx < pickUpConnections.size());
-                        TLLM_CHECK(connIdx < session.getConnections().size());
-                        futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, connIdx));
-                    }
-                    for (auto& future : futures)
-                    {
-                        future.get();
-                    }
-                    remainSendNum -= sendConcurrencyNum;
-                }
+                sendBufferFun(deviceId, pickUpConnections[0]);
             }
         }
-        else
+        catch (...)
         {
-            sendBufferFun(deviceId, pickUpConnections[0]);
+            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+            {
+                sendHolder.poison();
+            }
+            throw;
         }
         sendHolder.release();
     }
