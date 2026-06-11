@@ -308,7 +308,9 @@ l0_dgx_b200:
   - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2]
   - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses2_ring2]
   - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2]
-  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_vanilla_ulysses2_lpips_against_single_gpu_same_precision
+  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_vanilla_ulysses2_lpips_against_single_gpu_same_precision[bf16]
+  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_vanilla_ulysses2_lpips_against_single_gpu_same_precision[dynamic-fp8]
+  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_vanilla_ulysses2_lpips_against_single_gpu_same_precision[dynamic-fp4]
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_fp8
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4
