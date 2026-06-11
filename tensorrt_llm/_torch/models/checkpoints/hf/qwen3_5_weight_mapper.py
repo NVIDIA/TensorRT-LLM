@@ -20,6 +20,7 @@ _FP8_2D_BLOCK_SIZE = 128
 @register_mapper("HF", "Qwen3_5MoeForCausalLM")
 @register_mapper("HF", "Qwen3_5MoeForConditionalGeneration")
 @register_mapper("HF", "Qwen3_5ForCausalLM")
+@register_mapper("HF", "Qwen3_5ForConditionalGeneration")
 class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     """Weight mapper for Qwen3.5 MoE text checkpoints.
 
