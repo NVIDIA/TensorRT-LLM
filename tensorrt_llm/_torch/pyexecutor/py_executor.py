@@ -4241,16 +4241,9 @@ class PyExecutor:
 
     @staticmethod
     def _maybe_attach_ctx_usage(request: LlmRequest, response):
-        """Carry context-worker usage onto the generation response.
-
-        In gen-first disaggregated scheduling the context and generation
-        requests run concurrently, so the context worker's usage cannot be
-        injected into the request as in the context-first path. Instead it is
-        delivered to the generation worker through the KV-transfer aux buffer
-        (see RxSession.unpack_aux) and stored on
-        ``py_disaggregated_params.ctx_usage``. Surface it on the response so the
-        postprocessor can adopt the context-side prompt/cached token accounting.
-        """
+        """Surface gen-first ctx usage (delivered via the KV-transfer aux
+        buffer in RxSession.unpack_aux) onto the response so the postprocessor
+        adopts the context-side prompt/cached token accounting."""
         disagg_params = getattr(request, 'py_disaggregated_params', None)
         if disagg_params is not None and disagg_params.ctx_usage is not None:
             response.result.ctx_usage = disagg_params.ctx_usage
