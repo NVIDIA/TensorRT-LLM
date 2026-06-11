@@ -24,8 +24,8 @@ Pipeline (single CUDA Graph capture):
   1. ``GvrTopKLBPrepareKernel`` — 1-block kernel that classifies each
      request as long (seq_len > threshold) vs short via a block prefix
      sum, then writes:
-       order_row[B_max]     : long request_ids first, then short ones
-       counters[2]          : [n_long_req, n_short_req]
+       order_row[max_batch_size] : long request_ids first, then short ones
+       counters[2]               : [n_long_req, n_short_req]
   2. ``GvrTopKLBKernel.main_kernel`` — single launch with
      ``cluster_size=4``; each cluster reads counters + order_row to map
      bidx -> (row_id, branch). Long clusters delegate to a cs=4
@@ -49,38 +49,34 @@ from cutlass.utils.smem_allocator import SmemAllocator
 from .block_scan import block_prefix_sum_kernel
 from .gvr_topk_decode import GvrTopKKernel
 
-# Compile-time threshold: seq_len > LONG_THRESHOLD => long row (cs=4 path).
-# Derived from cluster cs=4 break-even ≈ T_row > 3.2us ≈ 64K elements on B200.
-# See ``gvr-topk-load-balance/design/idea_c_design.md`` §3.
-LONG_THRESHOLD_DEFAULT = 64 * 1024
-
 
 class GvrTopKLBPrepareKernel:
     """Single-block prepare kernel: partition requests into long / short.
 
-    Reads ``seq_lens[B]`` and produces:
-      - ``order_row[B_max]`` int32: request_ids, long group first
+    Reads ``seq_lens[batch_size]`` and produces:
+      - ``order_row[num_threads]`` int32: request_ids, long group first
       - ``counters[2]``     int32: [n_long_req, n_short_req]
 
     The output ``order_row`` is request-level (not row-level); the main
     kernel expands to row indices via ``req_id * next_n + nn``.
     """
 
-    # Upper bound on B (= batch_size). The grid is fixed (1, 1, 1) and the
-    # block has B_max threads, one per request slot. Threads with tidx >= B
-    # contribute 0 to the prefix sum (effectively skipped).
-    MAX_NUM_REQUESTS = 1024
-
     def __init__(
         self,
-        long_threshold: int = LONG_THRESHOLD_DEFAULT,
-        num_threads: int = MAX_NUM_REQUESTS,
+        long_threshold: int = 64 * 1024,
+        # Upper bound on the runtime batch_size. The grid is fixed
+        # (1, 1, 1) and the block has ``num_threads`` lanes, one per
+        # request slot; threads with tidx >= batch_size contribute 0 to
+        # the prefix sum (effectively skipped). 1024 is the largest power
+        # of two supported by ``block_prefix_sum_kernel`` (its cross-warp
+        # scan caps num_warps at 32).
+        num_threads: int = 1024,
     ):
         assert num_threads % 32 == 0
         # block_prefix_sum_kernel needs num_warps > 1 (its cross-warp scan
-        # uses one warp scanning across num_warps lanes).
-        assert num_threads >= 64
-        assert num_threads <= self.MAX_NUM_REQUESTS
+        # uses one warp scanning across num_warps lanes), and tops out at
+        # 32 warps == 1024 threads.
+        assert 64 <= num_threads <= 1024, f"num_threads must be in [64, 1024]; got {num_threads}"
         self.long_threshold = long_threshold
         self.num_threads = num_threads
         self.num_warps = num_threads // 32
@@ -88,10 +84,10 @@ class GvrTopKLBPrepareKernel:
     @cute.kernel
     def prepare_kernel(
         self,
-        seq_lens: cute.Tensor,  # [B] int32
-        order_row: cute.Tensor,  # [B_max] int32 output
+        seq_lens: cute.Tensor,  # [batch_size] int32
+        order_row: cute.Tensor,  # [num_threads] int32 output
         counters: cute.Tensor,  # [2] int32 output
-        B: cutlass.Int32,  # actual batch size, runtime
+        batch_size: cutlass.Int32,  # actual batch size, runtime
     ):
         tidx, _, _ = cute.arch.thread_idx()
 
@@ -119,9 +115,10 @@ class GvrTopKLBPrepareKernel:
             byte_alignment=64,
         )
 
-        # Step 1: classify request `tidx`. Threads with tidx >= B contribute 0.
+        # Step 1: classify request `tidx`. Threads with tidx >= batch_size
+        # contribute 0 (their seq_lens slot is unset / out of range).
         is_long_val = cutlass.Int32(0)
-        if tidx < B:
+        if tidx < batch_size:
             seq = seq_lens[tidx]
             if seq > cutlass.Int32(long_threshold):
                 is_long_val = cutlass.Int32(1)
@@ -156,7 +153,7 @@ class GvrTopKLBPrepareKernel:
         # ``dst`` is pre-initialized because CuTe DSL forbids first-defining
         # a Python variable inside a dynamic if branch and using it after.
         dst = cutlass.Int32(0)
-        if tidx < B:
+        if tidx < batch_size:
             excl_pos_long = pos_long - is_long_val
             if is_long_val == cutlass.Int32(1):
                 dst = excl_pos_long
@@ -168,7 +165,7 @@ class GvrTopKLBPrepareKernel:
         # Step 4: scalars.
         if tidx == cutlass.Int32(0):
             counters[0] = n_long_total
-            counters[1] = B - n_long_total
+            counters[1] = batch_size - n_long_total
 
     @cute.jit
     def __call__(
@@ -176,10 +173,10 @@ class GvrTopKLBPrepareKernel:
         seq_lens: cute.Tensor,
         order_row: cute.Tensor,
         counters: cute.Tensor,
-        B: cutlass.Int32,
+        batch_size: cutlass.Int32,
         stream,
     ):
-        self.prepare_kernel(seq_lens, order_row, counters, B).launch(
+        self.prepare_kernel(seq_lens, order_row, counters, batch_size).launch(
             grid=(1, 1, 1),
             block=(self.num_threads, 1, 1),
             stream=stream,
@@ -194,14 +191,12 @@ class GvrTopKLBKernel:
       - ``_cluster_kernel`` (cs=4) drives the long-row branch
       - ``_single_kernel``  (cs=1) drives the short-row branch
 
-    Main kernel launches once with ``cluster_size=4`` (the hardware
-    cluster shape); each cluster is homogeneous in branch choice (all 4
-    CTAs share the same ``cluster_id`` and therefore take the same
-    if/else path), which keeps any cluster sync in the long branch
-    deadlock-free.
+    Main kernel launches once with the configured ``cluster_size`` (the
+    hardware cluster shape); each cluster is homogeneous in branch choice
+    (all CTAs in a cluster share the same ``cluster_id`` and therefore
+    take the same if/else path), which keeps any cluster sync in the
+    long branch deadlock-free.
     """
-
-    CLUSTER_SIZE = 4
 
     def __init__(
         self,
@@ -211,8 +206,23 @@ class GvrTopKLBKernel:
         num_threads: int,
         compress_ratio: int = 1,
         return_output_values: bool = False,
-        long_threshold: int = LONG_THRESHOLD_DEFAULT,
-        max_B: int = 1024,
+        # Cluster size for the long branch. cs=4 is the default
+        # break-even pick on B200 (T_row > 3.2us recoups DSMEM sync);
+        # cs=2 trades less parallelism for cheaper sync, cs=8 is GPC-
+        # constrained and only profitable on very long rows. The same
+        # value is used as the hardware cluster shape at launch (and
+        # is exposed via ``self.cluster_size`` to the main kernel).
+        cluster_size: int = 4,
+        # Cluster cs=4 break-even ≈ T_row > 3.2us ≈ 64K elements on B200.
+        # See ``gvr-topk-load-balance/design/idea_c_design.md`` §3.
+        long_threshold: int = 64 * 1024,
+        # Worst-case batch size this kernel will ever see at runtime.
+        # The grid is fixed at ``max_batch_size * next_n * cluster_size``
+        # CTAs so CUDA Graph capture sees a single shape; the runtime
+        # ``counters`` (from prepare) tells the kernel how many of those
+        # clusters are actually alive — the rest early-exit on the
+        # ``cluster_id >= total_clusters`` check at kernel entry.
+        max_batch_size: int = 1024,
         # Passthrough knobs for the underlying GvrTopKKernel instances.
         enable_unroll_4: bool = True,
         enable_phase3_unroll: bool = False,
@@ -221,6 +231,10 @@ class GvrTopKLBKernel:
         use_256bit_load: bool = True,
         enable_warp_parallel_reduce: Optional[bool] = None,
     ):
+        assert cluster_size in (2, 4, 8), (
+            f"cluster_size must be 2, 4, or 8 (GPC-bound); got {cluster_size}"
+        )
+
         # Two underlying GvrTopKKernel instances. Each gets its own
         # compile-time cluster_size; SMEM / mbarrier layouts differ
         # between the two but the per-row body method is identical.
@@ -238,7 +252,7 @@ class GvrTopKLBKernel:
             compress_ratio=compress_ratio,
             return_output_values=return_output_values,
         )
-        self._cluster_kernel = GvrTopKKernel(cluster_size=self.CLUSTER_SIZE, **common_kwargs)
+        self._cluster_kernel = GvrTopKKernel(cluster_size=cluster_size, **common_kwargs)
         self._single_kernel = GvrTopKKernel(cluster_size=1, **common_kwargs)
         # NOTE: prepare kernel is intentionally NOT held here — it is
         # decoupled from the main kernel so callers can run it once per
@@ -251,15 +265,19 @@ class GvrTopKLBKernel:
         self.next_n = next_n
         self.num_threads = num_threads
         self.return_output_values = return_output_values
+        self.cluster_size = cluster_size
         self.long_threshold = long_threshold
-        self.max_B = max_B
+        self.max_batch_size = max_batch_size
 
-        # Grid sizing for the main kernel under CUDA Graph:
-        # worst case is all rows long (B_max * next_n long clusters, each
-        # one cluster) → CTAs = max_B * next_n * cluster_size. Any cluster
-        # beyond ``n_long + ceil(n_short / cs)`` early-exits.
-        self._max_grid_clusters = max_B * next_n
-        self._max_grid_ctas = self._max_grid_clusters * self.CLUSTER_SIZE
+        # Grid is FIXED at the worst-case ``max_batch_size * next_n``
+        # long clusters (each consuming ``cluster_size`` CTAs) so CUDA
+        # Graph capture sees a single static shape. The runtime
+        # ``counters`` (from prepare) gates how many of these clusters
+        # actually run — surplus clusters early-exit on the
+        # ``cluster_id >= total_clusters`` check at kernel entry; dead-
+        # cluster overhead is < 1 us on B200.
+        self._grid_clusters = max_batch_size * next_n
+        self._grid_ctas = self._grid_clusters * cluster_size
 
     @cute.kernel
     def main_kernel(
@@ -273,7 +291,7 @@ class GvrTopKLBKernel:
         counters: cute.Tensor,  # [2] int32 [n_long_req, n_short_req]
     ):
         bidx, _, _ = cute.arch.block_idx()
-        cluster_size = cutlass.const_expr(self.CLUSTER_SIZE)
+        cluster_size = cutlass.const_expr(self.cluster_size)
         next_n = cutlass.const_expr(self.next_n)
 
         cluster_id = bidx // cluster_size
@@ -369,9 +387,10 @@ class GvrTopKLBKernel:
             for layer in layers:
                 main(logits[layer], pre_idx[layer], ..., order_row, counters)
 
-        Grid is fixed at the worst-case ``max_B * next_n`` long clusters
-        (each consuming ``cluster_size`` CTAs); smaller batches see idle
-        padding clusters early-exit on the ``cluster_id >= total_clusters``
+        Grid is fixed at the worst-case ``max_batch_size * next_n`` long
+        clusters (each consuming ``cluster_size`` CTAs) for CUDA Graph
+        compatibility. When fewer rows are long at runtime the surplus
+        clusters early-exit on the ``cluster_id >= total_clusters``
         check inside the kernel. Dead-CTA overhead is < 1 us on B200.
         """
         self.main_kernel(
@@ -383,11 +402,11 @@ class GvrTopKLBKernel:
             order_row,
             counters,
         ).launch(
-            grid=(self._max_grid_ctas, 1, 1),
+            grid=(self._grid_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
-            cluster=(self.CLUSTER_SIZE, 1, 1),
+            cluster=(self.cluster_size, 1, 1),
             stream=stream,
         )
 
 
-__all__ = ["GvrTopKLBKernel", "GvrTopKLBPrepareKernel", "LONG_THRESHOLD_DEFAULT"]
+__all__ = ["GvrTopKLBKernel", "GvrTopKLBPrepareKernel"]

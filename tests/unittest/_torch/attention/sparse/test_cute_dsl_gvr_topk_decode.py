@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import cutlass
 import cutlass.cute as cute
 import pytest
@@ -22,7 +24,6 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import _TORCH_TO_CUTLASS_DTYPE
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import (
-    LONG_THRESHOLD_DEFAULT,
     GvrTopKLBKernel,
     GvrTopKLBPrepareKernel,
 )
@@ -286,7 +287,7 @@ def test_cute_dsl_gvr_topk_decode(
 # Load-Balance (Idea C) tests.
 #
 # The LB kernel adds a prepare step that classifies requests as long
-# (seq_len > LONG_THRESHOLD_DEFAULT) vs short and dispatches each cluster
+# (seq_len > long_threshold) vs short and dispatches each cluster
 # of 4 CTAs into either:
 #   - long branch: 4 CTAs cooperatively process 1 long row (cs=4 path)
 #   - short branch: 4 CTAs each process 1 short row independently (cs=1)
@@ -300,24 +301,25 @@ def test_cute_dsl_gvr_topk_decode(
 #      compare against the same tie-aware torch.topk reference.
 # ===========================================================================
 
-# Sentinel seq_len values for LB branch coverage.
-_LB_LONG_N = 128 * 1024  # > LONG_THRESHOLD_DEFAULT (64K)
-_LB_SHORT_N = 8 * 1024  # < LONG_THRESHOLD_DEFAULT
 
-_PREPARE_COMPILED_CACHE: dict = {}
-_LB_COMPILED_CACHE: dict = {}
+@functools.lru_cache(maxsize=None)
+def _compile_prepare(batch_size: int, max_batch_size: int, long_threshold: int):
+    """Compile prepare kernel.
 
-
-def _compile_prepare(B_max: int, long_threshold: int):
-    key = (B_max, long_threshold)
-    if key in _PREPARE_COMPILED_CACHE:
-        return _PREPARE_COMPILED_CACHE[key]
-    prep = GvrTopKLBPrepareKernel(long_threshold=long_threshold, num_threads=B_max)
-    fake_seq = make_fake_compact_tensor(cutlass.Int32, (B_max,), stride_order=(0,))
-    fake_order = make_fake_compact_tensor(cutlass.Int32, (B_max,), stride_order=(0,))
+    - ``batch_size``: compile-time fake_seq shape == runtime seq_lens
+      shape (drives shape match at TVM-FFI marshalling). Each unique
+      value triggers a separate compile.
+    - ``max_batch_size``: kernel block size + ``order_row`` buffer
+      length. Must be a power of two >= 64 (block_prefix_sum_kernel
+      cap) and >= batch_size so threads with ``tidx < batch_size``
+      cover every request slot.
+    """
+    prep = GvrTopKLBPrepareKernel(long_threshold=long_threshold, num_threads=max_batch_size)
+    fake_seq = make_fake_compact_tensor(cutlass.Int32, (batch_size,), stride_order=(0,))
+    fake_order = make_fake_compact_tensor(cutlass.Int32, (max_batch_size,), stride_order=(0,))
     fake_ctr = make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,))
     fake_stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-    compiled = cute.compile(
+    return cute.compile(
         prep,
         fake_seq,
         fake_order,
@@ -326,29 +328,26 @@ def _compile_prepare(B_max: int, long_threshold: int):
         stream=fake_stream,
         options="--enable-tvm-ffi",
     )
-    _PREPARE_COMPILED_CACHE[key] = compiled
-    return compiled
 
 
-def _run_lb_prepare(seq_lens: torch.Tensor, B_max: int, long_threshold: int):
-    """Run prepare kernel; pad seq_lens to B_max so dead threads classify-as-short.
+def _run_lb_prepare(seq_lens: torch.Tensor, max_batch_size: int, long_threshold: int):
+    """Run prepare kernel directly on the actual seq_lens (no padding).
 
-    The compiled kernel uses TVM FFI (``--enable-tvm-ffi``), so raw torch
-    tensors are passed directly — TVM FFI converts via DLPack and picks
-    up the active CUDA stream from the environment automatically.
+    ``seq_lens`` keeps its actual shape ``(batch_size,)`` — the prepare
+    kernel is compiled with fake_seq matching this exact shape (see
+    ``_compile_prepare``), so TVM-FFI marshalling is happy. The kernel
+    internally reads ``seq_lens[tidx]`` only under ``tidx < batch_size``.
     """
-    B = seq_lens.shape[0]
-    order_row = torch.full((B_max,), -1, dtype=torch.int32, device="cuda")
+    batch_size = seq_lens.shape[0]
+    order_row = torch.full((max_batch_size,), -1, dtype=torch.int32, device="cuda")
     counters = torch.zeros(2, dtype=torch.int32, device="cuda")
-    seq_padded = torch.zeros(B_max, dtype=torch.int32, device="cuda")
-    seq_padded[:B] = seq_lens
 
-    compiled = _compile_prepare(B_max, long_threshold)
-    compiled(seq_padded, order_row, counters, cutlass.Int32(B))
-    torch.cuda.synchronize()
+    compiled = _compile_prepare(batch_size, max_batch_size, long_threshold)
+    compiled(seq_lens, order_row, counters, cutlass.Int32(batch_size))
     return order_row, counters
 
 
+@functools.lru_cache(maxsize=None)
 def _compile_lb(
     dtype: torch.dtype,
     top_k: int,
@@ -356,12 +355,20 @@ def _compile_lb(
     num_rows: int,
     N: int,
     compress_ratio: int,
-    max_B: int,
+    max_batch_size: int,
     long_threshold: int,
 ):
-    key = (dtype, top_k, next_n, num_rows, N, compress_ratio, max_B, long_threshold)
-    if key in _LB_COMPILED_CACHE:
-        return _LB_COMPILED_CACHE[key]
+    """Compile the LB main kernel.
+
+    - ``num_rows`` baked in via fake_logits/fake_pre_idx/fake_out (each
+      unique value triggers a separate compile). ``seq_lens`` fake shape
+      uses ``n_groups = num_rows // next_n`` so runtime can pass the
+      actual seq_lens without padding.
+    - ``max_batch_size`` drives the grid (``* next_n * cluster_size``)
+      and the ``order_row`` buffer length so CUDA Graph capture sees a
+      fixed shape regardless of how many rows are actually long/short
+      at runtime.
+    """
     cute_dtype = _TORCH_TO_CUTLASS_DTYPE[dtype]
     kernel = GvrTopKLBKernel(
         dtype=cute_dtype,
@@ -371,7 +378,7 @@ def _compile_lb(
         compress_ratio=compress_ratio,
         return_output_values=False,
         long_threshold=long_threshold,
-        max_B=max_B,
+        max_batch_size=max_batch_size,
     )
     n_groups = num_rows // next_n
     fake_logits = make_fake_compact_tensor(
@@ -380,14 +387,14 @@ def _compile_lb(
     fake_pre_idx = make_fake_compact_tensor(
         cutlass.Int32, (n_groups, top_k), stride_order=(1, 0), assumed_align=16
     )
-    fake_seq = make_fake_compact_tensor(cutlass.Int32, (max_B,), stride_order=(0,))
+    fake_seq = make_fake_compact_tensor(cutlass.Int32, (n_groups,), stride_order=(0,))
     fake_out = make_fake_compact_tensor(
         cutlass.Int32, (num_rows, top_k), stride_order=(1, 0), assumed_align=16
     )
-    fake_order = make_fake_compact_tensor(cutlass.Int32, (max_B,), stride_order=(0,))
+    fake_order = make_fake_compact_tensor(cutlass.Int32, (max_batch_size,), stride_order=(0,))
     fake_ctr = make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,))
     fake_stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-    compiled = cute.compile(
+    return cute.compile(
         kernel,
         fake_logits,
         fake_pre_idx,
@@ -399,41 +406,32 @@ def _compile_lb(
         stream=fake_stream,
         options="--enable-tvm-ffi",
     )
-    _LB_COMPILED_CACHE[key] = compiled
-    return compiled
 
 
 def _run_lb(
     logits: torch.Tensor,
     pre_idx: torch.Tensor,
     seq_lens: torch.Tensor,
+    order_row: torch.Tensor,
+    counters: torch.Tensor,
     top_k: int,
     next_n: int,
     compress_ratio: int = 1,
-    max_B: int = 1024,
-    long_threshold: int = LONG_THRESHOLD_DEFAULT,
-):
-    """Drive the full Idea-C pipeline (prepare then main).
+    max_batch_size: int = 1024,
+    long_threshold: int = 64 * 1024,
+) -> torch.Tensor:
+    """Run the LB main kernel only — mirrors the production op contract.
 
-    Matches the production call pattern where prepare runs once per
-    decode step and main runs per-layer; here the two are chained
-    since each test is a single layer.
+    Caller is responsible for populating ``order_row`` and ``counters``
+    via :func:`_run_lb_prepare` once per decode step (the metadata is
+    invariant across the per-layer GVR Top-K calls within one step).
+    Returns the freshly-allocated ``output_indices`` tensor for the
+    correctness check.
     """
-    n_groups = seq_lens.shape[0]
     num_rows = logits.shape[0]
     N = logits.shape[1]
     out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
-    order_row = torch.full((max_B,), -1, dtype=torch.int32, device="cuda")
-    counters = torch.zeros(2, dtype=torch.int32, device="cuda")
 
-    # 1) prepare: classify per-group seq_lens into long/short partition.
-    seq_padded = torch.zeros(max_B, dtype=torch.int32, device="cuda")
-    seq_padded[:n_groups] = seq_lens
-    prep_compiled = _compile_prepare(max_B, long_threshold)
-    prep_compiled(seq_padded, order_row, counters, cutlass.Int32(n_groups))
-
-    # 2) main: consume prepared metadata. TVM FFI converts raw torch
-    # tensors via DLPack automatically; no explicit from_dlpack needed.
     compiled = _compile_lb(
         logits.dtype,
         top_k,
@@ -441,20 +439,19 @@ def _run_lb(
         num_rows,
         N,
         compress_ratio,
-        max_B,
+        max_batch_size,
         long_threshold,
     )
     compiled(
         logits,
         pre_idx,
-        seq_padded,
+        seq_lens,
         None,
         out_indices,
         order_row,
         counters,
     )
-    torch.cuda.synchronize()
-    return out_indices, order_row, counters
+    return out_indices
 
 
 @skip_not_sm100
@@ -471,20 +468,21 @@ def test_lb_prepare_partition(B, ratio):
     them, then verifies the kernel partitions the request_ids into
     [long...][short...] correctly.
     """
+    long_threshold = 64 * 1024
     torch.manual_seed(B * 1000 + int(ratio * 100))
     n_long_expect = int(round(B * ratio))
     seq_lens = torch.empty(B, dtype=torch.int32, device="cuda")
-    seq_lens[:n_long_expect] = LONG_THRESHOLD_DEFAULT * 2
-    seq_lens[n_long_expect:] = LONG_THRESHOLD_DEFAULT // 2
+    seq_lens[:n_long_expect] = long_threshold * 2
+    seq_lens[n_long_expect:] = long_threshold // 2
     perm = torch.randperm(B, device="cuda")
     seq_lens = seq_lens[perm]
 
-    is_long = (seq_lens > LONG_THRESHOLD_DEFAULT).cpu().numpy()
+    is_long = (seq_lens > long_threshold).cpu().numpy()
     ref_n_long = int(is_long.sum())
     ref_n_short = B - ref_n_long
 
-    B_max = 1024
-    order_row, counters = _run_lb_prepare(seq_lens, B_max, LONG_THRESHOLD_DEFAULT)
+    max_batch_size = 1024
+    order_row, counters = _run_lb_prepare(seq_lens, max_batch_size, long_threshold)
     n_long = int(counters[0].item())
     n_short = int(counters[1].item())
     assert n_long == ref_n_long, f"n_long mismatch: {n_long} vs {ref_n_long}"
@@ -512,9 +510,10 @@ def test_lb_prepare_partition(B, ratio):
 @pytest.mark.parametrize(
     "scenario,N,override",
     [
-        ("all_short", _LB_SHORT_N, None),
-        ("all_long", _LB_LONG_N, None),
-        ("mixed_half", _LB_LONG_N, "half"),  # 50/50 long/short
+        # N picked so all rows fall clearly below / above the 64K long_threshold.
+        ("all_short", 8 * 1024, None),
+        ("all_long", 128 * 1024, None),
+        ("mixed_half", 128 * 1024, "half"),  # 50/50 long/short via override
     ],
 )
 @pytest.mark.parametrize("batch_size", [4, 32])
@@ -539,16 +538,25 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size):
     )
     if override == "half":
         seq_lens = seq_lens.clone()
-        seq_lens[: batch_size // 2] = _LB_SHORT_N
-        seq_lens[batch_size // 2 :] = _LB_LONG_N
+        seq_lens[: batch_size // 2] = 8 * 1024  # short half (< 64K threshold)
+        seq_lens[batch_size // 2 :] = 128 * 1024  # long half  (> 64K threshold)
 
-    out_indices, _, counters = _run_lb(
+    max_batch_size = 1024
+    long_threshold = 64 * 1024
+    order_row, counters = _run_lb_prepare(seq_lens, max_batch_size, long_threshold)
+    out_indices = _run_lb(
         logits,
         pre_idx,
         seq_lens,
+        order_row,
+        counters,
         top_k,
         next_n,
+        max_batch_size=max_batch_size,
+        long_threshold=long_threshold,
     )
+    torch.cuda.synchronize()
+
     n_long = int(counters[0].item())
     if scenario == "all_long":
         assert n_long == batch_size, f"expected {batch_size} long, got {n_long}"
@@ -570,7 +578,7 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size):
         (torch.float32, 2048),
     ],
 )
-@pytest.mark.parametrize("N", [_LB_SHORT_N, _LB_LONG_N])
+@pytest.mark.parametrize("N", [8 * 1024, 128 * 1024])  # below / above 64K threshold
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("batch_size", [4, 32])
@@ -605,14 +613,22 @@ def test_lb_vs_reference(
         preidx_hit_rate=preidx_hit_rate,
         varlen=varlen,
     )
-    out_indices, _, _ = _run_lb(
+    max_batch_size = 1024
+    long_threshold = 64 * 1024
+    order_row, counters = _run_lb_prepare(seq_lens, max_batch_size, long_threshold)
+    out_indices = _run_lb(
         logits,
         pre_idx,
         seq_lens,
+        order_row,
+        counters,
         top_k,
         next_n,
         compress_ratio=compress_ratio,
+        max_batch_size=max_batch_size,
+        long_threshold=long_threshold,
     )
+    torch.cuda.synchronize()
     _tie_aware_check(
         out_indices,
         logits,
