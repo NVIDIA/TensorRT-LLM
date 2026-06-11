@@ -142,14 +142,13 @@ def _maybe_skip_dtype(state_dtype, use_sr):
     ],
     ids=["fp16", "bf16", "fp32", "int8", "int16", "fp8"],
 )
-@pytest.mark.parametrize("paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"])
 @pytest.mark.parametrize(
     "T", [6, 10, 16, 27, 32, 55], ids=["T6", "T10", "T16", "T27", "T32", "T55"]
 )
 @pytest.mark.parametrize(
     "write_checkpoint,rectangle_for_nowrite",
     [
-        (True, False),  # write path (rectangle_for_nowrite is ignored)
+        (True, False),  # write path; rectangle_for_nowrite is ignored
         (False, False),  # nowrite path via replay-style kernels
         (False, True),  # nowrite path via dedicated rectangle kernels
     ],
@@ -166,7 +165,6 @@ def test_replay_selective_state_update(
     d_state,
     ngroups,
     state_dtype,
-    paged_cache,
     T,
     write_checkpoint,
     rectangle_for_nowrite,
@@ -199,12 +197,8 @@ def test_replay_selective_state_update(
     # max_window); for larger T it scales with np2(T).
     max_window = max(triton.next_power_of_2(T), 16)
 
-    if paged_cache:
-        cache_size = 4
-        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
-    else:
-        cache_size = batch
-        state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
+    cache_size = 4
+    state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
 
     torch.manual_seed(42)
 
@@ -239,9 +233,7 @@ def test_replay_selective_state_update(
         state0_scales = None
         ref_input_state = state0.float()
 
-    # Old inputs: up to `max_window` tokens per batch request, so the test
-    # loop can probe PNAT > T-1 (which the prior T-token setup couldn't
-    # reach).  step1_T = max_window covers the full PNAT range we sweep.
+    # Seed enough history to cover every PNAT value swept below.
     step1_T = max_window
     x1 = torch.randn(batch, step1_T, nheads, head_dim, device=device, dtype=dtype)
     dt1_base = torch.randn(batch, step1_T, nheads, device=device, dtype=dtype)
@@ -254,11 +246,7 @@ def test_replay_selective_state_update(
     states_buffer_f32 = torch.zeros(
         cache_size, step1_T, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
-    cache_idx_for_capture = (
-        state_batch_indices
-        if paged_cache
-        else torch.arange(batch, device=device, dtype=torch.int32)
-    )
+    cache_idx_for_capture = state_batch_indices
     out1 = torch.zeros(batch, step1_T, nheads, head_dim, device=device, dtype=dtype)
     selective_state_update(
         ref_input_state.clone(),
@@ -280,8 +268,8 @@ def test_replay_selective_state_update(
     # Build cache tensors for the replay kernel.
     # old_x: (cache, 2, max_window, nheads, dim) bf16 — double-buffered
     # old_B: (cache, 2, max_window, ngroups, dstate) bf16 — double-buffered
-    # old_dt: (cache, 2, nheads, max_window) fp32 — double-buffered, T contiguous
-    # old_dA_cumsum: (cache, 2, nheads, max_window) fp32 — double-buffered, T contiguous
+    # old_dt: (cache, 2, nheads, max_window) fp32 — double-buffered, window contiguous
+    # old_dA_cumsum: (cache, 2, nheads, max_window) fp32 — double-buffered, window contiguous
     # cache_buf_idx: random 0s and 1s to verify indexing correctness
     old_x = torch.randn(cache_size, 2, max_window, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
@@ -295,16 +283,13 @@ def test_replay_selective_state_update(
     # positions [0:step1_T) = [0:max_window).  Whole buffer covered so PNAT
     # values up to max_window are exercised.  Inactive buffer has random
     # garbage to catch indexing bugs.
-    slots = state_batch_indices if paged_cache else slice(None)
-    # old_x active-buffer fill is done in the per-slot loop below (same pattern
-    # as old_B/old_dt/old_dA_cumsum since old_x is now double-buffered too).
 
     # Compute processed dt and dA_cumsum for step 1
     dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
 
     # Write to each slot's active buffer based on its cache_buf_idx
-    slot_indices = state_batch_indices.tolist() if paged_cache else list(range(cache_size))
+    slot_indices = state_batch_indices.tolist()
     for i, slot in enumerate(slot_indices):
         buf = cache_buf_idx[slot].item()
         batch_idx = i  # maps slot back to the batch index
@@ -338,6 +323,7 @@ def test_replay_selective_state_update(
 
         # Reference (fp32, starting from the same lossy-or-not state the
         # kernel sees).
+        slots = state_batch_indices
         ref_state_f32 = ref_input_state.clone()
         if k > 0:
             ref_state_f32[slots] = states_buffer_f32[slots, k - 1]
@@ -402,36 +388,14 @@ def test_replay_selective_state_update(
             dt_softplus=True,
             state_batch_indices=state_batch_indices,
             state_scales=test_scales,
-            write_checkpoint=write_checkpoint,
             rectangle_for_nowrite=rectangle_for_nowrite,
             mode=mode,
         )
 
-        # Tolerance rationale: the replay kernel uses bf16 tl.dot for four
-        # matmuls (dB_scaled @ old_x, C @ state, CB_scaled @ x, and C @ B in
-        # precompute).  The reference selective_state_update uses fp32
-        # element-wise MACs.  The bf16 input casts lose dt_bias/A-derived bits
-        # that the reference keeps — per-element rounding, not accumulating.
-        # Prefill (ssd_chunk_scan) does identical bf16 tl.dot
-        # casts, so we match prefill precision exactly.  Empirical: max ~1.0 at
-        # T<=16, ~2.0 at T=32-55; mean ~0.014; <0.02% of elements exceed 0.5.
-        # State dtype (fp16/bf16/fp32) doesn't shift the error — bf16 dot
-        # inputs dominate, not state storage.
-        #
-        # Quantized states add a per-element state quant error eps that
-        # propagates through C @ state in the output dot.  With dstate=128
-        # and C ~ N(0,1), the output channel std from this noise is roughly
-        # eps * sqrt(128/3) ≈ 6.5 * eps.  Stack with the bf16 baseline:
-        #   out_atol = bf16_atol + 6.5 * eps_max
-        # where eps_max is the worst-case per-element error at the
-        # post-replay SSM state magnitude (T=55 → amax ≈ 23).
-        #
-        # Per-element error (eps_max for T=55):
-        #   int8     (uniform grid):  amax/(2*127)        ≈ 0.091
-        #   int16    (uniform grid):  amax/(2*32767)      ≈ 3.5e-4
-        #   fp8_e4m3 (variable grid): amax/16             ≈ 1.44 (worst-case
-        #                             cell at top of channel; smaller for
-        #                             smaller-magnitude elements)
+        # Tolerance rationale: replay uses bf16 tl.dot while the reference
+        # selective_state_update uses fp32 element-wise MACs.  This matches
+        # prefill precision but needs a small absolute tolerance.  Quantized
+        # states add decode-grid error that propagates through C @ state.
         out_atol = (
             {torch.int8: 1.6, torch.int16: 1.05, torch.float8_e4m3fn: 4.0}[state_dtype]
             if is_quantized
@@ -473,15 +437,8 @@ def test_replay_selective_state_update(
                     ref_input_state[slots] if k == 0 else states_buffer_f32[slots, k - 1]
                 )
                 actual_fp32 = _dequantize_state(test_state[slots], test_scales[slots])
-                # State diff = bf16_replay_error + quant_error (per element).
-                # The bf16 component is the SAME error source the non-quant
-                # test absorbs in its atol=1.0 baseline (replay's tl.dot is
-                # bf16-input fp32-accum; per-element error ~ 2^-7 * amax,
-                # empirically ≤ ~0.2 at T=55 amax≈23).  Quant adds:
-                #   int8: amax/(2*127) ≈ 0.091 worst-case
-                #   int16: amax/(2*32767) ≈ 3.5e-4 (negligible vs bf16)
-                #   fp8_e4m3 (variable grid): amax/16 ≈ 1.44 worst-case
-                # Atol = bf16_baseline (1.0) + quant_eps_max.
+                # State tolerance covers bf16 replay dot error plus one
+                # per-element quantization step for the state dtype.
                 state_atol = {
                     torch.int8: 1.1,
                     torch.int16: 1.0,
@@ -976,7 +933,7 @@ def test_replay_selective_state_update_persistent_main_device_n_writes(
         T,
         max_window,
         batch,
-        None,
+        state_batch_indices,
         device,
         explicit_order=work_item_order,
     )
@@ -1079,7 +1036,6 @@ def test_replay_selective_state_update_persistent_main_device_n_writes(
     [torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn],
     ids=["fp16", "int8", "int16", "fp8"],
 )
-@pytest.mark.parametrize("paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"])
 @pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
 @pytest.mark.parametrize("mode", ["persistent_main", "persistent_dynamic"], ids=["pm", "pd"])
 def test_replay_selective_state_update_philox(
@@ -1088,7 +1044,6 @@ def test_replay_selective_state_update_philox(
     head_dim,
     d_state,
     ngroups,
-    paged_cache,
     T,
     mode,
 ):
@@ -1096,7 +1051,7 @@ def test_replay_selective_state_update_philox(
     Verify that Philox stochastic rounding produces correct results across
     all SR-supported state dtypes (fp16, int8, int16, fp8_e4m3fn).
 
-    Runs our kernel twice with identical inputs — once without rand_seed
+    Runs the replay kernel twice with identical inputs — once without rand_seed
     (deterministic RN), once with rand_seed (Philox SR) — and confirms:
       - Outputs are within bf16-dot tolerance (state perturbation ≤ 1 ULP).
       - State dtype is preserved.
@@ -1112,12 +1067,8 @@ def test_replay_selective_state_update_philox(
     dtype = torch.bfloat16
     assert nheads % ngroups == 0
 
-    if paged_cache:
-        cache_size = 4
-        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
-    else:
-        cache_size = batch
-        state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
+    cache_size = 4
+    state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
 
     torch.manual_seed(42)
 
@@ -1139,7 +1090,7 @@ def test_replay_selective_state_update_philox(
         )
         state0_scales = None
 
-    # Cache tensors (old_x now double-buffered like the others)
+    # Replay history cache tensors.
     old_x = torch.randn(cache_size, 2, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
     old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
@@ -1252,7 +1203,7 @@ def test_replay_selective_state_update_philox(
     # Per-channel decode_scale varies by 10x+ across channels (amax depends
     # on randn extremes), so a single flat atol can't bound it accurately —
     # use per-channel ULP-aware comparison.
-    slots = state_batch_indices if paged_cache else slice(None)
+    slots = state_batch_indices
     if is_quantized:
         rounded_fp32 = _dequantize_state(state_rounded[slots], scales_rounded[slots])
         no_round_fp32 = _dequantize_state(state_no_round[slots], scales_no_round[slots])
@@ -1841,7 +1792,6 @@ def test_replay_heads_per_block(
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
 @pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
-@pytest.mark.parametrize("paged_cache", [False, True], ids=["contig", "paged"])
 @pytest.mark.parametrize("rectangle_nowrite", [True, False], ids=["rect", "norect"])
 @pytest.mark.parametrize("mode", ["persistent_main", "persistent_dynamic"], ids=["pm", "pd"])
 def test_replay_heads_per_block_multistep(
@@ -1852,7 +1802,6 @@ def test_replay_heads_per_block_multistep(
     state_dtype,
     T,
     heads_per_block,
-    paged_cache,
     rectangle_nowrite,
     mode,
 ):
@@ -1877,12 +1826,8 @@ def test_replay_heads_per_block_multistep(
     D_base = torch.randn(nheads, device=device, dtype=dtype)
     D = repeat(D_base, "h -> h p", p=head_dim)
 
-    if paged_cache:
-        cache_size = 4
-        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
-    else:
-        cache_size = batch
-        state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
+    cache_size = 4
+    state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
 
     all_x = []
     all_dt = []
@@ -2031,7 +1976,7 @@ def test_replay_heads_per_block_multistep(
                 msg=f"Output mismatch at step {step}, slot {s_local} "
                 f"(acc={acc}) with HPB={heads_per_block}, T={T}, "
                 f"nheads={nheads}, ngroups={ngroups}, state_dtype={state_dtype}, "
-                f"paged_cache={paged_cache}, rectangle={rectangle_nowrite}",
+                f"rectangle={rectangle_nowrite}",
             )
 
 

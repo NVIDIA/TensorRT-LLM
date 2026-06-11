@@ -7,10 +7,13 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.models.modeling_utils import \
-    MODEL_CLASS_VISION_ENCODER_MAPPING
-from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
+from tensorrt_llm._utils import (
+    confidential_compute_enabled,
+    get_sm_version,
+    str_dtype_to_binding,
+    torch_dtype_to_str,
+)
 from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off
@@ -21,38 +24,55 @@ from tensorrt_llm.llmapi.llm_args import (
     WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import (LoraConfig,
-                                      get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_helper import LoraConfig, get_default_trtllm_modules_to_hf_modules
 from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
-from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
-                           get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
-                           is_hybrid_linear, is_mla, is_nemotron_hybrid,
-                           is_qwen3_hybrid)
+from ..speculative import (
+    get_num_extra_kv_tokens,
+    get_num_spec_layers,
+    get_spec_decoder,
+    should_use_separate_draft_kv_cache,
+)
+from .config_utils import (
+    extract_mamba_kv_cache_params,
+    is_gemma4_hybrid,
+    is_hybrid_linear,
+    is_mla,
+    is_nemotron_hybrid,
+    is_qwen3_hybrid,
+)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager,
-                                  MixedMambaHybridCacheManager,
-                                  use_cpp_mamba_cache_manager,
-                                  use_py_mamba_cache_manager)
+from .mamba_cache_manager import (
+    BaseMambaCacheManager,
+    CppMambaHybridCacheManager,
+    MixedMambaHybridCacheManager,
+    use_cpp_mamba_cache_manager,
+    use_py_mamba_cache_manager,
+)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, KVCacheManagerV2,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
-from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
-                      TRTLLMSampler)
-from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2Scheduler, SimpleScheduler,
-                        SimpleUnifiedScheduler)
+from .resource_manager import (
+    KVCacheManager,
+    KVCacheManagerV2,
+    PeftCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
+from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler, TRTLLMSampler
+from .scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    KVCacheV2Scheduler,
+    SimpleScheduler,
+    SimpleUnifiedScheduler,
+)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -97,9 +117,19 @@ def get_kv_cache_manager_cls(
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KVCacheManager without mamba caching")
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
+        if use_py_mamba_cache_manager():
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    "TRTLLM_USE_PY_MAMBA=1 forces "
+                    "MixedMambaHybridCacheManager, which does not support "
+                    "block reuse. Disable block reuse or unset "
+                    "TRTLLM_USE_PY_MAMBA to use CppMambaHybridCacheManager.")
+            logger.info(
+                "Using MixedMambaHybridCacheManager for hybrid mamba model")
+            return MixedMambaHybridCacheManager
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
-        if use_cpp_mamba_cache_manager() or use_py_mamba_cache_manager():
+        if use_cpp_mamba_cache_manager():
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager

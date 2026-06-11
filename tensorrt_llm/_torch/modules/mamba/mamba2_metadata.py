@@ -21,8 +21,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
@@ -143,19 +142,26 @@ def cu_seqlens_to_chunk_indices_offsets(
         chunk_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
-        cu_seqlens (torch.Tensor): 1D tensor of cumulative sequence lengths, shape (num_seqs + 1,). The first element should be 0. Each entry represents the starting index of a sequence in the flattened token array.
+        cu_seqlens (torch.Tensor): 1D tensor of cumulative sequence lengths,
+            shape (num_seqs + 1,). The first element should be 0. Each entry
+            represents the starting index of a sequence in the flattened token
+            array.
         chunk_size (int): The size of each physical mamba chunk (number of tokens per chunk).
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - chunk_indices (torch.Tensor): 1D tensor of indices indicating the physical chunk for each logical chunk.
-            - chunk_offsets (torch.Tensor): 1D tensor of offsets indicating the starting index of each logical chunk within its physical chunk.
+            - chunk_offsets (torch.Tensor): 1D tensor of offsets indicating
+              the starting index of each logical chunk within its physical
+              chunk.
 
     This function computes the chunk indices and offsets for the given cu_seqlens and chunk_size.
     Both are tensors of integers with length N, where N is the number of logical (pseudo) chunks.
-    A logical chunk is a sequence of tokens that are all part of the same sequence and are all in the same physical mamba chunk.
+    A logical chunk is a sequence of tokens that are all part of the same sequence
+    and are all in the same physical mamba chunk.
     In other words, a logical chunk changes every time we cross a sequence boundary or a physical mamba chunk boundary.
-    Logical chunks are needed to handle batched requests with initial states (see _state_passing_fwd and _chunk_scan_fwd).
+    Logical chunks are needed to handle batched requests with initial states
+    (see _state_passing_fwd and _chunk_scan_fwd).
     The chunk_indices tensor contains the index of the physical chunk for each logical chunk.
     The chunk_offsets tensor contains the offset (AKA starting index) of the logical chunk in the physical chunk.
 
@@ -167,9 +173,12 @@ def cu_seqlens_to_chunk_indices_offsets(
 
     In this example, we have 2 sequences, each with 5 tokens. The physical chunk size is 8 tokens.
     We have three logical chunks:
-    - the first logical chunk starts at token 0 in the first physical chunk and contains all 5 tokens from the first sequence
-    - the second logical chunk starts at token 5 in the first physical chunk and contains first 3 tokens from the second sequence
-    - the third logical chunk starts at token 0 in the second physical chunk and contains the remaining 2 tokens from the second sequence
+    - the first logical chunk starts at token 0 in the first physical chunk and
+      contains all 5 tokens from the first sequence
+    - the second logical chunk starts at token 5 in the first physical chunk
+      and contains first 3 tokens from the second sequence
+    - the third logical chunk starts at token 0 in the second physical chunk
+      and contains the remaining 2 tokens from the second sequence
     """
 
     total_seqlens = cu_seqlens[-1]
@@ -259,22 +268,26 @@ class Mamba2Metadata:
         self.replay_num_decodes = 0
         if not getattr(kv_cache_manager, 'use_replay_state_update', False):
             return
-        if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
+        num_decodes = batch_size - num_contexts
+        self.replay_num_decodes = num_decodes
+        self.replay_n_writes.zero_()
+        if num_decodes == 0:
             return
+        if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
+            raise RuntimeError(
+                "Replay state update is enabled, but the KV cache manager "
+                "does not expose replay state update metadata.")
 
         replay_metadata = kv_cache_manager.get_replay_state_update_metadata()
         if replay_metadata is None:
-            return
-        self.replay_n_writes.zero_()
+            raise RuntimeError(
+                "Replay state update is enabled for a decode batch, but the "
+                "KV cache manager returned no replay state update metadata.")
 
         prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
         cache_buf_idx = replay_metadata.cache_buf_idx
         replay_step_width = replay_metadata.replay_step_width
         replay_history_size = replay_metadata.replay_history_size
-        num_decodes = batch_size - num_contexts
-        self.replay_num_decodes = num_decodes
-        if num_decodes == 0:
-            return
 
         position_in_decode_batch = torch.arange(
             num_decodes, dtype=torch.int32, device=self.state_indices.device)
@@ -283,6 +296,8 @@ class Mamba2Metadata:
         pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
         active_cache_buf_idx = cache_buf_idx[cache_slot_idx].to(torch.int32)
 
+        # Keep field order and write-first partitioning in sync with the
+        # AutoDeploy replay metadata path in shim/interface.py.
         writes = (pnat + replay_step_width > replay_history_size)
         writes_i32 = writes.to(torch.int32)
         write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32
@@ -333,12 +348,10 @@ class Mamba2Metadata:
                 # cudaStreamSynchronize per element.
                 #
                 # Safe under CUDA graphs only when the source buffer has a
-                # stable data pointer across all calls (currently true for
-                # CppMambaHybridCacheManager.cuda_state_indices, allocated
-                # once in __init__). If a future cache manager reallocates
-                # this buffer between iterations, captured kernels would
-                # still read from the address seen at capture time, so we
-                # assert stability here.
+                # stable data pointer across all calls. If a cache manager
+                # reallocates this buffer between iterations, captured kernels
+                # would still read from the address seen at capture time, so
+                # we assert stability here.
                 if self._state_indices_aliased_ptr is None:
                     self._state_indices_aliased_ptr = indices.data_ptr()
                 else:
@@ -428,7 +441,7 @@ class Mamba2Metadata:
         # Complete any deferred recurrent-state block onboards scheduled by
         # CppMambaHybridCacheManager.prepare_resources(). prepare_resources
         # only enqueues the async cudaMemcpyAsync calls and sets a pending
-        # flag; we sync the onboard stream here, so the prior CPU-side prep
+        # flag; we sync the onboard stream here, so CPU-side prep
         # work in _prepare_tp_inputs overlaps with the in-flight transfers.
         # Cheap no-op on cache managers without this method or when no
         # transfers were scheduled this iteration.
