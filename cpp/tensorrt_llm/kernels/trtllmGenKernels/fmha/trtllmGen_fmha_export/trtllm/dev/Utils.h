@@ -32,7 +32,7 @@ namespace dev {
 
 // __block_size__ is only supported in CUDA 13 and later.
 // We can always emit the macro, and it will simply be ignored in CUDA 12.
-#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+#if !defined(TLLM_DISABLE_BLOCK_SIZE) && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
 #define TLLM_BLOCK_SIZE(bx, by, bz) __block_size__((bx, by, bz))
 #else
 #define TLLM_BLOCK_SIZE(bx, by, bz)

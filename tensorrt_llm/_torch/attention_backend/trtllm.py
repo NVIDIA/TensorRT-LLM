@@ -118,6 +118,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # C++ attention op requires a 2-D position_offsets tensor and reads
     # sizes()[1] as the generation length / packed-mask row stride.
     spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
+    # Compact Hopper C++ row stride for 1D dynamic-tree offsets.
+    position_offsets_stride: int = 0
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
@@ -170,10 +172,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     @property
     def spec_decoding_position_offsets_for_cpp(self) -> Optional[torch.Tensor]:
         """``spec_decoding_position_offsets`` reshaped to the 2D layout the C++
-        kernel expects. 1D inputs (dynamic-tree shorthand) are viewed as
-        ``(max_num_requests, -1)``."""
+        kernel expects."""
         offsets = self.spec_decoding_position_offsets
         if offsets is not None and offsets.dim() == 1:
+            if (self.spec_decoding_position_offsets_cpp is not None
+                    and not self.is_sm_version_trtllm_gen_kernel(
+                        sm=get_sm_version())):
+                return self.spec_decoding_position_offsets_cpp
             return offsets.view(self.max_num_requests, -1)
         return offsets
 
@@ -240,14 +245,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         offsets = self.spec_decoding_position_offsets
         if offsets is None or offsets.dim() != 1:
             self.spec_decoding_position_offsets_cpp = offsets
+            self.position_offsets_stride = 0
             return
 
         if self.max_num_requests > 0 and query_len > 0:
+            self.position_offsets_stride = query_len
             total = self.max_num_requests * query_len
             self.spec_decoding_position_offsets_cpp = offsets[:total].view(
                 self.max_num_requests, query_len)
         else:
             self.spec_decoding_position_offsets_cpp = offsets
+            self.position_offsets_stride = 0
 
     def _post_init_with_buffers(self, buffers) -> None:
 
@@ -908,15 +916,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 ``[num_contexts:batch_size]`` rather than ``[:batch_size]``.
         '''
 
-        # Disable spec decoding on Blackwell (sm100+). The trtllmGen FMHA
-        # kernels do not yet support speculative decoding mode.
+        # Blackwell trtllm-gen spec-dec is enabled only for dynamic-tree masks.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
-            not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()))
+            not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version())
+            or is_spec_dec_dynamic_tree)
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
+        # Forward static tree length to FMHA kernel selection.
+        self.max_total_draft_tokens = max_total_draft_tokens
 
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:
@@ -1004,9 +1014,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     mask_src = torch.index_select(
                         slot_storage.packed_mask, 0,
                         slot_ids)[:, :, :actual_mask_width]
-                    total = num_gens * n_dt * actual_mask_width
-                    self.spec_decoding_packed_mask.view(-1)[:total].copy_(
-                        mask_src.reshape(-1), non_blocking=True)
+                    if self.is_sm_version_trtllm_gen_kernel(
+                            sm=get_sm_version()):
+                        # Blackwell reads the padded 3D mask layout.
+                        self.spec_decoding_packed_mask[:num_gens, :n_dt, :
+                                                       actual_mask_width].copy_(
+                                                           mask_src,
+                                                           non_blocking=True)
+                    else:
+                        # Hopper XQA reads a compact flat prefix.
+                        total = num_gens * n_dt * actual_mask_width
+                        self.spec_decoding_packed_mask.view(-1)[:total].copy_(
+                            mask_src.reshape(-1), non_blocking=True)
 
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
                 cpp_query_len = n_dt
@@ -1669,6 +1688,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # stay as literal ``None`` until DeepSeek V4 sparse-MLA lands.
                 sparse_mla_topk_lens=None,
                 compressed_kv_cache_pool_ptr=None,
+                spec_decoding_target_max_draft_tokens=getattr(
+                    metadata, 'max_total_draft_tokens', None),
             )
 
         if self.print_skip_softmax_stat:
