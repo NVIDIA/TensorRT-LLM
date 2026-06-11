@@ -146,6 +146,58 @@ class GenerationRequest:
         self.id = id
         return self
 
+    # --- int32 token-id wire serialization + ctor buffer side-channel ----------
+    # Pickling a flat list[int] on the hot proxy->worker RPC-submit path emits one
+    # PyLong frame per token (O(ISL)). Encode token-ids as int32 bytes for the
+    # wire; on decode rebuild the list[int] (consumers unchanged) AND stash the
+    # int32 ndarray in `_prompt_token_ids_i32`, which base_worker._enqueue_request
+    # hands to the C++ Request ctor for a memcpy (no per-token cast on the
+    # GIL-held submit thread). Symmetric / single-build -> no wire-version concern.
+    _I32 = "\x00i32be"
+
+    @staticmethod
+    def _enc_tokens(v):
+        # flat list[int] -> (_I32, int32 bytes); leave None / list[list[int]] /
+        # ndarray untouched.
+        if type(v) is list and (len(v) == 0 or type(v[0]) is int):
+            return (GenerationRequest._I32,
+                    np.asarray(v, dtype=np.int32).tobytes())
+        return v
+
+    @staticmethod
+    def _dec_tokens(v):
+        # (_I32, bytes) -> (list[int], int32 ndarray buffer); else (v, None).
+        if type(v) is tuple and len(v) == 2 and v[0] == GenerationRequest._I32:
+            arr = np.frombuffer(v[1], dtype=np.int32)
+            return arr.tolist(), arr
+        return v, None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # transient buffer is rebuilt on decode; never pickle it
+        state.pop("_prompt_token_ids_i32", None)
+        if "prompt_token_ids" in state:
+            state["prompt_token_ids"] = GenerationRequest._enc_tokens(
+                state["prompt_token_ids"])
+        if state.get("query_token_ids") is not None:
+            state["query_token_ids"] = GenerationRequest._enc_tokens(
+                state["query_token_ids"])
+        return state
+
+    def __setstate__(self, state):
+        pt_buf = None
+        if "prompt_token_ids" in state:
+            # rebuild list[int] for all consumers; keep the int32 buffer for the ctor
+            state["prompt_token_ids"], pt_buf = GenerationRequest._dec_tokens(
+                state["prompt_token_ids"])
+        if state.get("query_token_ids") is not None:
+            # query_token_ids stays a plain list (no ctor fast-path for it)
+            q_list, _ = GenerationRequest._dec_tokens(state["query_token_ids"])
+            state["query_token_ids"] = q_list
+        self.__dict__.update(state)
+        # int32 buffer for the C++ Request ctor memcpy; None if not bytes-encoded
+        self._prompt_token_ids_i32 = pt_buf
+
 
 class TruncateKVCacheRequest:
 
