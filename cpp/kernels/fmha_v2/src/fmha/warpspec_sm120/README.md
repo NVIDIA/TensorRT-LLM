@@ -27,12 +27,19 @@ and the entry kernel in
 
 ## How the runner reaches this kernel
 
-The kernel is opt-in. The PyTorch attention op exposes a `use_skip_softmax_fmha`
-flag (plumbed `attentionOp` → `MHARunnerParams` → `Launch_params`); when it is
-set and the config matches (sm_120 / sm_121, BF16 in/out, causal, `head_dim ==
-head_dim_v` in `{128, 256}`, PACKED_QKV), `FusedMultiHeadAttentionXMMAKernelV2::run`
-dispatches to the `run_skip_softmax_*` bridges instead of the cubin path. The flag
-is a no-op on every other architecture and shape.
+This is the **default** sm_120 / sm_121 context FMHA — there is no opt-in flag.
+`FusedMultiHeadAttentionXMMAKernelV2::run` dispatches every prefill whose config
+matches (sm_120 / sm_121, BF16 in/out, causal, `head_dim == head_dim_v` in
+`{128, 256}`, PACKED_QKV) **and** that carries no feature the kernel does not
+implement (alibi, logit softcapping, sage attention, sliding-window / custom mask,
+returning softmax stats, interleaved) to the `run_skip_softmax_*` bridges; every
+other config falls through to the cubin/launcher path.
+
+The per-tile skip-softmax optimization is selected by
+`Launch_params::enableSkipSoftmax` (set when a skip-softmax threshold `> 0` is
+configured): the bridges instantiate the `ENABLE_SKIP_SOFTMAX = true` kernel
+variant when skipping is requested, and the `false` variant — a plain
+full-softmax prefill with no skip-check overhead — otherwise.
 
 The translation unit is compiled only into the `_context_attention_kernels_120`
 CMake target (sm_120 family). The all-architecture dispatch TU references the

@@ -85,8 +85,8 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
     target_compile_definitions(${TARGET_NAME} PRIVATE USE_DEMO_BERT_PARAMS=1
                                                       GENERATE_CUBIN=1)
     # Let the all-arch dispatch TU (fused_multihead_attention_v2.cpp) know the
-    # skip_softmax bridge symbols are available so it can reference them without an
-    # undefined-symbol error on builds that exclude sm_120.
+    # skip_softmax bridge symbols are available so it can reference them without
+    # an undefined-symbol error on builds that exclude sm_120.
     if(${arch} EQUAL 120)
       target_compile_definitions(context_attention_src
                                  PRIVATE TLLM_ENABLE_SKIP_SOFTMAX_SM120=1)

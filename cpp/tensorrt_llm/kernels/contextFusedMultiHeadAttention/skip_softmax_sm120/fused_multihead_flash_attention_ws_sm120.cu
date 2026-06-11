@@ -23,9 +23,12 @@
 // hardware that provides the TMA + sync-MMA combination this kernel targets.
 //
 // Supported shapes: BF16 in/out, head_dim == head_dim_v in {128, 256}, causal
-// mask, PACKED_QKV layout. The runner dispatches here only when those
-// constraints are met and the use_skip_softmax_fmha flag is set; see
-// fused_multihead_attention_v2.cpp.
+// mask, PACKED_QKV layout. This is the default sm_120 / sm_121 context FMHA: the
+// runner dispatches here for every prefill that meets those constraints (and
+// carries no unsupported feature), regardless of skip-softmax. The per-tile
+// skip-softmax optimization is active only when a prefill threshold is set
+// (params.skip_softmax_threshold_scale_factor > 0), which the bridge reads
+// directly to pick the kernel variant; see fused_multihead_attention_v2.cpp.
 //
 // The design rationale lives in
 // cpp/kernels/fmha_v2/src/fmha/warpspec_sm120/README.md.
@@ -55,7 +58,7 @@ namespace fmha_skip_softmax
 // smem rows -- the layout that matches the TMA 128B hardware swizzle. head_dim
 // 128 and 256 both satisfy this; a non-multiple-of-64 head dim would break the
 // swizzle invariant.
-template <int HEAD_DIM>
+template <int HEAD_DIM, bool ENABLE_SKIP_SOFTMAX>
 using Skip_softmax_ktraits = fmha::ws_sm120::Kernel_traits_skip_softmax_sm120<
     /*Traits_=*/fmha::Ampere_hmma_bf16_traits,
     /*S=*/128,
@@ -66,8 +69,7 @@ using Skip_softmax_ktraits = fmha::ws_sm120::Kernel_traits_skip_softmax_sm120<
     /*WARPS_N_=*/1,
     /*VERSION_=*/2,
     /*MASK_VERSION_=*/3, // 3 = causal
-    /*RING_DEPTH_=*/1,
-    /*ENABLE_SKIP_SOFTMAX_=*/true,
+    /*ENABLE_SKIP_SOFTMAX_=*/ENABLE_SKIP_SOFTMAX,
     /*NUM_PRODUCER_WARPS_=*/1>;
 
 } // namespace fmha_skip_softmax
@@ -146,6 +148,7 @@ static cudaError_t launch_skip_softmax(bert::Fused_multihead_attention_params_v2
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "../fused_multihead_attention_common.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -160,8 +163,16 @@ void run_skip_softmax_bf16_d256_causal_sm120(
     blp.total_q_seqlen = launch_params.total_q_seqlen;
     blp.attention_input_layout = fmha::Attention_input_layout::PACKED_QKV;
 
-    ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<256>>(
-        reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params), blp, stream);
+    // Skip-softmax is enabled by the threshold alone (no separate flag): run the
+    // skip variant when a prefill threshold is set, otherwise the no-skip variant
+    // (a plain full-softmax prefill) -- the default sm_120 / sm_121 context path.
+    auto& bert_params = reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params);
+    bool const enable_skip = params.skip_softmax_threshold_scale_factor > 0.f;
+    auto const err = enable_skip
+        ? ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<256, true>>(bert_params, blp, stream)
+        : ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<256, false>>(bert_params, blp, stream);
+    TLLM_CHECK_WITH_INFO(
+        err == cudaSuccess, "run_skip_softmax_bf16_d256_causal_sm120 launch failed: %s", cudaGetErrorString(err));
 }
 
 void run_skip_softmax_bf16_d128_causal_sm120(
@@ -171,8 +182,16 @@ void run_skip_softmax_bf16_d128_causal_sm120(
     blp.total_q_seqlen = launch_params.total_q_seqlen;
     blp.attention_input_layout = fmha::Attention_input_layout::PACKED_QKV;
 
-    ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<128>>(
-        reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params), blp, stream);
+    // Skip-softmax is enabled by the threshold alone (no separate flag): run the
+    // skip variant when a prefill threshold is set, otherwise the no-skip variant
+    // (a plain full-softmax prefill) -- the default sm_120 / sm_121 context path.
+    auto& bert_params = reinterpret_cast<bert::Fused_multihead_attention_params_v2&>(params);
+    bool const enable_skip = params.skip_softmax_threshold_scale_factor > 0.f;
+    auto const err = enable_skip
+        ? ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<128, true>>(bert_params, blp, stream)
+        : ::launch_skip_softmax<::fmha_skip_softmax::Skip_softmax_ktraits<128, false>>(bert_params, blp, stream);
+    TLLM_CHECK_WITH_INFO(
+        err == cudaSuccess, "run_skip_softmax_bf16_d128_causal_sm120 launch failed: %s", cudaGetErrorString(err));
 }
 
 } // namespace kernels

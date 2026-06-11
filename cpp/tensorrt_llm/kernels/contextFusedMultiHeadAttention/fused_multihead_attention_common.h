@@ -340,11 +340,6 @@ struct MHARunnerParams
     uint32_t* skipSoftmaxTotalBlocks;
     uint32_t* skipSoftmaxSkippedBlocks;
 #endif
-
-    // Opt into the skip_softmax (TMA-load + sync-MMA warp-specialized) FMHA on
-    // sm_120 / sm_121. Only honored for the supported shapes (BF16, causal,
-    // head_dim == head_dim_v in {128, 256}, packed QKV); ignored otherwise.
-    bool useSkip_softmaxFmha = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -559,9 +554,6 @@ struct Launch_params
     bool supportReturnSoftmaxStats;
     // enable skip softmax attention feature
     bool enableSkipSoftmax = false;
-    // dispatch to the skip_softmax (TMA-load + sync-MMA warp-specialized) FMHA on
-    // sm_120 / sm_121 for supported shapes.
-    bool useSkip_softmaxFmha = false;
 };
 
 } // namespace kernels

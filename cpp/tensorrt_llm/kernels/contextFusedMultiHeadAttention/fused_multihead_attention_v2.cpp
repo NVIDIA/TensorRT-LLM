@@ -277,14 +277,22 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
 {
 #if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
-    // Skip_softmax dispatch: route the matching config (sm_120 / sm_121, BF16
-    // in/out, head_dim == head_dim_v in {128, 256}, causal, PACKED_QKV) to the
-    // TMA-load + sync-MMA warp-specialized kernel when the caller opted in.
-    // Falls through to the normal cubin/launcher path otherwise.
-    if (launch_params.useSkip_softmaxFmha && (mSM == kSM_120 || mSM == kSM_121) && mInputDataType == DATA_TYPE_BF16
-        && mOutputDataType == DATA_TYPE_BF16 && params.d == params.dv
+    // Default sm_120 / sm_121 context FMHA. Every supported prefill is routed to
+    // the TMA-load + sync-MMA warp-specialized kernel, which carries the per-tile
+    // skip-softmax optimization. Skipping is active only when a threshold is set
+    // (enableSkipSoftmax == threshold > 0); with no threshold the kernel runs a
+    // plain full-softmax prefill. Shapes / features it does not implement fall
+    // through to the cubin/launcher path: non-BF16 (incl. fp8), head_dim not in
+    // {128, 256} or head_dim != head_dim_v, non-causal / sliding-window / custom
+    // mask, non-PACKED_QKV layout, alibi, logit softcapping, sage attention,
+    // interleaved, and returning softmax stats.
+    if ((mSM == kSM_120 || mSM == kSM_121) && launch_params.flash_attention && mInputDataType == DATA_TYPE_BF16
+        && mOutputDataType == DATA_TYPE_BF16 && params.d == params.dv && (params.d == 128 || params.d == 256)
         && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
-        && launch_params.attention_input_layout == AttentionInputLayout::PACKED_QKV)
+        && launch_params.attention_input_layout == AttentionInputLayout::PACKED_QKV && !params.has_alibi
+        && !launch_params.enableAttnLogitSoftcapping && !launch_params.interleaved
+        && params.softmax_stats_ptr == nullptr && launch_params.sage_block_size_q == 0
+        && launch_params.sage_block_size_k == 0 && launch_params.sage_block_size_v == 0)
     {
         if (params.d == 256)
         {

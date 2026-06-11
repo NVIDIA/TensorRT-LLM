@@ -14,16 +14,17 @@
 # limitations under the License.
 """Correctness tests for the skip_softmax sm_120 / sm_121 context FMHA.
 
-skip_softmax backs skip-softmax, so it is forced on by attaching a
-``SkipSoftmaxAttentionConfig`` with a tiny ``threshold_scale_factor`` (no tile
-is ever skipped, i.e. full softmax). For BF16 / head_dim in {128, 256} / causal
-/ packed QKV the runner dispatches unconditionally to skip_softmax, so these checks
-target the kernel directly. The multi-request cases guard the per-request TMA
-offset fix (every batch element used to re-read request 0's tokens).
+For BF16 / head_dim in {128, 256} / causal / packed QKV the runner dispatches
+unconditionally to this warp-specialized kernel -- it is the default sm_120 /
+sm_121 context FMHA -- so these checks target the kernel directly. Both variants
+are exercised: the default no-skip path (full softmax) and the skip path selected
+by a ``SkipSoftmaxAttentionConfig`` with a tiny ``threshold_scale_factor`` (so no
+tile is actually skipped, i.e. still full softmax). The multi-request cases guard
+the per-request TMA offset fix (every batch element used to re-read request 0's
+tokens).
 """
 
 import math
-from typing import List
 
 import pytest
 import torch
@@ -46,7 +47,7 @@ def _causal_reference(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    seq_lens: List[int],
+    seq_lens: list[int],
 ) -> torch.Tensor:
     """Per-request causal attention in fp32. q/k/v are packed ``[total, H*D]``."""
     outs = []
@@ -69,7 +70,9 @@ def _causal_reference(
     return torch.cat(outs)
 
 
-def _run_context(num_heads, num_kv_heads, head_dim, seq_lens, q, k, v, sparse_attention_config):
+def _run_context(
+    num_heads, num_kv_heads, head_dim, seq_lens, q, k, v, sparse_attention_config
+) -> tuple:
     """Build a TRTLLM attention layer + no-cache context metadata and run a
     packed-QKV causal prefill. Mirrors ``test_attention_no_cache``."""
     AttentionCls = get_attention_backend("TRTLLM")
@@ -117,10 +120,12 @@ SEQ_LENS = [
 ]
 
 
-@pytest.mark.parametrize("head_dim", [128], ids=lambda d: f"head_dim_{d}")
+@pytest.mark.parametrize("head_dim", [128, 256], ids=lambda d: f"head_dim_{d}")
 @pytest.mark.parametrize("num_heads,num_kv_heads", HEADS, ids=lambda x: f"h_{x}")
 @pytest.mark.parametrize("seq_lens", SEQ_LENS, ids=lambda s: f"seqs_{'_'.join(map(str, s))}")
-def test_skip_softmax_context_matches_reference(num_heads, num_kv_heads, head_dim, seq_lens):
+def test_skip_softmax_context_matches_reference(
+    num_heads, num_kv_heads, head_dim, seq_lens
+) -> None:
     """The skip_softmax context FMHA must match (a) a standard fp32 causal-attention
     reference and (b) the default (non-skip_softmax) TRTLLM context kernel on the
     same inputs, for both single- and multi-request batches."""
@@ -136,12 +141,14 @@ def test_skip_softmax_context_matches_reference(num_heads, num_kv_heads, head_di
 
     ref = _causal_reference(q, k, v, num_heads, num_kv_heads, head_dim, seq_lens)
 
-    # Trusted baseline: default TRTLLM context FMHA (no skip-softmax cfg).
-    _, _, out_default = _run_context(
+    # No-skip variant: the default sm_120 / sm_121 context path (no cfg) now runs
+    # the warp-spec kernel with ENABLE_SKIP_SOFTMAX = false (full softmax).
+    _, _, out_noskip = _run_context(
         num_heads, num_kv_heads, head_dim, seq_lens, q, k, v, sparse_attention_config=None
     )
-    # Under test: skip_softmax, forced on via the skip-softmax cfg.
-    skip_softmax_layer, _, out_skip_softmax = _run_context(
+    # Skip variant: a tiny threshold selects ENABLE_SKIP_SOFTMAX = true but skips
+    # no tile, so it must also reproduce full softmax.
+    _, _, out_skip_softmax = _run_context(
         num_heads,
         num_kv_heads,
         head_dim,
@@ -153,13 +160,12 @@ def test_skip_softmax_context_matches_reference(num_heads, num_kv_heads, head_di
     )
     torch.cuda.synchronize()
 
-    assert skip_softmax_layer.use_skip_softmax_fmha, "skip-softmax cfg did not enable skip_softmax"
-
-    # Baseline sanity, then the regression checks: skip_softmax must match both the
-    # reference and the default kernel (pre-fix, batches >1 were off by ~0.2).
-    torch.testing.assert_close(out_default.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    # Both kernel variants must match the fp32 reference and each other (the
+    # multi-request cases guard the per-request TMA offset fix: pre-fix, batches
+    # >1 were off by ~0.2).
+    torch.testing.assert_close(out_noskip.float(), ref.float(), atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(out_skip_softmax.float(), ref.float(), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(out_skip_softmax.float(), out_default.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out_skip_softmax.float(), out_noskip.float(), atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

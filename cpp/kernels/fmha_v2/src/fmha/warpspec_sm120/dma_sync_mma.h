@@ -29,8 +29,9 @@
 // fmha/warpspec/circular_buffer.h (Arrive_wait-based, also CC >= 9.0).
 
 #include <cstdio>
+#include <cstdlib> // abort
 
-#include <cuda.h> // CUtensorMap + cuTensorMapEncodeTiled (driver API)
+#include <cuda.h>  // CUtensorMap + cuTensorMapEncodeTiled (driver API)
 
 #include <fmha/hopper/arrive_wait.h>
 #include <fmha/hopper/tma_descriptor.h>
@@ -306,6 +307,11 @@ struct DMA
         static void encode(CUtensorMap& out, void* gmem_ptr, uint32_t const (&tensor_size)[3],
             uint64_t seq_stride_bytes, uint32_t const (&box_size)[3])
         {
+            // This kernel is BF16-only (Ampere_hmma_bf16_traits). The descriptor
+            // data type only drives out-of-bounds fill, which is disabled below
+            // (CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE), so TMA moves raw bytes regardless
+            // of fmt -- a 2-byte element therefore maps to BFLOAT16 safely. If FP16
+            // support is ever added, distinguish it here with a real data-type knob.
             CUtensorMapDataType fmt = (Kernel_traits::ELEMENT_BYTES == 2) ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
                                                                           : CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
 
@@ -334,6 +340,11 @@ struct DMA
                     "(dim=%u,%u,%u box=%u,%u,%u lead_bytes=%u swizzle=%d)\n",
                     err, tensor_size[0], tensor_size[1], tensor_size[2], box_size[0], box_size[1], box_size[2],
                     lead_bytes, static_cast<int>(swizzle));
+                // Abort rather than continue: `out` is left unencoded, so launching
+                // with it would be undefined behavior (a UTMALDG on a garbage
+                // descriptor). A failure here is a host-side programming error
+                // (invalid shape/swizzle), not a recoverable runtime condition.
+                abort();
             }
         }
 

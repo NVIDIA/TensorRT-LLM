@@ -498,28 +498,16 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
                     && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 
-    // Dispatch to the skip_softmax (TMA-load + sync-MMA warp-specialized) FMHA on
-    // sm_120 / sm_121 when requested by the caller.
-    mLaunchParams.useSkip_softmaxFmha = runnerParams.useSkip_softmaxFmha;
-
-    // Setup launch params for skip softmax attention
-    mLaunchParams.enableSkipSoftmax = false;
-    if (runnerParams.skipSoftmaxThresholdScaleFactor > 0)
-    {
-        bool const isSm120f = (mSM == kSM_120 || mSM == kSM_121);
-        bool const hopperWarpspec = isSm90 && mLaunchParams.warp_specialization;
-        // The skip_softmax kernel is the only sm_120 / sm_121 FMHA that implements
-        // skip-softmax, so skip-softmax there is only permitted with skip_softmax.
-        bool const sm120Skip_softmax = isSm120f && mLaunchParams.useSkip_softmaxFmha;
-        if (!mLaunchParams.flash_attention || !(hopperWarpspec || sm120Skip_softmax))
-        {
-            TLLM_CHECK_WITH_INFO(false,
-                "Skip softmax attention requires Hopper with warp specialization, or sm_120 / sm_121 with the "
-                "skip_softmax "
-                "FMHA enabled, together with flash attention.");
-        }
-        mLaunchParams.enableSkipSoftmax = true;
-    }
+    // Skip-softmax is driven by the threshold alone -- there is no separate enable
+    // flag. It is realized by two kernels: the Hopper warp-specialized FMHA, which
+    // is selected through the enableSkipSoftmax cubin-hash bit, and the sm_120 /
+    // sm_121 warp-specialized context FMHA, which reads the threshold directly and
+    // therefore does not need the cubin-hash bit (enableSkipSoftmax stays false
+    // there -- see fused_multihead_attention_v2.cpp). If no skip-capable kernel
+    // matches the config, skipping is simply not enabled and the request runs full
+    // softmax.
+    mLaunchParams.enableSkipSoftmax = runnerParams.skipSoftmaxThresholdScaleFactor > 0 && isSm90
+        && mLaunchParams.warp_specialization && mLaunchParams.flash_attention;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

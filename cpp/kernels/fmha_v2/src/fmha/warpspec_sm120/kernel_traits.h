@@ -23,22 +23,12 @@
 // LDGSTS-friendly Smem_tile_a/b/v with ldmatrix swizzle and the right
 // Cta_tile / Mma_tile / fragment shapes) and layers on the warp-spec
 // pieces:
-//   * RING_DEPTH-deep smem ring for Q, K, V (vs the 1- or 2-buffer
-//     ping-pong the tiled kernel uses today).
 //   * Shared struct with smem tiles + entry-produced / entry-consumed
 //     mbarrier arrays.
 //   * Circular_buffer_{q,k,v}_{reader,writer} type aliases against the
 //     existing fmha::ws::CircularBuffer infrastructure.
 //   * Named-barrier ids (collision-safe with the existing skip-softmax
 //     barrier ids 0x3 / 0x4 used on the non-warpspec tiled kernel).
-//
-// Assumption (resolved in phase 5 = build + iterate):
-//   fmha::Smem_tile_a / Smem_tile_b / Smem_tile_v accept a runtime number
-//   of buffers via their BUFFERS template parameter (they do --
-//   BUFFERS_PER_TILE_SMEM_K is just a constant value plumbed through
-//   from Kernel_traits_). The smem swizzle and BYTES_PER_BUFFER math
-//   are independent of the buffer count, so RING_DEPTH=3 should work
-//   structurally; ldmatrix access patterns also do not change.
 //
 // What this header does NOT include:
 //   * Host-side TMA descriptor setup (phase 3).
@@ -76,8 +66,6 @@ template <
     int VERSION_,
     // The mask version of the kernel.
     int MASK_VERSION_,
-    // Smem ring depth for Q, K, V tiles.
-    int RING_DEPTH_ = 3,
     // Skip-softmax knob.
     bool ENABLE_SKIP_SOFTMAX_ = false,
     // Producer warp count -- single 32-thread warp by default.
@@ -132,25 +120,9 @@ struct Kernel_traits_skip_softmax_sm120
     using Mma_tile_p = typename Base::Mma_tile_p;
     using Mma_tile_o = typename Base::Mma_tile_o;
 
-    // Skip_softmax uses a RING_DEPTH-buffer ring for K, V (and Q -- though Q only
-    // loads once per CTA, we still go through the same ring API so the
-    // barrier handshake is uniform).
-    enum
-    {
-        RING_DEPTH = RING_DEPTH_
-    };
-
-    // Smem tiles: same swizzle as the existing tiled kernel (the math doesn't
-    // care; the consumer's ldmatrix patterns work on either ring depth).
-    // We re-derive these with the override BUFFERS = RING_DEPTH.
-    //
-    // NB: phase 5 work item -- if Smem_tile_a / Smem_tile_b / Smem_tile_v
-    // bake any RING_DEPTH-dependent assumptions into their layout
-    // computation, the smem alloc here will be wrong and the consumer's
-    // smem pointer arithmetic will need to advance by
-    // RING_DEPTH * BYTES_PER_BUFFER instead. To unblock phase 1, we use
-    // the existing Smem_tile_q/k/v types unchanged; phase 5 will revisit
-    // if profiling shows ring depth > 2 is needed.
+    // Smem tiles: reuse the existing tiled-kernel types and their buffer counts
+    // (Base::BUFFERS_PER_TILE_SMEM_*); the swizzle and the consumer's ldmatrix
+    // access patterns are independent of the buffer count.
     using Smem_tile_q = typename Base::Smem_tile_q;
     using Smem_tile_k = typename Base::Smem_tile_k;
     using Smem_tile_o = typename Base::Smem_tile_o;
