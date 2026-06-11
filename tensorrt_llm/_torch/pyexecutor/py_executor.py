@@ -4223,6 +4223,14 @@ class PyExecutor:
                 req.py_kv_transfer_timed_out = False
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
+                if not ctx_draft_tokens and self.model_engine.enable_spec_decode:
+                    # CTX has no speculative decoding — fill dummy draft tokens
+                    # so model_engine builds the correct input shape (1 + draft_len
+                    # tokens per gen request). Dummies will be rejected on verify,
+                    # and the draft model will produce real tokens for next step.
+                    ctx_draft_tokens = [
+                        0
+                    ] * self.model_engine.max_total_draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.py_beam_width
                 for beam in range(0, beam_width):
