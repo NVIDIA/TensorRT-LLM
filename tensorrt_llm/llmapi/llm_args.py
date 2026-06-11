@@ -677,12 +677,27 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         "Requires formula coefficients in the model's config.json. "
         "Ignored if threshold_scale_factor is also set.")
 
+    @field_validator("target_sparsity")
+    @classmethod
+    def validate_target_sparsity(cls, target_sparsity):
+        values = target_sparsity.values() if isinstance(
+            target_sparsity, dict) else (target_sparsity, )
+        for value in values:
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    "target_sparsity must be in [0, 1] for Skip Softmax Attention."
+                )
+        return target_sparsity
+
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
     def to_sparse_params(self, **kwargs):
+        import fnmatch
+
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
             SkipSoftmaxParams, SkipSoftmaxScheduler,
+            skip_softmax_ignore_from_ckpt_sparse_attention_config,
             skip_softmax_target_sparsity_from_ckpt_sparse_attention_config)
 
         ckpt_sparse_attention_config = kwargs.get(
@@ -701,6 +716,27 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             ckpt_sparse_attention_config = getattr(pretrained_config,
                                                    "sparse_attention_config",
                                                    None)
+        module_names = []
+        module_name = kwargs.get("module_name", None)
+        if module_name is not None:
+            module_names.append(str(module_name))
+        layer_idx = kwargs.get("layer_idx", None)
+        if layer_idx is not None:
+            layer_idx = str(layer_idx)
+            module_names.extend((
+                f"model.layers.{layer_idx}.self_attn",
+                f"model.layers.{layer_idx}.attention",
+                f"layers.{layer_idx}.self_attn",
+                f"layers.{layer_idx}.attention",
+            ))
+        if module_names:
+            ignore = (skip_softmax_ignore_from_ckpt_sparse_attention_config(
+                ckpt_sparse_attention_config) or ())
+            if any(
+                    fnmatch.fnmatch(name, pattern) for pattern in ignore
+                    for name in module_names):
+                return None
+
         target_sparsity = self.target_sparsity
         if target_sparsity is None:
             target_sparsity = skip_softmax_target_sparsity_from_ckpt_sparse_attention_config(

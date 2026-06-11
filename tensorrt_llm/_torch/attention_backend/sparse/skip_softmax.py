@@ -351,16 +351,20 @@ class SkipSoftmaxScheduler:
             if threshold_config is None:
                 phase_formula = None
             else:
+                coefficient_config = threshold_config.get(phase)
+                if coefficient_config is None:
+                    coefficient_config = threshold_config.get("coefficients")
+                if coefficient_config is None and shared_formula is not None:
+                    coefficient_config = threshold_config
                 phase_formula = SkipSoftmaxFormula.parse_from_dict(
-                    threshold_config.get(phase), formula=shared_formula
+                    coefficient_config, formula=shared_formula
                 )
             if phase_formula is None:
                 raise ValueError(
                     f"SkipSoftmaxAttentionConfig: config.json must carry a "
-                    f"top-level 'formula' string and a '{phase}' coefficient "
-                    f"dictionary under sparse_attention_config.config_groups.*."
-                    f"threshold_scale_factor "
-                    f"to resolve target_sparsity."
+                    f"top-level 'formula' string and coefficient values under "
+                    f"sparse_attention_config.config_groups.*.threshold_scale_factor "
+                    f"to resolve target_sparsity for {phase}."
                 )
             return phase_formula.compute_threshold_scale_factor(sparsity)
 
