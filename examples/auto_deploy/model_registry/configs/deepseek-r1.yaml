@@ -57,6 +57,13 @@ transforms:
   apply_sharding_hints:
     enabled: true
     allreduce_strategy: SYMM_MEM
+    # shard_layers whitelist: the shared expert (layer_type="shared_expert") is
+    # NOT listed, so it stays REPLICATED. TP-sharding it corrupts NVFP4
+    # deswizzled weight scales (~2.5pt GSM8K loss). Required for accuracy.
+    shard_layers:
+    - mla
+    - moe
+    - mlp
   cleanup_identity_dtype_cast:
     enabled: true
   gather_logits_before_lm_head:
