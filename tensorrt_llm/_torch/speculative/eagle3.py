@@ -2,18 +2,23 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..distributed.ops import allgather
+from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
+from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import MTPSampler
+from .mtp import MTPSampler, _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -71,6 +76,15 @@ class Eagle3ResourceManager(BaseResourceManager):
         )
         # sequence length, only used for metadata preparation
         self.seq_lens = {i: 0 for i in range(slot_size)}
+
+        # Per-request delta pool tracking whether the request is in the
+        # thinking phase; mirrors MTPHiddenStatesManager.mtp_relaxed_delta_pool.
+        self.use_relaxed_acceptance_for_thinking = getattr(
+            config, 'use_relaxed_acceptance_for_thinking', False)
+        if self.use_relaxed_acceptance_for_thinking:
+            self.relaxed_delta_pool = torch.zeros((slot_size, ),
+                                                  dtype=torch.float,
+                                                  device='cuda')
         # start indices of each slot
         self.start_indices = {i: 0 for i in range(slot_size)}
         # whether the next draft forward is the first
@@ -97,6 +111,8 @@ class Eagle3ResourceManager(BaseResourceManager):
             if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 self.slot_ids.append(slot_id)
+                if self.use_relaxed_acceptance_for_thinking:
+                    self.relaxed_delta_pool[slot_id].fill_(0)
         # reset the flag before model forward
         self.is_first_draft = True
 
@@ -107,6 +123,8 @@ class Eagle3ResourceManager(BaseResourceManager):
         slot_id = self.slot_manager.get_slot(request.request_id)
         self.seq_lens[slot_id] = 0
         self.start_indices[slot_id] = 0
+        if self.use_relaxed_acceptance_for_thinking:
+            self.relaxed_delta_pool[slot_id].fill_(0)
         self.slot_manager.remove_slot(request.request_id)
         if self.sa_manager is not None:
             self.sa_manager.remove_request(request.request_id)
@@ -364,15 +382,32 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     dtype: torch.dtype = torch.bfloat16
     # The index of the batch inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
-    # Optional resource manager (used to access SA manager for EAGLE3+SA)
+    # Optional resource manager (used to access SA manager and relaxed-acceptance
+    # delta pool for Eagle3+SA / Eagle3+relaxed-thinking / MTP Eagle modes)
     spec_resource_manager: Optional[Eagle3ResourceManager] = None
     # Dynamic tree flags
     use_dynamic_tree: bool = False
     eagle_choices: Optional[List[List[int]]] = None
+    # Slot IDs for each request; populated in prepare() when spec_resource_manager
+    # is present (required for relaxed acceptance, mirrors MTPSpecMetadata.slot_ids).
+    slot_ids: Optional[torch.Tensor] = None
+    # One-model speculative decoding uses the first draft forward token counts
+    # for the first loop iteration and per-sequence token counts for
+    # subsequent iterations.
+    subseq_all_rank_num_tokens: Optional[List[int]] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
-            if self.num_layers == 1:
+            if self.spec_dec_mode.is_mtp_eagle_one_model():
+                # MTP Eagle one-model feeds the target model's hidden_states
+                # directly to the MTP layer (see Eagle3OneModelWorker
+                # prepare_1st_drafter_inputs / _run_draft_forward, both gated
+                # on self.is_mtp_eagle). It never reads spec_metadata.hidden_states,
+                # so leave layers_to_capture empty: this makes is_layer_capture()
+                # return False everywhere and avoids the post-MLP/MoE fusion
+                # disable side effect in modeling_deepseekv3 / glm / etc.
+                self.layers_to_capture = ()
+            elif self.num_layers == 1:
                 self.layers_to_capture = (self.num_layers - 1, )
             else:
                 if self.num_layers <= 5:
@@ -384,8 +419,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        if (self.spec_resource_manager is not None
-                and self.spec_resource_manager.hidden_states is not None):
+        if self.num_capture_layers == 0:
+            # No layers to capture (MTP Eagle one-model). Skip buffer
+            # allocation entirely; nothing reads self.hidden_states on this
+            # path.
+            self.hidden_states = None
+        elif (self.spec_resource_manager is not None
+              and self.spec_resource_manager.hidden_states is not None):
             self.hidden_states = self.spec_resource_manager.hidden_states
             expected_cols = self.hidden_size * len(self.layers_to_capture)
             assert self.hidden_states.shape[1] == expected_cols, (
@@ -414,6 +454,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 dtype=torch.int,
                 device='cuda',
             )
+        # Pre-allocate slot_ids; filled in prepare() when spec_resource_manager
+        # is present.  Mirrors MTPSpecMetadata.slot_ids allocation pattern.
+        self.slot_ids = torch.empty(
+            [self.max_num_requests],
+            dtype=torch.long,
+            device='cuda',
+        )
 
         # Set tree flags based on config
         if self.use_dynamic_tree:
@@ -440,11 +487,33 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        if self.is_spec_dec_tree:
-            self.num_tokens -= (
-                self.num_generations) * self.max_total_draft_tokens
-        else:
-            self.num_tokens -= (self.num_generations) * self.max_draft_len
+        # `num_tokens` here only feeds the attention-DP shape hint
+        # (allgathered in model_engine and overridden into
+        # `attn_metadata.all_rank_num_tokens` on the step-0 draft forward).
+        # Each mode uses a different convention:
+        #   - MTP Eagle: keep the 1st-iter shape (matches input_ids).
+        #   - Eagle3: subtract to the subseq shape.
+        if not self.spec_dec_mode.is_mtp_eagle_one_model():
+            if self.is_spec_dec_tree:
+                self.num_tokens -= (
+                    self.num_generations) * self.max_total_draft_tokens
+            else:
+                self.num_tokens -= (self.num_generations) * self.max_draft_len
+
+        if getattr(self.spec_resource_manager, "slot_manager",
+                   None) is not None:
+            # Populate slot_ids for all requests in this batch.  Used by relaxed
+            # acceptance (relaxed_delta_pool indexing), mirroring the pattern
+            # in MTPSpecMetadata.prepare().
+            eagle_slot_ids = [
+                self.spec_resource_manager.slot_manager.get_slot(rid)
+                for rid in self.request_ids
+            ]
+            eagle_slot_ids_tensor = torch.tensor(eagle_slot_ids,
+                                                 dtype=torch.int,
+                                                 pin_memory=prefer_pinned())
+            self.slot_ids[:num_seqs].copy_(eagle_slot_ids_tensor,
+                                           non_blocking=True)
 
         sa_manager = getattr(self.spec_resource_manager, 'sa_manager', None)
         if sa_manager is not None:
@@ -457,13 +526,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             layer_id: int,
             hidden_states: torch.Tensor,
             residual: Optional[torch.Tensor] = None) -> None:
+
         for i, captured_layer_id in enumerate(self.layers_to_capture):
             if captured_layer_id == layer_id:
-                num_tokens = hidden_states.shape[0]
                 to_save = hidden_states + residual if residual is not None else hidden_states
-                self.hidden_states[:num_tokens, i * self.hidden_size:(i + 1) *
-                                   self.hidden_size].copy_(to_save,
-                                                           non_blocking=True)
+                inplace_slice_copy(self.hidden_states, to_save,
+                                   i * self.hidden_size,
+                                   (i + 1) * self.hidden_size)
                 break
 
 
@@ -484,24 +553,43 @@ class Eagle3OneModelSampler(MTPSampler):
 
 
 class Eagle3OneModelWorker(SpecWorkerBase):
-    """Eagle3 one-model worker for linear tree speculative decoding.
+    """Unified one-model worker for Eagle3 and MTP Eagle speculative decoding.
 
-    For dynamic tree mode, use Eagle3OneModelDynamicTreeWorker from
-    eagle3_dynamic_tree.py instead.
+    The operating mode is determined by ``spec_config.spec_dec_mode``:
+      - EAGLE3_ONE_MODEL: multi-layer hidden states from Eagle3, apply_eagle3_fc
+        projection, independent EAGLE draft model network.
+      - MTP_EAGLE_ONE_MODEL: single last-layer hidden states, MTP layer called
+        repeatedly, supports TP-aware sampling and Mamba hybrid cache.
+
+    Where the two modes differ, ``self.is_mtp_eagle`` is used to branch.
+    For dynamic tree Eagle3, use ``Eagle3OneModelDynamicTreeWorker`` from
+    ``eagle3_dynamic_tree.py``.
     """
 
     def __init__(self,
                  spec_config: "EagleDecodingConfig",
-                 mapping: Mapping,
+                 mapping: Optional[Mapping] = None,
+                 model_config: Optional[ModelConfig] = None,
                  use_separate_draft_kv_cache: bool = False):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        # model_config is required for MTP Eagle TP / ADP / Mamba support; the
+        # Eagle3 path can leave it as None.
+        self.model_config = model_config
+
+        # Mode flag: True = MTP Eagle one-model, False = Eagle3 one-model.
+        self.is_mtp_eagle = spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+
+        # SA enhancer (common to both modes)
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if getattr(spec_config, 'sa_config', None) is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
         self.use_dynamic_tree = getattr(spec_config, 'use_dynamic_tree', False)
         self.spec_tree_manager = None
+
+        # MTP Eagle: lazily-resolved flag for Mamba hybrid cache support
+        self._is_mamba_hybrid_cache = None
 
     @property
     def max_draft_len(self) -> int:
@@ -509,16 +597,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        # Save kv_lens_cuda values separately instead of routing through
-        # prepare_for_spec_dec, which would clone the tensor and break the
-        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
         batch_size = attn_metadata.num_seqs
-        if hasattr(attn_metadata, 'kv_lens_cuda'):
-            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
-                                                                  batch_size].clone(
-                                                                  )
-        else:
-            self._saved_kv_lens_cuda = None
 
         # Save spec-dec params that the drafting loop will overwrite.
         # Without this, CUDA graph warmup's second iteration would run
@@ -546,12 +625,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
-        if self._saved_kv_lens_cuda is not None:
-            batch_size = self._saved_kv_lens_cuda.shape[0]
-            attn_metadata.kv_lens_cuda[:batch_size].copy_(
-                self._saved_kv_lens_cuda)
-            self._saved_kv_lens_cuda = None
-
         if self._saved_packed_mask is not None:
             batch_size = self._saved_packed_mask.shape[0]
             attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(
@@ -598,9 +671,24 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # Sample and accept tokens
+        # Sample and accept tokens. ``input_ids`` is required by the relaxed-
+        # acceptance path (scans for thinking-phase tokens); ignored otherwise.
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata)
+            input_ids, logits, attn_metadata, spec_metadata)
+
+        # Mamba hybrid models need state updates after token acceptance because
+        # the accepted token count affects which Mamba states are valid. The
+        # isinstance check below naturally no-ops on non-Mamba kv_cache_managers,
+        # so this is safe to run unconditionally regardless of spec mode (Eagle3
+        # over a Mamba-style draft is plausible, even if no such draft exists today).
+        if self._is_mamba_hybrid_cache is None:
+            self._is_mamba_hybrid_cache = isinstance(
+                attn_metadata.kv_cache_manager, MambaHybridCacheManager)
+        if num_gens > 0 and self._is_mamba_hybrid_cache:
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices)
 
         sa_manager = getattr(spec_metadata.spec_resource_manager, 'sa_manager',
                              None)
@@ -629,7 +717,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_metadata=spec_metadata,
             draft_model=draft_model)
 
-        # Predict draft tokens
+        # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
+        # so the post-loop restore (below) can put attn_metadata back into a
+        # state the target model expects.
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         # Get the draft KV cache manager if using separate layouts
@@ -678,28 +768,38 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    num_contexts, batch_size,
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens):
-        """Original linear draft loop (1 token per layer)."""
+        """Linear draft loop, unified for Eagle3 and MTP Eagle."""
         runtime_draft_len = spec_metadata.runtime_draft_len
+        num_gens = batch_size - num_contexts
         next_draft_tokens = []
         draft_logits_list = []
-        position_ids = inputs["position_ids"]
+        last_tokens_idx = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
+                # Run draft model (mode-specific via helper). The helper
+                # passes ``all_rank_num_tokens`` as a kwarg so the draft model
+                # handles save/restore internally (Eagle3DraftModel.forward
+                # uses try/finally); attn_metadata is left untouched here.
+                hidden_states, hidden_states_to_save = self._run_draft_forward(
+                    draft_model, inputs, spec_metadata, i)
+
+                # Compute gather_ids: on the first draft step each generation
+                # request may have accepted multiple tokens, so we index into
+                # the flattened token sequence to find the last accepted one.
+                # From step 1 onwards every sequence has length 1, so
+                # ``batch_indices_cuda`` is sufficient.
                 if i == 0:
-                    num_gens = batch_size - num_contexts
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *
                         (runtime_draft_len + 1)).long()
                     gather_ids_gen = (start_ids_gen +
                                       num_accepted_tokens[num_contexts:] - 1 +
                                       attn_metadata.num_ctx_tokens)
-                    gather_ids = torch.concat([
-                        spec_metadata.gather_ids[:num_contexts], gather_ids_gen
-                    ],
-                                              dim=0)
+                    gather_ids = torch.concat(
+                        [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
                 else:
-                    # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                     gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
                 if self.guided_decoder is not None:
@@ -708,59 +808,133 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                         num_accepted_tokens,
                                                         draft_step=i)
 
-                # Update attn_metadata.all_rank_num_tokens for attention DP
-                if original_all_rank_num_tokens is not None:
-                    if i == 0:
-                        attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
-                    elif spec_metadata.all_rank_num_seqs is not None:
-                        attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+                # Compute logits.
+                # MTP Eagle: shared_head of the MTP layer, with optional
+                #   ADP+LM-head-TP padding to ``max_num_requests`` so every TP
+                #   rank produces logits of the same shape.
+                # Eagle3: logits_processor of the EAGLE draft model.
+                use_lm_head_tp_in_adp = (
+                    self.is_mtp_eagle and self.model_config is not None
+                    and self.model_config.mapping.enable_attention_dp
+                    and getattr(self.model_config.mapping,
+                                'enable_lm_head_tp_in_adp', False))
+                if self.is_mtp_eagle:
+                    if use_lm_head_tp_in_adp:
+                        hidden_states_gathered = hidden_states[gather_ids]
+                        token_count = hidden_states_gathered.view(
+                            -1, hidden_states_gathered.shape[-1]).shape[0]
+                        max_num_requests = spec_metadata.max_num_requests
+                        pad_len = max_num_requests - token_count
+                        if pad_len > 0:
+                            padded_hidden_states = F.pad(
+                                hidden_states_gathered.view(
+                                    -1, hidden_states_gathered.shape[-1]),
+                                (0, 0, 0, pad_len),
+                                mode="constant",
+                                value=0)
+                        elif pad_len == 0:
+                            padded_hidden_states = hidden_states_gathered.view(
+                                -1, hidden_states_gathered.shape[-1])
+                        else:
+                            raise ValueError(
+                                "Eagle3OneModelWorker (MTP Eagle mode): "
+                                "token_count > max_num_requests, which is not supported"
+                            )
+                        logits = draft_model.mtp_layers[0].shared_head(
+                            padded_hidden_states, draft_model.lm_head,
+                            attn_metadata, True)
+                    else:
+                        logits = draft_model.mtp_layers[0].shared_head(
+                            hidden_states[gather_ids], draft_model.lm_head,
+                            attn_metadata, True)
+                else:
+                    logits = draft_model.logits_processor(
+                        hidden_states[gather_ids], draft_model.lm_head,
+                        attn_metadata, True)
 
-                hidden_states, hidden_states_to_save = draft_model.model(
-                    **inputs)
-
-                # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
-                # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
-                # then the following step can use regular decoding mode to generate 1 tokens per step.
-                # Currently the spec-dec mask for chained tree is not implemented yet.
-                # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
-                attn_metadata.use_spec_decoding = False
-
-                logits = draft_model.logits_processor(hidden_states[gather_ids],
-                                                      draft_model.lm_head,
-                                                      attn_metadata, True)
                 if self.guided_decoder is not None:
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    self.guided_decoder.execute_draft_batch(logits,
-                                                            d2t,
-                                                            draft_step=i)
+                    if self.is_mtp_eagle:
+                        self.guided_decoder.execute_draft_batch(logits,
+                                                                draft_step=i)
+                    else:
+                        d2t = getattr(draft_model.model, "d2t", None)
+                        self.guided_decoder.execute_draft_batch(logits,
+                                                                d2t,
+                                                                draft_step=i)
 
-                if spec_metadata.use_rejection_sampling:
+                # Sample the next draft token.
+                # MTP Eagle: TP-aware sampler; when ADP+LM-head-TP is active
+                #   logits are padded to max_num_requests across TP ranks, so
+                #   the result must be trimmed back to token_count.
+                # Eagle3: simple greedy sampling; d2t remaps vocab indices when
+                #   the draft model uses a compressed vocabulary.
+                if self.is_mtp_eagle:
+                    if use_lm_head_tp_in_adp:
+                        mapping_lm_head_tp = draft_model.mtp_layers[
+                            0].shared_head.mapping_lm_head_tp
+                        new_draft_token = self.draft_sampler(
+                            logits, mapping_lm_head_tp)
+                        new_draft_token = new_draft_token[:token_count]
+                    else:
+                        new_draft_token = self.draft_sampler(logits)
+                else:
+                    d2t = getattr(draft_model.model, "d2t", None)
+                    new_draft_token = self._draft_sampler_greedy(logits, d2t)
+
+                # Stash unpadded Eagle3 draft logits for rejection sampling on
+                # the next iteration. MTP Eagle's logits may be ADP-padded to
+                # max_num_requests, so we skip them here.
+                if not self.is_mtp_eagle and spec_metadata.use_rejection_sampling:
                     draft_logits_list.append(logits.clone())
 
-                new_draft_token = self.draft_decoder(logits, draft_model)
                 next_draft_tokens.append(new_draft_token)
-                # update inputs
-                hidden_states = hidden_states_to_save[gather_ids]
-                position_ids = inputs["position_ids"][gather_ids] + 1
-                # update attn_metadata
+
+                # Update hidden states for the next iteration.
+                # MTP Eagle: the MTP layer returns a single tensor; slice by
+                #   gather_ids to get one hidden state per request.
+                # Eagle3: the EAGLE draft model returns a secondary
+                #   ``hidden_states_to_save`` specifically for this purpose.
+                if self.is_mtp_eagle:
+                    hidden_states = hidden_states[gather_ids]
+                else:
+                    hidden_states = hidden_states_to_save[gather_ids]
+                position_ids = (_select_mtp_position_ids(
+                    inputs["position_ids"], gather_ids) + 1)
+
+                # Update attn_metadata for the next iteration.
                 if i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
-                    # cannot run generation if there is no kv cache
-                    if inputs["attn_metadata"].kv_cache_manager is not None:
+                    has_kv_cache = inputs[
+                        "attn_metadata"].kv_cache_manager is not None
+                    if has_kv_cache:
                         attn_metadata.host_request_types[:attn_metadata.
                                                          num_contexts].fill_(1)
                         attn_metadata.num_contexts = 0
-                    # update kv_lens_cuda
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                             runtime_draft_len -
                             num_accepted_tokens[num_contexts:])
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
-                elif hasattr(attn_metadata, 'kv_lens_cuda'):
-                    attn_metadata.kv_lens_cuda[:batch_size] += 1
-                # support attention dp
+
+                    if has_kv_cache:
+                        self._prepare_flash_mla_generation_layout(
+                            attn_metadata, num_contexts, batch_size)
+                    if hasattr(attn_metadata, 'kv_lens_cuda'):
+                        attn_metadata.update_for_spec_dec()
+
+                    # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
+                    # tokens in the first draft step (attention runs in spec-dec
+                    # mode), then 1 token per step in subsequent iterations.
+                    # Disable spec_decoding here so the masks/positions stay
+                    # correct on subsequent iters.
+                    attn_metadata.use_spec_decoding = False
+                else:
+                    if hasattr(attn_metadata, 'kv_lens_cuda'):
+                        attn_metadata.kv_lens_cuda[:batch_size] += 1
+                        attn_metadata.update_for_spec_dec()
+
                 inputs = {
                     "input_ids": new_draft_token,
                     "position_ids": position_ids,
@@ -786,52 +960,219 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         return next_draft_tokens
 
+    def _get_step_all_rank_num_tokens(self, spec_metadata, step_idx: int):
+        """Pick the right ``all_rank_num_tokens`` for this draft iteration.
+
+        Step 0 uses ``spec_metadata.all_rank_num_tokens``; subsequent steps
+        use ``spec_metadata.subseq_all_rank_num_tokens`` since every sequence
+        contributes a single token per iteration.
+        """
+        return (spec_metadata.all_rank_num_tokens
+                if step_idx == 0 else spec_metadata.subseq_all_rank_num_tokens)
+
+    def _run_draft_forward(self, draft_model, inputs, spec_metadata,
+                           step_idx: int):
+        """Invoke the draft model for one iteration, branching on mode.
+
+        ``all_rank_num_tokens`` is passed as a kwarg in both modes. For MTP
+        Eagle it goes directly to ``mtp_layers[0]``; for Eagle3 it goes to
+        ``Eagle3DraftModel.forward`` which guards it with a try/finally so
+        attn_metadata sees the original value on return.
+        """
+        all_rank_num_tokens = self._get_step_all_rank_num_tokens(
+            spec_metadata, step_idx)
+
+        if self.is_mtp_eagle:
+            hidden_states = draft_model.mtp_layers[0](
+                embed_tokens=draft_model.embed_tokens,
+                all_rank_num_tokens=all_rank_num_tokens,
+                **inputs)
+            return hidden_states, None
+
+        inputs["all_rank_num_tokens"] = all_rank_num_tokens
+        hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+        return hidden_states, hidden_states_to_save
+
+    def _prepare_flash_mla_generation_layout(self, attn_metadata, num_contexts,
+                                             batch_size):
+        """Reorder ``kv_block_ids_per_seq`` so gen requests precede context.
+
+        Flash MLA on first-step expects the layout used during normal
+        generation; both Eagle3 and MTP Eagle hit this when context requests
+        share the batch with gen requests.
+        """
+        if num_contexts <= 0 or not attn_metadata.enable_flash_mla:
+            return
+        reorder_block_ids_per_seq = torch.cat([
+            attn_metadata.kv_block_ids_per_seq[num_contexts:batch_size],
+            attn_metadata.kv_block_ids_per_seq[:num_contexts]
+        ])
+        attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
+            reorder_block_ids_per_seq, non_blocking=True)
+
+    @torch.compile(options={"max-autotune": True})
+    def _get_local_max_and_combined(self, logits, mapping_lm_tp=None):
+        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
+        vocab_per_rank = logits.shape[-1]
+        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else \
+            self.model_config.mapping
+        max_index_per_rank = local_argmax.type(
+            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
+        max_index_per_rank_float = max_index_per_rank.float()
+        local_max_values_float32 = local_max_values.float()
+        combined = torch.stack(
+            [max_index_per_rank_float, local_max_values_float32],
+            dim=-1).flatten(-2)
+        return combined
+
+    @torch.compile(options={"max-autotune": True})
+    def _get_draft_tokens_from_gathered(self, gathered):
+        gathered_indices_float = gathered[..., 0::2]
+        gathered_values_float = gathered[..., 1::2]
+        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
+        draft_tokens = torch.gather(gathered_indices_float, -1,
+                                    max_indices).squeeze(-1).type(torch.int32)
+        return draft_tokens
+
+    def draft_sampler(
+        self,
+        logits: torch.Tensor,
+        mapping_lm_head_tp=None,
+    ):
+        """TP-aware greedy draft token sampler (MTP Eagle path).
+
+        Falls back to simple argmax when no tensor parallelism is active or
+        when only attention DP is enabled without LM-head TP.
+        """
+        if (self.model_config is not None
+                and hasattr(self.model_config, 'mapping')
+                and self.model_config.mapping.tp_size > 1
+                and not self.model_config.mapping.enable_attention_dp):
+            combined = self._get_local_max_and_combined(logits)
+            gathered = allgather(combined, self.model_config.mapping, dim=-1)
+            return self._get_draft_tokens_from_gathered(gathered)
+        elif (self.model_config is not None
+              and hasattr(self.model_config, 'mapping')
+              and self.model_config.mapping.tp_size > 1
+              and self.model_config.mapping.enable_lm_head_tp_in_adp):
+            combined = self._get_local_max_and_combined(logits,
+                                                        mapping_lm_head_tp)
+            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
+            batch_size = logits.shape[0]
+            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
+            gathered = gathered.view(mapping_lm_head_tp.tp_size,
+                                     local_batch_size, -1)
+            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
+            return self._get_draft_tokens_from_gathered(sliced_gathered)
+        else:
+            return self._draft_sampler_greedy(logits)
+
+    @torch.compile(options={"max-autotune": True})
+    def _topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
+                     spec_metadata):
+        topk_value, topk_indices = torch.topk(gen_logprobs,
+                                              k=self.spec_config.relaxed_topk,
+                                              dim=-1)
+        topk_indices = topk_indices.reshape(num_gens, mtp_num_modules + 1,
+                                            self.spec_config.relaxed_topk)
+        topk_value = topk_value.reshape(num_gens, mtp_num_modules + 1,
+                                        self.spec_config.relaxed_topk)
+        draft_tokens = spec_metadata.draft_tokens.reshape(
+            num_gens, mtp_num_modules)
+        return topk_value, topk_indices, draft_tokens
+
+    @torch.compile(options={"max-autotune": True})
+    def _process_generation_logits(self, logits, num_contexts):
+        gen_logits = logits[num_contexts:]
+        gen_logprobs = torch.softmax(gen_logits, dim=-1)
+        return gen_logprobs
+
     def sample_and_accept_draft_tokens(
         self,
+        input_ids: torch.IntTensor,
         logits: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: Eagle3OneModelSpecMetadata,
     ):
+        """Sample the golden token and verify previously proposed draft tokens.
+
+        ``input_ids`` is scanned for thinking-phase tokens when relaxed
+        acceptance is enabled (both Eagle3 and MTP Eagle); ignored otherwise.
+        """
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        # Linear mode: reshape draft tokens for base implementation
+        runtime_draft_len = spec_metadata.runtime_draft_len
+
+        if getattr(self.spec_config, 'use_relaxed_acceptance_for_thinking',
+                   False):
+            # Relaxed acceptance — common path for Eagle3 and MTP Eagle.
+            # Accepts draft tokens that fall within the top-K candidates of the
+            # target distribution during the thinking phase.
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+
+            accepted_tokens = torch.ones((batch_size, runtime_draft_len + 1),
+                                         dtype=torch.int,
+                                         device=logits.device)
+            num_accepted_tokens = torch.ones(batch_size,
+                                             dtype=torch.int,
+                                             device=logits.device)
+
+            resource_manager = spec_metadata.spec_resource_manager
+            relaxed_delta_pool = resource_manager.relaxed_delta_pool
+
+            # Context phase: detect thinking tokens and update the delta pool
+            con_logits = logits[:num_contexts]
+            con_target_tokens = torch.argmax(con_logits, dim=-1)
+            accepted_tokens[:num_contexts, 0] = con_target_tokens[:num_contexts]
+            last_tokens_idx_for_thinking = torch.cumsum(
+                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
+            ctx_is_think = (ctx_input_ids ==
+                            self.spec_config.begin_thinking_phase_token).int()
+            ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
+            ctx_last_cumsum = ctx_is_think_cumsum[
+                last_tokens_idx_for_thinking[:num_contexts]]
+            ctx_think_tokens_num = torch.diff(
+                ctx_last_cumsum,
+                dim=0,
+                prepend=torch.zeros(1,
+                                    dtype=torch.int,
+                                    device=ctx_last_cumsum.device))
+            ctx_delta = (ctx_think_tokens_num
+                         >= 1).int() * self.spec_config.relaxed_delta
+            ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
+            relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
+
+            # Generation phase: top-k logprobs + relaxed acceptance op
+            gen_logprobs = self._process_generation_logits(logits, num_contexts)
+            topk_value, topk_indices, draft_tokens = self._topk_kernel(
+                gen_logprobs, num_gens, runtime_draft_len, spec_metadata)
+
+            accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
+                spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
+                relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
+                runtime_draft_len, batch_size, num_contexts,
+                self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
+                self.spec_config.begin_thinking_phase_token,
+                self.spec_config.end_thinking_phase_token)
+
+            num_accepted_tokens = self._apply_force_accepted_tokens(
+                num_accepted_tokens, num_contexts, runtime_draft_len)
+
+            return accepted_tokens, num_accepted_tokens
+
+        # Strict acceptance — common path for Eagle3 and MTP Eagle. Both modes
+        # use runtime_draft_len for dynamic draft length support.
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
         draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens,
-            spec_metadata.runtime_draft_len) if num_gens > 0 else torch.empty(
-                0,
-                spec_metadata.runtime_draft_len,
-                dtype=torch.int,
-                device=logits.device)
+            num_gens, runtime_draft_len) if num_gens > 0 else torch.empty(
+                0, runtime_draft_len, dtype=torch.int, device=logits.device)
         return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
                                          batch_size, spec_metadata)
-
-    def draft_decoder(
-        self,
-        logits: torch.Tensor,
-        draft_model: nn.Module,
-    ):
-        '''
-        Sampling draft tokens with support for non-greedy sampling.
-
-        Args:
-            logits: torch.Tensor
-                [num_tokens, vocab_size]
-                Logits produced by the draft model.
-            draft_model: nn.Module
-                The draft model.
-
-        Returns:
-            draft_tokens: torch.Tensor
-                [batch_size * max_draft_len]
-                Draft token ids. Flattened.
-        '''
-
-        d2t = getattr(draft_model.model, "d2t", None)
-        draft_tokens = self._draft_sampler_greedy(logits, d2t)
-
-        return draft_tokens
 
     def prepare_1st_drafter_inputs(
         self,
@@ -843,15 +1184,24 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         spec_metadata: Eagle3OneModelSpecMetadata,
         draft_model: nn.Module,
     ):
+        """Prepare inputs for the first draft model forward.
+
+        Branching:
+          - Eagle3: applies ``apply_eagle3_fc`` on multi-layer concatenated
+            hidden states.
+          - MTP Eagle: uses ``hidden_states`` directly (single last layer);
+            no FC projection.
+        """
         num_contexts = attn_metadata.num_contexts
         num_tokens = input_ids.shape[0]
 
-        # prepare hidden states
-        hidden_size_up = spec_metadata.hidden_size * len(
-            spec_metadata.layers_to_capture)
-        hidden_states = spec_metadata.hidden_states[:num_tokens, :
-                                                    hidden_size_up]
-        hidden_states = draft_model.apply_eagle3_fc(hidden_states)
+        if not self.is_mtp_eagle:
+            # Eagle3: project the multi-layer concatenated hidden states.
+            hidden_size_up = spec_metadata.hidden_size * len(
+                spec_metadata.layers_to_capture)
+            hidden_states = spec_metadata.hidden_states[:num_tokens, :
+                                                        hidden_size_up]
+            hidden_states = draft_model.apply_eagle3_fc(hidden_states)
 
         # context
         input_ids_ctx = self._prepare_context_input_ids(
@@ -872,3 +1222,25 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
+
+
+class MTPEagleWorker(Eagle3OneModelWorker):
+    """Backward-compatible alias for ``Eagle3OneModelWorker`` in MTP Eagle mode.
+
+    The constructor matches the historical positional signature
+    ``(spec_config, model_config, use_separate_draft_kv_cache)`` so callers
+    that import ``MTPEagleWorker`` from ``mtp.py`` or instantiate it directly
+    keep working. All logic is inherited from :class:`Eagle3OneModelWorker`.
+    """
+
+    def __init__(self,
+                 spec_config,
+                 model_config: Optional[ModelConfig] = None,
+                 use_separate_draft_kv_cache: bool = False):
+        super().__init__(
+            spec_config,
+            mapping=None,
+            model_config=model_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+        # Preserved for callers/tests that still expect this attribute.
+        self.is_thop = False

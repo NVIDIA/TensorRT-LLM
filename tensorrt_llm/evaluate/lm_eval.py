@@ -665,20 +665,34 @@ class LmEvalEvaluator(Evaluator):
     def command_harness(cls, ctx, **kwargs):
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
-        evaluator = cls(dataset_path=kwargs.pop("dataset_path", None),
-                        num_samples=kwargs.pop("num_samples", None),
-                        random_seed=kwargs.pop("random_seed", 0),
-                        apply_chat_template=kwargs.pop("apply_chat_template",
-                                                       False),
-                        fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn",
-                                                        False),
-                        system_prompt=kwargs.pop("system_prompt", None),
-                        is_multimodal=kwargs.pop("is_multimodal", False),
-                        chat_template_kwargs=kwargs.pop("chat_template_kwargs",
-                                                        None),
-                        log_samples=kwargs.pop("log_samples", False),
-                        output_path=kwargs.pop("output_path", None),
-                        output_dir=kwargs.pop("output_dir", None))
+        # Resolve the post-processor: accept a callable (already-bound) or the
+        # string key "strip_thinking_mmmu" coming from CLI flags.
+        post_process_fn = kwargs.pop("post_process_fn", None)
+        if isinstance(post_process_fn, str):
+            if post_process_fn == "strip_thinking_mmmu":
+                from .post_processing import \
+                    strip_thinking_and_extract_mmmu_answer
+                post_process_fn = strip_thinking_and_extract_mmmu_answer
+            else:
+                raise click.BadParameter(
+                    f"Unknown --post_process_fn={post_process_fn!r}; expected 'strip_thinking_mmmu'."
+                )
+
+        evaluator = cls(
+            dataset_path=kwargs.pop("dataset_path", None),
+            num_samples=kwargs.pop("num_samples", None),
+            random_seed=kwargs.pop("random_seed", 0),
+            apply_chat_template=kwargs.pop("apply_chat_template", False),
+            fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn", False),
+            system_prompt=kwargs.pop("system_prompt", None),
+            is_multimodal=kwargs.pop("is_multimodal", False),
+            chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
+            log_samples=kwargs.pop("log_samples", False),
+            output_path=kwargs.pop("output_path", None),
+            output_dir=kwargs.pop("output_dir", None),
+            post_process_fn=post_process_fn,
+            preserve_caller_max_tokens=kwargs.pop("preserve_caller_max_tokens",
+                                                  False))
         # Optional sampling overrides (default: greedy, as before).
         # When any of temperature / top_p / top_k / seed is set, the wrapper
         # uses CLI values in preference to the task yaml's gen_kwargs so
@@ -1252,6 +1266,21 @@ class MMMU(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="Directory to save the task infos.")
+    @click.option(
+        "--preserve_caller_max_tokens",
+        is_flag=True,
+        default=False,
+        help="Keep --max_output_length when larger than lm-eval task default "
+        "(MMMU's max_gen_toks=512 is too small for thinking models that "
+        "produce chain-of-thought before the answer).")
+    @click.option(
+        "--post_process_fn",
+        type=click.Choice(["strip_thinking_mmmu"]),
+        default=None,
+        help="Per-sample post-processor. 'strip_thinking_mmmu' strips "
+        "<think>...</think> and then runs the MMMU answer extractor — needed "
+        "for thinking models (Kimi K2.5, Step3p7) whose CoT output the "
+        "default lm-eval regex cannot parse.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
