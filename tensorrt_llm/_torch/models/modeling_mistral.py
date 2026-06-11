@@ -39,7 +39,7 @@ from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  BaseMultimodalInputProcessor, ContentFormat,
                                  ExtraProcessedInputs,
@@ -62,16 +62,8 @@ class MistralAttention(Attention):
     ):
         config = model_config.pretrained_config
         rope_params = RopeParams.from_config(config)
-        rope_params_section = getattr(config, "rope_scaling", None) or getattr(
-            config, "rope_parameters", None)
 
-        rope_type = getattr(
-            rope_params_section, "rope_type",
-            None) or (rope_params_section.get("rope_type") if isinstance(
-                rope_params_section, dict) else None) or getattr(
-                    config, "rope_type", None)
-
-        if rope_type == "yarn":
+        if rope_params.scale_type == RotaryScalingType.yarn:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.yarn,
                 rope=rope_params,
