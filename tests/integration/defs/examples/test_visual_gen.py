@@ -21,7 +21,6 @@ import os
 import random
 import subprocess
 import sys
-import textwrap
 import time
 import urllib.request
 import zipfile
@@ -114,16 +113,24 @@ VBENCH_DIMENSIONS = [
 
 # Golden VBench scores from HF reference video (WAN 2.1 1.3B); TRT-LLM is compared against these.
 VBENCH_WAN_GOLDEN_SCORES = {
-    "subject_consistency": 0.9381,
-    "background_consistency": 0.9535,
-    "motion_smoothness": 0.9923,
+    "subject_consistency": 0.8907,
+    "background_consistency": 0.9274,
+    "motion_smoothness": 0.9818,
     "dynamic_degree": 1.0000,
-    "aesthetic_quality": 0.5033,
-    "imaging_quality": 0.3033,
+    "aesthetic_quality": 0.2928,
+    "imaging_quality": 0.3812,
 }
 
 
 # TODO: Reference scores from bf16 baseline runs
+VBENCH_WAN22_BF16_GOLDEN_SCORES = {
+    "subject_consistency": 0.9103,
+    "background_consistency": 0.9516,
+    "motion_smoothness": 0.9693,
+    "dynamic_degree": 0.0000,
+    "aesthetic_quality": 0.6821,
+    "imaging_quality": 0.3993,
+}
 VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES = {
     "subject_consistency": 0.9173,
     "background_consistency": 0.9717,
@@ -141,24 +148,6 @@ VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES = {
     "imaging_quality": 0.7142,
 }
 
-VBENCH_LTX2_BF16_GOLDEN_SCORES = {
-    "subject_consistency": 0.9683,
-    "background_consistency": 0.9469,
-    "motion_smoothness": 0.9941,
-    "dynamic_degree": 1.0000,
-    "aesthetic_quality": 0.5097,
-    "imaging_quality": 0.7309,
-}
-
-VBENCH_LTX2_FP8_GOLDEN_SCORES = {
-    "subject_consistency": 0.9817,
-    "background_consistency": 0.9704,
-    "motion_smoothness": 0.9918,
-    "dynamic_degree": 0.0000,
-    "aesthetic_quality": 0.6062,
-    "imaging_quality": 0.6546,
-}
-
 # LTX-2 Two-Stage configuration
 LTX2_UPSAMPLER_SUBPATH = "LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors"
 LTX2_DISTILLED_LORA_SUBPATH = "LTX-2/ltx-2-19b-distilled-lora-384.safetensors"
@@ -171,12 +160,12 @@ LTX2_TWO_STAGE_GUIDANCE_SCALE = 4.0
 # Golden VBench scores for two-stage pipeline variants.
 # Initially None — first CI run is a baseline that prints scores for capture.
 VBENCH_LTX2_TWO_STAGE_BF16_GOLDEN_SCORES = {
-    "subject_consistency": 0.9785,
-    "background_consistency": 0.9498,
-    "motion_smoothness": 0.9894,
-    "dynamic_degree": 1.0,
-    "aesthetic_quality": 0.6165,
-    "imaging_quality": 0.6948,
+    "subject_consistency": 0.9877,
+    "background_consistency": 0.9601,
+    "motion_smoothness": 0.9952,
+    "dynamic_degree": 0.0,
+    "aesthetic_quality": 0.5839,
+    "imaging_quality": 0.5404,
 }
 
 VBENCH_LTX2_TWO_STAGE_FP8_GOLDEN_SCORES = {
@@ -204,12 +193,9 @@ AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", 
 
 @pytest.fixture(scope="session")
 def _visual_gen_deps(llm_venv):
-    """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
+    """Install Python deps once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by save_video() for MP4 encoding
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
 @pytest.fixture(scope="session")
@@ -325,6 +311,12 @@ def _skip_if_missing(path, label, is_dir=False):
     exists = os.path.isdir(path) if is_dir else os.path.exists(path)
     if not exists:
         pytest.skip(f"{label} not found: {path}")
+
+
+def _visual_gen_output_path(llm_venv, output_subdir):
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", output_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
 
 
 def _extract_visual_gen_lpips_golden_media(tmp_path):
@@ -610,6 +602,48 @@ def _generate_wan_lpips_video(
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=frame_rate)
 
 
+@pytest.fixture(scope="session")
+def wan21_bf16_video_path(_visual_gen_deps, llm_venv):
+    output_path = _visual_gen_output_path(llm_venv, "wan21_bf16")
+    if os.path.isfile(output_path):
+        return output_path
+    _generate_wan_lpips_video(
+        _lpips_model_path("Wan2.1-T2V-1.3B-Diffusers"),
+        output_path,
+        WAN21_LPIPS_PROMPT,
+        WAN21_LPIPS_NEGATIVE_PROMPT,
+        WAN21_LPIPS_HEIGHT,
+        WAN21_LPIPS_WIDTH,
+        WAN21_LPIPS_NUM_FRAMES,
+        WAN21_LPIPS_NUM_INFERENCE_STEPS,
+        WAN21_LPIPS_GUIDANCE_SCALE,
+        WAN21_LPIPS_SEED,
+        WAN_LPIPS_FRAME_RATE,
+    )
+    return output_path
+
+
+@pytest.fixture(scope="session")
+def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
+    output_path = _visual_gen_output_path(llm_venv, "wan22_bf16")
+    if os.path.isfile(output_path):
+        return output_path
+    _generate_wan_lpips_video(
+        _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
+        output_path,
+        WAN22_LPIPS_PROMPT,
+        WAN22_LPIPS_NEGATIVE_PROMPT,
+        WAN22_LPIPS_HEIGHT,
+        WAN22_LPIPS_WIDTH,
+        WAN22_LPIPS_NUM_FRAMES,
+        WAN22_LPIPS_NUM_INFERENCE_STEPS,
+        WAN22_LPIPS_GUIDANCE_SCALE,
+        WAN22_LPIPS_SEED,
+        WAN22_LPIPS_FRAME_RATE,
+    )
+    return output_path
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_flux1_lpips_against_golden(tmp_path):
     generated_path = tmp_path / "flux1_generated.png"
@@ -647,41 +681,25 @@ def test_flux2_lpips_against_golden(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx2_lpips_against_golden(tmp_path):
-    generated_path = tmp_path / "ltx2_generated.mp4"
+def test_ltx2_lpips_against_golden(tmp_path, ltx2_two_stage_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "ltx2_lpips_golden_video.mp4", "LTX-2 LPIPS golden video"
     )
-    _generate_ltx2_lpips_video(generated_path)
     score = _run_lpips_eval(
         tmp_path,
         "ltx2",
         "video",
         LTX2_T2V_PROMPT,
         golden_path,
-        generated_path,
+        ltx2_two_stage_bf16_video_path,
     )
     _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_wan21_t2v_lpips_against_golden(tmp_path):
-    generated_path = tmp_path / "wan21_t2v_generated.mp4"
+def test_wan21_t2v_lpips_against_golden(tmp_path, wan21_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "wan21_t2v_lpips_golden_video.mp4", "Wan 2.1 LPIPS golden video"
-    )
-    _generate_wan_lpips_video(
-        _lpips_model_path("Wan2.1-T2V-1.3B-Diffusers"),
-        generated_path,
-        WAN21_LPIPS_PROMPT,
-        WAN21_LPIPS_NEGATIVE_PROMPT,
-        WAN21_LPIPS_HEIGHT,
-        WAN21_LPIPS_WIDTH,
-        WAN21_LPIPS_NUM_FRAMES,
-        WAN21_LPIPS_NUM_INFERENCE_STEPS,
-        WAN21_LPIPS_GUIDANCE_SCALE,
-        WAN21_LPIPS_SEED,
-        WAN_LPIPS_FRAME_RATE,
     )
     score = _run_lpips_eval(
         tmp_path,
@@ -689,29 +707,15 @@ def test_wan21_t2v_lpips_against_golden(tmp_path):
         "video",
         WAN21_LPIPS_PROMPT,
         golden_path,
-        generated_path,
+        wan21_bf16_video_path,
     )
     _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_wan22_t2v_lpips_against_golden(tmp_path):
-    generated_path = tmp_path / "wan22_t2v_generated.mp4"
+def test_wan22_t2v_lpips_against_golden(tmp_path, wan22_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
-    )
-    _generate_wan_lpips_video(
-        _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
-        generated_path,
-        WAN22_LPIPS_PROMPT,
-        WAN22_LPIPS_NEGATIVE_PROMPT,
-        WAN22_LPIPS_HEIGHT,
-        WAN22_LPIPS_WIDTH,
-        WAN22_LPIPS_NUM_FRAMES,
-        WAN22_LPIPS_NUM_INFERENCE_STEPS,
-        WAN22_LPIPS_GUIDANCE_SCALE,
-        WAN22_LPIPS_SEED,
-        WAN22_LPIPS_FRAME_RATE,
     )
     score = _run_lpips_eval(
         tmp_path,
@@ -719,28 +723,19 @@ def test_wan22_t2v_lpips_against_golden(tmp_path):
         "video",
         WAN22_LPIPS_PROMPT,
         golden_path,
-        generated_path,
+        wan22_bf16_video_path,
     )
     _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
 
 
-@pytest.fixture(scope="session")
-def wan_trtllm_video_path(_visual_gen_deps, llm_venv, llm_root):
-    """Generate input video via models/wan_t2v.py and return path to trtllm_output.mp4."""
-    return _generate_wan_video(llm_venv, llm_root, WAN_T2V_MODEL_SUBPATH, "wan")
-
-
-def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
-    """Generate a video with examples/visual_gen/models/wan_t2v.py for a given checkpoint.
-
-    The slim example hardcodes prompt/H/W/frames (matching WAN_T2V_* constants
-    above), so this helper only synthesizes a VisualGenArgs YAML for engine
-    config (parallelism / attention / cuda graph) and passes it via
-    ``--visual_gen_args``.
+def _generate_wan_video(llm_venv, model_subpath, output_subdir):
+    """Generate a WAN video for a given model checkpoint.
 
     Returns the path to the generated .mp4, or calls pytest.skip if the model
     is not found under LLM_MODELS_ROOT.
     """
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, model_subpath)
     if not os.path.isdir(model_path):
@@ -754,50 +749,45 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
     if os.path.isfile(output_path):
         return output_path
 
-    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_t2v.py")
-    assert os.path.isfile(script_path), f"Visual gen script not found: {script_path}"
-
-    cfg_size = 2 if torch.cuda.device_count() >= 2 else 1
-    visual_gen_args_yaml = os.path.join(out_dir, "visual_gen_args.yaml")
-    with open(visual_gen_args_yaml, "w") as f:
-        f.write(
-            textwrap.dedent(
-                f"""\
-                attention_config:
-                  backend: VANILLA
-                parallel_config:
-                  cfg_size: {cfg_size}
-                  ulysses_size: 1
-                cuda_graph_config:
-                  enable: false
-                """
-            )
+    visual_gen_args = VisualGenArgs(
+        attention_config={"backend": "VANILLA"},
+        parallel_config={"cfg_size": 2 if torch.cuda.device_count() >= 2 else 1},
+        torch_compile_config={"enable": False},
+        compilation_config={"skip_warmup": True},
+    )
+    visual_gen = VisualGen(model=model_path, args=visual_gen_args)
+    try:
+        frame_rate = visual_gen.default_params.frame_rate
+        output = visual_gen.generate(
+            inputs=WAN_T2V_PROMPT,
+            params=VisualGenParams(
+                height=WAN_T2V_HEIGHT,
+                width=WAN_T2V_WIDTH,
+                seed=42,
+                num_frames=WAN_T2V_NUM_FRAMES,
+                frame_rate=frame_rate,
+            ),
         )
+        assert output.error is None, f"unexpected error on WAN run: {output.error}"
+        assert output.video is not None
+        _save_lpips_video_mp4(output.video, output_path, frame_rate=frame_rate)
+    finally:
+        visual_gen.shutdown()
 
-    cmd = [
-        script_path,
-        "--model",
-        model_path,
-        "--visual_gen_args",
-        visual_gen_args_yaml,
-        "--output_path",
-        output_path,
-    ]
-    venv_check_call(llm_venv, cmd)
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
     return output_path
 
 
 @pytest.fixture(scope="session")
-def wan22_a14b_fp8_video_path(_visual_gen_deps, llm_venv, llm_root):
+def wan22_a14b_fp8_video_path(_visual_gen_deps, llm_venv):
     """Generate video with Wan 2.2 A14B FP8 checkpoint."""
-    return _generate_wan_video(llm_venv, llm_root, WAN22_A14B_FP8_MODEL_SUBPATH, "wan22_fp8")
+    return _generate_wan_video(llm_venv, WAN22_A14B_FP8_MODEL_SUBPATH, "wan22_fp8")
 
 
 @pytest.fixture(scope="session")
-def wan22_a14b_nvfp4_video_path(_visual_gen_deps, llm_venv, llm_root):
+def wan22_a14b_nvfp4_video_path(_visual_gen_deps, llm_venv):
     """Generate video with Wan 2.2 A14B NVFP4 checkpoint."""
-    return _generate_wan_video(llm_venv, llm_root, WAN22_A14B_NVFP4_MODEL_SUBPATH, "wan22_nvfp4")
+    return _generate_wan_video(llm_venv, WAN22_A14B_NVFP4_MODEL_SUBPATH, "wan22_nvfp4")
 
 
 def _linear_type_to_quant_config(linear_type):
@@ -808,85 +798,6 @@ def _linear_type_to_quant_config(linear_type):
         "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
     }
     return mapping.get(linear_type)
-
-
-def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
-    """Generate a video using the LTX-2 Python API directly.
-
-    Returns the path to the generated .mp4, or calls pytest.skip if the model
-    or text encoder is not found under LLM_MODELS_ROOT.
-    """
-    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
-
-    scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
-    text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
-    if not os.path.isfile(model_path):
-        pytest.skip(
-            f"LTX-2 checkpoint not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {LTX2_MODEL_CHECKPOINT_PATH} under models root)"
-        )
-    if not os.path.isdir(text_encoder_path):
-        pytest.skip(
-            f"LTX-2 text encoder not found: {text_encoder_path} "
-            f"(set LLM_MODELS_ROOT or place {LTX2_TEXT_ENCODER_SUBPATH} under scratch)"
-        )
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", output_subdir)
-    os.makedirs(out_dir, exist_ok=True)
-    output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
-    if os.path.isfile(output_path):
-        return output_path
-
-    vg_kwargs = dict(pipeline_config={"text_encoder_path": text_encoder_path})
-    quant_config = _linear_type_to_quant_config(linear_type)
-    if quant_config is not None:
-        vg_kwargs["quant_config"] = quant_config
-    if torch.cuda.device_count() >= 2:
-        vg_kwargs["parallel_config"] = {"cfg_size": 2}
-
-    visual_gen_args = VisualGenArgs(**vg_kwargs)
-    visual_gen = VisualGen(model=model_path, args=visual_gen_args)
-
-    try:
-        params = VisualGenParams(
-            height=LTX2_T2V_HEIGHT,
-            width=LTX2_T2V_WIDTH,
-            num_frames=LTX2_T2V_NUM_FRAMES,
-            num_inference_steps=LTX2_T2V_STEPS,
-            guidance_scale=LTX2_T2V_GUIDANCE_SCALE,
-            max_sequence_length=LTX2_T2V_MAX_SEQ_LEN,
-            seed=LTX2_T2V_SEED,
-            frame_rate=LTX2_T2V_FRAME_RATE,
-            negative_prompt=LTX2_T2V_NEGATIVE_PROMPT,
-        )
-        output = visual_gen.generate(inputs=LTX2_T2V_PROMPT, params=params)
-        assert output.error is None, f"unexpected error on LTX-2 run: {output.error}"
-        assert output.video is not None
-        assert output.frame_rate == LTX2_T2V_FRAME_RATE
-        assert output.audio_sample_rate is not None and output.audio_sample_rate > 0
-        assert output.metrics is not None
-        assert output.metrics.generation > 0
-        assert output.metrics.denoise > 0
-        assert output.metrics.pre_denoise >= 0
-        assert output.metrics.post_denoise >= 0
-        output.save(output_path, frame_rate=LTX2_T2V_FRAME_RATE)
-    finally:
-        visual_gen.shutdown()
-
-    assert os.path.isfile(output_path), f"LTX-2 visual gen did not produce {output_path}"
-    return output_path
-
-
-@pytest.fixture(scope="session")
-def ltx2_bf16_video_path(_visual_gen_deps, llm_venv):
-    """Generate LTX-2 BF16 T2V video and return path."""
-    return _generate_ltx2_video(llm_venv, "ltx2_bf16")
-
-
-@pytest.fixture(scope="session")
-def ltx2_fp8_video_path(_visual_gen_deps, llm_venv):
-    """Generate LTX-2 FP8 T2V video and return path."""
-    return _generate_ltx2_video(llm_venv, "ltx2_fp8", linear_type="trtllm-fp8-per-tensor")
 
 
 def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default"):
@@ -956,7 +867,7 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
         assert output.metrics.generation > 0
         assert output.metrics.denoise > 0
         assert output.metrics.post_denoise >= 0
-        output.save(output_path, frame_rate=LTX2_T2V_FRAME_RATE)
+        _save_lpips_video_mp4(output.video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
     finally:
         visual_gen.shutdown()
 
@@ -966,8 +877,12 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
 
 @pytest.fixture(scope="session")
 def ltx2_two_stage_bf16_video_path(_visual_gen_deps, llm_venv):
-    """Generate LTX-2 two-stage BF16 T2V video and return path."""
-    return _generate_ltx2_two_stage_video(llm_venv, "ltx2_two_stage_bf16")
+    """Generate LTX-2 two-stage BF16 video with the LPIPS config and return path."""
+    output_path = _visual_gen_output_path(llm_venv, "ltx2_two_stage_bf16")
+    if os.path.isfile(output_path):
+        return output_path
+    _generate_ltx2_lpips_video(output_path)
+    return output_path
 
 
 @pytest.fixture(scope="session")
@@ -1009,16 +924,16 @@ def _get_per_video_scores(results, video_path_substr):
     return scores
 
 
-def test_vbench_dimension_score_wan(vbench_repo_root, wan_trtllm_video_path, llm_venv):
-    """Run VBench on WAN TRT-LLM video; compare to golden HF reference scores (diff < 0.05 or TRT-LLM >= golden)."""
-    videos_dir = os.path.dirname(wan_trtllm_video_path)
-    assert os.path.isfile(wan_trtllm_video_path), "TRT-LLM video must exist"
+def test_vbench_dimension_score_wan(vbench_repo_root, wan21_bf16_video_path, llm_venv):
+    """Run VBench on WAN 2.1 BF16 video generated with the LPIPS config."""
+    videos_dir = os.path.dirname(wan21_bf16_video_path)
+    assert os.path.isfile(wan21_bf16_video_path), "WAN 2.1 BF16 video must exist"
     _run_vbench_and_report(
         vbench_repo_root,
         videos_dir,
         VISUAL_GEN_OUTPUT_VIDEO,
         llm_venv,
-        title="WAN",
+        title="WAN 2.1 BF16",
         golden_scores=VBENCH_WAN_GOLDEN_SCORES,
         max_score_diff=0.05,
     )
@@ -1108,6 +1023,21 @@ def _run_vbench_and_report(
     return scores_trtllm
 
 
+def test_vbench_dimension_score_wan22_bf16(vbench_repo_root, wan22_bf16_video_path, llm_venv):
+    """VBench accuracy for Wan 2.2 A14B BF16 generated with the LPIPS config."""
+    videos_dir = os.path.dirname(wan22_bf16_video_path)
+    assert os.path.isfile(wan22_bf16_video_path), "WAN 2.2 BF16 video must exist"
+    _run_vbench_and_report(
+        vbench_repo_root,
+        videos_dir,
+        VISUAL_GEN_OUTPUT_VIDEO,
+        llm_venv,
+        title="WAN 2.2 A14B BF16",
+        golden_scores=VBENCH_WAN22_BF16_GOLDEN_SCORES,
+        max_score_diff=0.05,
+    )
+
+
 def test_vbench_dimension_score_wan22_a14b_fp8(
     vbench_repo_root, wan22_a14b_fp8_video_path, llm_venv
 ):
@@ -1138,36 +1068,6 @@ def test_vbench_dimension_score_wan22_a14b_nvfp4(
         llm_venv,
         title="WAN 2.2 A14B NVFP4",
         golden_scores=VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES,
-        max_score_diff=0.05,
-    )
-
-
-def test_vbench_dimension_score_ltx2_bf16(vbench_repo_root, ltx2_bf16_video_path, llm_venv):
-    """VBench accuracy for LTX-2 BF16 T2V — baseline run (golden scores TBD)."""
-    videos_dir = os.path.dirname(ltx2_bf16_video_path)
-    assert os.path.isfile(ltx2_bf16_video_path), "LTX-2 BF16 video must exist"
-    _run_vbench_and_report(
-        vbench_repo_root,
-        videos_dir,
-        VISUAL_GEN_OUTPUT_VIDEO,
-        llm_venv,
-        title="LTX-2 BF16",
-        golden_scores=VBENCH_LTX2_BF16_GOLDEN_SCORES,
-        max_score_diff=0.05,
-    )
-
-
-def test_vbench_dimension_score_ltx2_fp8(vbench_repo_root, ltx2_fp8_video_path, llm_venv):
-    """VBench accuracy for LTX-2 FP8 T2V — baseline run (golden scores TBD)."""
-    videos_dir = os.path.dirname(ltx2_fp8_video_path)
-    assert os.path.isfile(ltx2_fp8_video_path), "LTX-2 FP8 video must exist"
-    _run_vbench_and_report(
-        vbench_repo_root,
-        videos_dir,
-        VISUAL_GEN_OUTPUT_VIDEO,
-        llm_venv,
-        title="LTX-2 FP8",
-        golden_scores=VBENCH_LTX2_FP8_GOLDEN_SCORES,
         max_score_diff=0.05,
     )
 
