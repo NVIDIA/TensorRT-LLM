@@ -178,12 +178,6 @@ cache_config:
 
 Cache-DiT uses residual-difference gating (`DBCache`) to adaptively skip transformer blocks, with optional TaylorSeer polynomial prediction and step-computation mask (`SCM`).
 
-Requires the `cache-dit` package:
-
-```bash
-pip install cache-dit
-```
-
 Enable via `VisualGenArgs.cache_config`:
 
 ```yaml
