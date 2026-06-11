@@ -34,7 +34,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
     {
         "topk_indices",  # DSA-only
         "attention_mask_data",  # custom-mask code path
-        "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention._run`` for NVFP4 path
+        "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
     }
 )
 
@@ -173,4 +173,5 @@ class FallbackFmha(Fmha):
             # stay as literal ``None`` until DeepSeek V4 sparse-MLA lands.
             sparse_mla_topk_lens=None,
             compressed_kv_cache_pool_ptr=None,
+            spec_decoding_target_max_draft_tokens=metadata.max_total_draft_tokens,
         )
