@@ -457,7 +457,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         mocker.patch.dict(
             MMMU.EVALUATE_KWARGS,
             {
-                "model_type": "mistral_large_3",
+                "model_type": "mistral_common",
                 "is_force_single_image": True,
             },
         )
