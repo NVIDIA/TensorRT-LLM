@@ -827,12 +827,13 @@ class Qwen3VisionModel(torch.nn.Module):
 
         # Vision RoPE backend (FlashInfer path) gates on `position_ids is
         # not None`; supply trivial 0..seq_len-1 positions on device so
-        # the gate clears when `head_dim % 64 == 0`. For Qwen3-VL
-        # (head_dim=72) the gate misses and we fall through to the
-        # PyTorch path, which broadcasts cos/sin over the chunked q/k.
-        # Slicing the pre-allocated `_rope_position_ids_buffer` is a
-        # view -- no per-iter alloc and no host->device copy.
+        # the gate clears when `head_dim % 64 == 0`. Keep the pre-allocated
+        # buffer large enough for packed multi-video batches.
         seq_len = hidden_states.shape[0]
+        if seq_len > self._rope_position_ids_buffer.numel():
+            self._rope_position_ids_buffer = torch.arange(
+                seq_len, dtype=torch.int32, device=self.device
+            )
         rope_position_ids = self._rope_position_ids_buffer[:seq_len]
         position_embeddings = (cos, sin)
 
