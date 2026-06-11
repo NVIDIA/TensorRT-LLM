@@ -14,8 +14,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
-                    Optional, Union)
+from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, Coroutine,
+                    List, Optional, Union)
 
 import uvicorn
 from fastapi import Body, FastAPI, Request
@@ -1238,32 +1238,21 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs)
 
-            if request.prompt_token_ids is not None:
-                prompt = request.prompt_token_ids
-            else:
-                prompt: str = apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
-                    conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                )
-            prompt = prompt_inputs(prompt)
-
-            mm_data, mm_embeddings = await mm_coroutines
-            if mm_data:
-                prompt["multi_modal_data"] = mm_data
-            if mm_embeddings:
-                prompt["multi_modal_embeddings"] = mm_embeddings
-            if mm_data and mm_embeddings:
-                raise ValueError(
-                    "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
-                )
+            prompt = await _prepare_chat_prompt_inputs_nonblocking(
+                model_type=resolve_top_level_model_type(self.model_config),
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                conversation=conversation,
+                add_generation_prompt=request.add_generation_prompt,
+                mm_coroutines=mm_coroutines,
+                mm_placeholder_counts=mm_placeholder_counts,
+                tools=tool_dicts,
+                documents=request.documents,
+                chat_template=request.chat_template or self.chat_template,
+                chat_template_kwargs=request.chat_template_kwargs,
+                prompt_token_ids=request.prompt_token_ids,
+                allow_mm_embeddings=True,
+            )
 
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
@@ -1388,28 +1377,21 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs)
 
-            if request.prompt_token_ids is not None:
-                prompt = request.prompt_token_ids
-            else:
-                prompt: str = apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
-                    conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                )
-            prompt = prompt_inputs(prompt)
-
-            mm_data, mm_embeddings = await mm_coroutines
-            if mm_embeddings:
-                raise ValueError("Cannot use multimodal embeddings as input")
-            if mm_data is not None:
-                prompt["multi_modal_data"] = mm_data
+            prompt = await _prepare_chat_prompt_inputs_nonblocking(
+                model_type=resolve_top_level_model_type(self.model_config),
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                conversation=conversation,
+                add_generation_prompt=request.add_generation_prompt,
+                mm_coroutines=mm_coroutines,
+                mm_placeholder_counts=mm_placeholder_counts,
+                tools=tool_dicts,
+                documents=request.documents,
+                chat_template=request.chat_template or self.chat_template,
+                chat_template_kwargs=request.chat_template_kwargs,
+                prompt_token_ids=request.prompt_token_ids,
+                allow_mm_embeddings=False,
+            )
 
             promise = self.generator.generate_async(inputs=prompt, )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
@@ -2191,3 +2173,68 @@ class OpenAIServer(_VideoRoutesMixin):
 
         asyncio.create_task(_register_after_serving())
         await server.serve(sockets=sockets)
+
+
+async def _apply_chat_template_nonblocking(**kwargs: Any
+                                           ) -> Union[str, List[str]]:
+    """Apply a chat template without blocking the server event loop."""
+    # Thread-safety note: this offloads work that shares the server tokenizer and processor, so
+    # hidden mutable state in a custom tokenizer is the main risk.
+    # For this openai_server.py use, the risk is low: apply_chat_template reads tokenizer/processor
+    # configuration and mutates only per-request conversation dictionaries.
+    return await asyncio.to_thread(apply_chat_template, **kwargs)
+
+
+async def _prepare_chat_prompt_inputs_nonblocking(
+    *,
+    model_type: str,
+    tokenizer: Any,
+    processor: Any,
+    conversation: List[ConversationMessage],
+    add_generation_prompt: bool,
+    mm_coroutines: Coroutine[Any, Any, tuple[Optional[dict[str, List[Any]]],
+                                             Optional[dict[str, List[Any]]]]],
+    mm_placeholder_counts: List[dict[str, int]],
+    tools: Optional[List[dict[str, Any]]],
+    documents: Optional[List[dict[str, str]]],
+    chat_template: Optional[str],
+    chat_template_kwargs: Optional[dict[str, Any]],
+    prompt_token_ids: Optional[List[int]],
+    allow_mm_embeddings: bool,
+) -> dict[str, Any]:
+    """Prepare prompt inputs while overlapping media loading and template rendering."""
+    mm_task = asyncio.create_task(mm_coroutines)
+    try:
+        if prompt_token_ids is not None:
+            prompt = prompt_token_ids
+        else:
+            prompt = await _apply_chat_template_nonblocking(
+                model_type=model_type,
+                tokenizer=tokenizer,
+                processor=processor,
+                conversation=conversation,
+                add_generation_prompt=add_generation_prompt,
+                mm_placeholder_counts=mm_placeholder_counts,
+                tools=tools,
+                documents=documents,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs or {},
+            )
+        prepared_prompt = prompt_inputs(prompt)
+
+        mm_data, mm_embeddings = await mm_task
+        if mm_data:
+            prepared_prompt["multi_modal_data"] = mm_data
+        if mm_embeddings:
+            if not allow_mm_embeddings:
+                raise ValueError("Cannot use multimodal embeddings as input")
+            prepared_prompt["multi_modal_embeddings"] = mm_embeddings
+        if mm_data and mm_embeddings:
+            raise ValueError(
+                "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
+            )
+        return prepared_prompt
+    finally:
+        if not mm_task.done():
+            mm_task.cancel()
+        await asyncio.gather(mm_task, return_exceptions=True)
