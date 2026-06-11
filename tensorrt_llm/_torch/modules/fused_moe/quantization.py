@@ -2803,7 +2803,7 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         if not hasattr(module, 'tmp_cutlass_w3_w1_weights'):
             module.tmp_cutlass_w3_w1_weights = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
-        dst_base = dst_w3_w1_weight.storage().data_ptr()
+        dst_base = dst_w3_w1_weight.untyped_storage().data_ptr()
         dict_key = (dst_base, expert_idx)
         expert_entry = module.tmp_cutlass_w3_w1_weights.setdefault(dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight

@@ -765,24 +765,31 @@ def test_fp4_linear_cuda_core(dtype, mnk):
         (128, 18560, 4096),
         (1, 4096, 8192),
         (128, 4096, 8192),
-        # Non-64-aligned N and K (e.g. from TP sharding): exercises the
-        # zero-padding path in MarlinNVFP4LinearMethod.
+        # Non-64-aligned N and/or K (e.g. from TP sharding)
         (8, 2576, 672),
         (128, 2576, 672),
+        (8, 2576, 4096),
+        (8, 4096, 2576),
+        (8, 2576, 544),
+        (1, 96, 80),
+        (3, 176, 144),
+        (128, 928, 1360),
     ])
 def test_fp4_linear_marlin(dtype, mnk):
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 
     w_float = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=torch.float32)
-    w_fp4, w_sf_raw, w_dequant = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+    w_fp4, w_sf_swizzled, w_dequant = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
         w_float,
         scaling_vector_size,
         1,  # ufp8_type=1 (e4m3)
-        False,  # is_sf_swizzled_layout=False
+        True,  # is_sf_swizzled_layout=True (modelopt checkpoint native layout)
     )
-    assert torch.iinfo(w_sf_raw.dtype).bits == 8  # torch.uint8
-    w_sf_2d = w_sf_raw.view(OUTPUT_SIZE, -1).view(torch.float8_e4m3fn)
+    assert torch.iinfo(w_sf_swizzled.dtype).bits == 8  # torch.uint8
+    w_sf_2d = torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf_swizzled.view(pad_up(OUTPUT_SIZE, 128),
+                           -1)).view(torch.float8_e4m3fn)
 
     with model_extra_attrs({'nvfp4_gemm_allowed_backends': ['marlin']}):
         l_marlin = Linear(
