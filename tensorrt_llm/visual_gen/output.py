@@ -96,8 +96,12 @@ class VisualGenOutput:
     image: Optional[torch.Tensor] = None
     video: Optional[torch.Tensor] = None
     audio: Optional[torch.Tensor] = None
+    action: Optional[torch.Tensor] = None
     frame_rate: Optional[float] = None
     audio_sample_rate: Optional[int] = None
+    raw_action_dim: Optional[int] = None
+    action_mode: Optional[str] = None
+    domain_id: Optional[int] = None
     error: Optional[str] = None
     metrics: Optional[VisualGenMetrics] = None
 
