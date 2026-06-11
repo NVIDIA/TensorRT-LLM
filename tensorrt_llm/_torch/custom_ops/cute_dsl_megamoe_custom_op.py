@@ -702,15 +702,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 DEFAULT_MEGAMOE_TACTIC[4],
                 DEFAULT_MEGAMOE_TACTIC[5],
             )
+        (
+            mma_tiler,
+            cluster_shape,
+            use_2cta,
+            resolved_group_hint,
+            load_balance_mode,
+            use_bf16_redg,
+        ) = tactic
         kernel_cls = import_kernel()
         probe = kernel_cls(
-            mma_tiler_mnk=tuple(tactic[0]),
-            cluster_shape_mnk=tuple(tactic[1]),
-            use_2cta_instrs=bool(tactic[2]),
-            group_hint=int(tactic[3]),
+            mma_tiler_mnk=tuple(mma_tiler),
+            cluster_shape_mnk=tuple(cluster_shape),
+            use_2cta_instrs=bool(use_2cta),
+            group_hint=int(resolved_group_hint),
             token_padding_block=64,
             sf_padding_block=SfPaddingBlock,
-            load_balance_mode=str(tactic[4]),
+            load_balance_mode=str(load_balance_mode),
             static_expert_shape=(
                 num_experts_per_rank,
                 expand_intermediate_size_per_partition,
@@ -722,7 +730,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             max_tokens_per_rank=int(max_tokens_per_rank),
             hidden=int(hidden_size),
             fc2_output_dtype=cutlass.BFloat16,
-            in_kernel_fc2_reduce=bool(tactic[5]),
+            in_kernel_fc2_reduce=bool(use_bf16_redg),
             apply_topk_in_fc1=bool(apply_topk_in_fc1),
             gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
             **_LOCKED_KERNEL_KWARGS,
@@ -758,6 +766,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         # Module-scope compile cache shared by every runner instance.
         kernel_cache: dict = {}
+
+        # Module-scope tuning-config cache keyed on ``unique_id()``. The op
+        # rebuilds a runner per call, so an instance-level cache would never
+        # hit; keeping it at class scope amortizes the config build across
+        # calls (mirrors the ``tuning_config_cache`` of the CuteDSL
+        # grouped-gemm runners in ``cute_dsl_custom_ops.py``).
+        tuning_config_cache: dict = {}
 
         def __init__(
             self,
@@ -906,7 +921,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_output to the activation token count, so the
             autotuner does not double-enumerate tile sizes for
             independent token axes.
+
+            The config is cached at class scope keyed on ``unique_id()``.
+            Every field below is a constant except ``inputs_pre_hook``.
             """
+            key = self.unique_id()
+            cached = self.__class__.tuning_config_cache.get(key)
+            if cached is not None:
+                return cached
 
             # Constraints reuse the runner's own shape-derivation rules
             # (the activation token count drives every other tensor's
@@ -915,7 +937,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             def _num_tokens(shapes: List[torch.Size]) -> int:
                 return shapes[0][0]
 
-            return TuningConfig(
+            config = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
                         0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
@@ -929,6 +951,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     # fc1_alpha(8) / fc2_alpha(9) / fc1_norm_const(10).
                     ConstraintSpec(11, 0, _num_tokens),  # combine_output
                 ),
+                # ``inputs_pre_hook`` is a bound method of THIS runner
+                # instance, yet caching the whole config across instances is
+                # safe: the hook only reads ``num_experts_per_rank`` and
+                # ``world_size`` (see ``_autotuner_inputs_pre_hook``), and both
+                # are part of ``unique_id()`` -- so every runner that maps to
+                # the same cache key has a functionally identical hook. The
+                # first instance for a given key is retained alive by this
+                # bound method (one runner object per distinct layer config,
+                # negligible). Mirrors how the CuteDSL grouped-gemm runners
+                # cache a ``helper.inputs_pre_hook`` keyed on ``unique_id()``.
                 inputs_pre_hook=self._autotuner_inputs_pre_hook,
                 use_cold_l2_cache=True,
                 # CUDA Graph capture cannot reproduce MegaMoE's runtime
@@ -945,6 +977,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # ``cute_dsl_custom_ops.py``).
                 distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
             )
+            self.__class__.tuning_config_cache[key] = config
+            return config
 
         def _build_kernel(self, tactic: Tuple):
             (
@@ -959,7 +993,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
             kernel_cls = import_kernel()
             return kernel_cls(
-                mma_tiler_mnk=tuple(mma_tiler),
+                mma_tiler_mnk=tuple[Any, ...](mma_tiler),
                 cluster_shape_mnk=tuple(cluster_shape),
                 use_2cta_instrs=bool(use_2cta),
                 group_hint=int(resolved_group_hint),
@@ -985,25 +1019,46 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 **_LOCKED_KERNEL_KWARGS,
             )
 
-        def _compile_or_get(self, tactic: Tuple, kernel, runtime_kwargs):
-            # ``unique_id()`` already carries apply_topk_in_fc1 / gate_up_clamp,
-            # so the codegen-time graph/clamp modes are part of the cache key
-            # without listing them again here.
-            cache_key = (
+        def _tactic_cache_key(self, tactic: Tuple) -> Tuple:
+            # Hashable cache key shared by the compile cache and the
+            # local-workspace cache. ``unique_id()`` already carries
+            # apply_topk_in_fc1 / gate_up_clamp, so the codegen-time
+            # graph/clamp modes are part of the cache key without listing
+            # them again here.
+            (
+                mma_tiler,
+                cluster_shape,
+                use_2cta,
+                resolved_group_hint,
+                load_balance_mode,
+                use_bf16_redg,
+            ) = tactic
+            return (
                 self.unique_id(),
-                tuple(tactic[0]),
-                tuple(tactic[1]),
-                bool(tactic[2]),
-                int(tactic[3]),
-                str(tactic[4]),
-                bool(tactic[5]),
+                tuple(mma_tiler),
+                tuple(cluster_shape),
+                bool(use_2cta),
+                int(resolved_group_hint),
+                str(load_balance_mode),
+                bool(use_bf16_redg),
             )
+
+        def _compile_or_get(self, tactic: Tuple, kernel, runtime_kwargs):
+            (
+                mma_tiler,
+                cluster_shape,
+                use_2cta,
+                resolved_group_hint,
+                load_balance_mode,
+                use_bf16_redg,
+            ) = tactic
+            cache_key = self._tactic_cache_key(tactic)
             compiled = self.__class__.kernel_cache.get(cache_key)
             if compiled is not None:
                 return compiled
             compile_kwargs = dict(runtime_kwargs)
             hardware_info = cutlass.utils.HardwareInfo()
-            cluster_size = tactic[1][0] * tactic[1][1] * tactic[1][2]
+            cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
             compile_kwargs["max_active_clusters"] = hardware_info.get_max_active_clusters(
                 max(cluster_size, 1)
             )
@@ -1012,9 +1067,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # the standard TRT-LLM logger (honors TLLM_LOG_LEVEL).
             logger.info(
                 f"[MegaMoECuteDsl] cute.compile START tactic="
-                f"(mma_tiler={tactic[0]}, cluster={tactic[1]}, "
-                f"use_2cta={tactic[2]}, group_hint={tactic[3]}, "
-                f"load_balance={tactic[4]!r}, use_bf16_redg={tactic[5]})"
+                f"(mma_tiler={mma_tiler}, cluster={cluster_shape}, "
+                f"use_2cta={use_2cta}, group_hint={resolved_group_hint}, "
+                f"load_balance={load_balance_mode!r}, use_bf16_redg={use_bf16_redg})"
             )
             t_compile_start = time.perf_counter()
             compiled = cute.compile(kernel, **compile_kwargs)
@@ -1031,20 +1086,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
             inputs: List[torch.Tensor],
             *,
             tactic: Any = -1,
-            do_preparation: bool = False,
             peer_offsets: Optional[List[int]] = None,
             shared_workspace: Optional[torch.Tensor] = None,
             **kwargs,
         ) -> None:
             del kwargs
-            # ``do_preparation=True`` is the autotuner's pre-tactic
-            # warm-up hook. MegaMoE has no caller-allocated preallocation
-            # to do (workspaces are owned by the caller / runner class
-            # cache); running the kernel here would also leak unsupported-
-            # tactic crashes as async CUDA errors into the next call.
-            # Mirrors AllReduceRunner's early-return pattern.
-            if do_preparation:
-                return None
             t_forward_start = time.perf_counter()
             # Resolve fallback tactic.
             if tactic == -1 or tactic is None:
@@ -1090,15 +1136,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # ``local_workspace`` is per-rank private; cached across calls.
             local_workspace = _get_or_alloc_local_workspace(
                 kernel,
-                cache_key=(
-                    self.unique_id(),
-                    tuple(tactic_t[0]),
-                    tuple(tactic_t[1]),
-                    bool(tactic_t[2]),
-                    int(tactic_t[3]),
-                    str(tactic_t[4]),
-                    bool(tactic_t[5]),
-                ),
+                cache_key=self._tactic_cache_key(tactic_t),
                 device=activation.device,
             )
             # ``shared_workspace`` is peer-mapped (symmetric heap) for
