@@ -66,6 +66,18 @@ def test_requires_uniform_kv_caches_follows_attention_backend():
     )
 
 
+def test_cache_transceiver_rejects_unmanaged_persistent_caches():
+    """Cache transceiver rejects unmanaged persistent cache resources."""
+    args = LlmArgs(
+        model="test-model",
+        attn_backend="flashinfer",
+        cache_transceiver_config={"backend": "DEFAULT"},
+    )
+
+    assert args.requires_uniform_kv_caches is False
+    assert args.reject_unmanaged_persistent_caches is True
+
+
 # ================================
 # Config Flow Tests
 # ================================
