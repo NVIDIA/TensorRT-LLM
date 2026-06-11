@@ -284,7 +284,7 @@ class InfoPrinter:
             logger.info(reproduce_cmd)
 
 
-CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")
+CONFIG_BASE_DIR = os.getenv("DISAGG_CONFIG_DIR", os.path.join(EnvManager.get_work_dir(), "test_configs"))
 
 
 def extract_config_fields(config_data: dict) -> dict:
