@@ -36,7 +36,10 @@ import PIL.Image
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_T2I_PARAMS
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_ACTION_PARAMS,
+    COSMOS3_T2I_PARAMS,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
     COSMOS3_DURATION_TEMPLATE,
@@ -213,6 +216,24 @@ def _require_audio_pipeline(pipeline) -> None:
         pytest.skip("Checkpoint does not enable audio generation")
     if not hasattr(pipeline, "audio_tokenizer"):
         pytest.skip("Audio tokenizer was not loaded for this pipeline")
+
+
+def _require_action_pipeline(pipeline) -> None:
+    if not getattr(pipeline, "action_gen", False):
+        pytest.skip("Checkpoint does not enable action generation")
+
+
+def _assert_valid_action(action: torch.Tensor, *, raw_action_dim: int, chunk_size: int):
+    assert action is not None
+    assert action.dtype == torch.float32
+    assert action.dim() == 3, f"Expected (B,T,D), got {action.shape}"
+    batch, t, d = action.shape
+    assert batch == 1
+    assert t == chunk_size
+    assert d == raw_action_dim
+    af = action.float()
+    assert not torch.isnan(af).any()
+    assert not torch.isinf(af).any()
 
 
 def _make_test_image() -> PIL.Image.Image:
@@ -431,6 +452,126 @@ class TestCosmos3Audio:
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         assert result.frame_rate == FRAME_RATE
         _assert_valid_audio(result.audio, result.audio_sample_rate)
+
+
+@pytest.mark.integration
+@pytest.mark.cosmos3_action
+@pytest.mark.high_cuda_memory
+class TestCosmos3Action:
+    ACTION_HEIGHT = 480
+    ACTION_WIDTH = 832
+    ACTION_FRAMES = COSMOS3_ACTION_PARAMS["num_frames"]
+    ACTION_CHUNK = COSMOS3_ACTION_PARAMS["action_chunk_size"]
+    RAW_ACTION_DIM = 10
+
+    def test_policy_smoke(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        image = _make_test_image().resize((self.ACTION_WIDTH, self.ACTION_HEIGHT))
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=image,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+            num_frames=self.ACTION_FRAMES,
+            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            action_mode="policy",
+            domain_name="bridge_orig_lerobot",
+            raw_action_dim=self.RAW_ACTION_DIM,
+            action_chunk_size=self.ACTION_CHUNK,
+        )
+        _assert_valid_video(
+            result.video,
+            num_frames=self.ACTION_FRAMES,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+        )
+        _assert_valid_action(
+            result.action,
+            raw_action_dim=self.RAW_ACTION_DIM,
+            chunk_size=self.ACTION_CHUNK,
+        )
+        assert result.action_mode == "policy"
+        assert result.domain_id == 7
+
+    def test_forward_dynamics_smoke(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        image = _make_test_image().resize((self.ACTION_WIDTH, self.ACTION_HEIGHT))
+        action_traj = [[0.1] * self.RAW_ACTION_DIM for _ in range(self.ACTION_CHUNK)]
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=image,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+            num_frames=self.ACTION_FRAMES,
+            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            action_mode="forward_dynamics",
+            domain_name="bridge_orig_lerobot",
+            action=action_traj,
+            action_chunk_size=self.ACTION_CHUNK,
+        )
+        _assert_valid_video(
+            result.video,
+            num_frames=self.ACTION_FRAMES,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+        )
+        _assert_valid_action(
+            result.action,
+            raw_action_dim=self.RAW_ACTION_DIM,
+            chunk_size=self.ACTION_CHUNK,
+        )
+
+    def test_inverse_dynamics_smoke(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        image = _make_test_image().resize((self.ACTION_WIDTH, self.ACTION_HEIGHT))
+        video = [image.copy() for _ in range(NUM_FRAMES)]
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=None,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+            num_frames=NUM_FRAMES,
+            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            action_mode="inverse_dynamics",
+            domain_name="bridge_orig_lerobot",
+            raw_action_dim=self.RAW_ACTION_DIM,
+            action_chunk_size=NUM_FRAMES,
+            video=video,
+        )
+        _assert_valid_video(
+            result.video,
+            num_frames=NUM_FRAMES,
+            height=self.ACTION_HEIGHT,
+            width=self.ACTION_WIDTH,
+        )
+        _assert_valid_action(
+            result.action,
+            raw_action_dim=self.RAW_ACTION_DIM,
+            chunk_size=NUM_FRAMES,
+        )
+
+    def test_action_and_audio_rejected(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match="joint action and audio"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=_make_test_image(),
+                action_mode="policy",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+                enable_audio=True,
+            )
+
+    def test_action_and_t2i_rejected(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match="output_type='image'"):
+            _run_forward(
+                cosmos3_pipeline,
+                output_type="image",
+                action_mode="policy",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+            )
 
 
 @pytest.mark.integration
