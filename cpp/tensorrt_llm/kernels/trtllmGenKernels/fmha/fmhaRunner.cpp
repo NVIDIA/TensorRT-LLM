@@ -30,7 +30,8 @@ namespace kernels
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
-    int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV)
+    int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV,
+    bool fusesDsv4InvRopeFp8Quant)
     : mSM(tensorrt_llm::common::getSMVersion())
     , mDtypeQ(dtypeQ)
     , mDtypeK(dtypeK)
@@ -40,6 +41,7 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_ty
     , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
     , mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP)
     , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
+    , mFusesDsv4InvRopeFp8Quant(fusesDsv4InvRopeFp8Quant)
 {
     TLLM_CHECK_WITH_INFO(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
     TLLM_CHECK_WITH_INFO(mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16
@@ -51,14 +53,14 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_ty
     TLLM_CHECK_WITH_INFO(mDtypeV == DATA_TYPE_E2M1 || mDtypeV == DATA_TYPE_E4M3 || mDtypeV == DATA_TYPE_FP16
             || mDtypeV == DATA_TYPE_BF16,
         "Unsupported V data type");
-    TLLM_CHECK_WITH_INFO(mDtypeOut == DATA_TYPE_E2M1 || mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16
-            || mDtypeOut == DATA_TYPE_BF16,
+    TLLM_CHECK_WITH_INFO(mDtypeOut == DATA_TYPE_E2M1 || mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_MXE4M3
+            || mDtypeOut == DATA_TYPE_FP16 || mDtypeOut == DATA_TYPE_BF16,
         "Unsupported Output data type");
     auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
     mTotalDeviceMemory = totalMemory;
     TLLM_CHECK_WITH_INFO(mTotalDeviceMemory > 0, "Total device memory is invalid");
     mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeK, mDtypeV, mDtypeOut, mSM, numEltsPerSageAttnBlkQ,
-        numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
+        numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV, mFusesDsv4InvRopeFp8Quant);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -348,8 +348,7 @@ template <class FmhaOptions> static auto makeStrideKv(FmhaOptions const& options
     } else if (isContiguousKv(options.mQkvLayout)) {
       strideKeysVals = paddedHeadDimKv;
     } else if (isSeparateQkv(options.mQkvLayout) && !isK &&
-               options.mHeadDimQk != options.mHeadDimV &&
-               options.mDtypeKv != tg::Dtype::E4m3) {
+               options.mHeadDimQk != options.mHeadDimV && options.mDtypeKv != tg::Dtype::E4m3) {
       // Non-FP8 context MLA (DeepSeek 192/128, Mistral 128/64, ...): V is not head-contiguous.
       strideKeysVals = options.mNumHeadsKv * (options.mHeadDimQk - 64 + options.mHeadDimV);
     }
@@ -526,6 +525,8 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          slidingWindowKvPoolBasePtr,
                          params.ptrPageIdxKv,
                          params.ptrOutputScale,
+                         params.ptrDsv4InvRopeCosSinCache,
+                         params.ptrDsv4OScaleFp32,
                          params.ptrScaleSoftmaxLog2,
                          params.ptrScaleSfKv,
                          params.ptrScaleSfO,
@@ -572,6 +573,8 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     void const* slidingWindowKvPoolBasePtr,
                                     int const* kvPageIdxD,
                                     float const* outputScaleD,
+                                    float const* dsv4InvRopeCosSinCacheD,
+                                    float* dsv4OScaleFp32D,
                                     float const* scaleSoftmaxLog2D,
                                     float const* kvSfScaleD,
                                     float const* oSfScaleD,
@@ -804,6 +807,8 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // TRT-LLM restrictions: the quantization scales must be on the device. It will only be loaded
   // when -loadsScalesFromGmem true -dtypeElt e4m3 are specified.
   params.ptrOutputScale = outputScaleD;
+  params.ptrDsv4InvRopeCosSinCache = dsv4InvRopeCosSinCacheD;
+  params.ptrDsv4OScaleFp32 = dsv4OScaleFp32D;
 
   // The partial buffers' pointers when the multiCtasKv mode is enabled.
   params.ptrMultiCtasKvCounter = multiCtasKvCounterPtrD;
@@ -886,6 +891,8 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimV;
   params.mNumTokensPerCtaQ = numTokensPerCtaQ;
   params.mOutputScale = options.mOutputScale;
+  params.mDsv4HeadsPerGroup = options.mDsv4HeadsPerGroup;
+  params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;
   params.mScaleSoftmaxLog2 = softmaxScale;
   params.mScaleSfKv = kvSfScale;
   params.mScaleSfO = oSfScale;
@@ -933,6 +940,8 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     void const*,
                                     int const*,
                                     float const*,
+                                    float const*,
+                                    float*,
                                     float const*,
                                     float const*,
                                     float const*,

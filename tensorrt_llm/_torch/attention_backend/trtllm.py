@@ -1178,6 +1178,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     self.kv_lora_rank + self.qk_rope_head_dim)
             else:
                 v_head_size = self.v_head_dim
+        if kwargs.get("enable_dsv4_epilogue_fusion", False):
+            heads_per_group = 8
+            if self.num_heads % heads_per_group != 0:
+                raise ValueError(
+                    "DSv4 fused epilogue requires num_heads to be divisible by 8."
+                )
+            num_groups = self.num_heads // heads_per_group
+            scale_buf_m = (num_tokens + 3) // 4 * 4
+            output = q.new_empty(
+                (num_groups, num_tokens, heads_per_group * v_head_size),
+                dtype=torch.float8_e4m3fn)
+            output_sf = q.new_empty((num_groups, heads_per_group *
+                                     (v_head_size // 128), scale_buf_m),
+                                    dtype=torch.float32)
+            return [output, output_sf]
         if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
@@ -1331,7 +1346,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
-        use_nvfp4_output = output_sf is not None
+        use_nvfp4_output = (output_sf is not None
+                            and not forward_args.enable_dsv4_epilogue_fusion)
         out_scale = (forward_args.out_scale_sf
                      if use_nvfp4_output else forward_args.out_scale)
         kv_scale_orig_quant = (self.kv_scale_orig_quant
@@ -1360,7 +1376,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
+        use_python_trtllm_gen = (_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION
+                                 and not helix_active and not use_sage_attn and
+                                 not forward_args.enable_dsv4_epilogue_fusion)
+        if use_python_trtllm_gen and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
@@ -1566,6 +1585,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
                 quant_scale_qkv=forward_args.quant_scale_qkv,
+                dsv4_inv_rope_cos_sin_cache=(
+                    forward_args.dsv4_inv_rope_cos_sin_cache),
+                enable_dsv4_epilogue_fusion=(
+                    forward_args.enable_dsv4_epilogue_fusion),
             )
 
         if self.print_skip_softmax_stat:
@@ -1627,6 +1650,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
                 is_gen_only=is_gen_only,
+                enable_dsv4_epilogue_fusion=(
+                    forward_args.enable_dsv4_epilogue_fusion),
             )
 
             output = outputs[0]

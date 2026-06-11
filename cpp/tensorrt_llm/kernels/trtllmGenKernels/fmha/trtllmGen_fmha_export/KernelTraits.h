@@ -26,6 +26,7 @@
 #include <trtllm/gen/Expr.h>
 #include <trtllm/gen/Kernel.h>
 #endif // TLLM_FMHA_TRTLLM_COMPAT
+#include "Dsv4Constants.h"
 #include <nlohmann/json.hpp>
 #include <cassert>
 #include <numeric>
@@ -735,6 +736,23 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     : KernelConfig()
     , MmaTraits() {}
 
+  bool hasDsv4InvRopeFp8QuantEpilogueShape() const {
+    if (!mUseUtcmma2CtaMode || mClusterDimX != 2 || mSwapsMmaAb ||
+        mMultiCtasKvMode != MultiCtasKvMode::Disabled || mHeadDimPerStageKv != 0 ||
+        mHeadDimQk != kDsv4HeadDimQk || mHeadDimV != kDsv4HeadDimV ||
+        mHeadDimV % kDsv4QuantGroupSize != 0 || mHeadDimPerCtaV != kDsv4HeadDimPerCtaV ||
+        mHeadDimPerCtaV * mClusterDimX != mHeadDimV || mAtomQkM != 128 || mTilePvN <= 0) {
+      return false;
+    }
+
+    int32_t const numHeadDimStages = mHeadDimPerCtaV * mClusterDimX > mTilePvN
+                                       ? ceilDiv(mHeadDimPerCtaV * mClusterDimX, mTilePvN)
+                                       : 1;
+    int32_t const numTmemColsPerHeadDimStage = mTilePvN / mClusterDimX;
+    return numTmemColsPerHeadDimStage == kDsv4QuantGroupSize &&
+           numHeadDimStages * mAtomPvN == mHeadDimV;
+  }
+
   // The constructor.
   template <typename FmhaOptions_>
   KernelTraits(FmhaOptions_ const& options)
@@ -756,6 +774,12 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
 
     // The tile size for the correction step.
     mCorrTileSize = std::min(mValidTilePvN, 64);
+
+    if (mFusesDsv4InvRopeFp8Quant) {
+      TLLM_CHECK_ERROR(hasDsv4InvRopeFp8QuantEpilogueShape(),
+                       "DSv4 inverse-RoPE FP8 quant fusion requires the fixed 2-CTA keep-AB "
+                       "512-dim V shape with four 128-column quant chunks.");
+    }
 
     // The number of keys per tile.
     mNumKeysPerTile = std::min(mNumTokensPerPage, mTileSizeKv);

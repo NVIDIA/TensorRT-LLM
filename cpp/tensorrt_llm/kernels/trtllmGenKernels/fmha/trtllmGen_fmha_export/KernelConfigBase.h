@@ -511,6 +511,8 @@ template <> inline std::string toString(MmaOrder e) {
   /* Store tensor to gmem directly in the end of the correction task. */                           \
   /* True: vectorized store. False: TMA store using dedicated warp. */                             \
   X(bool, mFuseEpilogueIntoCorr, true, bool)                                                       \
+  /* Fuse DSv4 inverse RoPE + 1x128 E4M3 quantization into the correction epilogue. */             \
+  X(bool, mFusesDsv4InvRopeFp8Quant, false, bool)                                                  \
   /* Whether to transform K/V in the correction task. */                                           \
   X(bool, mFuseTransformKvIntoCorr, true, bool)                                                    \
   /* Whether to allocate separate transformed-K/V resources with independent pipelines. */         \

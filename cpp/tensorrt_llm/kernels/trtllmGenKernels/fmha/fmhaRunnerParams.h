@@ -210,6 +210,13 @@ MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
 
 struct TllmGenFmhaRunnerParams
 {
+    struct Dsv4EpilogueFusionParams
+    {
+        bool enabled{false};
+        float const* cosSinCache{nullptr};
+        int32_t scaleBufM{0};
+    };
+
     // Input layout.
     QkvLayout mQkvLayout;
     // Attention mask type.
@@ -274,6 +281,8 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // Optional DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
+    Dsv4EpilogueFusionParams mDsv4EpilogueFusion;
     // SageAttention scaling factors for Q, K, P and V.
     float const* sageAttnSfsQPtr = nullptr;
     float const* sageAttnSfsKPtr = nullptr;

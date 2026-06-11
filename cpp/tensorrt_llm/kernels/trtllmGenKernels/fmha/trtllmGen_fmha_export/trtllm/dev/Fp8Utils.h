@@ -60,9 +60,10 @@ inline __device__ void convertFloatToMxE4m3(OutT& out,
   // MxE4m3 uses one UE8M0 scale for each group of 32 E4M3 elements.
   int32_t constexpr NumEltsPerSf = 32;
   int32_t constexpr NumThreadsPerVec = NumEltsPerSf / NumEltsPerThread;
-  static_assert(NumEltsPerSf % NumEltsPerThread == 0 &&
-                NumEltsPerThread % 4 == 0, "NumEltsPerThread not supported.");
-  static_assert(sizeof(OutT) == NumEltsPerThread, "Output type not supported."); // 1 byte per element.
+  static_assert(NumEltsPerSf % NumEltsPerThread == 0 && NumEltsPerThread % 4 == 0,
+                "NumEltsPerThread not supported.");
+  static_assert(sizeof(OutT) == NumEltsPerThread,
+                "Output type not supported."); // 1 byte per element.
 
   float localAmax = 0.f;
 #pragma unroll
@@ -92,17 +93,18 @@ inline __device__ void convertFloatToMxE4m3(OutT& out,
 
 template <int32_t NumEltsPerThread, typename OutT>
 inline __device__ void convertFp16ToMxE4m3(OutT& out,
-                                            cutlass::float_ue8m0_t& sfOut,
-                                            cutlass::half_t const (&in)[NumEltsPerThread],
-                                            float sfScale) {
+                                           cutlass::float_ue8m0_t& sfOut,
+                                           cutlass::half_t const (&in)[NumEltsPerThread],
+                                           float sfScale) {
   // MxE4m3 uses one UE8M0 scale for each group of 32 E4M3 elements.
   int32_t constexpr NumEltsPerSf = 32;
   int32_t constexpr NumThreadsPerVec = NumEltsPerSf / NumEltsPerThread;
-  static_assert(NumEltsPerSf % NumEltsPerThread == 0 &&
-                NumEltsPerThread % 4 == 0, "NumEltsPerThread not supported.");
-  static_assert(sizeof(OutT) == NumEltsPerThread, "Output type not supported."); // 1 byte per element.
+  static_assert(NumEltsPerSf % NumEltsPerThread == 0 && NumEltsPerThread % 4 == 0,
+                "NumEltsPerThread not supported.");
+  static_assert(sizeof(OutT) == NumEltsPerThread,
+                "Output type not supported."); // 1 byte per element.
 
-  auto inH2 = reinterpret_cast<half2 const *>(&in[0]);
+  auto inH2 = reinterpret_cast<half2 const*>(&in[0]);
   auto localAmaxH2 = __habs2(inH2[0]);
 #pragma unroll
   for (int32_t i = 0; i < NumEltsPerThread / 2; ++i) {
@@ -134,6 +136,140 @@ inline __device__ void convertFp16ToMxE4m3(OutT& out,
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+__device__ __forceinline__ float maxAbs4(float x0, float x1, float x2, float x3) {
+  return fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Write the FP32 dequant scale for one output chunk and pack the already-finalized values to E4M3.
+// The stored scale is amax / 448, so dequantization is `fp8_value * scalePtr[scaleOffset]`.
+template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
+inline __device__ void e4m3PackEpilogue(OutRegs& out,
+                                        cutlass::Array<float, NumVals> const& vals,
+                                        float* scalePtr,
+                                        int64_t scaleOffset,
+                                        float amax) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+
+  // Avoid a zero scale when the whole quant chunk is zero.
+  float constexpr eps = 1.0e-12f;
+  float const clampedAmax = fmaxf(amax, eps);
+  // E4M3's largest finite value is 448; store scale = amax / 448 and quantize with 448 / amax.
+  float constexpr fp8Max = 448.f;
+  float constexpr fp8MaxRcp = 1.f / fp8Max;
+  float const outScale = clampedAmax * fp8MaxRcp;
+  float const invScale = __fdividef(fp8Max, clampedAmax);
+  scalePtr[scaleOffset] = outScale;
+
+  // Keep these multiplies scalar: fmul2 introduces extra array temporaries here and increases
+  // register spills in this epilogue.
+#pragma unroll
+  for (int32_t regIdx = 0; regIdx < NumPackedRegs; ++regIdx) {
+    int32_t const ii = regIdx * 4;
+    out[regIdx] = convert_float4_to_e4m3(vals[ii + 0] * invScale,
+                                         vals[ii + 1] * invScale,
+                                         vals[ii + 2] * invScale,
+                                         vals[ii + 3] * invScale);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Quantize one output chunk to packed E4M3 and write its FP32 dequant scale. The input values are
+// expected to already be in the final output layout.
+template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
+inline __device__ void e4m3QuantEpilogue(OutRegs& out,
+                                         cutlass::Array<float, NumVals> const& vals,
+                                         float* scalePtr,
+                                         int64_t scaleOffset) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+
+  float amax = 0.f;
+#pragma unroll
+  for (int32_t regIdx = 0; regIdx < NumPackedRegs; ++regIdx) {
+    int32_t const ii = regIdx * 4;
+    amax = fmaxf(amax, maxAbs4(vals[ii + 0], vals[ii + 1], vals[ii + 2], vals[ii + 3]));
+  }
+
+  e4m3PackEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset, amax);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Apply the DSv4 inverse-RoPE transform to the final 64 dimensions of a 512-dim head when this
+// 1x128 chunk covers that range, then quantize the chunk to packed E4M3 and write its FP32 dequant
+// scale. Chunks outside the inverse-RoPE range follow the same path as e4m3QuantEpilogue.
+template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
+inline __device__ void dsv4InvRopeFp8QuantEpilogue(OutRegs& out,
+                                                   cutlass::Array<float, NumVals>& vals,
+                                                   float* scalePtr,
+                                                   float const* cosSinCache,
+                                                   int64_t scaleOffset,
+                                                   int32_t position,
+                                                   int32_t headDimOffset) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+  static_assert(NumVals == 128, "DSv4 fused epilogue processes one 1x128 quant group.");
+
+  // DSv4 inverse-RoPE applies to the last 64 dimensions, [448, 512), of a 512-dim head. The
+  // helper processes one 128-value quant chunk, so the RoPE chunk starts at 384 and the RoPE
+  // values begin at offset 64 inside that chunk. DSv4 uses non-NeoX interleaved RoPE: adjacent
+  // element pairs share one cos/sin value. Each cos/sin cache row is laid out as
+  // [cos(32), sin(32)].
+  int32_t constexpr ropeStart = 448;
+  int32_t constexpr ropeHalf = 32;
+  int32_t constexpr ropeChunkStart = ropeStart - ropeHalf * 2;
+  int32_t constexpr ropeOffset = ropeStart - ropeChunkStart;
+  int32_t constexpr cosSinStride = ropeHalf * 2;
+
+  if (headDimOffset != ropeChunkStart) {
+    e4m3QuantEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset);
+    return;
+  }
+
+  float const* csRow = cosSinCache + position * cosSinStride;
+
+  float amax = 0.f;
+  static_assert(ropeOffset % 4 == 0, "The RoPE offset must be aligned to packed E4M3 registers.");
+  int32_t constexpr ropePackedRegStart = ropeOffset / 4;
+#pragma unroll
+  for (int32_t regIdx = 0; regIdx < ropePackedRegStart; ++regIdx) {
+    int32_t const ii = regIdx * 4;
+    amax = fmaxf(amax, maxAbs4(vals[ii + 0], vals[ii + 1], vals[ii + 2], vals[ii + 3]));
+  }
+
+  // Match the standalone TRT-LLM inverse-RoPE FP8 kernel's per-4-value structure: each packed
+  // register in the RoPE half contains two interleaved RoPE pairs. Update the four values in-place
+  // and include them in amax before the final pack pass.
+#pragma unroll
+  for (int32_t regIdx = ropePackedRegStart; regIdx < NumPackedRegs; ++regIdx) {
+    int32_t const ii = regIdx * 4;
+    int32_t const csIdx = (regIdx - ropePackedRegStart) * 2;
+
+    float const cos0 = csRow[csIdx + 0];
+    float const sin0 = csRow[ropeHalf + csIdx + 0];
+    float const first0 = vals[ii + 0];
+    float const second0 = vals[ii + 1];
+    float const rotatedFirst0 = first0 * cos0 + second0 * sin0;
+    float const rotatedSecond0 = second0 * cos0 - first0 * sin0;
+    vals[ii + 0] = rotatedFirst0;
+    vals[ii + 1] = rotatedSecond0;
+    amax = fmaxf(amax, fmaxf(fabsf(rotatedFirst0), fabsf(rotatedSecond0)));
+
+    float const cos1 = csRow[csIdx + 1];
+    float const sin1 = csRow[ropeHalf + csIdx + 1];
+    float const first1 = vals[ii + 2];
+    float const second1 = vals[ii + 3];
+    float const rotatedFirst1 = first1 * cos1 + second1 * sin1;
+    float const rotatedSecond1 = second1 * cos1 - first1 * sin1;
+    vals[ii + 2] = rotatedFirst1;
+    vals[ii + 3] = rotatedSecond1;
+    amax = fmaxf(amax, fmaxf(fabsf(rotatedFirst1), fabsf(rotatedSecond1)));
+  }
+
+  e4m3PackEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset, amax);
+}
 
 } // namespace dev
 } // namespace trtllm

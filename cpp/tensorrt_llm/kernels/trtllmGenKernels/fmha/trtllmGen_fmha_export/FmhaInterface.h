@@ -69,6 +69,9 @@ struct FmhaData {
   };
 
   struct Scales {
+    // DSv4 inverse-RoPE + 1x128 FP8 quant fusion output scale tensor.
+    float* dsv4OScaleFp32D{nullptr};
+
     // FP4 scaling factors for KV cache
     void const* kSfBasePtr;
     void const* vSfBasePtr;
@@ -104,6 +107,9 @@ struct FmhaData {
     // [sumOfSeqLensKv * numHeadsKv, hiddenDimKv] for sparse attention.
     void const* kBasePtr;
     void const* vBasePtr;
+
+    // DSv4 inverse-RoPE metadata inputs.
+    float const* dsv4InvRopeCosSinCacheD{nullptr};
 
     // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
     void const* slidingWindowKvPoolBasePtr{nullptr};
