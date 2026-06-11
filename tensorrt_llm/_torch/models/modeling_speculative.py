@@ -79,7 +79,8 @@ def _resolve_eagle3_sliding_window(config: PretrainedConfig,
             return None
 
     return sliding_window
-  
+
+
 def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
                              num_tokens: int) -> Optional[torch.Tensor]:
     """Slice speculative position IDs along the token dimension."""
