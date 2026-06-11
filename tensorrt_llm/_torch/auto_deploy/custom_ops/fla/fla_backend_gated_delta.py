@@ -54,9 +54,9 @@ from ..attention_interface import (
     AttentionRegistry,
     BatchInfo,
     Constant,
+    IntermediateSSMStateHandler,
     MHACallable,
     ResourceHandlerDict,
-    SpecSSMResourceHandler,
     SSMResourceHandler,
 )
 
@@ -307,24 +307,20 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
         num_heads = value_node.meta["val"].shape[-2]
         key_dim = key_node.meta["val"].shape[-1]
         value_dim = value_node.meta["val"].shape[-1]
+        delta_cache = SSMResourceHandler(
+            num_heads,
+            key_dim,
+            value_dim,
+            # GDN state is a running recurrence (unlike KV caches which store
+            # independent per-token values). Bfloat16 quantization errors
+            # compound at every decode step through the recurrence update, so
+            # we always use float32 to preserve accuracy over long sequences.
+            dtype=torch.float32,
+        )
 
         return {
-            "delta_cache": SSMResourceHandler(
-                num_heads,
-                key_dim,
-                value_dim,
-                # GDN state is a running recurrence (unlike KV caches which store
-                # independent per-token values). Bfloat16 quantization errors
-                # compound at every decode step through the recurrence update, so
-                # we always use float32 to preserve accuracy over long sequences.
-                dtype=torch.float32,
-            ),
-            "intermediate_delta_cache": SpecSSMResourceHandler(
-                num_heads,
-                key_dim,
-                value_dim,
-                dtype=torch.float32,
-            ),
+            "delta_cache": delta_cache,
+            "intermediate_delta_cache": IntermediateSSMStateHandler.from_base(delta_cache),
         }
 
     @classmethod
