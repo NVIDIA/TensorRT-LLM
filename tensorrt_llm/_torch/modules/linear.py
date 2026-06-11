@@ -2808,12 +2808,11 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
         assert size_k % group_size == 0, (
             f"size_k {size_k} must be divisible by group_size {group_size}")
 
-        # Marlin CUDA kernel block size = 64
         size_k_pad = fp4_utils.pad_up(size_k, 64)
-        size_n_pad = fp4_utils.pad_up(size_n, 64)
+        size_n_pad = fp4_utils.pad_up(size_n, 128)
 
         num_groups = size_k // group_size
-        n_padded = fp4_utils.pad_up(size_n, 128)
+        n_padded = size_n_pad
         scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
             weight_scale.view(n_padded, -1))
         # [size_n, num_groups] block scales; uint8 storage (reverse interleave),
@@ -2827,10 +2826,17 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
             weight = F.pad(weight,
                            (0,
                             (size_k_pad - size_k) // 2, 0, size_n_pad - size_n))
-            # scales: [N, num_groups] -> [N_pad, num_groups_pad]
-            scale_2d = F.pad(
-                scale_2d,
-                (0, num_groups_pad - num_groups, 0, size_n_pad - size_n))
+            # scales: [N, num_groups] -> [N_pad, num_groups_pad].
+            # The Marlin S0E5M3 fast-dequant is NOT zero-safe: a zero scale on
+            # a (zero-weight) padded K-group still corrupts that tile's output.
+            # Since K is the contraction dim, one bad group-scale poisons every
+            # output row, so padded K-groups must carry a valid non-zero fp8
+            # scale -- use the smallest-normal e4m3 value (0x08), matching the
+            # quantizer's own zero-block scale. N-row padding is sliced off in
+            # ``apply`` and can stay zero.
+            scale_2d = F.pad(scale_2d, (0, num_groups_pad - num_groups),
+                             value=0x08)
+            scale_2d = F.pad(scale_2d, (0, 0, 0, size_n_pad - size_n), value=0)
 
         qweight_int32 = weight.view(
             torch.int32).T.contiguous()  # [K_pad/4, N_pad]
