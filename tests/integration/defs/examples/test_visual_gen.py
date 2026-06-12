@@ -193,9 +193,11 @@ AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", 
 
 @pytest.fixture(scope="session")
 def _visual_gen_deps(llm_venv):
-    """Install Python deps once per session (shared by all video-gen fixtures)."""
+    """Install video-gen deps once per session."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
+    check_call(["apt-get", "update", "-y"], shell=False)
+    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
 @pytest.fixture(scope="session")
