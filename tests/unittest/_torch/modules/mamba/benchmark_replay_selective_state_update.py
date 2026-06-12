@@ -2472,10 +2472,7 @@ def _compile_warmup_phase(
             "num_loop_stages", "num_loop_stages_write", "num_loop_stages_nowrite"
         )
         pw_vals = _ps(args.precompute_num_warps)
-        ps_vals = _ps(args.precompute_num_stages)
         h_vals = _ps(args.heads_per_block)
-        mr_vals = _ps(args.maxnreg)
-        ct_vals = _ps(args.num_ctas)
         fl_vals = _ps(args.flatten)
         wsp_vals = _ps(args.warp_specialize)
         trl_vals = _ps(args.use_tma_rect_load)
@@ -2488,17 +2485,14 @@ def _compile_warmup_phase(
         for (mw, mnw), (ww, wnw), (sw, snw), (cw, cnw), (
             lw,
             lnw,
-        ), pw, ps_, h, mr, ct, fl, wsp, trl, twl, tnl, tws in _it.product(
+        ), pw, h, fl, wsp, trl, twl, tnl, tws in _it.product(
             m_pairs,
             w_pairs,
             ns_pairs,
             cps_pairs,
             ls_pairs,
             pw_vals,
-            ps_vals,
             h_vals,
-            mr_vals,
-            ct_vals,
             fl_vals,
             wsp_vals,
             trl_vals,
@@ -2519,10 +2513,7 @@ def _compile_warmup_phase(
                 ("num_loop_stages_write", lw),
                 ("num_loop_stages_nowrite", lnw),
                 ("precompute_num_warps", pw),
-                ("precompute_num_stages", ps_),
                 ("heads_per_block", h),
-                ("maxnreg", mr),
-                ("num_ctas", ct),
                 ("flatten", fl),
                 ("warp_specialize", wsp),
                 ("use_tma_rect_load", trl),
@@ -2798,10 +2789,7 @@ def _bench_config(
     num_warps_values = _parse_sweep(args.num_warps)
     num_stages_values = _parse_sweep(args.num_stages)
     precompute_num_warps_values = _parse_sweep(args.precompute_num_warps)
-    precompute_num_stages_values = _parse_sweep(args.precompute_num_stages)
     heads_per_block_values = _parse_sweep(args.heads_per_block)
-    maxnreg_values = _parse_sweep(args.maxnreg)
-    num_ctas_values = _parse_sweep(args.num_ctas)
     # Persistent-only sweep dims; ignored when the cell's mode != persistent_main.
     cta_per_sm_values = _parse_sweep(args.cta_per_sm)
     num_loop_stages_values = _parse_sweep(args.num_loop_stages)
@@ -3142,10 +3130,7 @@ def _bench_config(
                 num_stages_write_values,
                 num_stages_nowrite_values,
                 precompute_num_warps_values,
-                precompute_num_stages_values,
                 heads_per_block_values,
-                maxnreg_values,
-                num_ctas_values,
                 cta_per_sm_write_values,
                 cta_per_sm_nowrite_values,
                 num_loop_stages_write_values,
@@ -3168,10 +3153,7 @@ def _bench_config(
                 num_stages_values,
                 [None],
                 precompute_num_warps_values,
-                precompute_num_stages_values,
                 heads_per_block_values,
-                maxnreg_values,
-                num_ctas_values,
                 cta_per_sm_values,
                 [None],
                 num_loop_stages_values,
@@ -3214,10 +3196,7 @@ def _bench_config(
                         d.get("Sw"),
                         d.get("Snw"),
                         d.get("pW"),
-                        d.get("pS"),
                         d.get("H"),
-                        d.get("R"),
-                        d.get("CT"),
                         d.get("CPSw"),
                         d.get("CPSnw"),
                         d.get("LSw"),
@@ -3242,10 +3221,7 @@ def _bench_config(
             num_stages_w,
             num_stages_nw,
             precompute_num_warps,
-            precompute_num_stages,
             heads_per_block,
-            maxnreg,
-            num_ctas,
             cta_per_sm_w,
             cta_per_sm_nw,
             num_loop_stages_w,
@@ -3321,10 +3297,7 @@ def _bench_config(
                 num_warps=num_warps,
                 num_stages=num_stages,
                 precompute_num_warps=precompute_num_warps,
-                precompute_num_stages=precompute_num_stages,
                 heads_per_block=heads_per_block,
-                maxnreg=maxnreg,
-                num_ctas=num_ctas,
                 cta_per_sm=cta_per_sm,
                 num_loop_stages=num_loop_stages,
                 flatten=flatten,
@@ -3391,10 +3364,7 @@ def _bench_config(
                     _num_warps=num_warps,
                     _num_stages=num_stages,
                     _precompute_num_warps=precompute_num_warps,
-                    _precompute_num_stages=precompute_num_stages,
                     _heads_per_block=heads_per_block,
-                    _maxnreg=maxnreg,
-                    _num_ctas=num_ctas,
                     # Per-main overrides (None = tied to shared above; explicit
                     # only when the inner loop is iterating split axes).
                     _block_size_m_write=block_size_m_w if _any_split else None,
@@ -3438,14 +3408,6 @@ def _bench_config(
             _emit_split("Sw", "Snw", num_stages_w, num_stages_nw)
             parts.append(f"pW={_val(precompute_num_warps)}")
             parts.append(f"H={_val(heads_per_block)}")
-            optional_tag_parts = (
-                ("pS", precompute_num_stages),
-                ("R", maxnreg),
-                ("CT", num_ctas),
-            )
-            for _name, _value in optional_tag_parts:
-                if _value is not None:
-                    parts.append(f"{_name}={_value}")
             # Persistent-only knobs (only meaningful when MODE=persistent_main;
             # printed unconditionally so output rows are uniformly comparable
             # across modes when the user passed these sweeps).
@@ -3841,10 +3803,7 @@ _CELL_LIST_KEY_TO_ARG = {
     "LSw": "num_loop_stages_write",
     "LSnw": "num_loop_stages_nowrite",
     "pW": "precompute_num_warps",
-    "pS": "precompute_num_stages",
     "H": "heads_per_block",
-    "R": "maxnreg",
-    "CT": "num_ctas",
     "FL": "flatten",
     "WS": "warp_specialize",
     "TMARL": "use_tma_rect_load",
@@ -3958,10 +3917,7 @@ _CELL_LIST_KEY_TO_LOCAL = {
     "LSw": "num_loop_stages_w",
     "LSnw": "num_loop_stages_nw",
     "pW": "precompute_num_warps",
-    "pS": "precompute_num_stages",
     "H": "heads_per_block",
-    "R": "maxnreg",
-    "CT": "num_ctas",
     "FL": "flatten",
     "WS": "warp_specialize",
     "TMARL": "use_tma_rect_load",
@@ -4732,12 +4688,6 @@ def _parse_args() -> argparse.Namespace:
         help="Override num_warps for precompute kernel (comma-separated sweep).",
     )
     parser.add_argument(
-        "--precompute-num-stages",
-        type=str,
-        default=None,
-        help="Override num_stages for precompute kernel (comma-separated sweep).",
-    )
-    parser.add_argument(
         "--max-window",
         type=int,
         default=16,
@@ -4776,18 +4726,6 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Override HEADS_PER_BLOCK for precompute kernel (comma-separated sweep).",
-    )
-    parser.add_argument(
-        "--maxnreg",
-        type=str,
-        default=None,
-        help="Override maxnreg for the main kernel (comma-separated sweep).",
-    )
-    parser.add_argument(
-        "--num-ctas",
-        type=str,
-        default=None,
-        help="Override num_ctas for the main kernel (comma-separated sweep).",
     )
     parser.add_argument(
         "--cta-per-sm",
