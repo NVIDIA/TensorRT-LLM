@@ -182,16 +182,19 @@ class ResidualUnit(nn.Module):
         Returns:
             Output tensor of shape (B, C, T)
         """
-        res = x
-
-        x = self.conv1(self.snake1(x))
-        x = self.conv2(self.snake2(x))
+        output_tensor = self.conv1(self.snake1(x))
+        output_tensor = self.conv2(self.snake2(output_tensor))
 
         if self.causal:
-            # Trim right padding to get the causal output
-            x = x[:, :, : -self.padding]
+            output_tensor = output_tensor[:, :, : -self.padding]
+            res = x[:, :, : -self.padding]
+            return res + output_tensor
 
-        return x + res
+        res = x
+        padding = (res.shape[-1] - output_tensor.shape[-1]) // 2
+        if padding > 0:
+            res = res[..., padding:-padding]
+        return res + output_tensor
 
 
 class OobleckDecoderBlock(nn.Module):
@@ -332,11 +335,11 @@ class OobleckDecoderBlock(nn.Module):
         Returns:
             Output tensor of shape (B, C, T_upsampled)
         """
-        x = self.conv_t1(self.snake1(x))
+        x = self.snake1(x)
+        x = self.conv_t1(x)
         x = self.res_unit1(x)
         x = self.res_unit2(x)
-        x = self.res_unit3(x)
-        return x
+        return self.res_unit3(x)
 
     def remove_weight_norm(self) -> None:
         """Remove weight normalization from all layers."""
@@ -448,14 +451,24 @@ class OobleckDecoder(nn.Module):
         self.final_activation = nn.Tanh() if final_tanh else nn.Identity()
 
     def forward(self: "OobleckDecoder", x: torch.Tensor) -> torch.Tensor:
+        causal = self.model_config.get("causal", False)
+        if causal:
+            x = self.conv1(x)
+            x = self.conv1_trim(x)
+            for block in self.block:
+                x = block(x)
+            x = self.snake1(x)
+            x = self.conv2(x)
+            x = self.conv2_trim(x)
+            return self.final_activation(x)
+
         x = self.conv1(x)
-        x = self.conv1_trim(x)
         for block in self.block:
             x = block(x)
         x = self.snake1(x)
         x = self.conv2(x)
-        x = self.conv2_trim(x)
-        x = self.final_activation(x)
+        if not isinstance(self.final_activation, nn.Identity):
+            x = self.final_activation(x)
         return x
 
     def remove_weight_norm(self: "OobleckDecoder") -> None:
@@ -572,7 +585,7 @@ class LatentAutoEncoderV2(nn.Module):
         if self.latent_mean is not None and self.latent_std is not None:
             latent = latent * self.latent_std + self.latent_mean
 
-        return self.decoder(latent)
+        return self.decoder(latent).clamp(-1.0, 1.0)
 
     def remove_weight_norm(self: "LatentAutoEncoderV2") -> None:
         """Remove weight normalization from all components."""
