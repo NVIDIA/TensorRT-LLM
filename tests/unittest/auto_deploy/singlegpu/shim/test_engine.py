@@ -825,7 +825,7 @@ def test_ad_engine_prepare_inputs_generation_with_hybrid_cache():
     cache_seq_interface.shutdown()
 
 
-def test_ad_engine_prepare_inputs_prepares_sa_manager_with_extend_request_ids():
+def test_prepare_inputs_prepares_sa_manager():
     """SA slot binding uses the real extend request IDs from the scheduler."""
     device = torch.device("cuda")
     max_seq_len = 64

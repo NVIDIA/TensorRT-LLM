@@ -75,7 +75,7 @@ class MockFactory:
 """Unit tests for create_autodeploy_executor function."""
 
 
-def test_ad_engine_build_passes_sa_manager_to_optimizer_for_resize_accounting():
+def test_inference_optimizer_sees_sa_manager():
     ad_config = LlmArgs(
         model="target-model",
         max_batch_size=2,
@@ -89,9 +89,7 @@ def test_ad_engine_build_passes_sa_manager_to_optimizer_for_resize_accounting():
     get_inference_model = Mock(return_value=Mock())
     sa_manager = object()
 
-    # The resize_kv_cache transform runs inside InferenceOptimizer during engine build. SA-enhanced
-    # runs must pass the manager into optimizer shared config so resize and cudagraph warmup account
-    # for the already-reserved SA workspace.
+    # InferenceOptimizer needs the SA manager during CUDA graph capture.
     with (
         patch(
             "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
