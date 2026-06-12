@@ -90,7 +90,8 @@ The above example runs Multi-Head Latent Attention (MLA) with the following conf
 - Latent dimension: 512
 - RoPE dimension: 64
 - Number of heads: 128
-- Data types: Float16 (input), Float16 (output), Float32 (accumulation and LSE)
+- Data types: Float16/BFloat16 (input), Float16/BFloat16 (output),
+  Float32 (accumulation and LSE)
 
 It utilizes page table storage for the KV cache and enables both variable-length KV cache sequences
 and variable split KV processing with persistent scheduling.
@@ -110,7 +111,7 @@ To collect performance with NCU profiler:
 
 Constraints for this example:
 * Data type requirements:
-  - Input/output: Float16
+  - Input/output: Float16 or BFloat16
   - Accumulation and LSE: Float32
 * Fixed architecture parameters:
   - Number of attention heads: 128
@@ -3340,9 +3341,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         """
         if L != 512 or R != 64:
             return False
-        if in_dtype not in [cutlass.Float16]:
+        if in_dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
-        if out_dtype not in [cutlass.Float16]:
+        if out_dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False
