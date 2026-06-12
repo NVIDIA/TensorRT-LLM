@@ -54,6 +54,7 @@ def _make_allreduce_residual_rmsnorm_pattern(
     add_order: str = "residual_first",
     strategy: str = "AUTO",
     rmsnorm_op_name: str = "torch_rmsnorm",
+    with_reshape: bool = False,
 ):
     """Factory function to create pattern functions for allreduce+residual+rmsnorm fusion.
 
@@ -61,24 +62,42 @@ def _make_allreduce_residual_rmsnorm_pattern(
         add_order: Either "residual_first" (residual + x) or "x_first" (x + residual)
         strategy: AllReduce strategy to use in the pattern
         rmsnorm_op_name: Which rmsnorm op to match ("torch_rmsnorm" or "triton_rms_norm")
+        with_reshape: If True, insert a ``reshape`` between the all-reduce and the residual
+            add (e.g. ``[B*S, H] -> [B, S, H]``). Common when a tensor-parallel MLP/MoE
+            output is all-reduced as a flattened 2D tensor and reshaped back to the 3D
+            residual stream before the add.
 
     Returns:
         A pattern function that can be used with register_ad_pattern
+
+    Note:
+        A pre-RMSNorm residual downcast (``aten.to.dtype``) is intentionally NOT matched
+        here. Such a cast only survives tracing when the residual stream is in a higher
+        precision than the compute dtype (e.g. fp32), in which case the reference adds in
+        fp32 and downcasts the sum. The fused kernel cannot reproduce that
+        accumulate-then-downcast semantics from a single compute-dtype residual, so fusing
+        it would silently change residual-stream precision.
     """
     rmsnorm_op = _RMSNORM_OPS[rmsnorm_op_name]
 
     def pattern_fn(
         x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 0.1253
     ):
-        """Pattern: trtllm_dist_all_reduce(x) -> add residual -> rmsnorm
+        """Pattern: trtllm_dist_all_reduce(x) -> [reshape] -> add residual -> rmsnorm
 
         Reference PyTorch composition:
             y = trtllm_dist_all_reduce(x)
+            y = reshape(y, residual.shape)         # only if with_reshape
             z = residual + y  (or y + residual)
             normed = rmsnorm_op(z, weight, eps)
         Returns (normed, z)
         """
         hidden_states = torch.ops.auto_deploy.trtllm_dist_all_reduce(x, strategy)
+
+        # all-reduce preserves shape and is elementwise w.r.t. reshape, so a reshape
+        # between the all-reduce and the residual add commutes with the all-reduce.
+        if with_reshape:
+            hidden_states = torch.reshape(hidden_states, residual.shape)
 
         # Handle addition order
         if add_order == "residual_first":
@@ -94,9 +113,21 @@ def _make_allreduce_residual_rmsnorm_pattern(
 
 
 def _allreduce_residual_rmsnorm_replacement(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, strategy: str
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    strategy: str,
+    with_reshape: bool = False,
 ):
-    """Replacement using TRT-LLM fused kernel."""
+    """Replacement using TRT-LLM fused kernel.
+
+    When the matched pattern reshaped the all-reduce output before the residual add, the
+    reshape is pushed in front of the fused op's (internal) all-reduce input instead, which
+    is valid because all-reduce is elementwise and therefore commutes with reshape.
+    """
+    if with_reshape:
+        x = torch.reshape(x, residual.shape)
     return torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm(
         x, residual, weight, eps, strategy
     )
@@ -105,6 +136,13 @@ def _allreduce_residual_rmsnorm_replacement(
 # ============================================================================
 # Transform Implementation
 # ============================================================================
+
+
+def _is_reshape(node) -> bool:
+    return getattr(node, "op", None) == "call_function" and node.target in (
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.view.default,
+    )
 
 
 @TransformRegistry.register("fuse_allreduce_residual_rmsnorm")
@@ -118,6 +156,47 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
     Note: This transform expects torch_rmsnorm ops in the graph, which are created
     by the match_rmsnorm_pattern transform that runs earlier in the pipeline.
     """
+
+    @staticmethod
+    def _restore_dynamic_reshape(gm: GraphModule) -> int:
+        """Re-point baked-literal reshapes feeding the fused op at residual's runtime sizes.
+
+        The fused op is ``trtllm_fused_allreduce_residual_rmsnorm(x, residual, ...)``. For
+        the reshape variant ``x`` is a ``reshape(all_reduce_input, residual.shape)``. The
+        pattern matcher bakes ``residual.shape`` into concrete ints during replacement
+        tracing, so we replace that literal size list with ``aten.sym_size.int(residual, d)``
+        nodes, restoring a fully dynamic reshape. Returns the number of reshapes fixed.
+        """
+        fused_op = torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm
+        graph = gm.graph
+        num_fixed = 0
+        for node in list(graph.nodes):
+            if node.op != "call_function" or node.target != fused_op.default:
+                continue
+            if len(node.args) < 2:
+                continue
+            x_in, residual = node.args[0], node.args[1]
+            if not (_is_reshape(x_in) and isinstance(residual, torch.fx.Node)):
+                continue
+            size_arg = x_in.args[1]
+            if not (
+                isinstance(size_arg, (list, tuple))
+                and len(size_arg) > 0
+                and all(isinstance(s, int) for s in size_arg)
+            ):
+                continue
+            with graph.inserting_before(x_in):
+                dyn_sizes = [
+                    graph.call_function(torch.ops.aten.sym_size.int, (residual, d))
+                    for d in range(len(size_arg))
+                ]
+            x_in.update_arg(1, dyn_sizes)
+            num_fixed += 1
+        if num_fixed:
+            ad_logger.info(
+                f"Restored dynamic reshape on {num_fixed} fused allreduce-residual-rmsnorm op(s)"
+            )
+        return num_fixed
 
     def _apply(
         self,
@@ -157,30 +236,68 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
 
         patterns = ADPatternMatcherPass()
 
-        # Dummy shapes for tracing
-        bsz, hidden = 8, 512
-        dummy_args = [
-            torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # x
-            torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # residual
-            torch.randn(hidden, device="meta", dtype=torch.bfloat16),  # weight
-            0.1253,  # eps
-        ]
+        hidden = 512
         scalar_workaround = {"eps": 0.1253}
+
+        def _dummy_args(with_reshape: bool):
+            # Real graph (tensor-parallel MLP/MoE): the linear output is all-reduced as a
+            # 2D ``[tokens, hidden]`` tensor and then reshaped back to the 3D
+            # ``[batch, seq, hidden]`` residual stream before the add. So for the reshape
+            # variant ``x`` (the all-reduce input) is 2D and ``residual`` is 3D, i.e. the
+            # reshape EXPANDS 2D->3D. Using different ranks also keeps the reshape from
+            # being elided as an identity no-op during tracing (which would alter the
+            # pattern topology).
+            if with_reshape:
+                x = torch.randn(8, hidden, device="meta", dtype=torch.bfloat16)
+                residual = torch.randn(2, 4, hidden, device="meta", dtype=torch.bfloat16)
+            else:
+                x = torch.randn(8, hidden, device="meta", dtype=torch.bfloat16)
+                residual = torch.randn(8, hidden, device="meta", dtype=torch.bfloat16)
+            return [
+                x,
+                residual,
+                torch.randn(hidden, device="meta", dtype=torch.bfloat16),  # weight
+                0.1253,  # eps
+            ]
+
+        def _op_ignore_types(with_reshape: bool):
+            # Ignore the literal shape ints baked into the reshape so the pattern matches
+            # any reshape target shape rather than the specific dummy dims.
+            if with_reshape:
+                return {torch.ops.aten.reshape.default: (int,)}
+            return None
 
         for rmsnorm_op_name in _RMSNORM_OPS:
             for add_order in ("residual_first", "x_first"):
-                pattern = _make_allreduce_residual_rmsnorm_pattern(
-                    add_order=add_order, strategy=strategy, rmsnorm_op_name=rmsnorm_op_name
-                )
-                register_ad_pattern(
-                    search_fn=pattern,
-                    replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
-                    patterns=patterns,
-                    dummy_args=dummy_args,
-                    scalar_workaround=scalar_workaround,
-                )
+                for with_reshape in (False, True):
+                    pattern = _make_allreduce_residual_rmsnorm_pattern(
+                        add_order=add_order,
+                        strategy=strategy,
+                        rmsnorm_op_name=rmsnorm_op_name,
+                        with_reshape=with_reshape,
+                    )
+                    register_ad_pattern(
+                        search_fn=pattern,
+                        replace_fn=partial(
+                            _allreduce_residual_rmsnorm_replacement,
+                            strategy=strategy,
+                            with_reshape=with_reshape,
+                        ),
+                        patterns=patterns,
+                        dummy_args=_dummy_args(with_reshape),
+                        op_ignore_types=_op_ignore_types(with_reshape),
+                        scalar_workaround=scalar_workaround,
+                    )
 
         num_matches = patterns.apply(gm.graph)
+
+        # The pattern matcher re-traces the replacement with statically-shaped fake
+        # tensors (no dynamic_shapes), which bakes residual's concrete [B, S] dims into
+        # the reshape feeding the fused op (e.g. ``reshape(x, [2, 4, H])``). That makes
+        # the fused graph unusable at any other batch/seq. Re-point those reshapes at
+        # residual's *runtime* sizes so the fused all-reduce input shape stays dynamic.
+        if num_matches:
+            self._restore_dynamic_reshape(gm)
 
         info = TransformInfo(
             skipped=False,
