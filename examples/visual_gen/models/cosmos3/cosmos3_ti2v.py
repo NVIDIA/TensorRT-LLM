@@ -17,7 +17,7 @@ r"""Cosmos3 Text(+Image)-to-Video generation.
 
 Cosmos3 OmniMoT supports text-only (T2V) and image-conditioned (I2V/TI2V)
 generation from the same checkpoint. Pass ``--image_path`` to condition on a
-reference frame.
+reference frame, or use ``prompts/i2v.json`` which includes a ``vision_path``.
 
 Checkpoints (pass the Hub ID or local path via ``--model``):
 
@@ -44,63 +44,101 @@ Deployment configs (``examples/visual_gen/configs/``):
 - ``cosmos3-nano-1gpu.yaml`` — 1 GPU, FP8 dynamic quant
 - ``cosmos3-super-4gpu.yaml`` — 4 GPU, CFG + Ulysses + parallel VAE
 
-Usage:
+Example prompts live under ``prompts/`` (mirroring ``cosmos3-internal/inputs/omni``).
+
+Usage::
+
+    # Text-to-video
     python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
-        --prompt "The video opens with a view of a well-lit indoor space featuring a " \\
-        "wooden display case with compartments filled with various fruits, " \\
-        "including bananas, apples, pears, oranges, and carambolas. " \\
-        "The bananas are neatly arranged in the middle compartment, while apples " \\
-        "are in the left and a mix of pears, oranges, and carambolas are in the " \\
-        "right. " \\
-        "Two robotic arms with grippers are positioned at the bottom of the frame, " \\
-        "with the one on the left remaining stationary, partially obscuring the " \\
-        "apples. " \\
-        "The robotic arm on the right begins its action, extending towards the " \\
-        "right side of the display case. " \\
-        "It carefully picks up a pear from the fruit section, placing it into a " \\
-        "plastic bag in the shopping cart nearby, which has red handles. " \\
-        "After securing the pear, the arm retracts back to its original position. " \\
-        "The process repeats as the robotic arm picks up an orange and places it " \\
-        "in the bag, followed by a carambola. " \\
-        "The final frame captures the robotic arm returning to its initial " \\
-        "position, leaving the display case and surrounding area unchanged. " \\
-        "The video showcases a seamless and efficient automated fruit-picking " \\
-        "process, highlighting the precision and efficiency of modern robotics " \\
-        "in a retail setting." \
+        --prompt_file prompts/t2v.json \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
+    # Image-to-video (vision_path is read from the prompt file)
     python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
-        --prompt "A low-angle tracking shot follows a man riding a vintage black motorcycle " \\
-        "across a lush green grassy yard. Sunlight filters through overhead trees, casting " \\
-        "dappled shadows across the vibrating chrome exhaust and the rider's leather jacket. " \\
-        "He kicks up small blades of grass as he maneuvers the bike. He gradually decelerates, " \\
-        "the front fork compressing slightly as he brakes to a smooth halt beside another " \\
-        "individual standing in the shade. The camera settles into a medium two-shot, capturing " \\
-        "the rider lifting his visor to speak, his face framed by a matte helmet. The video is " \\
-        "8 seconds long and is of 24 FPS. This video is of 1280x720 resolution. Audio description: " \\
-        "The rhythmic, mechanical chugging of a four-stroke motorcycle engine dominates the " \\
-        "foreground, characterized by a throaty, guttural timbre. Periodic high-pitched revs " \\
-        "punctuate the steady idle as the throttle is twisted. The sound of tires crunching " \\
-        "softly over dry grass and twigs provides a textured background layer. As the vehicle " \\
-        "slows, the engine note drops to a low-frequency rumble before clicking into neutral. " \\
-        "A muffled, mid-range male voice begins speaking, accompanied by the metallic clink of " \\
-        "a helmet visor snapping upward and the faint chirping of distant birds in an open-air " \\
-        "environment." \
-        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
-        --enable_audio
+        --prompt_file prompts/i2v.json \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
+    # Text-to-video with audio
+    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/t2av.json \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # Text-to-image
+    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/t2i.json \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+        --output_path output.png
+
+    # Inline prompt (``--prompt`` or a JSON file path)
     python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
         --prompt "A cute puppy playing with a ball in a park" \
-        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
-        --output_type image \
-        --output_path output.png
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 """
 
 import argparse
 import json
 import os
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_path(path: str) -> str:
+    candidate = Path(path)
+    if candidate.is_file():
+        return str(candidate.resolve())
+    relative_to_script = _SCRIPT_DIR / path
+    if relative_to_script.is_file():
+        return str(relative_to_script.resolve())
+    return path
+
+
+def load_prompt_file(path: str) -> Dict[str, Any]:
+    """Load a Cosmos3 omni prompt JSON (``prompt``, optional ``vision_path``, etc.)."""
+    resolved = _resolve_path(path)
+    with open(resolved, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Prompt file must be a JSON object, got {type(data)!r}.")
+    if not data.get("prompt"):
+        raise ValueError(f"Prompt file {resolved!r} is missing a non-empty 'prompt' field.")
+    return data
+
+
+def resolve_prompt_and_options(
+    *,
+    prompt: Optional[str],
+    prompt_file: Optional[str],
+    image_path: Optional[str],
+    enable_audio: bool,
+    output_type: str,
+) -> tuple[str, Optional[str], bool, str]:
+    """Merge CLI args with optional prompt-file defaults."""
+    prompt_data: Dict[str, Any] = {}
+    if prompt_file is not None:
+        prompt_data = load_prompt_file(prompt_file)
+
+    resolved_prompt = prompt
+    if resolved_prompt is None:
+        resolved_prompt = prompt_data.get("prompt")
+    if not resolved_prompt:
+        raise ValueError("Provide --prompt or --prompt_file with a 'prompt' field.")
+
+    resolved_image = image_path
+    if resolved_image is None:
+        resolved_image = prompt_data.get("vision_path") or prompt_data.get("image_path")
+
+    resolved_enable_audio = enable_audio or bool(prompt_data.get("enable_audio", False))
+
+    resolved_output_type = output_type
+    model_mode = str(prompt_data.get("model_mode", "")).lower()
+    if model_mode == "text2image" and output_type == "video":
+        resolved_output_type = "image"
+
+    return resolved_prompt, resolved_image, resolved_enable_audio, resolved_output_type
 
 
 def main():
@@ -121,8 +159,14 @@ def main():
     parser.add_argument(
         "--prompt",
         type=str,
-        required=True,
-        help="Text prompt for generation",
+        default=None,
+        help="Text prompt for generation (overrides --prompt_file when both are set)",
+    )
+    parser.add_argument(
+        "--prompt_file",
+        type=str,
+        default="prompts/t2v.json",
+        help="Path to a JSON prompt file (default: prompts/t2v.json)",
     )
     parser.add_argument(
         "--negative_prompt",
@@ -134,7 +178,7 @@ def main():
         "--image_path",
         type=str,
         default=None,
-        help="Optional conditioning image path for I2V/TI2V",
+        help="Optional conditioning image path or URL for I2V/TI2V",
     )
     parser.add_argument(
         "--output_path",
@@ -143,12 +187,14 @@ def main():
         help="Path to save the output video",
     )
     parser.add_argument(
-        "--enable_duration_template", action="store_true", help="Enable duration template in prompt"
+        "--disable_duration_template",
+        action="store_true",
+        help="Disable duration metadata template (enabled by default, matching cosmos-framework CLI)",
     )
     parser.add_argument(
-        "--enable_resolution_template",
+        "--disable_resolution_template",
         action="store_true",
-        help="Enable resolution template in prompt",
+        help="Disable resolution metadata template (enabled by default, matching cosmos-framework CLI)",
     )
     parser.add_argument(
         "--use_system_prompt", action="store_true", help="Use system prompt in prompt"
@@ -164,6 +210,14 @@ def main():
     )
     args = parser.parse_args()
 
+    prompt, image_path, enable_audio, output_type = resolve_prompt_and_options(
+        prompt=args.prompt,
+        prompt_file=args.prompt_file,
+        image_path=args.image_path,
+        enable_audio=args.enable_audio,
+        output_type=args.output_type,
+    )
+
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
@@ -171,23 +225,27 @@ def main():
     # --- Model-specific: T2V / TI2V request construction ---
     # Query per-model defaults (resolution, steps, guidance, seed, etc.).
     params = visual_gen.default_params
-    if args.image_path is not None:
-        params.image = args.image_path
+    if image_path is not None:
+        params.image = image_path
 
+    negative_prompt_path = _resolve_path(args.negative_prompt)
     if args.negative_prompt is not None:
-        if os.path.isfile(args.negative_prompt) and args.negative_prompt.endswith(".json"):
-            negative_prompt = json.load(open(args.negative_prompt))
+        if os.path.isfile(negative_prompt_path) and negative_prompt_path.endswith(".json"):
+            with open(negative_prompt_path, encoding="utf-8") as f:
+                negative_prompt = json.load(f)
         else:
             negative_prompt = args.negative_prompt
     else:
         negative_prompt = None
 
-    params.extra_params["use_duration_template"] = args.enable_duration_template
-    params.extra_params["use_resolution_template"] = args.enable_resolution_template
+    if args.disable_duration_template:
+        params.extra_params["use_duration_template"] = False
+    if args.disable_resolution_template:
+        params.extra_params["use_resolution_template"] = False
     params.extra_params["use_system_prompt"] = args.use_system_prompt
-    params.extra_params["enable_audio"] = args.enable_audio
+    params.extra_params["enable_audio"] = enable_audio
     params.extra_params["use_guardrails"] = not args.disable_guardrails
-    params.extra_params["output_type"] = args.output_type
+    params.extra_params["output_type"] = output_type
 
     if negative_prompt is None:
         params.negative_prompt = None
@@ -197,7 +255,7 @@ def main():
         params.negative_prompt = json.dumps(negative_prompt)
 
     output = visual_gen.generate(
-        inputs=args.prompt,
+        inputs=prompt,
         params=params,
     )
 

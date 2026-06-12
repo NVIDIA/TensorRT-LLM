@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 import os
 import time
@@ -48,14 +49,6 @@ COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of 
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 
-# Inverse templates are appended to the negative prompt so the unconditional
-# branch is steered away from the requested duration/resolution.
-COSMOS3_INVERSE_DURATION_TEMPLATE = (
-    "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
-)
-COSMOS3_INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
-COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{width} resolution."
-
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
@@ -87,10 +80,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.action_gen = True
 
         super().__init__(pipeline_config)
-
-    @property
-    def dtype(self):
-        return self.pipeline_config.torch_dtype
 
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
@@ -295,8 +284,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             frame_rate=req.params.frame_rate,
-            use_duration_template=extra_params.get("use_duration_template", False),
-            use_resolution_template=extra_params.get("use_resolution_template", False),
+            use_duration_template=extra_params.get(
+                "use_duration_template",
+                COSMOS3_EXTRA_SPECS["use_duration_template"].default,
+            ),
+            use_resolution_template=extra_params.get(
+                "use_resolution_template",
+                COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
+            ),
             use_system_prompt=extra_params.get("use_system_prompt", False),
             use_guardrails=extra_params.get("use_guardrails", True),
             enable_audio=extra_params.get("enable_audio", False),
@@ -315,12 +310,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         resolution_template: Optional[str] = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
         force_duration_template: bool = False,
     ) -> str:
-        """Append duration and resolution metadata to a prompt.
+        """Append duration and resolution metadata to a plain-text prompt.
 
         ``duration_template`` / ``resolution_template`` of ``None`` disables that
-        template.  The positive prompt uses the forward templates; the negative
-        prompt uses the inverse templates with ``force_duration_template=True``
-        so the duration clause is appended even for single-frame requests.
+        template.  JSON prompts are handled by ``_format_prompt_with_metadata``.
         """
         parts: List[str] = []
         head = prompt.rstrip(".").strip()
@@ -334,6 +327,52 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if not parts:
             return ""
         return ". ".join(parts) + "."
+
+    def _format_prompt_with_metadata(
+        self,
+        prompt: str,
+        *,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        duration_template: Optional[str],
+        resolution_template: Optional[str],
+        force_duration_template: bool = False,
+    ) -> str:
+        """Apply cosmos-framework-style metadata to plain text or JSON prompts."""
+        stripped = prompt.strip()
+        if stripped.startswith("{"):
+            try:
+                data = json.loads(stripped)
+            except json.JSONDecodeError:
+                data = None
+            else:
+                if isinstance(data, dict):
+                    if duration_template is not None and (
+                        num_frames > 1 or force_duration_template
+                    ):
+                        duration = num_frames / frame_rate
+                        data["duration"] = f"{duration:.1f}s"
+                        data["fps"] = (
+                            int(frame_rate) if frame_rate == int(frame_rate) else frame_rate
+                        )
+                    if resolution_template is not None:
+                        data["resolution"] = {"W": width, "H": height}
+                        divisor = math.gcd(height, width)
+                        data["aspect_ratio"] = f"{height // divisor},{width // divisor}"
+                    return json.dumps(data, ensure_ascii=False)
+
+        return self._apply_metadata_templates(
+            prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            duration_template=duration_template,
+            resolution_template=resolution_template,
+            force_duration_template=force_duration_template,
+        )
 
     def _resize_and_center_crop_image(
         self, image: PIL.Image.Image, height: int, width: int
@@ -566,7 +605,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         Returns:
             Waveform tensor of shape (B, audio_channels, N_samples).
         """
-        return self.audio_tokenizer.decode(latent)  # [B, audio_channels, N_samples]
+        return self.audio_tokenizer.decode(latent).float()  # [B, audio_channels, N_samples]
 
     # =========================================================================
     # Forward (main generation entry point)
@@ -673,32 +712,21 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         else:
             res_tmpl = None
 
-        # Negative prompt: inverse templates, gated on the same flags as the
-        # positive templates, with the duration clause forced on so it is present
-        # even for single-frame requests.
-        inv_dur_tmpl = COSMOS3_INVERSE_DURATION_TEMPLATE if use_duration_template else None
-        if use_resolution_template:
-            inv_res_tmpl = (
-                COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
-                if is_t2i
-                else COSMOS3_INVERSE_RESOLUTION_TEMPLATE
-            )
-        else:
-            inv_res_tmpl = None
-
-        negative_prompt = self._apply_metadata_templates(
+        # Negative prompt: mirror positive metadata (cosmos-framework CLI default
+        # when ``negative_prompt_keep_metadata`` promotes mode to ``same``).
+        negative_prompt = self._format_prompt_with_metadata(
             negative_prompt,
             height=height,
             width=width,
             num_frames=num_frames,
             frame_rate=frame_rate,
-            duration_template=inv_dur_tmpl,
-            resolution_template=inv_res_tmpl,
-            force_duration_template=True,
+            duration_template=dur_tmpl,
+            resolution_template=res_tmpl,
+            force_duration_template=False,
         )
 
         prompt = [
-            self._apply_metadata_templates(
+            self._format_prompt_with_metadata(
                 p,
                 height=height,
                 width=width,

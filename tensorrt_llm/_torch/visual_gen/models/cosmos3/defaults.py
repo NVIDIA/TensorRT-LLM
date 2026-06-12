@@ -51,12 +51,12 @@ COSMOS3_T2I_PARAMS = {
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "use_duration_template": ExtraParamSchema(
         type="bool",
-        default=False,
+        default=True,
         description="Whether to use the duration template.",
     ),
     "use_resolution_template": ExtraParamSchema(
         type="bool",
-        default=False,
+        default=True,
         description="Whether to use the resolution template.",
     ),
     "use_system_prompt": ExtraParamSchema(

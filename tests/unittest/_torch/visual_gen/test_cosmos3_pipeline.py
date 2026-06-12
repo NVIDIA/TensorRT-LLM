@@ -16,12 +16,16 @@ Run T2I only:
 Run audio only:
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -s -m cosmos3_audio
 
+Run prompt metadata unit tests (no GPU):
+    pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -k FormatPromptWithMetadata
+
 Override checkpoint:
     DIFFUSION_MODEL_PATH_COSMOS3=/path/to/Cosmos3-Nano \\
         pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -s
 """
 
 import gc
+import json
 import os
 from pathlib import Path
 
@@ -33,6 +37,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_T2I_PARAMS
+from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    COSMOS3_DURATION_TEMPLATE,
+    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
+    Cosmos3OmniMoTPipeline,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
@@ -201,6 +211,157 @@ def _make_test_image() -> PIL.Image.Image:
     if image_path and os.path.exists(image_path):
         return PIL.Image.open(image_path).convert("RGB")
     return PIL.Image.new("RGB", (WIDTH, HEIGHT), color=(64, 128, 192))
+
+
+@pytest.fixture
+def cosmos3_format_pipeline():
+    """Minimal pipeline for prompt formatting helpers (no checkpoint)."""
+    return Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+
+
+def _format_prompt_with_metadata(
+    pipeline,
+    prompt: str,
+    *,
+    height: int = HEIGHT,
+    width: int = WIDTH,
+    num_frames: int = 189,
+    frame_rate: float = FRAME_RATE,
+    duration_template=COSMOS3_DURATION_TEMPLATE,
+    resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    force_duration_template: bool = False,
+) -> str:
+    return pipeline._format_prompt_with_metadata(
+        prompt,
+        height=height,
+        width=width,
+        num_frames=num_frames,
+        frame_rate=frame_rate,
+        duration_template=duration_template,
+        resolution_template=resolution_template,
+        force_duration_template=force_duration_template,
+    )
+
+
+class TestFormatPromptWithMetadataPlainText:
+    def test_appends_duration_and_resolution(self, cosmos3_format_pipeline):
+        result = _format_prompt_with_metadata(cosmos3_format_pipeline, "A cat on a beach")
+        assert result.startswith("A cat on a beach.")
+        assert "7.9 seconds long" in result
+        assert "720x1280" in result
+
+    def test_matches_apply_metadata_templates(self, cosmos3_format_pipeline):
+        prompt = "Mountain lake at sunrise"
+        via_format = _format_prompt_with_metadata(cosmos3_format_pipeline, prompt)
+        via_apply = cosmos3_format_pipeline._apply_metadata_templates(
+            prompt,
+            height=HEIGHT,
+            width=WIDTH,
+            num_frames=189,
+            frame_rate=FRAME_RATE,
+            duration_template=COSMOS3_DURATION_TEMPLATE,
+            resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+        )
+        assert via_format == via_apply
+
+    def test_templates_disabled_returns_prompt_only(self, cosmos3_format_pipeline):
+        result = _format_prompt_with_metadata(
+            cosmos3_format_pipeline,
+            "Plain prompt",
+            duration_template=None,
+            resolution_template=None,
+        )
+        assert result == "Plain prompt."
+
+    def test_empty_prompt_with_templates(self, cosmos3_format_pipeline):
+        result = _format_prompt_with_metadata(cosmos3_format_pipeline, "")
+        assert "7.9 seconds long" in result
+        assert "720x1280" in result
+
+    def test_invalid_json_prefix_falls_back_to_append(self, cosmos3_format_pipeline):
+        result = _format_prompt_with_metadata(cosmos3_format_pipeline, "{not valid json")
+        assert result.startswith("{not valid json.")
+        assert "720x1280" in result
+
+    def test_json_array_falls_back_to_append(self, cosmos3_format_pipeline):
+        result = _format_prompt_with_metadata(cosmos3_format_pipeline, '["a", "b"]')
+        assert result.startswith('["a", "b"].')
+        assert "720x1280" in result
+
+
+class TestFormatPromptWithMetadataJson:
+    def test_injects_metadata_fields(self, cosmos3_format_pipeline):
+        prompt = json.dumps({"prompt": "A foundry pour", "subjects": []})
+        result = _format_prompt_with_metadata(cosmos3_format_pipeline, prompt)
+        data = json.loads(result)
+        assert data["prompt"] == "A foundry pour"
+        assert data["subjects"] == []
+        assert data["duration"] == "7.9s"
+        assert data["fps"] == 24
+        assert data["resolution"] == {"W": 1280, "H": 720}
+        assert data["aspect_ratio"] == "9,16"
+
+    def test_overwrites_existing_metadata_fields(self, cosmos3_format_pipeline):
+        prompt = json.dumps(
+            {
+                "prompt": "test",
+                "duration": "5s",
+                "fps": 30,
+                "resolution": {"W": 640, "H": 480},
+                "aspect_ratio": "3,4",
+            }
+        )
+        data = json.loads(_format_prompt_with_metadata(cosmos3_format_pipeline, prompt))
+        assert data["duration"] == "7.9s"
+        assert data["fps"] == 24
+        assert data["resolution"] == {"W": 1280, "H": 720}
+        assert data["aspect_ratio"] == "9,16"
+
+    def test_single_frame_skips_duration_by_default(self, cosmos3_format_pipeline):
+        prompt = json.dumps({"prompt": "still life"})
+        data = json.loads(
+            _format_prompt_with_metadata(
+                cosmos3_format_pipeline,
+                prompt,
+                num_frames=1,
+                resolution_template=COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
+            )
+        )
+        assert "duration" not in data
+        assert data["resolution"] == {"W": 1280, "H": 720}
+
+    def test_single_frame_duration_when_forced(self, cosmos3_format_pipeline):
+        prompt = json.dumps({"prompt": "still life"})
+        data = json.loads(
+            _format_prompt_with_metadata(
+                cosmos3_format_pipeline,
+                prompt,
+                num_frames=1,
+                force_duration_template=True,
+            )
+        )
+        assert data["duration"] == "0.0s"
+
+    def test_non_integer_fps_preserved(self, cosmos3_format_pipeline):
+        prompt = json.dumps({"prompt": "test"})
+        data = json.loads(
+            _format_prompt_with_metadata(cosmos3_format_pipeline, prompt, frame_rate=23.976)
+        )
+        assert data["fps"] == 23.976
+
+    def test_resolution_only_when_duration_template_disabled(self, cosmos3_format_pipeline):
+        prompt = json.dumps({"prompt": "test"})
+        data = json.loads(
+            _format_prompt_with_metadata(
+                cosmos3_format_pipeline,
+                prompt,
+                duration_template=None,
+                resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+            )
+        )
+        assert "duration" not in data
+        assert "fps" not in data
+        assert data["resolution"] == {"W": 1280, "H": 720}
 
 
 @pytest.fixture(scope="class")
