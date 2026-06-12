@@ -1025,6 +1025,8 @@ class CachedSequenceInterface:
         replay_old_dA_cumsum: list,
         replay_cache_buf_idx: list,
         replay_prev_num_accepted: list,
+        replay_work_items: list,
+        replay_n_writes: list,
     ) -> None:
         """Validate persistent cache resources are cache-manager backed.
 
@@ -1050,6 +1052,8 @@ class CachedSequenceInterface:
                 replay_old_dA_cumsum,
                 replay_cache_buf_idx,
                 replay_prev_num_accepted,
+                replay_work_items,
+                replay_n_writes,
             ):
                 managed_names.update(name for name, _ in replay_resources)
 
@@ -1305,6 +1309,8 @@ class CachedSequenceInterface:
             replay_old_dA_cumsum,
             replay_cache_buf_idx,
             replay_prev_num_accepted,
+            replay_work_items,
+            replay_n_writes,
         )
 
         # 8. Allocate remaining unmanaged resources
