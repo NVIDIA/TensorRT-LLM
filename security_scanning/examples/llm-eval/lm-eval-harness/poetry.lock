@@ -14,14 +14,14 @@ files = [
 
 [[package]]
 name = "accelerate"
-version = "1.13.0"
+version = "1.14.0"
 description = "Accelerate"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "accelerate-1.13.0-py3-none-any.whl", hash = "sha256:cf1a3efb96c18f7b152eb0fa7490f3710b19c3f395699358f08decca2b8b62e0"},
-    {file = "accelerate-1.13.0.tar.gz", hash = "sha256:d631b4e0f5b3de4aff2d7e9e6857d164810dfc3237d54d017f075122d057b236"},
+    {file = "accelerate-1.14.0-py3-none-any.whl", hash = "sha256:e94390c2863b873be18f623f9df48a0d8fe5eff13ea7f1a00092b0a7904888c6"},
+    {file = "accelerate-1.14.0.tar.gz", hash = "sha256:41b9c4377a54e0b460a959b0defa1b736e4ca0a2373252d9a539964c2afe3c8d"},
 ]
 
 [package.dependencies]
@@ -42,7 +42,7 @@ sagemaker = ["sagemaker"]
 test-dev = ["bitsandbytes", "datasets", "diffusers", "evaluate", "scikit-learn", "scipy", "timm", "torchdata (>=0.8.0)", "torchpippy (>=0.2.0)", "tqdm", "transformers"]
 test-fp8 = ["torchao"]
 test-prod = ["parameterized", "pytest (>=7.2.0)", "pytest-order", "pytest-subtests", "pytest-xdist"]
-test-trackers = ["comet-ml", "dvclive", "matplotlib", "swanlab[dashboard]", "tensorboard", "trackio", "wandb"]
+test-trackers = ["dvclive", "matplotlib", "swanlab[dashboard]", "tensorboard", "trackio", "wandb"]
 testing = ["bitsandbytes", "datasets", "diffusers", "evaluate", "parameterized", "pytest (>=7.2.0)", "pytest-order", "pytest-subtests", "pytest-xdist", "scikit-learn", "scipy", "timm", "torchdata (>=0.8.0)", "torchpippy (>=0.2.0)", "tqdm", "transformers"]
 
 [[package]]
@@ -701,14 +701,14 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "filelock"
-version = "3.29.1"
+version = "3.29.3"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.29.1-py3-none-any.whl", hash = "sha256:85199dfd706869641b72b2e8955d5416a4b2b7dc4b0e8e6d97b4cc1299a6983b"},
-    {file = "filelock-3.29.1.tar.gz", hash = "sha256:d97e6b1b9757569626c58caa07dc4beb1613f4a2938b1e8cc81afca398906c9e"},
+    {file = "filelock-3.29.3-py3-none-any.whl", hash = "sha256:e58333029cc9b925f39aad59b1d8f0a1ad836af4e60d7217f4a4dba87461261d"},
+    {file = "filelock-3.29.3.tar.gz", hash = "sha256:7fc1b3f39cf172fd8203812043c57b8a65aef9969f38b6704f628b881f761a84"},
 ]
 
 [[package]]
@@ -994,21 +994,21 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.18.0"
+version = "1.19.0"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "huggingface_hub-1.18.0-py3-none-any.whl", hash = "sha256:729be4a976fb706dcc02d176bcda8a3f32bdf21a294e8f4b3dda6fbcbc9c1ab1"},
-    {file = "huggingface_hub-1.18.0.tar.gz", hash = "sha256:f0c5ecd1ef8c6a60f86f61ee278f2c1570ba9e279c9f54de9094210723b3613b"},
+    {file = "huggingface_hub-1.19.0-py3-none-any.whl", hash = "sha256:1dc72e1f6b4d6df6b30eb72e57d00514ef453d660f04af2b87f0e67267f31ee0"},
+    {file = "huggingface_hub-1.19.0.tar.gz", hash = "sha256:fd771622182d40977272a923953ee3b1b13538f9f8a7f5d78398f10af0f1c0bd"},
 ]
 
 [package.dependencies]
 click = ">=8.4.0"
 filelock = ">=3.10.0"
 fsspec = ">=2023.5.0"
-hf-xet = {version = ">=1.4.3,<2.0.0", markers = "platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\""}
+hf-xet = {version = ">=1.5.1,<2.0.0", markers = "platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\""}
 httpx = ">=0.23.0,<1"
 packaging = ">=20.9"
 pyyaml = ">=5.1"
@@ -1021,7 +1021,7 @@ all = ["Jinja2", "Pillow", "authlib (>=1.3.2)", "duckdb", "fastapi", "fastapi", 
 dev = ["Jinja2", "Pillow", "authlib (>=1.3.2)", "duckdb", "fastapi", "fastapi", "httpx", "itsdangerous", "jedi", "libcst (>=1.4.0)", "mypy (==1.15.0)", "numpy", "pytest (>=8.4.2)", "pytest-asyncio", "pytest-cov", "pytest-env", "pytest-mock", "pytest-rerunfailures (<16.0)", "pytest-vcr", "pytest-xdist", "ruff (>=0.9.0)", "soundfile", "ty", "types-PyYAML", "types-simplejson", "types-toml", "types-tqdm", "types-urllib3", "typing-extensions (>=4.8.0)", "urllib3 (<2.0)"]
 fastai = ["fastai (>=2.4)", "fastcore (>=1.3.27)", "toml"]
 gradio = ["gradio (>=5.0.0)", "requests"]
-hf-xet = ["hf-xet (>=1.4.3,<2.0.0)"]
+hf-xet = ["hf-xet (>=1.5.1,<2.0.0)"]
 mcp = ["mcp (>=1.8.0)"]
 oauth = ["authlib (>=1.3.2)", "fastapi", "httpx", "itsdangerous"]
 quality = ["libcst (>=1.4.0)", "mypy (==1.15.0)", "ruff (>=0.9.0)", "ty"]
@@ -3794,14 +3794,14 @@ dev = ["twine"]
 
 [[package]]
 name = "transformers"
-version = "5.10.2"
+version = "5.11.0"
 description = "Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and multimodal models, for both inference and training."
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "transformers-5.10.2-py3-none-any.whl", hash = "sha256:8a669db546f82c7c3618cb46ceb0f0afd89292bc70f319c058f8332ec63e268d"},
-    {file = "transformers-5.10.2.tar.gz", hash = "sha256:f9a44b9c8ca9ab1156b467f574d832ea066284299c2fd0ed84641ccb592751fc"},
+    {file = "transformers-5.11.0-py3-none-any.whl", hash = "sha256:06d0a34eab529955f8e704b530663c7d6bd6f9c7a9e47a05cddb4a44e7b6566b"},
+    {file = "transformers-5.11.0.tar.gz", hash = "sha256:1dbecade5b8a09bdf3e9e8fdfc9d312cb9eccf5a201080dc894b373f0f3eb5f4"},
 ]
 
 [package.dependencies]
@@ -3812,7 +3812,7 @@ pyyaml = ">=5.1"
 regex = ">=2025.10.22"
 safetensors = ">=0.4.3"
 tokenizers = ">=0.22.0,<=0.23.0"
-tqdm = ">=4.27"
+tqdm = ">=4.60"
 typer = "*"
 
 [package.extras]

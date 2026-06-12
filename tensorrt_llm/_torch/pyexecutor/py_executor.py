@@ -60,6 +60,7 @@ from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
+from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
@@ -72,8 +73,8 @@ from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
-from .resource_manager import (KVCacheManagerV2, ResourceManager,
-                               ResourceManagerType, request_context)
+from .resource_manager import (ResourceManager, ResourceManagerType,
+                               request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -4223,6 +4224,14 @@ class PyExecutor:
                 req.py_kv_transfer_timed_out = False
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
+                if not ctx_draft_tokens and self.model_engine.enable_spec_decode:
+                    # CTX has no speculative decoding — fill dummy draft tokens
+                    # so model_engine builds the correct input shape (1 + draft_len
+                    # tokens per gen request). Dummies will be rejected on verify,
+                    # and the draft model will produce real tokens for next step.
+                    ctx_draft_tokens = [
+                        0
+                    ] * self.model_engine.max_total_draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.py_beam_width
                 for beam in range(0, beam_width):
