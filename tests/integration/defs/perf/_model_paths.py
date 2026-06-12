@@ -123,9 +123,16 @@ MODEL_PATH_DICT = {
     "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
-# Models loaded directly by HuggingFace repo id (downloaded at runtime, not synced locally).
+# Model PATH of HuggingFace
 HF_MODEL_PATH = {
-    "nemotron_3_ultra_550b_nvfp4": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+    "llama_v3.1_8b_hf": "meta-llama/Llama-3.1-8B",
+    "llama_v3.1_8b_instruct_hf": "nvidia/Llama-3.1-8B-Instruct-FP8",
+    "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+    "llama_v3.1_nemotron_nano_8b_fp8_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1-FP8",
+    "llama_v3.3_nemotron_super_49b_hf": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.3_nemotron_super_49b_fp8_hf": "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b_fp8_hf": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
+    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
 }
 
 LORA_MODEL_PATH = {
