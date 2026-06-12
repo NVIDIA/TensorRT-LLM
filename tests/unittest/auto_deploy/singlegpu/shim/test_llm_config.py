@@ -66,6 +66,54 @@ def test_requires_uniform_kv_caches_follows_attention_backend():
     )
 
 
+@pytest.mark.parametrize("compile_backend", ["torch-simple", "torch-compile"])
+def test_non_piecewise_compile_backend_disables_default_piecewise(compile_backend):
+    args = LlmArgs(model="test-model", compile_backend=compile_backend)
+
+    assert args.transforms["compile_model"]["backend"] == compile_backend
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+@pytest.mark.parametrize("compile_backend", ["torch-simple", "torch-compile"])
+def test_transform_compile_backend_disables_default_piecewise(compile_backend):
+    args = LlmArgs(
+        model="test-model",
+        transforms={"compile_model": {"backend": compile_backend}},
+    )
+
+    assert args.compile_backend == compile_backend
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+def test_yaml_compile_backend_disables_default_piecewise(tmp_path):
+    yaml_path = tmp_path / "ad.yaml"
+    yaml_path.write_text("compile_backend: torch-simple\n")
+
+    args = LlmArgs(model="test-model", yaml_extra=[yaml_path])
+
+    assert args.compile_backend == "torch-simple"
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+def test_speculative_flashinfer_fallback_disables_piecewise():
+    from tensorrt_llm.llmapi import EagleDecodingConfig
+
+    spec_config = EagleDecodingConfig(
+        max_draft_len=3,
+        speculative_model="some/model",
+        eagle3_one_model=True,
+    )
+
+    args = LlmArgs(
+        model="test-model",
+        attn_backend="flashinfer",
+        speculative_config=spec_config,
+    )
+
+    assert args.compile_backend == "torch-simple"
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
 def test_cache_transceiver_rejects_unmanaged_persistent_caches():
     """Cache transceiver rejects unmanaged persistent cache resources."""
     args = LlmArgs(
