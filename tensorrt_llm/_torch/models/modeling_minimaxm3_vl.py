@@ -1841,8 +1841,136 @@ class MiniMaxM3VLInputProcessor:
             return list(value)
         return [value]
 
+    # ----- tokenized + MM fast-path hooks ---------------------------------
+    # Implementing these lets the runtime accept
+    # ``(prompt_token_ids, multi_modal_data)`` directly. Without them the
+    # runtime detokenizes prompt_token_ids back to text and re-runs the M3
+    # chat template, double-inserting ``]<]image[>[`` markers and crashing
+    # the HF processor at ``image_grid_thw[index].prod()``.
+
+    def get_vocab_size(self) -> Optional[int]:
+        # Top-level M3 VL config carries a legacy ``vocab_size=32000``;
+        # the real LM vocab lives on ``text_config`` (200064 incl. image
+        # / video / vision-start / vision-end tokens).
+        text_cfg = getattr(self._config, "text_config", None)
+        vocab = getattr(text_cfg, "vocab_size", None) or getattr(
+            self._config, "vocab_size", None)
+        return int(vocab) if vocab is not None else None
+
+    def get_mm_token_ids(self) -> torch.Tensor:
+        return torch.tensor(
+            [MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID],
+            dtype=torch.int32)
+
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        # VISION_START / VISION_END frame each MM span; declared as
+        # specials so they're counted in num_mm_tokens_per_placeholder
+        # but excluded from the embed-mask.
+        return torch.tensor(
+            [MINIMAX_M3_VL_VISION_START_TOKEN_ID, MINIMAX_M3_VL_VISION_END_TOKEN_ID],
+            dtype=torch.int32)
+
+    @staticmethod
+    def _hw(media: Any) -> Tuple[int, int]:
+        if isinstance(media, torch.Tensor):
+            return int(media.shape[-2]), int(media.shape[-1])
+        return int(media.height), int(media.width)
+
+    def get_num_tokens_per_image(self, *, image: Any, **kwargs: Any) -> int:
+        """Token count per image: ``(grid_h*grid_w)/merge^2 + 2`` (+VS/VE framing)."""
+        ip = self._processor.image_processor
+        h, w = self._hw(image)
+        merge = int(ip.merge_size)
+        return ip.get_number_of_image_patches(h, w) // (merge * merge) + 2
+
+    def get_num_tokens_per_video(
+        self,
+        *,
+        video: Any,
+        video_grid_thw: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> int:
+        """Token count per video block (+ VS/VE framing).
+
+        ``video_grid_thw`` is populated by the fast-path's dummy-text pass
+        in :func:`find_mm_token_lengths`, so we don't duplicate the video
+        resize / temporal-patch math here.
+        """
+        if video_grid_thw is None:
+            raise RuntimeError(
+                "MiniMaxM3VL fast path: get_num_tokens_per_video requires "
+                "precomputed video_grid_thw from the dummy-text pass.")
+        grid = (video_grid_thw.tolist()
+                if isinstance(video_grid_thw, torch.Tensor) else video_grid_thw)
+        merge = int(self._processor.image_processor.merge_size)
+        grid_t, grid_h, grid_w = int(grid[0]), int(grid[1]), int(grid[2])
+        return grid_t * (grid_h // merge) * (grid_w // merge) + 2
+
+    def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
+        # Return ``""``: ``__call__``'s chat-template branch already
+        # inserts one ``]<]image[>[`` / ``]<]video[>[`` marker per
+        # ``{"type": "image"}`` / ``{"type": "video"}`` content entry, so
+        # adding our own markers here would double them.
+        return ""
+
+    def expand_prompt_token_ids_for_mm(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_placeholder: List[int],
+        hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+        mm_data: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
+        """Rewrite chat-template placeholders into ``[VS, IMG*N, VE]`` blocks.
+
+        Dynamo's prompt_token_ids carries one ``image_token_id`` /
+        ``video_token_id`` per item with no VISION_START / VISION_END
+        framing; the HF MiniMaxVLProcessor would normally add it on the
+        slow path. We do the same here from ``num_mm_tokens_per_placeholder``
+        (which already accounts for the +2 framing).
+        """
+        mm_data = mm_data or {}
+        has_image = bool(mm_data.get("image"))
+        has_video = bool(mm_data.get("video"))
+        if has_image and has_video:
+            raise ValueError(
+                "MiniMaxM3VL fast path: mixed image + video in a single "
+                "request is not supported.")
+        if not (has_image or has_video):
+            return list(prompt_token_ids), None
+        placeholder_id = (MINIMAX_M3_VL_IMAGE_TOKEN_ID
+                          if has_image else MINIMAX_M3_VL_VIDEO_TOKEN_ID)
+        expected = len(num_mm_tokens_per_placeholder)
+        expanded: List[int] = []
+        consumed = 0
+        for tok in prompt_token_ids:
+            if tok != placeholder_id:
+                expanded.append(int(tok))
+                continue
+            if consumed >= expected:
+                raise ValueError(
+                    "MiniMaxM3VL fast path: prompt has more placeholders than "
+                    f"num_mm_tokens entries ({expected}).")
+            inner = int(num_mm_tokens_per_placeholder[consumed]) - 2
+            if inner < 1:
+                raise ValueError(
+                    f"MiniMaxM3VL fast path: num_mm_tokens[{consumed}]={inner + 2} "
+                    "must be >= 3 (VISION_START + >=1 placeholder + VISION_END).")
+            expanded.append(MINIMAX_M3_VL_VISION_START_TOKEN_ID)
+            expanded.extend([placeholder_id] * inner)
+            expanded.append(MINIMAX_M3_VL_VISION_END_TOKEN_ID)
+            consumed += 1
+        if consumed != expected:
+            raise ValueError(
+                f"MiniMaxM3VL fast path: prompt has {consumed} placeholders "
+                f"but num_mm_tokens has {expected} entries.")
+        return expanded, None
+
     # ----- main entry point -----------------------------------------------
-    def __call__(
+    # Implements the ``call_with_text_prompt`` hook required by
+    # :class:`BaseMultimodalInputProcessor`. The base class's ``__call__``
+    # dispatches text-prompt (with or without MM data) requests here and
+    # detokenizes token-id+MM requests to fall through to this method.
+    def call_with_text_prompt(
         self,
         inputs: Dict[str, Any],
         sampling_params: Any = None,

@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright 2025 XunhaoLai. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Adapted from SGLang's MiniMax-M3 sparse-attention Triton kernels under
+# ``python/sglang/srt/layers/attention/minimax_sparse_ops/`` (the
+# ``prefill/topk_sparse.py``, ``decode/topk_sparse.py``, and
+# ``prefill/flash_with_topk_idx.py`` modules in the SGLang repository,
+# https://github.com/sgl-project/sglang, Apache-2.0). The per-block max
+# score reduction + masked GQA softmax follow the same algorithm SGLang
+# uses for M3 sparse attention; the kernels here are restructured to
+# decouple the reductions from the attention matmul so PyTorch can run
+# the (G)QA-broadcast matmul while Triton owns the
+# mask + softmax + numerical-stability path.
 """Triton kernels for MiniMax-M3 sparse attention.
 
 Two OpenAI Triton kernels implement the reductions on the hot path:
