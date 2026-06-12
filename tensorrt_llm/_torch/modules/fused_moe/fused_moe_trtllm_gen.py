@@ -36,7 +36,7 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from ..gated_mlp import GatedMLP
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
-from .moe_op_backend import MoEOpBackend, get_op_backend
+from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
 
 # isort: off
 from .quantization import (
@@ -312,7 +312,13 @@ class TRTLLMGenFusedMoE(MoE):
             self.create_weights()
         self.layer_idx = layer_idx
 
-        if model_config.mapping.dp_size == 1 and self.quant_config.layer_quant_mode.has_fp8_block_scales(
+        # Set TLLM_MOE_DISABLE_SHARED_EXPERT_FUSION=1 to disable fusing the
+        # shared experts into the routed-expert grouped GEMM.
+        fusion_disabled = os.environ.get(
+            "TLLM_MOE_DISABLE_SHARED_EXPERT_FUSION", "0") == "1"
+        # Only the trtllm op backend implements fused shared experts
+        on_trtllm_backend = isinstance(self.op_backend, TRTLLMOpBackend)
+        if not fusion_disabled and on_trtllm_backend and model_config.mapping.dp_size == 1 and self.quant_config.layer_quant_mode.has_fp8_block_scales(
         ):
             # Not all models that use this backend define shared experts (e.g. non-DeepSeek
             # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
