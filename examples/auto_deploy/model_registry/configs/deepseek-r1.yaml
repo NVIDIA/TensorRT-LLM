@@ -1,6 +1,8 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
 max_batch_size: 256
+# Long-context/high-concurrency sizing. For low concurrency (conc=1), lower max_seq_len to the real max context:
+# smaller max_blocks_per_seq (=ceil(max_seq_len/tokens_per_block)) shrinks the decode KV block-table -> ~3% faster.
 max_seq_len: 8192
 max_num_tokens: 15360
 enable_chunked_prefill: true
@@ -34,9 +36,6 @@ transforms:
     backend: trtllm_mla
   fuse_rope_into_trtllm_mla:
     enabled: true
-  # Generic fuse_gemms merges the MLA q_a + kv_a_with_mqa projections into a
-  # 2112x7168 bf16 GEMM; torch_linear_simple then dispatches that exact shape
-  # to the trtllm dsv3 min-latency kernel (op-level, no extra transform).
   fuse_gemms:
     enabled: true
 
@@ -55,9 +54,6 @@ transforms:
   apply_sharding_hints:
     enabled: true
     allreduce_strategy: SYMM_MEM
-    # shard_layers whitelist: the shared expert (layer_type="shared_expert") is
-    # NOT listed, so it stays REPLICATED. TP-sharding it corrupts NVFP4
-    # deswizzled weight scales (~2.5pt GSM8K loss). Required for accuracy.
     shard_layers:
     - mla
     - moe
