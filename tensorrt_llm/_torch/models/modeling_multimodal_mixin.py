@@ -30,27 +30,6 @@ from .modeling_multimodal_utils import (
 
 
 @dataclass(frozen=True)
-class MultimodalEncoderOutput:
-    """Output produced by a model-owned multimodal encoder hook.
-
-    Contract:
-    - `embeddings` contains all multimodal embedding rows for the supplied
-      `multimodal_params`.
-    - Rows are concatenated in the same order as `multimodal_params`.
-    - Per-request row counts match `total_embeds_in_request` from runtime
-      metadata when that metadata is available.
-    - Special multimodal tokens occupy token positions but do not have rows in
-      this tensor.
-
-    The single-tensor shape is required for chunked-prefill embedding reuse,
-    which lets later chunks skip the encoder. See
-    `modeling_multimodal_utils.py` for the caching machinery.
-    """
-
-    embeddings: torch.Tensor
-
-
-@dataclass(frozen=True)
 class PreparedLlmInputs:
     """Prepared inputs returned by `MultimodalModelMixin`."""
 
@@ -71,8 +50,13 @@ class MultimodalModelMixin:
         self,
         multimodal_params: Sequence[MultimodalParams],
         **encoder_kwargs: Any,
-    ) -> MultimodalEncoderOutput:
-        """Run model-specific multimodal encoder work."""
+    ) -> torch.Tensor:
+        """Run model-specific multimodal encoder work.
+
+        Returns the single primary multimodal embedding tensor for the supplied params. Rows are
+        expected to be concatenated in request order, and special multimodal tokens occupy token
+        positions but do not have rows here.
+        """
         raise NotImplementedError
 
     @property
@@ -122,16 +106,16 @@ class MultimodalModelMixin:
         *,
         input_ids: torch.Tensor,
         multimodal_params: Sequence[MultimodalParams],
-        encoder_output: MultimodalEncoderOutput,
+        embeddings: torch.Tensor,
         **forward_kwargs: Any,
-    ) -> tuple[torch.Tensor, MultimodalEncoderOutput]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Optional hook before active chunk rows are selected.
 
         Runs after cache lookup or encoder execution has produced full
         per-request multimodal embeddings, but before the mixin selects rows
         active in the current forward chunk.
         """
-        return input_ids, encoder_output
+        return input_ids, embeddings
 
     def after_active_multimodal_embeddings(
         self,
@@ -179,24 +163,19 @@ class MultimodalModelMixin:
             multimodal_params=context_params,
             **forward_kwargs,
         )
-        full_output = self._get_or_encode_multimodal_embeddings(
+        full_embeddings = self._get_or_encode_multimodal_embeddings(
             context_params,
             **encoder_kwargs,
         )
 
-        input_ids, full_output = self.after_full_multimodal_embeddings(
+        input_ids, full_embeddings = self.after_full_multimodal_embeddings(
             input_ids=input_ids,
             multimodal_params=context_params,
-            encoder_output=full_output,
+            embeddings=full_embeddings,
             **forward_kwargs,
         )
 
-        active_embeddings = self._find_active_multimodal_embeddings(
-            [full_output.embeddings],
-            input_ids=input_ids,
-            positions=positions,
-            multimodal_params=context_params,
-        )
+        active_embeddings = find_input_mm_embeds([full_embeddings], list(context_params))
         active_embeddings, extra_embeds = self.after_active_multimodal_embeddings(
             active_embeddings=active_embeddings,
             multimodal_params=context_params,
@@ -228,50 +207,21 @@ class MultimodalModelMixin:
         self,
         multimodal_params: Sequence[MultimodalParams],
         **encoder_kwargs: Any,
-    ) -> MultimodalEncoderOutput:
+    ) -> torch.Tensor:
         """Return cached multimodal embeddings or run the encoder for misses.
 
-        Delegates cache lookup and gather behavior to
-        `get_multimodal_embeddings`, then validates the single primary tensor
-        contract for both encoded and cached-only paths.
+        Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
+        the single tensor contract for both encoded and cached-only paths.
         """
-
-        def encoder_forward_fn(params: list[MultimodalParams], **kwargs: Any) -> list[torch.Tensor]:
-            encoder_output = self.encode_multimodal_inputs(params, **kwargs)
-            if not isinstance(encoder_output, MultimodalEncoderOutput):
-                raise TypeError("encode_multimodal_inputs must return MultimodalEncoderOutput.")
-            if not isinstance(encoder_output.embeddings, torch.Tensor):
-                raise TypeError("MultimodalEncoderOutput.embeddings must be a torch.Tensor.")
-            return [encoder_output.embeddings]
-
         embeddings = get_multimodal_embeddings(
-            encoder_forward_fn=encoder_forward_fn,
+            encoder_forward_fn=self.encode_multimodal_inputs,
             multimodal_params=list(multimodal_params),
             encoder_kwargs=encoder_kwargs,
         )
-        primary = self._require_primary_embedding(embeddings)
-        # Validate post-gather so cached-only paths (KV reuse, all-cached chunked
-        # prefill) are also checked, not just paths that ran the encoder.
-        self._validate_primary_embedding_rows(primary, multimodal_params)
-        return MultimodalEncoderOutput(embeddings=primary)
-
-    def _find_active_multimodal_embeddings(
-        self,
-        multimodal_embeddings: list[torch.Tensor],
-        *,
-        input_ids: torch.Tensor,
-        positions: Optional[torch.Tensor],
-        multimodal_params: Sequence[MultimodalParams],
-    ) -> list[torch.Tensor]:
-        """Named internal stage for selecting active chunk multimodal rows.
-
-        This initial template stage currently delegates to
-        `find_input_mm_embeds`. Model-specific behavior around slicing should
-        use `after_full_multimodal_embeddings` or
-        `after_active_multimodal_embeddings` so the common mixin sequence stays
-        centralized.
-        """
-        return find_input_mm_embeds(multimodal_embeddings, list(multimodal_params))
+        # Validate post-gather so cached-only paths (KV reuse, all-cached chunked prefill) are also
+        # checked, not just paths that ran the encoder.
+        self._validate_embeddings(embeddings, multimodal_params)
+        return embeddings[0]
 
     def _fuse_multimodal_embeddings(
         self,
@@ -313,38 +263,44 @@ class MultimodalModelMixin:
         return fused_input_ids, inputs_embeds, ()
 
     @staticmethod
-    def _require_primary_embedding(embeddings: list[torch.Tensor]) -> torch.Tensor:
-        if len(embeddings) != 1:
-            raise ValueError(
-                "MultimodalModelMixin requires a single primary embedding tensor, "
-                f"got {len(embeddings)} tensors."
-            )
-        return embeddings[0]
-
-    @staticmethod
-    def _validate_primary_embedding_rows(
-        primary: torch.Tensor,
+    def _validate_embeddings(
+        embeddings: list[torch.Tensor],
         multimodal_params: Sequence[MultimodalParams],
     ) -> None:
-        """Validate gathered primary embedding row count against runtime metadata.
+        """Validate gathered embeddings embedding row count against runtime metadata.
 
         Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
         cannot be evaluated without complete metadata.
         """
+        if len(embeddings) != 1:
+            raise ValueError(
+                f"MultimodalModelMixin requires a single embedding tensor, got {len(embeddings)} "
+                "tensors."
+            )
+
+        embeddings_tensor = embeddings[0]
         expected_rows = 0
+        has_runtime_metadata = []
         for param in multimodal_params:
             runtime = param.multimodal_runtime
-            if runtime is None or runtime.total_embeds_in_request is None:
-                logger.debug(
-                    "Skipping multimodal embedding row-count validation: "
-                    "runtime metadata missing or incomplete for at least one param."
-                )
-                return
-            expected_rows += runtime.total_embeds_in_request
+            has_runtime = runtime is not None and runtime.total_embeds_in_request is not None
+            has_runtime_metadata.append(has_runtime)
+            if has_runtime:
+                expected_rows += runtime.total_embeds_in_request
 
-        actual_rows = primary.shape[0]
+        if any(has_runtime_metadata) and not all(has_runtime_metadata):
+            raise ValueError(
+                "Multimodal runtime metadata must be present for every param or none of them."
+            )
+        if not all(has_runtime_metadata):
+            logger.debug(
+                "Skipping multimodal embedding row-count validation: runtime metadata missing "
+                "for all params."
+            )
+            return
+
+        actual_rows = embeddings_tensor.shape[0]
         if actual_rows != expected_rows:
             raise ValueError(
-                "Multimodal embedding row count mismatch: "
-                f"expected {expected_rows}, got {actual_rows}."
+                f"Multimodal embedding row count mismatch: expected {expected_rows}, got {actual_rows}."
             )

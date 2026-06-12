@@ -48,8 +48,26 @@ class DummyMultimodalModel(MultimodalModelMixin):
         raise AssertionError("Tests use cached multimodal embeddings and should not encode.")
 
 
+class TensorEncoderMultimodalModel(DummyMultimodalModel):
+    def __init__(
+        self,
+        embedding: Embedding,
+        mm_token_ids: torch.Tensor,
+        mm_embeds: torch.Tensor,
+    ):
+        super().__init__(embedding, mm_token_ids)
+        self.mm_embeds = mm_embeds
+
+    def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
+        return self.mm_embeds
+
+
 def make_cached_multimodal_param(mm_embeds: torch.Tensor) -> MultimodalParams:
     return MultimodalParams(multimodal_data={"multimodal_embedding": mm_embeds})
+
+
+def make_raw_multimodal_param() -> MultimodalParams:
+    return MultimodalParams(multimodal_data={"image": {"pixel_values": torch.empty(1)}})
 
 
 @pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
@@ -79,6 +97,40 @@ def test_prepare_multimodal_inputs_forwards_precomputed_indices(device):
     assert out.input_ids is None
     assert out.inputs_embeds is not None
     assert out.inputs_embeds.shape == (input_ids.numel(), hidden)
+    torch.testing.assert_close(
+        out.inputs_embeds[mm_idx],
+        mm_emb.to(dtype=out.inputs_embeds.dtype, device=out.inputs_embeds.device),
+    )
+    torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
+    hidden = 8
+    mm_token_id = 7
+    emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
+
+    input_ids = torch.tensor([0, mm_token_id, 1], dtype=torch.long, device=device)
+    text_idx = torch.tensor([0, 2], dtype=torch.long, device=device)
+    mm_idx = torch.tensor([1], dtype=torch.long, device=device)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
+    model = TensorEncoderMultimodalModel(
+        emb,
+        torch.tensor([mm_token_id], dtype=torch.long, device=device),
+        mm_emb,
+    )
+
+    out = model.prepare_multimodal_inputs(
+        input_ids=input_ids,
+        positions=None,
+        multimodal_params=[make_raw_multimodal_param()],
+        num_context_requests=1,
+        text_token_indices=text_idx,
+        mm_token_indices=mm_idx,
+    )
+
+    assert out.input_ids is None
+    assert out.inputs_embeds is not None
     torch.testing.assert_close(
         out.inputs_embeds[mm_idx],
         mm_emb.to(dtype=out.inputs_embeds.dtype, device=out.inputs_embeds.device),

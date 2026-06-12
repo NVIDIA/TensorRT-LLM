@@ -196,10 +196,26 @@ def _cache_multimodal_embeddings(
     )
 
 
+def _normalize_encoder_embeddings(
+    encoder_embeddings: Union[torch.Tensor, List[torch.Tensor]],
+) -> List[torch.Tensor]:
+    if isinstance(encoder_embeddings, torch.Tensor):
+        return [encoder_embeddings]
+
+    if (not isinstance(encoder_embeddings, list) or not all(
+            isinstance(embedding, torch.Tensor)
+            for embedding in encoder_embeddings)):
+        raise TypeError(
+            "encoder_forward_fn must return a torch.Tensor or a list of torch.Tensor."
+        )
+
+    return encoder_embeddings
+
+
 def get_multimodal_embeddings(
     encoder_forward_fn: Callable[
-        [List[MultimodalParams]],
-        List[torch.Tensor],
+        ...,
+        torch.Tensor | List[torch.Tensor],
     ],
     multimodal_params: List[MultimodalParams],
     encoder_kwargs: Optional[Dict[str, Any]] = None,
@@ -215,7 +231,8 @@ def get_multimodal_embeddings(
 
     Args:
         encoder_forward_fn: Callable that performs encoder forward pass.
-                           Should accept List[MultimodalParams] and return List[torch.Tensor].
+                           Should accept List[MultimodalParams] and return either
+                           a single torch.Tensor or List[torch.Tensor].
         multimodal_params: All multimodal parameters in the batch.
         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
     Returns:
@@ -233,6 +250,7 @@ def get_multimodal_embeddings(
         kwargs = encoder_kwargs or {}
         encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
                                                 **kwargs)
+        encoder_embeddings = _normalize_encoder_embeddings(encoder_embeddings)
 
         # TODO: support multiple multimodal modalities per request
         if len(encoder_embeddings) > 1:
