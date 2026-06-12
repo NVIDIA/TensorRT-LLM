@@ -12,15 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Transformations for fusing collective operations.
-
-This module registers TRT-LLM backend patterns only. Fusion is only applied
-when TRT-LLM is available (MPI mode) since it provides optimized fused kernels.
-The torch backend (demollm mode) does not benefit from fusion.
-"""
+"""Transformations for fusing collective operations."""
 
 from functools import partial
-from typing import Tuple
+from typing import Literal, Tuple, Type
 
 import torch
 from torch.fx import GraphModule
@@ -29,7 +24,13 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 # TODO: This is an overly simplified model that works well for vanilla Llama models.
 # However, we eventually want to consider more sophisticated patterns such as
@@ -102,22 +103,43 @@ def _allreduce_residual_rmsnorm_replacement(
     )
 
 
+def _cute_allreduce_residual_rmsnorm_replacement(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+):
+    """Replacement using the experimental CuTe DSL fused kernel."""
+    return torch.ops.auto_deploy.cute_dist_fused_allreduce_residual_rmsnorm(
+        x, residual, weight, eps
+    )
+
+
 # ============================================================================
 # Transform Implementation
 # ============================================================================
+
+
+class FuseAllreduceResidualRMSNormConfig(TransformConfig):
+    """Configuration for allreduce + residual + RMSNorm fusion."""
+
+    backend: Literal["trtllm", "cute"] = "trtllm"
 
 
 @TransformRegistry.register("fuse_allreduce_residual_rmsnorm")
 class FuseAllreduceResidualRMSNorm(BaseTransform):
     """Fuse (allreduce + residual add + RMSNorm) into one fused op with tuple output.
 
-    This transform only applies when TRT-LLM ops are used (MPI mode), as it provides
-    optimized fused kernels. The torch backend (demollm mode) does not benefit from
-    this fusion and uses unfused operations.
+    This transform applies when TRT-LLM ops are used (MPI mode). The torch
+    backend (demollm mode) does not benefit from this fusion and uses unfused
+    operations.
 
     Note: This transform expects torch_rmsnorm ops in the graph, which are created
     by the match_rmsnorm_pattern transform that runs earlier in the pipeline.
     """
+
+    config: FuseAllreduceResidualRMSNormConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseAllreduceResidualRMSNormConfig
 
     def _apply(
         self,
@@ -155,6 +177,11 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Instantiate Pattern Functions
         # ============================================================================
 
+        if self.config.backend == "trtllm":
+            replace_fn = partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy)
+        else:
+            replace_fn = _cute_allreduce_residual_rmsnorm_replacement
+
         patterns = ADPatternMatcherPass()
 
         # Dummy shapes for tracing
@@ -174,7 +201,7 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
                 )
                 register_ad_pattern(
                     search_fn=pattern,
-                    replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
+                    replace_fn=replace_fn,
                     patterns=patterns,
                     dummy_args=dummy_args,
                     scalar_workaround=scalar_workaround,
