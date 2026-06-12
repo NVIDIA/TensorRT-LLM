@@ -403,7 +403,11 @@ class SkipSoftmaxScheduler:
         *,
         disabled_until_timestep: Optional[float],
     ) -> Optional[int]:
-        """Return the graph-key phase for the timestep disablement boundary."""
+        """Return the graph-key phase for the timestep disablement boundary.
+
+        VisualGen denoising timesteps descend from 1 to 0, so skip-softmax is
+        disabled while ``timestep >= disabled_until_timestep``.
+        """
         if disabled_until_timestep is None:
             return None
         timestep_value = cls._as_float(timestep)
