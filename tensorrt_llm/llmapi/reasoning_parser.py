@@ -318,12 +318,31 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                  *,
                  reasoning_at_start: bool = True,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        """Initialize the parser.
+
+        Two boolean flags are derived from ``chat_template_kwargs`` and gate
+        the "swap leaked reasoning into content" behavior in
+        ``_maybe_swap_content`` / ``parse_delta`` / ``finish``:
+
+        - ``_force_nonempty_content``: set when the caller passed
+          ``force_nonempty_content=True``. Power-user opt-in that forces the
+          swap whenever ``content`` is empty.
+        - ``_enable_thinking_is_false``: set when the caller passed
+          ``enable_thinking=False``. Triggers the same swap so OpenAI-style
+          clients (which render only ``content``) see a non-empty response
+          when the model leaks reasoning despite the thinking-off request.
+          Matches the HuggingFace ``SuperV3ReasoningParser`` shipped with
+          the model.
+        """
         self._force_nonempty_content = False
+        self._enable_thinking_is_false = False
         if isinstance(chat_template_kwargs, dict):
             reasoning_at_start = chat_template_kwargs.get(
                 "enable_thinking", reasoning_at_start)
             self._force_nonempty_content = chat_template_kwargs.get(
                 "force_nonempty_content", False) is True
+            self._enable_thinking_is_false = (
+                chat_template_kwargs.get("enable_thinking") is False)
         super().__init__(reasoning_at_start=reasoning_at_start,
                          chat_template_kwargs=chat_template_kwargs)
         self._tool_call_start = "<tool_call>"
@@ -336,14 +355,16 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
 
     def _maybe_swap_content(
             self, result: ReasoningParserResult) -> ReasoningParserResult:
-        """When force_nonempty_content is set and content is empty, move
-        reasoning_content into content so the response always has content.
+        """When force_nonempty_content is set, or the caller requested
+        ``enable_thinking=False`` and the model leaked into reasoning anyway,
+        move reasoning_content into content so the response always has
+        content.
 
         Whitespace-only content (e.g. a newline after the closing think tag) is
         treated as empty so the swap still runs (NVBug 6060281)."""
         content = result.content or ""
-        if self._force_nonempty_content and not content.strip(
-        ) and result.reasoning_content:
+        if ((self._force_nonempty_content or self._enable_thinking_is_false)
+                and not content.strip() and result.reasoning_content):
             return ReasoningParserResult(content=result.reasoning_content,
                                          reasoning_content="")
         return result
@@ -367,7 +388,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
             tool_idx = delta_text.find(self._tool_call_start)
             reasoning = remaining + delta_text[:tool_idx]
             content = delta_text[tool_idx:]
-            if self._force_nonempty_content:
+            if self._force_nonempty_content or self._enable_thinking_is_false:
                 self._found_closing_tag = True
                 self._accumulated_reasoning = ""
             return ReasoningParserResult(content=content,
@@ -375,7 +396,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
 
         was_in_reasoning = self.in_reasoning
         result = super().parse_delta(delta_text)
-        if self._force_nonempty_content:
+        if self._force_nonempty_content or self._enable_thinking_is_false:
             if result.reasoning_content:
                 self._accumulated_reasoning += result.reasoning_content
             if was_in_reasoning and not self.in_reasoning:
@@ -397,7 +418,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         if self.in_reasoning and not self._found_closing_tag:
             remaining = self._buffer
             self._buffer = ""
-            if self._force_nonempty_content:
+            if self._force_nonempty_content or self._enable_thinking_is_false:
                 all_content = self._accumulated_reasoning + remaining
                 self._accumulated_reasoning = ""
                 self.in_reasoning = False
