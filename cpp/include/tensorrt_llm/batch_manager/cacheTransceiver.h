@@ -35,6 +35,7 @@
 #include <torch/custom_class.h>
 #include <torch/python.h>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -225,6 +226,11 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
+    {
+        return false;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -272,6 +278,8 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
+    [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
+
 private:
     void initializeCommState();
 
@@ -287,6 +295,12 @@ private:
     // Dedup sets so observe-only timeout WARN logs fire at most once per stuck request.
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
+    std::unordered_set<LlmRequest::RequestIdType> mCompletedSenderRequestIds;
+    std::unordered_set<LlmRequest::RequestIdType> mFailedSenderRequestIds;
+    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mSenderRequestsAwaitingConsensus;
+    std::unordered_set<LlmRequest::RequestIdType> mCompletedRequesterRequestIds;
+    std::unordered_set<LlmRequest::RequestIdType> mFailedRequesterRequestIds;
+    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mRequesterRequestsAwaitingConsensus;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;

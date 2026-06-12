@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 #include "nixl.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
+#include <mutex>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -57,14 +58,18 @@ class NixlTransferStatus final : public TransferStatus
 {
 public:
     NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle);
+    ~NixlTransferStatus() override;
 
     [[nodiscard]] bool isCompleted() const override;
 
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
+    [[nodiscard]] bool release() override;
+
 private:
     nixlAgent* mRawAgent{};
     nixlXferReqH* mHandle{};
+    mutable std::mutex mHandleMutex;
 };
 
 class NixlTransferAgent final : public BaseTransferAgent
