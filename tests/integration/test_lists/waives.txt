@@ -355,6 +355,7 @@ unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_qwen_next-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_topk_4-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined SKIP (https://nvbugs/6199854)
+unittest/auto_deploy/singlegpu/shim/test_llm_config.py::test_speculative_flashinfer_fallback_disables_piecewise SKIP (https://nvbugs/6309375)
 unittest/auto_deploy/singlegpu/smoke SKIP (https://nvbugs/6306936)
 unittest/auto_deploy/singlegpu/smoke/test_disagg.py::test_autodeploy_disaggregated_batch_smoke[deepseek-trtllm-simple] SKIP (https://nvbugs/6307525)
 unittest/auto_deploy/singlegpu/smoke/test_disagg.py::test_autodeploy_disaggregated_batch_smoke[llama-flashinfer-cudagraph] SKIP (https://nvbugs/6307525)
