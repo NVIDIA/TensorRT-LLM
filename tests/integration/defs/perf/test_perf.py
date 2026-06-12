@@ -49,7 +49,6 @@ TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 NEMOTRON_SUPER_MODELS = {
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
-    "nemotron_3_ultra_550b_nvfp4",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
 }
@@ -62,7 +61,6 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "kimi_k2_nvfp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
-    "nemotron_3_ultra_550b_nvfp4",
     "glm_5_fp8",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
@@ -108,12 +106,13 @@ AUTODEPLOY_MODEL_CONFIGS = {
 
 
 def get_model_dir(model_name: str):
-    # HF models use the repo id verbatim (downloaded at runtime, no LLM_MODELS_ROOT prefix).
-    if model_name in HF_MODEL_PATH.keys():
-        return HF_MODEL_PATH[model_name]
+    model_dir = ""
     if model_name in MODEL_PATH_DICT.keys():
-        return os.path.join(llm_models_root(), MODEL_PATH_DICT[model_name])
-    return ""
+        model_dir = os.path.join(llm_models_root(), MODEL_PATH_DICT[model_name])
+    elif model_name in HF_MODEL_PATH.keys():
+        model_dir = os.path.join(llm_models_root(),
+                                 MODEL_PATH_DICT[model_name.split('_hf')[0]])
+    return model_dir
 
 
 def get_dataset_path():
@@ -1039,13 +1038,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_dir = self.get_trtllm_bench_model()
         if model_dir == "":
             pytest.skip("Model Name is not supported by trtllm-bench")
-        # Legacy "<name>_hf" label; weights load from --model_path.
         model_name = self._config.model_name
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
+        hf_model_name = HF_MODEL_PATH.get(model_name, "")
         build_cmd = [
-            self._build_script, "--log_level=info", f"--workspace={engine_dir}",
-            f"--model={model_name}", f"--model_path={model_dir}", "build",
+            self._build_script, f"--log_level=info",
+            f"--workspace={engine_dir}", f"--model={hf_model_name}",
+            f"--model_path={model_dir}", "build",
             f"--tp_size={self._config.tp_size}",
             f"--pp_size={self._config.pp_size}"
         ]
@@ -1170,11 +1170,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_name = self._config.model_name
         dataset_path = os.path.join(engine_dir, "synthetic_data.json")
         report_path = os.path.join(engine_dir, "report.json")
-        # Legacy "<name>_hf" label; weights load from --model_path.
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
+        hf_model_name = HF_MODEL_PATH.get(model_name, "")
         tp_pp_str = f"tp_{self._config.tp_size}_pp_{self._config.pp_size}"
-        engine_dir = os.path.join(engine_dir, tp_pp_str)
+        engine_dir = os.path.join(engine_dir, hf_model_name, tp_pp_str)
         benchmark_cmd = [
             self._benchmark_script,
             f"--model={model_name}",
