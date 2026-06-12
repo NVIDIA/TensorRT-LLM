@@ -1130,9 +1130,18 @@ if IS_MEGAMOE_OP_AVAILABLE:
             self.in_kernel_fc2_reduce = bool(in_kernel_fc2_reduce)
 
         def unique_id(self):
+            # local_rank is intentionally excluded from the key. The kernel
+            # requires every EP rank to run the SAME tactic (shared NVLink
+            # dispatch barrier + peer-pointer layout), and the MERGE tuning
+            # strategy merges per-shape timings by cache key across ranks --
+            # so the key MUST be identical on every rank for the all-gather
+            # merge to converge them onto one global-best tactic. Including
+            # local_rank would give each rank a distinct key, leaving every
+            # rank on its own best and breaking the same-tactic requirement.
+            # world_size stays so single-rank (degenerate) and multi-rank
+            # tuning never share entries.
             return (
                 self.world_size,
-                self.local_rank,
                 self.num_topk,
                 self.num_experts_per_rank,
                 self.hidden_size,
@@ -1302,13 +1311,26 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # L2-cache buffers rotate. Plain repeat-loop profiling
                 # is correct and only marginally slower.
                 use_cuda_graph=False,
-                # FUSED_COMM hard requirement: every EP rank must run
-                # the same compiled tactic per chunk so the NVLink
-                # dispatch barrier and peer pointer mapping line up.
-                # PARALLEL strategy keeps tactic selection lockstep
-                # across ranks (same as every multi-rank CuteDSL op in
-                # ``cute_dsl_custom_ops.py``).
-                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+                # MegaMoE fuses cross-rank dispatch + FC1 + FC2 + combine into
+                # one kernel: ranks couple at the dispatch count-exchange and
+                # combine NVLink barriers, and FC1 token tiles depend on peers'
+                # pull progress. Faithful per-tactic timing therefore requires
+                # ALL EP ranks to run the SAME tactic in lockstep and time it
+                # together. MERGE does exactly that: it does NOT split the
+                # candidate list across ranks (every rank profiles the full
+                # list, same tactic per step), inserts a tp_barrier before each
+                # measurement, and disables the short-profile heuristic so every
+                # rank issues an identical number of launches (otherwise the
+                # all-rank NVLink barriers would desync/hang). It then all-gathers
+                # the per-shape timings so every rank converges onto one
+                # global-best tactic -- which the kernel requires, since all EP
+                # ranks must run the same compiled tactic for the NVLink dispatch
+                # barrier and peer-pointer mapping to line up. PARALLEL (used by
+                # plain multi-rank CuteDSL GEMMs that have no in-kernel cross-rank
+                # coupling) would split tactics across ranks, contaminating the
+                # comm-coupled timing and risking barrier desync, so it is NOT
+                # used here.
+                distributed_tuning_strategy=DistributedTuningStrategy.MERGE,
             )
             self.__class__.tuning_config_cache[key] = config
             return config
