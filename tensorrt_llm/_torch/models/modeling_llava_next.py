@@ -87,12 +87,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         return self._dtype
 
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
-        """Surface the in-vocab image placeholder so
-        ``maybe_compute_mm_embed_cumsum`` builds ``embed_mask_cumsum`` via
-        ``torch.isin(input_ids, mm_token_ids)`` instead of the OOV
-        ``>= vocab_size`` fallback (which would miss all positions now that
-        the OOV remap in _expand/_postprocess/__call__ is gone).
-        """
+        """Return in-vocab multimodal placeholder token IDs."""
         return torch.tensor([self.image_token_index], dtype=torch.int32)
 
     def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:

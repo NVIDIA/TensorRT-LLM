@@ -2431,6 +2431,7 @@ class PyTorchModelEngine(ModelEngine):
         *,
         mm_token_indices_cpu: torch.Tensor,
         text_token_indices_cpu: torch.Tensor,
+        extra_mm_token_indices_cpu: Optional[torch.Tensor] = None,
         num_ctx_tokens: int,
         total_num_tokens: int,
     ) -> None:
@@ -2438,9 +2439,12 @@ class PyTorchModelEngine(ModelEngine):
         ``inputs`` so ``fuse_input_embeds`` can skip its ``torch.where`` host
         sync. If ``total_num_tokens > num_ctx_tokens`` (KV-cache path with
         extend/draft tokens appended after the indices were computed), the
-        post-context positions are by construction text and are appended to
-        ``text_token_indices_cpu`` via a CPU ``arange``/``cat`` (cheaper than
-        rebuilding via a bool mask + ``torch.where``)."""
+        post-context positions are appended as text except known multimodal
+        placeholders from first-draft prompt tails."""
+        if extra_mm_token_indices_cpu is not None and extra_mm_token_indices_cpu.numel(
+        ) > 0:
+            mm_token_indices_cpu = torch.cat(
+                [mm_token_indices_cpu, extra_mm_token_indices_cpu])
         mm_token_indices_cpu = maybe_pin_memory(mm_token_indices_cpu)
         inputs['mm_token_indices'] = mm_token_indices_cpu.to("cuda",
                                                              non_blocking=True)
@@ -2448,6 +2452,13 @@ class PyTorchModelEngine(ModelEngine):
             extra_text = torch.arange(num_ctx_tokens,
                                       total_num_tokens,
                                       dtype=text_token_indices_cpu.dtype)
+            if extra_mm_token_indices_cpu is not None and extra_mm_token_indices_cpu.numel(
+            ) > 0:
+                extra_text_mask = torch.ones(extra_text.numel(),
+                                             dtype=torch.bool)
+                extra_text_mask[extra_mm_token_indices_cpu -
+                                num_ctx_tokens] = False
+                extra_text = extra_text[extra_text_mask]
             text_token_indices_cpu = torch.cat(
                 [text_token_indices_cpu, extra_text])
         text_token_indices_cpu = maybe_pin_memory(text_token_indices_cpu)
@@ -3193,6 +3204,7 @@ class PyTorchModelEngine(ModelEngine):
         extend_dummy_requests = []
         generation_requests = []
         first_draft_requests = []
+        first_draft_mm_token_indices = []
         # Collect generation request IDs during categorization to avoid
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
@@ -3309,6 +3321,13 @@ class PyTorchModelEngine(ModelEngine):
                 all_prompt_tokens) - self.original_max_draft_len - 1
             end_compute = begin_compute + self.original_max_draft_len + 1
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
+            first_draft_start_idx = len(position_ids)
+            if mm_token_indices is not None:
+                _, prompt_mm_token_indices = self._prepare_multimodal_indices(
+                    prompt_tokens)
+                if prompt_mm_token_indices.numel() > 0:
+                    first_draft_mm_token_indices.append(
+                        prompt_mm_token_indices + first_draft_start_idx)
             position_ids.extend(
                 range(begin_compute, begin_compute + len(prompt_tokens)))
 
@@ -3951,10 +3970,15 @@ class PyTorchModelEngine(ModelEngine):
                     [item[1] for item in all_rank_num_tokens])
 
         if mm_token_indices is not None:
+            if first_draft_mm_token_indices:
+                extra_mm_token_indices = torch.cat(first_draft_mm_token_indices)
+            else:
+                extra_mm_token_indices = None
             self._ship_multimodal_indices(
                 inputs,
                 mm_token_indices_cpu=mm_token_indices,
                 text_token_indices_cpu=text_token_indices_ctx,
+                extra_mm_token_indices_cpu=extra_mm_token_indices,
                 num_ctx_tokens=num_ctx_tokens,
                 total_num_tokens=total_num_tokens,
             )

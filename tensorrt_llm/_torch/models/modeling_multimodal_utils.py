@@ -422,7 +422,10 @@ def filter_mm_token_from_input_ids(
     Args:
         input_ids: shape [text_total_length + mm_total_length].
         vocab_size: size of the model's vocabulary
-        mm_token_ids: possible token ids for multimodal tokens, if known. If not known and set to None, it is assumed that the multimodal tokens are out-of-vocabulary tokens i.e. the `input_ids` contains tokens >= vocab_size that represent the multimodal tokens.
+        mm_token_ids: possible token ids for multimodal tokens, if known. If
+            not known and set to None, it is assumed that the multimodal tokens
+            are out-of-vocabulary tokens i.e. the ``input_ids`` contains tokens
+            >= vocab_size that represent the multimodal tokens.
     Note:
         Example: input_ids=[1, 55, 2, 101], vocab_size=100, and
         mm_token_ids=[55] returns mm_token_indices=[1]; token 101 is text
