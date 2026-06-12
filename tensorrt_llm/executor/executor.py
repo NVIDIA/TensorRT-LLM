@@ -111,6 +111,15 @@ class GenerationExecutor(ABC):
         self._is_llm_executor = is_llm_executor
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
+        self._llm_id: Optional[str] = None
+
+    @property
+    def llm_id(self) -> Optional[str]:
+        return self._llm_id
+
+    @llm_id.setter
+    def llm_id(self, value: Optional[str]):
+        self._llm_id = value
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:

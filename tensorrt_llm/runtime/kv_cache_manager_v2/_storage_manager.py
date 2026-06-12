@@ -15,10 +15,9 @@
 
 import math
 import os
-import threading
 import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence, cast
 
@@ -176,57 +175,6 @@ MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheL
 # without being migrated to any further tier (i.e. dropped from the cache hierarchy).
 DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
 
-from tensorrt_llm.logger import logger
-
-
-class KVCacheMetrics:
-    """Per-pool-group KV cache transfer counters (interval-resettable)."""
-
-    def __init__(self, num_pool_groups: int) -> None:
-        self._num_pool_groups = num_pool_groups
-        self._lock = threading.Lock()
-        self._offload_blocks = [0] * num_pool_groups
-        self._offload_bytes = [0] * num_pool_groups
-        self._onboard_blocks = [0] * num_pool_groups
-        self._onboard_bytes = [0] * num_pool_groups
-        self._host_dropped_blocks = [0] * num_pool_groups
-        self._host_dropped_bytes = [0] * num_pool_groups
-
-    def record_offload(self, pg_idx: int, num_blocks: int, bytes_per_block: int) -> None:
-        with self._lock:
-            self._offload_blocks[pg_idx] += num_blocks
-            self._offload_bytes[pg_idx] += num_blocks * bytes_per_block
-
-    def record_onboard(self, pg_idx: int, num_blocks: int, bytes_per_block: int) -> None:
-        with self._lock:
-            self._onboard_blocks[pg_idx] += num_blocks
-            self._onboard_bytes[pg_idx] += num_blocks * bytes_per_block
-
-    def record_host_dropped(self, pg_idx: int, num_blocks: int, bytes_per_block: int) -> None:
-        with self._lock:
-            self._host_dropped_blocks[pg_idx] += num_blocks
-            self._host_dropped_bytes[pg_idx] += num_blocks * bytes_per_block
-
-    def snapshot_and_reset(self) -> list[dict[str, int]]:
-        with self._lock:
-            result = []
-            for i in range(self._num_pool_groups):
-                result.append({
-                    "offload_blocks": self._offload_blocks[i],
-                    "offload_bytes": self._offload_bytes[i],
-                    "onboard_blocks": self._onboard_blocks[i],
-                    "onboard_bytes": self._onboard_bytes[i],
-                    "host_dropped_blocks": self._host_dropped_blocks[i],
-                    "host_dropped_bytes": self._host_dropped_bytes[i],
-                })
-                self._offload_blocks[i] = 0
-                self._offload_bytes[i] = 0
-                self._onboard_blocks[i] = 0
-                self._onboard_bytes[i] = 0
-                self._host_dropped_blocks[i] = 0
-                self._host_dropped_bytes[i] = 0
-            return result
-
 
 class StorageManager:
     __slots__ = (
@@ -243,9 +191,6 @@ class StorageManager:
         "_event_manager",
         "_execution_stream",
         "__rawref__",
-        "_metrics",
-        "_metrics_interval",
-        "_metrics_timer_stop",
     )
     _life_cycles: LifeCycleRegistry
     _layer_to_life_cycle_ids: dict[LayerId, LifeCycleId]
@@ -331,7 +276,6 @@ class StorageManager:
             )
 
         num_levels = CacheLevel(len(config.cache_tiers))
-        logger.info("[KVCachePoolRatio]", f"init_ratio={[f'{r:.6f}' for r in init_ratio]}")
         self._levels = cast(
             TypedIndexList,
             [
@@ -351,53 +295,14 @@ class StorageManager:
             self._levels, lambda level: level.storage.num_pool_groups
         )
 
-        self._metrics = KVCacheMetrics(int(self.num_pool_groups))
-        self._metrics_interval = float(os.environ.get("TRTLLM_KV_METRICS_INTERVAL_S", "30"))
-        self._metrics_timer_stop = threading.Event()
-        self._start_metrics_logger()
-
     def __del__(self) -> None:
         self.destroy()
 
     def destroy(self) -> None:
-        if hasattr(self, "_metrics_timer_stop"):
-            self._metrics_timer_stop.set()
         if self.__rawref__.is_valid:
             self.__rawref__.invalidate()
             for lvl in self._levels:
                 lvl.storage.destroy()
-
-    def _start_metrics_logger(self) -> None:
-        def _log_loop() -> None:
-            while not self._metrics_timer_stop.wait(self._metrics_interval):
-                self._log_metrics()
-
-        t = threading.Thread(target=_log_loop, daemon=True, name="kv_cache_metrics")
-        t.start()
-
-    def _log_metrics(self) -> None:
-        snapshots = self._metrics.snapshot_and_reset()
-        for pg_idx in typed_range(self.num_pool_groups):
-            snap = snapshots[int(pg_idx)]
-            parts = [
-                f"pool_group={int(pg_idx)} interval={self._metrics_interval}s"
-                f" offload_blocks={snap['offload_blocks']}"
-                f" offload_bytes={snap['offload_bytes']}"
-                f" onboard_blocks={snap['onboard_blocks']}"
-                f" onboard_bytes={snap['onboard_bytes']}"
-                f" dropped_blocks={snap['host_dropped_blocks']}"
-                f" dropped_bytes={snap['host_dropped_bytes']}"
-            ]
-            for lvl_id in typed_range(self.num_cache_levels):
-                level_name = "gpu" if lvl_id == GPU_LEVEL else f"level{int(lvl_id)}"
-                stats = self.get_statistics(lvl_id)
-                s = stats[pg_idx]
-                used = s.total - s.free
-                parts.append(
-                    f"| {level_name}: used={used} free={s.free}"
-                    f" evictable={s.evictable} total={s.total}"
-                )
-            logger.info("[KVCacheMetrics]", " ".join(parts))
 
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
@@ -530,11 +435,9 @@ class StorageManager:
             assert all(p.status == PageStatus.DROPPABLE for pages in evicted for p in pages), (
                 "Corrupted eviction controller"
             )
-            for pg_idx, pages in typed_enumerate(evicted):
-                if pages:
-                    bytes_per_block = sum(self.slot_size(pg_idx))
-                    self._metrics.record_host_dropped(int(pg_idx), len(pages), bytes_per_block)
-                    if drop_recorder is not None:
+            if drop_recorder is not None:
+                for pg_idx in typed_range(self.num_pool_groups):
+                    if evicted[pg_idx]:
                         drop_recorder(evicted[pg_idx], level)
             return
         next_lvl = CacheLevel(level + 1)
@@ -595,11 +498,8 @@ class StorageManager:
                     dbg_rawrefs = [rawref.ref(p) for p in evicted[pg_idx]]
                 # Record the drop event before releasing — these pages are leaving the
                 # cache hierarchy entirely without being onboarded back to GPU.
-                if num_evicted > 0:
-                    bytes_per_block = sum(self.slot_size(pg_idx))
-                    self._metrics.record_host_dropped(int(pg_idx), num_evicted, bytes_per_block)
-                    if drop_recorder is not None:
-                        drop_recorder(evicted[pg_idx], lvl_id)
+                if drop_recorder is not None and num_evicted > 0:
+                    drop_recorder(evicted[pg_idx], lvl_id)
                 evicted[pg_idx].clear()
                 if not NDEBUG:
                     assert all(p() is None for p in dbg_rawrefs)  # pyright: ignore
@@ -740,12 +640,6 @@ class StorageManager:
                         )
                     if scheduled_for_eviction:
                         self.schedule_for_eviction(src)
-            if not defrag:
-                bytes_per_block = sum(self.slot_size(pool_group_index))
-                if dst_level > src_level:
-                    self._metrics.record_offload(int(pool_group_index), num_slots, bytes_per_block)
-                else:
-                    self._metrics.record_onboard(int(pool_group_index), num_slots, bytes_per_block)
             return None if update_src else dst_slots
         except Exception:
             for s in dst_slots:

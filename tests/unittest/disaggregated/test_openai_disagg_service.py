@@ -29,6 +29,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     ServerRole,
 )
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
+from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -56,11 +57,20 @@ def _client_factory(*_args, **_kwargs):
 
 def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
     config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
+    # The coordinator builds its own (empty) routers from config; override them
+    # with mocks so tests can stub placement / readiness directly.
+    cluster = DisaggCoordinatorService(config, client_factory=_client_factory)
     ctx_router = AsyncMock(spec=Router)
     gen_router = AsyncMock(spec=Router)
-    return OpenAIDisaggregatedService(
-        config, ctx_router, gen_router, client_factory=_client_factory
+    cluster._ctx_router = ctx_router
+    cluster._gen_router = gen_router
+    service = OpenAIDisaggregatedService(
+        config, cluster, client_factory=_client_factory
     )
+    # Convenience handles for tests that stub placement / readiness directly.
+    service._ctx_router = ctx_router
+    service._gen_router = gen_router
+    return service
 
 
 def _make_completion_response(
@@ -203,16 +213,18 @@ async def test_is_ready_waits_for_router_preparation():
         ),
         AsyncMock(),
     )
-    service._disagg_cluster_manager = cluster_manager
+    # Readiness now lives on the DisaggCoordinatorService the service holds.
+    local = service._cluster
+    local._disagg_cluster_manager = cluster_manager
 
     cluster_manager._current_ctx_workers["ctx"] = WorkerInfo(
         worker_id="ctx", role=ServerRole.CONTEXT
     )
-    service._ctx_router = SimpleNamespace(num_prepared_servers=0)
-    service._gen_router = SimpleNamespace(num_prepared_servers=1)
+    local._ctx_router = SimpleNamespace(num_prepared_servers=0)
+    local._gen_router = SimpleNamespace(num_prepared_servers=1)
     assert await service.is_ready() is False
 
-    service._ctx_router.num_prepared_servers = 1
+    local._ctx_router.num_prepared_servers = 1
     assert await service.is_ready() is False
 
     cluster_manager._current_gen_workers["gen"] = WorkerInfo(

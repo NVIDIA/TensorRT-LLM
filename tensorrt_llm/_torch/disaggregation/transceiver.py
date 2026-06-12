@@ -184,66 +184,44 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         if token_range is None and req.prompt_len > 0:
-            # Align with KV cache allocation (resize_context /
+            # Align with KV cache allocation (prepare_disagg_gen_init /
             # _get_context_bytes), which reserves prompt_len +
             # num_extra_kv_tokens slots for speculative decoding methods
             # (e.g. EAGLE3) that consume extra KV positions per request.
             num_extra_kv_tokens = getattr(self._kv_cache_manager, "num_extra_kv_tokens", 0) or 0
             token_range = TokenRange(start=0, end=req.prompt_len + num_extra_kv_tokens)
 
-        debug_kv_slice = os.environ.get("TRTLLM_DEBUG_KV_SLICE", "0").lower() not in (
-            "",
-            "0",
-            "false",
-        )
-        if token_range is None:
-            range_start = 0
-            range_end = req.prompt_len
-        else:
-            range_start = token_range.start
-            range_end = token_range.end
-        start_block = range_start // tpb
-        end_block = (range_end + tpb - 1) // tpb
-
         groups = []
         for idx, lg in enumerate(layer_groups):
             if isinstance(lg, MambaLayerGroup):
                 groups.append(np.array([], dtype=np.int64))
                 continue
-            raw_block_ids = adapter.get_block_ids(req, idx, lg)
+            block_ids = adapter.get_block_ids(req, idx, lg)
             window_size = lg.sliding_window_size
 
-            transfer_start_block = start_block
-            transfer_end_block = end_block
             if window_size is not None:
+                # Drop stale blocks the manager may still expose (V1 pre-eviction).
+                total_blocks = (req.prompt_len + tpb - 1) // tpb
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                transfer_start_block = max(transfer_start_block, stale_end)
-
-            if transfer_end_block <= transfer_start_block:
-                block_ids = np.array([], dtype=np.int64)
-            elif raw_block_ids.size >= transfer_end_block:
-                # Ordinal-preserving block table: slice the requested token range directly.
-                block_ids = raw_block_ids[transfer_start_block:transfer_end_block]
-            else:
-                # Some backends expose only a suffix, with any cached prefix already removed.
-                suffix_start_block = transfer_end_block - raw_block_ids.size
-                slice_start = max(transfer_start_block - suffix_start_block, 0)
-                block_ids = raw_block_ids[slice_start:]
-
-            effective_start_block = transfer_start_block
-            if is_gen_only:
-                cached_blocks = cached_per_lg[idx] // tpb
-                if window_size is not None:
-                    min_cached_blocks = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                    assert cached_blocks >= min_cached_blocks, (
-                        f"SWA adapter must clamp cached_tokens to >= stale_end*tpb "
-                        f"(cached={cached_per_lg[idx]}, stale_end*tpb={min_cached_blocks * tpb})"
+                expected_valid = max(0, total_blocks - stale_end)
+                if block_ids.size > expected_valid:
+                    block_ids = (
+                        block_ids[-expected_valid:]
+                        if expected_valid > 0
+                        else np.array([], dtype=np.int64)
                     )
-                effective_start_block = max(effective_start_block, cached_blocks)
-                cache_skip = max(0, cached_blocks - transfer_start_block)
+                if is_gen_only:
+                    # Adapter contract: SWA cached_tokens >= stale_end*tpb (clamped).
+                    cache_skip = cached_per_lg[idx] // tpb - stale_end
+                    assert cache_skip >= 0, (
+                        f"SWA adapter must clamp cached_tokens to >= stale_end*tpb "
+                        f"(cached={cached_per_lg[idx]}, stale_end*tpb={stale_end * tpb})"
+                    )
+                else:
+                    # Ctx side bypasses the adapter (cached_per_lg synthetically 0); no further skip.
+                    cache_skip = 0
             else:
-                # Ctx side bypasses the adapter (cached_per_lg synthetically 0); no further skip.
-                cache_skip = 0
+                cache_skip = cached_per_lg[idx] // tpb
 
             if cache_skip > 0:
                 block_ids = (
@@ -251,48 +229,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     if cache_skip < block_ids.size
                     else np.array([], dtype=np.int64)
                 )
-
-            if debug_kv_slice:
-                expected_blocks = max(0, transfer_end_block - effective_start_block)
-                if block_ids.size != expected_blocks:
-                    raise RuntimeError(
-                        f"Unexpected KV transfer block count for request {req.py_request_id}, "
-                        f"layer_group={idx}, token_range=[{range_start}, {range_end}), "
-                        f"block_range=[{transfer_start_block}, {transfer_end_block}), "
-                        f"effective_start_block={effective_start_block}, "
-                        f"expected={expected_blocks}, actual={block_ids.size}"
-                    )
-                if block_ids.size > 0 and np.any(block_ids < 0):
-                    bad_offsets = np.flatnonzero(block_ids < 0)[:8].tolist()
-                    raise RuntimeError(
-                        f"Invalid KV transfer block ids for request {req.py_request_id}, "
-                        f"layer_group={idx}, token_range=[{range_start}, {range_end}), "
-                        f"block_range=[{transfer_start_block}, {transfer_end_block}), "
-                        f"bad_offsets={bad_offsets}"
-                    )
-                if (
-                    block_ids.size > 0
-                    and lg.pool_views
-                    and hasattr(self._page_table, "pool_groups")
-                ):
-                    pool_slots = [
-                        self._page_table.pool_groups[lg.pool_group_idx].pools[
-                            pool_view.pool_idx
-                        ].num_slots
-                        for pool_view in lg.pool_views
-                    ]
-                    max_slot = min(pool_slots)
-                    if np.any(block_ids >= max_slot):
-                        bad_offsets = np.flatnonzero(block_ids >= max_slot)[:8].tolist()
-                        bad_values = block_ids[block_ids >= max_slot][:8].tolist()
-                        raise RuntimeError(
-                            f"Out-of-range KV transfer block ids for request "
-                            f"{req.py_request_id}, layer_group={idx}, "
-                            f"token_range=[{range_start}, {range_end}), "
-                            f"block_range=[{transfer_start_block}, {transfer_end_block}), "
-                            f"num_slots={max_slot}, bad_offsets={bad_offsets}, "
-                            f"bad_values={bad_values}"
-                        )
 
             groups.append(block_ids)
 
@@ -564,60 +500,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session.send(kv_slice)
         self._finalize_send(req, session)
 
-    def _debug_transfer_checks_enabled(self) -> bool:
-        value = os.environ.get("TRTLLM_DEBUG_KV_TRANSFER_REGION")
-        if value is None:
-            value = os.environ.get("TRTLLM_DEBUG_KV_SLICE", "0")
-        return value.lower() not in ("", "0", "false", "no", "off")
-
-    def _debug_validate_received_page_table(self, req: LlmRequest, where: str) -> None:
-        if not self._debug_transfer_checks_enabled() or self._page_table is None:
-            return
-
-        adapter = self._reuse_adapter
-        tpb = adapter.tokens_per_block
-        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
-        errors = []
-        for idx, lg in enumerate(self._page_table.layer_groups):
-            if isinstance(lg, MambaLayerGroup) or not lg.pool_views:
-                continue
-            raw_block_ids = adapter.get_block_ids(req, idx, lg)
-            pool_slots = []
-            for pool_view in lg.pool_views:
-                pool = self._page_table.pool_groups[lg.pool_group_idx].pools[pool_view.pool_idx]
-                pool_slots.append(int(pool.num_slots))
-            max_slot = min(pool_slots) if pool_slots else 0
-            live_start = 0
-            if lg.sliding_window_size is not None:
-                live_start = max(0, (req.prompt_len + 1 - lg.sliding_window_size) // tpb)
-
-            if raw_block_ids.size < prompt_blocks:
-                errors.append(
-                    f"lg={idx}: table too short raw={raw_block_ids.size} "
-                    f"prompt_blocks={prompt_blocks}"
-                )
-                continue
-
-            bad = []
-            for block in range(live_start, prompt_blocks):
-                page = int(raw_block_ids[block])
-                if page < 0 or page >= max_slot:
-                    bad.append((block, page))
-                    if len(bad) >= 8:
-                        break
-            if bad:
-                errors.append(
-                    f"lg={idx}: win={lg.sliding_window_size} live={live_start}-{prompt_blocks} "
-                    f"num_slots={max_slot} bad={bad}"
-                )
-
-        if errors:
-            raise RuntimeError(
-                f"Invalid received KV page table at {where}: "
-                f"rank={self._dist.rank}, req={req.py_request_id}, "
-                f"prompt_len={req.prompt_len}, errors={errors}"
-            )
-
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
         rid = get_unique_rid(req)
@@ -642,8 +524,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 self._publish_gen_transfer_metrics([rid], {rid})
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
-                self._trim_kv_to_prompt_history(req)
-                self._debug_validate_received_page_table(req, "sync_after_trim")
+                self._assert_disagg_history_declared(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -782,8 +663,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req = self._recv_reqs[rid]
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
-            self._trim_kv_to_prompt_history(req)
-            self._debug_validate_received_page_table(req, "async_after_trim")
+            self._assert_disagg_history_declared(req)
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             session.close()
             del self._recv_reqs[rid]
@@ -800,35 +680,39 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
 
-    def _trim_kv_to_prompt_history(self, req: LlmRequest) -> None:
-        """Mark received KV as historic so SWA pools release pre-window blocks.
+    def _assert_disagg_history_declared(self, req: LlmRequest) -> None:
+        """Verify the V2 scheduler pre-declared prompt_len as history.
 
-        Call right before the TRANS_COMPLETE state transition.  The cache
-        was sized to hold the full prompt by ``resize_context`` and just
-        got fully populated by the transfer; setting ``history_length`` to
-        the prompt length triggers ``_unlock_stale_blocks`` inside V2's
-        ``resize()`` for any sliding-window life cycle, releasing blocks
-        before the window back to their pool group.
+        Call right before the TRANS_COMPLETE state transition.  The V2
+        scheduler's ``_try_schedule_disagg_gen_init`` calls
+        ``prepare_disagg_gen_init``, which sets ``kv_cache.history_length``
+        to ``prompt_len`` at allocation time so SWA stale computation
+        skips pre-window blocks. If that contract is violated, SWA /
+        sparse-attn pools may fill with pre-window prompt blocks and the
+        V2 scheduler can deadlock under high concurrency (e.g., benchmark
+        fill-phase).
 
-        This closes the gap between transfer completion and
-        ``update_resources`` (which only runs after the *first* forward
-        pass and would otherwise be the first thing to update
-        ``history_length``).  In benchmark fill-phase the first forward
-        is gated until every disagg-gen request is ready, so without
-        this trim the SWA / sparse-attn pool groups stay 100% occupied
-        with pre-window prompt blocks and the V2 scheduler deadlocks
-        on the next ``resize(+1)``.
-
-        No-op for V1 managers and for V2 caches with only full-context
-        life cycles.
+        No-op for V1 managers (which lack ``get_history_length``) and for
+        V2 caches with only full-context life cycles (where the watermark
+        has no allocation effect).
         """
-        trim = getattr(self._kv_cache_manager, "trim_to_history", None)
-        if trim is None:
+        get_history = getattr(self._kv_cache_manager, "get_history_length", None)
+        if get_history is None:
             return
         prompt_len = getattr(req, "prompt_len", None)
         if not prompt_len or prompt_len <= 0:
             return
-        trim(req, prompt_len)
+        history = get_history(req)
+        if history is None:
+            # Cache was already released (e.g., cancelled mid-transfer); nothing to verify.
+            return
+        if history < prompt_len:
+            raise RuntimeError(
+                f"req {req.py_request_id}: kv_cache.history_length={history} "
+                f"< prompt_len={prompt_len} at TRANS_COMPLETE boundary. "
+                f"V2 scheduler must call prepare_disagg_gen_init() in "
+                f"_try_schedule_disagg_gen_init."
+            )
 
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.

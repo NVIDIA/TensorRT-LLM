@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import gc
 import importlib
 import inspect
@@ -1238,6 +1239,43 @@ def disaggregated(
     # Inherited by child processes via env var; used for deduplication at query time.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
 
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    # Disable GC by default (see note below).
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        gc.disable()
+
+    # Startup topology is driven by explicit config (num_workers +
+    # disagg_coordinator_url), NOT the WEB_CONCURRENCY env var. Three cases:
+    #   (a) disagg_coordinator_url set  -> don't start a coordinator here; the
+    #       fleet delegates to that external one (num_workers sizes the fleet).
+    #   (b) url absent, num_workers>1   -> start an implicit in-process
+    #       coordinator (port-1) + a delegating uvicorn fleet on the public port.
+    #   (c) url absent, num_workers==1  -> one self-contained server with a local
+    #       (in-process) coordinator.
+    num_workers = disagg_cfg.num_workers
+    coordinator_url = disagg_cfg.disagg_coordinator_url
+
+    if coordinator_url:
+        # (a) External coordinator: fork a fleet of delegating servers (or a
+        # single one) pointed at it; never start a coordinator in this process.
+        _serve_disagg_fleet(disagg_cfg, config_file,
+                            metadata_server_config_file, request_timeout,
+                            server_start_timeout, num_workers, coordinator_url)
+        return
+
+    if num_workers > 1:
+        # (b) Implicit coordinator in this process (on port-1) + a delegating
+        # uvicorn fleet (workers=N) on the public port. See below.
+        _serve_coordinator_and_fleet(disagg_cfg, config_file,
+                                     metadata_server_config_file,
+                                     metadata_server_cfg, request_timeout,
+                                     server_start_timeout, num_workers)
+        return
+
+    # (c) num_workers==1, no external coordinator: a single disagg server with an
+    # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
@@ -1246,9 +1284,6 @@ def disaggregated(
                 f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
             )
 
-        metadata_server_cfg = parse_metadata_server_config_file(
-            metadata_server_config_file)
-
         server = OpenAIDisaggServer(
             config=disagg_cfg,
             req_timeout_secs=request_timeout,
@@ -1256,20 +1291,162 @@ def disaggregated(
             metadata_server_cfg=metadata_server_cfg,
             metrics_interval_secs=metrics_log_interval)
 
-        # Disable GC by default
-        #   When concurrency is high, the number of Python objects increases, so
-        #   GC runs frequently and takes a long time to process. In this case,
-        #   requests are not immediately forwarded to CTX workers and GEN workers,
-        #   causing them to run with small batch sizes. Disabling GC can mitigate
-        #   this problem.
-        #   By testing this feature, we didn't observe significant RSS or VMS
-        #   increment, and observed that `count0` (obtained by `gc.get_count()`)
-        #   increases by fewer than 1,000 after every 200,000 requests, while the
-        #   maximum value of `count0` exceeded 3,000,000 during the test.
-        if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
-            gc.disable()
-
         asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+
+
+def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
+                         request_timeout, server_start_timeout, num_workers,
+                         coordinator_url):
+    """Fork a uvicorn fleet of delegating disagg servers pointed at ``coordinator_url``.
+
+    Each worker is an ordinary ``OpenAIDisaggServer`` built with ``coordinator_url``
+    so it holds a remote ``CoordinatorClient``. Invoked as ``python -m uvicorn`` so
+    there is no bespoke worker command; uvicorn owns the shared socket, worker
+    supervision, and graceful shutdown. MPI/PMIX/SLURM env is stripped so a worker
+    (a plain HTTP process) never joins an MPI namespace. Returns the Popen handle.
+    """
+    public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    child_env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
+                             "I_MPI_", "HYDRA_", "MPI_"))
+    }
+    # num_workers is explicit config now; ensure no stale WEB_CONCURRENCY leaks in
+    # and re-forks each plain-HTTP worker into a nested fleet.
+    child_env.pop("WEB_CONCURRENCY", None)
+    child_env[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL] = coordinator_url
+    child_env[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE] = os.path.abspath(
+        config_file)
+    if metadata_server_config_file:
+        child_env[DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE] = \
+            os.path.abspath(metadata_server_config_file)
+    child_env[DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT] = str(request_timeout)
+    child_env[DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT] = str(
+        server_start_timeout)
+    cmd = [sys.executable, "-m", "uvicorn", "--factory",
+           "--host", str(public_host), "--port", str(public_port),
+           "--workers", str(num_workers), "--timeout-keep-alive", "10",
+           "tensorrt_llm.commands.serve:create_disagg_server_app"]
+    logger.info(f"Launching disagg fleet: {num_workers} uvicorn workers on "
+                f"{public_host}:{public_port}, coordinator={coordinator_url}")
+    logger.info(f"Disagg fleet command: {' '.join(cmd)}")
+    fleet = subprocess.Popen(cmd, env=child_env, stdout=sys.stdout,
+                             stderr=sys.stderr, start_new_session=True)
+    logger.info(f"Disagg fleet launched (pid={fleet.pid})")
+
+    def _cleanup():
+        if fleet.poll() is None:
+            fleet.terminate()
+        try:
+            fleet.wait(timeout=10)
+        except Exception:
+            fleet.kill()
+
+    atexit.register(_cleanup)
+    return fleet
+
+
+def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
+                        request_timeout, server_start_timeout, num_workers,
+                        coordinator_url):
+    """External coordinator: fork the delegating fleet and block on it.
+
+    No coordinator is started in this process -- the fleet delegates to the
+    already-running coordinator at ``coordinator_url``.
+    """
+    fleet = _launch_disagg_fleet(disagg_cfg, config_file,
+                                 metadata_server_config_file, request_timeout,
+                                 server_start_timeout, num_workers,
+                                 coordinator_url)
+    rc = fleet.wait()
+    if rc != 0:
+        raise RuntimeError(f"Disagg fleet exited with code {rc}")
+
+
+def _serve_coordinator_and_fleet(disagg_cfg, config_file,
+                                 metadata_server_config_file,
+                                 metadata_server_cfg, request_timeout,
+                                 server_start_timeout, num_workers):
+    """workers>1, no external URL: coordinator server here + a delegating fleet.
+
+    This process runs the coordinator server (owns the ctx/gen routers, cluster
+    state, and centralized ZMQ ingest) on ``port-1``; a uvicorn fleet on the
+    public port delegates to it.
+    """
+    from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+    from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+
+    public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    coord_port = int(os.environ.get("TLLM_DISAGG_COORDINATOR_PORT",
+                                    public_port - 1))
+    coord_url = f"http://{public_host}:{coord_port}"
+
+    # 1. Launch the delegating fleet pointed at the implicit coordinator we start
+    #    below (port-1). Workers hold CoordinatorClients (no core), so they can't
+    #    race the coordinator's single ZMQ ingest bind.
+    _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
+                         request_timeout, server_start_timeout, num_workers,
+                         coord_url)
+
+    # 2. Build + serve the coordinator in this process. It OWNS routing state and
+    #    builds the owner routers itself (single shared namespace-aware core + ONE
+    #    ZMQ ingest server, started once here).
+    def _client_factory(router, role, max_retries=1):
+        from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+        return OpenAIHttpClient(router, role, request_timeout, max_retries)
+
+    coordinator = DisaggCoordinatorService(
+        disagg_cfg, _client_factory,
+        metadata_config=metadata_server_cfg,
+        server_start_timeout_secs=server_start_timeout)
+    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
+                f"(fleet on public port {public_port})")
+    asyncio.run(CoordinatorServer(coordinator)(public_host, coord_port))
+
+
+def create_disagg_server_app():
+    """uvicorn import-string factory: build one disagg server's FastAPI app.
+
+    Rebuilt inside each uvicorn worker process (workers=N). Fully stateless --
+    reads config + coordinator URL from the env ``_serve_coordinator_and_fleet``
+    exported (see ``DisaggWorkerEnvs``); the server holds a remote
+    ``CoordinatorClient`` so routing/readiness are delegated to the coordinator.
+    """
+    # A worker is a plain HTTP process, never an MPI rank; drop WEB_CONCURRENCY so
+    # it is never itself re-forked into multiple uvicorn workers.
+    os.environ.pop("WEB_CONCURRENCY", None)
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        gc.disable()
+
+    # All N fleet workers share one stdout; tag every trtllm log line from this
+    # worker with its PID so interleaved fleet output is attributable.
+    import logging as _logging
+    for _h in _logging.getLogger("TRT-LLM").handlers:
+        _h.setFormatter(_logging.Formatter(
+            fmt=f"[%(asctime)s] [fleet-worker pid={os.getpid()}] %(message)s",
+            datefmt="%m/%d/%Y-%H:%M:%S"))
+
+    config_file = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE]
+    coordinator_url = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL]
+    metadata_config_file = os.environ.get(
+        DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE)
+    request_timeout = int(os.environ.get(
+        DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT, "180"))
+    server_start_timeout = int(os.environ.get(
+        DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT, "180"))
+
+    disagg_cfg = parse_disagg_config_file(config_file)
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_config_file)
+
+    server = OpenAIDisaggServer(
+        config=disagg_cfg,
+        req_timeout_secs=request_timeout,
+        server_start_timeout_secs=server_start_timeout,
+        metadata_server_cfg=metadata_server_cfg,
+        coordinator_url=coordinator_url)
+    logger.info(f"Disagg server app built, coordinator={coordinator_url}")
+    return server.app
 
 
 def set_cuda_device():
@@ -1365,6 +1542,16 @@ class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
     TLLM_DISAGG_DEPLOYMENT_ID = "TRTLLM_DISAGG_DEPLOYMENT_ID"
     TLLM_DISAGG_ROLE = "TRTLLM_DISAGG_ROLE"
+
+
+class DisaggWorkerEnvs(StrEnum):
+    # Passed from the `disaggregated` coordinator to the forked worker fleet
+    # (uvicorn workers=N) via env, then read by create_disagg_server_app in each worker.
+    TLLM_DISAGG_COORDINATOR_URL = "TLLM_DISAGG_COORDINATOR_URL"
+    TLLM_DISAGG_CONFIG_FILE = "TLLM_DISAGG_CONFIG_FILE"
+    TLLM_DISAGG_METADATA_CONFIG_FILE = "TLLM_DISAGG_METADATA_CONFIG_FILE"
+    TLLM_DISAGG_REQUEST_TIMEOUT = "TLLM_DISAGG_REQUEST_TIMEOUT"
+    TLLM_DISAGG_SERVER_START_TIMEOUT = "TLLM_DISAGG_SERVER_START_TIMEOUT"
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):

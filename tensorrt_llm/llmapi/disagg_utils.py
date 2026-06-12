@@ -86,6 +86,16 @@ class DisaggServerConfig():
     # If this causes collisions, users can set node_id manually within range [0, 1023] in config
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
+    # Number of uvicorn disagg-server worker processes to fork on the public port.
+    # >1 means a fleet of delegating servers behind one coordinator. Replaces the
+    # WEB_CONCURRENCY env var (explicit config over implicit env).
+    num_workers: int = 1
+    # URL of an already-running coordinator (e.g. "http://host:8332"). When set,
+    # this process does NOT start a coordinator -- the fleet delegates to this
+    # external one. When absent and num_workers>1, an implicit coordinator is
+    # started in-process. When absent and num_workers==1, a single self-contained
+    # server with a local (in-process) coordinator is run.
+    disagg_coordinator_url: Optional[str] = None
 
 
 @dataclass
@@ -135,6 +145,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        schedule_style: Literal[
                            'context_first',
                            'generation_first'] = 'context_first',
+                       num_workers: int = 1,
+                       disagg_coordinator_url: Optional[str] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -182,6 +194,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         config.node_id = node_id
     if schedule_style:
         config.schedule_style = schedule_style
+    config.num_workers = num_workers
+    config.disagg_coordinator_url = disagg_coordinator_url
     return config
 
 
