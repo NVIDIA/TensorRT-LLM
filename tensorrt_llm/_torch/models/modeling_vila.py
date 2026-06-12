@@ -1046,7 +1046,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         mm_tokens = torch.tensor([*self.tokenizer.media_token_ids.values()
                                   ]).to(input_ids.device)
         mm_token_positions = torch.where(torch.isin(input_ids, mm_tokens))[0]
-        num_medias = num_mm_tokens = len(mm_token_positions)
+        num_medias = num_mm_tokens = mm_token_positions.numel()
         if num_medias > 1 and isinstance(mm_features, torch.Tensor):
             mm_features = list(
                 mm_features.split(mm_features.shape[0] // num_medias))
@@ -1120,7 +1120,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
                     dim=1)
             mm_ids_splits[i] = mm_ids.flatten()
 
-        ## replace mm token ids with the expanded out-of-vocab ids
+        ## replace mm token ids with the expanded multimodal ids
         mm_split_idx = 0
         for i, split in enumerate(input_ids_splits):
             if torch.isin(split, mm_tokens).any().item():

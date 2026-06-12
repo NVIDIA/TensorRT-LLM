@@ -1153,12 +1153,11 @@ class Qwen3VLModelBase(PreTrainedModel):
             if tid is not None
         ]
         self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
+        self.post_config()
 
     @property
     def mm_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
-
-        self.post_config()
 
     def post_config(self):
         # use llm.config as config for pytorch model engine
