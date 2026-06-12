@@ -283,6 +283,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_trtllm-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_cutedsl]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_trtllm]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_beam_search
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0]
   - accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-tp4-cutlass-auto]
