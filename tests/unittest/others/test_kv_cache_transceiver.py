@@ -84,6 +84,15 @@ def shutdown_transceivers(*transceivers):
         transceiver.shutdown()
 
 
+def get_context_completed_request_id(request, transceiver_runtime):
+    if transceiver_runtime == "PYTHON":
+        assert request.py_disaggregated_params is not None
+        disagg_request_id = request.py_disaggregated_params.disagg_request_id
+        assert disagg_request_id is not None
+        return disagg_request_id
+    return request.py_request_id
+
+
 @pytest.fixture(scope="function")
 def ctx_gen_kv_cache_dtype(request):
     if request.param == "ctx_fp8_gen_fp8":
@@ -198,9 +207,11 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
             completed_ctx_ids.update(completed)
             kv_cache_transceiver_gen.check_gen_transfer_status(1)
 
+        expected_ctx_id = get_context_completed_request_id(
+            ctx_request, transceiver_runtime)
+
         def transfers_done():
-            return (ctx_request.py_request_id in completed_ctx_ids
-                    and gen_request.state
+            return (expected_ctx_id in completed_ctx_ids and gen_request.state
                     == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
 
         wait_for_transfer_completion(poll_transfers, transfers_done)
