@@ -296,6 +296,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
+                    # Wake up the collector immediately so it processes the
+                    # initial stats emitted by the executor at startup (e.g.
+                    # cache_config_info).
+                    self._iteration_stats_wakeup_event.set()
                     logger.info(
                         "Started background iteration stats collector task")
 
