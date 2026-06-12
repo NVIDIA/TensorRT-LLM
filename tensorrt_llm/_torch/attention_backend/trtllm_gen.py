@@ -606,8 +606,8 @@ class FlashInferTrtllmGenAttention:
             return False, "trtllm-gen does not support sage attention."
         if meta.helix_position_offsets is not None:
             return False, "trtllm-gen does not support helix parallelism."
-        sparse_kv_indices = fwd.sparse.sparse_kv_indices
-        sparse_attn_indices = fwd.sparse.sparse_attn_indices
+        sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
+        sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
         if (
             (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
             or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)

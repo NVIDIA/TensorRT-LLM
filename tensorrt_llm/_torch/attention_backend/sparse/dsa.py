@@ -1991,9 +1991,14 @@ class Indexer(nn.Module):
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
 
-                q_split_threshold = (
-                    metadata.sparse_metadata_params.q_split_threshold)
-                q_split_eligible = q_split_threshold >= 0 and metadata.mapping is not None and not metadata.mapping.enable_attention_dp and metadata.mapping.tp_size > 1
+                sparse_metadata_params = metadata.sparse_metadata_params
+                q_split_threshold = (sparse_metadata_params.q_split_threshold
+                                     if sparse_metadata_params is not None else
+                                     8192)
+                q_split_eligible = (q_split_threshold >= 0
+                                    and metadata.mapping is not None
+                                    and not metadata.mapping.enable_attention_dp
+                                    and metadata.mapping.tp_size > 1)
 
                 if q_split_eligible:
                     tp_rank = metadata.mapping.tp_rank
