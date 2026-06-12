@@ -1132,6 +1132,10 @@ private:
     LoraDevicePathBuffers mFc2DeviceBuf;
     LoraDevicePathBuffers mGatedDeviceBuf;
 
+    // [P_max] int32 scratch for the Piece B adapter regroup (a stable read copy
+    // of permuted_row_to_unpermuted_row). Sized alongside the device scratch.
+    at::Tensor mLoraRegroupScratchDevice;
+
     // Tracks the shape parameters baked into the current scratch
     // allocation. (Re)allocation is required if any of these grows or if
     // the dtype changes.
@@ -1635,6 +1639,9 @@ private:
             alloc_one(mGatedDeviceBuf);
         }
 
+        // [P_max] scratch for the Piece B adapter regroup post-pass.
+        mLoraRegroupScratchDevice = at::empty({new_capacity}, dev_int32_opts);
+
         mLoraDeviceScratchCapacity = new_capacity;
         mLoraDeviceScratchMaxLoraRank = new_max_lora_rank;
         mLoraDeviceScratchDtypeBytes = dtype_bytes;
@@ -1717,6 +1724,10 @@ private:
         // from the kernel's per-token-pointer-array perspective).
         int64_t num_seqs = 0;
         bool has_gated = false;
+        // Number of distinct adapter slots (slot-indexed mode only). Captured at
+        // function scope so the device-path block below can size the Piece B
+        // adapter regroup; 0 means the regroup is unavailable for this call.
+        int64_t lora_num_slots = 0;
 
         if (has_per_request)
         {
@@ -1858,6 +1869,7 @@ private:
             check_pinned(*fc2_slot_lora_weight_ptrs, "fc2_slot_lora_weight_ptrs");
 
             int64_t const num_slots = fc1_slot_lora_ranks->size(0);
+            lora_num_slots = num_slots;
             TORCH_CHECK(fc1_slot_lora_weight_ptrs->dim() == 2 && fc1_slot_lora_weight_ptrs->size(0) == num_slots
                     && fc1_slot_lora_weight_ptrs->size(1) == 3,
                 "MoE LoRA fc1_slot_lora_weight_ptrs must have shape [max_lora_size, 3]; got ",
@@ -2016,6 +2028,22 @@ private:
             if (has_gated)
             {
                 populateLoraDevicePathModule(mGatedDeviceBuf, dp.gated);
+            }
+
+            // "Adapter as secondary sort key" (lora_gemm_by_adapter.md, Piece B):
+            // regroup the permuted rows by adapter slot within each expert block
+            // after the sort so Piece A can merge same-adapter runs. Always on
+            // for the slot-indexed device path (the per-token slot ids come from
+            // the token_to_slot mirror); the regroup is correctness-preserving
+            // (expert_first_token_offset is unchanged, only the index maps are
+            // permuted).
+            if (has_slot_indexed && lora_num_slots > 0)
+            {
+                dp.adapter_sort = true;
+                dp.token_to_slot_dev = mLoraTokenToSlotDevice.data_ptr<int32_t>();
+                dp.regroup_scratch_dev = mLoraRegroupScratchDevice.data_ptr<int32_t>();
+                dp.num_slots = static_cast<int>(lora_num_slots);
+                dp.num_tokens = num_tokens;
             }
 
             // Per-module dim_a/dim_b describe the LoRA adapter shape the

@@ -58,6 +58,7 @@
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_adapter_sort.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pointer_expand.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h"
 // NOTE: the device-path GEMM dispatch (cudaGraph(SplitK)GroupedGemm,
@@ -4228,6 +4229,23 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         }
 
         sync_check_cuda_error(stream);
+
+        // "Adapter as secondary sort key" (lora_gemm_by_adapter.md, Piece B):
+        // regroup the permuted rows within each expert block by adapter slot so
+        // the device-path builder (Piece A) merges same-adapter runs into fat-M
+        // problems. Gated to the fused prologue (its maps are the only ones we
+        // rewrite; the unfused path also produces permuted_token_selected_experts_
+        // which we do not touch) and to the slot-indexed device LoRA path. Leaves
+        // expert_first_token_offset_ unchanged - only the index maps are permuted.
+        if (use_lora && fused_prologue_result && lora_params.device_path.enabled
+            && lora_params.device_path.adapter_sort)
+        {
+            auto const& dp = lora_params.device_path;
+            ::tensorrt_llm::kernels::cutlass_kernels::launchMoeLoraAdapterRegroup(permuted_row_to_unpermuted_row_,
+                unpermuted_row_to_permuted_row, dp.regroup_scratch_dev, expert_first_token_offset_, dp.token_to_slot_dev,
+                num_experts_per_node, dp.num_tokens, expanded_num_rows, dp.num_slots, stream);
+            sync_check_cuda_error(stream);
+        }
 
         bool is_gated_activation = isGatedActivation(fc1_activation_type);
 
