@@ -66,6 +66,8 @@ def skip_softmax_config_from_ckpt_sparse_attention_config(
 
     config_groups = ckpt_sparse_attention_config.get("config_groups")
     if isinstance(config_groups, dict):
+        # ModelOpt may emit many sparse-attention groups. The shared
+        # skip-softmax helpers operate on the single skip-softmax group.
         groups = [
             group
             for group in config_groups.values()
@@ -237,6 +239,8 @@ def skip_softmax_ignore_from_ckpt_sparse_attention_config(
                 ignore.append(pattern)
 
     if isinstance(ckpt_sparse_attention_config, dict):
+        # The input may already be the skip-softmax group rather than the
+        # outer sparse_attention_config.
         _extend(ckpt_sparse_attention_config.get("ignore"))
     config = skip_softmax_config_from_ckpt_sparse_attention_config(ckpt_sparse_attention_config)
     if isinstance(config, dict) and config is not ckpt_sparse_attention_config:
@@ -257,10 +261,14 @@ def skip_softmax_formula_from_ckpt_sparse_attention_config(
     if not isinstance(threshold_config, dict) and "formula" in ckpt_sparse_attention_config:
         threshold_config = ckpt_sparse_attention_config
     if isinstance(threshold_config, dict):
-        return SkipSoftmaxFormula.parse_from_dict(
+        formula = SkipSoftmaxFormula.parse_from_dict(
             threshold_config.get("coefficients"),
             formula=threshold_config.get("formula"),
         )
+        if formula is not None:
+            return formula
+        # Scalar VisualGen configs may also keep coefficients next to formula.
+        return SkipSoftmaxFormula.parse_from_dict(threshold_config)
     return None
 
 
@@ -351,6 +359,8 @@ class SkipSoftmaxScheduler:
             if threshold_config is None:
                 phase_formula = None
             else:
+                # Prefer phase-specific coefficients for LLM, then shared
+                # coefficients, then inline coefficients in the threshold dict.
                 coefficient_config = threshold_config.get(phase)
                 if coefficient_config is None:
                     coefficient_config = threshold_config.get("coefficients")
