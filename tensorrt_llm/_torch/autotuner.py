@@ -253,6 +253,21 @@ class TunableRunner(ABC):
         """
         return tuple(self.__dict__.values())
 
+    @property
+    def _cache_key_prefix(self) -> Tuple[str, str]:
+        """Cached (class_name, unique_id_str) tuple — computed once per runner instance.
+
+        This avoids re-computing runner.__class__.__name__ and str(runner.unique_id())
+        on every get_cache_key() call during inference. These values are constant for a
+        given runner instance.
+        """
+        try:
+            return self.__cache_key_prefix
+        except AttributeError:
+            self.__cache_key_prefix = (self.__class__.__name__,
+                                       str(self.unique_id()))
+            return self.__cache_key_prefix
+
 
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True,
@@ -298,6 +313,9 @@ def autotune(tune_mode: bool = True,
         autotuner.skip_dynamic_tuning_buckets = old_skip
         if autotune_enabled:
             logger.info("[Autotuner] Autotuning process ends")
+            # Invalidate the choose_one cache since the profiling cache
+            # has been updated with new entries.
+            autotuner._choose_one_cache.clear()
 
         # save cache
         if cache_path is not None:
@@ -447,11 +465,15 @@ class AutoTunerProfilingCache:
         tuning_config: TuningConfig,
         apply_map_to_tuning_buckets: bool = True,
     ) -> Tuple:
+        # Use cached (class_name, unique_id_str) prefix to avoid
+        # recomputing str(runner.unique_id()) on every call (~1-2us saving).
+        prefix = runner._cache_key_prefix
         return (
             custom_op,
-            runner.__class__.__name__,
-            str(runner.unique_id()),
-            AutoTuner.get()._find_nearest_profile(
+            prefix[0],
+            prefix[1],
+            # Call classmethod directly — avoids AutoTuner.get() singleton lookup.
+            AutoTuner._find_nearest_profile(
                 input_shapes,
                 tuning_config.dynamic_tensor_specs,
                 tuning_config.constraint_specs,
@@ -790,6 +812,14 @@ class AutoTuner:
         # Last captured choose_one() contexts
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
+        # Inference fast-path cache for choose_one().
+        # Maps (custom_op, runner_ids, *bucketed_dims) -> (runner_id, tactic).
+        # On cache hit, resolves the runner via runners[runner_id] from the
+        # caller's list — never caches runner instances directly.
+        # Skips the full search_cache → _find_nearest_profile chain on
+        # repeated calls.
+        self._choose_one_cache: dict = {}
+
         # Dsitributed tuning state
         self._dist: Optional[Distributed] = None
         self._has_received_cache: bool = False
@@ -918,6 +948,31 @@ class AutoTuner:
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
 
+        # ---- NON-TUNING PATH: fast-key cache ----
+        if not self.is_tuning_mode and self._active_capture is None:
+            fast_key = self._make_fast_key(custom_op, runners, tuning_config,
+                                           inputs)
+            cached = self._choose_one_cache.get(fast_key)
+            if cached is not None:
+                best_runner_id, best_tactic = cached
+                return (runners[best_runner_id], best_tactic)
+
+            # Cache miss — full resolution via search_cache
+            input_shapes = tuple(self._get_input_sizes(inputs))
+            is_cache_hit, best_runner_id, best_tactic, min_time = \
+                self.profiling_cache.search_cache(
+                    custom_op, runners, input_shapes, tuning_config,
+                    apply_map_to_tuning_buckets=True)
+            if not is_cache_hit:
+                logger.warning_once(
+                    f"[AutoTuner] {custom_op} using the fallback tactic, "
+                    f"due to cache miss on input shapes={input_shapes}",
+                    key=(custom_op, "warning_autotuning_cache_miss_fallback"))
+            self._choose_one_cache[fast_key] = (best_runner_id, best_tactic)
+            return (runners[best_runner_id], best_tactic)
+
+        # ---- TUNING / CAPTURE / REPLAY ----
+
         # Check if we're in replay mode via active TacticsCapture
         if self._active_capture is not None and self._active_capture.is_replaying(
         ):
@@ -965,27 +1020,13 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
-        is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
-            custom_op,
-            runners,
-            input_shapes,
-            tuning_config,
-            apply_map_to_tuning_buckets=True)
+        is_cache_hit, best_runner_id, best_tactic, min_time = \
+            self.profiling_cache.search_cache(
+                custom_op, runners, input_shapes, tuning_config,
+                apply_map_to_tuning_buckets=True)
 
-        # Early return if it's not tuning, use cache found one or fallback one
-        if not self.is_tuning_mode:
-            best_runner = runners[best_runner_id]
-            # TODO: check the stored runner and tactic can implement this shape here
-            # Log the cache miss. Expect no cache miss in inference.
-            if not is_cache_hit:
-                logger.warning_once(
-                    f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
-                    key=(custom_op, "warning_autotuning_cache_miss_fallback"))
-
-            return (best_runner, best_tactic)
-
-        # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
-        if self.is_tuning_mode and is_cache_hit:
+        # Cache hit — skip profiling (avoids redundant work during tuning/capture).
+        if is_cache_hit:
             return (runners[best_runner_id], best_tactic)
 
         # PP rank does not have cache hit, so we try to receive the cache from the previous rank
@@ -1054,6 +1095,38 @@ class AutoTuner:
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
+
+    # ------------------------------------------------------------------
+    # _make_fast_key — bucketed cache key for choose_one fast path
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_fast_key(custom_op, runners, tuning_config, inputs):
+        """Build a minimal cache key from runner identity + bucketed dynamic dims.
+
+        Includes each runner's ``_cache_key_prefix`` (class name + unique_id)
+        so that different runner configurations for the same ``custom_op``
+        do not collide.  For the dynamic dimensions we extract only the 1–2
+        integer values that actually vary at inference time (e.g. batch size)
+        and bucket them.  This gives an O(R + K) key where R = len(runners)
+        (typically 1–3) and K = len(dynamic_tensor_specs) (typically 1).
+        """
+        runner_ids = tuple(r._cache_key_prefix for r in runners)
+        dynamic_specs = tuning_config.dynamic_tensor_specs
+        if not dynamic_specs:
+            return (custom_op, runner_ids)
+        max_tokens = tuning_config.tune_max_num_tokens
+        dyn_vals = []
+        for spec in dynamic_specs:
+            inp = inputs[spec.input_idx]
+            if isinstance(inp, torch.Tensor):
+                v = spec.map_to_tuning_buckets(inp.size(spec.dim_idx))
+            else:
+                v = 0
+            if max_tokens is not None:
+                v = min(v, max_tokens)
+            dyn_vals.append(v)
+        return (custom_op, runner_ids, *dyn_vals)
 
     def _profile_runners(
         self,
