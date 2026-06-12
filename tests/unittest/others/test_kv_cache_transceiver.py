@@ -510,15 +510,15 @@ def test_kv_transfer_timeout_silent_when_unset(capfd):
 
 
 @pytest.mark.timeout(120)
-def test_context_transfer_bounded_poll_keeps_request_in_progress():
+def test_context_transfer_bounded_poll_keeps_request_in_progress(capfd):
     """A bounded transfer poll must not make a non-ready request terminal."""
     mapping = Mapping(world_size=1, rank=0)
     dist = Distributed.get(mapping)
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
     kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
 
-    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
-                                                      max_tokens_in_buffer=512)
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="DEFAULT", max_tokens_in_buffer=512, kv_transfer_timeout_ms=100)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
                                                   AttentionTypeCpp.DEFAULT,
@@ -561,7 +561,15 @@ def test_context_transfer_bounded_poll_keeps_request_in_progress():
 
     kv_cache_manager_gen.impl.add_sequence_batch(
         [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
+
+    capfd.readouterr()
     transceiver_gen.request_and_receive_async(gen_request)
+    transceiver_gen.check_gen_transfer_status(0)
+    out = capfd.readouterr()
+    marker = "Generation KV cache transfer for request 100 exceeded configured timeout"
+    assert marker not in out.out, (
+        f"Generation transfer timeout WARN fired before the request had "
+        f"actually timed out; stdout:\n{out.out}")
 
     completed_ctx_ids = set()
 

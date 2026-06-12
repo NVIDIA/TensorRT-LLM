@@ -617,6 +617,7 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
         return;
     }
 
+    llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
     auto future = mCacheReceiver->receiveAsync(llmRequest);
     auto* requestPtr = llmRequest.get();
     mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
