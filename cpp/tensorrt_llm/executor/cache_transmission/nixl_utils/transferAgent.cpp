@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -594,7 +594,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     registerMemory(descs);
 
     // P2P fast-path agent. Constructed after the NIXL agent so that it queries the CUDA
-    // device context already set up by NIXL. Disabled via TRTLLM_DISABLE_P2P_TRANSFER.
+    // device context already set up by NIXL. Disabled via TRTLLM_KV_TRANSFER_P2P_DISABLE.
     if (!common::getEnvKvTransferP2pDisable())
     {
         mP2pAgent = std::make_unique<P2pTransferAgent>();
