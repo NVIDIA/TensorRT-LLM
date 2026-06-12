@@ -1609,6 +1609,13 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     def lm_head(self):
         return self.llm.lm_head
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
+    def set_guided_decoder(self, *args, **kwargs):
+        return self.llm.set_guided_decoder(*args, **kwargs)
+
     def load_draft_weights(self, *args, **kwargs):
         return self.llm.load_draft_weights(*args, **kwargs)
 
