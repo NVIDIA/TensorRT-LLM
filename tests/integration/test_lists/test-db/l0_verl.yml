@@ -34,3 +34,6 @@ l0_verl:
   - verl/test_verl_cases.py::test_wake_sleep_cycle
   - verl/test_verl_cases.py::test_inter_node_trtllm_rollout
   - verl/test_verl_cases.py::test_trtllm_abort
+  - verl/test_verl_E2E_convergence.py::test_e2e_convergence_qwen25_05b_grpo_trtllm
+  - verl/test_verl_E2E_convergence.py::test_e2e_convergence_qwen25_05b_grpo_trtllm_async_standalone
+  - verl/test_verl_E2E_feature.py::test_e2e_smoke_qwen25_7b_megatron_trtllm
