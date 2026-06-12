@@ -5,6 +5,7 @@
 
 import itertools
 import pickle
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +22,7 @@ from tensorrt_llm.visual_gen.args import (
     TorchCompileConfig,
     VisualGenArgs,
 )
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig
 
 
 class TestVisualGenArgsStrictValidation:
@@ -106,6 +108,31 @@ class TestAttentionConfigQuantValidation:
         )
 
         assert attention.quant_attention_config is not None
+
+
+class TestVisualGenExampleConfigs:
+    def test_wan22_skip_softmax_bf16_recipe_config(self):
+        repo_root = Path(__file__).resolve().parents[4]
+        config_path = (
+            repo_root
+            / "examples"
+            / "visual_gen"
+            / "configs"
+            / "wan2.2-t2v-bf16-skip-softmax-8gpu.yaml"
+        )
+
+        args = VisualGenArgs.from_yaml(config_path)
+        sparse_cfg = args.attention_config.sparse_attention_config
+
+        assert args.attention_config.backend == "TRTLLM"
+        assert isinstance(sparse_cfg, SkipSoftmaxConfig)
+        assert sparse_cfg.target_sparsity == 0.75
+        assert sparse_cfg.first_dense_steps == 16
+        assert args.torch_compile_config.enable is True
+        assert args.parallel_config.cfg_size == 2
+        assert args.parallel_config.ulysses_size == 4
+        assert args.parallel_config.parallel_vae_size == 8
+        assert args.cuda_graph_config.enable is False
 
 
 class TestPipelineRegistryUnique:
