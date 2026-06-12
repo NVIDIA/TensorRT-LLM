@@ -4,6 +4,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
 import torch
+import torch._inductor.config as inductor_config
 import torch.distributed as dist
 import torch.nn as nn
 from pydantic import Field
@@ -528,6 +529,15 @@ class BasePipeline(nn.Module):
         For non-transformer components, compiles the entire module.
         """
         tc_config = self.pipeline_config.torch_compile
+
+        # Inductor reads emulate_precision_casts at trace time (first compiled
+        # forward / warmup), so set it before compiling. Emulating eager-mode
+        # precision casts keeps compiled output numerically close to eager
+        # (diffusion fidelity); without it bf16 intermediate rounding diverges.
+        # Guarded for torch builds that predate the flag.
+        if hasattr(inductor_config, "emulate_precision_casts"):
+            inductor_config.emulate_precision_casts = True
+            logger.info("torch.compile: emulate_precision_casts=True")
 
         # Using default as max-autotune mode takes more initialization time and
         # does not improve performance a lot.
