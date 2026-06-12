@@ -622,9 +622,14 @@ class PythonMambaCacheManager(BaseResourceManager):
         # mamba cache index, maps request_id -> state indices
         self.mamba_cache_index: Dict[int, int] = {}
         self._dummy_request_ids: set[int] = set()
-        self._dummy_slot_mask = torch.zeros(max_batch_size,
-                                            dtype=torch.bool,
-                                            device=device)
+        # Batch-order mask aligned with state_indices; duplicate dummy request
+        # IDs mark every batch row even when they share one cache slot.
+        self._dummy_request_mask = torch.zeros(max_batch_size,
+                                               dtype=torch.bool,
+                                               device=device)
+        self._dummy_request_mask_host = torch.zeros(max_batch_size,
+                                                    dtype=torch.bool,
+                                                    pin_memory=prefer_pinned())
 
         # Permanent slot shared by every CUDA-graph padding sentinel id
         # (CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, one per
@@ -682,7 +687,6 @@ class PythonMambaCacheManager(BaseResourceManager):
                 raise RuntimeError("run out of mamba cache blocks")
             block = self.mamba_cache_free_blocks.pop()
             self.mamba_cache_index[r] = block
-            self._dummy_slot_mask[block] = False
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
@@ -699,6 +703,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                         self._seed_rank_offset))
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        requests = (scheduled_batch.context_requests +
+                    scheduled_batch.generation_requests)
         context_ids = [
             i.py_request_id for i in scheduled_batch.context_requests
         ]
@@ -707,6 +713,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         ]
         request_ids = context_ids + generation_ids
         self._prepare_mamba_cache_blocks(request_ids)
+        self._refresh_dummy_request_mask([req.is_dummy for req in requests])
 
     def _is_padding_sentinel(self, request_id: int) -> bool:
         # cuda_graph_runner caches one dummy per runtime_draft_len value
@@ -728,7 +735,6 @@ class PythonMambaCacheManager(BaseResourceManager):
         for r in request_ids:
             if r in self.mamba_cache_index:
                 block = self.mamba_cache_index[r]
-                self._dummy_slot_mask[block] = True
                 if (isinstance(self.mamba_cache, self.SpeculativeState)
                         and self._use_replay_state_update):
                     self.mamba_cache.prev_num_accepted_tokens[block] = 0
@@ -744,7 +750,6 @@ class PythonMambaCacheManager(BaseResourceManager):
                     raise RuntimeError("run out of mamba cache blocks")
                 block = self.mamba_cache_free_blocks.pop()
             self.mamba_cache_index[r] = block
-            self._dummy_slot_mask[block] = True
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
@@ -754,19 +759,33 @@ class PythonMambaCacheManager(BaseResourceManager):
         request_id = request.py_request_id
         if request_id not in self.mamba_cache_index:
             return
-        is_dummy = request_id in self._dummy_request_ids
         self._dummy_request_ids.discard(request_id)
         block = self.mamba_cache_index.pop(request_id)
         # Reserved slots must not re-enter the real-request free pool.
         if block != self._padding_slot and \
                 block != self._attention_dp_dummy_slot:
-            if is_dummy:
-                self._dummy_slot_mask[block] = False
             self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self, request_ids: List[int],
                           is_padding: List[bool]) -> List[int]:
-        return [self.mamba_cache_index[rid] for rid in request_ids]
+        assert len(request_ids) == len(is_padding)
+        indices = [self.mamba_cache_index[rid] for rid in request_ids]
+        is_dummy = [
+            rid in self._dummy_request_ids or padding
+            for rid, padding in zip(request_ids, is_padding)
+        ]
+        self._refresh_dummy_request_mask(is_dummy)
+        return indices
+
+    def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
+        n = len(is_dummy)
+        assert n <= self._dummy_request_mask_host.shape[0]
+        self._dummy_request_mask_host.zero_()
+        if n > 0:
+            self._dummy_request_mask_host[:n].copy_(
+                torch.as_tensor(is_dummy, dtype=torch.bool))
+        self._dummy_request_mask.copy_(self._dummy_request_mask_host,
+                                       non_blocking=True)
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
@@ -850,7 +869,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     @property
     def use_replay_state_update(self) -> bool:
-        return self._use_replay_state_update
+        return self.get_replay_state_update_metadata() is not None
 
     def get_replay_state_update_metadata(
             self) -> Optional[ReplayStateUpdateMetadata]:
@@ -925,14 +944,15 @@ class PythonMambaCacheManager(BaseResourceManager):
                 wrote_checkpoint, accepted_tokens,
                 prev_num_accepted_tokens + accepted_tokens)
             cache_buf_idx = self.mamba_cache.cache_buf_idx[state_indices_d]
-            is_dummy_slot = self._dummy_slot_mask[state_indices_d]
-            next_num_accepted_tokens = torch.where(is_dummy_slot,
+            is_dummy_request = self._dummy_request_mask[
+                num_contexts:num_contexts + num_gens]
+            next_num_accepted_tokens = torch.where(is_dummy_request,
                                                    prev_num_accepted_tokens,
                                                    next_num_accepted_tokens)
             self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = \
                 next_num_accepted_tokens
             self.mamba_cache.cache_buf_idx[state_indices_d] = \
-                torch.where(is_dummy_slot, cache_buf_idx,
+                torch.where(is_dummy_request, cache_buf_idx,
                             torch.where(wrote_checkpoint, 1 - cache_buf_idx,
                                         cache_buf_idx))
         else:
@@ -1073,7 +1093,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     @property
     def use_replay_state_update(self) -> bool:
-        return getattr(self._impl, 'use_replay_state_update', False)
+        return self.get_replay_state_update_metadata() is not None
 
     def get_replay_state_update_metadata(
             self) -> Optional[ReplayStateUpdateMetadata]:
@@ -1665,8 +1685,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                          dtype=torch.long,
                                          device="cpu")
         self._request_id_to_state_index = {}
-        self._dummy_slot_mask = None
-        self._dummy_slot_mask_host = None
+        self._request_id_to_is_dummy = {}
+        # Batch-order mask aligned with state_indices; duplicate dummy request
+        # IDs mark every batch row even when they share one cache slot.
+        self._dummy_request_mask = None
+        self._dummy_request_mask_host = None
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -1756,8 +1779,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
-        self._dummy_slot_mask = None
-        self._dummy_slot_mask_host = None
+        self._dummy_request_mask = None
+        self._dummy_request_mask_host = None
         self.old_x = None
         self.old_B = None
         self.old_dt = None
@@ -1823,8 +1846,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # we skip refresh_blocks entirely when nothing was scheduled.
         self._pending_state_transfers = self.impl.copy_linear_attention_block_batch(
             self.requests)
-        if self._pending_state_transfers:
-            logger.info("Need to transfer mamba state blocks")
         self._setup_state_indices()
         # Reset replay double-buffer state for fresh context blocks. A reused
         # block (prefix-cache hit or block recycled across requests) may carry
@@ -1933,13 +1954,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             next_num_accepted_tokens = torch.where(
                 wrote_checkpoint, accepted, prev_num_accepted_tokens + accepted)
             cache_buf_idx = self.cache_buf_idx[slots]
-            is_dummy_slot = self._dummy_slot_mask[slots]
-            next_num_accepted_tokens = torch.where(is_dummy_slot,
+            assert self._dummy_request_mask is not None
+            is_dummy_request = self._dummy_request_mask[
+                num_contexts:num_contexts + num_gens]
+            next_num_accepted_tokens = torch.where(is_dummy_request,
                                                    prev_num_accepted_tokens,
                                                    next_num_accepted_tokens)
             self.prev_num_accepted_tokens[slots] = next_num_accepted_tokens
             self.cache_buf_idx[slots] = torch.where(
-                is_dummy_slot, cache_buf_idx,
+                is_dummy_request, cache_buf_idx,
                 torch.where(wrote_checkpoint, 1 - cache_buf_idx, cache_buf_idx))
         else:
             # Legacy: copy the accepted SSM state from the intermediate buffer.
@@ -1955,6 +1978,19 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                     self.intermediate_conv_states,
                                     src_state_indices,
                                     num_accepted_draft_tokens, state_indices_d)
+
+    def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
+        if self._dummy_request_mask is None:
+            return
+
+        n = len(is_dummy)
+        assert n <= self._dummy_request_mask_host.shape[0]
+        self._dummy_request_mask_host.zero_()
+        if n > 0:
+            self._dummy_request_mask_host[:n].copy_(
+                torch.tensor(is_dummy, dtype=torch.bool))
+        self._dummy_request_mask.copy_(self._dummy_request_mask_host,
+                                       non_blocking=True)
 
     def get_num_available_tokens(self,
                                  token_num_upper_bound: int,
@@ -2045,6 +2081,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if request in self.requests:
             self.requests.remove(request)
             self._request_id_to_state_index.pop(request.py_request_id, None)
+            self._request_id_to_is_dummy.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:
@@ -2099,25 +2136,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
-        if self._dummy_slot_mask is not None:
-            self._dummy_slot_mask_host.zero_()
-            for i, req in enumerate(self.requests):
-                if req.is_dummy:
-                    self._dummy_slot_mask_host[
-                        self._host_state_indices[i].item()] = True
-            self._dummy_slot_mask.copy_(self._dummy_slot_mask_host,
-                                        non_blocking=True)
-            if (self.prev_num_accepted_tokens is not None
-                    and self.cache_buf_idx is not None):
-                self.prev_num_accepted_tokens.masked_fill_(
-                    self._dummy_slot_mask, 0)
-                self.cache_buf_idx.masked_fill_(self._dummy_slot_mask, 0)
+        self._refresh_dummy_request_mask(
+            [req.is_dummy for req in self.requests])
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
         for i, req in enumerate(self.requests):
             self._request_id_to_state_index[
                 req.py_request_id] = self._host_state_indices[i].item()
+            self._request_id_to_is_dummy[req.py_request_id] = req.is_dummy
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
@@ -2127,7 +2154,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # not the internal self.requests order.  This is critical when
             # the batch is reordered after prepare_resources (e.g. disagg
             # serving sorts generation_requests by py_batch_idx).
-            return [self._request_id_to_state_index[rid] for rid in request_ids]
+            indices = [
+                self._request_id_to_state_index[rid] for rid in request_ids
+            ]
+            if is_padding is None:
+                is_padding = [False] * len(request_ids)
+            assert len(request_ids) == len(is_padding)
+            is_dummy = [
+                self._request_id_to_is_dummy.get(rid, False) or padding
+                for rid, padding in zip(request_ids, is_padding)
+            ]
+            self._refresh_dummy_request_mask(is_dummy)
+            return indices
         return self.cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
@@ -2262,8 +2300,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self.old_B = None
             self.old_dt = None
             self.old_dA_cumsum = None
-            self._dummy_slot_mask = None
-            self._dummy_slot_mask_host = None
+            self._dummy_request_mask = None
+            self._dummy_request_mask_host = None
             return
 
         history_size = self.replay_history_size
@@ -2278,12 +2316,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cache_buf_idx = torch.zeros(cache_size,
                                          dtype=torch.int32,
                                          device=device)
-        self._dummy_slot_mask = torch.zeros(cache_size,
-                                            dtype=torch.bool,
-                                            device=device)
-        self._dummy_slot_mask_host = torch.zeros(cache_size,
-                                                 dtype=torch.bool,
-                                                 pin_memory=prefer_pinned())
+        self._dummy_request_mask = torch.zeros(self.max_batch_size,
+                                               dtype=torch.bool,
+                                               device=device)
+        self._dummy_request_mask_host = torch.zeros(self.max_batch_size,
+                                                    dtype=torch.bool,
+                                                    pin_memory=prefer_pinned())
         self.old_x = torch.zeros(num_local_mamba_layers,
                                  cache_size,
                                  2,
@@ -2318,18 +2356,21 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
     @property
     def use_replay_state_update(self) -> bool:
-        return self._use_replay_state_update
+        return self.get_replay_state_update_metadata() is not None
 
     def get_replay_state_update_metadata(
             self) -> Optional[ReplayStateUpdateMetadata]:
+        prev_num_accepted_tokens = getattr(self, 'prev_num_accepted_tokens',
+                                           None)
+        cache_buf_idx = getattr(self, 'cache_buf_idx', None)
         if (not self._use_replay_state_update
-                or self.prev_num_accepted_tokens is None
-                or self.cache_buf_idx is None or self.replay_step_width is None
+                or prev_num_accepted_tokens is None or cache_buf_idx is None
+                or self.replay_step_width is None
                 or self.replay_history_size is None):
             return None
         return ReplayStateUpdateMetadata(
-            prev_num_accepted_tokens=self.prev_num_accepted_tokens,
-            cache_buf_idx=self.cache_buf_idx,
+            prev_num_accepted_tokens=prev_num_accepted_tokens,
+            cache_buf_idx=cache_buf_idx,
             replay_step_width=self.replay_step_width,
             replay_history_size=self.replay_history_size)
 

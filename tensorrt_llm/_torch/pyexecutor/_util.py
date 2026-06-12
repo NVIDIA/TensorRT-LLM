@@ -1292,7 +1292,11 @@ def _create_kv_cache_manager(
             quant_config, 'mamba_ssm_stochastic_rounding',
             False) if quant_config is not None else False
 
-        use_replay = sm >= 80
+        use_replay = spec_config is not None and sm >= 80
+        if spec_config is None:
+            logger.info(
+                "Replay kernel requires speculative decoding; using non-replay path"
+            )
 
         # Block reuse (prefix caching): replay leaves SSM state at a
         # checkpoint after speculation. The next decode step replays forward

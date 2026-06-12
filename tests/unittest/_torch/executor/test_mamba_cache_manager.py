@@ -65,6 +65,18 @@ def test_python_mamba_resource_count_excludes_reserved_dummy_slots(enable_attent
 
 
 @skip_no_cuda
+def test_replay_inactive_without_spec_config():
+    mgr = _make_mgr(
+        max_batch_size=2,
+        max_draft_len=None,
+        use_replay_state_update=True,
+    )
+
+    assert mgr.use_replay_state_update is False
+    assert mgr.get_replay_state_update_metadata() is None
+
+
+@skip_no_cuda
 def test_padding_slot_not_held_by_parked_real():
     """Padding must not resolve to a slot owned by a parked real
     request outside the current batch."""
@@ -192,7 +204,11 @@ def test_replay_update_mamba_states_skips_dummy_slots():
     mgr.mamba_cache.cache_buf_idx[real_slot] = 1
     mgr.mamba_cache.cache_buf_idx[dummy_slot] = 1
 
-    state_indices = torch.tensor([real_slot, dummy_slot], dtype=torch.int32, device="cuda")
+    state_indices = torch.tensor(
+        mgr.get_state_indices([100, CUDA_GRAPH_DUMMY_REQUEST_ID], [False, True]),
+        dtype=torch.int32,
+        device="cuda",
+    )
     attn = SimpleNamespace(num_seqs=2, num_contexts=0)
     mgr.update_mamba_states(
         attn,

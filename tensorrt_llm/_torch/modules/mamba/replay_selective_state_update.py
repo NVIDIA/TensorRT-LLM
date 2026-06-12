@@ -3871,8 +3871,7 @@ def replay_selective_state_update(
             f"rand_seed must be a 1D tensor; got shape {tuple(rand_seed.shape)}"
         )
         assert rand_seed.shape[0] == 1, (
-            "rand_seed must have length 1; "
-            f"got shape {tuple(rand_seed.shape)}"
+            f"rand_seed must have length 1; got shape {tuple(rand_seed.shape)}"
         )
 
     tie_hdim = (
