@@ -2034,7 +2034,7 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states.update({
             'num_ctx_requests': 0,
             'num_ctx_tokens': 0,
-            'num_generation_tokens': num_generation_tokens
+            'num_generation_tokens': num_generation_tokens,
         })
 
         return lora_params

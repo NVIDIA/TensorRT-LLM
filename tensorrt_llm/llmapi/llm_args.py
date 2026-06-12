@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import ast
 import functools
 import json
@@ -4032,6 +4035,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Maximum number of iterations the scheduler will wait to accumulate new coming requests for improved GPU utilization efficiency. If greater than 0, the scheduler will delay batch processing to gather more requests up to the specified iteration limit. If 0, disables timeout-iters-based batching delays.",
         status="prototype")
 
+    batch_wait_delay_timeout_ms: NonNegativeFloat = Field(
+        default=0,
+        description=
+        "Maximum wall-clock time in milliseconds that the scheduler delay "
+        "batching logic may wait before allowing context requests. If greater "
+        "than 0, the scheduler may skip context-only iterations while "
+        "accumulating tokens up to batch_wait_max_tokens_ratio * "
+        "max_num_tokens. If 0, disables wall-clock-time-based batching delays.",
+        status="prototype")
+
     batch_wait_max_tokens_ratio: float = Field(
         default=0,
         ge=0,
@@ -4403,6 +4416,26 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_batch_wait_delay_timeout(self) -> 'TorchLlmArgs':
+        if self.batch_wait_delay_timeout_ms <= 0:
+            return self
+        if self.batch_wait_timeout_iters > 0:
+            raise ValueError(
+                "batch_wait_delay_timeout_ms and batch_wait_timeout_iters "
+                "cannot both be enabled.")
+        if not self.disable_overlap_scheduler:
+            raise ValueError("batch_wait_delay_timeout_ms requires "
+                             "disable_overlap_scheduler=True.")
+        if self.batch_wait_max_tokens_ratio <= 0:
+            raise ValueError("batch_wait_delay_timeout_ms requires "
+                             "batch_wait_max_tokens_ratio > 0.")
+        if self.max_num_tokens is None:
+            raise ValueError(
+                "batch_wait_delay_timeout_ms requires max_num_tokens to be set."
+            )
         return self
 
     @model_validator(mode="after")
