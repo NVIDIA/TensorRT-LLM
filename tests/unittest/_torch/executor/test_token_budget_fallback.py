@@ -52,12 +52,17 @@ class _FakeRequest:
         return self.context_current_position + self.context_chunk_size == self._prompt_len
 
 
-def _make_manager(max_num_tokens, tokens_per_block):
+def _make_manager(max_num_tokens, tokens_per_block, enable_chunked_prefill=True):
     # Skip the heavy (GPU-allocating) __init__; the method under test only
-    # needs these two attributes plus its own (bound) helper methods.
+    # needs these attributes plus its own (bound) helper methods.
     mgr = KVCacheManager.__new__(KVCacheManager)
     mgr.max_num_tokens = max_num_tokens
     mgr.tokens_per_block = tokens_per_block
+    # Re-chunking is only valid when chunked prefill is enabled; otherwise the
+    # attention backend cannot consume a partial context chunk and the fallback
+    # must defer instead. Default to enabled so the re-chunk tests exercise that
+    # path; the disabled case is covered explicitly below.
+    mgr.enable_chunked_prefill = enable_chunked_prefill
     return mgr
 
 
@@ -138,6 +143,26 @@ class TestFitTokenBudget(unittest.TestCase):
         self.assertEqual(batch.num_context_requests, 1)
         self.assertIn(ctx, batch.context_requests_chunking)
         self.assertNotIn(ctx, batch.context_requests_last_chunk)
+
+    def test_overshoot_defers_when_chunked_prefill_disabled(self):
+        # Regression for the CI failures (q.numel()==0 / "Separate quantized
+        # buffer is not provided" / cudaErrorInvalidValue) seen in PR #15187:
+        # when chunked prefill is disabled the attention backend cannot consume
+        # a partial context chunk, so an over-budget request that *would* be
+        # re-chunkable must instead be deferred whole -- never re-chunked.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False)
+        # Same shape as test_overshoot_rechunks_context (a 28-token budget and a
+        # 64-token last chunk that is block-aligned re-chunkable to 16), but with
+        # chunked prefill off the request must be deferred, not shrunk.
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        gen = _FakeRequest(py_beam_width=100)  # remaining = 28
+        batch = _make_batch([ctx], [gen])
+
+        mgr._fit_token_budget(batch)
+
+        self.assertEqual(batch.num_context_requests, 0)
+        self.assertEqual(ctx.context_chunk_size, 64)  # not re-chunked
+        self.assertTrue(ctx.is_last_context_chunk)  # still a whole last chunk
 
     def test_overshoot_defers_when_cannot_rechunk(self):
         # Only an 8-token budget remains -- smaller than one block -- so the

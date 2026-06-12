@@ -1452,6 +1452,16 @@ def _create_kv_cache_manager(
     # via cache_layer_idx — shared layers use target layer's index for
     # get_buffers(). No layer_offsets remapping needed here.
 
+    # Propagate the finalized chunked-prefill flag so KVCacheManager._fit_token_budget
+    # only re-chunks context requests when the attention backend can consume a
+    # partial context chunk; otherwise it defers them instead. The flag is read
+    # from attn_runtime_features, which py_executor_creator finalizes (including
+    # the SM-version / attention-backend overrides) before build_managers runs.
+    if isinstance(kv_cache_manager,
+                  KVCacheManager) and model_engine is not None:
+        kv_cache_manager.enable_chunked_prefill = bool(
+            model_engine.attn_runtime_features.chunked_prefill)
+
     return kv_cache_manager
 
 

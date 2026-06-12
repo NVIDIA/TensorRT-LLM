@@ -571,6 +571,7 @@ class KVCacheManager(BaseResourceManager):
         # attention types (e.g. Gemma4 SWA head_dim=256 + full-attention
         # head_dim=512).
         pool_configurations: Optional[List[PoolConfiguration]] = None,
+        enable_chunked_prefill: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -658,6 +659,12 @@ class KVCacheManager(BaseResourceManager):
         # Kept so prepare_resources can re-validate the per-step token budget
         # (the forward-pass scratch size enforced in _prepare_tp_inputs).
         self.max_num_tokens = max_num_tokens
+        # Whether chunked prefill is enabled for this engine. Gates the re-chunk
+        # path in _fit_token_budget: a context request may only be shrunk into a
+        # partial chunk when the attention backend is set up for chunked context.
+        # Defaults to False (safe: defer instead of re-chunk) and is set to the
+        # finalized value by _create_kv_cache_manager.
+        self.enable_chunked_prefill = enable_chunked_prefill
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
@@ -1035,6 +1042,13 @@ class KVCacheManager(BaseResourceManager):
         Deferred context requests are simply dropped from this iteration's
         ``scheduled_batch``; they remain in the active pool and are rescheduled
         on a later iteration with a fresh budget.
+
+        An over-budget context request is shrunk (re-chunked) in place only when
+        chunked prefill is enabled; otherwise the attention backend is not set
+        up to consume a partial context chunk and the request is deferred whole
+        instead. Re-chunking with chunked prefill disabled produces an invalid
+        forward pass (empty-query asserts / missing quantized KV buffers /
+        cudaErrorInvalidValue) -- see the regression covered by PR #15187.
         """
         budget = self.max_num_tokens
 
@@ -1072,13 +1086,17 @@ class KVCacheManager(BaseResourceManager):
             # Doesn't fit. Try re-chunking the compute (fewer tokens this step)
             # before deferring. Re-chunking only reduces compute tokens -- KV is
             # allocated for the full prompt regardless -- so block accounting is
-            # unaffected. Only safe when the request can be chunked further, the
-            # shrunk chunk still holds at least one block (aligned to block
-            # size), and the boundary won't split a bidirectional multimodal
-            # block.
+            # unaffected. Only safe when chunked prefill is enabled (otherwise
+            # the attention backend is not set up to consume a partial context
+            # chunk -- shrinking the chunk produces an invalid forward pass,
+            # e.g. cudaErrorInvalidValue / empty-query asserts), the request can
+            # be chunked further, the shrunk chunk still holds at least one block
+            # (aligned to block size), and the boundary won't split a
+            # bidirectional multimodal block.
             new_chunk = (remaining //
                          self.tokens_per_block) * self.tokens_per_block
-            if (new_chunk >= self.tokens_per_block
+            if (self.enable_chunked_prefill
+                    and new_chunk >= self.tokens_per_block
                     and new_chunk < req.context_chunk_size
                     and not self._has_mm_bidirectional_block(req)):
                 # Shrinking context_chunk_size flips is_last_context_chunk (a
