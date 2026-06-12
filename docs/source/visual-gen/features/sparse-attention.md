@@ -153,7 +153,9 @@ attention_config:
 
 ### CUDA Graphs
 
-`disabled_until_timestep` creates two sparse-attention phases when it is set: the high-timestep disabled phase and the enabled phase after the cutoff. VisualGen includes that phase in CUDA graph keys so graph capture does not reuse a graph across different Skip Softmax Attention settings.
+`disabled_until_timestep` creates two sparse-attention phases when it is set: the high-timestep disabled phase and the enabled phase after the cutoff. VisualGen includes that phase in CUDA graph keys so graph capture does not reuse a graph across different Skip Softmax Attention settings. See [VisualGen CUDA Graphs](cuda-graph.md) for the general capture and replay design.
+
+Graphs are captured lazily. The first denoising step seen for a given tensor shape and sparse-attention phase captures a graph; later steps with the same shape and phase replay that graph. When denoising crosses the cutoff, the phase key changes, so VisualGen captures a second graph for the enabled phase instead of replaying the graph from the disabled phase.
 
 ## Video Sparse Attention (VSA)
 

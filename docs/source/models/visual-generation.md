@@ -155,6 +155,10 @@ args = VisualGenArgs(
 )
 ```
 
+### CUDA Graphs
+
+VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See [VisualGen CUDA Graphs](../visual-gen/features/cuda-graph.md) for capture scope, graph keys, and sparse-attention phase behavior.
+
 ### Step Caching
 
 Both caching backends are configured through `VisualGenArgs.cache_config`. The backend is selected by the `cache_backend` discriminator field.
