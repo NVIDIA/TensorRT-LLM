@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,6 +86,10 @@ size_t TllmGenFmhaRunner::getTotalDeviceMemory() const
 {
     return mTotalDeviceMemory;
 }
+
+// Note: TllmGenFmhaRunner::probeKernelSelectionForTesting is defined inline
+// in fmhaRunner.h under #if TLLM_FMHA_TEST_HOOKS so production builds of
+// libtensorrt_llm.so do not export the test-only probe symbol.
 
 } // namespace kernels
 
