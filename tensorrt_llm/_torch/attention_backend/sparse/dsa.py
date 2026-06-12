@@ -2138,6 +2138,19 @@ class Indexer(nn.Module):
                 # avoids materializing a 2D contiguous tensor per call.
                 dsl_context_lens = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
+                # Wave-aware atom-split: the picker in `_pick_dsl_expand` caches
+                # (factor, atom) on metadata with invariant
+                # `factor * atom == 1 + max_draft_tokens` (the target/verify-time
+                # next_n). MTPEagle reuses the same metadata for its multi-step
+                # draft loop; after i=0 it mutates seq_lens to 1, so i≥1
+                # iterations run with next_n=1. The reshape
+                # `(num_gen, next_n, ...) -> (num_gen*factor, atom, ...)` is only
+                # valid when the caller actually supplies next_n == factor * atom
+                # tokens; gate here so i≥1 draft calls fall back to the
+                # kernel-native next_n=1 path.
+                dsl_atom_split = (metadata.dsl_expand_factor > 1
+                                  and next_n == metadata.dsl_expand_factor *
+                                  metadata.dsl_atom)
                 if self.use_fp4:
                     # FP4 DSL signature splits DG's (q, sf_q) tuple into two
                     # separate args and requires q.dtype == uint8 (q_decode
@@ -2151,16 +2164,7 @@ class Indexer(nn.Module):
                     dsl_q = q_decode.view(torch.uint8)
                     dsl_block_table = block_table
                     dsl_schedule_meta = metadata.scheduler_metadata_buffer
-
-                    # DSL FP4 kernel natively supports next_n ∈ {1, 2, 3}.
-                    # The wave-aware picker in `_pick_dsl_expand` is run
-                    # once per metadata prepare and the result cached on
-                    # `metadata.dsl_{expand_factor, atom}`. Trigger expand
-                    # whenever the picker decided to split (factor > 1),
-                    # regardless of next_n — this lets next_n ∈ {2, 3} also
-                    # benefit from atom-split when low-batch leaves SMs idle,
-                    # in addition to the mandatory next_n=4 case.
-                    if metadata.dsl_expand_factor > 1:
+                    if dsl_atom_split:
                         factor = metadata.dsl_expand_factor
                         eff_next_n = metadata.dsl_atom
                         exp_B = num_generations * factor
@@ -2180,16 +2184,14 @@ class Indexer(nn.Module):
                         max_seq_len)
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
-                    # Apply wave-aware atom-split when the picker decided to
-                    # split (factor > 1) — typically benefits small-batch /
-                    # low-ntask configs by raising SM utilization at the cost
-                    # of factor× KV HBM re-reads. Picker decision was cached
-                    # on metadata.{dsl_expand_factor, dsl_atom} during prepare.
+                    # Atom-split benefits small-batch / low-ntask configs by
+                    # raising SM utilization at the cost of factor× KV HBM
+                    # re-reads; guard logic shared via dsl_atom_split above.
                     dsl_q = q_decode
                     fp8_ctx_lens = dsl_context_lens
                     fp8_block_table = block_table
                     fp8_schedule_meta = metadata.scheduler_metadata_buffer
-                    if metadata.dsl_expand_factor > 1:
+                    if dsl_atom_split:
                         factor = metadata.dsl_expand_factor
                         atom = metadata.dsl_atom
                         exp_B = num_generations * factor
@@ -2652,26 +2654,25 @@ class DSACacheManager(KVCacheManager):
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
+        # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
         mem_per_token *= num_attention_layers * head_dim
 
-        # 1 for K, others for indexer K cache
-        head_dim_factor = (indexer_data_dim +
-                           index_head_dim // quant_block_size * 4) / head_dim
-        kv_factor = 1 + head_dim_factor
-        mem_per_token *= kv_factor
+        # Indexer K cache: physically allocated as raw UINT8 in
+        # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
+        # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
+        # the latent above). The data-portion byte count already reflects fp8 vs
+        # fp4 via indexer_data_dim.
+        indexer_bytes_per_token = num_attention_layers * (
+            indexer_data_dim + index_head_dim // quant_block_size * 4)
+        mem_per_token += indexer_bytes_per_token
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
         """Compute actual cache bytes per token from instance configuration."""
-        # self.kv_factor for K, others for indexer K cache.
-        # Under FP4 the indexer data portion is halved (two E2M1 codes per
-        # byte); scale bytes are unchanged.
-        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
-        head_dim_factor = (indexer_data_dim + self.index_head_dim //
-                           self.quant_block_size * 4) / self.head_dim
-        kv_factor = self.kv_factor + head_dim_factor
+        # MLA latent K cache: stored at the KV cache dtype (self.dtype). The
+        # indexer K cache is added separately below.
         cache_size_per_token = math.ceil(
-            kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
+            self.kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
                               DataType.FLOAT, DataType.NVFP4):
@@ -2684,4 +2685,15 @@ class DSACacheManager(KVCacheManager):
                 cache_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
+
+        # Indexer K cache: physically allocated as raw UINT8 in
+        # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
+        # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
+        # the latent above). Under FP4 the indexer data portion is halved (two
+        # E2M1 codes per byte); the scale bytes are unchanged.
+        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+        indexer_bytes_per_token = sum(self.num_kv_heads_per_layer) * (
+            indexer_data_dim + self.index_head_dim // self.quant_block_size * 4)
+        cache_size_bytes_per_token += indexer_bytes_per_token
+
         return cache_size_bytes_per_token

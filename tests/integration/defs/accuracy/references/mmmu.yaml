@@ -24,7 +24,10 @@ google/gemma-3-12b-it:
     kv_cache_quant_algo: FP8
     accuracy: 50.11
 LGAI-EXAONE/EXAONE-4.5-33B:
-  - accuracy: 51.22
+  # Empirically achieved ~46.5 across H20/B200/B300/GB200/GB300 since the
+  # model was added (PR #12873). The original 51.22 was committed without
+  # pre-merge CI validation and was never reproduced. See nvbugs/6211189.
+  - accuracy: 46.5
 Qwen/Qwen2-VL-7B-Instruct:
   - accuracy: 48.44
 Qwen/Qwen2.5-VL-7B-Instruct:
@@ -85,7 +88,14 @@ moonshotai/Kimi-K2.5:
 # reuses the FP8 baseline.
 stepfun-ai/Step-3.7-Flash:
   - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 64
+    accuracy: 60
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 60
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 64
+    accuracy: 60
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 60

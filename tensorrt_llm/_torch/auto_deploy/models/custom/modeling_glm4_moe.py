@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Slimmed down PyTorch GLM4 MoE model implementation for auto_deploy export.
+"""GLM4 MoE model (sharding IR).
 
 Source:
 https://huggingface.co/zai-org/GLM-4.7
@@ -109,9 +109,25 @@ class Glm4MoeRotaryEmbedding(nn.Module):
 
 
 class Glm4MoeMLP(nn.Module):
-    """MLP layer for GLM4 MoE (SwiGLU activation)."""
+    """MLP layer for GLM4 MoE (SwiGLU activation).
 
-    def __init__(self, config: Glm4MoeConfig, intermediate_size: Optional[int] = None):
+    When used as a shared expert inside MoE, ``add_all_reduce=False`` and
+    ``layer_type="moe"`` so the closing all_reduce is deferred to the merge
+    point and combined with the routed expert output.
+
+    Sharding strategy:
+      ``gate_proj`` / ``up_proj`` -> ``tp_mode="colwise"``.
+      ``down_proj`` -> ``tp_mode="rowwise"`` + ``all_reduce`` (deferred when
+      used as a shared expert).
+    """
+
+    def __init__(
+        self,
+        config: Glm4MoeConfig,
+        intermediate_size: Optional[int] = None,
+        add_all_reduce: bool = True,
+        layer_type: str = "mlp",
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size or config.intermediate_size
@@ -120,9 +136,34 @@ class Glm4MoeMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.add_all_reduce = add_all_reduce
+        self.layer_type = layer_type
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias,
+            tp_mode="colwise",
+            layer_type=self.layer_type,
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.up_proj.weight,
+            self.up_proj.bias,
+            tp_mode="colwise",
+            layer_type=self.layer_type,
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type=self.layer_type,
+        )
+        if self.add_all_reduce:
+            down = torch.ops.auto_deploy.all_reduce(down, layer_type=self.layer_type)
+        return down
 
 
 class Glm4MoeMoEGate(nn.Module):
@@ -171,7 +212,14 @@ class Glm4MoeMoEGate(nn.Module):
 
 
 class Glm4MoeMoE(nn.Module):
-    """Mixture of Experts layer for GLM4 MoE."""
+    """Mixture of Experts layer for GLM4 MoE.
+
+    Routed experts are dispatched via ``torch_moe`` (sharded by
+    ``apply_sharding_hints`` using ``layer_type="moe"``). The shared expert is a
+    TP-sharded MLP whose closing all_reduce is deferred so the routed and
+    shared partial sums can be combined with a single
+    ``all_reduce(layer_type="moe")`` at the merge point.
+    """
 
     def __init__(self, config: Glm4MoeConfig):
         super().__init__()
@@ -186,7 +234,10 @@ class Glm4MoeMoE(nn.Module):
         self._register_load_state_dict_pre_hook(self._unpack_packed_expert_weights)
         self.gate = Glm4MoeMoEGate(config)
         self.shared_experts = Glm4MoeMLP(
-            config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+            config,
+            intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            add_all_reduce=False,
+            layer_type="moe",
         )
 
     def _unpack_packed_expert_weights(self, state_dict, prefix, *args):
@@ -207,10 +258,16 @@ class Glm4MoeMoE(nn.Module):
             w3_weight=[expert.up_proj.weight for expert in self.experts],
             is_gated_mlp=True,
             act_fn=int(ActivationType.Silu),
+            layer_type="moe",
         )
 
         final_hidden_states = final_hidden_states.view(*orig_shape)
         final_hidden_states = final_hidden_states + self.shared_experts(identity)
+
+        # Single merge-point all_reduce for routed + shared partial sums.
+        final_hidden_states = torch.ops.auto_deploy.all_reduce(
+            final_hidden_states, layer_type="moe"
+        )
 
         return final_hidden_states
 
@@ -220,6 +277,15 @@ class Glm4MoeAttention(nn.Module):
 
     GLM4 MoE uses partial_rotary_factor=0.5, applying RoPE only to the first half
     of the head dimensions. It also supports optional per-head QK normalization.
+
+    Sharding strategy:
+      ``q_proj`` -> ``tp_mode="colwise"`` (sharded by ``num_heads``).
+      ``k_proj`` / ``v_proj`` -> ``tp_mode="colwise"`` with
+      ``tp_min_local_shape=head_dim`` (GQA-safe).
+      Q/K/V reshape -> ``auto_deploy.view`` with ``tp_scaled_dim=2`` (head
+      count dim scales with TP).
+      Post-attention reshape -> ``auto_deploy.view`` with ``tp_scaled_dim=2``.
+      ``o_proj`` -> ``tp_mode="rowwise"`` + ``all_reduce(layer_type="mha")``.
     """
 
     def __init__(self, config: Glm4MoeConfig, layer_idx: Optional[int] = None):
@@ -262,10 +328,49 @@ class Glm4MoeAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout)
-        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout).
+        # Head-count dim (2) scales with TP, so use auto_deploy.view.
+        q = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            layer_type="mha",
+        )
+        q = torch.ops.auto_deploy.view(
+            q,
+            [bsz, q_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.view(
+            k,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.view(
+            v,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         # Apply per-head Q/K normalization if enabled
         if self.use_qk_norm:
@@ -307,9 +412,22 @@ class Glm4MoeAttention(nn.Module):
             "bsnd",  # layout
         )
 
-        # Reshape [B, S, N, head_dim] -> [B, S, N * head_dim] and project
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
-        attn_output = self.o_proj(attn_output)
+        # Reshape [B, S, N, head_dim] -> [B, S, N * head_dim] and project.
+        # Collapsed dim scales with TP via num_heads.
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 
