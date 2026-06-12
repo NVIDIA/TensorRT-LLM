@@ -92,6 +92,53 @@ def test_super_mtp_smoke():
     assert len(prompts_and_outputs) == 1
 
 
+def test_deepseek_r1_mtp_smoke():
+    """Test one-model MTP/Eagle runtime with a tiny DeepSeek R1 target."""
+    test_prompt = "What is the capital of France?"
+    model_hub_id = "deepseek-ai/DeepSeek-R1"
+    model_path = hf_id_to_local_model_dir(model_hub_id)
+
+    experiment_config = get_small_model_config(
+        "deepseek-ai/DeepSeek-V3",
+        transforms={
+            "insert_cached_mla_attention": {"backend": "trtllm_mla"},
+            "fuse_rope_into_trtllm_mla": {"enabled": True},
+        },
+    )
+    experiment_config["args"]["model"] = model_path
+    experiment_config["args"]["runtime"] = "trtllm"
+    experiment_config["args"]["world_size"] = 1
+    experiment_config["args"]["speculative_config"] = MTPDecodingConfig(
+        max_draft_len=1,
+        mtp_eagle_one_model=True,
+        speculative_model=model_path,
+    )
+    experiment_config["args"]["speculative_model_kwargs"] = dict(
+        experiment_config["args"]["model_kwargs"]
+    )
+    experiment_config["args"]["disable_overlap_scheduler"] = False
+    experiment_config["args"]["compile_backend"] = "torch-cudagraph"
+    experiment_config["args"]["max_batch_size"] = 1
+    experiment_config["args"]["max_seq_len"] = 128
+    experiment_config["args"]["max_num_tokens"] = 128
+    experiment_config["args"]["cuda_graph_config"] = {"max_batch_size": 1}
+    experiment_config["prompt"]["batch_size"] = 1
+    experiment_config["prompt"]["queries"] = test_prompt
+
+    cfg = ExperimentConfig(**experiment_config)
+    cfg.prompt.sp_kwargs = {
+        "max_tokens": 8,
+        "top_k": None,
+        "temperature": 0.0,
+        "seed": 42,
+    }
+
+    results = main(cfg)
+
+    prompts_and_outputs = results["prompts_and_outputs"]
+    assert len(prompts_and_outputs) == 1
+
+
 def test_super_mtp_ssm_replay_smoke():
     """Smoke test: MTP Eagle one-model with flashinfer_ssm + ssm_replay=True compiles and runs.
 

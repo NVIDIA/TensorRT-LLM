@@ -151,7 +151,7 @@ class Quantization(BaseTransform):
                     skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
                 )
 
-            excluded = qcfg.get("exclude_modules", [])
+            excluded = _get_quantization_excludes(qcfg)
             cnt = 0
             for n in gm.graph.nodes:
                 if not is_linear_op(n):
@@ -331,6 +331,14 @@ class Quantization(BaseTransform):
         scale_values = [scales[scale_name] for scale_name in self.scale_names()]
         node.args = (*node.args, *scale_values)
         return True
+
+
+def _get_quantization_excludes(qcfg: Dict) -> List[str]:
+    """Return module exclusion patterns across supported HF quant config spellings."""
+    excludes = []
+    for key in ("exclude_modules", "modules_to_not_convert"):
+        excludes.extend(qcfg.get(key) or [])
+    return list(dict.fromkeys(excludes))
 
 
 @TransformRegistry.register("quantize_fp8_linear_from_config")
@@ -666,7 +674,7 @@ class FP8BMMQuantizationFromConfig(Quantization):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        excluded = qcfg.get("exclude_modules", [])
+        excluded = _get_quantization_excludes(qcfg)
         cnt = 0
 
         with WeightBiasInfoCache():
@@ -945,7 +953,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        excluded = qcfg.get("modules_to_not_convert", [])
+        excluded = _get_quantization_excludes(qcfg)
 
         cnt = 0
         with WeightBiasInfoCache():
