@@ -5733,11 +5733,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             enable_warp_parallel_reduce: bool,
             compress_ratio: int,
             return_output_values: bool,
+            cluster_size: int,
         ) -> None:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
                    num_threads_per_block, enable_warp_parallel_reduce,
-                   compress_ratio, return_output_values)
+                   compress_ratio, return_output_values, cluster_size)
             if key in cls.kernel_cache:
                 return
             n_rows = cute.sym_int()
@@ -5784,6 +5785,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 enable_warp_parallel_reduce=enable_warp_parallel_reduce,
                 compress_ratio=compress_ratio,
                 return_output_values=return_output_values,
+                cluster_size=cluster_size,
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -5808,6 +5810,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: int = 1,
             compress_ratio: int = 1,
             max_seq_len: Optional[int] = None,
+            cluster_size: Optional[int] = None,
         ) -> None:
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
@@ -5826,8 +5829,54 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # caller passes peak runtime N so the captured kernel selects
             # the large-N (T=1024, V=256) variant instead of the
             # capture-time-small-N variant.
-            N_dec = max_seq_len if max_seq_len is not None else logits.shape[1]
+            N_row = max_seq_len if max_seq_len is not None else logits.shape[1]
             num_sms = _get_num_sms()
+
+            # ---- cluster_size auto-dispatch (must run first) ----
+            # The cluster decision uses the FULL row length (cluster only
+            # pays for itself when the row is large enough to recoup the
+            # cluster sync + DSMEM gather overhead). Tuning on synth-data
+            # bundles (B200 SXM5, synth_comprehensive sweep 2026-06-10):
+            #   N < 64K              -> 1 (cluster sync unrecouped)
+            #   N >= 128K, BS <= 4   -> 8 (large N + tiny grid → 8-way
+            #                              parallel fits + wins up to 1.84x)
+            #   BS * 4 <= num_sms    -> 4 (single-wave for cs=4)
+            #   BS * 2 <= num_sms    -> 2 (single-wave for cs=2)
+            #   else                 -> 1 (multi-wave for any cs > 1 loses)
+            # Caller can pin a value (1..16); auto only when None.
+            if cluster_size is None:
+                if N_row < 65536:
+                    cluster_size = 1
+                elif num_rows <= 4 and N_row >= 131072:
+                    cluster_size = 8
+                elif num_rows * 4 <= num_sms:
+                    cluster_size = 4
+                elif num_rows * 2 <= num_sms:
+                    cluster_size = 2
+                else:
+                    cluster_size = 1
+
+            # Clamp to per-device hardware limit (per-GPC SM count). The
+            # kernel's __init__ validates against the absolute [1, 16] cap,
+            # but the actual launchable cluster size depends on GPC
+            # topology; pinning a value that exceeds it would fail at
+            # launch with a CUDA error. ``_query_max_cluster_size`` is
+            # lru_cache'd so the driver query runs once per process.
+            if cluster_size > 1:
+                hw_max_cluster = _query_max_cluster_size()
+                if cluster_size > hw_max_cluster:
+                    logger.warning_once(
+                        f"cute_dsl_gvr_topk_decode: cluster_size={cluster_size} "
+                        f"exceeds device max ({hw_max_cluster}); clamping.",
+                        key="cute_dsl_gvr_topk_decode_cluster_clamp",
+                    )
+                    cluster_size = hw_max_cluster
+
+            # Per-CTA effective scan length. With cluster_size > 1 each
+            # CTA only scans ``N_row // cluster_size`` of the row, so
+            # T / V / min_blocks heuristics below compare against the
+            # per-CTA work rather than the full row.
+            N_per_cta = N_row // cluster_size
 
             # Production tuning knobs (fixed across shapes).
             enable_unroll_4 = True
@@ -5836,21 +5885,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # ---- T (num_threads_per_block) + V (use_256bit_load) ----
             # T=1024 only when grid fits 1 CTA/SM and each thread has
-            # enough vec-loop work (N >= 65536). For half-prec under
-            # graph capture, raise the bar to 131072 so a small capture-N
-            # never forces T=1024 onto small-N replays (~14-16% regression).
+            # enough per-CTA vec-loop work (N_per_cta >= 65536). For
+            # half-prec under graph capture, raise the bar to 131072 so
+            # a small capture-N never forces T=1024 onto small-N replays
+            # (~14-16% regression).
             if max_seq_len is not None and logits.dtype != torch.float32:
                 n_thresh_t = 131072
             else:
                 n_thresh_t = 65536
-            num_threads_per_block = (1024 if (num_rows <= num_sms
-                                              and N_dec >= n_thresh_t) else 512)
-            # V=256-bit only for fp32 above N=16K. Half-prec cvt-to-fp32
-            # doubles fragment reg footprint and regresses 5-11% on K=512/1024.
-            # Caller contract: when this fires, ``logits.data_ptr()`` must
-            # be 32-byte aligned (satisfied by torch.empty() and row slices;
-            # column slices / stride-padded layouts may violate it).
-            use_256bit_load = (logits.dtype == torch.float32 and N_dec >= 16384)
+            num_threads_per_block = (1024 if
+                                     (num_rows <= num_sms
+                                      and N_per_cta >= n_thresh_t) else 512)
+            # V=256-bit only for fp32 above N=16K (per-CTA). Half-prec
+            # cvt-to-fp32 doubles fragment reg footprint and regresses
+            # 5-11% on K=512/1024. Caller contract: when this fires,
+            # ``logits.data_ptr()`` must be 32-byte aligned (satisfied by
+            # torch.empty() and row slices; column slices / stride-padded
+            # layouts may violate it).
+            use_256bit_load = (logits.dtype == torch.float32
+                               and N_per_cta >= 16384)
             if use_256bit_load:
                 ptr = logits.data_ptr()
                 assert ptr % 32 == 0, (
@@ -5870,14 +5923,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             vec_bits_host = 256 if use_256bit_load else 128
             vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32
                                            else 16)
-            n_vec_iters = max(1, N_dec // (num_threads_per_block * vec_w_host))
+            n_vec_iters = max(1,
+                              N_per_cta // (num_threads_per_block * vec_w_host))
             is_fp32 = logits.dtype == torch.float32
             if is_fp32:
                 if n_vec_iters < 4:
                     min_blocks_per_mp = 0
                 elif num_rows <= num_sms:
                     min_blocks_per_mp = 1
-                elif (num_sms * 2 < num_rows <= num_sms * 3 and N_dec <= 32768):
+                elif (num_sms * 2 < num_rows <= num_sms * 3
+                      and N_per_cta <= 32768):
                     # Wave-fit + latency-bound: mb=3 caps each CTA to fit
                     # all num_rows CTAs in a single wave. At N>=65K the
                     # kernel becomes bandwidth-bound and mb=2 wins.
@@ -5905,12 +5960,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 enable_warp_parallel_reduce,
                 compress_ratio,
                 return_output_values,
+                cluster_size,
             )
             key = (cute_dtype, top_k, next_n, enable_unroll_4,
                    enable_phase3_unroll, use_constant_hint, min_blocks_per_mp,
                    use_256bit_load, num_threads_per_block,
                    enable_warp_parallel_reduce, compress_ratio,
-                   return_output_values)
+                   return_output_values, cluster_size)
             # TVM FFI: pass raw torch tensors directly, env stream picked
             # up automatically (no from_dlpack, no stream argument).
             # ``output_values=None`` matches the kernel's compile-time
@@ -5930,6 +5986,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
+        cluster_size: Optional[int] = None,
     ) -> None:
         """CuTe DSL GVR (Guess-Verify-Refine) Top-K decode for Blackwell.
 
@@ -5951,6 +6008,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_seq_len: Graph-safe hint for peak ``logits.shape[1]`` at replay.
                 Pass under CUDA graph capture so the heuristic picks the
                 large-N kernel; leave ``None`` in eager mode.
+            cluster_size: Thread-block cluster size for the GVR kernel
+                (1 = single-CTA per row; 2/4/8 = N CTAs cooperatively
+                processing one row via DSMEM + cluster sync). ``None``
+                (default) delegates to the wrapper's auto-dispatch heuristic
+                based on (N, BS); pass an explicit int to pin the choice.
         """
         if not is_sm_100f():
             raise ValueError(
@@ -5991,6 +6053,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n=next_n,
             compress_ratio=compress_ratio,
             max_seq_len=max_seq_len,
+            cluster_size=cluster_size,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_decode")
@@ -6003,6 +6066,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
+        cluster_size: Optional[int] = None,
     ) -> None:
         return None
 
