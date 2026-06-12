@@ -104,6 +104,47 @@ def build_document(
     }
 
 
+def _post_to_opensearch(doc: dict, project: str) -> bool:
+    """POST one CBTS doc to OpenSearch via the stdlib.
+
+    report_cbts_decision.py always runs in the lightweight Setup Environment
+    pod, which ships python3 but not requests, so it posts with urllib instead
+    of OpenSearchDB.postToOpenSearchDB. Sends the Proxy-Authorization Basic
+    header the OpenSearch proxy expects (matching requests.auth.HTTPProxyAuth).
+    URL convention, credentials, and timeout come from open_search_db.
+    """
+    import base64
+    import urllib.error
+    import urllib.request
+
+    from open_search_db import (
+        OPEN_SEARCH_DB_BASE_URL,
+        OPEN_SEARCH_DB_PASSWORD,
+        OPEN_SEARCH_DB_USERNAME,
+        POST_TIMEOUT_SECONDS,
+    )
+
+    if not OPEN_SEARCH_DB_BASE_URL:
+        logger.info("OPEN_SEARCH_DB_BASE_URL is not set; skipping CBTS post")
+        return False
+    url = f"{OPEN_SEARCH_DB_BASE_URL}/dataflow2/{project}/posting"
+    headers = {"Content-Type": "application/json", "Accept-Charset": "UTF-8"}
+    if OPEN_SEARCH_DB_USERNAME and OPEN_SEARCH_DB_PASSWORD:
+        token = base64.b64encode(
+            f"{OPEN_SEARCH_DB_USERNAME}:{OPEN_SEARCH_DB_PASSWORD}".encode()
+        ).decode()
+        headers["Proxy-Authorization"] = f"Basic {token}"
+    req = urllib.request.Request(
+        url, data=json.dumps(doc).encode("utf-8"), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=POST_TIMEOUT_SECONDS) as resp:
+            return resp.status in (200, 201, 202)
+    except urllib.error.HTTPError as e:
+        logger.info("CBTS post HTTP %s: %s", e.code, e.read().decode("utf-8", "replace"))
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Post a CBTS decision to OpenSearch.")
     parser.add_argument(
@@ -114,8 +155,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", default=".", help="Repo root (for the case-rate counts).")
     args = parser.parse_args(argv)
 
-    # Lazy import: a missing dependency (e.g. requests) surfaces here and is
-    # caught by the __main__ guard, so telemetry never blocks CI.
+    # Lazy import: any failure surfaces here and is caught by the __main__
+    # guard, so telemetry never blocks CI. open_search_db imports cleanly
+    # without requests; only the constants and add_id_of_json are used here.
     from open_search_db import CBTS_PROJECT_NAME, OpenSearchDB
 
     decision = json.loads(Path(args.decision).read_text()) if args.decision else {}
@@ -127,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     doc = build_document(decision, args.status, args.reason, cbts_cases, total_cases)
     OpenSearchDB.add_id_of_json(doc)
-    ok = OpenSearchDB.postToOpenSearchDB(doc, CBTS_PROJECT_NAME)
+    ok = _post_to_opensearch(doc, CBTS_PROJECT_NAME)
     logger.info(
         "CBTS report %s: status=%s hit_stages=%d case_skip=%s (cbts %d / total %d)",
         "posted" if ok else "post returned False",

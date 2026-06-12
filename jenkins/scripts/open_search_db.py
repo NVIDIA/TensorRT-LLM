@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,8 +37,15 @@ import logging
 import os
 import time
 
-import requests
-from requests.auth import HTTPProxyAuth
+try:
+    import requests
+    from requests.auth import HTTPProxyAuth
+except ImportError:
+    # Lightweight CI pods (e.g. the Setup Environment pod) may not ship
+    # requests. Keep the module importable so requests-free callers can still
+    # use the constants and helpers; postToOpenSearchDB itself needs requests.
+    requests = None
+    HTTPProxyAuth = None
 
 PROJECT_ROOT = "swdl-trtllm-infra"
 MODE = "prod"
