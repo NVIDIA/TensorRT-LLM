@@ -20,6 +20,7 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+import os
 from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
 
 import torch
@@ -699,9 +700,54 @@ class RingAttention(AttentionBackend):
         self._out_buf = None
         self._lse_buf = None
 
-    def _ring_send_recv(self, send: torch.Tensor, recv: torch.Tensor) -> None:
-        """Post a non-blocking neighbor exchange. Even ranks send-then-recv to
-        avoid deadlock against odd ranks doing recv-then-send."""
+        # UB P2P buffers for Ring KV exchange (TRT-LLM UserBuffers one-sided push).
+        # Activated via TRTLLM_RING_TRANSPORT=ub (or auto when UB is initialized).
+        self._ub_send_buf = None
+        self._ub_recv_buf = None
+        self._ub_p2p_ready = False
+        ring_transport = os.environ.get("TRTLLM_RING_TRANSPORT", "auto")
+        if ring_transport in ("ub", "auto") and os.environ.get("TRTLLM_FORCE_NCCL_ALLREDUCE", "0") == "0":
+            try:
+                from tensorrt_llm.bindings.internal.userbuffers import (  # type: ignore
+                    ub_allocate, ub_is_initialized, ub_supported,
+                    userbuffers_send, userbuffers_recv,
+                )
+                if ub_supported() and ub_is_initialized():
+                    self._ub_p2p_ready = True
+                    self._ub_allocate = ub_allocate
+                    self._ub_send_fn = userbuffers_send
+                    self._ub_recv_fn = userbuffers_recv
+            except Exception:
+                pass
+
+        # NIXL P2P for Ring — single-sided RDMA READ, lower latency than NCCL isend/irecv.
+        # Activated via TRTLLM_RING_TRANSPORT=nixl (or auto when UB is not available).
+        self._nixl_ready = False
+        self._nixl_agent = None
+        self._nixl_prev_agent_name: str | None = None
+        self._nixl_prev_base_ptr: int | None = None
+        self._nixl_prev_device: int | None = None
+        self._nixl_kv_bufs_registered = False
+        self._nixl_status = None
+        if ring_transport == "nixl" or (ring_transport == "auto" and not self._ub_p2p_ready):
+            self._init_nixl_ring()
+
+    def _ring_send_recv(self, send: torch.Tensor, recv: torch.Tensor, cur: int = 0) -> None:
+        """Post a non-blocking neighbor exchange.
+
+        ``cur`` is the ping-pong slot index (0 or 1) used by the NIXL path to
+        compute the remote buffer offset.  Even ranks send-then-recv in the NCCL
+        path to avoid deadlock against odd ranks doing recv-then-send.
+
+        Transport priority: NIXL > UB > NCCL (set ``TRTLLM_RING_TRANSPORT`` to
+        override: ``nccl`` / ``ub`` / ``nixl`` / ``auto``).
+        """
+        if self._nixl_ready:
+            self._ring_send_recv_nixl(send, recv, cur)
+            return
+        if self._ub_p2p_ready:
+            self._ring_send_recv_ub(send, recv)
+            return
         if self._send_first:
             ops = [
                 dist.P2POp(dist.isend, send, self._send_rank, group=self.pg),
@@ -714,7 +760,122 @@ class RingAttention(AttentionBackend):
             ]
         self._p2p_reqs = dist.batch_isend_irecv(ops)
 
+    def _ring_send_recv_ub(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+        """UB-based P2P exchange: one-sided push to neighbor + spin-wait recv."""
+        nbytes = send.nbytes
+        if self._ub_send_buf is None or self._ub_send_buf.size < nbytes:
+            self._ub_send_buf = self._ub_allocate(nbytes)
+            self._ub_recv_buf = self._ub_allocate(nbytes)
+
+        import ctypes
+        send_view = torch.frombuffer(
+            (ctypes.c_byte * nbytes).from_address(self._ub_send_buf.addr),
+            dtype=send.dtype,
+        ).reshape(send.shape)
+        send_view.copy_(send.contiguous())
+
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+        self._ub_send_fn(
+            self._ub_send_buf.handle, 0, self._ub_recv_buf.handle, 0,
+            nbytes, self._send_rank, stream_ptr,
+        )
+        self._ub_recv_fn(
+            self._ub_send_buf.handle, 0, self._ub_recv_buf.handle, 0,
+            nbytes, self._recv_rank, stream_ptr,
+        )
+        torch.cuda.synchronize()
+
+        recv_view = torch.frombuffer(
+            (ctypes.c_byte * nbytes).from_address(self._ub_recv_buf.addr),
+            dtype=recv.dtype,
+        ).reshape(recv.shape)
+        recv.copy_(recv_view)
+
+    def _init_nixl_ring(self) -> None:
+        """Initialize NIXL agent and exchange descriptors with ring-group peers."""
+        try:
+            from tensorrt_llm._torch.disaggregation.nixl._agent_py import NixlTransferAgent
+        except ImportError:
+            return
+        try:
+            global_rank = dist.get_rank()
+            self._nixl_agent = NixlTransferAgent(
+                name=f"ring_rank_{global_rank}", use_prog_thread=True
+            )
+            local_desc = self._nixl_agent.get_local_agent_desc()
+            desc_tensor = torch.tensor(list(local_desc), dtype=torch.uint8).cuda()
+            desc_len = torch.tensor([len(local_desc)], dtype=torch.int64).cuda()
+            all_lens = [torch.zeros(1, dtype=torch.int64).cuda() for _ in range(self.world_size)]
+            dist.all_gather(all_lens, desc_len, group=self.pg)
+            max_len = int(max(int(l.item()) for l in all_lens))
+            padded = torch.zeros(max_len, dtype=torch.uint8).cuda()
+            padded[: len(local_desc)] = desc_tensor
+            all_descs = [torch.zeros(max_len, dtype=torch.uint8).cuda() for _ in range(self.world_size)]
+            dist.all_gather(all_descs, padded, group=self.pg)
+            ring_rank = dist.get_rank(group=self.pg)
+            prev_ring_rank = (ring_rank - 1) % self.world_size
+            prev_global_rank = dist.get_global_rank(self.pg, prev_ring_rank)
+            prev_len = int(all_lens[prev_ring_rank].item())
+            prev_desc = bytes(all_descs[prev_ring_rank][:prev_len].cpu().tolist())
+            self._nixl_prev_agent_name = f"ring_rank_{prev_global_rank}"
+            self._nixl_agent.load_remote_agent(self._nixl_prev_agent_name, prev_desc)
+            self._nixl_ready = True
+        except Exception:
+            self._nixl_agent = None
+
+    def _nixl_register_kv_bufs(self) -> None:
+        """Register the kv_bufs VRAM region with NIXL and all-gather base pointers."""
+        from tensorrt_llm._torch.disaggregation.base.agent import RegMemoryDescs
+        kv = self._kv_bufs
+        device_id = torch.cuda.current_device()
+        reg = RegMemoryDescs(type="VRAM", descs=[(kv.data_ptr(), kv.nbytes, device_id, "")])
+        self._nixl_agent.register_memory(reg)
+        info = torch.tensor([kv.data_ptr(), kv.nbytes, device_id], dtype=torch.int64).cuda()
+        all_info = [torch.zeros(3, dtype=torch.int64).cuda() for _ in range(self.world_size)]
+        dist.all_gather(all_info, info, group=self.pg)
+        ring_rank = dist.get_rank(group=self.pg)
+        prev_ring_rank = (ring_rank - 1) % self.world_size
+        prev = all_info[prev_ring_rank]
+        self._nixl_prev_base_ptr = int(prev[0].item())
+        self._nixl_prev_device = int(prev[2].item())
+        self._nixl_kv_bufs_registered = True
+
+    def _ring_send_recv_nixl(self, send: torch.Tensor, recv: torch.Tensor, cur: int) -> None:
+        """NIXL P2P: READ the previous rank's kv_bufs[cur] slot into local recv buffer.
+
+        Uses a barrier to guarantee the remote send buffer is populated before
+        the READ is submitted.  Stream-event synchronization can replace the
+        barrier once correctness is confirmed in production.
+        """
+        from tensorrt_llm._torch.disaggregation.base.agent import MemoryDescs, TransferRequest
+
+        torch.cuda.current_stream().synchronize()
+        dist.barrier(group=self.pg)
+
+        slot_bytes = send.nbytes
+        remote_src_ptr = self._nixl_prev_base_ptr + cur * slot_bytes
+        local_dst_ptr = recv.data_ptr()
+        device_id = torch.cuda.current_device()
+
+        src = MemoryDescs("VRAM", [(remote_src_ptr, slot_bytes, self._nixl_prev_device)])
+        dst = MemoryDescs("VRAM", [(local_dst_ptr, slot_bytes, device_id)])
+        req = TransferRequest(
+            op="READ",
+            src_descs=src,
+            dst_descs=dst,
+            remote_name=self._nixl_prev_agent_name,
+        )
+        self._nixl_status = self._nixl_agent.submit_transfer_requests(req)
+
     def _ring_wait(self) -> None:
+        if self._nixl_ready:
+            if self._nixl_status is not None:
+                self._nixl_status.wait()
+                self._nixl_status = None
+            torch.cuda.synchronize()
+            return
+        if self._ub_p2p_ready:
+            return  # UB kernels synchronize internally
         for r in self._p2p_reqs:
             r.wait()
         self._p2p_reqs.clear()
@@ -731,6 +892,12 @@ class RingAttention(AttentionBackend):
         self._out_buf = q.new_empty(B, S, H, D, dtype=torch.float32)
         self._lse_buf = q.new_empty(B, S, H, dtype=torch.float32)
         self._buf_key = key
+        # Re-register kv_bufs with NIXL whenever the shape (and thus the buffer
+        # address) changes — lazily deferred from __init__ because the shape is
+        # not known until the first forward call.
+        if self._nixl_ready:
+            self._nixl_kv_bufs_registered = False
+            self._nixl_register_kv_bufs()
 
     def _update_out_and_lse(
         self,
@@ -773,7 +940,7 @@ class RingAttention(AttentionBackend):
         for step in range(self.world_size):
             cur, nxt = step % 2, 1 - step % 2
             if step < self.world_size - 1:
-                self._ring_send_recv(kv_bufs[cur], kv_bufs[nxt])
+                self._ring_send_recv(kv_bufs[cur], kv_bufs[nxt], cur)
             block_out, block_lse_bh = self.inner.forward_with_lse(
                 q=q,
                 k=kv_bufs[cur, 0],
