@@ -2776,41 +2776,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         runtime.total_embeds_in_request = int(embed_mask_cumsum[-1])
         return context_ids[runtime.past_seen_token_num : runtime.chunk_end_pos]
 
-    @staticmethod
-    def _validate_evs_context_batch(
-        ctx_params: List[MultimodalParams],
-        num_context_requests: int,
-    ) -> None:
-        """Reject EVS video mixed with text-only context requests.
-
-        Args:
-            ctx_params: Multimodal params associated with current context
-                requests. Today this list contains only context requests with
-                multimodal content.
-            num_context_requests: Total number of current context requests in
-                the flattened forward batch, including text-only requests.
-
-        Raises:
-            ValueError: If an EVS video context is batched together with a
-                text-only context request.
-        """
-        has_video = any(
-            param.has_content() and param.multimodal_data.get("modality_type") == "video"
-            for param in ctx_params
-        )
-        has_text_only_context = len(ctx_params) < num_context_requests or any(
-            not param.has_content() for param in ctx_params
-        )
-        if has_video and has_text_only_context:
-            # TODO(TRTLLM-12534): Remove this guard once merge_evs_mm_embeds writes each
-            # multimodal context chunk using its flattened input_ids offset
-            # instead of assuming a contiguous multimodal prefix.
-            raise ValueError(
-                "EVS video requests cannot be inflight-batched with text-only "
-                "context requests yet. merge_evs_mm_embeds currently assumes "
-                "multimodal context chunks form a contiguous input_ids prefix."
-            )
-
     def _check_encoders_exist(self, raw_ctx_params: List[MultimodalParams]) -> None:
         """Check encoders needed by raw inputs exist.
 
@@ -2882,24 +2847,29 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         if not context_parts:
             return input_ids
-        context_ids = torch.cat(context_parts, dim=0)
-        # -> [num_tokens, ]
 
-        # Special handling for inflight-batching.
-        # Assume input ids format is [context_ids, generation_ids].
-        # Under chunked prefill, multimodal_runtime narrows context_ids to the current
-        # context chunk so decode ids after it are preserved.
-        if context_ids.shape[0] > input_ids.shape[0]:
-            raise ValueError(
-                "EVS-adjusted context length "
-                f"({context_ids.shape[0]}) exceeds input_ids length "
-                f"({input_ids.shape[0]}). This usually means a chunked "
-                "multimodal request reached merge_evs_mm_embeds without "
-                "multimodal_runtime metadata."
-            )
-        context_ids = context_ids.to(device=input_ids.device, dtype=input_ids.dtype)
-        input_ids[: context_ids.shape[0]] = context_ids
-        del context_ids
+        # Write each request's EVS-adjusted token IDs into its own span of the
+        # flattened input_ids. Multimodal context requests are not necessarily a
+        # contiguous prefix: text-only context requests carry no multimodal_params
+        # (so they never appear here) yet still occupy input_ids, and they may
+        # precede or sit between multimodal ones. Each write therefore starts at
+        # the request's recorded flattened offset. The merge is length-preserving
+        # (the slot was pre-sized to the post-EVS retained count), so every span
+        # ends exactly where the next request begins and `input_ids` is never
+        # grown. Under chunked prefill, multimodal_runtime narrows each context
+        # part to the current chunk so decode ids after it are preserved.
+        for multimodal_param, context_part in zip(multimodal_params, context_parts, strict=True):
+            start = multimodal_param.input_ids_start_offset
+            end = start + context_part.shape[0]
+            if not (0 <= start <= end <= input_ids.shape[0]):
+                raise ValueError(
+                    f"EVS-adjusted context span [{start}, {end}) is invalid for "
+                    f"input_ids of length {input_ids.shape[0]} (expected "
+                    "0 <= start <= end <= length). This usually means an incorrect "
+                    "input_ids_start_offset, or a chunked multimodal request reached "
+                    "merge_evs_mm_embeds without multimodal_runtime metadata."
+                )
+            input_ids[start:end] = context_part.to(device=input_ids.device, dtype=input_ids.dtype)
 
         return input_ids
 
@@ -3142,8 +3112,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         mm_embedding = []
         if len(multimodal_params) > 0:
             ctx_params = multimodal_params[:num_context_requests]
-            if self.video_pruning_rate > 0:
-                self._validate_evs_context_batch(ctx_params, num_context_requests)
             raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
             # Raw image/video/audio tensors: run local encoder.
             if raw_ctx_params:
