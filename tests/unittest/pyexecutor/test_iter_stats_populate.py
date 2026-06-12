@@ -98,10 +98,17 @@ class _StubRequest:
 
 
 class _StubScheduledBatch:
-    def __init__(self, context_reqs=None, gen_reqs=None, paused_reqs=None):
+    def __init__(
+        self,
+        context_reqs=None,
+        gen_reqs=None,
+        paused_reqs=None,
+        recompute_paused_reqs=None,
+    ):
         self.context_requests = list(context_reqs or [])
         self.generation_requests = list(gen_reqs or [])
         self.paused_requests = list(paused_reqs or [])
+        self.recompute_paused_requests = list(recompute_paused_reqs or [])
 
     @property
     def num_context_requests(self):
@@ -173,6 +180,7 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
+    fake._is_stats_dummy_request.side_effect = lambda req: bool(getattr(req, "is_dummy", False))
     return fake
 
 
@@ -400,10 +408,15 @@ def test_paused_decode_requests():
         _StubRequest(num_tokens=300),
         _StubRequest(num_tokens=800),
     ]
-    stats = _invoke_update_iter_stats(_StubScheduledBatch(paused_reqs=paused), [], num_ctx_tokens=0)
+    recompute_paused = [_StubRequest(num_tokens=700)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(paused_reqs=paused, recompute_paused_reqs=recompute_paused),
+        [],
+        num_ctx_tokens=0,
+    )
     ifb = stats.inflight_batching_stats
-    assert ifb.num_paused_requests == 2
-    assert ifb.num_paused_kv_tokens == 1100
+    assert ifb.num_paused_requests == 3
+    assert ifb.num_paused_kv_tokens == 1800
 
 
 def test_dummy_filtering_on_kv_token_fields():
