@@ -873,6 +873,89 @@ if IS_MEGAMOE_OP_AVAILABLE:
         _MEGAMOE_SYMM_PROVIDER_CACHE[cache_key] = provider
         return provider
 
+    # ---- AutoTuner profiling scratch (symmetric, transient) ---------------
+    # The fused kernel uses a SINGLE ``peer_rank_ptr_mapper`` (one
+    # ``peer_offsets``) for every cross-rank access, so ALL cross-rank tensors
+    # -- activation / activation_sf / topk_weights / combine_output AND the
+    # shared_workspace -- must live in one symmetric allocation at a consistent
+    # per-rank offset. During the real run the backend supplies the staging
+    # symmetric buffer; but the AutoTuner regenerates the data inputs as fresh
+    # NON-symmetric tensors for each profile, which makes the peer mapping point
+    # outside any symmetric region (illegal memory access, multi-rank only).
+    # We therefore profile against a SEPARATE symmetric scratch buffer (a full
+    # MegaMoeSymmMemProvider with its own peer_offsets) so the real staging
+    # buffer is never corrupted. The scratch is shared across MoE layers with
+    # the same layout (one buffer per shape) and released after warmup via
+    # ``release_megamoe_profiling_scratch()``.
+    _MEGAMOE_PROFILING_SCRATCH_CACHE: dict = {}
+    _ACTIVE_MEGAMOE_PROFILING_SCRATCH = None
+
+    def get_megamoe_profiling_scratch(
+        *,
+        process_group,
+        world_size: int,
+        rank: int,
+        hidden_size: int,
+        max_tokens_per_rank: int,
+        num_topk: int,
+        output_dtype: torch.dtype,
+        shared_workspace_bytes: int,
+        in_kernel_fc2_reduce: bool = False,
+    ):
+        """Return a cached, transient symmetric scratch provider used ONLY for
+        AutoTuner profiling. ``None`` for single-rank (no cross-rank exchange).
+        Shares one buffer across layers with the same layout; freed by
+        :func:`release_megamoe_profiling_scratch`.
+        """
+        if int(world_size) <= 1:
+            return None
+        if not hasattr(process_group, "group_name"):
+            raise RuntimeError(
+                "get_megamoe_profiling_scratch requires a ProcessGroup with "
+                ".group_name (mapping.moe_ep_group_pg)."
+            )
+        cache_key = (
+            str(process_group.group_name),
+            int(hidden_size),
+            int(max_tokens_per_rank),
+            int(num_topk),
+            str(output_dtype),
+            int(shared_workspace_bytes),
+            bool(in_kernel_fc2_reduce),
+        )
+        cached = _MEGAMOE_PROFILING_SCRATCH_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        provider = MegaMoeSymmMemProvider(
+            process_group=process_group,
+            world_size=world_size,
+            rank=rank,
+            hidden_size=hidden_size,
+            max_tokens_per_rank=max_tokens_per_rank,
+            num_topk=num_topk,
+            output_dtype=output_dtype,
+            shared_workspace_bytes=shared_workspace_bytes,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        )
+        _MEGAMOE_PROFILING_SCRATCH_CACHE[cache_key] = provider
+        return provider
+
+    def set_active_megamoe_profiling_scratch(regions) -> None:
+        """Set (``None`` clears) the :class:`MegaMoeSymmRegions` the MegaMoE op
+        uses for AutoTuner profiling on the current call. The backend sets this
+        around the op invocation; the op consumes it inside ``choose_one``.
+        """
+        global _ACTIVE_MEGAMOE_PROFILING_SCRATCH
+        _ACTIVE_MEGAMOE_PROFILING_SCRATCH = regions
+
+    def release_megamoe_profiling_scratch() -> None:
+        """Free all profiling-scratch symmetric buffers. Call after warmup once
+        tuning is done; profiling re-allocates lazily if it runs again.
+        """
+        global _ACTIVE_MEGAMOE_PROFILING_SCRATCH
+        _ACTIVE_MEGAMOE_PROFILING_SCRATCH = None
+        _MEGAMOE_PROFILING_SCRATCH_CACHE.clear()
+
     def query_megamoe_shared_workspace_bytes(
         *,
         world_size: int,
@@ -1038,6 +1121,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # form-A and form-B get independent compile / workspace caches.
             self.apply_topk_in_fc1 = bool(apply_topk_in_fc1)
             self.gate_up_clamp = None if gate_up_clamp is None else float(gate_up_clamp)
+            # Per-call AutoTuner profiling scratch (symmetric ``MegaMoeSymmRegions``)
+            # set by the op around ``choose_one`` so the profiling pre-hook routes
+            # the cross-rank inputs through a symmetric scratch buffer instead of
+            # the AutoTuner's fresh non-symmetric tensors. ``None`` outside tuning
+            # and for the single-rank degenerate path.
+            self._profiling_scratch = None
             self.in_kernel_fc2_reduce = bool(in_kernel_fc2_reduce)
 
         def unique_id(self):
@@ -1093,6 +1182,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
             if total_experts <= 0:
                 return inputs
 
+            # topk_idx (inputs[2]) is consumed LOCALLY (not peer-mapped), so it
+            # stays a regenerated tensor; just make the fake ids a valid
+            # round-robin so they never index OOB into the expert tables.
             topk_idx = inputs[2]
             if isinstance(topk_idx, torch.Tensor) and topk_idx.dim() == 2:
                 T, K = topk_idx.shape
@@ -1106,6 +1198,36 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 ).view(T, K)
                 topk_idx.copy_(valid)
 
+            scratch = self._profiling_scratch
+            if scratch is not None:
+                # Multi-rank profiling: route the CROSS-RANK inputs through the
+                # symmetric scratch buffer (sliced to the regenerated token
+                # count) so the kernel's single peer_rank_ptr_mapper resolves to
+                # a valid symmetric region. The AutoTuner's fresh non-symmetric
+                # tensors are discarded for these indices; the staging buffer is
+                # never touched. Fake values mirror the legacy sanitizer
+                # (round-robin topk above, SF/weights == 1.0) so the GEMM does
+                # NaN-free, representative work.
+                m = int(inputs[0].shape[0])
+                act = scratch.activation[:m]
+                act.copy_(inputs[0].view(torch.uint8))
+                inputs[0] = act.view(inputs[0].dtype)
+
+                sf = scratch.activation_sf[:m]
+                sf.fill_(0x38)  # raw byte == FP8 1.0
+                inputs[1] = sf if inputs[1].dtype == torch.uint8 else sf.view(inputs[1].dtype)
+
+                w = scratch.topk_weights[:m]
+                w.fill_(1.0)
+                inputs[3] = w
+
+                comb = scratch.combine_output[:m]
+                comb.zero_()  # form-B accumulates onto live rows; form-A overwrites
+                inputs[11] = comb
+                return inputs
+
+            # Single-rank / scratch-disabled (legacy path; no symmetric
+            # requirement): sanitize the regenerated tensors in place.
             # inputs[1] is already float8_e4m3fn, where fill_(1.0) writes the
             # FP8 value 1.0 (byte 0x38); the uint8 fallback writes that raw byte
             # directly (do NOT fill_(0x38) on the FP8 view -- that is 56.0).
@@ -1592,14 +1714,32 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_output,
         ]
         tuner = AutoTuner.get()
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
-            [runner],
-            runner.get_tuning_config(),
-            inputs,
-            peer_offsets=peer_offsets,
-            shared_workspace=shared_workspace,
-        )
+        # AutoTuner profiling must use a SYMMETRIC buffer for the cross-rank
+        # inputs. The backend hands off a transient symmetric scratch (its own
+        # peer_offsets + shared_workspace); the profiling pre-hook routes the
+        # cross-rank inputs through it so the real staging buffer is never
+        # corrupted. Single-rank / no-scratch falls back to the staging buffer.
+        prof_scratch = _ACTIVE_MEGAMOE_PROFILING_SCRATCH if world_size > 1 else None
+        if prof_scratch is not None:
+            runner._profiling_scratch = prof_scratch
+            prof_peer_offsets = list(prof_scratch.peer_offsets)
+            prof_shared_workspace = prof_scratch.shared_workspace
+        else:
+            runner._profiling_scratch = None
+            prof_peer_offsets = peer_offsets
+            prof_shared_workspace = shared_workspace
+        try:
+            _, best_tactic = tuner.choose_one(
+                "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
+                [runner],
+                runner.get_tuning_config(),
+                inputs,
+                peer_offsets=prof_peer_offsets,
+                shared_workspace=prof_shared_workspace,
+            )
+        finally:
+            runner._profiling_scratch = None
+        # Real run always uses the caller's staging buffer + peer_offsets.
         runner(
             inputs,
             tactic=best_tactic,
