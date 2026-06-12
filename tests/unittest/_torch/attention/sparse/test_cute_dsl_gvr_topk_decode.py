@@ -13,21 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
+import os
+import sys
 
-import cutlass
-import cutlass.cute as cute
 import pytest
 import torch
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
-from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import _TORCH_TO_CUTLASS_DTYPE
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import (
-    GvrTopKLBKernel,
-    GvrTopKLBPrepareKernel,
-)
 from tensorrt_llm._utils import get_sm_version
+
+# Standalone LB wrappers live in run_gvr_topk.py alongside the single-CTA
+# wrapper so tests and bench scripts share the same compile-time caching.
+_RUN_GVR_DIR = os.path.join(
+    os.path.dirname(
+        os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        )
+    ),
+    "tests",
+    "scripts",
+    "cute_dsl_kernels",
+    "top_k",
+)
+if _RUN_GVR_DIR not in sys.path:
+    sys.path.insert(0, _RUN_GVR_DIR)
+from run_gvr_topk import gvr_topk_lb_decode, gvr_topk_lb_prepare  # noqa: E402
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
@@ -302,158 +312,6 @@ def test_cute_dsl_gvr_topk_decode(
 # ===========================================================================
 
 
-@functools.lru_cache(maxsize=None)
-def _compile_prepare(batch_size: int, max_batch_size: int, long_threshold: int):
-    """Compile prepare kernel.
-
-    - ``batch_size``: compile-time fake_seq shape == runtime seq_lens
-      shape (drives shape match at TVM-FFI marshalling). Each unique
-      value triggers a separate compile.
-    - ``max_batch_size``: kernel block size + ``order_row`` buffer
-      length. Must be a power of two >= 64 (block_prefix_sum_kernel
-      cap) and >= batch_size so threads with ``tidx < batch_size``
-      cover every request slot.
-    """
-    prep = GvrTopKLBPrepareKernel(long_threshold=long_threshold, num_threads=max_batch_size)
-    fake_seq = make_fake_compact_tensor(cutlass.Int32, (batch_size,), stride_order=(0,))
-    fake_order = make_fake_compact_tensor(cutlass.Int32, (max_batch_size,), stride_order=(0,))
-    fake_ctr = make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,))
-    fake_stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(
-        prep,
-        fake_seq,
-        fake_order,
-        fake_ctr,
-        cutlass.Int32(0),
-        stream=fake_stream,
-        options="--enable-tvm-ffi",
-    )
-
-
-def _run_lb_prepare(seq_lens: torch.Tensor, max_batch_size: int, long_threshold: int):
-    """Run prepare kernel directly on the actual seq_lens (no padding).
-
-    ``seq_lens`` keeps its actual shape ``(batch_size,)`` — the prepare
-    kernel is compiled with fake_seq matching this exact shape (see
-    ``_compile_prepare``), so TVM-FFI marshalling is happy. The kernel
-    internally reads ``seq_lens[tidx]`` only under ``tidx < batch_size``.
-    """
-    batch_size = seq_lens.shape[0]
-    order_row = torch.full((max_batch_size,), -1, dtype=torch.int32, device="cuda")
-    counters = torch.zeros(2, dtype=torch.int32, device="cuda")
-
-    compiled = _compile_prepare(batch_size, max_batch_size, long_threshold)
-    compiled(seq_lens, order_row, counters, cutlass.Int32(batch_size))
-    return order_row, counters
-
-
-@functools.lru_cache(maxsize=None)
-def _compile_lb(
-    dtype: torch.dtype,
-    top_k: int,
-    next_n: int,
-    num_rows: int,
-    N: int,
-    compress_ratio: int,
-    max_batch_size: int,
-    long_threshold: int,
-):
-    """Compile the LB main kernel.
-
-    - ``num_rows`` baked in via fake_logits/fake_pre_idx/fake_out (each
-      unique value triggers a separate compile). ``seq_lens`` fake shape
-      uses ``n_groups = num_rows // next_n`` so runtime can pass the
-      actual seq_lens without padding.
-    - ``max_batch_size`` drives the grid (``* next_n * cluster_size``)
-      and the ``order_row`` buffer length so CUDA Graph capture sees a
-      fixed shape regardless of how many rows are actually long/short
-      at runtime.
-    """
-    cute_dtype = _TORCH_TO_CUTLASS_DTYPE[dtype]
-    kernel = GvrTopKLBKernel(
-        dtype=cute_dtype,
-        top_k=top_k,
-        next_n=next_n,
-        num_threads=512,
-        compress_ratio=compress_ratio,
-        return_output_values=False,
-        long_threshold=long_threshold,
-        max_batch_size=max_batch_size,
-    )
-    n_groups = num_rows // next_n
-    fake_logits = make_fake_compact_tensor(
-        cute_dtype, (num_rows, N), stride_order=(1, 0), assumed_align=16
-    )
-    fake_pre_idx = make_fake_compact_tensor(
-        cutlass.Int32, (n_groups, top_k), stride_order=(1, 0), assumed_align=16
-    )
-    fake_seq = make_fake_compact_tensor(cutlass.Int32, (n_groups,), stride_order=(0,))
-    fake_out = make_fake_compact_tensor(
-        cutlass.Int32, (num_rows, top_k), stride_order=(1, 0), assumed_align=16
-    )
-    fake_order = make_fake_compact_tensor(cutlass.Int32, (max_batch_size,), stride_order=(0,))
-    fake_ctr = make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,))
-    fake_stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(
-        kernel,
-        fake_logits,
-        fake_pre_idx,
-        fake_seq,
-        None,
-        fake_out,
-        fake_order,
-        fake_ctr,
-        stream=fake_stream,
-        options="--enable-tvm-ffi",
-    )
-
-
-def _run_lb(
-    logits: torch.Tensor,
-    pre_idx: torch.Tensor,
-    seq_lens: torch.Tensor,
-    order_row: torch.Tensor,
-    counters: torch.Tensor,
-    top_k: int,
-    next_n: int,
-    compress_ratio: int = 1,
-    max_batch_size: int = 1024,
-    long_threshold: int = 64 * 1024,
-) -> torch.Tensor:
-    """Run the LB main kernel only — mirrors the production op contract.
-
-    Caller is responsible for populating ``order_row`` and ``counters``
-    via :func:`_run_lb_prepare` once per decode step (the metadata is
-    invariant across the per-layer GVR Top-K calls within one step).
-    Returns the freshly-allocated ``output_indices`` tensor for the
-    correctness check.
-    """
-    num_rows = logits.shape[0]
-    N = logits.shape[1]
-    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
-
-    compiled = _compile_lb(
-        logits.dtype,
-        top_k,
-        next_n,
-        num_rows,
-        N,
-        compress_ratio,
-        max_batch_size,
-        long_threshold,
-    )
-    compiled(
-        logits,
-        pre_idx,
-        seq_lens,
-        None,
-        out_indices,
-        order_row,
-        counters,
-    )
-    return out_indices
-
-
 @skip_not_sm100
 @pytest.mark.parametrize("B", [1, 8, 32, 128, 256, 1024])
 @pytest.mark.parametrize(
@@ -482,7 +340,7 @@ def test_lb_prepare_partition(B, ratio):
     ref_n_short = B - ref_n_long
 
     max_batch_size = 1024
-    order_row, counters = _run_lb_prepare(seq_lens, max_batch_size, long_threshold)
+    order_row, counters = gvr_topk_lb_prepare(seq_lens, max_batch_size, long_threshold)
     n_long = int(counters[0].item())
     n_short = int(counters[1].item())
     assert n_long == ref_n_long, f"n_long mismatch: {n_long} vs {ref_n_long}"
@@ -543,8 +401,8 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size):
 
     max_batch_size = 1024
     long_threshold = 64 * 1024
-    order_row, counters = _run_lb_prepare(seq_lens, max_batch_size, long_threshold)
-    out_indices = _run_lb(
+    order_row, counters = gvr_topk_lb_prepare(seq_lens, max_batch_size, long_threshold)
+    _, out_indices = gvr_topk_lb_decode(
         logits,
         pre_idx,
         seq_lens,
@@ -615,8 +473,8 @@ def test_lb_vs_reference(
     )
     max_batch_size = 1024
     long_threshold = 64 * 1024
-    order_row, counters = _run_lb_prepare(seq_lens, max_batch_size, long_threshold)
-    out_indices = _run_lb(
+    order_row, counters = gvr_topk_lb_prepare(seq_lens, max_batch_size, long_threshold)
+    _, out_indices = gvr_topk_lb_decode(
         logits,
         pre_idx,
         seq_lens,

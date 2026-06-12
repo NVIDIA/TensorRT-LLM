@@ -267,6 +267,213 @@ def gvr_topk_decode(
         return None, out_indices
 
 
+# ---- Load-Balance (Idea C) wrappers ----------------------------------------
+try:
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import (
+        GvrTopKLBKernel,
+        GvrTopKLBPrepareKernel,
+    )
+except (ModuleNotFoundError, ImportError):
+    from blackwell.top_k.gvr_topk_decode_load_balance import (  # type: ignore[no-redef]
+        GvrTopKLBKernel,
+        GvrTopKLBPrepareKernel,
+    )
+
+
+@functools.cache
+def _compile_lb_prepare(num_threads: int, batch_size: int, long_threshold: int):
+    """JIT-compile the LB prepare kernel for a specific triple.
+
+    Specialized over ``(num_threads, batch_size, threshold)``.
+
+    ``num_threads`` = kernel block size + ``order_row`` length.
+    ``batch_size``  = compile-time seq_lens shape (must equal runtime
+                      ``seq_lens.shape[0]`` for TVM-FFI marshalling).
+    """
+    prep = GvrTopKLBPrepareKernel(long_threshold=long_threshold, num_threads=num_threads)
+    fake_seq = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (batch_size,), stride_order=(0,)
+    )
+    fake_order = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (num_threads,), stride_order=(0,)
+    )
+    fake_ctr = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,))
+    fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        prep,
+        fake_seq,
+        fake_order,
+        fake_ctr,
+        cutlass.Int32(0),
+        stream=fake_stream,
+        options="--enable-tvm-ffi",
+    )
+
+
+def gvr_topk_lb_prepare(
+    seq_lens: torch.Tensor,
+    max_batch_size: int = 1024,
+    long_threshold: int = 64 * 1024,
+    order_row: Optional[torch.Tensor] = None,
+    counters: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the LB prepare kernel.
+
+    ``seq_lens`` keeps its actual shape ``(batch_size,)`` — the kernel
+    is compiled to match that exact shape; ``max_batch_size`` only
+    determines the prepare kernel's block size and the ``order_row``
+    buffer length. Returns ``(order_row, counters)`` which the caller
+    feeds into :func:`gvr_topk_lb_decode` for every per-layer Top-K
+    call within the same decode step.
+    """
+    assert seq_lens.is_cuda and seq_lens.dtype == torch.int32
+    batch_size = seq_lens.shape[0]
+    if order_row is None:
+        order_row = torch.full((max_batch_size,), -1, dtype=torch.int32, device=seq_lens.device)
+    if counters is None:
+        counters = torch.zeros(2, dtype=torch.int32, device=seq_lens.device)
+
+    compiled = _compile_lb_prepare(max_batch_size, batch_size, long_threshold)
+    compiled(seq_lens, order_row, counters, cutlass.Int32(batch_size))
+    return order_row, counters
+
+
+@functools.cache
+def _compile_lb(
+    cute_dtype,
+    top_k: int,
+    next_n: int,
+    num_rows: int,
+    N: int,
+    compress_ratio: int,
+    max_batch_size: int,
+    long_threshold: int,
+    num_threads: int,
+    cluster_size: int,
+    return_output_values: bool,
+):
+    """JIT-compile the LB main kernel.
+
+    ``num_rows`` baked in via fake tensors; ``seq_lens`` fake shape
+    uses ``n_groups = num_rows // next_n`` so the caller can feed the
+    actual seq_lens without padding. ``max_batch_size`` drives the
+    grid (``* next_n * cluster_size`` CTAs) for CUDA Graph
+    compatibility.
+    """
+    kernel = GvrTopKLBKernel(
+        dtype=cute_dtype,
+        top_k=top_k,
+        next_n=next_n,
+        num_threads=num_threads,
+        compress_ratio=compress_ratio,
+        return_output_values=return_output_values,
+        cluster_size=cluster_size,
+        long_threshold=long_threshold,
+        max_batch_size=max_batch_size,
+    )
+    n_groups = num_rows // next_n
+    fake_logits = cute.runtime.make_fake_compact_tensor(
+        cute_dtype, (num_rows, N), stride_order=(1, 0), assumed_align=16
+    )
+    fake_pre_idx = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (n_groups, top_k), stride_order=(1, 0), assumed_align=16
+    )
+    fake_seq = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (n_groups,), stride_order=(0,))
+    fake_out_v = (
+        cute.runtime.make_fake_compact_tensor(
+            cute_dtype, (num_rows, top_k), stride_order=(1, 0), assumed_align=16
+        )
+        if return_output_values
+        else None
+    )
+    fake_out_i = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (num_rows, top_k), stride_order=(1, 0), assumed_align=16
+    )
+    fake_order = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (max_batch_size,), stride_order=(0,)
+    )
+    fake_ctr = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,))
+    fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel,
+        fake_logits,
+        fake_pre_idx,
+        fake_seq,
+        fake_out_v,
+        fake_out_i,
+        fake_order,
+        fake_ctr,
+        stream=fake_stream,
+        options="--enable-tvm-ffi",
+    )
+
+
+def gvr_topk_lb_decode(
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    order_row: torch.Tensor,
+    counters: torch.Tensor,
+    top_k: int,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    cluster_size: int = 4,
+    long_threshold: int = 64 * 1024,
+    max_batch_size: int = 1024,
+    num_threads: int = 512,
+    return_output_values: bool = False,
+    out_values: Optional[torch.Tensor] = None,
+    out_indices: Optional[torch.Tensor] = None,
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    """Run the LB (Idea C) main kernel.
+
+    ``order_row`` and ``counters`` MUST already be populated by a prior
+    call to :func:`gvr_topk_lb_prepare` for the current ``seq_lens``
+    (the metadata is invariant across per-layer Top-K calls within one
+    decode step, so callers run prepare once and reuse).
+    """
+    assert logits.is_cuda and logits.dim() == 2
+    assert pre_idx.dim() == 2 and pre_idx.dtype == torch.int32
+    assert seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+
+    if logits.dtype not in _DTYPE_TORCH_TO_CUTE:
+        raise ValueError(f"Unsupported logits dtype: {logits.dtype}")
+    cute_dtype = _DTYPE_TORCH_TO_CUTE[logits.dtype]
+
+    num_rows = logits.shape[0]
+    N = logits.shape[1]
+    if out_indices is None:
+        out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
+    if return_output_values and out_values is None:
+        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
+    if not return_output_values:
+        out_values = None  # passed to kernel as ``None``
+
+    compiled = _compile_lb(
+        cute_dtype,
+        top_k,
+        next_n,
+        num_rows,
+        N,
+        compress_ratio,
+        max_batch_size,
+        long_threshold,
+        num_threads,
+        cluster_size,
+        return_output_values,
+    )
+    compiled(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_values,
+        out_indices,
+        order_row,
+        counters,
+    )
+    return out_values, out_indices
+
+
 # ---- Correctness helpers ----------------------------------------------------
 def _make_inputs(
     num_rows: int,
