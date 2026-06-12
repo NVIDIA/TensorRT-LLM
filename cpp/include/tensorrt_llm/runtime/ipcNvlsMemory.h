@@ -44,6 +44,12 @@ struct IpcNvlsHandle
 
 void MPI_group_barrier(std::set<int> ranks);
 
+//! \brief Whether NVLS (NVLink SHARP) multicast can actually be used on this
+//! node. Checks the static capability (CUDA driver >= 12010 and
+//! CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED) and then confirms the fabric/IMEX
+//! plane can really bind multicast memory -- the static attribute alone is a
+//! false positive when nvidia-imex is not provisioned. Returns true only when
+//! multicast is both supported and usable. The (heavy) result is cached.
 bool ipcNvlsSupported();
 
 IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks);

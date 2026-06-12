@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/ncclUtils.h"
+#include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -160,6 +161,13 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     setenv("NCCL_GRAPH_REGISTER", "0", 0);
+    // NCCL aborts during init if it tries NVLS multicast but the fabric/IMEX
+    // plane can't bind it. Disable NVLS when it isn't actually usable so NCCL
+    // falls back to NVLink P2P. No-overwrite preserves an explicit user setting.
+    if (!tensorrt_llm::runtime::ipcNvlsSupported())
+    {
+        setenv("NCCL_NVLS_ENABLE", "0", 0);
+    }
 #endif // _WIN32
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
     commMap[group] = ncclComm;
