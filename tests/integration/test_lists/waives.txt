@@ -60,7 +60,6 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[cutlass-au
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[trtllm-auto] SKIP (https://nvbugs/6278350)
 accuracy/test_llm_api_pytorch.py::TestKanana_Instruct::test_auto_dtype SKIP (https://nvbugs/6209806)
 accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[dep8] SKIP (https://nvbugs/6260890)
-accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8] SKIP (https://nvbugs/6248837)
 accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8_attn_dp] SKIP (https://nvbugs/6144270)
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4[4gpus] SKIP (https://nvbugs/6261793)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[pp4-attn_backend=FLASHINFER-torch_compile=False] SKIP (https://nvbugs/6075556)
