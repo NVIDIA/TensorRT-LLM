@@ -2667,7 +2667,11 @@ class KvCacheCompressionConfig(StrictBaseModel):
     as a resource manager in create_py_executor (_util.py), like the KV cache
     manager itself. Concrete algorithms subclass this and add their parameters.
     """
-    algorithm: str
+    algorithm: str = Field(
+        description=
+        "Name of the KV-cache compression algorithm to run; selects which "
+        "compression manager is built. Concrete algorithm configs subclass this "
+        "and set the value.")
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
