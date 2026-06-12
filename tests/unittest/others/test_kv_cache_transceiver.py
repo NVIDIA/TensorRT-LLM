@@ -16,7 +16,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    MambaHybridCacheManager
+    MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
@@ -432,7 +432,7 @@ def create_hybrid_cache_manager(mapping,
                                 dtype,
                                 mamba_conv_dtype=torch.float16,
                                 mamba_ssm_dtype=torch.float16):
-    """Create a MambaHybridCacheManager for testing hybrid models.
+    """Create a MixedMambaHybridCacheManager for testing hybrid models.
 
     This manager handles both KV cache (attention layers) and Mamba cache (RNN layers).
 
@@ -449,7 +449,7 @@ def create_hybrid_cache_manager(mapping,
     attention_layer_mask = [True, False]
     mamba_layer_mask = [False, True]
 
-    return MambaHybridCacheManager(
+    return MixedMambaHybridCacheManager(
         # Mamba cache parameters
         mamba_d_state=16,
         mamba_d_conv=4,
@@ -572,7 +572,7 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
                                                       max_tokens_in_buffer=512)
     dist = Distributed.get(mapping)
 
-    # Create transceivers - MambaHybridCacheManager serves as both kv_cache_manager and mamba_cache_manager
+    # Create transceivers - the hybrid manager serves as both kv_cache_manager and mamba_cache_manager
     cache_transceiver_ctx = create_kv_cache_transceiver(
         mapping,
         dist,
