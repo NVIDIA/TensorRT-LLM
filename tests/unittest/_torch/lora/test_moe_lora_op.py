@@ -206,15 +206,13 @@ def test_moe_per_expert_lora_changes_output():
 
 
 @requires_cuda_and_op
-def test_moe_lora_slot_indexed_matches_per_request(monkeypatch):
+def test_moe_lora_slot_indexed_matches_per_request():
     """The slot-indexed (CUDA-graph) input schema must produce bit-identical
-    output to the per-request schema for the same adapter, since both expand to
-    the same per-token (rank, A_ptr, B_ptr) arrays inside the op.
+    output to the per-request (eager) schema for the same adapter, since both
+    expand to the same per-token (rank, A_ptr, B_ptr) arrays inside the op.
 
-    The slot-indexed schema always takes the capture-safe device path, so for an
-    apples-to-apples bit-exact comparison we force the per-request schema onto
-    the device path too (TLLM_MOE_LORA_USE_DEVICE_PATH=1). Both then share the
-    pointer-expand + grouped-GEMM kernels, so identical per-token tables yield
+    Both schemas feed the identical grouped-GEMM LoRA core (pointer-expand +
+    problem-builder + grouped GEMM), so identical per-token tables yield
     bit-identical output.
     """
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
@@ -253,8 +251,7 @@ def test_moe_lora_slot_indexed_matches_per_request(monkeypatch):
         rank=rank,
     )
 
-    # Force both schemas onto the device path, via a fresh runner.
-    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+    # Both schemas feed the same grouped-GEMM core; use a fresh runner.
     MoERunner.runner_dict.clear()
     try:
         out_per_request = _call_fused_moe(

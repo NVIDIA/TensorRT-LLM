@@ -54,7 +54,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cutlass import CutlassFusedMoE
+from .fused_moe_cutlass import CutlassFusedMoE, raise_moe_lora_multichunk_unsupported
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -150,21 +150,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 2: Determine communication method ==========
         num_chunks = moe.calculate_num_chunks(all_rank_num_tokens_padded)
 
-        # Routed-expert MoE LoRA carries per-request adapter metadata that is
-        # not re-sliced per token-chunk, so multi-chunk execution would mismatch
-        # the kernel's per-token expansion. Reject here with a clear message
-        # instead of failing inside the C++ op.
         if (
             num_chunks > 1
             and moe.backend.__class__ == CutlassFusedMoE
             and moe.backend._moe_lora_active(lora_params)
         ):
-            raise NotImplementedError(
-                f"Routed-expert MoE LoRA does not support multi-chunk execution "
-                f"(num_chunks={num_chunks}). Reduce the per-forward token count "
-                f"or increase `moe_max_num_tokens` so the MoE runs in a single "
-                f"chunk."
-            )
+            raise_moe_lora_multichunk_unsupported(num_chunks)
 
         # May fall back AllToAll -> AllGather; this is the only sanctioned
         # mutation of ``moe.comm`` from a scheduler.

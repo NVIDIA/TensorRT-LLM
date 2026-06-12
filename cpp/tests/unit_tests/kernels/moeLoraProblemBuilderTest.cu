@@ -70,8 +70,13 @@ RefOutputs cpuReference(std::vector<int32_t> const& ranks, std::vector<int64_t> 
     for (int64_t i = 0; i < P; ++i)
     {
         int32_t const rank = ranks[i];
+        // Rank-0 rows carry no active adapter (null A/B pointers), so the
+        // out-GEMM N is forced to 0 to let the grouped GEMM skip them instead of
+        // launching tiles that dereference the null B pointer. Mirrors the
+        // kernel in moe_lora_problem_builder.cu.
+        int const out_n = (rank > 0) ? static_cast<int>(out_hidden_size) : 0;
         r.problem_sizes_in[i] = cutlass::gemm::GemmCoord(1, rank, static_cast<int>(in_hidden_size));
-        r.problem_sizes_out[i] = cutlass::gemm::GemmCoord(1, static_cast<int>(out_hidden_size), rank);
+        r.problem_sizes_out[i] = cutlass::gemm::GemmCoord(1, out_n, rank);
 
         int64_t const in_row_stride = in_hidden_size * dtype_bytes;
         int64_t const work_row_stride = max_lora_rank * dtype_bytes;

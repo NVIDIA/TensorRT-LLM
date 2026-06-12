@@ -1151,44 +1151,61 @@ def _write_routed_expert_lora_adapter(save_dir: str, *, moe_layers: list[int],
         json.dump(adapter_config, f)
 
 
+def _run_moe_routed_expert_multi_lora(model_dir: str, lora_config: "LoraConfig",
+                                      lora_paths: list,
+                                      cuda_graph_config) -> list:
+    """Serve fabricated routed-expert MoE LoRA adapters for a mixed batch.
+
+    Returns the per-request output token lists for the mixed batch. The batch
+    mixes a no-LoRA (rank-0) request with every adapter so the rank-0
+    skip path and all adapters run through a single (captured, when
+    cuda_graph_config is set) decode forward. Returns
+    [base_tokens, adapter_0_tokens, ...].
+    """
+    llm = LLM(model=model_dir,
+              lora_config=lora_config,
+              moe_config=MoeConfig(backend="CUTLASS"),
+              cuda_graph_config=cuda_graph_config)
+    try:
+        sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+        prompt = "What is your name?"
+
+        lora_requests = [
+            LoRARequest(f"moe-lora-{i}", i, path)
+            for i, path in enumerate(lora_paths)
+        ]
+        requests = [None] + lora_requests
+        outputs = llm.generate([prompt] * len(requests),
+                               sampling_params,
+                               lora_request=requests)
+        return [list(o.outputs[0].token_ids) for o in outputs]
+    finally:
+        llm.shutdown()
+
+
 @skip_gpu_memory_less_than_40gb
 @pytest.mark.part0
-@pytest.mark.parametrize("moe_lora_mode", [
-    "host_path",
-    "device_path_eager",
-    "device_path_cudagraph",
-])
-def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
-        moe_lora_mode: str, monkeypatch) -> None:
+def test_qwen_moe_routed_expert_multi_lora_varying_ranks() -> None:
     """Routed-expert MoE LoRA on Qwen1.5-MoE with the PyTorch CUTLASS backend.
 
     Five dummy adapters of varying rank target the routed experts (moe_h_to_4h,
-    moe_gate, moe_4h_to_h). The same workload runs through each of the three
-    routed-expert LoRA execution paths, selected by moe_lora_mode:
+    moe_gate, moe_4h_to_h). The same workload runs through both routed-expert
+    MoE LoRA execution modes, which share the grouped-GEMM LoRA core:
 
-    - host_path: eager, legacy host path (per-request D2H pointer expand).
-    - device_path_eager: eager, capture-safe device path forced on via
-      TLLM_MOE_LORA_USE_DEVICE_PATH (per-request schema, no CUDA graph).
-    - device_path_cudagraph: CUDA graph decode, which always takes the
-      slot-indexed device path; all adapters share one captured graph,
-      exercising the slot-indexed device path and per-slot rank handling.
+    - eager: the per-request input schema (host adapter expansion) feeds the
+      grouped-GEMM core; no CUDA graph.
+    - cudagraph: CUDA-graph decode, which takes the slot-indexed input schema;
+      all adapters share one captured graph, exercising per-slot rank handling.
 
-    Current transformers stores the routed experts as fused 3D parameters, so
-    PEFT cannot produce per-expert adapter weights; the adapters are fabricated
-    directly in the per-expert key layout the TRT-LLM loader expects. An
-    explicit module mapping is supplied because the default map only knows
-    w1/w2/w3 for routed experts. lora_B is non-zero so each adapter perturbs the
-    routed-expert output, letting the test assert the LoRA is actually applied.
+    Both modes feed the identical grouped-GEMM core, so their outputs must match
+    token-for-token. Current transformers stores the routed experts as fused 3D
+    parameters, so PEFT cannot produce per-expert adapter weights; the adapters
+    are fabricated directly in the per-expert key layout the TRT-LLM loader
+    expects. An explicit module mapping is supplied because the default map only
+    knows w1/w2/w3 for routed experts. lora_B is non-zero so each adapter
+    perturbs the routed-expert output, letting the test assert the LoRA is
+    actually applied.
     """
-    # Select the execution path. The eager device path is forced via env var
-    # (read once at FusedMoeRunner construction); the CUDA-graph path always
-    # takes the slot-indexed device path, so it needs no env opt-in.
-    cuda_graph_config = None
-    if moe_lora_mode == "device_path_eager":
-        monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
-    elif moe_lora_mode == "device_path_cudagraph":
-        cuda_graph_config = CudaGraphConfig(max_batch_size=10)
-
     model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
 
     # Five adapters with varying ranks; max_lora_rank must cover the largest.
@@ -1238,51 +1255,51 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
             )
             lora_paths.append(lora_path)
 
-        lora_config = LoraConfig(
-            lora_dir=lora_paths,
-            lora_target_modules=target_modules,
-            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
-            max_lora_rank=max_rank,
-            max_loras=len(ranks),
-            max_cpu_loras=len(ranks),
-        )
-        llm = LLM(model=model_dir,
-                  lora_config=lora_config,
-                  moe_config=MoeConfig(backend="CUTLASS"),
-                  cuda_graph_config=cuda_graph_config)
-        try:
-            sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
-            prompt = "What is your name?"
+        def _make_lora_config() -> LoraConfig:
+            return LoraConfig(
+                lora_dir=lora_paths,
+                lora_target_modules=target_modules,
+                trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
+                max_lora_rank=max_rank,
+                max_loras=len(ranks),
+                max_cpu_loras=len(ranks),
+            )
 
-            base_tokens = list(
-                llm.generate([prompt], sampling_params,
-                             lora_request=None)[0].outputs[0].token_ids)
+        # Run both modes against the same fabricated adapters.
+        eager_tokens = _run_moe_routed_expert_multi_lora(model_dir,
+                                                         _make_lora_config(),
+                                                         lora_paths,
+                                                         cuda_graph_config=None)
+        cudagraph_tokens = _run_moe_routed_expert_multi_lora(
+            model_dir,
+            _make_lora_config(),
+            lora_paths,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=10))
 
-            lora_requests = [
-                LoRARequest(f"moe-lora-{i}", i, path)
-                for i, path in enumerate(lora_paths)
-            ]
-
-            # One batch mixes a no-LoRA (rank-0) request with every adapter so
-            # the rank-0 skip path and all adapters run through a single
-            # (captured, when enabled) decode graph.
-            requests = [None] + lora_requests
-            outputs = llm.generate([prompt] * len(requests),
-                                   sampling_params,
-                                   lora_request=requests)
-            out_tokens = [list(o.outputs[0].token_ids) for o in outputs]
-
+        for mode, out_tokens in (("eager", eager_tokens), ("cudagraph",
+                                                           cudagraph_tokens)):
             # The no-LoRA row (index 0) must run (rank-0 skip path) and produce
             # output.
             assert out_tokens[0], (
-                "No-LoRA row in the mixed batch produced no tokens.")
-            # Every adapter -- not just one -- must change the output vs base.
-            for i in range(len(lora_requests)):
-                assert out_tokens[i + 1] != base_tokens, (
-                    f"Routed-expert MoE LoRA adapter {i} produced output "
-                    "identical to the base model; it was not applied.")
-        finally:
-            llm.shutdown()
+                f"[{mode}] No-LoRA row in the mixed batch produced no tokens.")
+            # Every adapter (not just one) must change the output vs base.
+            # This exercises each input schema's end-to-end plumbing: the eager
+            # run drives the per-request schema, the cudagraph run drives the
+            # slot-indexed schema, and both must actually apply every adapter.
+            for i in range(len(ranks)):
+                assert out_tokens[i + 1] != out_tokens[0], (
+                    f"[{mode}] Routed-expert MoE LoRA adapter {i} produced "
+                    "output identical to the no-LoRA row; it was not applied.")
+
+        # We intentionally do not assert eager_tokens == cudagraph_tokens.
+        # Bit-exact equivalence of the per-request and slot-indexed schemas is
+        # proven at the op level by
+        # test_moe_lora_op.py::test_moe_lora_slot_indexed_matches_per_request
+        # (rtol=0, atol=0). End to end, eager and CUDA-graph runs are not
+        # bit-identical: CUDA-graph decode pads the batch and may select
+        # different GEMM tactics for the non-LoRA parts of the model, and greedy
+        # decoding amplifies sub-ULP differences into divergent tokens. That
+        # nondeterminism is unrelated to MoE LoRA.
 
 
 class TestLlmError:

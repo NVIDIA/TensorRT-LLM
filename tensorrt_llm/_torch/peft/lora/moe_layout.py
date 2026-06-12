@@ -12,8 +12,10 @@ from typing import Dict, List, Optional
 
 import torch
 
-# Routed-expert MoE LoRA modules.
-MOE_LORA_MODULES: List[str] = ["moe_h_to_4h", "moe_4h_to_h", "moe_gate"]
+# Routed-expert MoE LoRA modules (canonical names live in layer.py).
+from .layer import MOE_LORA_MODULE_NAMES
+
+MOE_LORA_MODULES: List[str] = list(MOE_LORA_MODULE_NAMES)
 
 
 def make_per_expert_lora(
