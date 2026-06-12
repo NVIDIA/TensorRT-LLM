@@ -566,6 +566,9 @@ class LlmResult:
         self._py_result = py_result
         self.is_final = is_final
         self.cached_tokens = 0
+        # Context-worker usage for gen-first disagg, delivered via the
+        # KV-transfer aux buffer (see _maybe_attach_ctx_usage).
+        self.ctx_usage = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics

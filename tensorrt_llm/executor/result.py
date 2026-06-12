@@ -498,6 +498,17 @@ class GenerationResultBase:
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
                                             None)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
+            # Expose gen-first ctx usage so the postprocessor
+            # (_ctx_usage_from_outputs) can adopt the context-side accounting.
+            # ctx_usage only exists on the Python LlmResult wrapper; the raw C++
+            # bindings.executor.Result (non-disagg / benchmark path) does not
+            # have it, so fall back to None as with cached_tokens above.
+            ctx_usage = getattr(response_result, 'ctx_usage', None)
+            if ctx_usage is not None:
+                self._disaggregated_params = dataclasses.replace(
+                    self._disaggregated_params or DisaggregatedParams(),
+                    ctx_usage=ctx_usage,
+                )
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and
