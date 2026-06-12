@@ -818,6 +818,9 @@ class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def get_final_normalization(self):
+        return self.model.norm
+
     def get_decoder(self):
         return self.model
 
@@ -839,6 +842,47 @@ class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states).float()
 
         return DeepSeekV3CausalLMOutput(logits=logits)
+
+
+class DeepSeekV3EagleLayer(nn.Module):
+    """DeepSeek-V3-family native MTP layer for AutoDeploy one-model drafting."""
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.enorm = DeepSeekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = DeepSeekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.mtp_block = DeepSeekV3DecoderLayer(config, layer_idx=layer_idx)
+        self.shared_head_norm = DeepSeekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        inputs_embeds = self.enorm(inputs_embeds)
+        hidden_states = self.hnorm(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.eh_proj.weight,
+            self.eh_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        hidden_states = torch.ops.auto_deploy.all_reduce(hidden_states, layer_type="mlp")
+        hidden_states = self.mtp_block(hidden_states, position_ids)
+        return self.shared_head_norm(hidden_states)
+
+
+def build_deepseek_v3_eagle_layers(config) -> list[nn.Module]:
+    """Build DeepSeek-V3/R1 native MTP layers for Eagle one-model drafting."""
+    num_mtp_layers = int(getattr(config, "num_nextn_predict_layers", 1) or 1)
+    start_layer_idx = int(config.num_hidden_layers)
+    return [
+        DeepSeekV3EagleLayer(config, layer_idx=start_layer_idx + i) for i in range(num_mtp_layers)
+    ]
 
 
 # Register with AutoModelForCausalLMFactory

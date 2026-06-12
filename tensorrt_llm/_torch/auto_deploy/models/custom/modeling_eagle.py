@@ -47,6 +47,7 @@ from ...distributed.common import broadcast
 from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
+from .modeling_deepseek import build_deepseek_v3_eagle_layers
 from .modeling_nemotron_h import build_nemotron_eagle_layers
 
 # =============================================================================
@@ -76,12 +77,14 @@ def get_eagle_layers(config, model_type: str) -> Union[nn.ModuleList, nn.Module]
     match model_type:
         case "llama":
             layers = build_llama_eagle_layers(config)
+        case "deepseek_v3":
+            layers = build_deepseek_v3_eagle_layers(config)
         case "nemotron_h":
             layers = build_nemotron_eagle_layers(config)
         case _:
             raise ValueError(
                 f"Model type '{model_type}' not supported for Eagle drafter. "
-                f"Supported types: llama, nemotron_h"
+                f"Supported types: llama, deepseek_v3, nemotron_h"
             )
 
     if len(layers) == 1:
@@ -142,6 +145,13 @@ class EagleConfig(PretrainedConfig):
                 r"^mtp\.": "model.",
             },
         },
+        "deepseek_v3": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": True,
+            "num_capture_layers": 1,
+            "normalize_target_hidden_state": False,
+            "layers_handle_final_norm": True,
+        },
     }
     # Some custom HF config classes expose backward-compatibility fields as properties instead of
     # storing them directly in __dict__. Those values do not survive config.to_dict(), so carry
@@ -149,6 +159,30 @@ class EagleConfig(PretrainedConfig):
     _preserved_config_attrs: ClassVar[Dict[str, tuple[str, ...]]] = {
         "nemotron_h": ("mtp_hybrid_override_pattern",),
     }
+
+    @staticmethod
+    def _deepseek_v3_checkpoint_conversion_mapping(config_dict: Dict[str, Any]) -> Dict[str, str]:
+        num_hidden_layers = config_dict.get("num_hidden_layers")
+        if num_hidden_layers is None:
+            raise ValueError("DeepSeek-V3 Eagle config requires num_hidden_layers")
+
+        num_mtp_layers = int(config_dict.get("num_nextn_predict_layers", 1) or 1)
+        mapping = {}
+        for mtp_idx in range(num_mtp_layers):
+            source_layer = int(num_hidden_layers) + mtp_idx
+            target_prefix = "model.layers" if num_mtp_layers == 1 else f"model.layers.{mtp_idx}"
+            source_prefix = rf"^model\.layers\.{source_layer}\."
+            mapping.update(
+                {
+                    source_prefix + r"enorm\.": f"{target_prefix}.enorm.",
+                    source_prefix + r"hnorm\.": f"{target_prefix}.hnorm.",
+                    source_prefix + r"eh_proj\.": f"{target_prefix}.eh_proj.",
+                    source_prefix + r"shared_head\.norm\.": f"{target_prefix}.shared_head_norm.",
+                    source_prefix: f"{target_prefix}.mtp_block.",
+                }
+            )
+
+        return mapping
 
     @classmethod
     def from_base_config(
@@ -173,6 +207,12 @@ class EagleConfig(PretrainedConfig):
         for key in cls._preserved_config_attrs.get(model_type, ()):
             if key not in config_dict and hasattr(config, key):
                 config_dict[key] = getattr(config, key)
+
+        if model_type == "deepseek_v3":
+            defaults = dict(defaults)
+            defaults["_checkpoint_conversion_mapping"] = (
+                cls._deepseek_v3_checkpoint_conversion_mapping(config_dict)
+            )
 
         # Log when config overrides a default
         for key, value in defaults.items():
