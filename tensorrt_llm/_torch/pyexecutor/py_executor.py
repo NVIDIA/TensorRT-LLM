@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import functools
+import json
 import os
 import threading
 import time
@@ -2553,6 +2554,14 @@ class PyExecutor:
         if self.should_stop_processing:
             return None, None
 
+        # Fire pending control action before scheduling so the scheduler
+        # sees the post-action state of ``active_requests``. Without this,
+        # an in-flight refit that pauses GENERATION_IN_PROGRESS requests
+        # would race with a ``scheduled_batch`` already built around the
+        # pre-pause state, and ``_forward_step`` would receive entries
+        # whose KV has just been freed.
+        self._handle_control_request()
+
         if self.kv_cache_transceiver:
             self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
@@ -2851,7 +2860,6 @@ class PyExecutor:
                     self._maybe_rebalance_kv_pools()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
-                self._handle_control_request()
 
                 if scheduled_batch is None:
                     break
@@ -3058,18 +3066,41 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _handle_control_request(self):
-        if len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0 and \
-            len(self.control_requests) > 0:
-            assert len(self.control_requests) == 1, (
-                f"Expected exactly one control request to be processed at a time, "
-                f"but found {len(self.control_requests)} control requests. "
-                f"This may indicate a race condition or improper control request handling."
-            )
-            self.control_requests.pop(0)
-            self.control_request_barrier.set()
-            self.control_action_done.wait()
-            self.control_action_done.clear()
+        """Fire the next pending control action at the next step boundary.
+
+        drain=True  (default): wait until ``active_requests`` and
+            ``waiting_queue`` are empty — exclusive engine access.
+        drain=False: as soon as a fetched batch contains a control request,
+            fire the action first, then continue forwarding requests.
+        """
+        if len(self.control_requests) == 0:
+            return
+
+        assert len(self.control_requests) == 1, (
+            f"Expected exactly one control request to be processed at a time, "
+            f"but found {len(self.control_requests)} control requests. "
+            f"This may indicate a race condition or improper control request handling."
+        )
+
+        pending = self.control_requests[0]
+
+        if pending.control_requires_drain and (
+            len(self.active_requests) != 0 or len(self.waiting_queue) != 0
+        ):
+            # drain=True: keep the sentinel parked until the engine drains.
+            return
+
+        logger.info(
+            f"[control_action] firing control request "
+            f"drain={pending.control_requires_drain} "
+            f"active_requests={len(self.active_requests)} "
+            f"waiting_queue={len(self.waiting_queue)}"
+        )
+        self.control_requests.pop(0)
+        self.control_request_barrier.set()
+        self.control_action_done.wait()
+        self.control_action_done.clear()
+        logger.info("[control_action] control request finished")
 
     def _sync_and_process_resource_governor_queue(self):
         """Synchronize and process resource governor requests across all ranks.
@@ -3187,29 +3218,25 @@ class PyExecutor:
             mgr.resume_request(req)
 
     @contextmanager
-    def control_action(self):
-        """
-        Context manager for synchronized control actions.
+    def control_action(self, *, drain: bool = True):
+        """Run an action at a scheduler step boundary.
 
-        Usage:
-            with control_action():
-                # Eventloop thread has finished all previous requests and paused
-                do some actions here
-            # Eventloop thread resumes automatically after exiting
+        drain=True  (default): block until ``active_requests`` and
+                               ``waiting_queue`` are empty before yielding.
+        drain=False: yield at the next step boundary without draining.
+                     In-flight requests keep their KV caches across the
+                     action; same-batch requests fetched after the sentinel
+                     are parked until the ``with`` block exits.
         """
 
         if self.dist.rank == 0:
-            self.executor_request_queue.enqueue_control_request()
+            self.executor_request_queue.enqueue_control_request(drain=drain)
 
-        # Wait for worker to finish all previous requests
         self.control_request_barrier.wait()
 
         try:
-            # Yield control to the with block
-            # Worker is now paused, safe to execute actions
             yield self
         finally:
-            # Cleanup: signal worker to resume
             self.control_action_done.set()
             self.control_request_barrier.clear()
 
@@ -3236,7 +3263,6 @@ class PyExecutor:
                     self._maybe_rebalance_kv_pools()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
-                self._handle_control_request()
 
                 if scheduled_batch is None:
                     break
