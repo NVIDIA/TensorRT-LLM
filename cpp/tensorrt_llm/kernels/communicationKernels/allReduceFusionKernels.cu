@@ -325,9 +325,17 @@ protected:
 #pragma unroll
         for (int i = 0; i < kMathCount; ++i)
         {
-            reinterpret_cast<DType*>(&norm_out)[i]
-                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * s_val
-                    * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
+            // Gemma-style RMSNorm scales by (1 + weight); the standard fused kernel
+            // scales by weight directly. Apply the +1 offset at runtime when the
+            // caller flags a gemma norm so the fused AR+RMSNorm matches the unfused
+            // gemma path (used by Qwen3-Next/Qwen3.5, whose norms are all gemma).
+            float gamma_val = static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]);
+            if (m_params.use_gemma)
+            {
+                gamma_val = gamma_val + 1.0f;
+            }
+            reinterpret_cast<DType*>(&norm_out)[i] = static_cast<DType>(
+                static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * s_val * gamma_val);
         }
         return norm_out;
     }

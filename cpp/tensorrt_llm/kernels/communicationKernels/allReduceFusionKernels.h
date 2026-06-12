@@ -139,6 +139,10 @@ struct AllReduceFusionParams
     float rms_eps;
     float* scale_factor;
     bool use_oneshot;
+    // When true, the fused RMSNorm scales by (1 + gamma) instead of gamma
+    // (gemma-style norm, e.g. Qwen3-Next/Qwen3.5). Defaults to false to keep
+    // standard RMSNorm behavior for all other callers.
+    bool use_gemma = false;
     QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
     AllReduceFusionPattern pattern;
