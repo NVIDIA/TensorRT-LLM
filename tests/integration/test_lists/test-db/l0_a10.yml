@@ -196,6 +196,7 @@ l0_a10:
   # ------------- TRT tests ---------------
   - unittest/kv_cache_manager_v2_tests/ # 4 min
   - unittest/dynamo
+  - unittest/test_lazy_torchvision_imports.py
   - unittest/api_stability
   - unittest/bindings
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
