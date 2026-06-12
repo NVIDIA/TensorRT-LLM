@@ -91,7 +91,7 @@ def build_document(
     return {
         "@timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "s_commit": os.getenv("gitlabCommit", ""),
-        "s_pr_number": os.getenv("gitlabMergeRequestIid", ""),
+        "s_pr_number": os.getenv("CBTS_PR_NUMBER", ""),
         "s_build_url": os.getenv("BUILD_URL", ""),
         "s_cbts_status": status,
         "s_scope": str(scope) if scope is not None else "",
