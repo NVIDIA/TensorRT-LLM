@@ -68,7 +68,7 @@ from .utils import (
 )
 
 
-class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
+class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
     """Implements batched matrix multiplication with SwiGLU fusion in the epilogue
     (C = SwiGLU(alpha * A x SFA x B x SFB)) for Blackwell GPUs with persistent tile scheduling
     and warp specialization.
@@ -99,7 +99,7 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
             * Cluster shape M/N must be <= 4 for scale factor multicasts due to limited scale factor size.
 
     Example:
-        >>> gemm = Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel(
+        >>> gemm = Sm100BlockScaledPersistentDenseGemmActFusionKernel(
         ...     sf_vec_size=16,
         ...     mma_tiler_mn=(256, 128),
         ...     cluster_shape_mn=(2, 1),
@@ -183,6 +183,18 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
         self.vectorized_f32 = vectorized_f32
         self.activation_type = activation_type
         self.is_gated = is_gated_activation(activation_type)
+        # Precompute per-activation flags as plain Python bools so the epilogue
+        # dispatch can use cutlass.const_expr(...) on them (like is_gated). An
+        # inline enum comparison inside @cute.jit is not folded as a constant.
+        self._act_is_swiglu = activation_type == ActivationType.Swiglu
+        self._act_is_gelu = activation_type == ActivationType.Gelu
+        # Host-side guard (raise is not allowed inside the @cute.kernel epilogue):
+        # only SwiGLU and GELU(tanh) are wired in the fused epilogue.
+        if not (self._act_is_swiglu or self._act_is_gelu):
+            raise NotImplementedError(
+                f"Fused epilogue activation {activation_type} not implemented "
+                f"(only Swiglu and Gelu are wired)."
+            )
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1539,11 +1551,16 @@ class Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel:
 
                     acc_vec_up = tTR_rAcc_up.load()
                     tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.is_gated):
+                    # Dispatch the fused activation on activation_type (the source
+                    # of truth). is_gated only governs the structural subtile load
+                    # above (2 subtiles up+gate vs 1) and must NOT pick the
+                    # activation: otherwise a non-gated ReLU/SiLU would wrongly get
+                    # GELU and a gated GEGLU would wrongly get SwiGLU.
+                    if cutlass.const_expr(self._act_is_swiglu):
                         # SwiGLU: output = (alpha * up) * silu(alpha * gate)
                         acc_vec_gate = tTR_rAcc_gate.load()
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
-                    else:
+                    elif cutlass.const_expr(self._act_is_gelu):
                         # GELU (tanh approx): output = gelu_tanh(alpha * up + bias)
                         bias_vec = None
                         if cutlass.const_expr(gBias_mnl is not None):
