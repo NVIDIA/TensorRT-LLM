@@ -4327,7 +4327,7 @@ class PyExecutor:
         """Surface gen-first ctx usage (delivered via the KV-transfer aux
         buffer in RxSession.unpack_aux) onto the response so the postprocessor
         adopts the context-side prompt/cached token accounting."""
-        disagg_params = getattr(request, 'py_disaggregated_params', None)
+        disagg_params = request.py_disaggregated_params
         if disagg_params is not None and disagg_params.ctx_usage is not None:
             response.result.ctx_usage = disagg_params.ctx_usage
 

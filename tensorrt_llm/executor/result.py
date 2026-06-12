@@ -500,7 +500,7 @@ class GenerationResultBase:
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             # Expose gen-first ctx usage so the postprocessor
             # (_ctx_usage_from_outputs) can adopt the context-side accounting.
-            ctx_usage = getattr(response_result, 'ctx_usage', None)
+            ctx_usage = response_result.ctx_usage
             if ctx_usage is not None:
                 self._disaggregated_params = dataclasses.replace(
                     self._disaggregated_params or DisaggregatedParams(),
