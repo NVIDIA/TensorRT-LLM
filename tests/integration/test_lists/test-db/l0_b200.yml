@@ -223,7 +223,6 @@ l0_b200:
   - examples/test_visual_gen.py::test_ltx2_example
   - examples/test_visual_gen.py::test_wan_i2v_example
   - examples/test_visual_gen.py::test_cosmos3_example
-  - examples/test_visual_gen.py::test_qwen_image_example
   # - examples/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
