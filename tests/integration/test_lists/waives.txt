@@ -2,6 +2,7 @@ accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype SKIP (https://nvbugs/616
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[adp-mtp2] SKIP
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[noadp-mtp0] SKIP
+accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype ${skipIfPrefix("DGX_B300-4_GPUs-PyTorch-DS-1", "TODO(NVBUG): flaky disagg server startup timeout on B300/GB300 only; ~37%/7d, green on B200/GB200")}
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype SKIP (https://nvbugs/6200572)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/6117811)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True] SKIP (https://nvbugs/6117811)
