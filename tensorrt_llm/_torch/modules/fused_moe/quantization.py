@@ -2455,9 +2455,22 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 continue
 
             if not torch.allclose(w1_ws2, w3_ws2):
+                # Subclasses are expected to have already requantized the
+                # smaller-sf2 side (gate or up) against max(w1_ws2, w3_ws2)
+                # before this point, so the kernel's shared alpha is
+                # consistent with both block-scale tensors. If they reach
+                # here still unequal, the block scales were left calibrated
+                # against their original sf2 and the kernel will silently
+                # apply the wrong dequantization scale to whichever side has
+                # the smaller sf2 -- warn loudly.
                 logger.warning(
                     f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_ws2} != {w3_ws2}), "
-                    f"selecting the larger value. Accuracy may be affected.")
+                    f"selecting the larger value. The block scales were not "
+                    f"rescaled to compensate; the kernel will use an inflated "
+                    f"effective scale on the smaller-sf2 side. Accuracy will "
+                    f"be affected; preferred fix is to pre-fuse the scales in "
+                    f"the checkpoint (re-quantize gate and up against "
+                    f"max(gate_sf2, up_sf2)).")
                 w1_ws2 = torch.max(w1_ws2, w3_ws2)
                 w3_ws2 = w1_ws2
 
@@ -2850,7 +2863,156 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                 "constant", 0).contiguous()
         return source_tensor
 
+    @staticmethod
+    def _requantize_fp4_with_new_scale_2(weight: torch.Tensor,
+                                         weight_scale: torch.Tensor,
+                                         old_scale_2: torch.Tensor,
+                                         new_scale_2: torch.Tensor):
+        """Dequantize an NVFP4 weight + block scale tensor pair using the
+        original per-tensor global scale, then requantize with ``new_scale_2``.
+
+        Returns a (new_weight, new_weight_scale) pair with the same shapes,
+        dtypes, and device as the originals.  Use this when fusing two
+        projections (e.g. gate/up) that were calibrated with different
+        weight_scale_2 values into a single GEMM whose alpha must be derived
+        from a shared scale -- if only the alpha is changed without
+        requantizing the smaller-sf2 side, the kernel applies an inflated
+        effective scale to that side and dequantization is wrong.
+        """
+        orig_scale_dtype = weight_scale.dtype
+        orig_scale_shape = weight_scale.shape
+        orig_weight_device = weight.device
+        orig_scale_device = weight_scale.device
+
+        # fp4_quantize requires a CUDA tensor. Regular experts live on this
+        # rank's GPU (cuda:local_rank); shared experts (online EPLB) are staged
+        # on CPU. Pick the weight's own CUDA device when available, otherwise
+        # the rank's active CUDA device -- never a bare .cuda() (== cuda:0),
+        # which would spill onto the wrong GPU under multi-GPU TP.
+        compute_device = weight.device if weight.is_cuda else torch.device(
+            'cuda', torch.cuda.current_device())
+
+        # Dequantize on the input's native device (the dequant op accepts CPU
+        # and CUDA) and bf16-cast for numerical stability through the requant.
+        dequant_shape = (weight.shape[0], weight.shape[1] * 2)
+        weight_dequant = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+            weight.contiguous(),
+            weight_scale.flatten().view(float4_sf_dtype).contiguous(),
+            old_scale_2, 16, 1, True).to(dtype=torch.bfloat16).reshape(
+                dequant_shape)
+
+        weight_requant, weight_scale_requant = torch.ops.trtllm.fp4_quantize(
+            weight_dequant.to(compute_device),
+            (1.0 / new_scale_2).to(compute_device), 16, False)
+
+        return (weight_requant.to(device=orig_weight_device,
+                                  dtype=weight.dtype),
+                weight_scale_requant.reshape(orig_scale_shape).view(
+                    orig_scale_dtype).to(device=orig_scale_device))
+
+    def _fuse_w3_w1_scale_2(self, module: torch.nn.Module):
+        """Pre-fuse gate (w1) and up (w3) weight_scale_2 in-place by
+        requantizing the smaller-sf2 side against max(w1_sf2, w3_sf2).
+
+        Without this step the kernel applies a shared alpha = max(sf2) *
+        input_scale to both halves, but the smaller-sf2 side's block scales
+        were calibrated against its own (smaller) sf2 -- so the effective
+        dequant scale on that side is inflated by max_sf2/own_sf2.  See
+        comment in _reconcile_and_compute_alphas for the assumption.
+
+        Regular and shared (online EPLB) experts are fused independently:
+        each set of experts has its own per-tensor sf2 dict and its own dst
+        weight/scale buffers, and both index local experts from slot 0. They
+        must not be merged -- the regular sf2 is unrelated to the shared one,
+        so fusing them in the same bucket would requantize shared weights
+        against the wrong scale and leave tmp_shared_weight_scale_2 untouched
+        (still mismatched, still warning).
+        """
+        if (not hasattr(module, 'tmp_cutlass_w3_w1_weights')
+                or not hasattr(module, 'tmp_cutlass_w3_w1_weight_scales')):
+            return
+
+        # Regular experts: weights/scales destined for the module's own
+        # w3_w1 buffers, with per-tensor sf2 in tmp_weight_scale_2.
+        if hasattr(module, 'tmp_weight_scale_2'):
+            self._fuse_w3_w1_scale_2_for_dst(
+                module, module.tmp_weight_scale_2,
+                module.w3_w1_weight.data.storage().data_ptr(),
+                module.w3_w1_weight_scale.data.storage().data_ptr())
+
+        # Shared experts (online EPLB): staged in the local_shared buffers
+        # with their own per-tensor sf2 in tmp_shared_weight_scale_2.
+        if (hasattr(module, 'tmp_shared_weight_scale_2')
+                and getattr(module, 'local_shared_w3_w1_tensors', None)
+                is not None and getattr(
+                    module, 'local_shared_w3_w1_scale_tensors', None)
+                is not None):
+            self._fuse_w3_w1_scale_2_for_dst(
+                module, module.tmp_shared_weight_scale_2,
+                module.local_shared_w3_w1_tensors.storage().data_ptr(),
+                module.local_shared_w3_w1_scale_tensors.storage().data_ptr())
+
+    def _fuse_w3_w1_scale_2_for_dst(self, module: torch.nn.Module,
+                                    sf2_by_expert: Dict[int, Dict],
+                                    weight_dst_base: int, scale_dst_base: int):
+        """Fuse w1/w3 sf2 for one set of experts (regular or shared).
+
+        ``weight_dst_base`` / ``scale_dst_base`` are the ``data_ptr()`` of the
+        destination weight / scale buffers for this set; the tmp dicts are
+        keyed on ``(dst_base, expert_idx)`` precisely so regular and shared
+        copies of the same local expert id can be told apart. We select only
+        the entries for this set, so each ``expert_idx`` maps to exactly one
+        weight entry and one scale entry.
+        """
+        weights_by_expert: Dict[int, Dict] = {
+            expert_idx: entry
+            for (base, expert_idx), entry in
+            module.tmp_cutlass_w3_w1_weights.items() if base == weight_dst_base
+        }
+        scales_by_expert: Dict[int, Dict] = {
+            expert_idx: entry
+            for (base, expert_idx), entry in
+            module.tmp_cutlass_w3_w1_weight_scales.items()
+            if base == scale_dst_base
+        }
+
+        for expert_idx, scales in sf2_by_expert.items():
+            w1_sf2 = scales.get('w1')
+            w3_sf2 = scales.get('w3')
+            if w1_sf2 is None or w3_sf2 is None:
+                continue
+            if torch.allclose(w1_sf2, w3_sf2):
+                continue
+
+            max_sf2 = torch.max(w1_sf2, w3_sf2)
+            w_entry = weights_by_expert.get(expert_idx)
+            s_entry = scales_by_expert.get(expert_idx)
+            if w_entry is not None and s_entry is not None:
+                for half in ('w1', 'w3'):
+                    old_sf2 = scales[half]
+                    if torch.allclose(old_sf2, max_sf2):
+                        continue  # Already at max, no requant needed.
+                    weight = w_entry.get(half)
+                    scale = s_entry.get(half)
+                    if weight is None or scale is None:
+                        continue
+                    new_weight, new_scale = (
+                        self._requantize_fp4_with_new_scale_2(
+                            weight, scale, old_sf2, max_sf2))
+                    w_entry[half] = new_weight
+                    s_entry[half] = new_scale
+
+            # Mark this expert as fused so _reconcile_and_compute_alphas
+            # skips the warning and just computes alpha from the shared sf2.
+            scales['w1'] = max_sf2
+            scales['w3'] = max_sf2
+
     def process_weights_after_loading(self, module: torch.nn.Module):
+        # Requantize per-expert when gate (w1) and up (w3) have different
+        # per-tensor weight_scale_2 -- must run before cat+pad+interleave
+        # so the rescaled block scales feed into the finalized buffers.
+        self._fuse_w3_w1_scale_2(module)
+
         # Finalize w3_w1 weights: cat + pad
         if hasattr(module, 'tmp_cutlass_w3_w1_weights'):
             for entry in module.tmp_cutlass_w3_w1_weights.values():
