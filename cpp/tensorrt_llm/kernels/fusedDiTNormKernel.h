@@ -27,7 +27,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// Single fused DiT pre-block kernel covering KA/KB/KC/KD via template flags.
+// Single fused DiT pre-block kernel covering all AdaLN variants via template flags.
 //
 // Pipeline (compile-time selected, all "pluggable" except RmsNorm which is always on):
 //   1. Phase 0a -- cp.async x -> SMEM                                     (always)
@@ -44,10 +44,10 @@ namespace kernels
 //        HAS_QUANT=true : NVFP4 + 128x4 swizzled SF to (out_fp4[k], out_sf[k])
 //
 // Specializations used by LTX-2:
-//   KA: HAS_RESIDUAL=false, HAS_GATE=false, HAS_SHIFT_SCALE=true,  NUM_OUT=1
-//   KB: HAS_RESIDUAL=true,  HAS_GATE=false, HAS_SHIFT_SCALE=true,  NUM_OUT=2
-//   KC: HAS_RESIDUAL=true,  HAS_GATE=true,  HAS_SHIFT_SCALE=true,  NUM_OUT=1
-//   KD: HAS_RESIDUAL=true,  HAS_GATE=true,  HAS_SHIFT_SCALE=false, NUM_OUT=1
+//   rmsnorm_shift_scale:            HAS_RESIDUAL=false, HAS_GATE=false, HAS_SHIFT_SCALE=true,  NUM_OUT=1
+//   resid_rmsnorm_shift_scale_dual: HAS_RESIDUAL=true,  HAS_GATE=false, HAS_SHIFT_SCALE=true,  NUM_OUT=2
+//   gate_resid_rmsnorm_shift_scale: HAS_RESIDUAL=true,  HAS_GATE=true,  HAS_SHIFT_SCALE=true,  NUM_OUT=1
+//   gate_resid_rmsnorm:             HAS_RESIDUAL=true,  HAS_GATE=true,  HAS_SHIFT_SCALE=false, NUM_OUT=1
 //
 // HAS_GATE implies HAS_RESIDUAL (asserted at compile time).
 //
@@ -56,7 +56,7 @@ namespace kernels
 //
 // Tile: production hardcoded to (ROWS_PER_BLOCK=1, BLOCK_SIZE=256). NCU sweep on B200 at
 // the production shape found 1r256 the best balance: 2r256 has too much per-thread register
-// pressure (12.5% theoretical occupancy on KB-bf16); 1r512 reaches higher occupancy but its
+// pressure (12.5% theoretical occupancy on the dual-output bf16 variant); 1r512 reaches higher occupancy but its
 // 16-warp CTAs starve the SM warp schedulers and pay a heavier __syncthreads() barrier.
 //
 // Supported hidden_dim: 2048 (LTX-2 audio) and 4096 (LTX-2 video).

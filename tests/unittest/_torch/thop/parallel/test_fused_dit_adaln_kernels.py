@@ -8,11 +8,11 @@
 # via a bf16-narrow-first hw add, matching the PyTorch eager `_get_ada_values` combine.
 #
 # Ops covered (bf16 + NVFP4 `_quant` variant unless noted):
-#   KA  fused_dit_rmsnorm_shift_scale                RMSNorm -> (1 + s) * n + h
-#   KC  fused_dit_resid_rmsnorm_shift_scale_dual     resid -> RMSNorm -> two shift_scale outputs
-#   KB  fused_dit_gate_resid_rmsnorm_shift_scale     gate-resid -> RMSNorm -> shift_scale
-#   KD  fused_dit_gate_resid_rmsnorm                 gate-resid -> RMSNorm
-#   GR  fused_dit_gate_resid                         gate-resid only (bf16, no norm)
+#   fused_dit_rmsnorm_shift_scale                RMSNorm -> (1 + s) * n + h
+#   fused_dit_resid_rmsnorm_shift_scale_dual     resid -> RMSNorm -> two shift_scale outputs
+#   fused_dit_gate_resid_rmsnorm_shift_scale     gate-resid -> RMSNorm -> shift_scale
+#   fused_dit_gate_resid_rmsnorm                 gate-resid -> RMSNorm
+#   fused_dit_gate_resid                         gate-resid only (bf16, no norm)
 
 import pytest
 import torch
@@ -25,7 +25,7 @@ import tensorrt_llm  # noqa: F401  -- triggers libth_common.so load (registers t
 pytestmark = skip_pre_blackwell
 
 
-# Shared gate-residual input builder (KD + GR use identical inputs).
+# Shared gate-residual input builder (gate_resid and gate_resid_rmsnorm use identical inputs).
 def _make_gate_resid_inputs(num_tokens, hidden_dim, batch_size, seed):
     torch.manual_seed(seed)
     device = "cuda"
@@ -37,7 +37,7 @@ def _make_gate_resid_inputs(num_tokens, hidden_dim, batch_size, seed):
 
 
 # =====================================================================================
-# KA: fused_dit_rmsnorm_shift_scale  (RMSNorm + AdaLN affine-modulation)
+# fused_dit_rmsnorm_shift_scale  (RMSNorm + AdaLN affine-modulation)
 #   Signature: x, scale_table (fp32 [D]), scale_ts (bf16 [B, T, D]),
 #                 shift_table (fp32 [D]), shift_ts (bf16 [B, T, D]), [sf_scale,] eps
 #   Kernel composes the modulator inline: scale[d] = scale_table[d] + scale_ts[b, d].
@@ -241,7 +241,7 @@ def test_rmsnorm_shift_scale_fp4_quant(hidden_dim, batch_size, tokens_per_batch)
 
 
 # =====================================================================================
-# KC: fused_dit_resid_rmsnorm_shift_scale_dual
+# fused_dit_resid_rmsnorm_shift_scale_dual
 #   bf16  -> (out_dir1, out_dir2);  quant -> (fp4_dir1, sf_dir1, fp4_dir2, sf_dir2)
 #   Post-attn2 site: residual_add(x, attn2_out) -> rms_norm -> two independent
 #   (1+s)*normed+h modulations, feeding the FFN up_proj (dir1) and AV cross-attn to_q (dir2).
@@ -406,7 +406,7 @@ def test_resid_rmsnorm_shift_scale_dual_fp4_quant(hidden_dim, batch_size, tokens
 
 
 # =====================================================================================
-# KB: fused_dit_gate_resid_rmsnorm_shift_scale  (+ _quant)
+# fused_dit_gate_resid_rmsnorm_shift_scale  (+ _quant)
 #   gate-residual -> RMSNorm -> shift_scale. Each modulator (gate, scale, shift) is built
 #   inline from a (table, ts) pair, eliminating the upstream broadcast-add Triton prep kernel.
 # =====================================================================================
@@ -552,7 +552,7 @@ def test_gate_resid_rmsnorm_shift_scale_fp4_quant(hidden_dim, batch_size, tokens
 
 
 # =====================================================================================
-# KD: fused_dit_gate_resid_rmsnorm  (+ _quant)
+# fused_dit_gate_resid_rmsnorm  (+ _quant)
 #   gate[d]    = gate_table[d].to(bf16) + gate_ts[b, d]    (bf16 narrow, bf16 hw add)
 #   x_new[n,d] = x[n,d] + attn_out[n,d] * gate[d]          (in-place)
 #   normed     = rms_norm(x_new)
@@ -657,7 +657,7 @@ def test_gate_resid_rmsnorm_quant_rejects_unsupported_dim():
 
 
 # =====================================================================================
-# GR: fused_dit_gate_resid  (bf16-only, no RMSNorm, no shift_scale)
+# fused_dit_gate_resid  (bf16-only, no RMSNorm, no shift_scale)
 #   x <- x + attn_out * (gate_table.to(bf16) + gate_ts), in-place.
 #   Used at the FFN output gate site (`vx = vx + ff(vx_scaled) * vgate_mlp`).
 # =====================================================================================
