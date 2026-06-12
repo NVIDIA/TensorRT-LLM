@@ -635,12 +635,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             else None
         )
 
-        _mm_ids = [self.image_token_ids]
-        if self.audio_token_ids is not None:
-            _mm_ids.append(self.audio_token_ids)
-        if self.video_token_ids is not None:
-            _mm_ids.append(self.video_token_ids)
-        self._mm_token_ids = torch.cat(_mm_ids) if len(_mm_ids) > 1 else self.image_token_ids
+        _mm_ids = [config.image_token_id]
+        if getattr(config, "audio_token_id", None) is not None:
+            _mm_ids.append(config.audio_token_id)
+        if getattr(config, "video_token_id", None) is not None:
+            _mm_ids.append(config.video_token_id)
+        self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
 
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
