@@ -374,27 +374,29 @@ if IS_MEGAMOE_OP_AVAILABLE:
         _MEGAMOE_LOCAL_WORKSPACE_CACHE[cache_key] = local_workspace
         return local_workspace
 
-    def _zero_local_workspace_preserving_phase(local_workspace, kernel) -> None:
-        """Per-launch zero of the local workspace that PRESERVES the
-        self-priming ``nvlink_barrier_counter`` region (multi-rank EP path).
+    # Counters + small data regions that must be zeroed every launch.
+    # Bulk buffers (l1_token_buffer, l1_sf_buffer, fc1_output, etc.) are
+    # overwritten by dispatch/FC1 and safe to skip.
+    # nvlink_barrier_counter is a phase-flip barrier — NOT zeroed.
+    _LOCAL_MUST_ZERO_NAMES = (
+        "l1_arrival_count",
+        "expert_send_count",
+        "grid_sync_counter",
+        "fc1_done_counter",
+        "fc2_done_counter",
+        "load_balance_counter",
+        # Pad-row stale data would corrupt FC2 → combine scatter.
+        "l1_topk_weights_buffer",
+        "token_src_metadata",
+    )
 
-        The kernel's reusable phase-flip NVLink barrier keeps its cross-rank
-        ``nvlink_barrier_signal`` (in the symmetric shared workspace, which is
-        NOT re-zeroed per launch) in lockstep with this per-rank
-        ``nvlink_barrier_counter``. Re-zeroing the counter while the signal is
-        not reset would decouple the phase and deadlock the barrier. Every
-        other local counter (l1_arrival_count, fc1_done_counter,
-        fc2_done_counter, expert_send_count, ...) still needs a per-launch
-        reset, so we zero the whole buffer except the counter's byte range.
-        """
-        off = int(kernel._local_offsets["nvlink_barrier_counter"])
-        nbytes = int(kernel._local_region_by_name["nvlink_barrier_counter"].nbytes)
-        total = local_workspace.numel()
-        if off > 0:
-            local_workspace[:off].zero_()
-        end = off + nbytes
-        if end < total:
-            local_workspace[end:].zero_()
+    def _zero_local_workspace_preserving_phase(local_workspace, kernel) -> None:
+        for name in _LOCAL_MUST_ZERO_NAMES:
+            if name not in kernel._local_offsets:
+                continue
+            off = int(kernel._local_offsets[name])
+            nbytes = int(kernel._local_region_by_name[name].nbytes)
+            local_workspace[off:off + nbytes].zero_()
 
     # ----- Symmetric-memory provider (NVSHMEM-equivalent) -------------------
     #
@@ -588,17 +590,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
             return byte_view.view(dtype).view(shape)
 
         def get_regions(self) -> MegaMoeSymmRegions:
+            # Re-creating views every call breaks CUDA-graph capture.
+            cached = getattr(self, "_cached_regions", None)
+            if cached is not None:
+                return cached
             hidden = self.hidden_size
             max_t = self.max_tokens_per_rank
             top_k = self.num_topk
-            # ``sf_bytes_per_row`` MUST match the byte width used at
-            # allocation time (``__init__`` above) and at the backend's
-            # ``quantize_input`` output: kernel reads
-            # ``ceil(hidden / 64) * 4`` FP8 bytes per token via the
-            # ``sf_addr`` formula in dispatch_kernel.py. ``hidden // 16``
-            # under-allocates by 2 bytes when hidden % 64 != 0.
             sf_bytes_per_row = megamoe_activation_sf_bytes_per_row(hidden)
-            return MegaMoeSymmRegions(
+            regions = MegaMoeSymmRegions(
                 base_buf=self._buf,
                 activation=self._region_view("activation", (max_t, hidden // 2), torch.uint8),
                 activation_sf=self._region_view(
@@ -615,6 +615,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 rank=self.rank,
                 world_size=self.world_size,
             )
+            self._cached_regions = regions
+            return regions
 
     def get_megamoe_symm_provider(
         *,
