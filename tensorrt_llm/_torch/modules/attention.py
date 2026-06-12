@@ -699,7 +699,7 @@ class Attention(nn.Module):
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         has_lora: bool = False,
-        **kwargs,
+        multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
         num_tokens = attn_metadata.num_tokens
 
@@ -736,7 +736,7 @@ class Attention(nn.Module):
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
-                    **kwargs,
+                    multi_item_part_lens=multi_item_part_lens,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -783,7 +783,7 @@ class Attention(nn.Module):
                 output=output[:num_tokens, :] if output is not None else None,
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
-                multi_item_part_lens=kwargs.get("multi_item_part_lens"),
+                multi_item_part_lens=multi_item_part_lens,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -804,7 +804,7 @@ class Attention(nn.Module):
         mrope_config: Optional[dict],
         attention_sinks: Optional[torch.Tensor] = None,
         has_lora: bool = False,
-        **kwargs,
+        multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
@@ -841,18 +841,20 @@ class Attention(nn.Module):
                 output_sf,
             )
         else:
-            output, output_sf = self._attn_impl(q,
-                                                k,
-                                                v,
-                                                attn_metadata,
-                                                attention_mask,
-                                                mrope_rotary_cos_sin,
-                                                mrope_position_deltas,
-                                                attention_window_size,
-                                                attention_mask_data,
-                                                attention_sinks=attention_sinks,
-                                                has_lora=has_lora,
-                                                **kwargs)
+            output, output_sf = self._attn_impl(
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                attention_window_size,
+                attention_mask_data,
+                attention_sinks=attention_sinks,
+                has_lora=has_lora,
+                multi_item_part_lens=multi_item_part_lens,
+            )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
 
@@ -967,7 +969,6 @@ class Attention(nn.Module):
             attention_sinks=attention_sinks,
             has_lora=bool(lora_params),
             multi_item_part_lens=multi_item_part_lens,
-            **kwargs,
         )
 
         if self.attn_output_gate:
