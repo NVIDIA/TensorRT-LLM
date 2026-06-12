@@ -1173,7 +1173,8 @@ def create_autodeploy_executor(
         )
 
     # Reserve SA workspace before engine build so resize_kv_cache sees less free GPU memory and
-    # sizes the KV cache with room for the SA pool.
+    # sizes the KV cache with room for the SA pool. This is workspace allocation only; there is no
+    # scheduler batch to prepare at this point.
     sa_manager = None
     if spec_config is not None and getattr(spec_config, "sa_config", None) is not None:
         sa_manager = SuffixAutomatonManager(
@@ -1181,7 +1182,7 @@ def create_autodeploy_executor(
             max_num_sequences,
             ad_config.max_seq_len,
         )
-        sa_manager.prepare([], spec_config.max_draft_len)
+        sa_manager._ensure_workspace(spec_config.max_draft_len)
 
     # initialize model engine
     engine = ADEngine.build_from_config(

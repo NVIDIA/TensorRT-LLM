@@ -219,9 +219,9 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
     def _assert_workspace_reserved_before_build(*args, **kwargs):
         # Resize accounting depends on the SA workspace being reserved BEFORE the engine builds
         # (the build runs the KV-cache resize). Asserting from build_from_config's side_effect pins
-        # the ordering: the eager empty-batch prepare() must already have run by the time the engine
+        # the ordering: the eager workspace allocation must already have run by the time the engine
         # is built. A plain assert_called_once after the call would not catch a reordering.
-        mock_sa_manager.prepare.assert_called_once_with([], spec_config.max_draft_len)
+        mock_sa_manager._ensure_workspace.assert_called_once_with(spec_config.max_draft_len)
         return mock_engine
 
     with (

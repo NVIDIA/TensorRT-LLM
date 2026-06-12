@@ -164,7 +164,7 @@ def test_super_mtp_ssm_replay_smoke():
 
 
 def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
-    """Test Llama/Eagle runtime with SA enhancer enabled."""
+    """Test Llama/Eagle runtime with SA enhancer enabled on a repetitive prompt."""
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     test_prompt = "repeat repeat repeat repeat"
@@ -198,10 +198,15 @@ def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
 
     def recording_maybe_override_all_draft_tokens(self, draft_tokens):
         output = original_maybe_override_all_draft_tokens(self, draft_tokens)
+        max_match_len = 0
+        if output.shape[0] > 0 and self.sa_match_len is not None:
+            max_match_len = int(self.sa_match_len[: output.shape[0]].max().item())
         sa_calls["maybe_override_all_draft_tokens"].append(
             {
                 "input_shape": tuple(draft_tokens.shape),
                 "output_shape": tuple(output.shape),
+                "max_match_len": max_match_len,
+                "threshold": self.threshold,
             }
         )
         return output
@@ -225,7 +230,7 @@ def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
         "speculative_model": eagle_model_path,
         "eagle3_layers_to_capture": [0, 1, 2],
         "sa_config": {
-            "threshold": 1,
+            "threshold": 2,
         },
     }
     experiment_config["args"]["speculative_model_kwargs"] = {
@@ -264,6 +269,10 @@ def test_llama_eagle_with_sa_enhancer_smoke(monkeypatch):
     assert all(call["draft_shape"][1] >= 3 for call in sa_calls["extend_and_prepare"])
     assert all(
         call["input_shape"] == call["output_shape"]
+        for call in sa_calls["maybe_override_all_draft_tokens"]
+    )
+    assert any(
+        call["max_match_len"] >= call["threshold"]
         for call in sa_calls["maybe_override_all_draft_tokens"]
     )
 
