@@ -61,6 +61,7 @@ def _compile(
     compress_ratio: int,
     return_output_values: bool,
     cluster_size: int = 1,
+    seqlen_sorted: bool = False,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -107,6 +108,18 @@ def _compile(
         stride_order=(1, 0),
         assumed_align=16,
     )
+    # When seqlen_sorted=False the kernel never reads order_row (the
+    # const_expr branch elides the indirection); pass None so cute.compile
+    # doesn't materialize a placeholder buffer.
+    order_row_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (n_batch,),
+            stride_order=(0,),
+        )
+        if seqlen_sorted
+        else None
+    )
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = GvrTopKKernel(
         dtype=cute_dtype,
@@ -122,6 +135,7 @@ def _compile(
         compress_ratio=compress_ratio,
         return_output_values=return_output_values,
         cluster_size=cluster_size,
+        seqlen_sorted=seqlen_sorted,
     )
     return cute.compile(
         kernel,
@@ -130,6 +144,7 @@ def _compile(
         seq_lens_fake,
         out_values_fake,
         out_indices_fake,
+        order_row_fake,
         stream=fake_stream,
         options="--enable-tvm-ffi",
     )
@@ -155,6 +170,8 @@ def gvr_topk_decode(
     max_seq_len: Optional[int] = None,
     return_output_values: bool = False,
     cluster_size: int = 1,
+    seqlen_sorted: bool = False,
+    order_row: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -175,6 +192,17 @@ def gvr_topk_decode(
                    is forced to 0. Mirrors heuristicTopKDecode.cu PR #14219.
         max_seq_len: Graph-safe hint for peak ``logits.shape[1]`` at replay
                    (same compressed-token-index space as ``logits``).
+        seqlen_sorted: When True, the kernel uses ``order_row`` (an LJF
+                   request-level dispatch order) to resolve which row a
+                   given CTA processes, so longer rows land in earlier
+                   waves. Use together with :func:`gvr_topk_sort_prepare`.
+                   Compatible with ``cluster_size > 1``.
+        order_row: Required iff ``seqlen_sorted=True``. Request-level —
+                   ``int32[batch_size = num_rows // next_n]`` on the same
+                   device as ``logits``; ``order_row[i]`` is the original
+                   request_id of the i-th-priority request. The kernel
+                   expands to row level via
+                   ``order_row[req] * next_n + nn``.
 
     Returns:
         ``(out_values, out_indices)`` both shaped ``[num_rows, top_k]``.
@@ -183,6 +211,19 @@ def gvr_topk_decode(
     assert logits.dim() == 2, f"logits must be 2D, got {logits.shape}"
     assert pre_idx.dim() == 2 and pre_idx.dtype == torch.int32
     assert seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+    if seqlen_sorted:
+        # order_row is request-level (length = seq_lens.shape[0] =
+        # num_rows // next_n), NOT row-level.
+        assert (
+            order_row is not None
+            and order_row.dtype == torch.int32
+            and order_row.is_cuda
+            and order_row.shape == seq_lens.shape
+        ), (
+            "seqlen_sorted=True requires order_row: int32[batch_size] on CUDA"
+            f" (expected shape {tuple(seq_lens.shape)}, got "
+            f"{tuple(order_row.shape) if order_row is not None else None})"
+        )
 
     if logits.dtype not in _DTYPE_TORCH_TO_CUTE:
         raise ValueError(f"Unsupported logits dtype: {logits.dtype}")
@@ -251,20 +292,38 @@ def gvr_topk_decode(
         compress_ratio,
         return_output_values,
         cluster_size,
+        seqlen_sorted,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
+    # When seqlen_sorted=False the const_expr branch elides the order_row
+    # read so the kernel accepts None for that slot as well.
     compiled(
         logits,
         pre_idx,
         seq_lens,
         out_values if return_output_values else None,
         out_indices,
+        order_row if seqlen_sorted else None,
     )
     if return_output_values:
         return out_values, out_indices
     else:
         return None, out_indices
+
+
+def gvr_topk_sort_prepare(seq_lens: torch.Tensor) -> torch.Tensor:
+    """Build the LJF dispatch order for :func:`gvr_topk_decode`.
+
+    Returns ``int32[num_rows]`` whose i-th entry is the original-batch
+    index of the i-th longest row. Run once per decode step; the same
+    ``order_row`` is reused across all per-layer ``gvr_topk_decode``
+    calls with ``seqlen_sorted=True`` (seq_lens is layer-invariant
+    within a decode step). For an LB-style two-bucket partition, use
+    :func:`gvr_topk_lb_prepare` instead.
+    """
+    assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+    return torch.argsort(seq_lens, descending=True, stable=False).to(torch.int32)
 
 
 # ---- Load-Balance (Idea C) wrappers ----------------------------------------
