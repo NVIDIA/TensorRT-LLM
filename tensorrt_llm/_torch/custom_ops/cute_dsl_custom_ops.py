@@ -6485,7 +6485,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # Used by the CUTEDSL attention backend (see attention_backend/cute_dsl.py).
     #
     # One generic Runner ``CuteDSLNVMlaDecodeBlackwellRunner`` services both
-    # FP8 and FP16 paths — only the cutlass ``in_dtype`` is passed at
+    # FP8 and FP16/BF16 paths — only the cutlass ``in_dtype`` is passed at
     # construction; the kernel class is derived from it via
     # ``CuteDSLNVMlaDecodeBlackwellRunner._KERNEL_CLASS_BY_DTYPE``. Each
     # dtype still has its own ``@torch.library.custom_op`` (distinct op
@@ -6498,6 +6498,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     #
     #   torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
     #       → CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float16)
+    #         or CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.BFloat16)
     #         (→ BlackwellMultiHeadLatentAttentionForwardFP16)
     # =========================================================================
 
@@ -6511,13 +6512,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
         """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
 
-        Works for both FP8 and FP16 — pass the cutlass input dtype at
+        Works for FP8, FP16, and BF16 — pass the cutlass input dtype at
         construction; the kernel class is derived from it:
 
             CuteDSLNVMlaDecodeBlackwellRunner(
                 in_dtype=cutlass.Float8E4M3FN, ...)   # → ...ForwardFP8
             CuteDSLNVMlaDecodeBlackwellRunner(
                 in_dtype=cutlass.Float16, ...)        # → ...ForwardFP16
+            CuteDSLNVMlaDecodeBlackwellRunner(
+                in_dtype=cutlass.BFloat16, ...)       # → ...ForwardFP16
 
         ``get_valid_tactics`` returns the tiler shapes as tactics
         (``(mma_qk_tiler_mn, mma_pv_tiler_mn)`` tuples), filtered by the
@@ -6537,6 +6540,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _KERNEL_CLASS_BY_DTYPE = {
             cutlass.Float8E4M3FN: BlackwellMultiHeadLatentAttentionForwardFP8,
             cutlass.Float16: BlackwellMultiHeadLatentAttentionForwardFP16,
+            cutlass.BFloat16: BlackwellMultiHeadLatentAttentionForwardFP16,
         }
 
         def __init__(
@@ -6692,8 +6696,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.is_persistent,
                     self.is_var_seq,
                     self.is_var_split_kv,
-                    num_heads=self.num_heads,
-                    seq_len_q=self.seq_len_q,
                 )
 
                 q_latent_ct = cute.runtime.from_dlpack(
@@ -6713,8 +6715,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     o, assumed_align=16).mark_layout_dynamic(leading_dim=1)
                 lse_ct = cute.runtime.from_dlpack(
                     lse, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-                workspace_ct = cute.runtime.from_dlpack(
+                # An empty workspace means split_kv == 1: the kernel's
+                # initialize_workspace builds the acc_o/acc_lse accumulators iff
+                # ``workspace is not None`` (regardless of split_kv), so a
+                # non-None but zero-sized workspace makes it write the partials
+                # into a 0-byte buffer (illegal global write). Pass None so the
+                # split_kv kernel writes the final result straight into ``o``.
+                workspace_ct = (cute.runtime.from_dlpack(
                     workspace, assumed_align=16).mark_layout_dynamic()
+                                if workspace.numel() > 0 else None)
                 cache_seqs_ct = cute.runtime.from_dlpack(
                     cache_seqs, assumed_align=16).mark_layout_dynamic()
                 block_split_kvs_ct = (cute.runtime.from_dlpack(
@@ -6751,7 +6760,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 page_table,
                 o,
                 lse,
-                workspace,
+                workspace if workspace.numel() > 0 else None,
                 split_kv,
                 cache_seqs,
                 block_split_kvs if self.is_var_split_kv else None,
@@ -6875,7 +6884,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_scale: float,
         output_scale: float,
     ) -> None:
-        """CuTe DSL FP16 MLA decode (Blackwell SM100/SM103).
+        """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
 
         ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
         see ``BlackwellMultiHeadLatentAttentionForwardFP16``.
@@ -6885,8 +6894,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 f"trtllm::cute_dsl_mla_decode_fp16_blackwell requires SM 100 "
                 f"or SM 103, got SM {sm_version}")
 
+        if q_latent.dtype == torch.float16:
+            in_dtype = cutlass.Float16
+        elif q_latent.dtype == torch.bfloat16:
+            in_dtype = cutlass.BFloat16
+        else:
+            raise ValueError(
+                "trtllm::cute_dsl_mla_decode_fp16_blackwell supports "
+                "torch.float16 or torch.bfloat16 inputs, got "
+                f"{q_latent.dtype}")
+        if not (
+                q_rope.dtype == c_latent.dtype == c_rope.dtype == o.dtype
+                == q_latent.dtype):
+            raise ValueError(
+                "trtllm::cute_dsl_mla_decode_fp16_blackwell requires q, KV, "
+                f"and output dtypes to match; got q_latent={q_latent.dtype}, "
+                f"q_rope={q_rope.dtype}, c_latent={c_latent.dtype}, "
+                f"c_rope={c_rope.dtype}, o={o.dtype}")
+
         runner = CuteDSLNVMlaDecodeBlackwellRunner(
-            in_dtype=cutlass.Float16,
+            in_dtype=in_dtype,
             num_heads=num_heads,
             seq_len_q=seq_len_q,
             page_size=page_size,
