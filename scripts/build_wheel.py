@@ -667,20 +667,37 @@ def main(*,
 
     targets = ["tensorrt_llm", "nvinfer_plugin_tensorrt_llm"]
 
+    # Allow `-D BUILD_DEEP_EP=OFF` etc. via --extra-cmake-vars to actually
+    # exclude those targets from the build.  Otherwise the named target
+    # would still be in BUILD_WHEEL_TARGETS and ninja would fail to find it
+    # once the corresponding subdirectory is gated out.
+    def _override_off(name: str) -> bool:
+        # By this point, line ~600 has transformed entries to '"-DKEY=VAL"'
+        # form.  Strip enclosing quotes and a leading -D to compare.
+        for v in (extra_cmake_vars or ()):
+            stripped = v.strip().strip('"').lstrip('-').lstrip('D').lstrip(' ')
+            if stripped in (f"{name}=OFF", f"{name}=0", f"{name}=Off",
+                            f"{name}=off"):
+                return True
+        return False
+
     if cpp_only:
         build_pyt = "OFF"
         build_deep_ep = "OFF"
         build_deep_gemm = "OFF"
         build_flash_mla = "OFF"
     else:
-        targets.extend([
-            "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
-            "flash_mla"
-        ])
         build_pyt = "ON"
-        build_deep_ep = "ON"
-        build_deep_gemm = "ON"
-        build_flash_mla = "ON"
+        build_deep_ep = "OFF" if _override_off("BUILD_DEEP_EP") else "ON"
+        build_deep_gemm = "OFF" if _override_off("BUILD_DEEP_GEMM") else "ON"
+        build_flash_mla = "OFF" if _override_off("BUILD_FLASH_MLA") else "ON"
+        targets.extend(["th_common", "bindings", "pg_utils"])
+        if build_deep_ep == "ON":
+            targets.append("deep_ep")
+        if build_deep_gemm == "ON":
+            targets.append("deep_gemm")
+        if build_flash_mla == "ON":
+            targets.append("flash_mla")
 
     if benchmarks:
         targets.append("benchmarks")
@@ -1030,9 +1047,14 @@ def main(*,
         binding_lib_file_name = binding_lib_dir.name
         install_file(binding_lib_dir, pkg_dir)
 
-        with (build_dir / "tensorrt_llm" / "deep_ep" /
-              "cuda_architectures.txt").open() as f:
-            deep_ep_cuda_architectures = f.read().strip().strip(";")
+        deep_ep_archs_file = (build_dir / "tensorrt_llm" / "deep_ep" /
+                              "cuda_architectures.txt")
+        if deep_ep_archs_file.exists():
+            with deep_ep_archs_file.open() as f:
+                deep_ep_cuda_architectures = f.read().strip().strip(";")
+        else:
+            # BUILD_DEEP_EP=OFF -- skip deep_ep packaging
+            deep_ep_cuda_architectures = ""
         if deep_ep_cuda_architectures:
             install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"),
                          pkg_dir)
@@ -1053,23 +1075,27 @@ def main(*,
                 "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
                 lib_dir / "nvshmem")
 
-        install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
-                     pkg_dir)
-        install_tree(build_dir / "tensorrt_llm" / "deep_gemm" / "python" /
-                     "deep_gemm",
-                     deep_gemm_dir,
-                     dirs_exist_ok=True)
-
-        with (build_dir / "tensorrt_llm" / "flash_mla" /
-              "cuda_architectures.txt").open() as f:
-            flash_mla_cuda_architectures = f.read().strip().strip(";")
-        if flash_mla_cuda_architectures:
-            install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
+        if build_deep_gemm == "ON":
+            install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
                          pkg_dir)
-            install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
-                         "flash_mla",
-                         pkg_dir / "flash_mla",
+            install_tree(build_dir / "tensorrt_llm" / "deep_gemm" / "python" /
+                         "deep_gemm",
+                         deep_gemm_dir,
                          dirs_exist_ok=True)
+
+        if build_flash_mla == "ON":
+            with (build_dir / "tensorrt_llm" / "flash_mla" /
+                  "cuda_architectures.txt").open() as f:
+                flash_mla_cuda_architectures = f.read().strip().strip(";")
+            if flash_mla_cuda_architectures:
+                install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
+                             pkg_dir)
+                install_tree(build_dir / "tensorrt_llm" / "flash_mla" /
+                             "python" / "flash_mla",
+                             pkg_dir / "flash_mla",
+                             dirs_exist_ok=True)
+        else:
+            flash_mla_cuda_architectures = ""
 
         if not skip_stubs:
             with working_directory(pkg_dir):
