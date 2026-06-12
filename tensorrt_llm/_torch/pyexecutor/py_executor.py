@@ -517,8 +517,6 @@ class PyExecutor:
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
-        self.benchmark_fill_stall_timeout_s = float(
-            os.environ.get("TLLM_BENCHMARK_FILL_STALL_TIMEOUT_S", 60.0))
 
         # list of requests in each PP micro batch
         self.num_micro_batches = max(self.dist.pp_size,
@@ -588,6 +586,9 @@ class PyExecutor:
         def on_detected():
             logger.error(
                 f"Hang detected on rank {self.global_rank} in PyExecutor.")
+            if self._event_loop_error is None:
+                self._event_loop_error = RuntimeError(
+                    f"Hang detected on rank {self.global_rank} in PyExecutor.")
             self.shutdown_event.set()
             self.is_shutdown = True
 
@@ -2740,67 +2741,30 @@ class PyExecutor:
             # scheduler could not allocate KV for any of them, the benchmark
             # will hang forever because in-progress generation requests won't
             # release their KV cache.
-            #
-            # Only watch during the fill phase: once fill completes the count
-            # stays at its target value through the entire decode, which would
-            # otherwise look like a stall. With ADP, requests are sharded
-            # across TP ranks so the comparison must use the global count
-            # (allgather) against the global target.
-            if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
-                    and not self.is_warmup):
-                # NOTE: keep the gate condition free of any per-rank state
-                # (e.g. `fitting_disagg_gen_init_requests`).  The
-                # `tp_allgather` below is a collective and every ADP rank
-                # must participate together; otherwise ranks desync and a
-                # later allgather mixes payload shapes (list[int] from
-                # gather_all_rank_states vs int from the gate's
-                # _is_benchmark_disagg_fill_complete), producing TypeErrors
-                # like "argument after * must be an iterable, not int" or
-                # "unsupported operand type(s) for +: 'int' and 'list'".
-                # The per-rank "still has fitting requests" hint is folded
-                # into the same allgather so we can suppress the stall
-                # check globally when any rank is still making progress.
-                local_ready_gen = sum(
-                    1 for req in self.active_requests if req.state in (
-                        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
-                        LlmRequestState.GENERATION_IN_PROGRESS,
-                    ))
-                local_has_fitting = 1 if fitting_disagg_gen_init_requests else 0
-                if self.enable_attention_dp:
-                    responses = self.dist.tp_allgather(
-                        [local_ready_gen, local_has_fitting])
-                    total_ready_gen = sum(r[0] for r in responses)
-                    any_rank_has_fitting = any(r[1] for r in responses)
-                else:
-                    total_ready_gen = local_ready_gen
-                    any_rank_has_fitting = bool(local_has_fitting)
-
-                if not any_rank_has_fitting:
-                    now = time.time()
-                    last_count = getattr(self, "_bench_disagg_last_gen_count",
-                                         None)
-                    last_change_time = getattr(
-                        self, "_bench_disagg_last_gen_count_time", None)
-                    if (last_count != total_ready_gen
-                            or last_change_time is None):
-                        self._bench_disagg_last_gen_count = total_ready_gen
-                        self._bench_disagg_last_gen_count_time = now
-                    elif (now - last_change_time
-                          > self.benchmark_fill_stall_timeout_s
-                          and total_ready_gen < self.benchmark_req_queues_size):
-                        error_msg = (
-                            f"Benchmark gen request count stalled at "
-                            f"{total_ready_gen} "
-                            f"for {now - last_change_time:.0f}s "
-                            f"(target {self.benchmark_req_queues_size}, "
-                            f"fetched={self.num_fetch_requests}). "
-                            f"Likely causes: KV transfer stuck, KV cache pool "
-                            f"too small, or transceiver deadlock. Aborting all "
-                            f"active requests.")
-                        logger.error(error_msg)
-                        self._handle_errors(error_msg,
-                                            requests=self.active_requests)
-                        return None, None
+            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
+                    and not fitting_disagg_gen_init_requests):
+                stuck_init_requests = [
+                    req for req in self.active_requests
+                    if req.is_disagg_generation_init_state
+                ]
+                # Only fail once all benchmark requests have been fetched
+                # so that _handle_errors covers every request and every
+                # client receives an error response.
+                if (stuck_init_requests and self.num_fetch_requests
+                        >= self.benchmark_req_queues_size):
+                    error_msg = (
+                        f"Insufficient KV cache for gen-only benchmark mode: "
+                        f"{len(stuck_init_requests)} request(s) are waiting for "
+                        f"KV cache allocation but the scheduler could not fit "
+                        f"any of them. Increase free_gpu_memory_fraction or "
+                        f"reduce TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
+                        f"{self.benchmark_req_queues_size}).")
+                    logger.error(error_msg)
+                    # Fail all active and waiting requests so every
+                    # client receives an error instead of hanging.
+                    self._handle_errors(error_msg,
+                                        requests=self.active_requests)
+                    return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -4400,27 +4364,26 @@ class PyExecutor:
             gen_first_ctx_requests)
 
     def _count_schedulable_active_requests(self) -> int:
-        """Count active requests eligible for scheduling.
+        """Count active requests that are ready for scheduling.
 
-        Excludes GENERATION_TO_COMPLETE (V2 scheduler skips state
-        >= GENERATION_TO_COMPLETE) and, in disaggregated mode, requests
-        still awaiting KV cache transfer.
+        In non-disaggregated mode, all active requests are schedulable.
+        In disaggregated mode, requests still waiting for KV cache
+        transfer (in INIT or transmission-in-progress state) are
+        excluded because they cannot participate in the forward pass
+        until transfer completes.
+
+        Returns:
+            The number of active requests eligible for scheduling.
         """
-
-        def _is_to_complete(req) -> bool:
-            return req.state == LlmRequestState.GENERATION_TO_COMPLETE
-
         if self.kv_cache_transceiver is None:
-            return sum(1 for req in self.active_requests
-                       if not _is_to_complete(req))
+            return len(self.active_requests)
 
         def _is_awaiting_kv_transfer(req) -> bool:
             return (req.is_disagg_generation_init_state
                     or req.is_disagg_generation_transmission_in_progress)
 
-        return sum(
-            1 for req in self.active_requests
-            if not _is_awaiting_kv_transfer(req) and not _is_to_complete(req))
+        return sum(1 for req in self.active_requests
+                   if not _is_awaiting_kv_transfer(req))
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
@@ -4456,14 +4419,21 @@ class PyExecutor:
     def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
         if not self.enable_attention_dp or self.kv_cache_transceiver is None:
             return
+        has_ctx = False
+        has_gen = False
         for req in candidates:
             rt = getattr(req, "llm_request_type", None)
             if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
-                self._adp_dummy_is_gen = False
-                return
-            if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
-                self._adp_dummy_is_gen = True
-                return
+                has_ctx = True
+            elif rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+                has_gen = True
+        # Prefer the CTX role when both types are present this iteration: a CTX
+        # dummy is padded to max_num_tokens so idle ranks keep MoE all-to-all
+        # token counts comparable with ranks doing real context work.
+        if has_ctx:
+            self._adp_dummy_is_gen = False
+        elif has_gen:
+            self._adp_dummy_is_gen = True
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
@@ -4482,8 +4452,6 @@ class PyExecutor:
         # Other ranks have work but this rank is idle — insert a dummy so
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
-            # Pad CTX-type dummies to max_num_tokens so the MoE all-to-all
-            # sees a comparable token count across ranks.
             token_nums = None
             if (not self._adp_dummy_is_gen
                     and self.kv_cache_transceiver is not None
@@ -5518,17 +5486,20 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
-        if self.enable_attention_dp and self.dist.world_size != 1:
+        if (self.kv_cache_transceiver is not None and self.enable_attention_dp
+                and self.dist.world_size != 1):
             any_timed_out = any(self.dist.tp_allgather(
                 bool(timed_out_requests)))
             if any_timed_out:
                 self._handle_errors(error_msg="Request timed out (KV transfer)",
-                                    requests=timed_out_requests)
+                                    requests=timed_out_requests,
+                                    charge_budget=False)
         else:
             for req in timed_out_requests:
                 self._handle_errors(
                     error_msg=f"Request {req.py_request_id} timed out",
-                    requests=[req])
+                    requests=[req],
+                    charge_budget=False)
         return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,

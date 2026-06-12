@@ -693,25 +693,18 @@ def test_adp_dummy_role_unchanged_when_attention_dp_disabled():
     assert stub._adp_dummy_is_gen is True
 
 
-def test_pad_dummy_excludes_generation_to_complete_in_disagg():
-    stub = _StubADPExecutor()
-    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
-    stub.expected_num_active_requests = 1
-
-    _run_pad(stub)
-
-    assert len(stub.add_dummy_calls) == 1
-    assert len(stub.active_requests) == 2
-
-
-def test_pad_dummy_excludes_generation_to_complete_in_non_disagg():
+def test_pad_dummy_counts_generation_to_complete():
+    # Regression for test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance:
+    # a GENERATION_TO_COMPLETE request still counts as active, so no dummy is added
+    # on top of it (which would overflow max_batch_size=1).
     stub = _StubADPExecutor(kv_cache_transceiver=None)
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
 
-    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls == []
+    assert len(stub.active_requests) == 1
 
 
 def test_pad_dummy_skips_when_active_request_present():
@@ -762,6 +755,22 @@ def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
 
+def test_pad_dummy_ctx_added_for_disagg_rank_only_awaiting_kv_transfer():
+    # Disagg ADP: a rank whose only request is awaiting KV transfer counts as
+    # idle (excluded by _count_schedulable), so a CTX dummy padded to
+    # max_num_tokens is added to keep it in the MoE all-to-all.
+    stub = _StubADPExecutor(max_num_tokens=4096)
+    stub._adp_dummy_is_gen = False
+    stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["token_nums"] == [4096]
+    assert stub.add_dummy_calls[0]["is_gen"] is False
+
+
 def test_pad_dummy_no_op_when_attention_dp_disabled():
     stub = _StubADPExecutor(enable_attention_dp=False)
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
@@ -770,3 +779,111 @@ def test_pad_dummy_no_op_when_attention_dp_disabled():
     _run_pad(stub)
 
     assert stub.add_dummy_calls == []
+
+
+# ---------------------------------------------------------------------------
+# ADP-safe disagg cache error handling (#13900): all TP ranks enter _handle_errors together.
+# ---------------------------------------------------------------------------
+def _err_req():
+    return _make_adp_request(LlmRequestState.DISAGG_TRANS_ERROR)
+
+
+def _make_disagg_err_stub(
+    *,
+    enable_attention_dp=True,
+    kv_cache_transceiver=object(),
+    world_size=2,
+    active_requests=None,
+    tp_allgather_result=None,
+):
+    stub = types.SimpleNamespace()
+    stub.enable_attention_dp = enable_attention_dp
+    stub.kv_cache_transceiver = kv_cache_transceiver
+    stub.active_requests = active_requests if active_requests is not None else []
+    stub.dist = Mock()
+    stub.dist.world_size = world_size
+    stub.dist.rank = 0
+    if tp_allgather_result is not None:
+        stub.dist.tp_allgather = Mock(return_value=tp_allgather_result)
+    else:
+        stub.dist.tp_allgather = Mock(side_effect=lambda v: [v])
+    stub.handle_errors_calls = []
+
+    def _rec_handle_errors(error_msg, requests=None, charge_budget=True):
+        stub.handle_errors_calls.append(
+            {"error_msg": error_msg, "requests": requests, "charge_budget": charge_budget}
+        )
+
+    stub._handle_errors = _rec_handle_errors
+    for helper in (
+        "_handle_disagg_cache_errors_synced",
+        "_get_disagg_reqs_in_error_state",
+        "_check_cache_transfer_errors",
+    ):
+        setattr(stub, helper, types.MethodType(getattr(PyExecutor, helper), stub))
+    return stub
+
+
+class TestDisaggCacheErrorsSynced:
+    def test_guard_short_circuits_without_transceiver(self):
+        stub = _make_disagg_err_stub(kv_cache_transceiver=None, active_requests=[_err_req()])
+        stub._handle_disagg_cache_errors_synced()
+        stub.dist.tp_allgather.assert_not_called()
+        assert stub.handle_errors_calls == []
+
+    def test_guard_short_circuits_without_adp(self):
+        stub = _make_disagg_err_stub(enable_attention_dp=False, active_requests=[_err_req()])
+        stub._handle_disagg_cache_errors_synced()
+        stub.dist.tp_allgather.assert_not_called()
+        assert stub.handle_errors_calls == []
+
+    def test_guard_short_circuits_single_rank(self):
+        stub = _make_disagg_err_stub(world_size=1, active_requests=[_err_req()])
+        stub._handle_disagg_cache_errors_synced()
+        stub.dist.tp_allgather.assert_not_called()
+        assert stub.handle_errors_calls == []
+
+    def test_all_ranks_enter_when_a_peer_has_error(self):
+        # Local rank has NO error reqs, but a peer does (tp_allgather sees True);
+        # this rank must STILL call _handle_errors so all ranks enter together.
+        stub = _make_disagg_err_stub(active_requests=[], tp_allgather_result=[False, True])
+        stub._handle_disagg_cache_errors_synced()
+        assert len(stub.handle_errors_calls) == 1
+        assert stub.handle_errors_calls[0]["requests"] == []
+        assert stub.handle_errors_calls[0]["charge_budget"] is False
+
+    def test_no_handle_when_no_rank_has_error(self):
+        stub = _make_disagg_err_stub(active_requests=[], tp_allgather_result=[False, False])
+        stub._handle_disagg_cache_errors_synced()
+        assert stub.handle_errors_calls == []
+
+    def test_local_error_req_forwarded_request_scoped(self):
+        err = _err_req()
+        ok = _make_adp_request(_STATE_GENERATION_IN_PROGRESS)
+        stub = _make_disagg_err_stub(active_requests=[ok, err], tp_allgather_result=[True])
+        stub._handle_disagg_cache_errors_synced()
+        assert len(stub.handle_errors_calls) == 1
+        assert stub.handle_errors_calls[0]["requests"] == [err]
+        assert stub.handle_errors_calls[0]["charge_budget"] is False
+
+
+class TestCheckCacheTransferErrorsAdpNoop:
+    def test_noop_under_adp_multirank(self):
+        # Even with an error req present, ADP+world_size>1 defers to the synced handler.
+        stub = _make_disagg_err_stub(active_requests=[_err_req()])
+        stub._check_cache_transfer_errors("ctx")
+        assert stub.handle_errors_calls == []
+
+    def test_handles_error_when_not_adp(self):
+        err = _err_req()
+        stub = _make_disagg_err_stub(enable_attention_dp=False, active_requests=[err])
+        stub._check_cache_transfer_errors("ctx")
+        assert len(stub.handle_errors_calls) == 1
+        assert stub.handle_errors_calls[0]["requests"] == [err]
+        assert stub.handle_errors_calls[0]["charge_budget"] is False
+
+    def test_handles_error_on_single_rank(self):
+        err = _err_req()
+        stub = _make_disagg_err_stub(world_size=1, active_requests=[err])
+        stub._check_cache_transfer_errors("gen")
+        assert len(stub.handle_errors_calls) == 1
