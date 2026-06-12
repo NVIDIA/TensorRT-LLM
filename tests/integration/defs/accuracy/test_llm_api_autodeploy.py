@@ -370,6 +370,9 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
                 "torch_dtype": "bfloat16"
             },
         }
+        kwargs.setdefault("transforms",
+                          {}).setdefault("compile_model",
+                                         {})["piecewise_enabled"] = False
 
         return kwargs
 
@@ -671,6 +674,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         kwargs["attn_backend"] = attn_backend
         kwargs.setdefault("transforms", {}).setdefault(
             "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
+        if enable_attention_dp:
+            kwargs.setdefault("transforms",
+                              {}).setdefault("compile_model",
+                                             {})["piecewise_enabled"] = False
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,
@@ -1508,7 +1515,11 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                      id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
         pytest.param(
             "Qwen/QwQ-32B",
-            {},
+            {"transforms": {
+                "compile_model": {
+                    "piecewise_enabled": False
+                }
+            }},
             [MMLU],
             marks=pytest.mark.skip_less_device_memory(80000),
             id="Qwen_QwQ-32B",

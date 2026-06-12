@@ -679,7 +679,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         )
         tp_size = vgm.tp_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
-        cp_size = vgm.cp_size if vgm else 1
+        ring_size = vgm.ring_size if vgm else 1
         head_divisibility_factor = tp_size * ulysses_size
 
         if (ulysses_size > 1 or tp_size > 1) and (
@@ -692,10 +692,11 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 f"TP * Ulysses size ({tp_size} * {ulysses_size})"
             )
 
-        if cp_size > 1:
-            # Context parallelism is not compatible with Cosmos3 cross-attention: its forward()
-            # TODO: Re-enable once Ring/Attn2D PRs with cross-attention support have landed.
-            raise NotImplementedError("Context parallelism is not supported for Cosmos3. ")
+        if ring_size > 1:
+            # Ring parallelism is not compatible with Cosmos3 cross-attention.
+            raise NotImplementedError(
+                "Ring parallelism is not supported for Cosmos3 cross-attention."
+            )
 
         self.language_model = Cosmos3LanguageModel(model_config)
 
