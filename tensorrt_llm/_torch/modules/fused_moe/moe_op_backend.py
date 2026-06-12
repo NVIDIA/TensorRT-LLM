@@ -107,6 +107,7 @@ class MoEOpBackend:
         gemm2_weights_scale: torch.Tensor,
         num_experts: int,
         top_k: int,
+        num_fused_shared_experts: Optional[int],
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
@@ -248,6 +249,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         gemm2_weights_scale,
         num_experts,
         top_k,
+        num_fused_shared_experts,
         n_group,
         topk_group,
         intermediate_size,
@@ -276,6 +278,7 @@ class TRTLLMOpBackend(MoEOpBackend):
             gemm2_weights_scale,
             num_experts,
             top_k,
+            num_fused_shared_experts,
             n_group,
             topk_group,
             intermediate_size,
@@ -591,6 +594,7 @@ class FlashinferOpBackend(MoEOpBackend):
         gemm2_weights_scale,
         num_experts,
         top_k,
+        num_fused_shared_experts,
         n_group,
         topk_group,
         intermediate_size,
@@ -608,6 +612,9 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
+        assert not num_fused_shared_experts, (
+            "Flashinfer backend does not support fusing shared experts"
+        )
         if router_logits is not None:
             return self._fused_moe.trtllm_fp8_block_scale_moe(
                 router_logits,

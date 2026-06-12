@@ -356,6 +356,17 @@ class ConfigurableMoE(MoE):
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
 
+    @property
+    def num_fused_shared_expert(self) -> int:
+        """Expose the backend's fused-shared-expert count so model code (e.g.
+        DeepseekV3 post_load_weights / shared-expert TP sizing) sees it through
+        this wrapper. Returns 0 when the backend does not support fusion."""
+        return getattr(self.backend, "num_fused_shared_expert", 0)
+
+    def fuse_shared_expert(self, shared_experts):
+        """Delegate shared-expert fusion to the backend (e.g. TRTLLMGenFusedMoE)."""
+        return self.backend.fuse_shared_expert(shared_experts)
+
     def validate_config(self):
         """
         Validate configuration parameters
