@@ -332,12 +332,8 @@ def test_eagle_wrapper_sa_override_requires_manager():
     with pytest.raises(RuntimeError):
         wrapper._maybe_apply_sa_draft_override(next_new_tokens, num_prefill=1, sa_manager=None)
 
-    wrapper._maybe_apply_sa_draft_override(
-        next_new_tokens,
-        num_prefill=2,
-        sa_manager=None,
-        require_sa_manager=False,
-    )
+    with pytest.raises(RuntimeError):
+        wrapper._maybe_apply_sa_draft_override(next_new_tokens, num_prefill=2, sa_manager=None)
 
 
 def test_eagle_wrapper_cached_forward_requires_manager_when_sa_enabled():
@@ -391,7 +387,6 @@ def test_eagle_wrapper_forward_unpacks_spec_dec_args():
         mock_cached.assert_called_once_with(
             csi,
             sa_manager=sa_manager,
-            require_sa_manager=True,
         )
         mock_prefill.assert_not_called()
 

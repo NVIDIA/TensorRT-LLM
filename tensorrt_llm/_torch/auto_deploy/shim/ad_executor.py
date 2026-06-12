@@ -440,9 +440,7 @@ class ADEngine(ModelEngine):
             dist_config: DistConfig (single source of truth for distributed config within AD).
             mapping: Mapping for external TRT-LLM APIs (KV cache, sampler, etc.).
             reporting_info: Reporting configuration for logging.
-            sa_manager: SA suffix-automaton manager, set when SA enhancement is enabled. Owned by
-                the PyExecutor resource managers; passed in here so the engine holds it from
-                construction rather than lazily fetching it during prepare_inputs.
+            sa_manager: SA suffix-automaton manager, set when SA enhancement is enabled.
         """
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
         # This is not correctly declared in the base ModelEngine class though...

@@ -646,7 +646,7 @@ def test_resize_kv_cache_transform_runs_when_needed():
     assert info.skipped is False
 
 
-def test_resize_kv_cache_does_not_require_live_sa_manager():
+def test_resize_kv_cache_forwards_sa_manager_to_speculative_model():
     from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
     kv_cache_config = KvCacheConfig(
@@ -688,8 +688,7 @@ def test_resize_kv_cache_does_not_require_live_sa_manager():
     assert info.skipped is False
     assert isinstance(spec_dec_args, SpeculativeDecodingModelArgs)
     assert spec_dec_args.cache_seq_interface is cm
-    assert spec_dec_args.sa_manager is None
-    assert spec_dec_args.require_sa_manager is False
+    assert spec_dec_args.sa_manager is sa_manager
     resize_kv_cache_manager.assert_called_once_with(0)
 
 

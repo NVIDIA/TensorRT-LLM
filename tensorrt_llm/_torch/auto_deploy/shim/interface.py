@@ -1379,16 +1379,11 @@ class SpeculativeDecodingModelArgs:
             ``PyExecutor`` resource managers and held by the AutoDeploy engine as a reference. Set
             only when SA enhancement is enabled (``spec_config.sa_config`` is not ``None``) and the
             manager exists; ``None`` otherwise (e.g. non-SA speculation).
-        require_sa_manager: Whether a configured SA draft enhancer must receive ``sa_manager``.
-            Runtime and CUDA graph capture use the default ``True``. The KV-cache resize pass sets
-            this to ``False`` after the SA workspace has already been reserved, because resize only
-            needs that memory to be unavailable to the KV-cache allocator.
     """
 
     cache_seq_interface: CachedSequenceInterface
     sa_manager: Optional[object] = None
-    require_sa_manager: bool = True
 
     def __hash__(self) -> int:
         """Hash by resource identity so cudagraph static-arg checks survive wrapper recreation."""
-        return hash((id(self.cache_seq_interface), id(self.sa_manager), self.require_sa_manager))
+        return hash((id(self.cache_seq_interface), id(self.sa_manager)))

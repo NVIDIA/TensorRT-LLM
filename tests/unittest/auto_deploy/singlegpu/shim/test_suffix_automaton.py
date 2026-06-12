@@ -43,3 +43,36 @@ def test_prepare_reserves_gpu_workspace():
         assert free_after < free_before
     finally:
         manager.shutdown()
+
+
+def test_warmup_dummy_request_ids_do_not_create_request_state():
+    """Synthetic resize/cudagraph request IDs should not populate real SA request slots."""
+    max_seq_len = 64
+    max_num_requests = 2
+    max_draft_len = 3
+    manager = SuffixAutomatonManager(
+        SAConfig(max_seq_len=max_seq_len, max_slots=max_num_requests),
+        max_num_requests=max_num_requests,
+    )
+
+    try:
+        warmup_request_ids = [100, 101]
+        manager.prepare(warmup_request_ids, max_draft_len)
+        accepted_tokens = torch.ones(
+            (len(warmup_request_ids), max_draft_len + 1), dtype=torch.int32, device="cuda"
+        )
+        num_accepted_tokens = torch.ones(
+            (len(warmup_request_ids),), dtype=torch.int32, device="cuda"
+        )
+
+        manager.extend(
+            warmup_request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+        )
+
+        assert manager._request_to_slot == {}
+        assert manager._active_slots == set()
+    finally:
+        manager.shutdown()

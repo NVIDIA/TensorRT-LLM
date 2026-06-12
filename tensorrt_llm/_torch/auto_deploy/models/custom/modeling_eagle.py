@@ -819,7 +819,6 @@ class EagleWrapper(nn.Module):
             hidden_states = fc(hidden_states)
         return hidden_states
 
-    # TODO: go through this logic, not sure if it is correct at the moment
     def apply_d2t(self, draft_output_ids: torch.Tensor) -> torch.Tensor:
         """Apply draft-to-target token mapping if available."""
         d2t = getattr(self._draft_inner_model, "d2t", None)
@@ -858,14 +857,13 @@ class EagleWrapper(nn.Module):
 
         - If spec_dec_args is provided: inference mode (after graph transforms + cache init, or
           the KV-cache resize transform). Its cache_seq_interface drives the cached path; its
-          sa_manager (possibly None) drives optional SA draft enhancement.
+          sa_manager drives optional SA draft enhancement.
         - Otherwise: prefill-only mode (export time, before caches are inserted).
         """
         if spec_dec_args is not None:
             return self._forward_with_kv_cache(
                 spec_dec_args.cache_seq_interface,
                 sa_manager=spec_dec_args.sa_manager,
-                require_sa_manager=spec_dec_args.require_sa_manager,
             )
         else:
             return self._forward_prefill_only(**kwargs)
@@ -948,8 +946,6 @@ class EagleWrapper(nn.Module):
         Returns:
             Tensor of shape [num_tokens, hidden_size * num_capture_layers].
         """
-        # TODO: we should eventually use the resource manager to have them be concatenated before
-        # and we just write into a view and hence can just take the whole tensor here.
         buffers = sorted(
             [
                 (name, tensor)
@@ -970,13 +966,10 @@ class EagleWrapper(nn.Module):
         next_new_tokens: torch.Tensor,
         num_prefill: int,
         sa_manager,
-        require_sa_manager: bool = True,
     ) -> None:
         if self.sa_enhancer is None:
             return
         if sa_manager is None:
-            if not require_sa_manager and num_prefill == next_new_tokens.shape[0]:
-                return
             raise RuntimeError("SA enhancer is enabled but no SA manager was provided.")
 
         # next_new_tokens is [batch, 1 + max_draft_len]: column 0 is the golden/bonus token and
@@ -992,7 +985,6 @@ class EagleWrapper(nn.Module):
         self,
         csi: CachedSequenceInterface,
         sa_manager=None,
-        require_sa_manager: bool = True,
     ):
         """Forward pass with KV cache (inference after graph transforms).
 
@@ -1002,7 +994,7 @@ class EagleWrapper(nn.Module):
         Expected kwargs that are accessed directly are described in the required_kwargs property.
         Additional kwargs are forwarded to target/draft submodules (kv caches, etc.).
         """
-        if self.sa_enhancer is not None and sa_manager is None and require_sa_manager:
+        if self.sa_enhancer is not None and sa_manager is None:
             raise RuntimeError("SA enhancer is enabled but no SA manager was provided.")
 
         # ---- Phase 0: Check batch information ----
@@ -1012,12 +1004,6 @@ class EagleWrapper(nn.Module):
         num_prefill_tokens, num_extend_tokens, num_decode_tokens = batch_info.get_num_tokens()
         num_sequences = num_prefill + num_extend + num_decode
         num_total_tokens = num_prefill_tokens + num_extend_tokens + num_decode_tokens
-        skip_sa_enhancer = False
-        if self.sa_enhancer is not None and sa_manager is None:
-            if num_extend > 0:
-                raise RuntimeError("SA enhancer is enabled but no SA manager was provided.")
-            skip_sa_enhancer = True
-
         # some sanity checks on the batch
         assert num_decode == 0, "decode without drafting is not supported inside the eagle wrapper"
         if num_extend > 0:
@@ -1042,8 +1028,6 @@ class EagleWrapper(nn.Module):
         hidden_states = self._collect_hidden_states(csi.named_args, num_total_tokens)
         if self.normalize_target_hidden_state:
             # MTP: hidden states are captured at the residual add (pre-normalization).
-            # Apply the target model's final normalization to match the PyTorch backend
-            # which passes normalized hidden_states to MTPEagleWorker.
             hidden_states = self.normalize_target_hidden_states(hidden_states)
             # Cast to draft model dtype (e.g. target may be FP8, draft BF16).
             hidden_states = hidden_states.to(self._draft_dtype)
@@ -1105,11 +1089,9 @@ class EagleWrapper(nn.Module):
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
 
-        if self.sa_enhancer is not None and not skip_sa_enhancer:
+        if self.sa_enhancer is not None:
             self.sa_enhancer.extend_and_prepare(
                 sa_manager=sa_manager,
-                # extend_and_prepare only needs the request count here; the real request->slot
-                # binding was already done by sa_manager.prepare() in the executor.
                 request_ids=list(range(num_sequences)),
                 accepted_tokens=new_tokens_2d,
                 num_accepted_tokens=new_tokens_lens,
@@ -1204,7 +1186,6 @@ class EagleWrapper(nn.Module):
             next_new_tokens,
             num_prefill,
             sa_manager,
-            require_sa_manager=require_sa_manager,
         )
 
         # ---- Phase 6: Package output ----
