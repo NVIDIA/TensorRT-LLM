@@ -252,12 +252,16 @@ class ExternalDraftTokensConfig
 public:
     explicit ExternalDraftTokensConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
         std::optional<FloatType> const& acceptanceThreshold = std::nullopt,
-        std::optional<bool> const& fastLogits = std::nullopt);
+        std::optional<bool> const& fastLogits = std::nullopt,
+        std::optional<FloatType> const& fsdThreshold = std::nullopt,
+        std::optional<SizeType32> const& fsdDivergenceType = std::nullopt);
 
     [[nodiscard]] VecTokens getTokens() const;
     [[nodiscard]] std::optional<Tensor> getLogits() const;
     [[nodiscard]] std::optional<FloatType> getAcceptanceThreshold() const;
     [[nodiscard]] std::optional<bool> getFastLogits() const;
+    [[nodiscard]] std::optional<FloatType> getFsdThreshold() const;
+    [[nodiscard]] std::optional<SizeType32> getFsdDivergenceType() const;
 
 private:
     friend class Serialization;
@@ -269,6 +273,11 @@ private:
     std::optional<FloatType> mAcceptanceThreshold;
     /// @brief Use direct transfer for draft logits
     std::optional<bool> mFastLogits;
+    /// @brief Fuzzy Speculative Decoding divergence threshold. When set and > 0, tokens rejected by SD are accepted
+    /// if the divergence between target and draft distributions is below this threshold. Disabled by default.
+    std::optional<FloatType> mFsdThreshold;
+    /// @brief Fuzzy Speculative Decoding divergence type. 0=JS, 1=KL, 2=TV, 3=ReverseKL. Defaults to 0 (JS).
+    std::optional<SizeType32> mFsdDivergenceType;
 };
 
 /// @brief Configuration for prompt tuning

@@ -115,6 +115,11 @@ public:
         SizeType32 step;
         float constantThreshold;
         bool useRandomAcceptanceThreshold;
+
+        //! FSD divergence threshold (0 = disabled, no extra computation)
+        float fsdThreshold{0.F};
+        //! FSD divergence type (0=JS, 1=KL, 2=TV, 3=ReverseKL)
+        SizeType32 fsdDivergenceType{0};
     };
 
     class ExplicitDraftTokensInputs

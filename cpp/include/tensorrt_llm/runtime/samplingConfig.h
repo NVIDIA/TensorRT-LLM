@@ -193,6 +193,10 @@ public:
             configs, [&configs](size_t ci) { return configs[ci].draftAcceptanceThreshold; }, 0);
         minP = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].minP; }, layers::DefaultDecodingParams::getMinP());
+        fsdThreshold = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].fsdThreshold; }, 0);
+        fsdDivergenceType = fuseValues<SizeType32>(
+            configs, [&configs](size_t ci) { return configs[ci].fsdDivergenceType; }, 0);
     }
 
     explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
@@ -205,6 +209,15 @@ public:
         {
             draftAcceptanceThreshold
                 = std::vector<FloatType>{externalDraftTokensConfig.value().getAcceptanceThreshold().value()};
+        }
+        if (externalDraftTokensConfig && externalDraftTokensConfig.value().getFsdThreshold())
+        {
+            fsdThreshold = std::vector<FloatType>{externalDraftTokensConfig.value().getFsdThreshold().value()};
+        }
+        if (externalDraftTokensConfig && externalDraftTokensConfig.value().getFsdDivergenceType())
+        {
+            fsdDivergenceType
+                = std::vector<SizeType32>{externalDraftTokensConfig.value().getFsdDivergenceType().value()};
         }
 
 #define SET_FROM_OPTIONAL(varName, VarName, VarType)                                                                   \
@@ -282,6 +295,8 @@ public:
         // valid &= validateVec("lengthPenalty", lengthPenalty, 0.f);
         valid &= validateVec("noRepeatNgramSize", noRepeatNgramSize, 0);
         valid &= validateVec("minP", minP, -fltEpsilon, {1.f});
+        valid &= validateVec("fsdThreshold", fsdThreshold, 0.f);
+        valid &= validateVec("fsdDivergenceType", fsdDivergenceType, 0, {3});
         // TODO: check `beamWidthArray`
 
         // Detect greedy sampling and overwrite params.
@@ -371,6 +386,10 @@ public:
     // speculative decoding, only the first value is used (in gptDecoderBatched.cpp)
     OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batchSize]
 
+    // Fuzzy Speculative Decoding (FSD) parameters
+    OptVec<FloatType> fsdThreshold;       // [1] or [batchSize], FSD divergence threshold (0 = disabled)
+    OptVec<SizeType32> fsdDivergenceType; // [1] or [batchSize], FSD divergence type (0=JS, 1=KL, 2=TV, 3=ReverseKL)
+
     // medusa params
     OptVec<std::vector<SizeType32>> topKMedusaHeads; // [batchSize, maxMedusaHeads]
 
@@ -387,6 +406,7 @@ public:
             && topPDecay == other.topPDecay && topPMin == other.topPMin && topPResetIds == other.topPResetIds
             && beamSearchDiversityRate == other.beamSearchDiversityRate && lengthPenalty == other.lengthPenalty
             && earlyStopping == other.earlyStopping && draftAcceptanceThreshold == other.draftAcceptanceThreshold
+            && fsdThreshold == other.fsdThreshold && fsdDivergenceType == other.fsdDivergenceType
             && topKMedusaHeads == other.topKMedusaHeads && normalizeLogProbs == other.normalizeLogProbs
             && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs && minP == other.minP
             && beamWidthArray == other.beamWidthArray;
