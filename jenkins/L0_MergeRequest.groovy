@@ -27,6 +27,9 @@ SCAN_ROOT = "scan"
 
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+CI_ANALYSER_REPO = env.CI_ANALYSER_REPO ? env.CI_ANALYSER_REPO : "ssh://git@gitlab-master.nvidia.com:12051/qgai/trtllm-ci-analyser.git"
+CI_ANALYSER_BRANCH = env.CI_ANALYSER_BRANCH ? env.CI_ANALYSER_BRANCH : "qgai_ci_with_code"
+CI_ANALYSER_ANTHROPIC_CREDENTIAL_ID = env.CI_ANALYSER_ANTHROPIC_CREDENTIAL_ID ? env.CI_ANALYSER_ANTHROPIC_CREDENTIAL_ID : "ANTHROPIC_AUTH_TOKEN"
 
 // Container configuration
 def getContainerURIs()
@@ -1318,6 +1321,83 @@ def collectTestResults(pipeline, testFilter, globalVars)
     })
 }
 
+def runCiAnalyser(pipeline)
+{
+    stage("Run CI Analyser") {
+        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            try {
+                timeout(time: 10, unit: 'MINUTES') {
+                    container('alpine') {
+                        withEnv([
+                            "CI_ANALYSER_REPO=${CI_ANALYSER_REPO}",
+                            "CI_ANALYSER_BRANCH=${CI_ANALYSER_BRANCH}",
+                            "ANALYSER_SOURCE_REPO_DIR=${env.WORKSPACE}/${LLM_ROOT}",
+                            "PIP_INDEX_URL=https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+                        ]) {
+                            withCredentials([
+                                usernamePassword(
+                                    credentialsId: 'open_search_db_credentials',
+                                    usernameVariable: 'OPENSEARCH_USERNAME',
+                                    passwordVariable: 'OPENSEARCH_PASSWORD'
+                                ),
+                                usernamePassword(
+                                    credentialsId: 'github-cred-trtllm-ci',
+                                    usernameVariable: 'GITHUB_USER',
+                                    passwordVariable: 'GITHUB_TOKEN'
+                                ),
+                                string(
+                                    credentialsId: CI_ANALYSER_ANTHROPIC_CREDENTIAL_ID,
+                                    variable: 'ANTHROPIC_AUTH_TOKEN'
+                                )
+                            ]) {
+                                sh '''
+                                    set +e
+                                    apk add --no-cache git openssh-client python3 py3-pip
+                                    setup_status=$?
+                                    if [ "$setup_status" -ne 0 ]; then
+                                        echo "ci_analyser dependency setup failed with exit code: $setup_status"
+                                        exit "$setup_status"
+                                    fi
+
+                                    rm -rf trtllm-ci-analyser
+                                    GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" \
+                                        git clone --depth 1 --branch "$CI_ANALYSER_BRANCH" \
+                                        "$CI_ANALYSER_REPO" trtllm-ci-analyser
+                                    clone_status=$?
+                                    if [ "$clone_status" -ne 0 ]; then
+                                        echo "ci_analyser git clone failed with exit code: $clone_status"
+                                        exit "$clone_status"
+                                    fi
+
+                                    cd trtllm-ci-analyser
+                                    python3 -m pip config set global.break-system-packages true || true
+                                    python3 -m pip install -r requirements.txt
+                                    install_status=$?
+                                    if [ "$install_status" -ne 0 ]; then
+                                        echo "ci_analyser pip install failed with exit code: $install_status"
+                                        exit "$install_status"
+                                    fi
+
+                                    python3 ci_analyser.py \
+                                        --jenkins-url "$BUILD_URL" \
+                                        --write-opensearch \
+                                        --output ci_analyser_output.json
+                                    analyser_status=$?
+                                    echo "ci_analyser exit code: $analyser_status"
+                                    exit "$analyser_status"
+                                '''
+                            }
+                        }
+                    }
+                }
+            } finally {
+                archiveArtifacts artifacts: 'trtllm-ci-analyser/ci_analyser_output.json',
+                    allowEmptyArchive: true
+            }
+        }
+    }
+}
+
 def getCommonParameters()
 {
     return [
@@ -1745,7 +1825,11 @@ pipeline {
                     }
                 }
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
-                    collectTestResults(this, testFilter, globalVars)
+                    try {
+                        collectTestResults(this, testFilter, globalVars)
+                    } finally {
+                        runCiAnalyser(this)
+                    }
                 }
             }
         }
