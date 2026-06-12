@@ -1203,3 +1203,74 @@ TEST_F(P2pTransferAgentTest, SequentialAgentsReusingPoolAddress)
         ASSERT_EQ(hostBuf[0], 0x5A) << "round=" << round;
     }
 }
+
+// Sanity check for the locked accessor introduced in plan-A''. A fresh agent has not
+// registered anything yet, so isSupported() must be false and serializeIfSupported()
+// must return an empty string. This exercises the lock + flag handoff and guarantees
+// the AgentDesc construction path produces an empty p2pBlob in that state (which
+// downstream code relies on to skip the import).
+TEST_F(P2pTransferAgentTest, SerializeIfSupportedEmptyOnFreshAgent)
+{
+    P2pTransferAgent agent;
+    EXPECT_FALSE(agent.isSupported());
+    EXPECT_TRUE(agent.serializeLocalInfoIfSupported().empty());
+}
+
+// Regression for resource leak / thread::id reuse in P2pTransferContextPool.
+// Spawns many transient caller threads, each acquiring a Context from the SAME agent;
+// after they all join, the pool must have dropped their per-thread Contexts (otherwise
+// long-lived processes with churning callers would leak ~64MB cubTempStorage + a worker
+// pool per dead thread, and a reused thread::id could hand a fresh thread a stale
+// Context from a previous CUDA context).
+//
+// Tolerance: we allow a small steady-state count for the test runner's main thread (which
+// itself called numContexts() through the agent). Anything close to kThreads would mean
+// the thread-exit guard didn't fire.
+TEST_F(P2pTransferAgentTest, TransientCallerThreadsReleaseContextOnExit)
+{
+    P2pTransferAgent agent;
+    EXPECT_EQ(agent.numContexts(), 0u) << "fresh agent should have no per-thread Contexts";
+
+    constexpr int kThreads = 32;
+    constexpr size_t kNumEntries = 4;
+    constexpr size_t kEntrySize = 4096;
+
+    std::vector<void*> srcPtrs, dstPtrs;
+    std::vector<size_t> sizes(kNumEntries, kEntrySize);
+    for (size_t ii = 0; ii < kNumEntries; ++ii)
+    {
+        srcPtrs.push_back(gpuAllocPattern(kEntrySize, 0x33));
+        dstPtrs.push_back(gpuAllocZeroed(kEntrySize));
+    }
+
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t)
+    {
+        threads.emplace_back(
+            [&]()
+            {
+                auto& ctx = agent.contextForCurrentThread();
+                auto status = ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+                if (!status || status->wait(-1) != TransferState::kSUCCESS)
+                {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+    }
+    // Peak count: each running thread should have exactly one Context. We don't assert
+    // the exact peak because some threads may finish before others begin, but the agent
+    // must not have crashed or returned nullptr from contextForCurrentThread.
+    for (auto& th : threads)
+    {
+        th.join();
+    }
+    EXPECT_EQ(failures.load(), 0);
+
+    // After every transient thread exits, every guard's destructor has run and erased
+    // its entry. The current (test) thread never called contextForCurrentThread on this
+    // agent, so the count must be exactly 0.
+    EXPECT_EQ(agent.numContexts(), 0u)
+        << "Pool retained Contexts after caller threads exited — thread-exit guard regressed";
+}

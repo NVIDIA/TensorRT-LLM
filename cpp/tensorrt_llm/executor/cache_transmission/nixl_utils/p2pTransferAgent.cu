@@ -30,6 +30,7 @@
 #include <poll.h>
 #include <random>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
 #include <unistd.h>
@@ -122,9 +123,17 @@ std::vector<int> recvFds(int socket, size_t count)
 int createUdsServer(char const* path)
 {
     ::unlink(path);
+
+    // Restrict the socket file to owner-only BEFORE bind by setting a tight umask. We
+    // can't rely on the process-wide umask (it may be looser, and changing it racily
+    // affects other threads), but `bind` honors the calling thread's umask when it
+    // creates the inode. Save/restore so we don't perturb other code in this thread.
+    mode_t prevUmask = ::umask(0177);
+
     int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0)
     {
+        ::umask(prevUmask);
         return -1;
     }
     struct sockaddr_un addr = {};
@@ -133,11 +142,26 @@ int createUdsServer(char const* path)
     if (::bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
         ::close(sock);
+        ::umask(prevUmask);
         return -1;
     }
+    ::umask(prevUmask);
+
+    // Belt-and-suspenders: enforce 0600 even if some platform/filesystem ignored umask
+    // for AF_UNIX inodes. A failure here means we cannot guarantee owner-only access,
+    // so refuse to start the server rather than expose POSIX FDs to other users.
+    if (::chmod(path, S_IRUSR | S_IWUSR) < 0)
+    {
+        TLLM_LOG_ERROR("P2pTransfer: failed to chmod 0600 UDS socket '%s' errno=%d", path, errno);
+        ::close(sock);
+        ::unlink(path);
+        return -1;
+    }
+
     if (::listen(sock, 5) < 0)
     {
         ::close(sock);
+        ::unlink(path);
         return -1;
     }
     return sock;
@@ -163,6 +187,36 @@ int connectUds(char const* path, int maxRetries = 50)
     }
     ::close(sock);
     return -1;
+}
+
+/// @brief Verify the connected UDS peer runs under the same uid as us. Linux-only
+/// (SO_PEERCRED). Without this check, any local process that can `connect()` the
+/// socket would receive POSIX FDs to our GPU memory; chmod 0600 makes the socket
+/// path unreachable to other users, but we want a defense-in-depth check at the
+/// protocol layer too. Returns true only on confirmed same-uid peer.
+bool peerUidIsSelf(int clientSocket)
+{
+#ifdef SO_PEERCRED
+    struct ucred cred = {};
+    socklen_t len = sizeof(cred);
+    if (::getsockopt(clientSocket, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0 || len != sizeof(cred))
+    {
+        TLLM_LOG_WARNING("P2pTransfer: SO_PEERCRED query failed errno=%d", errno);
+        return false;
+    }
+    if (cred.uid != ::geteuid())
+    {
+        TLLM_LOG_WARNING(
+            "P2pTransfer: rejecting UDS client uid=%u pid=%d (server uid=%u)", cred.uid, cred.pid, ::geteuid());
+        return false;
+    }
+    return true;
+#else
+    // Non-Linux: SO_PEERCRED unavailable. Falling back to "trust any caller" would
+    // be unsafe — fail closed.
+    TLLM_LOG_WARNING("P2pTransfer: SO_PEERCRED not available on this platform; rejecting UDS client");
+    return false;
+#endif
 }
 
 std::string generateUdsPath()
@@ -678,14 +732,41 @@ P2pHandleExporter::P2pHandleExporter(CUdevice localDevice)
 P2pHandleExporter::~P2pHandleExporter()
 {
     stopUdsServer();
-    for (int fd : mExportedFds)
+    // No lock needed: by the time the dtor runs, the UDS server thread is joined and
+    // no caller can hold a reference to *this. Defensive locking would only mask a
+    // real bug (using the exporter during/after destruction).
+    for (auto& pool : mLocalInfo.pools)
     {
-        if (fd >= 0)
+        for (int fd : pool.fds)
         {
-            ::close(fd);
+            if (fd >= 0)
+            {
+                ::close(fd);
+            }
         }
+        pool.fds.clear();
     }
-    mExportedFds.clear();
+}
+
+std::string P2pHandleExporter::serializeIfSupported() const
+{
+    // Atomic supported-check + serialize. Holding mInfoMutex across serialize() is the
+    // whole point: it makes (a) the supported flag, (b) the pool/chunk layout, and
+    // (c) the udsPath observed by the caller mutually consistent. Without the lock,
+    // a concurrent registerMemory could append a pool between the supported check and
+    // the serialize, producing a half-empty blob on the wire.
+    std::lock_guard<std::mutex> lock(mInfoMutex);
+    if (!mLocalInfo.supported)
+    {
+        return {};
+    }
+    return mLocalInfo.serialize();
+}
+
+bool P2pHandleExporter::isSupported() const
+{
+    std::lock_guard<std::mutex> lock(mInfoMutex);
+    return mLocalInfo.supported;
 }
 
 size_t P2pHandleExporter::getVmmGranularity() const
@@ -704,12 +785,12 @@ size_t P2pHandleExporter::getVmmGranularity() const
     return granularity;
 }
 
-void P2pHandleExporter::detectAndExportChunks(CUdeviceptr scanStart, size_t scanSize, CUdeviceptr poolBase,
-    size_t poolTotalSize, std::vector<P2pMemChunk>& chunks)
+void P2pHandleExporter::detectAndExportChunks(
+    CUdeviceptr scanStart, size_t scanSize, CUdeviceptr poolBase, size_t poolTotalSize, P2pMemPool& pool)
 {
     if (mDetectedHandleType == VmmHandleType::kCudaIpc)
     {
-        exportSingleChunkCudaIpc(poolBase, poolTotalSize, chunks);
+        exportSingleChunkCudaIpc(poolBase, poolTotalSize, pool);
         return;
     }
 
@@ -730,11 +811,11 @@ void P2pHandleExporter::detectAndExportChunks(CUdeviceptr scanStart, size_t scan
 
         if (mDetectedHandleType == VmmHandleType::kPosixFd)
         {
-            exportSingleChunkPosixFd(chunkBase, chunkSize, poolBase, chunks);
+            exportSingleChunkPosixFd(chunkBase, chunkSize, poolBase, pool);
         }
         else
         {
-            exportSingleChunkFabric(chunkBase, chunkSize, poolBase, chunks);
+            exportSingleChunkFabric(chunkBase, chunkSize, poolBase, pool);
         }
 
         current = chunkBase + chunkSize;
@@ -742,10 +823,10 @@ void P2pHandleExporter::detectAndExportChunks(CUdeviceptr scanStart, size_t scan
 }
 
 void P2pHandleExporter::exportSingleChunkFabric(
-    CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, std::vector<P2pMemChunk>& chunks)
+    CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, P2pMemPool& pool)
 {
     uint64_t offset = chunkBase - poolBase;
-    for (auto const& existing : chunks)
+    for (auto const& existing : pool.chunks)
     {
         if (existing.virtAddrOffset == offset)
         {
@@ -771,15 +852,15 @@ void P2pHandleExporter::exportSingleChunkFabric(
     if (err == CUDA_SUCCESS)
     {
         TLLM_LOG_DEBUG("P2pTransfer: exported fabric chunk offset=%lu size=%zu", chunk.virtAddrOffset, chunk.size);
-        chunks.push_back(std::move(chunk));
+        pool.chunks.push_back(std::move(chunk));
     }
 }
 
 void P2pHandleExporter::exportSingleChunkPosixFd(
-    CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, std::vector<P2pMemChunk>& chunks)
+    CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, P2pMemPool& pool)
 {
     uint64_t offset = chunkBase - poolBase;
-    for (auto const& existing : chunks)
+    for (auto const& existing : pool.chunks)
     {
         if (existing.virtAddrOffset == offset)
         {
@@ -812,18 +893,14 @@ void P2pHandleExporter::exportSingleChunkPosixFd(
     TLLM_LOG_DEBUG(
         "P2pTransfer: exported POSIX FD=%d for chunk offset=%lu size=%zu", fd, chunk.virtAddrOffset, chunk.size);
 
-    chunks.push_back(std::move(chunk));
-
-    {
-        std::lock_guard<std::mutex> fdsLock(mExportedFdsMutex);
-        mExportedFds.push_back(fd);
-    }
+    // Append the chunk and its fd in lockstep — pool.fds[i] corresponds to pool.chunks[i].
+    pool.chunks.push_back(std::move(chunk));
+    pool.fds.push_back(fd);
 }
 
-void P2pHandleExporter::exportSingleChunkCudaIpc(
-    CUdeviceptr poolBase, size_t poolTotalSize, std::vector<P2pMemChunk>& chunks)
+void P2pHandleExporter::exportSingleChunkCudaIpc(CUdeviceptr poolBase, size_t poolTotalSize, P2pMemPool& pool)
 {
-    if (!chunks.empty())
+    if (!pool.chunks.empty())
     {
         return;
     }
@@ -845,12 +922,17 @@ void P2pHandleExporter::exportSingleChunkCudaIpc(
     std::memcpy(chunk.fabricHandle, &ipcHandle, sizeof(ipcHandle));
 
     TLLM_LOG_DEBUG("P2pTransfer: exported CudaIpc handle for pool at 0x%lx, size=%zu", poolBase, poolTotalSize);
-    chunks.push_back(std::move(chunk));
+    pool.chunks.push_back(std::move(chunk));
 }
 
 void P2pHandleExporter::exportHandles(RegisterDescs const& descs)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
+
+    // Hold mInfoMutex for the whole export pass so the UDS server thread, if it's already
+    // running, observes a consistent pool/fd layout and never sends a partially-extended
+    // pool's FDs.
+    std::lock_guard<std::mutex> poolsLock(mInfoMutex);
 
     std::unordered_map<uint64_t, size_t> processedPools;
     for (size_t i = 0; i < mLocalInfo.pools.size(); ++i)
@@ -937,14 +1019,13 @@ void P2pHandleExporter::exportHandles(RegisterDescs const& descs)
             if (newStart < existingStart)
             {
                 size_t extendSize = std::min(existingStart, newEnd) - newStart;
-                detectAndExportChunks(newStart, extendSize, basePtr, existingPool.poolTotalSize, existingPool.chunks);
+                detectAndExportChunks(newStart, extendSize, basePtr, existingPool.poolTotalSize, existingPool);
             }
             if (newEnd > existingEnd)
             {
                 CUdeviceptr extendStart = std::max(existingEnd, newStart);
                 size_t extendSize = newEnd - extendStart;
-                detectAndExportChunks(
-                    extendStart, extendSize, basePtr, existingPool.poolTotalSize, existingPool.chunks);
+                detectAndExportChunks(extendStart, extendSize, basePtr, existingPool.poolTotalSize, existingPool);
             }
 
             existingPool.registeredAddr = std::min(existingStart, newStart);
@@ -976,7 +1057,7 @@ void P2pHandleExporter::exportHandles(RegisterDescs const& descs)
         pool.registeredAddr = ptr;
         pool.registeredSize = descSize;
 
-        detectAndExportChunks(ptr, descSize, basePtr, totalSize, pool.chunks);
+        detectAndExportChunks(ptr, descSize, basePtr, totalSize, pool);
 
         if (!pool.chunks.empty())
         {
@@ -1018,98 +1099,96 @@ void P2pHandleExporter::removeHandles(RegisterDescs const& descs)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
 
-    if (mLocalInfo.pools.empty())
+    // Same scope as exportHandles. Held across pool erase + FD close so the UDS server
+    // never observes a half-removed pool.
+    bool noPoolsLeft = false;
+    bool isPosixFdMode = false;
     {
-        return;
-    }
+        std::lock_guard<std::mutex> poolsLock(mInfoMutex);
 
-    std::unordered_set<uint64_t> poolBasesToRemove;
-    for (auto const& desc : descs.getDescs())
-    {
-        CUdeviceptr ptr = static_cast<CUdeviceptr>(desc.getAddr());
-        CUdeviceptr basePtr;
-        size_t totalSize;
-        auto err = cuMemGetAddressRange(&basePtr, &totalSize, ptr);
-        if (err != CUDA_SUCCESS)
+        if (mLocalInfo.pools.empty())
         {
-            continue;
+            return;
         }
-        poolBasesToRemove.insert(basePtr);
-    }
 
-    if (poolBasesToRemove.empty())
-    {
-        return;
-    }
-
-    bool isPosixFdMode = (mDetectedHandleType == VmmHandleType::kPosixFd);
-    for (auto it = mLocalInfo.pools.begin(); it != mLocalInfo.pools.end();)
-    {
-        if (poolBasesToRemove.find(it->poolBaseAddr) != poolBasesToRemove.end())
+        std::unordered_set<uint64_t> poolBasesToRemove;
+        for (auto const& desc : descs.getDescs())
         {
-            if (isPosixFdMode)
+            CUdeviceptr ptr = static_cast<CUdeviceptr>(desc.getAddr());
+            CUdeviceptr basePtr;
+            size_t totalSize;
+            auto err = cuMemGetAddressRange(&basePtr, &totalSize, ptr);
+            if (err != CUDA_SUCCESS)
             {
-                std::lock_guard<std::mutex> fdsLock(mExportedFdsMutex);
-                if (!mExportedFds.empty())
+                continue;
+            }
+            poolBasesToRemove.insert(basePtr);
+        }
+
+        if (poolBasesToRemove.empty())
+        {
+            return;
+        }
+
+        isPosixFdMode = (mDetectedHandleType == VmmHandleType::kPosixFd);
+        for (auto it = mLocalInfo.pools.begin(); it != mLocalInfo.pools.end();)
+        {
+            if (poolBasesToRemove.find(it->poolBaseAddr) != poolBasesToRemove.end())
+            {
+                // Close only this pool's FDs — never another pool's. pool.fds is in chunk order
+                // by construction (exportSingleChunkPosixFd appends them in lockstep).
+                for (int fd : it->fds)
                 {
-                    size_t fdOffset = 0;
-                    for (auto prev = mLocalInfo.pools.begin(); prev != it; ++prev)
+                    if (fd >= 0)
                     {
-                        fdOffset += prev->chunks.size();
-                    }
-                    size_t fdCount = it->chunks.size();
-                    size_t fdEnd = std::min(fdOffset + fdCount, mExportedFds.size());
-                    for (size_t i = fdOffset; i < fdEnd; ++i)
-                    {
-                        if (mExportedFds[i] >= 0)
-                        {
-                            ::close(mExportedFds[i]);
-                        }
-                    }
-                    if (fdOffset < mExportedFds.size())
-                    {
-                        mExportedFds.erase(mExportedFds.begin() + static_cast<ptrdiff_t>(fdOffset),
-                            mExportedFds.begin() + static_cast<ptrdiff_t>(fdEnd));
+                        ::close(fd);
                     }
                 }
-            }
+                it->fds.clear();
 
-            TLLM_LOG_DEBUG("P2pTransfer: removed pool at base=0x%lx registered=[0x%lx, +%zu)", it->poolBaseAddr,
-                it->registeredAddr, it->registeredSize);
-            it = mLocalInfo.pools.erase(it);
+                TLLM_LOG_DEBUG("P2pTransfer: removed pool at base=0x%lx registered=[0x%lx, +%zu)", it->poolBaseAddr,
+                    it->registeredAddr, it->registeredSize);
+                it = mLocalInfo.pools.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        noPoolsLeft = mLocalInfo.pools.empty();
+        if (noPoolsLeft)
+        {
+            mLocalInfo.supported = false;
+            TLLM_LOG_INFO("P2pTransfer: all pools removed, disabled");
         }
         else
         {
-            ++it;
+            TLLM_LOG_DEBUG("P2pTransfer: %zu pools remaining after removal", mLocalInfo.pools.size());
         }
     }
 
-    if (mLocalInfo.pools.empty())
+    // stopUdsServer joins the server thread; that thread takes mInfoMutex itself, so we
+    // must release the lock above before calling it to avoid self-deadlock.
+    if (noPoolsLeft && isPosixFdMode)
     {
-        mLocalInfo.supported = false;
-        if (isPosixFdMode)
-        {
-            stopUdsServer();
-            for (int fd : mExportedFds)
-            {
-                if (fd >= 0)
-                {
-                    ::close(fd);
-                }
-            }
-            mExportedFds.clear();
-        }
-        TLLM_LOG_INFO("P2pTransfer: all pools removed, disabled");
-    }
-    else
-    {
-        TLLM_LOG_DEBUG("P2pTransfer: %zu pools remaining after removal", mLocalInfo.pools.size());
+        stopUdsServer();
     }
 }
 
 void P2pHandleExporter::startUdsServer()
 {
-    if (mExportedFds.empty())
+    // Caller (exportHandles) holds mInfoMutex.
+    bool anyFds = false;
+    for (auto const& pool : mLocalInfo.pools)
+    {
+        if (!pool.fds.empty())
+        {
+            anyFds = true;
+            break;
+        }
+    }
+    if (!anyFds)
     {
         return;
     }
@@ -1117,8 +1196,8 @@ void P2pHandleExporter::startUdsServer()
     // Idempotent: exportHandles() runs this on every successful registerMemory call,
     // but the server only needs to be started once per exporter. Reassigning the
     // std::thread while the previous one is still joinable would trigger std::terminate.
-    // The already-running server reads mExportedFds under mExportedFdsMutex, so new FDs
-    // added by a later registerMemory are served automatically — no restart required.
+    // The already-running server walks mLocalInfo.pools[*].fds under mInfoMutex, so new
+    // FDs added by a later registerMemory are served automatically — no restart required.
     if (mUdsServerRunning.load(std::memory_order_acquire))
     {
         return;
@@ -1138,7 +1217,7 @@ void P2pHandleExporter::startUdsServer()
     mUdsServerThread = std::thread(
         [this]()
         {
-            TLLM_LOG_DEBUG("P2pTransfer: UDS server started at %s with %zu FDs", mUdsPath.c_str(), mExportedFds.size());
+            TLLM_LOG_DEBUG("P2pTransfer: UDS server started at %s", mUdsPath.c_str());
 
             while (mUdsServerRunning.load(std::memory_order_acquire))
             {
@@ -1163,6 +1242,13 @@ void P2pHandleExporter::startUdsServer()
                     continue;
                 }
 
+                // Reject any client that isn't the same uid as us before reading even one byte.
+                if (!peerUidIsSelf(clientSocket))
+                {
+                    ::close(clientSocket);
+                    continue;
+                }
+
                 uint32_t numExpected = 0;
                 ssize_t bytesRead = ::read(clientSocket, &numExpected, sizeof(numExpected));
                 if (bytesRead != sizeof(numExpected))
@@ -1172,9 +1258,25 @@ void P2pHandleExporter::startUdsServer()
                     continue;
                 }
 
-                std::lock_guard<std::mutex> fdsLock(mExportedFdsMutex);
+                // Snapshot FDs in pool-iteration order while holding mInfoMutex. Sending
+                // outside the lock prevents export/remove from blocking on slow clients.
+                // The remote uses the same iteration order to map chunks back to handles.
+                std::vector<int> snapshot;
+                {
+                    std::lock_guard<std::mutex> poolsLock(mInfoMutex);
+                    size_t total = 0;
+                    for (auto const& pool : mLocalInfo.pools)
+                    {
+                        total += pool.fds.size();
+                    }
+                    snapshot.reserve(total);
+                    for (auto const& pool : mLocalInfo.pools)
+                    {
+                        snapshot.insert(snapshot.end(), pool.fds.begin(), pool.fds.end());
+                    }
+                }
 
-                uint32_t numAvailable = static_cast<uint32_t>(mExportedFds.size());
+                uint32_t numAvailable = static_cast<uint32_t>(snapshot.size());
                 ssize_t bytesWritten = ::write(clientSocket, &numAvailable, sizeof(numAvailable));
                 if (bytesWritten != sizeof(numAvailable))
                 {
@@ -1187,7 +1289,7 @@ void P2pHandleExporter::startUdsServer()
                 bool sendOk = true;
                 for (uint32_t i = 0; i < numToSend; ++i)
                 {
-                    if (!sendFd(clientSocket, mExportedFds[i]))
+                    if (!sendFd(clientSocket, snapshot[i]))
                     {
                         TLLM_LOG_WARNING("P2pTransfer: UDS failed to send FD[%u]", i);
                         sendOk = false;
@@ -1857,12 +1959,60 @@ P2pTransferContextPool::P2pTransferContextPool(CUdevice localDevice, std::shared
 {
 }
 
+std::shared_ptr<P2pTransferContextPool> P2pTransferContextPool::create(CUdevice localDevice,
+    std::shared_ptr<CudaEventPool> eventPool, int batchCopyThreads, size_t multiThreadMinOps, bool cubZeroCopy,
+    std::shared_ptr<P2pAgentCounters> counters)
+{
+    // make_shared can't reach the private ctor, so route through new + a non-deleting
+    // shared_ptr deleter? Simpler: use a friend struct trick. Cleanest: make_shared via
+    // a tiny helper struct that inherits and exposes the ctor.
+    struct Maker : public P2pTransferContextPool
+    {
+        Maker(CUdevice d, std::shared_ptr<CudaEventPool> ep, int bct, size_t mtmo, bool czc,
+            std::shared_ptr<P2pAgentCounters> c)
+            : P2pTransferContextPool(d, std::move(ep), bct, mtmo, czc, std::move(c))
+        {
+        }
+    };
+
+    return std::make_shared<Maker>(
+        localDevice, std::move(eventPool), batchCopyThreads, multiThreadMinOps, cubZeroCopy, std::move(counters));
+}
+
+namespace
+{
+
+/// @brief Thread-local guard. One instance per (thread × pool). Captures a weak_ptr to
+/// the pool so that if the pool is destroyed before the thread exits, the destructor
+/// safely no-ops. Each thread owns a thread_local map keyed by pool*; the map's value
+/// is this guard. When the thread exits, the map is destroyed in reverse insertion
+/// order, which destructs each guard, which (if its weak_ptr is still alive) calls
+/// eraseForCurrentThread() to drop that thread's Context from the pool.
+struct PoolThreadExitGuard
+{
+    std::weak_ptr<P2pTransferContextPool> weakPool;
+
+    ~PoolThreadExitGuard()
+    {
+        // Best-effort: pool may already be gone, in which case its destructor already
+        // dropped this thread's Context. Cuda may also be tearing down; eraseForCurrentThread
+        // is noexcept and tolerates cudaErrorCudartUnloading.
+        if (auto pool = weakPool.lock())
+        {
+            pool->eraseForCurrentThread();
+        }
+    }
+};
+
+/// One map per OS thread; survives across pool instances as long as the thread lives.
+/// Keyed by raw pool pointer because guards differ per-pool. Using `unique_ptr` so each
+/// guard's destructor runs at thread exit (or at erase) without re-running.
+thread_local std::unordered_map<P2pTransferContextPool*, std::unique_ptr<PoolThreadExitGuard>> tlsExitGuards;
+
+} // namespace
+
 P2pTransferContext& P2pTransferContextPool::contextForCurrentThread()
 {
-    // Look up by thread id under the mutex. A thread_local pointer cache is unsafe here
-    // because a previous pool at the same address (common for stack-allocated or reused
-    // heap allocations) would leave a stale entry pointing at a freed Context. The mutex
-    // cost is small compared to the CUDA work that follows.
     auto tid = std::this_thread::get_id();
     std::unique_lock lock(mMutex);
     auto it = mContexts.find(tid);
@@ -1874,7 +2024,46 @@ P2pTransferContext& P2pTransferContextPool::contextForCurrentThread()
         mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy, mCounters);
     P2pTransferContext* raw = ctx.get();
     mContexts[tid] = std::move(ctx);
+    lock.unlock();
+
+    // Install (once per thread × pool) a thread-exit guard that will erase this thread's
+    // Context when the calling thread terminates. weak_from_this() is safe here because
+    // the public factory `create()` always wraps the object in a shared_ptr.
+    auto& guardSlot = tlsExitGuards[this];
+    if (!guardSlot)
+    {
+        auto guard = std::make_unique<PoolThreadExitGuard>();
+        guard->weakPool = weak_from_this();
+        guardSlot = std::move(guard);
+    }
     return *raw;
+}
+
+size_t P2pTransferContextPool::numContexts() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mContexts.size();
+}
+
+void P2pTransferContextPool::eraseForCurrentThread() noexcept
+{
+    auto tid = std::this_thread::get_id();
+    // Move the Context out under the lock, then destroy outside the lock so its
+    // worker pool join doesn't block other threads from using the pool concurrently.
+    std::unique_ptr<P2pTransferContext> dying;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto it = mContexts.find(tid);
+        if (it == mContexts.end())
+        {
+            return;
+        }
+        dying = std::move(it->second);
+        mContexts.erase(it);
+    }
+    // dying is destroyed here, joining its (best-case empty) worker pool. Any CUDA
+    // teardown errors from finalize-time invocation are absorbed by the underlying
+    // resource destructors (CudaStream/etc. tolerate cudaErrorCudartUnloading).
 }
 
 // ============================================================================
@@ -1904,7 +2093,8 @@ P2pTransferAgent::P2pTransferAgent()
     , mCounters(std::make_shared<P2pAgentCounters>())
     , mExporter(mLocalDevice)
     , mRegistry(mLocalDevice)
-    , mContextPool(mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy, mCounters)
+    , mContextPool(P2pTransferContextPool::create(
+          mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy, mCounters))
 {
     if (mBatchCopyThreads > 1)
     {

@@ -708,11 +708,10 @@ AgentDesc NixlTransferAgent::getLocalAgentDesc()
         }
     }
 
-    std::string p2pBlob;
-    if (mP2pAgent && mP2pAgent->isSupported())
-    {
-        p2pBlob = mP2pAgent->exporter().getLocalInfo().serialize();
-    }
+    // Single locked call inside the exporter — atomic supported-check + serialize.
+    // The previous "isSupported() then getLocalInfo().serialize()" pair raced with
+    // concurrent registerMemory, which could mutate mLocalInfo between the two reads.
+    std::string p2pBlob = mP2pAgent ? mP2pAgent->serializeLocalInfoIfSupported() : std::string{};
 
     return AgentDesc{nixlBlob, std::move(regions), std::move(p2pBlob)};
 }
