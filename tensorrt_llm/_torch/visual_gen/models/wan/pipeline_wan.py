@@ -4,6 +4,7 @@ from typing import List, Optional, Union
 import diffusers
 import PIL.Image
 import torch
+import torch._inductor.config as inductor_config
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -109,6 +110,15 @@ class WanPipeline(BasePipeline):
             )
 
         super().__init__(pipeline_config)
+
+    def torch_compile(self) -> None:
+        # WAN blocks have explicit bf16 casts whose eager rounding Inductor drops
+        # when fusing; emulate them so compiled output stays close to eager. Set
+        # before super() compiles (Inductor reads the flag at trace time).
+        if hasattr(inductor_config, "emulate_precision_casts"):
+            inductor_config.emulate_precision_casts = True
+            logger.info("WAN torch.compile: emulate_precision_casts=True")
+        super().torch_compile()
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
