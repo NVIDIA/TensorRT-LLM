@@ -36,6 +36,7 @@ from ..pyexecutor.resource_manager import (BaseResourceManager,
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+    from ..pyexecutor.llm_request import LlmRequest
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -574,24 +575,19 @@ class SpecMetadata:
         model. Use this method to record them. By default, does nothing.
         """
 
-    def populate_sampling_params_for_one_model(
-            self, requests: list["LlmRequest"]) -> None:
-        """
-        Set up topp/topk/temperatures for 1-model sampler.
+    def _scan_one_model_sampling(
+        self, requests: list["LlmRequest"]
+    ) -> tuple[list[tuple[float, int, float, int]], list[int]]:
+        """Single source of truth for one-engine sampling-param detection.
 
-        Scans sampling configs to set skip_*/is_all_greedy_sample flags. When
-        any request needs sampling, also builds per-token/per-request lists
-        and copies them to GPU buffers; all-greedy batches skip this entirely.
+        Scans the batch's sampling configs and sets skip_*/has_greedy_requests/
+        is_all_greedy_sample (honoring the warmup capture override). Returns
+        ``(per_request_normalized, per_request_slot_ids)`` for buffer
+        population. Does NOT allocate or fill GPU buffers, so it is safe to call
+        before the CUDA graph key is built.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
         from tensorrt_llm.sampling_params import SamplingParams
-
-        if not self.spec_dec_mode.use_one_engine():
-            return
-
-        if self.temperatures is None:
-            # Ensures determinism across ranks.
-            torch.manual_seed(0)
 
         # Need to use a very small value for temperature when disabled to avoid division by 0
         DISABLE_TEMP_VAL = 1e-5
@@ -707,6 +703,44 @@ class SpecMetadata:
                 (0.7, 50, 0.9, num_tokens)
                 for (_, _, _, num_tokens) in per_request_normalized
             ]
+
+        return per_request_normalized, per_request_slot_ids
+
+    def update_is_all_greedy_sample(self, requests: list["LlmRequest"]) -> None:
+        """Refresh ``is_all_greedy_sample`` for the *current* batch.
+
+        Must be called BEFORE the CUDA graph key is built (the key includes
+        ``is_all_greedy_sample`` to choose the argmax vs advanced-sampling graph
+        variant). ``populate_sampling_params_for_one_model`` runs later, inside
+        ``_prepare_inputs``, and re-derives the same flag while filling the GPU
+        sampling buffers. Computing the flag here first keeps the selected graph
+        consistent with the buffers ``populate`` fills; otherwise the key would
+        use the previous iteration's stale value and could replay the advanced
+        graph against unpopulated (greedy) buffers, which can hang/corrupt the
+        run (notably for MTP with num_nextn>=2).
+        """
+        if not self.spec_dec_mode.use_one_engine():
+            return
+        self._scan_one_model_sampling(requests)
+
+    def populate_sampling_params_for_one_model(
+            self, requests: list["LlmRequest"]) -> None:
+        """
+        Set up topp/topk/temperatures for 1-model sampler.
+
+        Scans sampling configs to set skip_*/is_all_greedy_sample flags. When
+        any request needs sampling, also builds per-token/per-request lists
+        and copies them to GPU buffers; all-greedy batches skip this entirely.
+        """
+        if not self.spec_dec_mode.use_one_engine():
+            return
+
+        if self.temperatures is None:
+            # Ensures determinism across ranks.
+            torch.manual_seed(0)
+
+        per_request_normalized, per_request_slot_ids = (
+            self._scan_one_model_sampling(requests))
 
         tokens_per_request = (self.max_total_draft_tokens + 1 if
                               self.is_spec_dec_tree else self.max_draft_len + 1)
