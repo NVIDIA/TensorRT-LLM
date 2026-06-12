@@ -42,8 +42,10 @@ Operating modes:
   whose `post_load_weights()` is pure alias wiring; models that additionally
   rely on plain Python attributes set inside `post_load_weights()` (rather
   than registered `nn.Buffer` / `nn.Parameter` assignments) need to migrate
-  those side effects to `transform_weights()` or `cache_derived_state()`
-  before they are safe on the RO path.
+  those side effects to `cache_derived_state()` or another hook that runs on
+  the RO reader. One-shot tensor layout changes belong in `transform_weights()`
+  on the writer; RO runs `setup_aliases()`, `materialize_module()`, then
+  `cache_derived_state()`.
 """
 
 from contextlib import contextmanager
