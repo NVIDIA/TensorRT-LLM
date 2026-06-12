@@ -34,6 +34,7 @@ def _make_inputs(
     seed: int,
     compress_ratio: int = 1,
     preidx_hit_rate: float = 0.0,
+    varlen: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (logits, pre_idx, seq_lens) for the op.
 
@@ -48,27 +49,43 @@ def _make_inputs(
     production (V3.2 ~40%, V4 Pro ~75%) where the kernel's Guess phase
     short-circuits. Always preserves the ``pre_idx[..., 0] = argmax``
     invariant on slot 0.
+
+    ``varlen=False``: ``seq_lens = N * cr`` uniformly across groups.
+    ``varlen=True``: per-group seq_lens drawn uniformly in
+    ``[top_k*cr + next_n, N*cr]`` so the kernel's per-row N_eff varies.
+    Argmax / ref_topk are computed over the smallest group's N_eff so
+    they're guaranteed in-range for every row.
     """
     torch.manual_seed(seed)
-    device = "cuda"
-    logits_f32 = torch.randn(num_rows, N, dtype=torch.float32, device=device) * 2.0
+    torch.cuda.manual_seed(seed)
+
+    logits_f32 = torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 2.0
     logits = logits_f32.to(dtype)
 
     num_groups = num_rows // next_n
-    # argmax must come from the effective scan range, not full N — for
-    # next_n>1 the kernel's row-0 N_eff is only (N - next_n + 1) cols, so
-    # an argmax landing in the [N_eff, N) tail would violate the
-    # pre_idx[..., 0] invariant. Use N_eff = N - next_n + 1 (the
-    # tightest, row-0 boundary; always <= per-row N_eff for any ofs).
-    effective_len = N - next_n + 1
+
+    # seq_lens in UNCOMPRESSED space. Kernel divides by cr internally.
+    if varlen:
+        lo = top_k * compress_ratio + next_n  # ensures N_eff >= top_k
+        seq_lens = torch.randint(
+            lo, N * compress_ratio + 1, (num_groups,), dtype=torch.int32, device="cuda"
+        )
+    else:
+        seq_lens_val = N * compress_ratio
+        seq_lens = torch.full((num_groups,), seq_lens_val, dtype=torch.int32, device="cuda")
+
+    # Smallest per-row N_eff across all groups — safe upper bound for the
+    # argmax/topk scan range (every row's N_eff >= this value).
+    min_seq_lens = int(seq_lens.min().item())
+    effective_len = (min_seq_lens - next_n + 1) // compress_ratio
+
     group_logits = logits[::next_n, :effective_len]
     argmax_idx = group_logits.argmax(dim=-1).int()
-    pre_idx = torch.zeros(num_groups, top_k, dtype=torch.int32, device=device)
+    pre_idx = torch.zeros(num_groups, top_k, dtype=torch.int32, device="cuda")
     pre_idx[:, 0] = argmax_idx
 
     if preidx_hit_rate <= 0.0:
         # Worst-case: only slot 0 is meaningful, rest are junk arange.
-        # Tests kernel robustness to low-hit-rate preIdx.
         for j in range(1, top_k):
             pre_idx[:, j] = j
     else:
@@ -76,24 +93,14 @@ def _make_inputs(
         # random in-range fillers. Tests the Guess-phase short-circuit
         # path (production V3.2 ~40%, V4 Pro ~75%).
         ref_topk = group_logits.topk(top_k, dim=-1).indices.int()
-        keep_mask = torch.rand(ref_topk.shape, device=device) < preidx_hit_rate
+        keep_mask = torch.rand(ref_topk.shape, device="cuda") < preidx_hit_rate
         random_fill = torch.randint(
-            0, effective_len, ref_topk.shape, device=device, dtype=torch.int32
+            0, effective_len, ref_topk.shape, device="cuda", dtype=torch.int32
         )
         guess = torch.where(keep_mask, ref_topk, random_fill)
-        # Slot 0 must stay as argmax (kernel's strict invariant).
         guess[:, 0] = argmax_idx
         pre_idx[:, :] = guess
 
-    # seq_lens is uncompressed; kernel divides by cr internally.
-    # ``seq_lens = N * cr`` makes the kernel's per-row effective scan
-    # length cover the full N columns of ``logits`` for the typical
-    # row 0 (ofs=0). Within a group different rows still see slightly
-    # different N_eff under cr>1 floor division — the reference check
-    # mirrors the kernel formula exactly, so all (next_n, cr) combos
-    # are exercisable.
-    seq_lens_val = N * compress_ratio
-    seq_lens = torch.full((num_groups,), seq_lens_val, dtype=torch.int32, device=device)
     return logits, pre_idx, seq_lens
 
 
@@ -190,15 +197,36 @@ def _tie_aware_check(
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [
+        # Production cells: (bf16, K=512/1024) and (fp32, K=2048) match
+        # the deployed K -> dtype mapping. (fp16, K=1024) is added to keep
+        # the fp16 convert-to-fp32 tail path under test even though it is
+        # not a current production cell.
+        (torch.bfloat16, 512),
+        (torch.bfloat16, 1024),
+        (torch.float16, 1024),
+        (torch.float32, 2048),
+    ],
+)
 @pytest.mark.parametrize("N", [4096, 65536])
+@pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("batch_size", [1, 32])
 @pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize("preidx_hit_rate", [0.0, 0.5])
+@pytest.mark.parametrize("cluster_size", [1, 4])
 def test_cute_dsl_gvr_topk_decode(
-    dtype, top_k, N, next_n, batch_size, compress_ratio, preidx_hit_rate
+    dtype,
+    top_k,
+    N,
+    varlen,
+    next_n,
+    batch_size,
+    compress_ratio,
+    preidx_hit_rate,
+    cluster_size,
 ):
     """Compare custom op output against torch.topk reference (tie-aware).
 
@@ -206,11 +234,14 @@ def test_cute_dsl_gvr_topk_decode(
     a real topK index); ``0.5`` matches realistic production preIdx
     overlap with topK (V3.2 ~40%, V4 Pro ~75%) and exercises the
     kernel's Guess-phase short-circuit path.
+
+    ``varlen=False`` uses uniform seq_lens=N*cr across the batch;
+    ``varlen=True`` draws per-row seq_lens uniformly in [N/2, N]*cr.
     """
     if N - next_n + 1 < top_k:
-        pytest.skip(
-            f"N_eff < top_k ({N - next_n + 1} < {top_k}) is a degenerate path not exercised here"
-        )
+        pytest.skip(f"N_eff < top_k ({N - next_n + 1} < {top_k}) is a degenerate path")
+    if varlen and batch_size < 2:
+        pytest.skip("varlen with batch_size<2 collapses to fixed")
 
     num_rows = batch_size * next_n
     logits, pre_idx, seq_lens = _make_inputs(
@@ -222,6 +253,7 @@ def test_cute_dsl_gvr_topk_decode(
         seed=42,
         compress_ratio=compress_ratio,
         preidx_hit_rate=preidx_hit_rate,
+        varlen=varlen,
     )
 
     out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
@@ -234,6 +266,7 @@ def test_cute_dsl_gvr_topk_decode(
         top_k=top_k,
         next_n=next_n,
         compress_ratio=compress_ratio,
+        cluster_size=cluster_size,
     )
     torch.cuda.synchronize()
 
