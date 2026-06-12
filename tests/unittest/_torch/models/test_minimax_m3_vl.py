@@ -5027,3 +5027,225 @@ def test_goal_22_3_iter189_modality_order_validation():
     print(
         f"[M3-PARITY] iter189_modality_order_validation negative_controls=2 passed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tokenized + MM fast-path hooks: regression coverage for the bug where
+# Dynamo's pre-chat-templated prompt_token_ids were getting detokenized
+# back to text and re-templated, doubling the image marker and crashing
+# the HF MiniMaxVLProcessor at ``image_grid_thw[index].prod()``.
+# ---------------------------------------------------------------------------
+
+
+def _make_minimax_m3_vl_fast_path_processor():
+    """Build a ``MiniMaxM3VLInputProcessor`` instance without invoking
+    ``AutoProcessor.from_pretrained`` (which would require the full
+    checkpoint). The instance has the constants/hooks needed to drive the
+    tokenized fast-path expansion in isolation.
+    """
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
+        get_minimax_m3_vl_input_processor_cls,
+    )
+
+    cls = get_minimax_m3_vl_input_processor_cls()
+    obj = cls.__new__(cls)
+    # Minimal config so get_vocab_size doesn't blow up.
+    obj._config = SimpleNamespace(vocab_size=200_064)
+    obj._model_path = "/dev/null"
+    obj._tokenizer = None
+    obj._use_fast = True
+    obj._multimodal_hashing_supported = None
+    # Fake processor exposing the merge_size that the per-image / per-video
+    # token-count helpers consult. We don't need the real image_processor
+    # here because the tests below feed precomputed image_grid_thw values.
+    fake_image_processor = SimpleNamespace(merge_size=2)
+    obj._processor = SimpleNamespace(image_processor=fake_image_processor)
+    return obj
+
+
+def test_fast_path_get_text_with_mm_placeholders_returns_empty():
+    """``get_text_with_mm_placeholders`` must return ``""`` so the chat
+    template inserts exactly ``mm_counts['image']`` image markers via the
+    ``{"type": "image"}`` content entries. Returning the markers ourselves
+    would cause the template to double-insert them and re-trip the
+    ``image_grid_thw[1]`` out-of-bounds crash that this fast path is
+    designed to avoid.
+    """
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    assert proc.get_text_with_mm_placeholders({"image": 1}) == ""
+    assert proc.get_text_with_mm_placeholders({"image": 3, "video": 0}) == ""
+    assert proc.get_text_with_mm_placeholders({}) == ""
+
+
+def test_fast_path_mm_token_and_special_ids_match_checkpoint_constants():
+    """The MM fast-path expansion must report the M3 VL canonical token
+    ids (200025/200026 placeholders + 200029/200030 framing) so the
+    runtime's embed-mask + multimodal-hashing math classifies positions
+    correctly.
+    """
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
+        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
+        MINIMAX_M3_VL_VIDEO_TOKEN_ID,
+        MINIMAX_M3_VL_VISION_END_TOKEN_ID,
+        MINIMAX_M3_VL_VISION_START_TOKEN_ID,
+    )
+
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    mm_tokens = proc.get_mm_token_ids().tolist()
+    specials = proc.get_mm_special_token_ids().tolist()
+    assert mm_tokens == [
+        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
+        MINIMAX_M3_VL_VIDEO_TOKEN_ID,
+    ]
+    assert specials == [
+        MINIMAX_M3_VL_VISION_START_TOKEN_ID,
+        MINIMAX_M3_VL_VISION_END_TOKEN_ID,
+    ]
+
+
+def test_fast_path_expand_image_placeholders_adds_framing():
+    """Each single ``IMAGE_TOKEN_ID`` in the Dynamo-style prompt must be
+    rewritten to ``[VISION_START, IMAGE_TOKEN*N, VISION_END]`` where
+    ``N = num_mm_tokens_per_placeholder[i] - 2``. This matches what the
+    HF MiniMaxVLProcessor would produce in the slow path, so model
+    forward sees the same input_ids shape regardless of which path the
+    request takes.
+    """
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
+        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
+        MINIMAX_M3_VL_VISION_END_TOKEN_ID,
+        MINIMAX_M3_VL_VISION_START_TOKEN_ID,
+    )
+
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    img = MINIMAX_M3_VL_IMAGE_TOKEN_ID
+    vs = MINIMAX_M3_VL_VISION_START_TOKEN_ID
+    ve = MINIMAX_M3_VL_VISION_END_TOKEN_ID
+
+    # 1 placeholder, N = 5 inner image tokens (num_mm_tokens = 5 + 2).
+    prompt_token_ids = [42, 43, img, 44, 45]
+    expanded, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
+        prompt_token_ids,
+        num_mm_tokens_per_placeholder=[7],
+        mm_data={"image": [object()]},
+    )
+    assert mm_data_updates is None
+    assert expanded == [42, 43, vs, img, img, img, img, img, ve, 44, 45]
+    # Position invariant: the run is contiguous and totals exactly N+2 tokens.
+    assert expanded.count(img) == 5
+    assert expanded.count(vs) == 1 and expanded.count(ve) == 1
+
+
+def test_fast_path_expand_multi_image_per_item_counts():
+    """Two images with different per-item token counts must be expanded
+    with their respective ``num_mm_tokens_per_placeholder`` entries.
+    """
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
+        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
+    )
+
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    img = MINIMAX_M3_VL_IMAGE_TOKEN_ID
+
+    prompt_token_ids = [1, img, 2, img, 3]
+    # Image-0: N=3 inner placeholders (total 5). Image-1: N=4 inner (total 6).
+    expanded, _ = proc.expand_prompt_token_ids_for_mm(
+        prompt_token_ids,
+        num_mm_tokens_per_placeholder=[5, 6],
+        mm_data={"image": [object(), object()]},
+    )
+    assert expanded.count(img) == 3 + 4
+    # Total length grew by (5 - 1) + (6 - 1) = 9 tokens.
+    assert len(expanded) == len(prompt_token_ids) + 9
+
+
+def test_fast_path_expand_video_placeholders_use_video_token_id():
+    """Video-only requests must expand ``VIDEO_TOKEN_ID`` placeholders,
+    not ``IMAGE_TOKEN_ID`` ones.
+    """
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
+        MINIMAX_M3_VL_VIDEO_TOKEN_ID,
+    )
+
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    vid = MINIMAX_M3_VL_VIDEO_TOKEN_ID
+
+    prompt_token_ids = [100, vid, 200]
+    expanded, _ = proc.expand_prompt_token_ids_for_mm(
+        prompt_token_ids,
+        num_mm_tokens_per_placeholder=[4],
+        mm_data={"video": [object()]},
+    )
+    # Inner count is 2, plus framing → total 4 added between text tokens.
+    assert expanded.count(vid) == 2
+
+
+def test_fast_path_expand_rejects_mixed_image_and_video():
+    """Single-modality only: the registry's ``_get_single_mm_token_lengths``
+    returns only one modality's counts, so mixing image + video in one
+    request must fail loudly rather than silently corrupting the prompt.
+    """
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    with pytest.raises(ValueError, match="mixed image \\+ video"):
+        proc.expand_prompt_token_ids_for_mm(
+            prompt_token_ids=[1, 2, 3],
+            num_mm_tokens_per_placeholder=[3],
+            mm_data={"image": [object()], "video": [object()]},
+        )
+
+
+def test_fast_path_expand_rejects_placeholder_count_mismatch():
+    """If the prompt carries more (or fewer) placeholder tokens than
+    ``num_mm_tokens_per_placeholder`` entries, we raise rather than
+    producing a malformed prompt that fuse_input_embeds would reject
+    deep inside the model.
+    """
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
+        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
+    )
+
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    img = MINIMAX_M3_VL_IMAGE_TOKEN_ID
+
+    # Two image placeholders in the prompt, but only one entry provided.
+    with pytest.raises(ValueError, match="more placeholders than"):
+        proc.expand_prompt_token_ids_for_mm(
+            prompt_token_ids=[img, img],
+            num_mm_tokens_per_placeholder=[5],
+            mm_data={"image": [object(), object()]},
+        )
+
+    # One image placeholder in the prompt, but two entries provided.
+    with pytest.raises(ValueError, match="prompt has 1 placeholders"):
+        proc.expand_prompt_token_ids_for_mm(
+            prompt_token_ids=[img],
+            num_mm_tokens_per_placeholder=[5, 5],
+            mm_data={"image": [object(), object()]},
+        )
+
+
+def test_fast_path_hooks_are_registered_on_processor_class():
+    """The runtime's tokenized-prompt branch in
+    ``create_input_processor_with_hash.input_processor_wrapper`` gates
+    on ``hasattr(input_processor, 'get_text_with_mm_placeholders')`` and
+    ``hasattr(input_processor, 'expand_prompt_token_ids_for_mm')``. If
+    these go missing, the runtime detokenizes Dynamo's prompt_token_ids
+    and the M3 chat template gets re-applied, producing the duplicate
+    image marker that crashed the HF processor.
+    """
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
+        get_minimax_m3_vl_input_processor_cls,
+    )
+
+    cls = get_minimax_m3_vl_input_processor_cls()
+    assert hasattr(cls, "get_text_with_mm_placeholders"), (
+        "MiniMaxM3VLInputProcessor must expose get_text_with_mm_placeholders "
+        "for the tokenized + MM fast path; without it the runtime "
+        "detokenizes Dynamo's prompt_token_ids and re-runs the chat "
+        "template, doubling image markers and crashing at "
+        "image_grid_thw[index].prod()."
+    )
+    assert hasattr(cls, "expand_prompt_token_ids_for_mm")
+    assert hasattr(cls, "get_num_tokens_per_image")
+    assert hasattr(cls, "get_num_tokens_per_video")
+
