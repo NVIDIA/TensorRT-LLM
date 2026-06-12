@@ -253,9 +253,7 @@ class KvCacheCreator:
         if cls == KVCacheManagerV2:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None and self._max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0:
                 # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
                 # split-pool layout. KVCacheManager (V1) coerces head_dim list
                 # to max(head_dim), changing per-layer KV byte sizes — which
@@ -265,12 +263,12 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Gemma4 hybrid attention requires KVCacheManagerV2, "
                         "which is not yet supported with kv_connector_manager, "
-                        "beam_width > 1, event_buffer_max_size > 0, or "
-                        "cache_transceiver. Disable these features to run "
+                        "beam_width > 1, or event_buffer_max_size > 0. "
+                        "Disable these features to run "
                         "Gemma4 hybrid models.")
                 logger.warning(
                     "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
+                    "or event buffer max size > 0. Falling back to KVCacheManager."
                 )
                 cls = KVCacheManager
         # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
@@ -886,11 +884,9 @@ class KvCacheCreator:
         if draft_kv_cache_manager_cls == KVCacheManagerV2:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None and self._max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0:
                 logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, or event buffer max size > 0. "
                     "Falling back to KVCacheManager for draft model.")
                 draft_kv_cache_manager_cls = KVCacheManager
 
@@ -1726,6 +1722,10 @@ def create_py_executor_instance(
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
 
+    hang_detection_timeout = None
+    if os.environ.get("TRTLLM_HANG_DETECTION_TIMEOUT"):
+        hang_detection_timeout = int(os.environ["TRTLLM_HANG_DETECTION_TIMEOUT"])
+
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -1754,6 +1754,7 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
+        hang_detection_timeout=hang_detection_timeout,
         dwdp_manager=dwdp_manager,
         enable_kv_pool_rebalance=llm_args.kv_cache_config.
         enable_kv_pool_rebalance,

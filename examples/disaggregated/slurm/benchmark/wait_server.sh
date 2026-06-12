@@ -11,20 +11,27 @@ readonly HEALTH_CHECK_INTERVAL=10
 readonly STATUS_UPDATE_INTERVAL=30
 
 
-# Wait for server to be healthy
+# Wait for server to be healthy (returns 200 only when cluster is ready)
 echo "Waiting for server ${hostname}:${port} to be healthy..."
 start_time=$(date +%s)
-while ! curl -s -o /dev/null -w "%{http_code}" "http://${hostname}:${port}/health" > /dev/null 2>&1; do
+while true; do
+    status_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        "http://${hostname}:${port}/health" 2>/dev/null || echo "000")
+
+    if [ "$status_code" = "200" ]; then
+        break
+    fi
+
     current_time=$(date +%s)
     elapsed=$((current_time - start_time))
 
     if [ $elapsed -ge $TIMEOUT ]; then
-        echo "Error: Server not healthy after ${TIMEOUT} seconds"
+        echo "Error: Server not healthy after ${TIMEOUT} seconds (last status: ${status_code})"
         exit 1
     fi
 
     if [ $((elapsed % STATUS_UPDATE_INTERVAL)) -eq 0 ] && [ $elapsed -gt 0 ]; then
-        echo "Waiting for server to be healthy... (${elapsed}s elapsed)"
+        echo "Waiting for server to be healthy... (${elapsed}s elapsed, status: ${status_code})"
     fi
 
     sleep $HEALTH_CHECK_INTERVAL

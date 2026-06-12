@@ -11,31 +11,31 @@ numa_bind=${5}
 log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
-# CUDA_VISIBLE_DEVICES selection:
-#   - Default packing (no gpu_map file): each node is dedicated to one
-#     worker, so SLURM_LOCALID maps directly to the physical GPU id.
-#   - Compact packing (gpu_map file emitted by submit.py): two workers may
-#     share a node and would both see LOCALID=0, so look up the per-worker
-#     gpu_map "<rank> <host> <local_gpu_id>" by SLURM_PROCID. srun
-#     --distribution=arbitrary assigns PROCID in hostfile order, so it
-#     indexes directly into the map.
-gpu_map_file="${log_dir}/gpu_map_${role}_${instance_id}.txt"
-if [ -f "${gpu_map_file}" ]; then
-    gpu_id=$(awk -v p="${SLURM_PROCID}" '$1==p {print $3; exit}' "${gpu_map_file}")
-    if [ -z "${gpu_id}" ]; then
-        echo "ERROR: no GPU mapping for SLURM_PROCID=${SLURM_PROCID} in ${gpu_map_file}" >&2
-        exit 1
-    fi
-    export CUDA_VISIBLE_DEVICES=${gpu_id}
+server_role=${9}
+disagg_cluster_uri=${10}
+
+# Do not set CUDA_VISIBLE_DEVICES here. Let Slurm/enroot expose the devices
+# assigned to this step; TRT-LLM relies on that visibility for peer checks.
+
+# Only clear UCX_TLS if the benchmark config didn't explicitly set one.
+if [ -z "${UCX_TLS:-}" ]; then
+    unset UCX_TLS
 else
-    export CUDA_VISIBLE_DEVICES=${SLURM_LOCALID}
+    echo "Using UCX_TLS: ${UCX_TLS}"
 fi
 
-# Clear UCX_TLS for specific clusters
-unset UCX_TLS
+# Resolve KVBM leader ZMQ hostname to IPv4 so ZMQ can bind (leader) and
+# connect (workers) using the same address across nodes.
+if [ -n "${DYN_KVBM_LEADER_ZMQ_HOST:-}" ]; then
+    resolved_ip=$(getent ahostsv4 "${DYN_KVBM_LEADER_ZMQ_HOST}" | awk '{print $1}' | head -1)
+    if [ -n "${resolved_ip}" ]; then
+        export DYN_KVBM_LEADER_ZMQ_HOST="${resolved_ip}"
+        echo "Resolved DYN_KVBM_LEADER_ZMQ_HOST to ${resolved_ip}"
+    fi
+fi
 
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
-echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
 
 if [ "${numa_bind}" = "true" ]; then
     numa_bind_cmd="numactl -m 0,1"
@@ -59,4 +59,6 @@ fi
 ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
     trtllm-serve ${model_path} \
         --host $(hostname) --port ${port} \
-        --config ${config_file}
+        --config ${config_file} \
+        --server_role ${server_role} \
+        --disagg_cluster_uri ${disagg_cluster_uri}

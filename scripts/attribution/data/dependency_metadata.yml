@@ -13,6 +13,8 @@ cublas/13.2.0.9-1:
   license: 2c87cfab9e957b479ea6a78eb0216e3e
 cuda/13.1:
   license: fea620923810592cdac232cf283cf62c
+cuda/13.2:
+  license: 2c87cfab9e957b479ea6a78eb0216e3e
 cutlass/v4.2.1:
   copyright: d947127725edf33c1500800079a57db6
   license: d20f16a5b120b638d901622bcebaaacf
@@ -20,6 +22,10 @@ cutlass/v4.3.0:
   copyright: 501a1dd5925b22dbe66ce8f195440dec
   license: 0d49472f2c1269d573d79e5603778a9f
   source: https://github.com/NVIDIA/cutlass/tree/v4.3.0
+cutlass/v4.4.2:
+  copyright: aa8578535b24304362e63f0e170d8e60
+  license: 1078b45037d7c56c5c2af36977a4d08e
+  source: https://github.com/NVIDIA/cutlass/tree/v4.4.2
 deep_ep/5be51b228a7c82dbdb213ea58e77bffd12b38af8:
   license: 452b3ef002dc6ec283fb723f0dd84997
   source: https://github.com/deepseek-ai/DeepEP/tree/5be51b228a7c82dbdb213ea58e77bffd12b38af8
@@ -48,6 +54,8 @@ nanobind/a0ed2587f1089ef7657e2ed49ad6756b01c74e9f:
   license: 79df324968e086693ff395c0aa33621f
   source: https://github.com/wjakob/nanobind/tree/a0ed2587f1089ef7657e2ed49ad6756b01c74e9f
 nccl/2.28.9-1+cuda13.0:
+  license: 4298d3289e0199f28acd651c007e42fb
+nccl/2.29.2-1+cuda13.1:
   license: 4298d3289e0199f28acd651c007e42fb
 nixl/0.8.0:
   copyright: cb99251e73f1a5b0d1b0b8f439706f6c
@@ -82,6 +90,9 @@ tensorrt/10.14.1:
 torch/2.10.0a0+b4e4ee81d3.nv25.12:
   attribution: 48d075fc0e5fbb2ba08f86611b695294
   license: 169131c8cef5eadb022ea205db4d2740
+torch/2.11.0a0+eb65b36914.nv26.2:
+  attribution: 48d075fc0e5fbb2ba08f86611b695294
+  license: 65c6c6240d2646d9f610b442bc319a44
 torch/2.9.1+cu130:
   attribution: 48d075fc0e5fbb2ba08f86611b695294
   license: 77373b86cfc1cd5b85d571fa55dda65f

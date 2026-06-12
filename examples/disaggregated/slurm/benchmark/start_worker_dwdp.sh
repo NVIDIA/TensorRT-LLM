@@ -13,8 +13,17 @@ num_ctx_gpus=${7}
 ctx_worker_env_var=${8}
 gen_worker_env_var=${9}
 
-unset UCX_NET_DEVICES
-unset UCX_TLS
+if [ -z "${UCX_NET_DEVICES:-}" ]; then
+    unset UCX_NET_DEVICES
+else
+    echo "Using UCX_NET_DEVICES: ${UCX_NET_DEVICES}"
+fi
+
+if [ -z "${UCX_TLS:-}" ]; then
+    unset UCX_TLS
+else
+    echo "Using UCX_TLS: ${UCX_TLS}"
+fi
 
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname)"
 
