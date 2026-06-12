@@ -794,7 +794,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         activation_sf_gemm = cute.make_tensor(
             activation_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (tokens_sum_padded, hidden_padded, 1), self.sf_vec_size),
+                (tokens_sum_padded, hidden_padded, c1), self.sf_vec_size),
         )
         intermediate_gateup_padded_mul_hidden_padded = fc1_weight_sf.shape[1]
         intermediate_gateup_padded = (
@@ -926,7 +926,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint64,
+            internal_type=cutlass.Uint16,
         )
 
         # TMA load SFB1 (= activation_sf, fc1 activation SFs)
@@ -941,7 +941,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.mma_tiler_sfb,
             tiled_mma_sfb,
             self.cluster_layout_sfb_vmnk.shape,
-            internal_type=cutlass.Uint64,
+            internal_type=cutlass.Uint16,
         )
 
         # TMA store for fc1 NVFP4 output (via SMEM-staged bulk store).
@@ -999,7 +999,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Uint64,
+            internal_type=cutlass.Uint16,
         )
         tma_atom_fc1_output_sf_as_fc2_input, tma_tensor_fc1_output_sf_as_fc2_input = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_op,
@@ -1008,7 +1008,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.mma_tiler_sfb,
             tiled_mma_sfb,
             self.cluster_layout_sfb_vmnk.shape,
-            internal_type=cutlass.Uint64,
+            internal_type=cutlass.Uint16,
         )
 
         # ── Scheduler params + grid + launch ──
