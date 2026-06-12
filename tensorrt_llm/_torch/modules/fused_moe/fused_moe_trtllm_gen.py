@@ -28,6 +28,7 @@ from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ..gated_mlp import GatedMLP
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_op_backend import MoEOpBackend, get_op_backend
 
@@ -254,8 +255,17 @@ class TRTLLMGenFusedMoE(MoE):
         # - self.initial_global_assignments, self.slot_start, self.slot_end, etc.
 
         self._weights_created = False
+        self.num_fused_shared_expert = 0
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+        self.layer_idx = layer_idx
+
+        if model_config.mapping.dp_size == 1 and self.quant_config.layer_quant_mode.has_fp8_block_scales(
+        ):
+            # Not all models that use this backend define shared experts (e.g. non-DeepSeek
+            # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
+            self.num_fused_shared_expert = getattr(
+                model_config.pretrained_config, "n_shared_experts", 0) or 0
 
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:
@@ -419,7 +429,10 @@ class TRTLLMGenFusedMoE(MoE):
             return
 
         self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
+        if self.quant_config.layer_quant_mode.has_fp8_block_scales():
+            self.quant_method.create_weights(self, self.num_fused_shared_expert)
+        else:
+            self.quant_method.create_weights(self)
 
         self._weights_created = True
         self._check_configs()
@@ -576,6 +589,11 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor=None,
             )
 
+    def fuse_shared_expert(self, shared_experts: GatedMLP):
+        assert self._weights_created
+        self.quant_method.fuse_shared_expert(self, shared_experts,
+                                             self.num_fused_shared_expert)
+
     def run_moe(
         self,
         x: torch.Tensor,
@@ -677,6 +695,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w2_weight_scaling_factor,
                 self.num_slots,
                 top_k,
+                self.num_fused_shared_expert,
                 n_group,
                 topk_group,
                 self.intermediate_size_per_partition,
