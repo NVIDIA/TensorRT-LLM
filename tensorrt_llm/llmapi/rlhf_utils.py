@@ -155,10 +155,6 @@ class WorkerExtension:
             logger.error("Encountered an error in update_weights")
             raise e
 
-    def reset_prefix_cache(self) -> None:
-        """Invalidate the KV cache prefix reuse state after weight updates."""
-        self.engine.reset_prefix_cache()
-
     @control_action_decorator
     def wait_for_engine_idle(self) -> None:
         """Block until the engine has no active or queued requests."""
