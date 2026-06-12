@@ -21,8 +21,8 @@ from tensorrt_llm._torch.speculative.suffix_automaton import SAConfig, SuffixAut
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
-def test_prepare_reserves_gpu_workspace():
-    """prepare() should make SA workspace visible in device free-memory accounting."""
+def test_ensure_workspace_reserves_gpu_workspace():
+    """_ensure_workspace() should make SA workspace visible in device free-memory accounting."""
     max_seq_len = 64
     max_num_requests = 2
     max_draft_len = 3
@@ -36,7 +36,7 @@ def test_prepare_reserves_gpu_workspace():
         torch.cuda.synchronize()
         free_before, _ = torch.cuda.mem_get_info()
 
-        manager.prepare([], max_draft_len)
+        manager._ensure_workspace(max_draft_len)
         torch.cuda.synchronize()
         free_after, _ = torch.cuda.mem_get_info()
 
