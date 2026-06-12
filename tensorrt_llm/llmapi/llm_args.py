@@ -784,6 +784,12 @@ class MoeConfig(StrictBaseModel):
         "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
     )
 
+    triton_pad_token_dim: bool = Field(
+        default=False,
+        description=
+        "Pad the MoE token dimension to a finite set of geometric buckets (at most 12.5% padding) before the Triton grouped GEMMs, and pre-compile those buckets during engine warmup. This bounds the number of Triton JIT kernel specializations, eliminating first-seen-shape compile stalls under serving traffic with varied prompt lengths. Only effective for the TRITON MoE backend with W4A16 MXFP4 quantization (where padded outputs are bit-identical); ignored otherwise."
+    )
+
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 

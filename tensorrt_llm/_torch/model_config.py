@@ -150,6 +150,9 @@ class ModelConfig(Generic[TConfig]):
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
+    # If true, pad the MoE token dimension to geometric buckets in the TRITON
+    # MoE backend to bound the Triton JIT kernel specialization space
+    moe_triton_pad_token_dim: bool = False
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
     # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.

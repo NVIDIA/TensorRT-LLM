@@ -924,6 +924,8 @@ class ModelLoader:
             disable_finalize_fusion,
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
+            moe_triton_pad_token_dim=self.llm_args.moe_config.
+            triton_pad_token_dim,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
             allowed_backends,
             use_cute_dsl_blockscaling_mm=self.llm_args.

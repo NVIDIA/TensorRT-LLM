@@ -5,6 +5,7 @@ import gc
 import inspect
 import math
 import os
+import time
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -962,6 +963,11 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
+        if can_run_general_warmup:
+            # Pre-compile the Triton MoE kernel specializations across the
+            # context token-dim buckets (active iff
+            # moe_config.triton_pad_token_dim enabled token-dim bucketing).
+            self._run_triton_moe_prewarm(resource_manager)
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
@@ -1140,6 +1146,69 @@ class PyTorchModelEngine(ModelEngine):
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
         )
         AutoTuner.get().print_profiling_cache()
+
+    def _run_triton_moe_prewarm(self, resource_manager: ResourceManager):
+        """Pre-compiles Triton MoE (matmul_ogs) kernel specializations across
+        the context token-dim buckets.
+
+        The Triton MoE backend JIT-compiles a new grouped-GEMM specialization
+        the first time it sees a novel total token count m (see the comment
+        above round_up_to_triton_moe_m_bucket in fused_moe_triton.py). In
+        serving, every first-seen specialization stalls the GPU for the
+        duration of the JIT compile (~0.2-2s). With token-dim bucketing
+        active, the set of m values the kernels can observe is finite, so this
+        warmup sweeps exactly those buckets and the compiles happen at startup
+        instead of in the serving path.
+
+        No-op unless the model contains Triton MoE modules with token-dim
+        bucketing enabled (moe_config.triton_pad_token_dim).
+        """
+        from ..modules.fused_moe.fused_moe_triton import TritonFusedMoE
+        if not any(
+                isinstance(module, TritonFusedMoE) and module.pad_token_dim
+                for module in self.model.modules()):
+            return
+        token_counts = self._get_triton_moe_prewarm_token_counts(
+            resource_manager)
+        if not token_counts:
+            return
+        logger.info(
+            f"Running Triton MoE prewarm with {len(token_counts)} context "
+            f"token counts in [{token_counts[0]}, {token_counts[-1]}]")
+        start_time = time.time()
+        self._general_warmup(resource_manager,
+                             [(num_tokens, 0) for num_tokens in token_counts])
+        logger.info(
+            f"Triton MoE prewarm took {time.time() - start_time:.1f} seconds")
+
+    def _get_triton_moe_prewarm_token_counts(
+            self, resource_manager: ResourceManager) -> List[int]:
+        """Returns the ascending grid of context token counts to sweep in
+        :meth:`_run_triton_moe_prewarm`."""
+        from ..modules.fused_moe.fused_moe_triton import \
+            iter_triton_moe_m_buckets
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        token_num_upper_bound = min(self.max_num_tokens,
+                                    self.batch_size * (self.max_seq_len - 1))
+        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num_upper_bound,
+            max_num_draft_tokens=self.original_max_draft_len)
+        max_tokens = min(self.max_num_tokens, curr_max_num_tokens)
+        # 1- and 2-token shapes are already covered by the general warmup.
+        min_tokens = 3
+        if max_tokens < min_tokens:
+            return []
+        # With token-dim bucketing active, the Triton MoE only ever sees
+        # bucket-sized token counts, so warming exactly the buckets is
+        # exhaustive. max_tokens itself is included because it pads internally
+        # to the same (possibly > max_tokens) bucket that any serving token
+        # count in the last partial bucket maps to.
+        token_counts = set(bucket
+                           for bucket in iter_triton_moe_m_buckets(max_tokens)
+                           if bucket >= min_tokens)
+        token_counts.add(max_tokens)
+        return sorted(token_counts)
 
     def _compute_dynamic_draft_len_mapping(self) -> Optional[Dict[int, int]]:
         """Compute graph_bs → draft_len mapping for dynamic draft length feature.

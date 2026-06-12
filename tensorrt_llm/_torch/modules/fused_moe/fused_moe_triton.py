@@ -30,6 +30,8 @@ from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 
+from tensorrt_llm.logger import logger
+
 from ...model_config import ModelConfig
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoE
@@ -752,6 +754,48 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
 
 def get_padded_size(size: int, padding: int) -> int:
     return ((size + padding - 1) // padding) * padding
+
+
+# ---------------------------------------------------------------------------
+# Token-dim bucketing to bound the Triton kernel specialization space
+# ---------------------------------------------------------------------------
+# The Triton grouped GEMM (matmul_ogs) JIT-compiles a new kernel specialization
+# the first time it sees a novel token count m: kernel meta-parameters such as
+# block_m are derived from m (see triton_kernels/matmul_ogs_details/
+# opt_flags.py), and Triton additionally specializes the m-derived integer
+# kernel arguments (m * top_k, grid_m, ...) on divisibility by 16. Under
+# serving traffic with randomized prompt lengths, novel m values keep arriving
+# and each first-seen specialization stalls the host (and therefore the GPU)
+# for the duration of a JIT compile (~0.2-2s).
+#
+# Padding the token dimension up to a geometric bucket
+# (MoeConfig.triton_pad_token_dim) keeps the set of m values observable by the
+# Triton kernels finite, so all specializations can be exhaustively
+# pre-compiled at warmup (see _run_triton_moe_prewarm in
+# pyexecutor/model_engine.py).
+
+# m is rounded up to a multiple of 2**(floor(log2(m)) - 3), i.e. 8 buckets per
+# power-of-two octave, which bounds the padding overhead by 12.5%.
+_PAD_M_LOG2_BUCKETS_PER_OCTAVE = 3
+
+
+def round_up_to_triton_moe_m_bucket(num_tokens: int) -> int:
+    """Rounds num_tokens up to the next Triton MoE token-dim bucket."""
+    if num_tokens <= (1 << _PAD_M_LOG2_BUCKETS_PER_OCTAVE):
+        return num_tokens
+    granularity = 1 << (num_tokens.bit_length() - 1 -
+                        _PAD_M_LOG2_BUCKETS_PER_OCTAVE)
+    return (num_tokens + granularity - 1) // granularity * granularity
+
+
+def iter_triton_moe_m_buckets(max_num_tokens: int) -> List[int]:
+    """Returns all Triton MoE token-dim buckets in [1, max_num_tokens], ascending."""
+    buckets = []
+    bucket = 1
+    while bucket <= max_num_tokens:
+        buckets.append(bucket)
+        bucket = round_up_to_triton_moe_m_bucket(bucket + 1)
+    return buckets
 
 
 # Pad both n and k dimensions, then shard along shard_axis
@@ -1523,6 +1567,22 @@ class TritonFusedMoE(MoE):
         self.swiglu_beta = _maybe_squeeze_act_param(swiglu_beta)
         self.swiglu_limit = _maybe_squeeze_act_param(swiglu_limit)
 
+        # Token-dim bucketing is restricted to W4A16 MXFP4, where padded rows
+        # provably cannot change the outputs of real tokens (BF16/FP16
+        # activations, no dynamic activation scales). Quantization modes with
+        # dynamic per-tensor activation scales (FP8 QDQ, W4A8 MXFP4 FP8) are
+        # excluded because padded rows contribute swiglu(bias) values to the
+        # second GEMM's dynamic amax.
+        self.pad_token_dim = (
+            model_config.moe_triton_pad_token_dim
+            and self.quant_config is not None
+            and self.quant_config.layer_quant_mode.has_w4a16_mxfp4())
+        if model_config.moe_triton_pad_token_dim and not self.pad_token_dim:
+            logger.warning_once(
+                "moe_config.triton_pad_token_dim is only supported with W4A16 "
+                "MXFP4 quantization; disabling token-dim padding.",
+                key="triton_pad_token_dim_unsupported_quant")
+
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
@@ -1566,7 +1626,26 @@ class TritonFusedMoE(MoE):
         assert use_dp_padding is None or not use_dp_padding, \
             "TritonFusedMoE does not support use_dp_padding=True"
 
+        num_tokens = x.shape[0]
+        padded_num_tokens = round_up_to_triton_moe_m_bucket(
+            num_tokens) if self.pad_token_dim else num_tokens
+        if padded_num_tokens != num_tokens:
+            # Pad the token dimension to a bucket so the set of Triton kernel
+            # specializations stays finite (see the comment above
+            # round_up_to_triton_moe_m_bucket). The padded rows hold zero
+            # activations and zero router logits: they are routed like any
+            # other token, but the grouped GEMMs compute every output row
+            # independently from its own input row, so they only append rows
+            # to the expert groups and never mix into the outputs of real
+            # tokens, which are sliced back out below.
+            pad_rows = padded_num_tokens - num_tokens
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad_rows))
+            router_logits = torch.nn.functional.pad(router_logits,
+                                                    (0, 0, 0, pad_rows))
+
         hidden_states = self.quant_method.apply(self, x, router_logits)
+        if padded_num_tokens != num_tokens:
+            hidden_states = hidden_states[:num_tokens]
 
         final_hidden_states = self.reducescatter_or_allreduce(
             hidden_states,
