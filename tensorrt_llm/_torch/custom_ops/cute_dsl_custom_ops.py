@@ -5735,11 +5735,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             compress_ratio: int,
             return_output_values: bool,
             cluster_size: int,
+            seqlen_sorted: bool,
         ) -> None:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
                    num_threads_per_block, enable_warp_parallel_reduce,
-                   compress_ratio, return_output_values, cluster_size)
+                   compress_ratio, return_output_values, cluster_size,
+                   seqlen_sorted)
             if key in cls.kernel_cache:
                 return
             n_rows = cute.sym_int()
@@ -5770,6 +5772,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Int32, (n_rows, top_k),
                 stride_order=(1, 0),
                 assumed_align=16)
+            # seqlen_sorted=False compiles the LJF indirection out via
+            # const_expr → no order_row read → fake = None (mirrors the
+            # out_values optional pattern). seqlen_sorted=True compiles
+            # the indirection in; fake shape = batch (n_batch) since
+            # order_row is request-level, not row-level.
+            order_row_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_batch, ), stride_order=(0, )) if seqlen_sorted else None)
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -5787,6 +5797,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 compress_ratio=compress_ratio,
                 return_output_values=return_output_values,
                 cluster_size=cluster_size,
+                seqlen_sorted=seqlen_sorted,
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -5795,6 +5806,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seq_lens_fake,
                 out_values_fake,
                 out_indices_fake,
+                order_row_fake,
                 stream=fake_stream,
                 options="--enable-tvm-ffi",
             )
@@ -5812,6 +5824,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             compress_ratio: int = 1,
             max_seq_len: Optional[int] = None,
             cluster_size: Optional[int] = None,
+            order_row: Optional[torch.Tensor] = None,
         ) -> None:
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
@@ -5948,6 +5961,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     min_blocks_per_mp = 1
 
+            # seqlen_sorted = (order_row is not None). When True the
+            # kernel resolves the owning row via order_row[req] * next_n
+            # + nn so longer rows hit earlier waves (LJF). order_row is
+            # request-level (shape == seq_lens.shape).
+            seqlen_sorted = order_row is not None
+            if seqlen_sorted:
+                assert (
+                    order_row.dtype == torch.int32 and order_row.is_cuda
+                    and order_row.shape == seq_lens.shape
+                ), ("order_row must be int32, CUDA, shape == seq_lens.shape "
+                    f"(={tuple(seq_lens.shape)}); got dtype={order_row.dtype} "
+                    f"shape={tuple(order_row.shape)}")
+
             cls._compile(
                 cute_dtype,
                 top_k,
@@ -5962,18 +5988,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 compress_ratio,
                 return_output_values,
                 cluster_size,
+                seqlen_sorted,
             )
             key = (cute_dtype, top_k, next_n, enable_unroll_4,
                    enable_phase3_unroll, use_constant_hint, min_blocks_per_mp,
                    use_256bit_load, num_threads_per_block,
                    enable_warp_parallel_reduce, compress_ratio,
-                   return_output_values, cluster_size)
+                   return_output_values, cluster_size, seqlen_sorted)
             # TVM FFI: pass raw torch tensors directly, env stream picked
             # up automatically (no from_dlpack, no stream argument).
-            # ``output_values=None`` matches the kernel's compile-time
-            # ``return_output_values=False`` constexpr — no writes for top-k values.
+            # ``out_values = None``  — return_output_values=False, kernel
+            #                          skips STG.value.
+            # ``order_row``           — None when seqlen_sorted=False (no
+            #                          LJF indirection), else the
+            #                          caller-provided request-level
+            #                          dispatch order.
             cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
-                                  output_indices)
+                                  output_indices, order_row)
 
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
                              mutates_args=("output_indices", ),
@@ -5988,6 +6019,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
         cluster_size: Optional[int] = None,
+        order_row: Optional[torch.Tensor] = None,
     ) -> None:
         """CuTe DSL GVR (Guess-Verify-Refine) Top-K decode for Blackwell.
 
@@ -6014,6 +6046,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 processing one row via DSMEM + cluster sync). ``None``
                 (default) delegates to the wrapper's auto-dispatch heuristic
                 based on (N, BS); pass an explicit int to pin the choice.
+            order_row: Optional request-level LJF (longest-job-first)
+                dispatch order. When provided, must be ``int32`` on CUDA
+                with ``shape == seq_lens.shape``; ``order_row[i]`` is the
+                original request_id of the i-th-priority request. The
+                kernel then resolves the owning row per CTA as
+                ``order_row[cluster_id // next_n] * next_n +
+                (cluster_id % next_n)`` so longer rows hit earlier waves
+                — mitigates wave-tail imbalance when ``num_rows >
+                num_sms / cluster_size``. ``None`` (default) keeps the
+                legacy static mapping and the kernel const_expr elides
+                the indirection (legacy SASS unchanged). Typically built
+                once per decode step via :func:`gvr_topk_sort_prepare`
+                and reused across layers (``seq_lens`` is layer-
+                invariant).
         """
         if not is_sm_100f():
             raise ValueError(
@@ -6055,6 +6101,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             compress_ratio=compress_ratio,
             max_seq_len=max_seq_len,
             cluster_size=cluster_size,
+            order_row=order_row,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_decode")
@@ -6068,6 +6115,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
         cluster_size: Optional[int] = None,
+        order_row: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 

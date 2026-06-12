@@ -37,7 +37,11 @@ _RUN_GVR_DIR = os.path.join(
 )
 if _RUN_GVR_DIR not in sys.path:
     sys.path.insert(0, _RUN_GVR_DIR)
-from run_gvr_topk import gvr_topk_lb_decode, gvr_topk_lb_prepare  # noqa: E402
+from run_gvr_topk import (  # noqa: E402
+    gvr_topk_lb_decode,
+    gvr_topk_lb_prepare,
+    gvr_topk_sort_prepare,
+)
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
@@ -237,6 +241,7 @@ def _tie_aware_check(
 @pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize("preidx_hit_rate", [0.0, 0.5])
 @pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("seqlen_sorted", [False, True])
 def test_cute_dsl_gvr_topk_decode(
     dtype,
     top_k,
@@ -247,6 +252,7 @@ def test_cute_dsl_gvr_topk_decode(
     compress_ratio,
     preidx_hit_rate,
     cluster_size,
+    seqlen_sorted,
 ):
     """Compare custom op output against torch.topk reference (tie-aware).
 
@@ -257,6 +263,15 @@ def test_cute_dsl_gvr_topk_decode(
 
     ``varlen=False`` uses uniform seq_lens=N*cr across the batch;
     ``varlen=True`` draws per-row seq_lens uniformly in [N/2, N]*cr.
+
+    ``seqlen_sorted=True`` exercises the LJF host-side dispatch order:
+    we build ``order_row`` via :func:`gvr_topk_sort_prepare` (descending
+    argsort over ``seq_lens``) and pass it through the custom op. The
+    kernel must produce the same per-row top-K (rows are still written
+    back at their original positions, since the kernel uses
+    ``row_idx = order_row[req] * next_n + nn`` for both reads and
+    writes). The reference comparison is unchanged — it asserts that
+    each row's output is a valid top-K of that row's masked logits.
     """
     if N - next_n + 1 < top_k:
         pytest.skip(f"N_eff < top_k ({N - next_n + 1} < {top_k}) is a degenerate path")
@@ -278,6 +293,10 @@ def test_cute_dsl_gvr_topk_decode(
 
     out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
 
+    # LJF dispatch order — request-level (length == batch_size).
+    # gvr_topk_sort_prepare returns int32 on the same device as seq_lens.
+    order_row = gvr_topk_sort_prepare(seq_lens) if seqlen_sorted else None
+
     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
         logits,
         pre_idx,
@@ -287,6 +306,7 @@ def test_cute_dsl_gvr_topk_decode(
         next_n=next_n,
         compress_ratio=compress_ratio,
         cluster_size=cluster_size,
+        order_row=order_row,
     )
     torch.cuda.synchronize()
 
