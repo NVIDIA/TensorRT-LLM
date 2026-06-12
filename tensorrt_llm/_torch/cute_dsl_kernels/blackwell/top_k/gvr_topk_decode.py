@@ -230,6 +230,7 @@ class GvrTopKKernel:
         cluster_size: int = 1,
         enable_smem_cache: bool = False,
         smem_cache_elems: int = 32768,
+        seqlen_sorted: bool = False,
     ):
         # cluster_size: number of CTAs cooperating per row. 1 = single-CTA
         # path; 2/4 = thread-block cluster with DSMEM aggregation. Capped at
@@ -239,6 +240,16 @@ class GvrTopKKernel:
                 f"cluster_size must be in [1, 16] (B200 GPC limit); got {cluster_size}"
             )
         self.cluster_size = cluster_size
+        # When True, the kernel resolves the owning row per CTA via a
+        # caller-provided ``order_row`` indirection — an LJF host-side
+        # dispatch order so longer rows hit earlier waves. ``order_row``
+        # is REQUEST-level: int32[batch_size = num_rows / next_n],
+        # typically a descending argsort of seq_lens. The kernel
+        # expands to row level as ``order_row[req] * next_n + nn`` so a
+        # request's ``next_n`` rows stay contiguous. Compatible with
+        # cluster_size > 1: all cs CTAs in a cluster see the same
+        # cluster_id (= bidx // cluster_size), hence the same row.
+        self.seqlen_sorted = seqlen_sorted
         # SMEM slice cache (optional): pre-stage each CTA's slice into SMEM
         # once between Phase 1 and Phase 2, so Phase 2/3's GE-count scans
         # read LDS instead of re-streaming GMEM. Requires
@@ -1722,25 +1733,51 @@ class GvrTopKKernel:
         seq_lens: cute.Tensor,  # [numRows / next_n] int32
         output_values: cute.Tensor,  # [numRows, top_k] dtype
         output_indices: cute.Tensor,  # [numRows, top_k] int32
+        order_row: cute.Tensor,  # [batch_size] int32 (or None when seqlen_sorted=False)
     ):
-        """Thin entry: bidx → (row_idx, cta_in_cluster), then run_one_row.
+        """Thin entry: bidx → row_idx → run_one_row.
 
-        grid = (num_rows * cluster_size,); 1 row per thread-block cluster.
-        cluster_id == row index, cta_in_cluster ∈ [0, cluster_size). CTA r
-        scans row[r * N / cs : (r+1) * N / cs] in Phase 2, so the per-row
-        GE-count scales as 1 / cs. At cluster_size == 1 this collapses to
-        one CTA per row scanning the whole row.
+        grid = (num_rows * cluster_size,) where num_rows = batch_size *
+        next_n. cluster_id = bidx // cluster_size, cta_in_cluster ∈
+        [0, cluster_size). CTA r scans row[r * N / cs : (r+1) * N / cs]
+        in Phase 2, so the per-row GE-count scales as 1 / cs. At
+        cluster_size == 1 this collapses to one CTA per row scanning
+        the whole row.
+
+        When ``self.seqlen_sorted`` is True, the LJF dispatch order
+        operates at REQUEST granularity (``order_row`` has length
+        batch_size = num_rows / next_n). The owning row is resolved as
+        ``order_row[cluster_id // next_n] * next_n + cluster_id % next_n``
+        so the ``next_n`` rows of one request stay contiguous in
+        dispatch order. All ``cluster_size`` CTAs within a cluster see
+        the same ``cluster_id`` and therefore the same row, preserving
+        cluster-sync semantics.
 
         Body is extracted into :meth:`run_one_row` so other entries (e.g.
         the LB load-balance variant) can resolve ``row_idx`` differently
-        from the static ``bidx // cluster_size`` mapping used here.
+        from the mappings used here.
         """
         bidx, _, _ = cute.arch.block_idx()
         cluster_size = cutlass.const_expr(self.cluster_size)
+        seqlen_sorted = cutlass.const_expr(self.seqlen_sorted)
+        next_n = cutlass.const_expr(self.next_n)
         if cutlass.const_expr(cluster_size > 1):
-            row_idx = bidx // cluster_size
+            cluster_id = bidx // cluster_size
         else:
-            row_idx = bidx
+            cluster_id = bidx
+        if cutlass.const_expr(seqlen_sorted):
+            # order_row is request-level (batch_size); expand to row-level
+            # via req_id * next_n + nn so a request's next_n rows stay
+            # contiguous in dispatch order (mirrors the LB main entry).
+            if cutlass.const_expr(next_n == 1):
+                row_idx = order_row[cluster_id]
+            else:
+                req_offset = cluster_id // cutlass.Int32(next_n)
+                nn = cluster_id % cutlass.Int32(next_n)
+                req_id = order_row[req_offset]
+                row_idx = req_id * cutlass.Int32(next_n) + nn
+        else:
+            row_idx = cluster_id
         self.run_one_row(
             row_idx,
             input_data,
@@ -2168,6 +2205,7 @@ class GvrTopKKernel:
         seq_lens: cute.Tensor,
         output_values: cute.Tensor,  # or None.
         output_indices: cute.Tensor,
+        order_row: cute.Tensor,  # or None when seqlen_sorted=False
         stream,
     ):
         num_rows = input_data.shape[0]
@@ -2183,6 +2221,7 @@ class GvrTopKKernel:
             seq_lens,
             output_values,
             output_indices,
+            order_row,
         ).launch(
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
