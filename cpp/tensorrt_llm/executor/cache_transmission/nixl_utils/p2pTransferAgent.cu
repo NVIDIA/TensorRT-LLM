@@ -33,6 +33,7 @@
 #include <sys/un.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -852,6 +853,10 @@ void P2pHandleExporter::exportHandles(RegisterDescs const& descs)
     TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
 
     std::unordered_map<uint64_t, size_t> processedPools;
+    for (size_t i = 0; i < mLocalInfo.pools.size(); ++i)
+    {
+        processedPools.emplace(mLocalInfo.pools[i].poolBaseAddr, i);
+    }
 
     for (auto const& desc : descs.getDescs())
     {
@@ -1228,6 +1233,43 @@ void P2pHandleExporter::stopUdsServer()
 // P2pRemoteMappingRegistry
 // ============================================================================
 
+namespace
+{
+
+void releaseRemoteP2pMapping(RemoteP2pMapping& mapping)
+{
+    if (mapping.handleType == VmmHandleType::kCudaIpc)
+    {
+        for (auto& poolMapping : mapping.pools)
+        {
+            if (poolMapping.localVirtAddr != 0)
+            {
+                TLLM_CUDA_CHECK_FREE_RESOURCE(
+                    cudaIpcCloseMemHandle(reinterpret_cast<void*>(poolMapping.localVirtAddr)));
+            }
+        }
+        return;
+    }
+
+    for (auto& poolMapping : mapping.pools)
+    {
+        if (poolMapping.localVirtAddr != 0)
+        {
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize));
+        }
+        for (auto handle : poolMapping.importedHandles)
+        {
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
+        }
+        if (poolMapping.localVirtAddr != 0)
+        {
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize));
+        }
+    }
+}
+
+} // namespace
+
 P2pRemoteMappingRegistry::P2pRemoteMappingRegistry(CUdevice localDevice)
     : mLocalDevice(localDevice)
 {
@@ -1235,37 +1277,12 @@ P2pRemoteMappingRegistry::P2pRemoteMappingRegistry(CUdevice localDevice)
 
 P2pRemoteMappingRegistry::~P2pRemoteMappingRegistry()
 {
+    TLLM_CUDA_CHECK_FREE_RESOURCE(cudaSetDevice(static_cast<int>(mLocalDevice)));
     for (auto& [name, mappingPtr] : mMappings)
     {
-        if (mappingPtr->handleType == VmmHandleType::kCudaIpc)
-        {
-            for (auto& poolMapping : mappingPtr->pools)
-            {
-                if (poolMapping.localVirtAddr != 0)
-                {
-                    cudaIpcCloseMemHandle(reinterpret_cast<void*>(poolMapping.localVirtAddr));
-                }
-            }
-        }
-        else
-        {
-            for (auto& poolMapping : mappingPtr->pools)
-            {
-                if (poolMapping.localVirtAddr != 0)
-                {
-                    TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize));
-                }
-                for (auto handle : poolMapping.importedHandles)
-                {
-                    TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
-                }
-                if (poolMapping.localVirtAddr != 0)
-                {
-                    TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize));
-                }
-            }
-        }
+        releaseRemoteP2pMapping(*mappingPtr);
     }
+    mMappings.clear();
 }
 
 bool P2pRemoteMappingRegistry::hasMapping(std::string const& name) const
@@ -1431,6 +1448,7 @@ void P2pRemoteMappingRegistry::importAndMap(std::string const& name, P2pMemInfo 
         poolMapping.localVirtAddr = localVa;
 
         bool allChunksMapped = true;
+        std::vector<std::pair<CUdeviceptr, size_t>> mappedRanges;
         size_t fdIndexBeforePool = fdIndex;
         for (auto const& chunk : pool.chunks)
         {
@@ -1438,7 +1456,10 @@ void P2pRemoteMappingRegistry::importAndMap(std::string const& name, P2pMemInfo 
             {
                 TLLM_LOG_ERROR(
                     "P2pTransfer: chunk offset %lu < mapped offset %lu", chunk.virtAddrOffset, pool.mappedOffset);
-                fdIndex++;
+                if (info.handleType == VmmHandleType::kPosixFd && fdIndex < receivedFds.size())
+                {
+                    ::close(receivedFds[fdIndex++]);
+                }
                 allChunksMapped = false;
                 continue;
             }
@@ -1485,12 +1506,22 @@ void P2pRemoteMappingRegistry::importAndMap(std::string const& name, P2pMemInfo 
                 anyImportFailed = true;
                 break;
             }
+            mappedRanges.emplace_back(localVa + localOffset, chunk.size);
 
             CUmemAccessDesc accessDesc = {};
             accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             accessDesc.location.id = static_cast<int>(mLocalDevice);
             accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            TLLM_CU_CHECK(cuMemSetAccess(localVa + localOffset, chunk.size, &accessDesc, 1));
+            err = cuMemSetAccess(localVa + localOffset, chunk.size, &accessDesc, 1);
+            if (err != CUDA_SUCCESS)
+            {
+                TLLM_LOG_WARNING(
+                    "P2pTransfer: failed to set access for remote chunk at localOffset=%lu error=%d", localOffset, err);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(importedHandle));
+                allChunksMapped = false;
+                anyImportFailed = true;
+                break;
+            }
 
             poolMapping.importedHandles.push_back(importedHandle);
         }
@@ -1506,10 +1537,17 @@ void P2pRemoteMappingRegistry::importAndMap(std::string const& name, P2pMemInfo 
             if (info.handleType == VmmHandleType::kPosixFd)
             {
                 size_t expectedFdsForPool = pool.chunks.size();
-                size_t consumedFdsForPool = fdIndex - fdIndexBeforePool;
-                fdIndex += (expectedFdsForPool - consumedFdsForPool);
+                size_t poolFdEnd = std::min(fdIndexBeforePool + expectedFdsForPool, receivedFds.size());
+                for (size_t i = fdIndex; i < poolFdEnd; ++i)
+                {
+                    ::close(receivedFds[i]);
+                }
+                fdIndex = std::max(fdIndex, poolFdEnd);
             }
-            TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(localVa, pool.mappedSize));
+            for (auto const& [mappedAddr, mappedSize] : mappedRanges)
+            {
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(mappedAddr, mappedSize));
+            }
             for (auto handle : poolMapping.importedHandles)
             {
                 TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
@@ -1558,34 +1596,7 @@ void P2pRemoteMappingRegistry::cleanup(std::string const& name)
         mMappings.erase(it);
     }
 
-    if (mappingPtr->handleType == VmmHandleType::kCudaIpc)
-    {
-        for (auto& poolMapping : mappingPtr->pools)
-        {
-            if (poolMapping.localVirtAddr != 0)
-            {
-                cudaIpcCloseMemHandle(reinterpret_cast<void*>(poolMapping.localVirtAddr));
-            }
-        }
-    }
-    else
-    {
-        for (auto& poolMapping : mappingPtr->pools)
-        {
-            if (poolMapping.localVirtAddr != 0)
-            {
-                TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize));
-            }
-            for (auto handle : poolMapping.importedHandles)
-            {
-                TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
-            }
-            if (poolMapping.localVirtAddr != 0)
-            {
-                TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize));
-            }
-        }
-    }
+    releaseRemoteP2pMapping(*mappingPtr);
 }
 
 void* P2pRemoteMappingRegistry::translate(RemoteP2pMapping const& mapping, uintptr_t remoteAddr, size_t transferSize)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -156,7 +156,7 @@ private:
     /// Per-agent maps because different remote agents may have overlapping virtual addresses.
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
 
-    /// Optional P2P fast-path agent. nullptr when TRTLLM_DISABLE_P2P_TRANSFER=1.
+    /// Optional P2P fast-path agent. nullptr when TRTLLM_KV_TRANSFER_P2P_DISABLE=1.
     /// Owns the handle exporter, remote mapping registry, per-thread transfer contexts,
     /// and shared batch-copy worker pool / event pool. When unset or when a remote agent's
     /// import failed, submitTransferRequests falls back to the NIXL path below.
