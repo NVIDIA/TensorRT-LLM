@@ -549,6 +549,11 @@ class MegaMoECuteDsl(MoE):
         # cache in ``cute_dsl_megamoe_custom_op.py``. ``None`` for the
         # single-rank degenerate path.
         self._symm_provider = None
+        # Symmetric scratch regions used ONLY for AutoTuner profiling (one
+        # buffer shared across same-shape MoE layers). Allocated alongside
+        # ``_symm_provider`` and released after warmup via
+        # ``release_megamoe_profiling_scratch()``. ``None`` for single-rank.
+        self._profiling_scratch_regions = None
         self._weights_loaded = False
         self._weights_created = False
         self._post_load_done = False
@@ -749,6 +754,7 @@ class MegaMoECuteDsl(MoE):
         would block the rendezvous and is a hard error for multi-rank.
         """
         from ....custom_ops.cute_dsl_megamoe_custom_op import (
+            get_megamoe_profiling_scratch,
             get_megamoe_symm_provider,
             query_megamoe_shared_workspace_bytes,
         )
@@ -771,7 +777,7 @@ class MegaMoECuteDsl(MoE):
             max_tokens_per_rank=int(self.max_num_tokens),
             in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
         )
-        return get_megamoe_symm_provider(
+        staging = get_megamoe_symm_provider(
             process_group=self._ep_pg,
             world_size=self.ep_size,
             rank=self.ep_rank,
@@ -782,6 +788,21 @@ class MegaMoECuteDsl(MoE):
             shared_workspace_bytes=shared_workspace_bytes,
             in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
         )
+        # Separate symmetric scratch for AutoTuner profiling (same layout, own
+        # peer_offsets). Shared across same-shape layers; freed after warmup.
+        scratch = get_megamoe_profiling_scratch(
+            process_group=self._ep_pg,
+            world_size=self.ep_size,
+            rank=self.ep_rank,
+            hidden_size=self.hidden_size,
+            max_tokens_per_rank=int(self.max_num_tokens),
+            num_topk=top_k,
+            output_dtype=self.dtype or torch.bfloat16,
+            shared_workspace_bytes=shared_workspace_bytes,
+            in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+        )
+        self._profiling_scratch_regions = scratch.get_regions() if scratch is not None else None
+        return staging
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:
         if self.quant_method is None:
@@ -1221,6 +1242,15 @@ class MegaMoECuteDsl(MoE):
         # and needs no per-launch zero.
         if self.in_kernel_fc2_reduce and num_tokens > 0:
             combine_output[:num_tokens].zero_()
+        # Hand the symmetric profiling scratch to the op so AutoTuner profiling
+        # keeps the cross-rank inputs symmetric without touching this staging
+        # buffer. Cleared right after so a later same-process op call for a
+        # different shape never reuses a stale scratch.
+        from ....custom_ops.cute_dsl_megamoe_custom_op import set_active_megamoe_profiling_scratch
+
+        set_active_megamoe_profiling_scratch(
+            self._profiling_scratch_regions if world_size > 1 else None
+        )
         torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell(
             activation=_as_nvfp4(activation),
             activation_sf=_as_fp8_sf(activation_sf),
@@ -1248,6 +1278,7 @@ class MegaMoECuteDsl(MoE):
             gate_up_clamp=self.gate_up_clamp,
             in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
         )
+        set_active_megamoe_profiling_scratch(None)
         if num_tokens == 0:
             return torch.empty((0, hidden), dtype=output_dtype, device=combine_output.device)
         if self.in_kernel_fc2_reduce:
