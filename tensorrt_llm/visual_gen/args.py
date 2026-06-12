@@ -406,6 +406,11 @@ class TorchCompileConfig(StrictBaseModel):
     enable: bool = Field(True, status="prototype")
     enable_fullgraph: bool = Field(False, status="prototype")
     enable_autotune: bool = Field(True, status="prototype")
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        status="prototype",
+        description="Additional options forwarded to torch.compile(options=...).",
+    )
 
 
 class CudaGraphConfig(StrictBaseModel):

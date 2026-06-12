@@ -522,6 +522,10 @@ class BasePipeline(nn.Module):
             f"world_size={dist.get_world_size(vgm.vae_group)}"
         )
 
+    def _torch_compile_options(self) -> Dict[str, Any]:
+        """Return torch.compile options for this pipeline."""
+        return dict(self.pipeline_config.torch_compile.options)
+
     def torch_compile(self) -> None:
         """Apply torch.compile to pipeline components based on TorchCompileConfig.
 
@@ -536,6 +540,17 @@ class BasePipeline(nn.Module):
         # Using default as max-autotune mode takes more initialization time and
         # does not improve performance a lot.
         compile_mode = "default"
+        compile_options = self._torch_compile_options()
+        compile_kwargs = {
+            "dynamic": None,
+            "fullgraph": tc_config.enable_fullgraph,
+        }
+        if compile_options:
+            compile_kwargs["options"] = compile_options
+            compile_detail = f"options={compile_options}"
+        else:
+            compile_kwargs["mode"] = compile_mode
+            compile_detail = f"mode={compile_mode}"
 
         # Compiling transformer blocks provides max performance value.
         targets = self.transformer_components
@@ -552,27 +567,15 @@ class BasePipeline(nn.Module):
                     blocks = getattr(model, block_name)
                     logger.info(
                         f"torch.compile: {name}.{block_name} "
-                        f"({len(blocks)} blocks, mode={compile_mode})"
+                        f"({len(blocks)} blocks, {compile_detail})"
                     )
                     compiled_blocks = []
                     for block in blocks:
-                        compiled_blocks.append(
-                            torch.compile(
-                                block,
-                                mode=compile_mode,
-                                dynamic=None,
-                                fullgraph=tc_config.enable_fullgraph,
-                            )
-                        )
+                        compiled_blocks.append(torch.compile(block, **compile_kwargs))
                     setattr(model, block_name, nn.ModuleList(compiled_blocks))
             else:
-                logger.info(f"torch.compile: {name} (whole module, mode={compile_mode})")
-                compiled = torch.compile(
-                    model,
-                    mode=compile_mode,
-                    dynamic=None,
-                    fullgraph=tc_config.enable_fullgraph,
-                )
+                logger.info(f"torch.compile: {name} (whole module, {compile_detail})")
+                compiled = torch.compile(model, **compile_kwargs)
                 setattr(self, name, compiled)
 
     @staticmethod

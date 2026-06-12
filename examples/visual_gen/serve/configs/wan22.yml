@@ -3,3 +3,6 @@ cache_config:
 parallel_config:
   cfg_size: 1
   ulysses_size: 1
+torch_compile_config:
+  options:
+    emulate_precision_casts: true

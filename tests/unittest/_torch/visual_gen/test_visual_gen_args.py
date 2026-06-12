@@ -234,6 +234,90 @@ class TestVisualGenArgsFromDict:
         assert "dynamic_weight_quant" not in dumped
         assert "force_dynamic_quantization" not in dumped
 
+    def test_torch_compile_options_dict_passthrough(self):
+        args = VisualGenArgs(
+            **{
+                "model": "/tmp/model",
+                "torch_compile_config": {
+                    "options": {
+                        "emulate_precision_casts": True,
+                    },
+                },
+            }
+        )
+
+        assert args.torch_compile_config.options == {"emulate_precision_casts": True}
+        assert args.model_dump()["torch_compile_config"]["options"] == {
+            "emulate_precision_casts": True
+        }
+
+    def test_torch_compile_options_forwarded_to_torch_compile(self, monkeypatch):
+        import torch.nn as nn
+
+        from tensorrt_llm._torch.visual_gen.config import (
+            DiffusionModelConfig,
+            DiffusionPipelineConfig,
+        )
+        from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+
+        class DummyTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Linear(1, 1), nn.Linear(1, 1)])
+
+        class DummyPipeline(BasePipeline):
+            def _init_transformer(self):
+                self.transformer = DummyTransformer()
+
+            def _setup_cuda_graphs(self):
+                pass
+
+        compile_calls = []
+
+        def fake_compile(module, **kwargs):
+            compile_calls.append((module, kwargs))
+            return module
+
+        monkeypatch.setattr("torch.compile", fake_compile)
+
+        config = DiffusionPipelineConfig(
+            model_configs={"transformer": DiffusionModelConfig(pretrained_config={})},
+            torch_compile=TorchCompileConfig(
+                enable_fullgraph=True,
+                options={"emulate_precision_casts": True},
+            ),
+        )
+        pipeline = DummyPipeline(config)
+        pipeline.torch_compile()
+
+        assert len(compile_calls) == 2
+        for _, kwargs in compile_calls:
+            assert "mode" not in kwargs
+            assert kwargs["dynamic"] is None
+            assert kwargs["fullgraph"] is True
+            assert kwargs["options"] == {"emulate_precision_casts": True}
+
+    def test_wan_torch_compile_default_options_preserve_user_override(self):
+        import torch._inductor.config as inductor_config
+
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+        pipeline = object.__new__(WanPipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig()
+        default_options = pipeline._torch_compile_options()
+
+        if hasattr(inductor_config, "emulate_precision_casts"):
+            assert default_options["emulate_precision_casts"] is True
+        else:
+            assert "emulate_precision_casts" not in default_options
+
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            torch_compile=TorchCompileConfig(options={"emulate_precision_casts": False})
+        )
+        override_options = pipeline._torch_compile_options()
+        assert override_options["emulate_precision_casts"] is False
+
 
 class TestVisualGenArgsFromYaml:
     """from_yaml round-trips through a YAML file."""
@@ -258,6 +342,19 @@ class TestVisualGenArgsFromYaml:
         yaml_path.write_text("model: /tmp/model\nlinear:\n  type: default\n")
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             VisualGenArgs.from_yaml(yaml_path)
+
+    def test_from_yaml_torch_compile_options(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\n"
+            "torch_compile_config:\n"
+            "  options:\n"
+            "    emulate_precision_casts: true\n"
+        )
+
+        args = VisualGenArgs.from_yaml(yaml_path)
+
+        assert args.torch_compile_config.options == {"emulate_precision_casts": True}
 
 
 class TestParallelConfigValidation:
