@@ -940,9 +940,11 @@ class TestMoeFP8:
                               use_topk_as_input=False)
 
     @pytest.mark.parametrize("num_tokens", [16])
-    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8, 0), (72, 1, 1, 6, 0),
-                                             (72, 1, 1, 6, 1),
-                                             (72, 1, 1, 6, 2)])
+    @pytest.mark.parametrize("expert_info",
+                             [(32, 8, 4, 8, 0), (384, 1, 1, 8, 0),
+                              (72, 1, 1, 6, 0), (72, 1, 1, 6, 1),
+                              (72, 1, 1, 6, 2), (384, 1, 1, 8, 1),
+                              (384, 1, 1, 8, 2)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
     @pytest.mark.parametrize("use_topk_as_input", [False, True],

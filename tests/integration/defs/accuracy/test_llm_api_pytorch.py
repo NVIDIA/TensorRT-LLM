@@ -1950,6 +1950,45 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_fp8_block_scales_fusion_tmp(self):
+        # TEMP (PR#11143 validation, NOT for commit): force the TRT-LLM Gen MoE
+        # backend + disable attention DP so the shared-expert -> sparse-expert
+        # fusion path (dp_size==1 + fp8_block_scales gate) is actually exercised
+        # end-to-end. The stock test uses DEEPGEMM (no fusion) on SM>=100.
+        # TP from env TRTLLM_VALIDATE_TP (default 4). Run from tests/integration/defs:
+        #   LLM_MODELS_ROOT=/llm-models TRTLLM_VALIDATE_TP=4 python3 -m pytest -s -v \
+        #     accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_fusion_tmp
+        tp = int(os.environ.get("TRTLLM_VALIDATE_TP", "4"))
+        # TRTLLM_VALIDATE_BACKEND: TRTLLM (fusion) | DEEPGEMM (stock, no fusion).
+        # DEEPGEMM is used to prove the TP>1 tunable_allreduce hang is independent
+        # of the shared-expert fusion (fusion is not active with DEEPGEMM).
+        moe_backend = os.environ.get("TRTLLM_VALIDATE_BACKEND", "TRTLLM")
+        # TRTLLM_VALIDATE_AR: override allreduce_strategy (AUTO|NCCL|...). Used to
+        # work around the AUTO-strategy collective deadlock seen at TP>1 on B300.
+        ar_strategy = os.environ.get("TRTLLM_VALIDATE_AR", "AUTO")
+        # TRTLLM_VALIDATE_ADP: enable_attention_dp (0|1). Diagnostic only: with 1,
+        # attention uses DP (no pure-TP o_proj allreduce) and fusion is OFF; used to
+        # bound whether the TP=4 hang is specific to the attention_dp=False TP path.
+        attention_dp = os.environ.get("TRTLLM_VALIDATE_ADP", "0") == "1"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            moe_config=MoeConfig(backend=moe_backend),
+            allreduce_strategy=ar_strategy,
+        )
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                 tensor_parallel_size=tp,
+                 moe_expert_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False])
     @parametrize_with_ids(
