@@ -1436,6 +1436,22 @@ class AutoTuner:
             # profile the kernel with the full repeat to get precise time
             avg_time = pure_profile(stream, self.repeat)
 
+        # Under the MERGE strategy every rank profiles the SAME tactic in
+        # lockstep (no tactic split, tp_barrier before each measurement,
+        # short-profile disabled), so the per-rank timings for this tactic are
+        # directly comparable. For a cross-rank coupled kernel (e.g. AllReduce,
+        # MegaMoE) the effective latency is the SLOWEST rank -- the op is done
+        # only when every rank finishes -- so reduce the per-rank times by MAX
+        # to score the tactic by its true multi-rank cost instead of a single
+        # rank's local view. Reducing here also gives every rank an identical
+        # score, so all ranks select the same best tactic (required when the
+        # kernel needs every rank on the same compiled tactic). The all-gather
+        # uses the same group as _merge_cache_data and is balanced across ranks
+        # because MERGE forces an identical number of launches per rank.
+        if (tuning_config.distributed_tuning_strategy
+                == DistributedTuningStrategy.MERGE and self._is_distributed()):
+            avg_time = max(self._dist.tp_cp_allgather(avg_time))
+
         shapes = self._get_input_sizes(inputs)
         self._debug_logger(
             f"[Autotuner] Profiled runner={runner}, tactic={tactic}, shapes={shapes}: {avg_time:.6f}ms."
