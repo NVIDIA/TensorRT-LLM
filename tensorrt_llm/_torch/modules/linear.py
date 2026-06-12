@@ -23,7 +23,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.mode import (
+    QuantAlgo, get_mxfp4_support_error_message, get_sm_version_from_torch,
+    is_mxfp4_supported)
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform, resmooth_to_fp8_e8m0,
     transform_sf_into_required_layout)
@@ -96,6 +98,28 @@ class TensorParallelMode(str, enum.Enum):
     @classmethod
     def flip(cls, mode):
         return cls.ROW if mode == cls.COLUMN else cls.COLUMN
+
+
+def _get_fp4_quant_mode(quant_config: Optional[QuantConfig]):
+    if quant_config is None:
+        return None
+
+    quant_mode = quant_config.layer_quant_mode
+    if (quant_mode.has_nvfp4() or quant_mode.has_w4a8_nvfp4_fp8()
+            or quant_mode.has_mxfp4()):
+        return quant_mode
+    return None
+
+
+def _validate_fp4_quant_config_support(
+        quant_config: Optional[QuantConfig]) -> None:
+    quant_mode = _get_fp4_quant_mode(quant_config)
+    if quant_mode is None:
+        return
+
+    sm = get_sm_version_from_torch()
+    if not is_mxfp4_supported(sm, quant_mode):
+        raise ValueError(get_mxfp4_support_error_message(sm, quant_mode))
 
 
 def load_weight_shard(
@@ -2958,6 +2982,7 @@ class Linear(nn.Module):
         if self._weights_created:
             return
 
+        _validate_fp4_quant_config_support(self.quant_config)
         self.rebuild_tensor_metadata = {}
 
         self.quant_method = self.get_quant_method(self.quant_config)
