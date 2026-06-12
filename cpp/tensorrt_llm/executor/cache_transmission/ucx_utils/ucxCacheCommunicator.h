@@ -24,14 +24,12 @@
 #include "ucxx/utils/sockaddr.h"
 #include "ucxx/utils/ucx.h"
 #include <cstdint>
-#include <future>
 #if __linux__
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #endif
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 
-#include <future>
 #include <map>
 #include <memory>
 #include <string>
@@ -48,9 +46,7 @@ private:
     std::vector<std::shared_ptr<ucxx::Worker>> mWorkersPool;
     std::string mWorkerAddress;
     std::map<UcxConnection::ConnectionIdType, std::shared_ptr<UcxConnection>> mConnections;
-    std::map<UcxConnection::ConnectionIdType, std::future<void>> mConnectionFutures;
     std::mutex mConnectionsMutex;
-    std::mutex mConnectionFuturesMutex;
     std::unordered_map<std::string, uint64_t> mAddressToConnectionId;
     std::mutex mAddressToConnectionIdMutex;
     CommState mCommState;
@@ -64,7 +60,7 @@ private:
     std::thread mZmqRepThread;
     std::atomic<bool> mIsRunning{true};
 
-    UcxConnection::ConnectionIdType getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
+    UcxConnection::ConnectionIdType getNewConnectionId();
     UcxConnection::ConnectionIdType addConnection(std::string const& ip, uint16_t port);
 
 public:
@@ -77,7 +73,8 @@ public:
         return std::make_unique<UcxConnectionManager>();
     }
 
-    void addConnection(std::string const& workerAddress);
+    void addConnection(std::string const& workerAddress, UcxConnection::ConnectionIdType connectionId,
+        UcxConnection::ConnectionIdType connectionIdInPeer);
     Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;

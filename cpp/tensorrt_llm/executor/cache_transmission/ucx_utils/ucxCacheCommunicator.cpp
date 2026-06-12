@@ -60,10 +60,13 @@ public:
 
     MessageType mType;
     std::optional<std::string> mWorkerAddress;
+    std::optional<uint64_t> mConnectionId;
 
-    UcxCmMessage(MessageType type, std::optional<std::string> workerAddress)
+    UcxCmMessage(
+        MessageType type, std::optional<std::string> workerAddress, std::optional<uint64_t> connectionId = std::nullopt)
         : mType(type)
         , mWorkerAddress(std::move(workerAddress))
+        , mConnectionId(connectionId)
     {
     }
 
@@ -71,7 +74,8 @@ public:
     {
         namespace su = tensorrt_llm::executor::serialize_utils;
 
-        return su::serializedSize(message.mType) + su::serializedSize(message.mWorkerAddress);
+        return su::serializedSize(message.mType) + su::serializedSize(message.mWorkerAddress)
+            + su::serializedSize(message.mConnectionId);
     }
 
     static void serialize(UcxCmMessage const& message, std::ostream& os)
@@ -79,6 +83,7 @@ public:
         namespace su = tensorrt_llm::executor::serialize_utils;
         su::serialize(message.mType, os);
         su::serialize(message.mWorkerAddress, os);
+        su::serialize(message.mConnectionId, os);
     }
 
     static UcxCmMessage deserialize(std::istream& is)
@@ -86,7 +91,8 @@ public:
         namespace su = tensorrt_llm::executor::serialize_utils;
         auto type = su::deserialize<MessageType>(is);
         auto workerAddress = su::deserialize<std::optional<std::string>>(is);
-        return UcxCmMessage(type, workerAddress);
+        auto connectionId = su::deserialize<std::optional<uint64_t>>(is);
+        return UcxCmMessage(type, workerAddress, connectionId);
     }
 };
 
@@ -442,16 +448,21 @@ UcxConnectionManager::UcxConnectionManager()
 
                     if (ucxCmessage.mType == UcxCmMessage::MessageType::GET_WORKER_ADDRESS)
                     {
-                        // add Connection
                         TLLM_CHECK_WITH_INFO(ucxCmessage.mWorkerAddress.has_value(), "workerAddress is null");
+                        TLLM_CHECK_WITH_INFO(ucxCmessage.mConnectionId.has_value(), "connectionId is null");
                         std::string workerAddress = ucxCmessage.mWorkerAddress.value();
+                        UcxConnection::ConnectionIdType clientConnectionId = ucxCmessage.mConnectionId.value();
+                        UcxConnection::ConnectionIdType serverConnectionId = getNewConnectionId();
                         std::string selfWorkerAddress = mWorkerAddress;
-                        UcxCmMessage serverMessage(UcxCmMessage::MessageType::SERVER_WORKER_ADDRESS, selfWorkerAddress);
+                        UcxCmMessage serverMessage(
+                            UcxCmMessage::MessageType::SERVER_WORKER_ADDRESS, selfWorkerAddress, serverConnectionId);
                         std::ostringstream oStream;
                         UcxCmMessage::serialize(serverMessage, oStream);
                         std::string serverMessageStr = oStream.str();
+                        // Register the connection (endpoint + future) BEFORE sending the ZMQ reply,
+                        // so the future is in mConnectionFutures when recvConnect looks it up.
+                        addConnection(workerAddress, serverConnectionId, clientConnectionId);
                         mZmqRepSocket.send(zmq::buffer(serverMessageStr), zmq::send_flags::none);
-                        addConnection(workerAddress);
                     }
                     else if (ucxCmessage.mType == UcxCmMessage::MessageType::STOP)
                     {
@@ -511,25 +522,17 @@ UcxConnectionManager::~UcxConnectionManager()
     TLLM_LOG_DEBUG(mRank, "END UcxConnectionManager::~UcxConnectionManager");
 }
 
-void UcxConnectionManager::addConnection(std::string const& workerAddress)
+void UcxConnectionManager::addConnection(std::string const& workerAddress, UcxConnection::ConnectionIdType connectionId,
+    UcxConnection::ConnectionIdType connectionIdInPeer)
 {
     try
     {
         auto workerAddressPtr = ucxx::createAddressFromString(workerAddress);
         auto newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(workerAddressPtr, true);
 
-        UcxConnection::ConnectionIdType connectionId = getNewConnectionId(newEp);
-        std::scoped_lock lock(mConnectionFuturesMutex);
-
-        std::future<void> future = std::async(std::launch::async,
-            [this, connectionId, newEp]()
-            {
-                std::scoped_lock lock(mConnectionsMutex);
-                std::shared_ptr<UcxConnection> connection
-                    = std::make_shared<UcxConnection>(connectionId, newEp, this, false);
-                mConnections.emplace(connectionId, connection);
-            });
-        mConnectionFutures.emplace(connectionId, std::move(future));
+        std::scoped_lock lock(mConnectionsMutex);
+        auto connection = std::make_shared<UcxConnection>(connectionId, connectionIdInPeer, newEp, this, false);
+        mConnections.emplace(connectionId, connection);
     }
     catch (std::exception const& e)
     {
@@ -564,13 +567,12 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
         UcxConnection::ConnectionIdType connectionId = 0;
         {
             std::scoped_lock addConnectionIPLock(sAddConnectionIPMutex);
-            // This lock ensures that only one thread can create an endpoint from hostname and establish a UCX
-            // connection at a time, guaranteeing that the only one listener will send connectionId to requester in the
-            // same time.
+            connectionId = getNewConnectionId();
             auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
             reqSocket.set(zmq::sockopt::ipv6, 1);
             reqSocket.connect(build_zmq_endpoint(ip, port));
-            UcxCmMessage getWorkerAddressMessage(UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress);
+            UcxCmMessage getWorkerAddressMessage(
+                UcxCmMessage::MessageType::GET_WORKER_ADDRESS, mWorkerAddress, connectionId);
             std::ostringstream oStream;
             UcxCmMessage::serialize(getWorkerAddressMessage, oStream);
             std::string getWorkerAddressMessageStr = oStream.str();
@@ -583,11 +585,12 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
             UcxCmMessage serverMessage = UcxCmMessage::deserialize(is);
             TLLM_CHECK_WITH_INFO(serverMessage.mType == UcxCmMessage::MessageType::SERVER_WORKER_ADDRESS,
                 "serverMessage.mType is not SERVER_WORKER_ADDRESS");
+            TLLM_CHECK_WITH_INFO(serverMessage.mConnectionId.has_value(), "serverMessage.mConnectionId is null");
+            UcxConnection::ConnectionIdType serverConnectionId = serverMessage.mConnectionId.value();
             std::string serverWorkerAddress = serverMessage.mWorkerAddress.value();
             auto serverWorkerAddressPtr = ucxx::createAddressFromString(serverWorkerAddress);
             auto newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, true);
-            connectionId = getNewConnectionId(newEp);
-            connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
+            connection = std::make_shared<UcxConnection>(connectionId, serverConnectionId, newEp, this, true);
         }
         TLLM_CHECK(connectionId != 0);
         std::scoped_lock lock(mConnectionsMutex, mAddressToConnectionIdMutex);
@@ -604,7 +607,7 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
     }
 }
 
-UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp)
+UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId()
 {
     return mConnectionIdCounter++;
 }
@@ -628,14 +631,8 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
     memcpy(data, buffer.data(), size);
     UcxConnection::ConnectionIdType connectionId
         = *reinterpret_cast<UcxConnection::ConnectionIdType*>(buffer.data() + size);
-    std::scoped_lock lock(mConnectionsMutex, mConnectionFuturesMutex);
-    TLLM_CHECK_WITH_INFO(mConnectionFutures.find(connectionId) != mConnectionFutures.end(),
-        "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId, mRank);
-    if (mConnectionFutures.at(connectionId).valid())
-    {
-        // wait for the connection to be created
-        mConnectionFutures.at(connectionId).get();
-    }
+
+    std::scoped_lock lock(mConnectionsMutex);
     TLLM_CHECK_WITH_INFO(mConnections.find(connectionId) != mConnections.end(),
         "Connection not found In recvConnect connectionId: %lu , worldRank: %d", connectionId, mRank);
 
