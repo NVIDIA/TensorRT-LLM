@@ -385,6 +385,8 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
                                 binding_lib_name: str):
     build_run(f"\"{venv_python}\" -m pip install nanobind")
     build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+    nanobind_stubgen_patterns = get_project_dir(
+    ) / "scripts" / "nanobind_stubgen.patterns"
 
     env_stub_gen = os.environ.copy()
     cuda_home_dir = env_stub_gen.get("CUDA_HOME") or env_stub_gen.get(
@@ -402,8 +404,10 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
         link_dir = None
 
     try:
-        build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
-                  env=env_stub_gen)
+        build_run(
+            f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O . "
+            f"-p \"{nanobind_stubgen_patterns}\" -q",
+            env=env_stub_gen)
         # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
         # succeeds; CLI args after `-c ...` land in sys.argv[1:] for argparse.
         build_run(
