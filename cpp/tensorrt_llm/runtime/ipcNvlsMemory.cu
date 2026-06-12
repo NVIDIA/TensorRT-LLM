@@ -240,7 +240,7 @@ public:
         nvls_handle->ipc_uc_vas.resize(ranks.size());
         nvls_handle->ipc_uc_handles.resize(ranks.size());
 
-        for (int i = 0; i < ranks.size(); i++)
+        for (std::size_t i{0U}; i < ranks.size(); i++)
         {
             IpcMemHandle peer_ipc_handle = ipc_handle;
             ipc_communicator->bcastMemHandle(&peer_ipc_handle, i);
@@ -517,7 +517,7 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
     handle->size = size;
     handle->uc_ptr = reinterpret_cast<uintptr_t>(ptr);
     handle->mc_ptr = reinterpret_cast<uintptr_t>(nvshmemx_mc_ptr(NVSHMEM_TEAM_WORLD, ptr));
-    for (int i = 0; i < ranks.size(); i++)
+    for (std::size_t i{0U}; i < ranks.size(); i++)
     {
         handle->ipc_uc_ptrs.push_back(reinterpret_cast<uintptr_t>(nvshmem_ptr(ptr, i)));
     }
