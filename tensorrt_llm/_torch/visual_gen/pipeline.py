@@ -98,7 +98,7 @@ def _parse_profile_range():
 
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
-    from .config import DiffusionModelConfig
+    from .config import DiffusionPipelineConfig
 
 
 class BasePipeline(nn.Module):
@@ -107,7 +107,7 @@ class BasePipeline(nn.Module):
     """
 
     @classmethod
-    def resolve_variant(cls, config: "DiffusionModelConfig") -> Type["BasePipeline"]:
+    def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
 
         Override in subclasses to select a variant pipeline at creation
@@ -117,11 +117,11 @@ class BasePipeline(nn.Module):
         """
         return cls
 
-    def __init__(self, model_config: "DiffusionModelConfig"):
+    def __init__(self, pipeline_config: "DiffusionPipelineConfig"):
         super().__init__()
-        self.model_config = model_config
-        self.config = model_config.pretrained_config
-        self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
+        self.pipeline_config = pipeline_config
+        self.config = pipeline_config.primary_pretrained_config
+        self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
@@ -171,10 +171,10 @@ class BasePipeline(nn.Module):
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
-        if not self.model_config.cuda_graph.enable:
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
-        if self.model_config.torch_compile.enable:
+        if self.pipeline_config.torch_compile.enable:
             logger.warning(
                 "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
             )
@@ -294,7 +294,7 @@ class BasePipeline(nn.Module):
         Returns:
             (shapes, steps) tuple where shapes = list of (h, w, f)
         """
-        warmup_cfg = self.model_config.compilation
+        warmup_cfg = self.pipeline_config.compilation
 
         if warmup_cfg.resolutions is not None or warmup_cfg.num_frames is not None:
             resolutions = (
@@ -397,13 +397,12 @@ class BasePipeline(nn.Module):
             self.transformer.post_load_weights()
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
-        """Pick TeaCache coefficients from checkpoint path; updates model_config.teacache in place."""
+        """Pick TeaCache coefficients from checkpoint path; updates pipeline config in place."""
         if not coefficients:
             return
-        teacache_cfg = self.model_config.teacache
-        checkpoint_path = (
-            getattr(getattr(self.model_config, "pretrained_config", None), "_name_or_path", "")
-            or ""
+        teacache_cfg = self.pipeline_config.teacache
+        checkpoint_path = getattr(
+            self.pipeline_config.primary_pretrained_config, "_name_or_path", ""
         )
         matched = False
         for model_size, coeff_data in coefficients.items():
@@ -445,7 +444,7 @@ class BasePipeline(nn.Module):
             self.cache_accelerator.unwrap()
             self.cache_accelerator = None
 
-        cfg = self.model_config
+        cfg = self.pipeline_config
 
         if cfg.cache_backend == "cache_dit":
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
@@ -476,8 +475,8 @@ class BasePipeline(nn.Module):
         parallel-VAE decode ownership applies. The actual ``ParallelVAEFactory``
         wrap is a local side effect that only runs on ranks in ``vae_ranks``.
         """
-        parallel_cfg = self.model_config.parallel
-        vgm = self.model_config.visual_gen_mapping
+        parallel_cfg = self.pipeline_config.parallel
+        vgm = self.pipeline_config.visual_gen_mapping
 
         # Global preconditions — evaluate identically on every rank.
         self._parallel_vae_enabled = (
@@ -528,7 +527,7 @@ class BasePipeline(nn.Module):
 
         For non-transformer components, compiles the entire module.
         """
-        tc_config = self.model_config.torch_compile
+        tc_config = self.pipeline_config.torch_compile
 
         # Using default as max-autotune mode takes more initialization time and
         # does not improve performance a lot.
@@ -663,7 +662,7 @@ class BasePipeline(nn.Module):
             Non-decoding ranks return ``None`` (or a tuple of ``None``).
         """
         if self._parallel_vae_enabled:
-            vgm = self.model_config.visual_gen_mapping
+            vgm = self.pipeline_config.visual_gen_mapping
             decode_ranks = set(vgm.vae_ranks)
         else:
             decode_ranks = {0}
@@ -703,13 +702,12 @@ class BasePipeline(nn.Module):
         Returns:
             Dict with CFG configuration including split tensors
         """
-        vgm = self.model_config.visual_gen_mapping
+        vgm = self.pipeline_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
         attn2d_row_size = vgm.attn2d_row_size if vgm else 1
         attn2d_col_size = vgm.attn2d_col_size if vgm else 1
-        attn2d_size = attn2d_row_size * attn2d_col_size
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
 
         is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
@@ -722,10 +720,9 @@ class BasePipeline(nn.Module):
                 if attn2d_row_size * attn2d_col_size > 1:
                     logger.info(
                         f"CFG Parallel: cfg_size={cfg_size}, "
-                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}"
+                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}, "
+                        f"ulysses_size={ulysses_size}"
                     )
-                else:
-                    logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
 
             # Split main embeddings
             if is_split_embeds:
@@ -776,7 +773,7 @@ class BasePipeline(nn.Module):
         local_extras,
     ):
         """Execute single denoising step with CFG parallel."""
-        vgm = self.model_config.visual_gen_mapping
+        vgm = self.pipeline_config.visual_gen_mapping
         cfg_pg = vgm.cfg_group if vgm else None
         cfg_size = vgm.cfg_size if vgm else 1
 
@@ -1108,7 +1105,7 @@ class BasePipeline(nn.Module):
             if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
                 stats = self.cache_accelerator.get_stats()
                 if stats:
-                    if self.model_config.cache_backend == "cache_dit":
+                    if self.pipeline_config.cache_backend == "cache_dit":
                         logger.info("Cache-DiT stats: %s", stats)
                     elif "hit_rate" in stats:
                         logger.info(

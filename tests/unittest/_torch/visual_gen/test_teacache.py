@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tensorrt_llm._torch.visual_gen.cache.teacache import TeaCacheBackend
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm.visual_gen.args import TeaCacheConfig
 
@@ -31,8 +31,11 @@ class TestSetupTeacache:
     def _make_pipeline_mock(self, checkpoint_name, use_ret_steps=False):
         pipeline = MagicMock()
         pipeline.cache_accelerator = None
-        pipeline.model_config = DiffusionModelConfig(
+        model_config = DiffusionModelConfig(
             pretrained_config=SimpleNamespace(_name_or_path=f"/path/to/{checkpoint_name}/snapshot"),
+        )
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            model_configs={"transformer": model_config},
             cache=TeaCacheConfig(
                 teacache_thresh=0.3,
                 use_ret_steps=use_ret_steps,
@@ -51,7 +54,7 @@ class TestSetupTeacache:
         with patch.object(TeaCacheBackend, "enable"):
             BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), coefficients)
 
-        assert pipeline.model_config.teacache.coefficients == [1.0, 2.0, 3.0]
+        assert pipeline.pipeline_config.teacache.coefficients == [1.0, 2.0, 3.0]
 
     def test_no_match_raises_valueerror(self):
         """Raises ValueError (fail-early) when no variant matches checkpoint."""
@@ -66,7 +69,7 @@ class TestSetupTeacache:
     def test_disabled_teacache_is_noop(self):
         """No-op when cache is None (TeaCache not selected)."""
         pipeline = self._make_pipeline_mock("FLUX.1-dev")
-        pipeline.model_config = pipeline.model_config.model_copy(update={"cache": None})
+        pipeline.pipeline_config = pipeline.pipeline_config.model_copy(update={"cache": None})
 
         BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), {"dev": [1.0]})
         assert pipeline.cache_accelerator is None

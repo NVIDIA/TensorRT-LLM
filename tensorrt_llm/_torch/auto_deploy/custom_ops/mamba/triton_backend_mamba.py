@@ -19,7 +19,12 @@ import torch
 
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 
-from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable, SpecSSMResourceHandler
+from ..attention_interface import (
+    AttentionRegistry,
+    BatchInfo,
+    IntermediateSSMStateHandler,
+    MHACallable,
+)
 from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
@@ -274,7 +279,7 @@ class TritonBackendSSM(BaseBackendSSM):
     @classmethod
     def get_cache_initializers(cls, source_attn_node, cache_config):
         ret = super().get_cache_initializers(source_attn_node, cache_config)
-        ret["intermediate_ssm_state_cache"] = SpecSSMResourceHandler.from_base(
+        ret["intermediate_ssm_state_cache"] = IntermediateSSMStateHandler.from_base(
             ret["ssm_state_cache"]
         )
         return ret

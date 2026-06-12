@@ -461,8 +461,11 @@ class DeepSeekV3Attention(nn.Module):
         self.softmax_scale = self.q_head_dim ** (-0.5)
         if config.rope_scaling is not None:
             mscale_all_dim = config.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = config.rope_scaling["factor"]
-            if mscale_all_dim:
+            # transformers 5.x populates rope_scaling to {"rope_type": "default"} when the
+            # checkpoint has no scaling (e.g. DeepSeek-V3-Lite), so "factor" may be absent.
+            # Only apply the YaRN mscale correction when an explicit factor is present.
+            scaling_factor = config.rope_scaling.get("factor")
+            if scaling_factor is not None and mscale_all_dim:
                 mscale = DeepSeekV3YarnRotaryEmbedding._yarn_get_mscale(
                     scaling_factor, mscale_all_dim
                 )

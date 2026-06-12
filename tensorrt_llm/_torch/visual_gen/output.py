@@ -162,7 +162,10 @@ def to_visual_gen_output(resp: "DiffusionResponse") -> "VisualGenOutput":
     from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 
     if resp.error_msg is not None:
-        return VisualGenOutput(request_id=resp.request_id, error=resp.error_msg)
+        return VisualGenOutput(
+            request_id=resp.request_id,
+            error=resp.error_msg,
+        )
     out = resp.output
     metrics = VisualGenMetrics(
         generation=resp.generation,
@@ -197,7 +200,10 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
 
     if resp.error_msg is not None:
         return [
-            VisualGenOutput(request_id=resp.request_id, error=resp.error_msg)
+            VisualGenOutput(
+                request_id=resp.request_id,
+                error=resp.error_msg,
+            )
             for _ in range(batch_size)
         ]
     out = resp.output

@@ -31,7 +31,8 @@ import numpy as np
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import parse_gsm8k_output, wait_for_server
+from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
+                         wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call, check_output, print_info
@@ -298,14 +299,18 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
         "deepseek_r1_v2_fp4_mtp_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm_mtp.yaml",
-        "gpt_oss_120b_stress":
+        "gpt_oss_120b_trtllm_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
-        "gpt_oss_120b_eagle_stress":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm_eagle.yaml",
-        "gpt_oss_120b_cutlass_stress":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm_cutlass.yaml",
+        "gpt_oss_120b_eagle_triton_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_triton.yaml",
+        "gpt_oss_120b_eagle_trtllm_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_trtllm.yaml",
+        "gpt_oss_120b_triton_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_triton.yaml",
         "qwen3_5_4b_fp8_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_qwen3_5_4b_fp8_tllm.yaml",
+        "qwen3_32b_fp8_stress":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
@@ -490,6 +495,11 @@ def run_client_tests(example_dir,
                         "The capital of Germany is Berlin",
                         "Using `asyncio` in Python"
                     ]
+                elif "qwen3_32b_fp8" in test_desc:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Asyncio in Python is a library"
+                    ]
                 else:
                     expected_strings = [
                         "The capital of Germany is Berlin",
@@ -616,6 +626,13 @@ def setup_disagg_cluster(
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
 
+    speculative_config = config.get("speculative_config")
+    if isinstance(speculative_config, dict):
+        speculative_model = speculative_config.get("speculative_model")
+        if speculative_model:
+            speculative_config["speculative_model"] = resolve_llm_model_path(
+                speculative_model)
+
     disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
@@ -646,6 +663,8 @@ def setup_disagg_cluster(
 
     # Launch workers
     model = model_name or config.get("model")
+    if model:
+        model = resolve_llm_model_path(model)
     ctx_workers = []
     gen_workers = []
     disagg_server = None
@@ -2273,8 +2292,30 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     model_dir = f"{llm_models_root()}/{model_path}"
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    env = llm_venv._new_env.copy()
+    tiktoken_vocab = os.path.join(llm_models_root(), "datasets",
+                                  "tiktoken_vocab")
+    env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
+    env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
+
     run_disaggregated_test(disaggregated_example_root,
                            "gpt_oss_120b_harmony",
+                           env=env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['Qwen3/Qwen3-32B-FP8'])
+def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
+                                     disaggregated_example_root, llm_venv,
+                                     model_path):
+    model_dir = resolve_llm_model_path(model_path)
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
@@ -2297,7 +2338,7 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                             cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
     pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
-                            test_desc='gpt_oss_120b_stress',
+                            test_desc='gpt_oss_120b_trtllm_stress',
                             request_count=60000,
                             accuracy_threshold=0.42,
                             cancellation_rate=10,
@@ -2306,22 +2347,34 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     pytest.param(
         TestConfig(
             model_path='gpt_oss/gpt-oss-120b',
-            test_desc='gpt_oss_120b_eagle_stress',
+            test_desc='gpt_oss_120b_eagle_triton_stress',
             request_count=60000,
             accuracy_threshold=0.42,
             speculative_model_path='gpt_oss/gpt-oss-120b-Eagle3',
             cancellation_rate=10,
             cancellation_delay=0.5,
         ),
-        marks=(pytest.mark.skip_less_device(8), skip_pre_hopper),
+        marks=(pytest.mark.skip_less_device(8), skip_no_hopper),
+    ),
+    pytest.param(
+        TestConfig(
+            model_path='gpt_oss/gpt-oss-120b',
+            test_desc='gpt_oss_120b_eagle_trtllm_stress',
+            request_count=60000,
+            accuracy_threshold=0.42,
+            speculative_model_path='gpt_oss/gpt-oss-120b-Eagle3',
+            cancellation_rate=10,
+            cancellation_delay=0.5,
+        ),
+        marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell),
     ),
     pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
-                            test_desc='gpt_oss_120b_cutlass_stress',
-                            request_count=60000,
+                            test_desc='gpt_oss_120b_triton_stress',
+                            request_count=30000,
                             accuracy_threshold=0.42,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
-                 marks=(pytest.mark.skip_less_device(4), skip_pre_hopper)),
+                 marks=(pytest.mark.skip_less_device(4), skip_no_hopper)),
     pytest.param(TestConfig(model_path='Qwen3.5-4B-FP8',
                             test_desc='qwen3_5_4b_fp8_stress',
                             request_count=3000,
@@ -2329,6 +2382,11 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
+    pytest.param(TestConfig(model_path='Qwen3/Qwen3-32B-FP8',
+                            test_desc='qwen3_32b_fp8_stress',
+                            request_count=10000,
+                            accuracy_threshold=0.42),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
 ],
                          ids=lambda x: x.test_desc)
 @pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
@@ -2343,7 +2401,7 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
-    model_dir = f"{llm_models_root()}/{model_path}"
+    model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
     config_file = get_test_config(test_desc, disaggregated_example_root,

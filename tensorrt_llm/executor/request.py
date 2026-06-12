@@ -89,6 +89,8 @@ class PromptAdapterRequest:
 
 
 class GenerationRequest:
+    # Mirrors C++ Request::Impl::kMaxCacheSaltLength
+    MAX_CACHE_SALT_LEN: int = 256
 
     def __init__(
         self,
@@ -105,7 +107,7 @@ class GenerationRequest:
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
-        cache_salt_id: Optional[int] = None,
+        cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
@@ -134,7 +136,21 @@ class GenerationRequest:
         self.disaggregated_params = disaggregated_params
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
-        self.cache_salt_id = cache_salt_id
+        if cache_salt is not None:
+            if not isinstance(cache_salt, str):
+                raise TypeError(
+                    f"cache_salt must be str or None, got {type(cache_salt).__name__}"
+                )
+            # The C++ side validates against UTF-8 byte length, so do the same here
+            # (Python `len()` would count Unicode code points, which can pass this
+            # guard but fail at C++ dispatch for non-ASCII salts).
+            cache_salt_byte_len = len(cache_salt.encode("utf-8"))
+            if cache_salt_byte_len > self.MAX_CACHE_SALT_LEN:
+                raise ValueError(
+                    f"cache_salt UTF-8 byte length ({cache_salt_byte_len}) "
+                    f"exceeds the maximum supported length "
+                    f"({self.MAX_CACHE_SALT_LEN}).")
+        self.cache_salt = cache_salt
         self.arrival_time = arrival_time
         if not (0.0 <= priority <= 1.0):
             raise ValueError(

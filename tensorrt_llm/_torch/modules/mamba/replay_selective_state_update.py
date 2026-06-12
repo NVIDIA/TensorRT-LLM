@@ -226,7 +226,7 @@ def _replay_precompute_kernel(
         other=0.0,
     )
 
-    # Compute raw CB once — shared across all heads in this block
+    # Compute raw CB once, shared across all heads in this block.
     raw_CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
 
     # Store B to cache (once per group, only if this block covers the first heads)
@@ -458,17 +458,18 @@ def _replay_state_update_kernel(
     # two back).  coeff is all-zero (offs_t < 0), total_decay is 1.0, so the
     # replay leaves `state` unchanged — cache contents don't matter on step 0.
     coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
-    coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
+    accepted_mask = t_mask & (offs_t < prev_num_accepted_tokens)
+    coeff = tl.where(accepted_mask, coeff, 0.0)
 
-    # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
+    # Zero stale rows beyond PNAT to prevent Inf/NaN from reaching tl.dot.
     old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
     old_x_all = tl.load(
         old_x_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
-        mask=t_mask[:, None] & m_mask[None, :],
+        mask=accepted_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
 
-    # Load old_B from READ buffer: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE)
+    # Apply the same accepted-row mask to old_B.
     old_B_base = (
         old_B_ptr
         + cache_batch_idx * stride_old_B_cache
@@ -477,7 +478,7 @@ def _replay_state_update_kernel(
     )
     old_B_all = tl.load(
         old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
-        mask=t_mask[:, None] & n_mask[None, :],
+        mask=accepted_mask[:, None] & n_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
@@ -488,7 +489,7 @@ def _replay_state_update_kernel(
     total_decay = tl.where(prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum), 1.0)
     state *= total_decay
 
-    # tl.dot fast-forward: old_x^T @ dB_scaled → (M, dstate)
+    # tl.dot fast-forward: old_x^T @ dB_scaled -> (M, dstate)
     state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
 
     # Write post-replay state
@@ -497,7 +498,7 @@ def _replay_state_update_kernel(
         # Each Philox call produces 4 random ints.  We call randint4x on
         # quarter-sized dstate offsets and join+reshape to get the full
         # (M, dstate) random tensor — 4x fewer PRNG rounds.
-        rand_seed = tl.load(rand_seed_ptr)
+        rand_seed = tl.load(rand_seed_ptr + cache_batch_idx)
         base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
         offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // 4)
         rand_offsets_q = (
@@ -671,8 +672,11 @@ def replay_selective_state_update(
         z: (batch, T, nheads, dim) optional silu gate.
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
         state_batch_indices: (batch,) optional cache slot mapping.
-        rand_seed: optional single-element int64 CUDA tensor for Philox PRNG seed.
-            When provided, state is stochastically rounded to fp16 on store.
+        rand_seed: optional (cache_size,) int64 CUDA tensor of per-cache-slot
+            Philox PRNG seeds.  The caller bumps this tensor in-place for each
+            replay invocation so CUDA graph replay still gets fresh draws; the
+            kernel indexes it by cache_batch_idx.  When provided, state is
+            stochastically rounded to fp16 on store.
             When None, standard deterministic rounding is used.
         philox_rounds: number of Philox PRNG rounds (default 10).
         launch_with_pdl: enable external PDL (conv1d → precompute chain).
@@ -743,6 +747,19 @@ def replay_selective_state_update(
     assert old_dA_cumsum.shape == (cache_size, 2, nheads, T)
     assert cache_buf_idx.shape == (cache_size,)
     assert prev_num_accepted_tokens.shape == (cache_size,)
+    if rand_seed is not None:
+        assert rand_seed.dtype == torch.int64, (
+            f"rand_seed dtype must be int64, got {rand_seed.dtype}"
+        )
+        assert rand_seed.dim() == 1, (
+            f"rand_seed must be a 1D tensor; got shape {tuple(rand_seed.shape)}"
+        )
+        if rand_seed.shape[0] == 1 and cache_size > 1:
+            rand_seed = rand_seed.expand(cache_size).contiguous()
+        assert rand_seed.shape[0] >= cache_size, (
+            f"rand_seed must have length 1 or >= cache_size ({cache_size}); "
+            f"got shape {tuple(rand_seed.shape)}"
+        )
 
     tie_hdim = (
         A.stride(-1) == 0
@@ -755,7 +772,7 @@ def replay_selective_state_update(
     device = x.device
     BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
 
-    # Allocate precomputed intermediates (per-call, not cached)
+    # Allocate precomputed intermediates (per-call, not cached).
     cb_scaled = torch.empty(
         batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_T, device=device, dtype=torch.float32
     )

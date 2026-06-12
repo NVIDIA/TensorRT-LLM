@@ -17,7 +17,6 @@ import math
 from typing import Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding
@@ -27,8 +26,10 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -221,12 +222,12 @@ class Cosmos3CausalAttention(Attention):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             qkv_mode=QKVMode.SEPARATE_QKV,
-            qk_norm=True,
+            qk_norm=False,
             qk_norm_mode="per_head",
             bias=False,
             config=model_config,
             layer_idx=layer_idx,
-            enable_ulysses=False,
+            enable_sequence_parallel=False,
         )
         self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
         self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
@@ -247,9 +248,9 @@ class Cosmos3CausalAttention(Attention):
 
         q, k, v = self.get_qkv(hidden_states)
 
-        q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        q = q.view(batch_size, seq_len, self.local_num_attention_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.local_num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.local_num_key_value_heads, self.head_dim)
 
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -300,12 +301,12 @@ class Cosmos3CrossAttention(Attention):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             qkv_mode=QKVMode.FUSE_QKV,
-            qk_norm=True,
+            qk_norm=False,
             qk_norm_mode="per_head",
             bias=False,
             config=model_config,
             layer_idx=layer_idx,
-            enable_ulysses=True,
+            enable_sequence_parallel=True,
         )
         model_config.attention.backend = original_backend
 
@@ -341,9 +342,9 @@ class Cosmos3CrossAttention(Attention):
 
         q, k, v = self.get_qkv(hidden_states)
 
-        q = q.view(batch_size, seq_len_gen, self.num_attention_heads, self.head_dim)
-        k = k.view(batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim)
-        v = v.view(batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim)
+        q = q.view(batch_size, seq_len_gen, self.local_num_attention_heads, self.head_dim)
+        k = k.view(batch_size, seq_len_gen, self.local_num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len_gen, self.local_num_key_value_heads, self.head_dim)
 
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -395,6 +396,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             dtype=torch.bfloat16,
             config=model_config,
             layer_idx=layer_idx,
+            reduce_output=model_config.mapping.tp_size > 1,
         )
 
     def forward(
@@ -457,6 +459,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             dtype=torch.bfloat16,
             config=model_config,
             layer_idx=layer_idx,
+            reduce_output=model_config.mapping.tp_size > 1,
         )
 
     def forward(
@@ -639,10 +642,9 @@ class Cosmos3LanguageModel(nn.Module):
         return cached_kv
 
 
-class Cosmos3VFMTransformer(nn.Module):
+class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
-        super().__init__()
-        self.model_config = model_config
+        super().__init__(model_config)
         pretrained_config = model_config.pretrained_config
 
         self.hidden_size = pretrained_config.hidden_size
@@ -669,44 +671,32 @@ class Cosmos3VFMTransformer(nn.Module):
             )
 
         vgm = model_config.visual_gen_mapping
-        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
-        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
-        attn2d_mesh_size = attn2d_row_size * attn2d_col_size
+
+        self.sharder = SequenceSharder.from_vgm(
+            vgm,
+            num_attention_heads=self.num_attention_heads,
+            num_kv_heads=self.num_kv_heads,
+        )
+        tp_size = vgm.tp_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
-        use_attn2d = attn2d_mesh_size > 1
-        use_ulysses = ulysses_size > 1
+        ring_size = vgm.ring_size if vgm else 1
+        head_divisibility_factor = tp_size * ulysses_size
 
-        if vgm is not None and vgm.tp_size > 1:
-            raise ValueError(
-                f"Cosmos3 does not support tensor parallelism. Got tp_size={vgm.tp_size}"
-            )
-
-        if use_ulysses and (
-            self.num_attention_heads % ulysses_size != 0 or self.num_kv_heads % ulysses_size != 0
+        if (ulysses_size > 1 or tp_size > 1) and (
+            self.num_attention_heads % head_divisibility_factor != 0
+            or self.num_kv_heads % head_divisibility_factor != 0
         ):
             raise ValueError(
                 f"num_attention_heads ({self.num_attention_heads}) and "
                 f"num_kv_heads ({self.num_kv_heads}) must be divisible by "
-                f"ulysses_size ({ulysses_size})"
+                f"TP * Ulysses size ({tp_size} * {ulysses_size})"
             )
 
-        if use_attn2d:
-            # Attention2D is not compatible with Cosmos3 cross-attention: its forward()
-            # TODO: Re-enable once Ring/Attn2D PRs with cross-attention support have landed.
+        if ring_size > 1:
+            # Ring parallelism is not compatible with Cosmos3 cross-attention.
             raise NotImplementedError(
-                "Attention2D (Ring attention) is not supported for Cosmos3. "
-                "Use Ulysses sequence parallelism instead."
+                "Ring parallelism is not supported for Cosmos3 cross-attention."
             )
-        elif use_ulysses:
-            self.use_seq_parallel = True
-            self.seq_parallel_size = ulysses_size
-            self.seq_parallel_pg = vgm.ulysses_group
-            self.seq_parallel_rank = vgm.ulysses_rank
-        else:
-            self.use_seq_parallel = False
-            self.seq_parallel_size = 1
-            self.seq_parallel_pg = None
-            self.seq_parallel_rank = 0
 
         self.language_model = Cosmos3LanguageModel(model_config)
 
@@ -920,73 +910,40 @@ class Cosmos3VFMTransformer(nn.Module):
             cached_kv_full = self.language_model(text_ids, text_mask, freqs_und)
             self.cached_freqs_gen = freqs_gen
 
-            if self.use_seq_parallel:
-                rank = self.seq_parallel_rank
-                # Round max_real_len up to next multiple of ulysses_size.
-                # At most seq_parallel_size-1 extra positions, negligible softmax dilution.
-                val = (
-                    self.seq_parallel_size - max_real_len % self.seq_parallel_size
-                ) % self.seq_parallel_size
+            if self.sharder.is_active:
+                # Round max_real_len up to next multiple of sharder.size.
+                # At most size-1 extra positions, negligible softmax dilution.
+                val = (self.sharder.size - max_real_len % self.sharder.size) % self.sharder.size
                 S_text_shard_total = int(max_real_len) + val
-                S_text_shard = S_text_shard_total // self.seq_parallel_size
 
                 self.cached_kv = []
                 for k, v in cached_kv_full:
-                    # Slice to S_text_shard_total; zero out the val padding positions
                     k = k[:, :S_text_shard_total].clone()
                     v = v[:, :S_text_shard_total].clone()
                     if val > 0:
                         k[:, int(max_real_len) :] = 0
                         v[:, int(max_real_len) :] = 0
                     self.cached_kv.append(
-                        (
-                            k[:, rank * S_text_shard : (rank + 1) * S_text_shard],
-                            v[:, rank * S_text_shard : (rank + 1) * S_text_shard],
-                        )
+                        (self.sharder.shard(k, dim=1), self.sharder.shard(v, dim=1))
                     )
             else:
                 self.cached_kv = cached_kv_full
 
-        if self.use_seq_parallel:
-            S_gen = hidden_gen.shape[1]
-            pad = (self.seq_parallel_size - S_gen % self.seq_parallel_size) % self.seq_parallel_size
-            if pad > 0:
-                # This will cause minor noise in softmax due to padding.
-                hidden_gen = F.pad(hidden_gen, (0, 0, 0, pad))
-                cos, sin = self.cached_freqs_gen
-                cos_padded = F.pad(cos, (0, 0, 0, 0, 0, pad))
-                sin_padded = F.pad(sin, (0, 0, 0, 0, 0, pad))
-            else:
-                cos_padded, sin_padded = self.cached_freqs_gen
-            padded_s_gen = S_gen + pad
-            S_shard = padded_s_gen // self.seq_parallel_size
-            hidden_gen = hidden_gen[
-                :, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard
-            ]
-            # Shard freqs_gen to match
-            freqs_gen = (
-                cos_padded[
-                    :, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard
-                ],
-                sin_padded[
-                    :, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard
-                ],
-            )
-        else:
-            freqs_gen = self.cached_freqs_gen
+        S_gen = hidden_gen.shape[1]
+        hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
+        cos, sin = self.cached_freqs_gen
+        cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
+        sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
+        freqs_gen = (cos, sin)
 
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = self.cached_kv[i]
-            if self.seq_parallel_size <= 1:
+            if not self.sharder.is_active:
                 k_und = k_und[:, :max_real_len]
                 v_und = v_und[:, :max_real_len]
             hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
 
-        if self.use_seq_parallel:
-            hidden_gen = hidden_gen.contiguous()
-            parts = [torch.empty_like(hidden_gen) for _ in range(self.seq_parallel_size)]
-            dist.all_gather(parts, hidden_gen, group=self.seq_parallel_pg)
-            hidden_gen = torch.cat(parts, dim=1)[:, :S_gen]  # [B, S_gen, patch_latent_dim]
+        hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
         return self.unpatchify(self.llm2vae(hidden_gen), T, H, W)

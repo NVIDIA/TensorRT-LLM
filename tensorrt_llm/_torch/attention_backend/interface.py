@@ -24,8 +24,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
+from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
-from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
 
 try:
@@ -321,12 +322,16 @@ class AttentionMetadata:
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
                                    max_draft_tokens: int = 0,
-                                   buffers=None) -> Self:
+                                   buffers=None,
+                                   encode_only: bool = False) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        When encode_only is True, initialize seq_lens as ones(max_batch_size)
+        and leave num_contexts at the caller's discretion.
         """
         if self.is_cuda_graph:
             return self
@@ -336,13 +341,20 @@ class AttentionMetadata:
         cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True)
+                max_batch_size, True, max_draft_tokens, buffers, encode_only)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
             cuda_graph_metadata._seq_lens_cuda = None
-            cuda_graph_metadata.seq_lens = torch.ones(
-                (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
+            if encode_only:
+                # Encoder: variable seq_lens per batch; the runner in-place
+                # updates them via the seq_lens setter each replay.
+                cuda_graph_metadata.seq_lens = torch.ones((max_batch_size, ),
+                                                          dtype=torch.int)
+            else:
+                cuda_graph_metadata.seq_lens = torch.ones(
+                    (max_batch_size, ),
+                    dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
@@ -357,7 +369,11 @@ class AttentionMetadata:
                     device='cuda',
                 )
 
-        cuda_graph_metadata.num_contexts = 0
+        if not encode_only:
+            # Decoder CUDA graphs are always generation-only (no context
+            # requests). Encoder CUDA graphs are the opposite (all context);
+            # the caller sets num_contexts = padded_batch_size.
+            cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
