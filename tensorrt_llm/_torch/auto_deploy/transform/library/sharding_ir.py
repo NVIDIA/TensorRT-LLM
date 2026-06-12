@@ -595,6 +595,48 @@ class WeightedParamShardableNode(ShardableNode):
         return 1 if count > 0 else 0
 
 
+@ShardableNode.register(torch.ops.auto_deploy.torch_attention)
+class AttentionSinksShardableNode(ShardableNode):
+    """``torch_attention`` with per-head ``sinks``: shard sinks along the head dim.
+
+    Attention-sink models (e.g. GPT-OSS) add a learnable per-head sink scalar
+    (shape ``[num_heads]``). When the heads are TP-sharded (q/k/v colwise), the
+    ``sinks`` arg must follow the same head split, else the op sees full sinks
+    against the sharded head count. Standard attention (no ``sinks``) is a no-op.
+
+    Gating is handled by the apply loop: attention-DP skips all non-MoE nodes
+    (so attention stays replicated and sinks stays full), and ``shard_layers``
+    gates via the node's ``layer_type`` hint (default ``"mha"``).
+    """
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        if dc.tp_size <= 1:
+            return 0
+        count = 0
+        for wn in extract_weight_nodes(self.node).weights:
+            # Only the per-head ``sinks`` (1-D) follows the head split; never a 2-D weight.
+            if wn.tensor.dim() != 1:
+                continue
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=wn.tensor,
+                param_key=wn.node_key,
+                dim=0,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+            )
+            count += 1
+        if count:
+            ad_logger.debug("  sharded attention sinks along head dim")
+        return 1 if count > 0 else 0
+
+    @classmethod
+    def _strip_node_hints(cls, node: Node) -> bool:
+        # Leave ``torch_attention`` untouched at strip time: its ``layer_type`` is a
+        # benign op default that downstream backend selection reads as-is.
+        return False
+
+
 @ShardableNode.register(*_auto_deploy_ops("torch_rmsnorm_gated", "triton_rmsnorm_gated"))
 class NormShardableNode(ShardableNode):
     """Gated RMSNorm op: shard weight parameter."""
