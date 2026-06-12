@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU Qwen-Image with NVFP4 dynamic quantization.
+# 1-GPU Qwen-Image with FP8 blockwise dynamic quantization.
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 quant_config:
-  quant_algo: NVFP4
+  quant_algo: FP8_BLOCK_SCALES
   dynamic: true
 attention_config:
   backend: VANILLA

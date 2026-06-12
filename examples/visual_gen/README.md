@@ -31,7 +31,7 @@ python models/ltx2.py --visual_gen_args configs/ltx2-t2v-fp8-1-gpu.yaml
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
 python models/cosmos3_ti2v.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"
-python models/qwen_image.py --visual_gen_args configs/qwen-image-fp4-1gpu.yaml
+python models/qwen_image.py --visual_gen_args configs/qwen-image-fp8-1gpu.yaml
 ```
 
 Install deps from the repo root: `pip install -r requirements-dev.txt`.

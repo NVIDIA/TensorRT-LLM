@@ -16,7 +16,7 @@
 
 Usage:
     python qwen_image.py
-    python qwen_image.py --visual_gen_args ../configs/qwen-image-fp4-1gpu.yaml
+    python qwen_image.py --visual_gen_args ../configs/qwen-image-fp8-1gpu.yaml
 """
 
 import argparse
