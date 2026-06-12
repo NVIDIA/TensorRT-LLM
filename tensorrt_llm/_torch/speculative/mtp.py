@@ -142,6 +142,20 @@ class MTPSpecMetadata(SpecMetadata):
     # CUDA graph, we use this tensor to store the number of input tokens for the
     # subsequent draft forward.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
+    # Dynamic-tree drafting (one-model MTP-Eagle). When use_dynamic_tree is True,
+    # the target's multi-token verify forward uses a per-slot tree mask sourced
+    # from spec_tree_manager.slot_storage (see model_engine.update_spec_dec_param).
+    use_dynamic_tree: bool = False
+    dynamic_tree_max_topK: Optional[int] = None
+    spec_tree_manager: Optional[object] = None
+    # Dynamic-tree per-gen-request tree links for the Mamba tree-aware verify
+    # forward, gathered from spec_tree_manager.slot_storage in prepare().
+    # Shapes [num_generations, max_total_draft_tokens + 1], int32, root at
+    # index 0.  None for linear MTP. retrieve_parent_token stays None: the
+    # mixer's conv1d kernel derives + fills it from next_token/next_sibling.
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
+    retrieve_parent_token: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.mtp_hidden_states_manager is not None:
@@ -171,6 +185,12 @@ class MTPSpecMetadata(SpecMetadata):
             self.mtp_num_modules,
             device='cuda',
         )
+        # Dynamic-tree drafting drives the target's multi-token verify forward
+        # through the spec-dec tree mask (see model_engine.update_spec_dec_param,
+        # which routes on these flags + spec_tree_manager.use_dynamic_tree).
+        if self.use_dynamic_tree:
+            self.is_spec_dec_tree = True
+            self.is_spec_dec_dynamic_tree = True
 
     @property
     def all_rank_num_seqs(self):
@@ -196,7 +216,15 @@ class MTPSpecMetadata(SpecMetadata):
         # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
         # forward and only one input token in the following draft forward.
         # This num_tokens is used to set the all_rank_num_tokens for attention dp.
-        if not self.spec_dec_mode.is_mtp_eagle_one_model():
+        if self.use_dynamic_tree:
+            # Target verify forward processes (max_total_draft_tokens + 1) tokens
+            # per gen request, but the draft step-0 forward (which consumes
+            # all_rank_num_tokens) processes only (max_draft_len + 1) per request
+            # after prepare_drafter_inputs repacks the accepted path. Correct
+            # num_tokens to the draft step-0 count for attention dp.
+            self.num_tokens -= self.num_generations * (
+                self.max_total_draft_tokens - self.max_draft_len)
+        elif not self.spec_dec_mode.is_mtp_eagle_one_model():
             self.num_tokens -= self.num_generations
 
         if self.mtp_hidden_states_manager is not None:  # MTP vanilla or use relaxed acceptance
@@ -239,6 +267,35 @@ class MTPSpecMetadata(SpecMetadata):
             gen_request_ids = self.request_ids[num_contexts:]
             if gen_request_ids:
                 sa_manager.prepare(gen_request_ids, self.max_draft_len)
+
+        # Dynamic tree: gather per-gen-request tree links for the Mamba
+        # tree-aware verify forward (the tree being verified this step was
+        # built last step into slot_storage). all_ids_buf is laid out
+        # [ctx | gen] and was filled by model_engine.fill_all_slot_ids before
+        # this prepare() runs (see _prepare_inputs). Token order matches the
+        # target forward's verify layout (root/golden at index 0).
+        self.retrieve_next_token = None
+        self.retrieve_next_sibling = None
+        self.retrieve_parent_token = None
+        if self.use_dynamic_tree and self.spec_tree_manager is not None:
+            num_gens = self.num_generations
+            if num_gens > 0:
+                num_contexts = num_seqs - num_gens
+                slot_storage = self.spec_tree_manager.slot_storage
+                gen_slot_ids = slot_storage.all_ids_buf[
+                    num_contexts:num_contexts + num_gens]
+                next_token, next_sibling = slot_storage.next_links_from_slots(
+                    gen_slot_ids, num_gens)
+                # No-tree gen slots (CUDA-graph/warmup dummies, and a real
+                # slot's first decode before a tree exists) have sentinel
+                # links.  The Mamba tree-aware verify conv1d/SSU reads these
+                # unconditionally, so substitute a valid linear chain for those
+                # rows; real-tree rows are untouched.
+                slot_storage.apply_no_tree_linear_chain(next_token,
+                                                        next_sibling,
+                                                        gen_slot_ids, num_gens)
+                self.retrieve_next_token = next_token
+                self.retrieve_next_sibling = next_sibling
 
 
 class MTPSampler(SpecSamplerBase):

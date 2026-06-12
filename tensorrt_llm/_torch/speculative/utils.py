@@ -24,6 +24,8 @@ from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
 from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .model_drafter import ModelDrafter
 from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata, MTPWorker
+from .mtp_dynamic_tree import (MTPEagleDynamicTreeResourceManager,
+                               MTPEagleDynamicTreeWorker)
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
@@ -61,6 +63,7 @@ def get_spec_metadata(spec_config,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
+            use_dynamic_tree=getattr(spec_config, 'use_dynamic_tree', False),
         )
     if spec_config.spec_dec_mode.is_mtp_vanilla():
         return MTPSpecMetadata(
@@ -208,6 +211,16 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         if sa_cfg is not None:
             sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
                                                 max_seq_len)
+        # Dynamic tree needs a SpecTreeManager (for the target's tree-mask verify
+        # forward) composed with the MTP hidden-state slot pools.
+        if getattr(spec_config, 'use_dynamic_tree', False):
+            return MTPEagleDynamicTreeResourceManager(
+                spec_config,
+                model_config.torch_dtype,
+                model_config.hidden_size,
+                max_num_requests,
+                sa_manager=sa_manager,
+            )
         if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
             # Unified resource manager: the unified worker reads
             # ``relaxed_delta_pool`` from ``Eagle3ResourceManager`` (mirrors the
@@ -381,6 +394,9 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config, model_config, use_separate_draft_kv_cache)
     if spec_dec_mode.is_mtp_eagle_one_model():
+        if getattr(spec_config, 'use_dynamic_tree', False):
+            return MTPEagleDynamicTreeWorker(spec_config, model_config,
+                                             use_separate_draft_kv_cache)
         return MTPEagleWorker(spec_config, model_config,
                               use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
