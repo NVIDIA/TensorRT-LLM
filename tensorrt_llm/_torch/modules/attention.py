@@ -1887,8 +1887,76 @@ class MLA(nn.Module):
         q = (q * attn_scale).to(q.dtype)
         return q
 
-    def _deepseek_v4_o_proj(self, attn_out_latent: torch.Tensor,
-                            position_ids: torch.Tensor) -> torch.Tensor:
+    def _should_use_dsv4_epilogue_fusion(self, num_contexts: int,
+                                         num_generations: int) -> bool:
+        if os.environ.get("TRTLLM_DSV4_FUSED_EPILOGUE", "0") != "1":
+            return False
+        if not self.is_deepseek_v4:
+            return False
+        if num_contexts == 0 and num_generations == 0:
+            return False
+        if num_contexts > 0 and num_generations > 0:
+            return False
+        if self.mapping.has_cp_helix():
+            return False
+        if not is_sm_100f():
+            return False
+        if not getattr(self.mapping, "enable_attention_dp", False):
+            return False
+        if self.num_heads not in (64, 128):
+            return False
+        if getattr(self.mqa, "sparse_attention_config", None) is None:
+            return False
+        if not getattr(self.mqa, "has_fp8_kv_cache", False):
+            return False
+        if self.o_a_proj.dtype != torch.float8_e4m3fn:
+            return False
+        if self.kv_lora_rank != 448 or self.qk_rope_head_dim != 64:
+            return False
+        if self.qk_head_dim != 512 or self.v_head_dim != 512:
+            return False
+        if (self.n_local_groups <= 0
+                or self.num_heads_tp % self.n_local_groups != 0):
+            return False
+        if self.num_heads_tp // self.n_local_groups != 8:
+            return False
+        return not self.inverse_rotary_emb.is_neox
+
+    def _create_dsv4_epilogue_buffers(self, q: torch.Tensor, num_tokens: int):
+        heads_per_group = self.num_heads_tp // self.n_local_groups
+        scale_buf_m = (num_tokens + 3) // 4 * 4
+        fp8_o = torch.empty((self.n_local_groups, num_tokens,
+                             heads_per_group * self.v_head_dim),
+                            dtype=torch.float8_e4m3fn,
+                            device=q.device)
+        scale = torch.empty((self.n_local_groups, heads_per_group *
+                             (self.v_head_dim // 128), scale_buf_m),
+                            dtype=torch.float32,
+                            device=q.device)
+        return fp8_o, scale
+
+    def _deepseek_v4_o_proj(
+        self,
+        attn_out_latent,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if isinstance(attn_out_latent, (tuple, list)):
+            attn_fp8, attn_scale = attn_out_latent
+            num_tokens = attn_fp8.shape[1]
+            scale_buf_m = (num_tokens + 3) // 4 * 4
+            if attn_scale.shape[2] != scale_buf_m:
+                attn_scale = attn_scale[:, :, :scale_buf_m]
+
+            o_lora = torch.empty(
+                [num_tokens, self.n_local_groups, self.o_lora_rank],
+                device=attn_fp8.device,
+                dtype=self.dtype)
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(attn_fp8, self.o_a_proj,
+                                                        attn_scale,
+                                                        self.o_a_proj_scale,
+                                                        o_lora.transpose(0, 1))
+            return self.o_b_proj(o_lora.flatten(1))
+
         num_tokens = attn_out_latent.shape[0]
         attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp,
                                                -1)
@@ -2225,6 +2293,8 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
+            enable_dsv4_epilogue_fusion = self._should_use_dsv4_epilogue_fusion(
+                num_contexts, num_generations)
             self.forward_context_sparse_mla(
                 q_ctx,
                 compressed_kv_ctx,
@@ -2235,6 +2305,7 @@ class MLA(nn.Module):
                 topk_indices=topk_indices[:num_ctx_tokens, :]
                 if topk_indices is not None else None,
                 position_ids=position_ids,
+                enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
             )
 
         if num_generations > 0:
@@ -2246,14 +2317,19 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
+            enable_dsv4_epilogue_fusion = self._should_use_dsv4_epilogue_fusion(
+                num_contexts, num_generations)
             self.forward_generation_sparse_mla(
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
+                position_ids=position_ids[num_ctx_tokens:num_tokens]
+                if position_ids is not None else None,
                 latent_cache=latent_cache_gen,
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
+                enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
             )
 
     def forward_impl_with_deepseek_v4(self,
@@ -2459,6 +2535,8 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
+            enable_dsv4_epilogue_fusion = self._should_use_dsv4_epilogue_fusion(
+                num_contexts, num_generations)
             self.forward_context_sparse_mla(
                 q_ctx,
                 compressed_kv_ctx,
@@ -2468,6 +2546,7 @@ class MLA(nn.Module):
                 position_ids=position_ids[:num_ctx_tokens],
                 latent_cache=latent_cache_ctx,
                 topk_indices=topk_indices_ctx,
+                enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
             )
 
         if num_generations > 0:
@@ -2482,6 +2561,8 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
+            enable_dsv4_epilogue_fusion = self._should_use_dsv4_epilogue_fusion(
+                num_contexts, num_generations)
             self.forward_generation_sparse_mla(
                 q_gen,
                 compressed_kv_gen,
@@ -2491,6 +2572,7 @@ class MLA(nn.Module):
                 position_ids=position_ids[num_ctx_tokens:num_tokens],
                 latent_cache=latent_cache_gen,
                 topk_indices=topk_indices_gen,
+                enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
             )
 
     def forward_context_default(
@@ -2576,6 +2658,7 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        enable_dsv4_epilogue_fusion: bool = False,
     ) -> torch.Tensor:
         """Run context-phase attention for DSA models.
 
@@ -2608,14 +2691,16 @@ class MLA(nn.Module):
                                         attn_metadata, output, latent_cache)
 
         if get_sm_version() >= 100:
-            return self.forward_absorption_context(q,
-                                                   compressed_kv,
-                                                   k_pe,
-                                                   attn_metadata,
-                                                   output,
-                                                   position_ids=position_ids,
-                                                   latent_cache=latent_cache,
-                                                   topk_indices=topk_indices)
+            return self.forward_absorption_context(
+                q,
+                compressed_kv,
+                k_pe,
+                attn_metadata,
+                output,
+                position_ids=position_ids,
+                latent_cache=latent_cache,
+                topk_indices=topk_indices,
+                enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion)
         else:
             assert not self.is_deepseek_v4, "DeepSeek-V4 is not supported on pre-blackwell GPUs."
             return self.forward_sparse_mla_kvcache_bf16(q,
@@ -2635,16 +2720,19 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        enable_dsv4_epilogue_fusion: bool = False,
     ) -> torch.Tensor:
         if get_sm_version() >= 100:
-            return self.forward_absorption_generation(q,
-                                                      compressed_kv,
-                                                      k_pe,
-                                                      attn_metadata,
-                                                      output,
-                                                      position_ids=position_ids,
-                                                      latent_cache=latent_cache,
-                                                      topk_indices=topk_indices)
+            return self.forward_absorption_generation(
+                q,
+                compressed_kv,
+                k_pe,
+                attn_metadata,
+                output,
+                position_ids=position_ids,
+                latent_cache=latent_cache,
+                topk_indices=topk_indices,
+                enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion)
         else:
             assert not self.is_deepseek_v4, "DeepSeek-V4 is not supported on pre-blackwell GPUs."
             return self.forward_sparse_mla_kvcache_bf16(q,
@@ -2991,6 +3079,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        enable_dsv4_epilogue_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
@@ -3123,6 +3212,14 @@ class MLA(nn.Module):
 
         # Use generation_only for generation phase and context_only for context phase in DSA attention
         attention_input_type = AttentionInputType.generation_only
+        dsv4_output = output if self.is_deepseek_v4 else None
+        dsv4_output_sf = None
+        dsv4_cos_sin_cache = None
+        if enable_dsv4_epilogue_fusion:
+            assert self.is_deepseek_v4
+            dsv4_output, dsv4_output_sf = self._create_dsv4_epilogue_buffers(
+                q, num_tokens)
+            dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
 
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
@@ -3133,7 +3230,8 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=attention_input_type,
             out_scale=self.out_scale,
-            output=output if self.is_deepseek_v4 else None,
+            output=dsv4_output,
+            output_sf=dsv4_output_sf,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
@@ -3145,8 +3243,15 @@ class MLA(nn.Module):
             mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
+            dsv4_inv_rope_cos_sin_cache=dsv4_cos_sin_cache,
+            enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
         )
         fused_q = None
+
+        if enable_dsv4_epilogue_fusion:
+            self._dsv4_epilogue_fusion_result = self._deepseek_v4_o_proj(
+                attn_out_latent)
+            return output
 
         if self.is_deepseek_v4:
             if self.mapping.has_cp_helix():
@@ -3201,6 +3306,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        enable_dsv4_epilogue_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
 
@@ -3278,6 +3384,15 @@ class MLA(nn.Module):
             quant_q_buffer = None
             quant_scale_qkv = None
 
+        dsv4_output = output if self.is_deepseek_v4 else None
+        dsv4_output_sf = None
+        dsv4_cos_sin_cache = None
+        if enable_dsv4_epilogue_fusion:
+            assert self.is_deepseek_v4
+            dsv4_output, dsv4_output_sf = self._create_dsv4_epilogue_buffers(
+                q, num_tokens)
+            dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
+
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
             fused_q,
@@ -3287,17 +3402,25 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=attention_input_type,
             out_scale=self.out_scale,
-            output=output if self.is_deepseek_v4 else None,
+            output=dsv4_output,
+            output_sf=dsv4_output_sf,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
             quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
             quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
             topk_indices=topk_indices,  # used by DSA attention
             is_generation=False,  # used by DSA attention
+            dsv4_inv_rope_cos_sin_cache=dsv4_cos_sin_cache,
+            enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
         )
         fused_q = None
         self._fused_quant_q_buffer = None
         self._fused_q_pe = None
+
+        if enable_dsv4_epilogue_fusion:
+            self._dsv4_epilogue_fusion_result = self._deepseek_v4_o_proj(
+                attn_out_latent)
+            return output
 
         if self.is_deepseek_v4:
             if self.mapping.has_cp_helix():
@@ -3499,6 +3622,7 @@ class MLA(nn.Module):
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
+        self._dsv4_epilogue_fusion_result = None
         if self.register_to_config:
             if self.is_dsa:
                 proj_outputs = torch.ops.trtllm.mla_dsa_proj(
@@ -3534,7 +3658,13 @@ class MLA(nn.Module):
                               latent_cache_gen=latent_cache_gen)
 
         if self.is_deepseek_v4:
-            attn_output = self._deepseek_v4_o_proj(attn_output, position_ids)
+            dsv4_fused_output = self._dsv4_epilogue_fusion_result
+            if dsv4_fused_output is not None:
+                attn_output = dsv4_fused_output
+                self._dsv4_epilogue_fusion_result = None
+            else:
+                attn_output = self._deepseek_v4_o_proj(attn_output,
+                                                       position_ids)
         else:
             attn_output = _helix_cp_output_projection(
                 self.o_proj, attn_output, attn_metadata, all_reduce_params,

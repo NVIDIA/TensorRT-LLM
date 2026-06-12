@@ -16,11 +16,15 @@
 
 #pragma once
 
+#include "Dsv4Constants.h"
 #include "KernelTraits.h"
 #include <trtllm/gen/CudaArchDecl.h>
 #include <trtllm/gen/CudaRunner.h>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <cfloat>
+#include <cstdint>
+#include <limits>
 #include <string>
 
 namespace fmha {
@@ -45,6 +49,10 @@ struct FmhaOptions : public KernelConfigBase {
   int mChunkedAttentionSize{0};
   // Dry-run: print a log but does not actually generate anything
   bool mDryRun{false};
+  // It is fixed to 8 for DSv4 inverse-RoPE FP8 quant fusion.
+  int32_t mDsv4HeadsPerGroup{kDsv4HeadsPerGroup};
+  // Token dimension reserved by the DSv4 FP32 scale tensor. This host-side value may be padded.
+  int32_t mDsv4ScaleBufM{0};
   // Enable the auto tuner.
   bool mEnablesAutoTuner{false};
   // Enable the BF16Q+FP8KV K-only transform path. Disabled by default.
@@ -128,6 +136,8 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mChecksResults);
     TO_JSON(mChunkedAttentionSize);
     TO_JSON(mDryRun);
+    TO_JSON(mDsv4HeadsPerGroup);
+    TO_JSON(mDsv4ScaleBufM);
     TO_JSON(mEnablesAutoTuner);
     TO_JSON(mEnablesBf16QFp8KvKOnlyTransform);
     TO_JSON(mIsExportingCubin);
@@ -253,6 +263,24 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     TLLM_CHECK_ERROR(options.mNumInstsQ == 1 && options.mNumInstsKv == 1,
                      "BF16Q+FP8KV full-transform kernels require numInstsQ == 1 and "
                      "numInstsKv == 1.");
+  }
+
+  if (options.mFusesDsv4InvRopeFp8Quant) {
+    bool const isSpecDecTree =
+      options.mIsCustomSpecDecodingGen && options.mSpecDecodingTargetMaxGenLen > 0;
+    bool const isSupportedDsv4FusionConfig =
+      options.mIsMlaGen && options.mSparseType == SparseType::DynamicTokenSparse &&
+      options.mFuseEpilogueIntoCorr && isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType) &&
+      options.mQkvLayout == QkvLayout::PagedKv && options.mDtypeQ == tg::Dtype::E4m3 &&
+      options.mDtypeK == tg::Dtype::E4m3 && options.mDtypeV == tg::Dtype::E4m3 &&
+      options.mDtypeOut == tg::Dtype::E4m3 && options.mHeadDimQk == kDsv4HeadDimQk &&
+      options.mHeadDimV == kDsv4HeadDimV && options.mHeadDimPerCtaV == kDsv4HeadDimPerCtaV &&
+      options.mMultiCtasKvMode == MultiCtasKvMode::Disabled && !options.mUseBlockSparseAttention &&
+      !isSpecDecTree;
+    TLLM_CHECK_ERROR(isSupportedDsv4FusionConfig,
+                     "DSv4 inverse-RoPE FP8 quant fusion only supports the fixed DSv4 sparse MLA "
+                     "generation keep-AB paged-KV E4M3 configuration with standard non-tree "
+                     "causal generation/context position semantics.");
   }
 
   // The number of instances for Q and Kv must be set together.
@@ -398,7 +426,7 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Special options for block-scaled outputs.
   if (fmha::hasOutputSfs(options.mDtypeOut)) {
     TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
-                      "E2m1 / MxE4m3 output only supports fuseEpilogueIntoCorr");
+                     "E2m1 / MxE4m3 output only supports fuseEpilogueIntoCorr");
 
     // Make sure the number of SFs per row can be divided by 4, required for interleaved SF layout.
     int32_t numEltsPerSfO = tg::dtypeNumEltsPerSf(options.mDtypeOut);
@@ -616,6 +644,38 @@ inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& o
   // Enable variable sequence if minSeqLenQ < maxSeqLenQ or minSeqLenKv < maxSeqLenKv.
   options.mSupportsVarSeqLens |=
     (options.mMinSeqLenQ < options.mMaxSeqLenQ) || (options.mMinSeqLenKv < options.mMaxSeqLenKv);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Update the runtime DSv4 inverse-RoPE + FP8 quant layout. This must run after the sample sequence
+// lengths have been generated because the compact benchmark layout depends on mSumOfSeqLensQ.
+inline void updateDsv4InvRopeFp8QuantOptions(FmhaOptions& options) {
+  if (!options.mFusesDsv4InvRopeFp8Quant) {
+    return;
+  }
+
+  TLLM_CHECK_ERROR(options.mDsv4HeadsPerGroup == kDsv4HeadsPerGroup,
+                   "DSv4 inverse-RoPE FP8 quant fusion requires dsv4HeadsPerGroup=8.");
+  TLLM_CHECK_ERROR(options.mNumHeadsQ % options.mDsv4HeadsPerGroup == 0,
+                   "numHeadsQ must be divisible by the DSv4 packed output head group size.");
+
+  if (options.mDsv4ScaleBufM == 0) {
+    int64_t const maxPackedTokens =
+      std::max(int64_t{options.mSumOfSeqLensQ},
+               int64_t{options.mBatchSize} * int64_t{options.mMaxSeqLenQ});
+    // If the caller does not pass TensorRT-LLM's scaleBufM, use a conservative standalone
+    // benchmark capacity and keep the TensorRT-LLM scale-token alignment.
+    int64_t constexpr scaleTokenAlignment = 4;
+    int64_t const paddedScaleBufM =
+      (maxPackedTokens + scaleTokenAlignment - 1) / scaleTokenAlignment * scaleTokenAlignment;
+    TLLM_CHECK_ERROR(paddedScaleBufM <= std::numeric_limits<int32_t>::max(),
+                     "DSv4 inverse-RoPE FP8 quant scale token dimension overflows int32_t.");
+    options.mDsv4ScaleBufM = static_cast<int32_t>(paddedScaleBufM);
+  }
+  TLLM_CHECK_ERROR(options.mDsv4ScaleBufM > 0, "Dsv4ScaleBufM must be initialized.");
+  TLLM_CHECK_ERROR(options.mDsv4ScaleBufM >= options.mSumOfSeqLensQ,
+                   "DSv4 inverse-RoPE FP8 quant scale buffer must cover all packed Q tokens.");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
