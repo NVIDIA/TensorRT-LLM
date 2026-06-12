@@ -1022,12 +1022,8 @@ class BasicAVTransformerBlock(nn.Module):
                     video.cross_gate_timestep,
                 )
                 vx_norm3 = rms_norm(vx, eps=self.norm_eps)
-                vx_scaled_a2v = apply_shift_scale(
-                    vx_norm3, scale_ca_video_a2v, shift_ca_video_a2v, self._fuse_adaln
-                )
-                vx_scaled_v2a = apply_shift_scale(
-                    vx_norm3, scale_ca_video_v2a, shift_ca_video_v2a, self._fuse_adaln
-                )
+                vx_scaled_a2v = apply_shift_scale(vx_norm3, scale_ca_video_a2v, shift_ca_video_a2v)
+                vx_scaled_v2a = apply_shift_scale(vx_norm3, scale_ca_video_v2a, shift_ca_video_v2a)
 
             if text_a_attn_raw is not None:
                 # Dual-shift_scale for the audio side (a2v consumes ax K side, v2a consumes ax Q side).
@@ -1078,12 +1074,8 @@ class BasicAVTransformerBlock(nn.Module):
                     audio.cross_gate_timestep,
                 )
                 ax_norm3 = rms_norm(ax, eps=self.norm_eps)
-                ax_scaled_a2v = apply_shift_scale(
-                    ax_norm3, scale_ca_audio_a2v, shift_ca_audio_a2v, self._fuse_adaln
-                )
-                ax_scaled_v2a = apply_shift_scale(
-                    ax_norm3, scale_ca_audio_v2a, shift_ca_audio_v2a, self._fuse_adaln
-                )
+                ax_scaled_a2v = apply_shift_scale(ax_norm3, scale_ca_audio_a2v, shift_ca_audio_a2v)
+                ax_scaled_v2a = apply_shift_scale(ax_norm3, scale_ca_audio_v2a, shift_ca_audio_v2a)
 
             # a2v / v2a outputs are parked in ``*_attn_raw`` (see above). Per-batch SKIP
             # perturbation masks are pre-multiplied onto the attn output here, since the
@@ -1946,7 +1938,6 @@ class LTXModel(BaseDiffusionModel):
         proj_out: nn.Module,
         x: torch.Tensor,
         embedded_timestep: torch.Tensor,
-        fuse_adaln: bool,
     ) -> torch.Tensor:
         scale_shift_values = (
             scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
@@ -1954,7 +1945,7 @@ class LTXModel(BaseDiffusionModel):
         )
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
         x = norm_out(x)
-        x = apply_shift_scale(x, scale, shift, fuse_adaln)
+        x = apply_shift_scale(x, scale, shift)
         return proj_out(x)
 
     # -- Forward -------------------------------------------------------------
@@ -2174,7 +2165,6 @@ class LTXModel(BaseDiffusionModel):
                 self.proj_out,
                 video_args.x,
                 video_args.embedded_timestep,
-                self._fuse_adaln,
             )
             if video_args is not None
             else None
@@ -2186,7 +2176,6 @@ class LTXModel(BaseDiffusionModel):
                 self.audio_proj_out,
                 audio_args.x,
                 audio_args.embedded_timestep,
-                self._fuse_adaln,
             )
             if audio_args is not None
             else None

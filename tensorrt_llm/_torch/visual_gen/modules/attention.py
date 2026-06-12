@@ -506,7 +506,7 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        hidden_states,
+        hidden_states: torch.Tensor | Fp4QuantizedTensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:

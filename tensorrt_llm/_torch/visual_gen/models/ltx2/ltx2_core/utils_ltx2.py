@@ -137,17 +137,14 @@ def apply_shift_scale(
     x_normed: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
-    fuse: bool,
 ) -> torch.Tensor:
     """Affine-only AdaLN modulation: ``x_normed * (1 + scale) + shift``.
 
     Used for the LTX-2 output head and rare cross-attention rms-precomputed
     fallback sites (fires once per inference / never in the hot path). Always
     runs eager -- the dedicated CUDA kernel was deleted because the saving on
-    these rare call sites did not justify the maintenance burden. The ``fuse``
-    parameter is kept for call-site signature compatibility but is unused.
+    these rare call sites did not justify the maintenance burden.
     """
-    del fuse
     return x_normed * (1 + scale) + shift
 
 
