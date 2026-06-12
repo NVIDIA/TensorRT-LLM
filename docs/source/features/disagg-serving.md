@@ -233,6 +233,10 @@ Example (two-node deployment):
 - **Client entrypoint**
   - Send requests or use a load balancer forwarding to `node-a:8000` and `node-b:8000`
 
+The disaggregated server runs a single asyncio event loop that performs per-request routing and relays the streamed (SSE) response between the client and the generation server. At high concurrency this host-side loop — rather than the GPU workers — can become the latency bottleneck and inflate time-to-first-token. Because each instance is an independent, stateless front end over the shared context/generation pool (the instances do not coordinate with each other), running several of them parallelizes this host-side work without adding GPU nodes. The instances may run on separate nodes or be co-located on a single node on different ports.
+
+**Preserve session affinity for cache-aware routing.** Each instance keeps its own in-memory routing state — per-server load counters and, for cache-aware or conversation routing, the conversation-to-server mapping. If the load balancer spreads a single conversation's requests across different instances, those instances may route the requests to different context servers and lose KV-cache locality. Configure the load balancer (or client-side sharding) with session affinity so that all requests belonging to the same conversation reach the same disaggregated server instance.
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
