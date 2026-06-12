@@ -11,6 +11,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (BlockHashMixin, ConversationRouter,
+                                       DynamoKvCacheAwareRouter,
                                        KvCacheAwareRouter, LoadBalancingRouter,
                                        RoundRobinRouter, create_router)
 
@@ -535,8 +536,31 @@ def test_create_router(servers):
     kv_cache_aware_router = create_router(router_config, servers)
     assert isinstance(kv_cache_aware_router, KvCacheAwareRouter)
 
+    router_config = RouterConfig(type="dynamo_kv_cache_aware",
+                                 args={
+                                     "endpoint": "dynamo.trtllm.generate",
+                                     "router_block_size": 128,
+                                 })
+    dynamo_router = create_router(router_config, servers)
+    assert isinstance(dynamo_router, DynamoKvCacheAwareRouter)
+
     with pytest.raises(ValueError):
         create_router(RouterConfig(type="unsupported_router"), servers)
+
+
+def test_dynamo_router_worker_id_map(servers):
+    router = DynamoKvCacheAwareRouter(
+        server_role=None,
+        servers=servers,
+        endpoint="dynamo.trtllm.generate",
+        worker_id_map={
+            "http://server1": 11,
+            "server2": 12,
+        },
+    )
+
+    assert router._extract_dynamo_worker_id("server1") == 11
+    assert router._extract_dynamo_worker_id("server2") == 12
 
 
 @pytest.fixture
