@@ -5157,9 +5157,6 @@ class PyExecutor:
         return new_target_inputs, num_accepted_tokens_device
 
     def reset_prefix_cache(self):
-        if self.active_requests or self.waiting_queue:
-            raise RuntimeError(
-                "reset_prefix_cache() requires no active or queued requests.")
         self.kv_cache_manager.reset_reuse_state()
 
     def _handle_guided_decoder_errors(
