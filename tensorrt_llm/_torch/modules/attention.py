@@ -13,6 +13,7 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import pad_up
 
 from ..attention_backend import (AttentionForwardArgs, AttentionInputType,
                                  AttentionMetadata, FlashInferAttentionMetadata,
@@ -1001,20 +1002,22 @@ class Attention(nn.Module):
 
 
 @torch.library.custom_op("trtllm::mla_custom_op_inplace",
-                         mutates_args=("output", ))
+                         mutates_args=("output", "output_sf"))
 def mla_custom_op_inplace(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
     latent_cache_gen: Optional[torch.Tensor],
+    output_sf: Optional[torch.Tensor],
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
     mla_layer.forward_impl(position_ids,
                            hidden_states,
                            metadata,
                            output=output,
-                           latent_cache_gen=latent_cache_gen)
+                           latent_cache_gen=latent_cache_gen,
+                           output_sf=output_sf)
 
 
 @torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())
@@ -1093,7 +1096,7 @@ def _mla_dsa_proj_fake(
 
 
 @torch.library.custom_op("trtllm::mla_dsa_attn_inplace",
-                         mutates_args=("output", ))
+                         mutates_args=("output", "output_sf"))
 def mla_dsa_attn_inplace(
     q: torch.Tensor,
     compressed_kv: torch.Tensor,
@@ -1103,6 +1106,7 @@ def mla_dsa_attn_inplace(
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
+    output_sf: Optional[torch.Tensor],
 ) -> None:
     """Batch-structure-dependent attention dispatch for DSA MLA.
 
@@ -1111,11 +1115,14 @@ def mla_dsa_attn_inplace(
     trailing q_scale is only consumed by the FP4 dispatch; the FP8 path
     ignores it. Runs sparse_attn_indexer then dispatches context/generation
     attention. This op is excluded from CUDA graph capture.
+
+    output_sf, when present, is the swizzled E4M3 scale-factor buffer the
+    v_b_proj NVFP4 fusion writes alongside the packed-FP4 output.
     """
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
     mla_layer.forward_dsa_attn(q, compressed_kv, k_pe, latent_cache,
                                indexer_intermediates, position_ids, metadata,
-                               output)
+                               output, output_sf)
 
 
 def fp8_block_scaling_bmm_out(
@@ -1637,6 +1644,45 @@ class MLA(nn.Module):
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
         hidden_size = self.o_proj.in_features
+
+        # When the v_b_proj BMM folds o_proj's NVFP4 input-quantize into its
+        # epilogue, the attention "output" is a pre-quantized NVFP4 activation:
+        # a packed-E2M1 buffer (2 values/byte) plus a swizzled E4M3 scale-factor
+        # tensor, sized exactly like TrtllmAttention.create_output's NVFP4 path
+        # so o_proj consumes it as an Fp4QuantizedTensor. Only the generation
+        # absorption path writes it; create_output runs before that BMM so the
+        # buffers are allocated here (the attention op writes them in-place).
+        #
+        # Restricted to pure-generation batches (num_contexts == 0, the disagg
+        # gen server): in mixed ctx+gen batches the context path still writes
+        # BF16 v_head_dim into the shared output buffer, which is incompatible
+        # with the packed-FP4 layout, and the 1D swizzled SF cannot be sliced by
+        # token offset. The targeted nvjet->quant pair is a generation-phase
+        # kernel anyway.
+        if num_contexts == 0 and self._resolve_vbproj_nvfp4_fusion() is not None:
+            # Packed E2M1: hidden_size // 2 bytes/token (hidden_size = L*N), so
+            # this is byte-identical to the kernel's M-major [M, L, N//2] buffer
+            # and reshapes zero-copy to the monolithic [M, L*N] activation
+            # o_proj consumes.
+            output = hidden_states.new_empty([num_tokens, hidden_size // 2],
+                                             dtype=torch.uint8)
+            # Monolithic swizzled SF over [num_tokens, hidden_size], sized
+            # EXACTLY pad_up(num_tokens, 128) * pad_up(hidden_size // 16, 4) --
+            # byte-for-byte what fp4_quantize([num_tokens, hidden_size]) produces
+            # and what o_proj's NVFP4 GEMM demands (it validates the act-SF size
+            # with NO slack). The bmm_nvfp4_out epilogue is kept within these
+            # exact bounds because can_implement
+            # (PersistentDenseGemmNVFP4OutKernel.is_sf_write_in_bounds) rejects
+            # any tactic whose CTA-M tile / cluster grouping would write SF rows
+            # past pad_up(num_tokens, 128). Mirrors bmm_nvfp4_out_sfc_numel in
+            # cute_dsl_custom_ops.py (keep the two in sync).
+            scaling_vector_size = 16
+            sfc_cols = pad_up(hidden_size // scaling_vector_size, 4)
+            sfc_rows = pad_up(num_tokens, 128)
+            output_sf = hidden_states.new_empty([sfc_rows * sfc_cols],
+                                                dtype=torch.uint8)
+            return [output, output_sf]
+
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
@@ -1657,7 +1703,8 @@ class MLA(nn.Module):
                      hidden_states: torch.Tensor,
                      attn_metadata: AttentionMetadata,
                      output: torch.Tensor,
-                     latent_cache_gen: Optional[torch.Tensor] = None) -> None:
+                     latent_cache_gen: Optional[torch.Tensor] = None,
+                     output_sf: Optional[torch.Tensor] = None) -> None:
         """
         Forward pass for the MLA module. Writes result into output tensor in-place.
 
@@ -1667,6 +1714,9 @@ class MLA(nn.Module):
             attn_metadata (AttentionMetadata): The attention metadata.
             output (torch.Tensor): The output tensor to write results into.
             latent_cache_gen (Optional[torch.Tensor]): The latent cache used in generation.
+            output_sf (Optional[torch.Tensor]): When the v_b_proj NVFP4 fusion is
+                active, the swizzled E4M3 scale-factor buffer the generation
+                absorption path writes alongside the packed-FP4 ``output``.
         """
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -1761,6 +1811,9 @@ class MLA(nn.Module):
                 q_gen = self._attention_scaling(
                     q_gen, position_ids[..., num_ctx_tokens:])
 
+            # output_sf is only allocated for pure-generation batches
+            # (num_contexts == 0), so num_ctx_tokens == 0 and the full SF buffer
+            # maps to the gen tokens.
             self.forward_absorption_generation(
                 q_gen,
                 compressed_kv_gen,
@@ -1769,12 +1822,15 @@ class MLA(nn.Module):
                 output[num_ctx_tokens:num_tokens, :],
                 position_ids=position_ids,
                 latent_cache=latent_cache_gen,
+                output_sf=output_sf,
             )
 
-    def forward_impl_with_dsa(self, position_ids: Optional[torch.Tensor],
+    def forward_impl_with_dsa(self,
+                              position_ids: Optional[torch.Tensor],
                               hidden_states: torch.Tensor,
                               attn_metadata: AttentionMetadata,
-                              output: torch.Tensor) -> None:
+                              output: torch.Tensor,
+                              output_sf: Optional[torch.Tensor] = None) -> None:
         """
         Forward pass for the MLA module with DSA (always in MQA mode).
         Writes result into output tensor in-place.
@@ -1787,6 +1843,9 @@ class MLA(nn.Module):
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
             output (torch.Tensor): The output tensor to write results into.
+            output_sf (Optional[torch.Tensor]): When the v_b_proj NVFP4 fusion is
+                active, the swizzled E4M3 scale-factor buffer written alongside
+                the packed-FP4 ``output``.
         """
         proj_outputs = self.forward_dsa_proj(position_ids, hidden_states,
                                              attn_metadata)
@@ -1794,7 +1853,7 @@ class MLA(nn.Module):
         indexer_intermediates = proj_outputs[4:]
         self.forward_dsa_attn(q, compressed_kv, k_pe, latent_cache,
                               indexer_intermediates, position_ids,
-                              attn_metadata, output)
+                              attn_metadata, output, output_sf)
 
     def forward_dsa_proj(
         self,
@@ -1866,6 +1925,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
+        output_sf: Optional[torch.Tensor] = None,
     ) -> None:
         """Batch-structure-dependent attention for DSA MLA (Op 2, not graph-captured).
 
@@ -1947,6 +2007,10 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
+            # output_sf is only allocated for pure-generation batches
+            # (num_contexts == 0, the disagg gen server), so num_ctx_tokens == 0
+            # here and the full SF buffer maps to the gen tokens -- no slicing of
+            # the 1D swizzled SF (which can't be row-sliced) is needed.
             self.forward_generation_dsa(
                 q_gen,
                 compressed_kv_gen,
@@ -1955,6 +2019,7 @@ class MLA(nn.Module):
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache_gen,
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
+                output_sf=output_sf,
             )
 
     def forward_context_default(
@@ -2096,6 +2161,7 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        output_sf: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if get_sm_version() >= 100:
             return self.forward_absorption_generation(q,
@@ -2104,7 +2170,8 @@ class MLA(nn.Module):
                                                       attn_metadata,
                                                       output,
                                                       latent_cache=latent_cache,
-                                                      topk_indices=topk_indices)
+                                                      topk_indices=topk_indices,
+                                                      output_sf=output_sf)
         else:
             return self.forward_sparse_mla_kvcache_bf16(q,
                                                         latent_cache,
@@ -2452,6 +2519,41 @@ class MLA(nn.Module):
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
+    def _resolve_vbproj_nvfp4_fusion(self):
+        """Lazily decide whether the v_b_proj BMM may fold the o_proj NVFP4
+        input-quantize into its epilogue (fused_add via bmm_nvfp4_out), caching
+        o_proj's static input_scale.
+
+        Eligible only when:
+          (1) the env gate is on,
+          (2) running on the SM100 (Blackwell) family,
+          (3) v_b_proj is BF16 (the absorption V-up GEMM that currently emits a
+              BF16 output a standalone fp4_quantize then quantizes), and
+          (4) o_proj is static-NVFP4 (NVFP4 weights, calibrated input_scale, no
+              AWQ pre_quant_scale, not forced to dynamic quantization) so it can
+              directly consume the pre-quantized Fp4QuantizedTensor.
+
+        Returns o_proj.input_scale when eligible (cached on
+        ``self._vbproj_fused_scale``), else None. ``False`` is used as the
+        resolved-but-disabled sentinel."""
+        cached = getattr(self, "_vbproj_fused_scale", None)
+        if cached is not None:
+            return cached if cached is not False else None
+
+        scale = None
+        if (os.environ.get("TRTLLM_DEEPSEEK_NEXT_LAYER_NVFP4_FUSION", "0") == "1"
+                and is_sm_100f()
+                and getattr(self, "v_b_proj", None) is not None
+                and self.v_b_proj.dtype == torch.bfloat16):
+            op = getattr(self, "o_proj", None)
+            if (op is not None and getattr(op, "has_nvfp4", False)
+                    and not getattr(op, "force_dynamic_quantization", False)
+                    and getattr(op, "input_scale", None) is not None
+                    and getattr(op, "pre_quant_scale", None) is None):
+                scale = op.input_scale
+        self._vbproj_fused_scale = scale if scale is not None else False
+        return scale
+
     def forward_absorption_generation(
         self,
         q: torch.Tensor,
@@ -2462,6 +2564,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        output_sf: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
@@ -2610,6 +2713,26 @@ class MLA(nn.Module):
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads_tp_cp, self.kv_lora_rank])
+
+        vbproj_fused_scale = (self._resolve_vbproj_nvfp4_fusion()
+                              if output_sf is not None else None)
+        if vbproj_fused_scale is not None:
+            # Fold o_proj's NVFP4 input-quantize into the v_b_proj BMM epilogue:
+            # the batched BF16 GEMM emits packed E2M1 + monolithic swizzled E4M3
+            # SF directly into the pre-allocated output / output_sf buffers, so
+            # the standalone fp4_quantize between the BF16 V-up GEMM and o_proj
+            # disappears. A = attn_out_latent.transpose(0,1) [L, M, kv_lora_rank]
+            # (M-strided view, accepted by the op); B = v_b_proj [L, v_head_dim,
+            # kv_lora_rank] K-major. MLA.forward wraps (output, output_sf) into
+            # an Fp4QuantizedTensor that o_proj consumes directly.
+            torch.ops.trtllm.bmm_nvfp4_out_inplace(
+                attn_out_latent.transpose(0, 1),
+                self.v_b_proj,
+                vbproj_fused_scale,
+                output,
+                output_sf,
+            )
+            return output
 
         attn_output = output.view(
             [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
@@ -2900,8 +3023,17 @@ class MLA(nn.Module):
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
 
-        attn_output = self.create_output(hidden_states,
-                                         attn_metadata.num_contexts)
+        # create_output returns [output, output_sf] when the v_b_proj BMM folds
+        # o_proj's NVFP4 input-quantize into its epilogue (pure-generation
+        # batches only); otherwise a single BF16 output tensor. output_sf is the
+        # swizzled E4M3 scale-factor buffer the generation absorption path writes
+        # alongside the packed-FP4 output.
+        created = self.create_output(hidden_states, attn_metadata.num_contexts)
+        if isinstance(created, (list, tuple)):
+            attn_output, output_sf = created
+        else:
+            attn_output, output_sf = created, None
+
         if self.register_to_config:
             if self.is_dsa:
                 proj_outputs = torch.ops.trtllm.mla_dsa_proj(
@@ -2910,24 +3042,33 @@ class MLA(nn.Module):
                 indexer_intermediates = proj_outputs[4:]
                 torch.ops.trtllm.mla_dsa_attn_inplace(
                     q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
-                    position_ids, self.layer_idx_str, attn_output)
+                    position_ids, self.layer_idx_str, attn_output, output_sf)
             else:
                 torch.ops.trtllm.mla_custom_op_inplace(hidden_states,
                                                        position_ids,
                                                        self.layer_idx_str,
                                                        attn_output,
-                                                       latent_cache_gen)
+                                                       latent_cache_gen,
+                                                       output_sf)
         elif self.is_dsa:
             self.forward_impl_with_dsa(position_ids,
                                        hidden_states,
                                        attn_metadata,
-                                       output=attn_output)
+                                       output=attn_output,
+                                       output_sf=output_sf)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
                               attn_metadata,
                               output=attn_output,
-                              latent_cache_gen=latent_cache_gen)
+                              latent_cache_gen=latent_cache_gen,
+                              output_sf=output_sf)
+
+        # Wrap the pre-quantized packed-FP4 output + swizzled SF so o_proj
+        # consumes it directly as an Fp4QuantizedTensor (mirrors the generic
+        # Attention.forward_impl quantize-output path).
+        if output_sf is not None:
+            attn_output = Fp4QuantizedTensor(attn_output, output_sf)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
