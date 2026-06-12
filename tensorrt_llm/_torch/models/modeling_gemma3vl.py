@@ -193,6 +193,8 @@ class Gemma3VLM(PreTrainedModel):
         self.image_token_ids = torch.tensor([config.image_token_index],
                                             dtype=torch.int32,
                                             device=self._device)
+        self._mm_token_ids = torch.tensor([config.image_token_index],
+                                          dtype=torch.int32)
 
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
@@ -323,4 +325,4 @@ class Gemma3VLM(PreTrainedModel):
 
     @property
     def mm_token_ids(self):
-        return self.image_token_ids
+        return self._mm_token_ids
