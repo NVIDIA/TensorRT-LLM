@@ -517,8 +517,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ):
-        # Skip the tp_allgather in _ctx_consensus when this transceiver never sends (pure GEN role).
-        if not self._ever_had_send_session:
+        # Skip the consensus collectives when this transceiver never sends (pure GEN role).
+        # Guarded with pp_size==1 (not _ctx_need_pp_sync): under pipeline parallelism the
+        # per-rank send marker flips asymmetrically across PP stages, so short-circuiting here
+        # would let some ranks skip the pp_allgather barrier while peers enter it -> deadlock
+        # (e.g. ADP+PP tp4_pp2_dp_both). With PP=1 there is no cross-stage consensus barrier.
+        if not self._ever_had_send_session and not self._ctx_need_pp_sync:
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -573,8 +577,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
-        # Skip the allgather in _gen_consensus when this transceiver never receives (pure CTX role).
-        if not self._ever_had_recv_session:
+        # Skip the consensus collectives when this transceiver never receives (pure CTX role).
+        # Guarded with pp_size==1 (not _ctx_need_pp_sync): see check_context_transfer_status --
+        # under PP the per-rank recv marker flips asymmetrically across stages, so an early
+        # return would desync the consensus barrier; only short-circuit when PP is absent.
+        if not self._ever_had_recv_session and not self._ctx_need_pp_sync:
             return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0

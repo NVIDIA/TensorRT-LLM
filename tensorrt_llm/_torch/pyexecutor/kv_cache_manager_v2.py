@@ -1019,6 +1019,12 @@ class KVCacheManagerV2(BaseResourceManager):
         try:
             return kv_cache.resize(target_capacity, history_length=history_length)
         except Exception as e:
+            # Best-effort SWA trim: resize() can raise more than ValueError
+            # under v2 KV-cache + uneven-PP disagg (e.g. internal state
+            # assertions). A failed trim MUST degrade gracefully (return
+            # False) -- letting the exception propagate aborts KV-block
+            # release, leaking storage slots and killing the run. Do not
+            # narrow this except.
             logger.warning(
                 f"trim_to_history failed for req {req.py_request_id} "
                 f"(capacity={kv_cache.capacity}, target_history={history_length}): {e}"
