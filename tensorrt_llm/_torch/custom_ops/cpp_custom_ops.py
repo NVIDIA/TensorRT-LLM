@@ -1166,6 +1166,118 @@ def _register_fake():
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
 
+    @torch.library.register_fake("trtllm::fused_dit_rmsnorm_shift_scale")
+    def _(x, scale_table, scale_ts, shift_table, shift_ts, eps):
+        """Fake/meta for the bf16 RMSNorm + AdaLN shift_scale op. x is not
+        mutated; returns a new bf16 tensor shaped like x."""
+        return torch.empty_like(x)
+
+    @torch.library.register_fake("trtllm::fused_dit_rmsnorm_shift_scale_quant")
+    def _(x, scale_table, scale_ts, shift_table, shift_ts, sf_scale, eps):
+        """Fake/meta for the RMSNorm + shift_scale op with NVFP4 quant. SF layout is SWIZZLED 128x4.
+
+        Modulator is built inline from (table, ts) pairs:
+          scale[d] = scale_table[d] + scale_ts[b, d]
+        Folds the upstream broadcast-add Triton prep kernel into the C++ op.
+        """
+        D = x.shape[-1]
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        _, scale_shape = fp4_utils.get_fp4_shape((M, D),
+                                                 16,
+                                                 is_swizzled_layout=True)
+        out_fp4 = x.new_empty((M, D // 2), dtype=torch.uint8)
+        out_sf = x.new_empty((scale_shape, ), dtype=torch.uint8)
+        return out_fp4, out_sf
+
+    @torch.library.register_fake(
+        "trtllm::fused_dit_gate_resid_rmsnorm_shift_scale")
+    def _(x, attn_out, gate_table, gate_ts, scale_table, scale_ts, shift_table,
+          shift_ts, eps):
+        """Fake/meta for the bf16 gate-resid + RMSNorm + shift_scale op. x is
+        mutated in place; the returned shift_scale output is a new tensor like x."""
+        return torch.empty_like(x)
+
+    @torch.library.register_fake(
+        "trtllm::fused_dit_gate_resid_rmsnorm_shift_scale_quant")
+    def _(x, attn_out, gate_table, gate_ts, scale_table, scale_ts, shift_table,
+          shift_ts, sf_scale, eps):
+        """Fake/meta for the gate-resid + RMSNorm + shift_scale op with NVFP4 quant. SF layout is SWIZZLED 128x4.
+
+        Modulators built inline from (table, ts) pairs; folds upstream
+        broadcast-add Triton prep kernel into the C++ op.
+        """
+        D = x.shape[-1]
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        _, scale_shape = fp4_utils.get_fp4_shape((M, D),
+                                                 16,
+                                                 is_swizzled_layout=True)
+        out_fp4 = x.new_empty((M, D // 2), dtype=torch.uint8)
+        out_sf = x.new_empty((scale_shape, ), dtype=torch.uint8)
+        return out_fp4, out_sf
+
+    # trtllm::fused_dit_gate_resid intentionally has NO register_fake: its schema
+    # returns Tensor(a!) (the in-place input alias), which torch.compile
+    # functionalization rejects. Without a fake it graph-breaks and runs eager --
+    # correct output (same kernel), just not captured in the compiled graph.
+
+    @torch.library.register_fake("trtllm::fused_dit_gate_resid_rmsnorm")
+    def _(x, attn_out, gate_table, gate_ts, eps):
+        """Fake/meta for the bf16 gate-resid + rms_norm op (residual_add + gate_mul + rms_norm).
+        Gate built inline from (table, ts) pair -- folds the upstream
+        broadcast-add Triton prep + `attn * gate` mul into Phase 0b."""
+        return torch.empty_like(x)
+
+    @torch.library.register_fake("trtllm::fused_dit_gate_resid_rmsnorm_quant")
+    def _(x, attn_out, gate_table, gate_ts, sf_scale, eps):
+        """Fake/meta for the gate-resid + rms_norm + NVFP4 quant op (residual_add + gate_mul + rms_norm).
+        Gate built inline from (table, ts) pair. SF layout is SWIZZLED 128x4."""
+        D = x.shape[-1]
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        _, scale_shape = fp4_utils.get_fp4_shape((M, D),
+                                                 16,
+                                                 is_swizzled_layout=True)
+        out_fp4 = x.new_empty((M, D // 2), dtype=torch.uint8)
+        out_sf = x.new_empty((scale_shape, ), dtype=torch.uint8)
+        return out_fp4, out_sf
+
+    @torch.library.register_fake(
+        "trtllm::fused_dit_resid_rmsnorm_shift_scale_dual")
+    def _(x, attn2_out, scale_dir1_table, scale_dir1_ts, shift_dir1_table,
+          shift_dir1_ts, scale_dir2_table, scale_dir2_ts, shift_dir2_table,
+          shift_dir2_ts, eps):
+        """Fake/meta for the bf16 residual + RMSNorm + dual shift_scale op. x is
+        mutated in place; both outputs are new tensors shaped like x."""
+        return torch.empty_like(x), torch.empty_like(x)
+
+    @torch.library.register_fake(
+        "trtllm::fused_dit_resid_rmsnorm_shift_scale_dual_quant")
+    def _(x, attn2_out, scale_dir1_table, scale_dir1_ts, shift_dir1_table,
+          shift_dir1_ts, scale_dir2_table, scale_dir2_ts, shift_dir2_table,
+          shift_dir2_ts, sf_scale1, sf_scale2, eps):
+        """Fake/meta for the residual + RMSNorm + dual shift_scale op with dual NVFP4 quant. SF layout is SWIZZLED 128x4.
+
+        4 modulators built inline from (table, ts) pairs; folds upstream
+        broadcast-add Triton prep kernel into the C++ op.
+        """
+        D = x.shape[-1]
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        _, scale_shape = fp4_utils.get_fp4_shape((M, D),
+                                                 16,
+                                                 is_swizzled_layout=True)
+        out1_fp4 = x.new_empty((M, D // 2), dtype=torch.uint8)
+        out1_sf = x.new_empty((scale_shape, ), dtype=torch.uint8)
+        out2_fp4 = x.new_empty((M, D // 2), dtype=torch.uint8)
+        out2_sf = x.new_empty((scale_shape, ), dtype=torch.uint8)
+        return out1_fp4, out1_sf, out2_fp4, out2_sf
+
     @torch.library.register_fake("trtllm::convert_req_index_to_global")
     def _(req_id: torch.Tensor, block_table: torch.Tensor,
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
