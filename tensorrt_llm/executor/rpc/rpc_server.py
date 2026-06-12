@@ -61,7 +61,6 @@ class RPCServer:
 
         self._functions: Dict[str, Callable[..., Any]] = {
             # Some built-in methods for RPC server
-            "_rpc_shutdown": lambda: self.shutdown(is_remote_call=True),
             "_rpc_get_attr": lambda name: self.get_attr(name),
         }
 
@@ -324,7 +323,7 @@ class RPCServer:
             return False
 
         # Allow shutdown methods to proceed
-        if req.method_name in ["_rpc_shutdown", "shutdown"]:
+        if req.method_name in ["shutdown"]:
             return False
 
         # Send cancellation error for all other requests
@@ -363,7 +362,7 @@ class RPCServer:
 
             # shutdown methods depend on _num_pending_requests, so
             # they should not be counted
-            if req.method_name not in ["_rpc_shutdown", "shutdown"]:
+            if req.method_name not in ["shutdown"]:
                 self._num_pending_requests += 1
                 logger_debug(
                     f"[server] Worker received request {req}, pending: {self._num_pending_requests}"
@@ -419,8 +418,8 @@ class RPCServer:
                         )
 
             # Decrement pending count
-            if req.method_name not in ["_rpc_shutdown", "shutdown"]:
-                self._num_pending_requests -= 1
+                if req.method_name not in ["shutdown"]:
+                    self._num_pending_requests -= 1
 
     def _calculate_adjusted_timeout(self,
                                     req: RPCRequest,

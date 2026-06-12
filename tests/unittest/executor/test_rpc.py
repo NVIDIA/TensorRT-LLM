@@ -99,6 +99,18 @@ class TestRpcBasics:
         with RpcServerWrapper(App()) as server:
             assert server.address == server.addr
 
+    def test_rpc_shutdown_is_not_remote_callable(self):
+
+        class App:
+            pass
+
+        with RpcServerWrapper(App()) as server:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
+                with pytest.raises(RPCError):
+                    client._rpc_shutdown().remote()
+                with pytest.raises(RuntimeError):
+                    client.shutdown_server()
+
     def test_rpc_with_error(self):
 
         class App:
