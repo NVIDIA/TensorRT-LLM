@@ -13,6 +13,7 @@ rationale and high-level architecture diagrams, see the
 [tech-blog]: ../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.md
 
 - [Two integration levels](#two-integration-levels)
+- [Lowered sparse parameters](#lowered-sparse-parameters)
 - [Framework-level sparse attention](#framework-level-sparse-attention)
   - [Prediction hooks](#prediction-hooks)
   - [AttentionOp behavior](#attentionop-behavior)
@@ -44,6 +45,42 @@ TensorRT LLM's sparse attention algorithms fall into two categories.
 This guide focuses primarily on the framework-level path. Kernel-level
 algorithms reuse the same configuration surface but skip the prediction
 and memory-management sections below.
+
+## Lowered sparse parameters
+
+Sparse attention has two configuration layers.
+
+- **User-facing sparse configs** live in `tensorrt_llm/llmapi/llm_args.py`
+  for LLM and `tensorrt_llm/visual_gen/sparse_attention.py` for
+  VisualGen. They are the Python/YAML surface and may also merge data
+  from checkpoint `config.json`.
+- **Lowered sparse params** live under
+  `tensorrt_llm/_torch/attention_backend/sparse/`. They are backend-owned
+  runtime objects consumed by attention implementations and metadata
+  builders.
+
+The lowering boundary is intentional: `AttentionBackend` instances
+should not keep or interpret user-facing config objects. Before an
+attention backend is constructed, the model layer calls
+`to_sparse_params(...)` on the user config. That method resolves
+per-model, per-layer, checkpoint, and default values into an
+algorithm-specific `SparseParams` dataclass, or returns `None` when the
+algorithm should not apply to that layer. The resolved object is then
+passed to `create_attention(..., sparse_params=...)` and stored on the
+backend instance.
+
+Algorithms that need sparse metadata, auxiliary buffers, or per-batch
+runtime state also implement `to_sparse_metadata_params(...)`. This
+returns an algorithm-specific `SparseMetadataParams` object for
+`AttentionMetadata`, analogous to how `to_sparse_params(...)` returns
+`SparseParams` for `AttentionBackend`. Keep them separate: metadata
+params describe allocation and runtime metadata state, while sparse
+params describe per-attention-layer kernel or prediction behavior.
+
+When adding a new algorithm, define concrete parameter dataclasses next
+to the backend implementation, implement the two lowering methods on the
+public config class, and make backend code consume only the lowered
+params.
 
 ## Framework-level sparse attention
 
@@ -263,8 +300,11 @@ entirely. Implementation lives inside the attention kernel; the only
 framework wiring is:
 
 - A new config subclass with its own `algorithm` discriminator.
-- A switch inside the attention backend (e.g., `_torch/attention_backend/trtllm_gen.py`)
-  that reads the config and enables the kernel-side fast path.
+- A lowered `SparseParams` object that carries the resolved kernel
+  settings.
+- A switch inside the attention backend (e.g.,
+  `_torch/attention_backend/trtllm_gen.py`) that reads the lowered params
+  and enables the kernel-side fast path.
 
 Skip Softmax Attention follows this pattern — see the
 [BLASST tech blog](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md)
