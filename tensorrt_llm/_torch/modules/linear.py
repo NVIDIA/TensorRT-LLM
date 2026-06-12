@@ -2945,8 +2945,7 @@ class Linear(nn.Module):
             capability = torch.cuda.get_device_capability(
                 torch.device('cuda:0'))
             # enable cuda core for sm89, sm120, and sm121
-            self.enable_cuda_core = (capability[0] == 8 and capability[1] == 9) \
-                or (capability[0] == 12 and capability[1] in (0, 1))
+            self.enable_cuda_core = capability in ((8, 9), (12, 0), (12, 1))
 
         if not skip_create_weights_in_init:
             self.create_weights()
