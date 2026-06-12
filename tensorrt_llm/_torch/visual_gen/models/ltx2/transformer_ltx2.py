@@ -72,7 +72,7 @@ class LTX2Attention(Attention):
     - Output projection (to_out)
 
     Adds LTX-2 specifics:
-    - LTX 3D RoPE (INTERLEAVED / SPLIT) with separate k_pe support
+    - LTX 3D RoPE (INTERLEAVED / SPLIT)
     - Gated attention (to_gate_logits)
     - Cross-attention with different context_dim for K/V input
     """
@@ -274,8 +274,8 @@ class LTX2Attention(Attention):
         before all-gather. RoPE is per-token element-wise so it commutes with
         seq-dim concat — bit-identical to the post-gather rope while saving
         the cos/sin all-gather collective and reducing K-rope compute by U×.
-        The forward() consumer should pass ``k_pe=None`` to signal that K is
-        already rotated.
+        After this, K is already rotated, and the forward() consumer passes
+        ``pre_projected_kv=(k, v)`` to skip re-rotation.
         """
         k = self.to_k(context)
         v = self.to_v(context)
@@ -298,19 +298,23 @@ class LTX2Attention(Attention):
         x: torch.Tensor,
         context: torch.Tensor | None = None,
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
-        k_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
         Caller contract:
-          - FUSE_QKV (self-attn): pe must be set; k_pe and pre_projected_kv unused.
-          - SEPARATE_QKV (cross-attn): cached path requires pre_projected_kv;
-            uncached path uses ``context`` (may be None when the async-Ulysses
-            inner backend was swapped to a non-async one — falls back to
-            self-attn via kv_source=x). pe optional (None = norm-only).
-            k_pe overrides pe for K (e.g. AV cross-attn) when provided.
+          - FUSE_QKV (self-attn): pe must be set; pre_projected_kv unused.
+          - SEPARATE_QKV self-attn (async-Ulysses): pre_projected_kv=None,
+            context=None — routed to ``forward_async`` (V/Q/K rolling A2A).
+            Falls through to the sync SEPARATE_QKV self-attn path when the
+            inner backend lacks ``forward_async`` (Ulysses-inactive swap).
+          - SEPARATE_QKV cross-attn: pre_projected_kv must be set (K already
+            norm+rope'd by ``project_kv`` upstream — text cache or AV
+            project-before-gather). pe optional (None = norm-only on Q).
+            Uncached cross-attn (context != None without pre_projected_kv) is
+            rejected: Q/K may have different lengths so sharing pe would
+            mis-rotate K. Caller must use project_kv + pre_projected_kv.
 
         Args:
             key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
@@ -324,13 +328,13 @@ class LTX2Attention(Attention):
         Routing:
           1. Async-Ulysses self-attn → ``forward_async`` (V/Q/K rolling A2A).
           2. FUSE_QKV self-attn → packed fused kernel (or naive mini-config).
-          3. SEPARATE_QKV cross-attn → split fused kernel (or naive mini-config).
+          3. SEPARATE_QKV cross-attn (cached) → split fused kernel.
+          4. SEPARATE_QKV self-attn (sync fallback) → split fused kernel on x.
         """
         # Async-Ulysses self-attn dispatch. ``hasattr`` guard: audio_attn1 may
         # have ``set_ulysses_active(False)`` swap ``self.attn`` to a plain
         # backend that lacks ``forward_async`` — fall through to the sync
-        # uncached SEPARATE_QKV branch, which handles context=None via
-        # kv_source=x.
+        # uncached SEPARATE_QKV branch (self-attn on x).
         if (
             self.qkv_mode == QKVMode.SEPARATE_QKV
             and self._use_async_ulysses
@@ -378,24 +382,28 @@ class LTX2Attention(Attention):
                     if pe is not None:
                         q = apply_rotary_emb(q, pe, self.rope_type)
             else:
-                # ─── uncached cross-attn / async self-attn fallback ───
-                # LTX-2 prod doesn't use uncached cross-attn (always pre-projects
-                # K/V). This branch also catches async self-attn when the inner
-                # backend lacks forward_async (audio Ulysses-inactive swap):
-                # context=None then, fall back to self-attn via kv_source=x.
-                kv_source = context if context is not None else x
+                # ─── uncached SEPARATE_QKV ───
+                # Two valid cases:
+                #   (a) async-Ulysses self-attn fallback (context=None) when
+                #       the inner backend lacks forward_async (e.g. audio
+                #       Ulysses-inactive swap). Use x for K/V (self-attn).
+                #   (b) (forbidden) uncached cross-attn (context != None) —
+                #       Q/K may have different lengths so sharing pe would
+                #       mis-rotate K. Caller must use project_kv + pre_projected_kv.
+                if context is not None:
+                    raise ValueError(
+                        "uncached SEPARATE_QKV cross-attn is forbidden; "
+                        "pass pre_projected_kv from project_kv(context, pe=...)."
+                    )
                 q = self.to_q(x)
-                k = self.to_k(kv_source)
-                v = self.to_v(kv_source)
+                k = self.to_k(x)
+                v = self.to_v(x)
                 if use_fused:
                     self.apply_split_norm_or_norm_rope(
                         q, self.norm_q.weight, self.num_attention_heads, pe
                     )
                     self.apply_split_norm_or_norm_rope(
-                        k,
-                        self.norm_k.weight,
-                        self.num_key_value_heads,
-                        k_pe if k_pe is not None else pe,
+                        k, self.norm_k.weight, self.num_key_value_heads, pe
                     )
                 else:
                     if self.qk_norm:
@@ -403,9 +411,7 @@ class LTX2Attention(Attention):
                         k = self.norm_k(k)
                     if pe is not None:
                         q = apply_rotary_emb(q, pe, self.rope_type)
-                    k_pe_use = k_pe if k_pe is not None else pe
-                    if k_pe_use is not None:
-                        k = apply_rotary_emb(k, k_pe_use, self.rope_type)
+                        k = apply_rotary_emb(k, pe, self.rope_type)
 
         attn_kwargs = {}
         if key_padding_mask is not None:
@@ -746,7 +752,8 @@ class BasicAVTransformerBlock(nn.Module):
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
                 attention outputs for selected blocks/modalities.
             text_kv_video: Pre-projected (K, V) for video text cross-attention.
-                Falls back to inline computation if ``None``.
+                Required when the video stream runs cross-attn — built by
+                ``LTXModel.prepare_text_cache``.
             text_kv_audio: Pre-projected (K, V) for audio text cross-attention.
         """
         if video is None and audio is None:
@@ -885,7 +892,6 @@ class BasicAVTransformerBlock(nn.Module):
                         vx_scaled,
                         pre_projected_kv=(k_a2v, v_a2v),
                         pe=video.cross_positional_embeddings,
-                        k_pe=None,  # K already rotated in project_kv
                         key_padding_mask=audio.audio_padding_mask,
                     )
                     * gate_out_a2v
@@ -927,7 +933,6 @@ class BasicAVTransformerBlock(nn.Module):
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
-                        k_pe=None,  # K already rotated in project_kv
                     )
                     * gate_out_v2a
                 )

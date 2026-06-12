@@ -67,14 +67,15 @@ from .cuda_graph_runner import (CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
 from .guided_decoder import CapturableGuidedDecoder
+from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
-                               KVCacheManagerV2, PeftCacheManager,
-                               ResourceManager, ResourceManagerType)
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -2639,8 +2640,10 @@ class PyTorchModelEngine(ModelEngine):
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
-            self.guided_decoder.add_batch(scheduled_requests,
-                                          new_tokens=new_tokens_device)
+            self.guided_decoder.add_batch(
+                scheduled_requests,
+                new_tokens=new_tokens_device,
+                runtime_draft_len=self.runtime_draft_len)
 
         if self._can_use_incremental_update(scheduled_requests,
                                             new_tokens_device,
