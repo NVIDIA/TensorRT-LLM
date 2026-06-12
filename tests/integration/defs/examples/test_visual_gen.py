@@ -1456,11 +1456,11 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
 
 
 def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/qwen_image.py with NVFP4 config end-to-end.
+    """Run examples/visual_gen/models/qwen_image.py with FP8 config end-to-end.
 
     Validates that the Qwen-Image example script and
-    ``configs/qwen-image-fp4-1gpu.yaml`` work together as documented. Uses the
-    local Qwen-Image checkpoint and the shared NVFP4 dynamic-quant config.
+    ``configs/qwen-image-fp8-1gpu.yaml`` work together as documented. Uses the
+    local Qwen-Image checkpoint and the shared FP8 blockwise dynamic-quant config.
     """
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, QWEN_IMAGE_MODEL_SUBPATH)
@@ -1479,7 +1479,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "qwen_image.py")
     config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "qwen-image-fp4-1gpu.yaml"
+        llm_root, "examples", "visual_gen", "configs", "qwen-image-fp8-1gpu.yaml"
     )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
