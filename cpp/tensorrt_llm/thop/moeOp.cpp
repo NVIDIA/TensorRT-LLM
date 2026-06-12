@@ -127,10 +127,12 @@ inline void moeLoraDeviceRunImpl(::tensorrt_llm::kernels::cutlass_kernels::MoeLo
     // wrappers fall back to the smaller-tile family when min(K, N) < kMinKN.
     constexpr int kMinKN = 16;
 
-    // In-GEMM (low-rank down-projection). Each problem is a single permuted
-    // token (M=1), so split-K over K offers no benefit. Use the plain grouped
-    // GEMM; the split-K grouped GEMM raises an illegal instruction on SM100 when
-    // reused within a process.
+    // In-GEMM (low-rank down-projection). The problem builder run-length-
+    // aggregates same-adapter rows, so a problem's M ranges from 1 up to the
+    // run length; the array length (and therefore the problem count below)
+    // stays num_permuted_tokens with the tail padded as N=0 no-ops. Use the
+    // plain grouped GEMM (not split-K): the split-K grouped GEMM raises an
+    // illegal instruction on SM100 when reused within a process.
     ::tensorrt_llm::kernels::cudaGraphGroupedGemm(arrays.problem_sizes_in, static_cast<int>(num_permuted_tokens),
         arrays.a_ptrs_in, arrays.b_ptrs_in, arrays.d_ptrs_in, arrays.d_ptrs_in, arrays.lda_in, arrays.ldb_in,
         arrays.ldd_in, arrays.ldd_in,
@@ -2049,22 +2051,31 @@ private:
 
             // Pinned-host max-problem-size hints used by cuda_graph_*_grouped_gemm
             // for kernel selection. Values are upper bounds safe to fix at
-            // warmup time (M=1 since each problem is one row; N/K depend on
-            // module direction and max_lora_rank).
+            // warmup time. The problem builder run-length-aggregates rows that
+            // share an adapter, so a single problem's M is no longer 1: in the
+            // worst case every permuted row collapses into one problem, so the
+            // M upper bound is the full permuted-row count
+            // (num_tokens * experts_per_token). N/K depend on module direction
+            // and max_lora_rank. (The device-only grouped path reads the actual
+            // per-problem sizes from device memory and derives the threadblock
+            // count from occupancy, so this host hint is only consulted by the
+            // host-precompute schedule mode; we still keep it a true upper
+            // bound.)
+            int const max_problem_m = static_cast<int>(num_tokens * static_cast<int64_t>(experts_per_token));
             auto fill_max_problem = [](void* host_ptr, int m, int n, int k)
             {
                 auto* coord = static_cast<cutlass::gemm::GemmCoord*>(host_ptr);
                 *coord = cutlass::gemm::GemmCoord(m, n, k);
             };
-            // In-GEMM: M=1, N=max_lora_rank, K=in_dim. Out-GEMM: M=1, N=out_dim, K=max_lora_rank.
-            fill_max_problem(dp.fc1.host_max_problem_in_pinned, 1, lora_max_low_rank, hidden_size);
-            fill_max_problem(dp.fc1.host_max_problem_out_pinned, 1, inter_size, lora_max_low_rank);
-            fill_max_problem(dp.fc2.host_max_problem_in_pinned, 1, lora_max_low_rank, inter_size);
-            fill_max_problem(dp.fc2.host_max_problem_out_pinned, 1, hidden_size, lora_max_low_rank);
+            // In-GEMM: N=max_lora_rank, K=in_dim. Out-GEMM: N=out_dim, K=max_lora_rank.
+            fill_max_problem(dp.fc1.host_max_problem_in_pinned, max_problem_m, lora_max_low_rank, hidden_size);
+            fill_max_problem(dp.fc1.host_max_problem_out_pinned, max_problem_m, inter_size, lora_max_low_rank);
+            fill_max_problem(dp.fc2.host_max_problem_in_pinned, max_problem_m, lora_max_low_rank, inter_size);
+            fill_max_problem(dp.fc2.host_max_problem_out_pinned, max_problem_m, hidden_size, lora_max_low_rank);
             if (has_gated)
             {
-                fill_max_problem(dp.gated.host_max_problem_in_pinned, 1, lora_max_low_rank, hidden_size);
-                fill_max_problem(dp.gated.host_max_problem_out_pinned, 1, inter_size, lora_max_low_rank);
+                fill_max_problem(dp.gated.host_max_problem_in_pinned, max_problem_m, lora_max_low_rank, hidden_size);
+                fill_max_problem(dp.gated.host_max_problem_out_pinned, max_problem_m, inter_size, lora_max_low_rank);
             }
         }
 

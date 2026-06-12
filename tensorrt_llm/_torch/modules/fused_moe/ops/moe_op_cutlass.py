@@ -250,7 +250,9 @@ class CutlassMoEOp(MoEOp):
                 tuner_num_tokens,
                 None,
                 use_dynamic_fc2_scale,
-                # Routed-expert LoRA args, unused on this op path.
+                # Per-request routed-expert LoRA args, unused on this op path:
+                # fc1/fc2/gated ranks + weight_ptrs, host_request_types,
+                # host_context_lengths, then lora_max_low_rank.
                 None,
                 None,
                 None,
@@ -259,7 +261,16 @@ class CutlassMoEOp(MoEOp):
                 None,
                 None,
                 None,
-                0)
+                0,
+                # Slot-indexed routed-expert LoRA args, unused on this op path:
+                # fc1/fc2/gated slot ranks + weight_ptrs, token_to_slot.
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None)
 
         # Return output based on latency mode
         return output if min_latency_mode else [output]

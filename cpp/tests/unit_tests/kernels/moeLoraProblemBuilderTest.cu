@@ -29,8 +29,10 @@ namespace
 using ::tensorrt_llm::kernels::cutlass_kernels::launchMoeLoraProblemBuilder;
 using ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGemmGroupArrays;
 
-// Host-side reference reproducing the builder's per-row logic. Same
-// formulas as the kernel; used only as parity ground truth.
+// Host-side reference reproducing the builder's run-length-aggregating logic.
+// Consecutive rows sharing the same (rank, A_ptr, B_ptr) are merged into one
+// M=run_length problem in slots [0, num_groups); the tail [num_groups, P) is
+// filled with N=0 no-ops. Same formulas as the kernel; parity ground truth.
 struct RefOutputs
 {
     std::vector<cutlass::gemm::GemmCoord> problem_sizes_in;
@@ -53,6 +55,10 @@ RefOutputs cpuReference(std::vector<int32_t> const& ranks, std::vector<int64_t> 
     int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices)
 {
     int64_t const P = static_cast<int64_t>(ranks.size());
+    int64_t const in_row_stride = in_hidden_size * dtype_bytes;
+    int64_t const work_row_stride = max_lora_rank * dtype_bytes;
+    int64_t const out_row_stride = out_hidden_size * dtype_bytes;
+
     RefOutputs r;
     r.problem_sizes_in.resize(P);
     r.problem_sizes_out.resize(P);
@@ -67,31 +73,64 @@ RefOutputs cpuReference(std::vector<int32_t> const& ranks, std::vector<int64_t> 
     r.ldb_out.resize(P);
     r.ldd_out.resize(P);
     r.splitk_offsets.resize(P + 1);
-    for (int64_t i = 0; i < P; ++i)
+
+    // Phase 1 equivalent: initialize every slot as an N=0 no-op.
+    for (int64_t p = 0; p < P; ++p)
+    {
+        r.problem_sizes_in[p] = cutlass::gemm::GemmCoord(1, 0, static_cast<int>(in_hidden_size));
+        r.problem_sizes_out[p] = cutlass::gemm::GemmCoord(1, 0, 0);
+        r.a_ptrs_in[p] = input_base;
+        r.b_ptrs_in[p] = 0;
+        r.d_ptrs_in[p] = lowrank_workspace;
+        r.b_ptrs_out[p] = 0;
+        r.d_ptrs_out[p] = output_base;
+        r.lda_in[p] = in_hidden_size;
+        r.ldb_in[p] = in_hidden_size;
+        r.ldd_in[p] = max_lora_rank;
+        r.ldb_out[p] = 0;
+        r.ldd_out[p] = out_hidden_size;
+    }
+
+    // Phase 2 equivalent: merge maximal same-(rank, A_ptr, B_ptr) runs.
+    int64_t group = 0;
+    int64_t splitk_acc = 0;
+    int64_t i = 0;
+    while (i < P)
     {
         int32_t const rank = ranks[i];
-        r.problem_sizes_in[i] = cutlass::gemm::GemmCoord(1, rank, static_cast<int>(in_hidden_size));
-        r.problem_sizes_out[i] = cutlass::gemm::GemmCoord(1, static_cast<int>(out_hidden_size), rank);
+        int64_t const a_ptr_bits = ptrs[2 * i + 0];
+        int64_t const b_ptr_bits = ptrs[2 * i + 1];
+        int64_t j = i + 1;
+        while (j < P && ranks[j] == rank && ptrs[2 * j + 0] == a_ptr_bits && ptrs[2 * j + 1] == b_ptr_bits)
+        {
+            ++j;
+        }
+        int const M = static_cast<int>(j - i);
+        int const out_n = (rank > 0) ? static_cast<int>(out_hidden_size) : 0;
 
-        int64_t const in_row_stride = in_hidden_size * dtype_bytes;
-        int64_t const work_row_stride = max_lora_rank * dtype_bytes;
-        int64_t const out_row_stride = out_hidden_size * dtype_bytes;
+        r.problem_sizes_in[group] = cutlass::gemm::GemmCoord(M, rank, static_cast<int>(in_hidden_size));
+        r.problem_sizes_out[group] = cutlass::gemm::GemmCoord(M, out_n, rank);
+        r.a_ptrs_in[group] = input_base + i * in_row_stride;
+        r.b_ptrs_in[group] = a_ptr_bits;
+        r.d_ptrs_in[group] = lowrank_workspace + i * work_row_stride;
+        r.b_ptrs_out[group] = b_ptr_bits;
+        r.d_ptrs_out[group] = output_base + i * out_row_stride;
+        r.lda_in[group] = in_hidden_size;
+        r.ldb_in[group] = in_hidden_size;
+        r.ldd_in[group] = max_lora_rank;
+        r.ldb_out[group] = rank;
+        r.ldd_out[group] = out_hidden_size;
+        r.splitk_offsets[group] = splitk_acc;
+        splitk_acc += static_cast<int64_t>(M) * max_lora_rank * splitk_slices;
 
-        r.a_ptrs_in[i] = input_base + i * in_row_stride;
-        r.b_ptrs_in[i] = ptrs[2 * i + 0];
-        r.d_ptrs_in[i] = lowrank_workspace + i * work_row_stride;
-        r.b_ptrs_out[i] = ptrs[2 * i + 1];
-        r.d_ptrs_out[i] = output_base + i * out_row_stride;
-
-        r.lda_in[i] = in_hidden_size;
-        r.ldb_in[i] = in_hidden_size;
-        r.ldd_in[i] = max_lora_rank;
-        r.ldb_out[i] = rank;
-        r.ldd_out[i] = out_hidden_size;
-
-        r.splitk_offsets[i] = i * max_lora_rank * splitk_slices;
+        ++group;
+        i = j;
     }
-    r.splitk_offsets[P] = P * max_lora_rank * splitk_slices;
+    for (int64_t p = group; p < P; ++p)
+    {
+        r.splitk_offsets[p] = splitk_acc;
+    }
+    r.splitk_offsets[P] = splitk_acc;
     return r;
 }
 
@@ -359,6 +398,121 @@ TEST_F(MoeLoraProblemBuilderTest, NullSplitkOffsets)
 
     runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
         max_lora_rank, dtype_bytes, splitk_slices, /*with_splitk=*/false);
+}
+
+// Returns a stable pointer for a given adapter id + side, independent of the
+// row. Rows that share (adapter_id, rank) therefore form an aggregation run.
+int64_t adapterById(int adapter_id, int side)
+{
+    return (static_cast<int64_t>(side + 1) << 56) | (static_cast<int64_t>(adapter_id + 1) << 24);
+}
+
+// Builds the per-row (A_ptr, B_ptr) table from a per-row adapter id. Rank-0
+// rows get null pointers, matching the pointer-expand kernel's no-adapter path.
+std::vector<int64_t> ptrsFromAdapterIds(std::vector<int32_t> const& ranks, std::vector<int> const& adapter_ids)
+{
+    std::vector<int64_t> ptrs;
+    ptrs.reserve(ranks.size() * 2);
+    for (size_t i = 0; i < ranks.size(); ++i)
+    {
+        if (ranks[i] == 0)
+        {
+            ptrs.push_back(0);
+            ptrs.push_back(0);
+        }
+        else
+        {
+            ptrs.push_back(adapterById(adapter_ids[i], /*side=*/0));
+            ptrs.push_back(adapterById(adapter_ids[i], /*side=*/1));
+        }
+    }
+    return ptrs;
+}
+
+// All rows share one adapter and rank -> a single merged M=P problem, with the
+// remaining P-1 slots padded as no-ops.
+TEST_F(MoeLoraProblemBuilderTest, AllSameAdapterRun)
+{
+    int64_t const in_hidden_size = 16;
+    int64_t const out_hidden_size = 32;
+    int64_t const max_lora_rank = 8;
+    int64_t const dtype_bytes = 2;
+    int64_t const splitk_slices = 4;
+    int64_t const input_base = static_cast<int64_t>(0xD'0000'0000ull);
+    int64_t const lowrank_workspace = static_cast<int64_t>(0xE'0000'0000ull);
+    int64_t const output_base = static_cast<int64_t>(0xF'0000'0000ull);
+
+    std::vector<int32_t> ranks(6, 8);
+    std::vector<int> adapter_ids(6, 7);
+    auto ptrs = ptrsFromAdapterIds(ranks, adapter_ids);
+
+    runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
+        max_lora_rank, dtype_bytes, splitk_slices);
+}
+
+// Adapters alternate A, B, A, B, ... so no two neighbors merge: every problem
+// stays M=1, matching the un-aggregated behavior.
+TEST_F(MoeLoraProblemBuilderTest, AlternatingAdaptersNoMerge)
+{
+    int64_t const in_hidden_size = 16;
+    int64_t const out_hidden_size = 32;
+    int64_t const max_lora_rank = 8;
+    int64_t const dtype_bytes = 2;
+    int64_t const splitk_slices = 4;
+    int64_t const input_base = static_cast<int64_t>(0x11'0000'0000ull);
+    int64_t const lowrank_workspace = static_cast<int64_t>(0x12'0000'0000ull);
+    int64_t const output_base = static_cast<int64_t>(0x13'0000'0000ull);
+
+    std::vector<int32_t> ranks = {8, 8, 8, 8, 8, 8};
+    std::vector<int> adapter_ids = {0, 1, 0, 1, 0, 1};
+    auto ptrs = ptrsFromAdapterIds(ranks, adapter_ids);
+
+    runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
+        max_lora_rank, dtype_bytes, splitk_slices);
+}
+
+// Blocked runs of varying length and rank, including a contiguous rank-0 run
+// (null pointers) that merges into a single no-op problem. Exercises the
+// split-K prefix sum over uneven run lengths and the no-op padding tail.
+TEST_F(MoeLoraProblemBuilderTest, BlockedRunsVaryingRanksAndRank0)
+{
+    int64_t const in_hidden_size = 16;
+    int64_t const out_hidden_size = 32;
+    int64_t const max_lora_rank = 16;
+    int64_t const dtype_bytes = 2;
+    int64_t const splitk_slices = 4;
+    int64_t const input_base = static_cast<int64_t>(0x14'0000'0000ull);
+    int64_t const lowrank_workspace = static_cast<int64_t>(0x15'0000'0000ull);
+    int64_t const output_base = static_cast<int64_t>(0x16'0000'0000ull);
+
+    //                       |-- run A (rank 8) --|  |-- rank-0 --|  |-- run B (rank 16) --|  | C |
+    std::vector<int32_t> ranks = {8, 8, 8, 0, 0, 16, 16, 4};
+    std::vector<int> adapter_ids = {1, 1, 1, -1, -1, 2, 2, 3};
+    auto ptrs = ptrsFromAdapterIds(ranks, adapter_ids);
+
+    runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
+        max_lora_rank, dtype_bytes, splitk_slices);
+}
+
+// Same adapter id but a rank change must still break the run (rank is part of
+// the aggregation key).
+TEST_F(MoeLoraProblemBuilderTest, RankChangeBreaksRun)
+{
+    int64_t const in_hidden_size = 16;
+    int64_t const out_hidden_size = 32;
+    int64_t const max_lora_rank = 16;
+    int64_t const dtype_bytes = 2;
+    int64_t const splitk_slices = 2;
+    int64_t const input_base = static_cast<int64_t>(0x17'0000'0000ull);
+    int64_t const lowrank_workspace = static_cast<int64_t>(0x18'0000'0000ull);
+    int64_t const output_base = static_cast<int64_t>(0x19'0000'0000ull);
+
+    std::vector<int32_t> ranks = {8, 8, 16, 16};
+    std::vector<int> adapter_ids = {5, 5, 5, 5}; // same adapter, differing rank
+    auto ptrs = ptrsFromAdapterIds(ranks, adapter_ids);
+
+    runAndCompare(ranks, ptrs, input_base, lowrank_workspace, output_base, in_hidden_size, out_hidden_size,
+        max_lora_rank, dtype_bytes, splitk_slices);
 }
 
 } // namespace
