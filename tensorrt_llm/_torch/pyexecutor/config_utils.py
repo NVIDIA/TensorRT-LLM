@@ -6,6 +6,7 @@ from typing import List, Optional
 import torch
 import transformers
 
+from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 
 
@@ -251,6 +252,12 @@ def extract_mamba_kv_cache_params(
 
     mamba_ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
                              if quant_config is not None else None)
+    if mamba_ssm_cache_dtype is None:
+        config_mamba_ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
+        if isinstance(config_mamba_ssm_dtype, torch.dtype):
+            mamba_ssm_cache_dtype = config_mamba_ssm_dtype
+        elif isinstance(config_mamba_ssm_dtype, str):
+            mamba_ssm_cache_dtype = str_dtype_to_torch(config_mamba_ssm_dtype)
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -317,13 +324,26 @@ class _Qwen35ConfigCompat:
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
     }
+    _QWEN_IMAGE_BENCH_ARCHITECTURE = "QwenImageBenchForConditionalGeneration"
+
+    @staticmethod
+    def is_qwen_image_bench_config(config_dict: dict,
+                                   model_name_or_path: str) -> bool:
+        architectures = config_dict.get("architectures") or []
+        model_id = str(model_name_or_path).rstrip("/\\")
+        model_name = re.split(r"[/\\]", model_id)[-1].casefold()
+        return (architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
+                and bool(config_dict.get("text_config"))
+                and bool(config_dict.get("vision_config"))
+                and model_name == "qwen-image-bench")
 
     @staticmethod
     def _extract_text_config(config_dict: dict) -> dict:
         """Pull nested text_config from VLM checkpoints, or use dict as-is."""
         architectures = config_dict.get("architectures") or []
-        if architectures and architectures[
-                0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES:
+        if (architectures
+                and architectures[0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES
+                and config_dict.get("text_config")):
             text_config = dict(config_dict.get("text_config") or {})
         else:
             text_config = dict(config_dict)
@@ -462,6 +482,18 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif _Qwen35ConfigCompat.is_qwen_image_bench_config(config_dict,
+                                                        model_name_or_path):
+        model_config = transformers.AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code)
+        # Keep the composite VLM config so the vision encoder and multimodal
+        # token IDs remain available, but normalize the text side to the
+        # Qwen3Next-compatible shape used by TRT-LLM's Qwen3.5 decoder.
+        model_config.architectures = [
+            _Qwen35ConfigCompat._QWEN_IMAGE_BENCH_ARCHITECTURE
+        ]
+        model_config.text_config = transformers.Qwen3NextConfig.from_dict(
+            _Qwen35ConfigCompat.normalize(config_dict))
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

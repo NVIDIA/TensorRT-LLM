@@ -68,7 +68,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
-        self.transformer = Cosmos3VFMTransformer(self.pipeline_config.model_configs["transformer"])
+        self.model_config = self.pipeline_config.model_configs["transformer"]
+        self.transformer = Cosmos3VFMTransformer(self.model_config)
 
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
