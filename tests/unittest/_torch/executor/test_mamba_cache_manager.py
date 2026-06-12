@@ -17,6 +17,8 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
+    calc_context_stop_positions,
+    validate_hybrid_cache_config,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -244,6 +246,74 @@ def test_cpp_add_dummy_requests_noop_on_empty_list():
     stub.mamba_impl.allocate_cache_blocks.assert_not_called()
 
 
+def test_calc_context_stop_positions_save_last_snapshot():
+    assert calc_context_stop_positions(
+        prompt_len=70, tokens_per_block=32, mamba_state_cache_interval=256, save_last_snapshot=True
+    ) == [64, 70]
+    assert calc_context_stop_positions(70, 32, 256, False) == [70]
+    assert calc_context_stop_positions(16, 32, 256, True) == [16]
+    assert calc_context_stop_positions(70, 32, 0, True) == [64, 70]
+    assert calc_context_stop_positions(70, 32, None, True) == [64, 70]
+
+
+def test_cpp_hybrid_prepare_expect_chunking_points():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=256)
+    mgr.tokens_per_block = 32
+    mgr.linear_attention_metadata = SimpleNamespace(
+        states_snapshot_interval=256, save_last_snapshot=True
+    )
+    request = SimpleNamespace(prompt_len=300, expect_chunking_points=None)
+
+    mgr.prepare_expect_chunking_points([request])
+
+    assert request.expect_chunking_points == [256, 288, 300]
+
+
+def test_cpp_hybrid_prepare_expect_chunking_points_save_last_only():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=0)
+    mgr.tokens_per_block = 32
+    mgr.linear_attention_metadata = SimpleNamespace(
+        states_snapshot_interval=0, save_last_snapshot=True
+    )
+    request = SimpleNamespace(prompt_len=70, expect_chunking_points=None)
+
+    mgr.prepare_expect_chunking_points([request])
+
+    assert request.expect_chunking_points == [64, 70]
+
+
+def test_cpp_hybrid_next_state_step_uses_expected_chunking_points():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    request = SimpleNamespace(
+        is_context_finished=False,
+        context_current_position=0,
+        context_chunk_size=128,
+        expect_chunking_points=[256, 288, 300],
+        prompt_len=300,
+    )
+
+    assert mgr._get_next_recurrent_state_step(request) == 255
+
+
+def test_cpp_hybrid_next_state_step_falls_back_to_actual_chunk_end():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    request = SimpleNamespace(
+        is_context_finished=False,
+        context_current_position=0,
+        context_chunk_size=128,
+        expect_chunking_points=None,
+        prompt_len=300,
+    )
+
+    assert mgr._get_next_recurrent_state_step(request) == 127
+
+
 @skip_no_cuda
 def test_cpp_get_state_indices_resolves_sentinel_to_reserved_slot():
     """End-to-end C++ path: add_dummy_requests + getStateIndices must
@@ -294,7 +364,7 @@ def _build_hybrid_with_mamba_layer(
     spec_config=None,
     max_batch_size=4,
     enable_block_reuse=False,
-    mamba_state_cache_interval=256,
+    mamba_state_cache_interval=None,
     is_estimating_kv_cache=False,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
@@ -305,6 +375,8 @@ def _build_hybrid_with_mamba_layer(
     attn_mask = [False, True]
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     # Cap max_tokens to keep the real C++ pool allocation tiny.
+    if enable_block_reuse and mamba_state_cache_interval is None:
+        mamba_state_cache_interval = 32
     kv_cache_config = KvCacheConfig(
         max_tokens=512,
         enable_block_reuse=enable_block_reuse,
@@ -497,6 +569,54 @@ def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
         f"need >= live_state + reuse_snapshots = {expected_min}; the old "
         f"max(reuse, live) formula dropped reuse headroom"
     )
+
+
+# ---------------------------------------------------------------------------
+# validate_hybrid_cache_config: pure-Python guard on KvCacheConfig
+# ---------------------------------------------------------------------------
+
+
+def test_validate_hybrid_cache_config_noop_when_reuse_disabled():
+    cfg = KvCacheConfig(enable_block_reuse=False, mamba_state_cache_interval=None)
+    validate_hybrid_cache_config(cfg, tokens_per_block=32)
+
+
+def test_validate_hybrid_cache_config_accepts_valid_interval():
+    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=256)
+    validate_hybrid_cache_config(cfg, tokens_per_block=32)
+
+
+def test_validate_hybrid_cache_config_accepts_save_last_without_interval():
+    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=None)
+    validate_hybrid_cache_config(cfg, tokens_per_block=32)
+    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=0)
+    validate_hybrid_cache_config(cfg, tokens_per_block=32)
+
+
+def test_validate_hybrid_cache_config_rejects_unset_interval_without_save_last():
+    cfg = KvCacheConfig(
+        enable_block_reuse=True, mamba_state_cache_interval=None, mamba_save_last_snapshot=False
+    )
+    with pytest.raises(ValueError, match="must be specified"):
+        validate_hybrid_cache_config(cfg, tokens_per_block=32)
+    cfg = KvCacheConfig(
+        enable_block_reuse=True, mamba_state_cache_interval=0, mamba_save_last_snapshot=False
+    )
+    with pytest.raises(ValueError, match="must be specified"):
+        validate_hybrid_cache_config(cfg, tokens_per_block=32)
+
+
+@pytest.mark.parametrize("interval", [-1, -256])
+def test_validate_hybrid_cache_config_rejects_negative_interval(interval):
+    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=interval)
+    with pytest.raises(ValueError, match="non-negative"):
+        validate_hybrid_cache_config(cfg, tokens_per_block=32)
+
+
+def test_validate_hybrid_cache_config_rejects_non_multiple_interval():
+    cfg = KvCacheConfig(enable_block_reuse=True, mamba_state_cache_interval=100)
+    with pytest.raises(ValueError, match="multiple of tokens_per_block"):
+        validate_hybrid_cache_config(cfg, tokens_per_block=32)
 
 
 # ---------------------------------------------------------------------------

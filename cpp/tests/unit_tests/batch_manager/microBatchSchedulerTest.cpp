@@ -2041,6 +2041,63 @@ TEST_F(ForceChunkTest, CapacityExactFit)
     EXPECT_EQ(reqs[1]->getContextChunkSize(), 10);
 }
 
+TEST_F(ForceChunkTest, ExpectedChunkingPoints)
+{
+    auto reqs = initRequests({30});
+    reqs[0]->setExpectChunkingPoints(std::vector<SizeType32>{12, 25});
+
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {12}, "iter 1");
+
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {25}, "iter 2");
+
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {30}, "iter 3");
+}
+
+TEST_F(ForceChunkTest, PrepopulatedPromptLenRespectsExpectedChunkingPoints)
+{
+    auto reqs = initRequests({160});
+    reqs[0]->setContextChunkSize(128);
+    reqs[0]->setExpectChunkingPoints(std::vector<SizeType32>{96, 128, 160});
+
+    reqs[0]->setPrepopulatedPromptLen(64, /*kvTokensPerBlock=*/32);
+
+    EXPECT_EQ(reqs[0]->getPrepopulatedPromptLen(), 64);
+    EXPECT_EQ(reqs[0]->getContextCurrentPosition(), 64);
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 32);
+
+    reqs[0]->moveToNextContextChunk();
+    EXPECT_EQ(reqs[0]->getContextCurrentPosition(), 96);
+}
+
+TEST_F(ForceChunkTest, PrepopulatedPromptLenDoesNotRoundDownExpectedChunkingPoint)
+{
+    auto reqs = initRequests({128});
+    reqs[0]->setContextChunkSize(64);
+    reqs[0]->setExpectChunkingPoints(std::vector<SizeType32>{75, 128});
+
+    reqs[0]->setPrepopulatedPromptLen(64, /*kvTokensPerBlock=*/32);
+
+    EXPECT_EQ(reqs[0]->getContextCurrentPosition(), 64);
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 11);
+
+    reqs[0]->moveToNextContextChunk();
+    EXPECT_EQ(reqs[0]->getContextCurrentPosition(), 75);
+}
+
+TEST_F(ForceChunkTest, CapacityRoundsExpectedChunkDownToUnit)
+{
+    auto reqs = initRequests({50});
+    reqs[0]->setExpectChunkingPoints(std::vector<SizeType32>{30});
+
+    MicroBatchScheduler::setCtxRequestsChunkSize(
+        reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/25, /*chunkUnitSize=*/10, std::nullopt);
+
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 20);
+}
+
 TEST_F(ForceChunkTest, MultiIteration)
 {
     // A request with prompt_len=25 and chunk_unit_size=10 processes in 3 iterations:

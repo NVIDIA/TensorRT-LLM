@@ -2824,10 +2824,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                                   description="The number of tokens per block.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    mamba_state_cache_interval: PositiveInt = Field(
-        default=256,
+    mamba_state_cache_interval: Optional[int] = Field(
+        default=None,
         description=
         "The number of tokens between cache steps in the Mamba prefix cache.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_save_last_snapshot: bool = Field(
+        default=True,
+        description=(
+            "Whether to store an additional Mamba state snapshot at the "
+            "last block boundary before the end of the prompt."))
 
     use_kv_cache_manager_v2: bool = Field(
         default=False,

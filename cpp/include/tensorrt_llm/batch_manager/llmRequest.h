@@ -1170,12 +1170,41 @@ public:
             // Currently, the runtime process is to apply for cache first and then determine prepopulation.
             // Use the prepopulated length to advance the context position and decrease chunk size if necessary.
             auto chunkSize = getContextChunkSize();
-            if (prepopulatedPromptLen + chunkSize < promptLen)
+            auto const maxChunkEndPosition = std::min(prepopulatedPromptLen + chunkSize, promptLen);
+
+            std::optional<SizeType32> nextExpectedChunkingPoint;
+            bool endsAtExpectedChunkingPoint{false};
+            if (mExpectChunkingPoints && !mExpectChunkingPoints->empty())
+            {
+                for (auto const point : *mExpectChunkingPoints)
+                {
+                    if (point > prepopulatedPromptLen)
+                    {
+                        if (!nextExpectedChunkingPoint || point < nextExpectedChunkingPoint.value())
+                        {
+                            nextExpectedChunkingPoint = point;
+                        }
+                    }
+                }
+            }
+
+            if (nextExpectedChunkingPoint)
+            {
+                auto const nextPosition = std::min(nextExpectedChunkingPoint.value(), promptLen);
+                if (nextPosition <= maxChunkEndPosition)
+                {
+                    chunkSize = std::max<SizeType32>(0, nextPosition - prepopulatedPromptLen);
+                    endsAtExpectedChunkingPoint = true;
+                }
+            }
+
+            if (!endsAtExpectedChunkingPoint && prepopulatedPromptLen + chunkSize < promptLen)
             {
                 // make sure to end at block boundary after current chunk
+                TLLM_CHECK(kvTokensPerBlock > 0);
                 auto const flooredEndPosition
                     = (prepopulatedPromptLen + chunkSize) / kvTokensPerBlock * kvTokensPerBlock;
-                chunkSize = flooredEndPosition - prepopulatedPromptLen;
+                chunkSize = std::max<SizeType32>(0, flooredEndPosition - prepopulatedPromptLen);
                 TLLM_CHECK(chunkSize <= getContextChunkSize());
             }
             contextCurrentPosition = prepopulatedPromptLen;
@@ -1183,9 +1212,17 @@ public:
 
             if (!isLastContextChunk())
             {
-                TLLM_CHECK_WITH_INFO((getContextCurrentPosition() + getContextChunkSize()) % kvTokensPerBlock == 0,
+                auto const contextEndPosition = getContextCurrentPosition() + getContextChunkSize();
+                auto const isExpectedChunkingPoint = [this, contextEndPosition]()
+                {
+                    return mExpectChunkingPoints
+                        && std::find(mExpectChunkingPoints->begin(), mExpectChunkingPoints->end(), contextEndPosition)
+                        != mExpectChunkingPoints->end();
+                }();
+                TLLM_CHECK_WITH_INFO(isExpectedChunkingPoint || contextEndPosition % kvTokensPerBlock == 0,
                     "To prevent cache fragmentation, the context position after current chunk should be divisible "
-                    "by the number of tokens per block, except for the last chunk.");
+                    "by the number of tokens per block or match an expected chunking point, except for the last "
+                    "chunk.");
             }
         }
     }
@@ -1205,6 +1242,16 @@ public:
     void setEstimatedReusableTokens(SizeType32 estimatedReusableTokens) const noexcept
     {
         mEstimatedReusableTokens = estimatedReusableTokens;
+    }
+
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getExpectChunkingPoints() const noexcept
+    {
+        return mExpectChunkingPoints;
+    }
+
+    void setExpectChunkingPoints(std::optional<std::vector<SizeType32>> expectChunkingPoints)
+    {
+        mExpectChunkingPoints = std::move(expectChunkingPoints);
     }
 
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
@@ -2060,6 +2107,8 @@ protected:
     // capacity-scheduler queries. Reset to 0 after addSequenceBatch sets
     // the authoritative mPrepopulatedPromptLen and advances context position.
     mutable SizeType32 mEstimatedReusableTokens{0};
+
+    std::optional<std::vector<SizeType32>> mExpectChunkingPoints{std::nullopt};
 
     SizeType32 mMaxSentTokenLen;
 

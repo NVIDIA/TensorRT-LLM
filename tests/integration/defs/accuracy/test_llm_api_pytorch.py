@@ -6940,19 +6940,19 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp, save_last",
         [
-            (1, 1, 256, False, False),
-            (4, 1, 256, False, True),
-            (4, 4, 256, False, False),
-            (4, 4, 256, True, False),
-            (4, 4, 512, True, True),
+            (1, 1, 0, False, False, True),
+            (4, 1, 256, False, True, False),
+            (4, 4, 256, False, False, False),
+            (4, 4, 512, True, False, False),
+            (4, 4, 0, True, True, True),
         ],
         ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp,
-                                     use_mtp):
+                                     use_mtp, save_last):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
             pytest.skip(
@@ -6968,6 +6968,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     enable_block_reuse=True,
                     mamba_ssm_cache_dtype="float16",
                     mamba_state_cache_interval=mamba_state_cache_interval,
+                    mamba_save_last_snapshot=save_last,
                     free_gpu_memory_fraction=0.8,
                 ),
                 max_batch_size=32,
@@ -6987,6 +6988,68 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    def test_nvfp4_block_reuse_sequential_contained_prompt(self):
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=True,
+                    mamba_ssm_cache_dtype="float16",
+                    mamba_state_cache_interval=0,
+                    mamba_save_last_snapshot=True,
+                    free_gpu_memory_fraction=0.6,
+                ),
+                max_batch_size=8,
+                tensor_parallel_size=1,
+                moe_expert_parallel_size=1,
+                pipeline_parallel_size=1,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+        ) as llm:
+            first_turn = (
+                "User: I'm preparing a production rollout for a TensorRT-LLM "
+                "service that will handle repeated troubleshooting questions. "
+                "The service runs on NVIDIA B200 GPUs and uses the Nemotron 3 "
+                "Super 120B model with NVFP4 quantization. What checks should "
+                "I run before enabling KV cache reuse?")
+            first_prompt = f"{first_turn}\nAI Agent:"
+            first_prompt_ids = llm.tokenizer.encode(first_prompt)
+            # Exercise reuse from a saved last snapshot, not only from a full
+            # KV block.
+            while (len(first_prompt_ids) <= 32
+                   or len(first_prompt_ids) % 32 == 0):
+                first_turn += (
+                    " Include model loading, GPU memory headroom, and a short "
+                    "deterministic generation check.")
+                first_prompt = f"{first_turn}\nAI Agent:"
+                first_prompt_ids = llm.tokenizer.encode(first_prompt)
+
+            agent_reply = (
+                " Check model loading, verify GPU memory headroom, run one "
+                "deterministic prompt, and compare latency before and after "
+                "reuse is enabled.")
+            suffix_ids = llm.tokenizer.encode(
+                f"{agent_reply}\n\nUser: Thanks. Turn that into a concise "
+                "two-step validation plan for the on-call runbook.\nAI Agent:",
+                add_special_tokens=False)
+            second_prompt_ids = first_prompt_ids + suffix_ids
+            assert second_prompt_ids[:len(first_prompt_ids)] == first_prompt_ids
+
+            sampling_params = SamplingParams(max_tokens=8,
+                                             temperature=0,
+                                             add_special_tokens=False,
+                                             ignore_eos=True)
+            first_outputs = llm.generate([first_prompt_ids],
+                                         sampling_params=sampling_params)
+            second_outputs = llm.generate([second_prompt_ids],
+                                          sampling_params=sampling_params)
+
+            assert len(first_outputs) == 1
+            assert len(second_outputs) == 1
+            assert len(first_outputs[0].outputs[0].token_ids) > 0
+            assert len(second_outputs[0].outputs[0].token_ids) > 0
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)

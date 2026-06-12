@@ -1194,22 +1194,46 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
 
 def calc_context_stop_positions(prompt_len: int,
                                 tokens_per_block: int,
-                                mamba_state_cache_interval: int,
+                                mamba_state_cache_interval: Optional[int],
                                 save_last_snapshot: bool = False) -> list[int]:
     """Compute token positions at which mamba state snapshots should be saved.
 
     Returns positions spaced by ``mamba_state_cache_interval`` plus the final
     prompt length (and optionally the last block-aligned position).
     """
-    stop_positions = list(
-        range(mamba_state_cache_interval, prompt_len,
-              mamba_state_cache_interval))
+    stop_positions = []
+    if mamba_state_cache_interval is not None and mamba_state_cache_interval > 0:
+        stop_positions.extend(
+            range(mamba_state_cache_interval, prompt_len,
+                  mamba_state_cache_interval))
+
     last_ckpt = prompt_len // tokens_per_block * tokens_per_block
-    if save_last_snapshot and (last_ckpt not in stop_positions):
+    if save_last_snapshot and last_ckpt > 0:
         stop_positions.append(last_ckpt)
-    if prompt_len not in stop_positions:
-        stop_positions.append(prompt_len)
-    return stop_positions
+    stop_positions.append(prompt_len)
+    return sorted({pos for pos in stop_positions if 0 < pos <= prompt_len})
+
+
+def validate_hybrid_cache_config(kv_cache_config: KvCacheConfig,
+                                 tokens_per_block: int) -> None:
+    if not kv_cache_config.enable_block_reuse:
+        return
+
+    interval = kv_cache_config.mamba_state_cache_interval
+    has_last_snapshot = kv_cache_config.mamba_save_last_snapshot
+
+    if interval is None or interval == 0:
+        if not has_last_snapshot:
+            raise ValueError(
+                "mamba_state_cache_interval must be specified when block reuse "
+                "is enabled without mamba_save_last_snapshot")
+        return
+    if interval < 0:
+        raise ValueError("mamba_state_cache_interval must be non-negative")
+    if interval % tokens_per_block != 0:
+        raise ValueError(
+            "mamba_state_cache_interval must be a multiple of tokens_per_block "
+            "for proper block alignment")
 
 
 @triton.jit
@@ -1415,6 +1439,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             )
             return
 
+        validate_hybrid_cache_config(kv_cache_config, tokens_per_block)
+
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
         d_inner = mamba_head_dim * mamba_num_heads
@@ -1471,6 +1497,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
         self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_state_cache_interval if kv_cache_config.enable_block_reuse else 0
+        self.linear_attention_metadata.save_last_snapshot = kv_cache_config.mamba_save_last_snapshot
         # RNN model params for disagg TP-mismatch split/concat.
         conv_section_map = {"nemotron_hybrid": 1, "qwen3_next": 2}
         self.linear_attention_metadata.rnn_num_heads = self._rnn_num_heads
@@ -1609,17 +1636,19 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_mamba_layers_per_rank = len(
             mapping.pp_layers(params.num_mamba_layers))
         state_bytes_per_rank = num_mamba_layers_per_rank * state_bytes_per_layer
+        saves_last_snapshot = (kv_cache_config.enable_block_reuse
+                               and kv_cache_config.mamba_save_last_snapshot)
 
-        # Per-request fixed cost. STATIC_SLOTS_PER_REQUEST = 1 today (the
-        # live mamba state); fixed-position snapshots are not yet
-        # implemented and would simply increment this constant. With
-        # pipeline parallelism, multiple microbatches are in-flight
-        # concurrently on the same rank, so each rank holds Mamba state
-        # for up to ``max_batch_size * pp_size`` concurrent sequences.
-        STATIC_SLOTS_PER_REQUEST = 1
+        # Per-request fixed cost: one live mamba state, plus one optional
+        # last block-aligned snapshot when block reuse is enabled. With
+        # pipeline parallelism, multiple microbatches are in-flight on the
+        # same rank, so each rank holds Mamba state for up to
+        # ``max_batch_size * pp_size`` concurrent sequences.
+        live_slots_per_request = 1
+        last_snapshot_slots_per_request = 1 if saves_last_snapshot else 0
         pp_size = mapping.pp_size if mapping is not None else 1
         intercept = (max_batch_size * pp_size * state_bytes_per_rank *
-                     STATIC_SLOTS_PER_REQUEST)
+                     (live_slots_per_request + last_snapshot_slots_per_request))
 
         # Regular-snapshot bytes per token. None / non-positive intervals
         # mean "no regular snapshots", so the mamba contribution is zero.
@@ -1632,8 +1661,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # otherwise we may run out of kv cache blocks prior to mamba blocks due to the large number of max_batch_size.
         # So we ignore intercept and only calculate max_tokens based on slope
         # This can be improved by a more accurate max_batch_size and ISL/OSL estimation in the future.
+        # Keep the last-snapshot fixed cost because it is not represented by the regular-snapshot slope.
         if mamba_slope > 0:
-            intercept = 0
+            intercept = (max_batch_size * pp_size * state_bytes_per_rank *
+                         last_snapshot_slots_per_request)
         return attention_slope + mamba_slope, intercept
 
     def shutdown(self):
@@ -1842,9 +1873,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             rs_free = stats.num_free_blocks_per_window_size.get(
                 LinearCacheType.RECURRENT_STATES.value, 0)
             # Reserve 1 block for the always-allocated last block (corner case
-            # / final live state) so we don't promise more tokens than the
-            # pool can actually back at allocation time.
-            usable_rs_blocks = max(0, rs_free - 1)
+            # / final live state), plus one more when save-last-snapshot is
+            # enabled, so we don't promise more tokens than the pool can
+            # actually back at allocation time.
+            fixed_blocks = 1 + int(
+                self.linear_attention_metadata.save_last_snapshot)
+            usable_rs_blocks = max(0, rs_free - fixed_blocks)
             rs_token_cap = usable_rs_blocks * interval
             result = min(result, rs_token_cap)
         return max(result, 0)
@@ -1913,18 +1947,30 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self._request_id_to_state_index.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
+    def _get_next_recurrent_state_step(self, req: LlmRequest) -> int:
+        if req.is_context_finished:
+            return self.get_num_tokens(req) - 1
+        if not self.kv_cache_config.enable_block_reuse:
+            return req.prompt_len - 1
+
+        chunk_end = req.context_current_position + req.context_chunk_size
+        expected_points = getattr(req, "expect_chunking_points", None)
+        if expected_points:
+            next_point = min(
+                (point for point in expected_points if point >= chunk_end),
+                default=None,
+            )
+            if next_point is not None:
+                return min(next_point, req.prompt_len) - 1
+
+        return chunk_end - 1
+
     def _setup_state_indices(self) -> None:
         if self.local_num_mamba_layers == 0:
             return
         block_indices = []
         for req in self.requests:
-            if req.is_context_finished:
-                next_step = self.get_num_tokens(req) - 1
-            elif self.kv_cache_config.enable_block_reuse:
-                next_step = (req.context_current_position - 1 +
-                             req.context_chunk_size)
-            else:
-                next_step = req.prompt_len - 1
+            next_step = self._get_next_recurrent_state_step(req)
             block_indices.append(next_step // self.tokens_per_block)
         self.impl.copy_batch_block_offsets(
             self.host_block_offsets,
@@ -1951,7 +1997,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 value = int(values[bad_i])
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
-                    f"(expected 0 <= index < {max_blocks}) for request {bad_i}, "
+                    f"(expected 0 <= index < {max_blocks}) for request {req.py_request_id}, "
                     f"prompt_len={req.prompt_len}, "
                     f"is_context_finished={req.is_context_finished}, "
                     f"context_current_position={req.context_current_position}, "
@@ -1982,6 +2028,28 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return [self._request_id_to_state_index[rid] for rid in request_ids]
         return self.cuda_state_indices
 
+    def prepare_expect_chunking_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        """Set expected context chunking points before scheduler chunking."""
+        if not self.kv_cache_config.enable_block_reuse:
+            for request in requests:
+                request.expect_chunking_points = None
+            return
+
+        interval = self.linear_attention_metadata.states_snapshot_interval
+        save_last_snapshot = self.linear_attention_metadata.save_last_snapshot
+        if (interval is None or interval <= 0) and not save_last_snapshot:
+            for request in requests:
+                request.expect_chunking_points = None
+            return
+
+        for request in requests:
+            if request.expect_chunking_points is not None:
+                continue
+            request.expect_chunking_points = calc_context_stop_positions(
+                request.prompt_len, self.tokens_per_block, interval,
+                save_last_snapshot)
+
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
         """Compute the next prefill chunk size for a context request when block reuse is enabled.
 
@@ -2004,9 +2072,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             assert current == 0, f"Expected context_current_position to be 0 when block reuse is disabled, but got {current}"
             return prompt_len - current
         step = self.linear_attention_metadata.states_snapshot_interval
-        stop_positions = calc_context_stop_positions(prompt_len,
-                                                     self.tokens_per_block,
-                                                     step)
+        stop_positions = calc_context_stop_positions(
+            prompt_len, self.tokens_per_block, step,
+            self.linear_attention_metadata.save_last_snapshot)
         stop_positions = sorted(set(stop_positions))
         for pos in stop_positions:
             if pos > current:

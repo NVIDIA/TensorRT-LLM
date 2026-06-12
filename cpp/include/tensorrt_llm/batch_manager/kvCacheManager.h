@@ -201,10 +201,16 @@ struct LinearAttentionMetadata
         if (statesSnapshotInterval > 0)
         {
             count += promptLen / statesSnapshotInterval; // round down
+            // both enabled
+            if (saveLastSnapshot
+                && (promptLen / tokensPerBlock * tokensPerBlock
+                    != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+            {
+                count += 1;
+            }
         }
-        if (saveLastSnapshot
-            && (promptLen / tokensPerBlock * tokensPerBlock
-                != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+        // only last snapshot enabled
+        else if (saveLastSnapshot)
         {
             count += 1;
         }
@@ -1266,6 +1272,13 @@ private:
 
     bool tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams);
 
+    //! \brief Store stale recurrent-state blocks for reuse and replace their sequence slots with placeholders.
+    //! \details A real recurrent-state block is stale once its block end is not later than
+    //!          the request current position and a later real recurrent-state block exists
+    //!          in the same beam.
+    void storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(
+        GenerationRequest& sequence, LlmRequest const& llmRequest);
+
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr const& block, GenerationRequest& sequence, SizeType32 beamIdx);
 
@@ -1328,6 +1341,9 @@ private:
 
     // List of allocated blocks for each sequences
     std::unordered_map<LlmRequest::RequestIdType, std::vector<BlockPtr>> mAllocatedBlocksPerSeq;
+    // Request IDs whose stale recurrent-state context blocks have already been
+    // stored and replaced with placeholders at generation start.
+    std::set<LlmRequest::RequestIdType> mStoredLinearAttentionCopySourceReqIds;
 
     // Pool per unique numKvHeads in the model
     std::vector<KVCacheBlockPool> mPools;

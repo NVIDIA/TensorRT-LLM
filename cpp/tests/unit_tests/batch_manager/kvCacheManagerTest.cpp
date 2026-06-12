@@ -7926,9 +7926,26 @@ void testKVCacheManagerLinearAttention_BlockCopying(
     for (int step = 0; step < contextPositionPerStep.size(); ++step)
     {
         int contextPosition = contextPositionPerStep[step];
+        auto const copiedPosition = llmRequest0->getContextCurrentPosition();
         // called before every forward step
-        kvCacheManager.copyLinearAttentionBlock(*llmRequest0);
+        bool const didCopy = kvCacheManager.copyLinearAttentionBlock(*llmRequest0);
         cudaDeviceSynchronize();
+        if (copiedPosition > 0 && copiedPosition % tokensPerBlock == 0 && copiedPosition <= llmRequest0->getPromptLen())
+        {
+            auto const copiedBlockIndex = copiedPosition / tokensPerBlock - 1;
+            if (expectedBlockIds.at(0).at(copiedBlockIndex) >= 0)
+            {
+                ASSERT_TRUE(didCopy);
+                auto const blockIdsAfterCopy
+                    = kvCacheManager.getCacheBlockIds(llmRequest0->mRequestId, linearWindowSizeCode);
+                for (int beam = 0; beam < beamWidth; ++beam)
+                {
+                    ASSERT_EQ(
+                        blockIdsAfterCopy.at(beam).at(copiedBlockIndex), expectedBlockIds.at(beam).at(copiedBlockIndex))
+                        << "Copied recurrent-state sources are released only at generation start";
+                }
+            }
+        }
         int blockIndex = tc::ceilDiv(contextPosition, tokensPerBlock) - 1;
         bool shareAmongBeams = beamWidth > 1 && expectedBlockIds[0][blockIndex] == expectedBlockIds[1][blockIndex];
         for (int beam = 0; beam < beamWidth; ++beam)
@@ -8120,6 +8137,127 @@ INSTANTIATE_TEST_SUITE_P(BlockManagerLinearAttention, LinearAttentionBlockCopyin
         std::make_tuple(4, 96, 35),              // edge cases: numContextTokens % tokensPerBlock == 0 and beamWidth > 1
         std::make_tuple(4, 97, 35)               // normal case beamWidth > 1
         ));
+
+TEST_F(KVCacheManagerTest, LinearAttentionContextCopyReplacesComputedStatesWithPlaceholders)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 32;
+    auto constexpr blocksInPrimaryPool = 30;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr beamWidth = 1;
+    auto constexpr numContextTokens = tokensPerBlock * 8 + 1;
+    auto constexpr sinkTokenLen = 0;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto constexpr maxAttentionWindow = numContextTokens + sinkTokenLen + 1;
+    SizeType32 constexpr linearWindowSizeCode = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata linearAttentionMetadata{
+        .cacheType = linearWindowSizeCode,
+        .allRecurrentStatesBytes = 440 * 1024,
+        .statesSnapshotInterval = tokensPerBlock * 2,
+        .saveLastSnapshot = true,
+        .numPlaceholderBlocks = blocksInPrimaryPool * 100,
+    };
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow},
+        nvinfer1::DataType::kHALF, sinkTokenLen, stream, maxAttentionWindow, /*chunkSize*/ 0,
+        /*enableBlockReuse*/ true, CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse*/ false,
+        /*copyOnPartialReuse*/ true, nullptr, /*enableIndexerKCache*/ false, /*indexerKCacheQuantBlockSize*/ 128,
+        /*indexerKCacheIndexHeadDim*/ 0, /*indexerKCacheUseFp4=*/false, linearAttentionMetadata);
+    kvCacheManager.allocatePools(false);
+
+    auto inputTokens = std::make_shared<VecTokens>();
+    for (int i = 0; i < numContextTokens; ++i)
+    {
+        inputTokens->push_back(i);
+    }
+    auto llmRequest = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    llmRequest->setContextChunkSize(linearAttentionMetadata.statesSnapshotInterval);
+
+    kvCacheManager.addSequenceBatch({{{llmRequest->mRequestId, numContextTokens, beamWidth}}}, {std::ref(*llmRequest)});
+
+    auto const initialBlockIds = kvCacheManager.getCacheBlockIds(llmRequest->mRequestId, linearWindowSizeCode);
+    ASSERT_EQ(initialBlockIds.size(), 1);
+    EXPECT_THAT(initialBlockIds.at(0), testing::ElementsAre(-2, 0, -3, 1, -4, 2, -5, 3, 4));
+    EXPECT_EQ(blocksInPrimaryPool - kvCacheManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 5);
+
+    for (auto const contextPosition :
+        {tokensPerBlock * 2, tokensPerBlock * 4, tokensPerBlock * 6, tokensPerBlock * 8, numContextTokens})
+    {
+        (void) kvCacheManager.copyLinearAttentionBlock(*llmRequest);
+        cudaDeviceSynchronize();
+        llmRequest->setContextCurrentPosition(contextPosition);
+    }
+
+    auto const contextBlockIds = kvCacheManager.getCacheBlockIds(llmRequest->mRequestId, linearWindowSizeCode);
+    ASSERT_EQ(contextBlockIds.size(), 1);
+    EXPECT_THAT(contextBlockIds.at(0), testing::ElementsAre(-2, 0, -3, 1, -4, 2, -5, 3, 4));
+    EXPECT_EQ(blocksInPrimaryPool - kvCacheManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 5);
+
+    llmRequest->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    (void) kvCacheManager.copyLinearAttentionBlock(*llmRequest);
+    cudaDeviceSynchronize();
+
+    auto const finalBlockIds = kvCacheManager.getCacheBlockIds(llmRequest->mRequestId, linearWindowSizeCode);
+    ASSERT_EQ(finalBlockIds.size(), 1);
+    EXPECT_THAT(finalBlockIds.at(0), testing::ElementsAre(-2, -6, -3, -7, -4, -8, -5, -9, 4));
+    EXPECT_EQ(blocksInPrimaryPool - kvCacheManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 1);
+
+    (void) kvCacheManager.copyLinearAttentionBlock(*llmRequest);
+    cudaDeviceSynchronize();
+    EXPECT_EQ(kvCacheManager.getCacheBlockIds(llmRequest->mRequestId, linearWindowSizeCode), finalBlockIds);
+    EXPECT_EQ(blocksInPrimaryPool - kvCacheManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 1);
+
+    kvCacheManager.storeContextBlocks(*llmRequest);
+
+    auto constexpr req2NumContextTokens = tokensPerBlock * 2 + 6;
+    auto req2InputTokens = std::make_shared<VecTokens>();
+    for (int i = 0; i < req2NumContextTokens; ++i)
+    {
+        req2InputTokens->push_back(i);
+    }
+    auto req2 = std::make_shared<LlmRequest>(1, maxNewTokens, req2InputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequenceBatch({{{req2->mRequestId, req2NumContextTokens, beamWidth}}}, {std::ref(*req2)});
+
+    auto const req2BlockIds = kvCacheManager.getCacheBlockIds(req2->mRequestId, linearWindowSizeCode);
+    ASSERT_EQ(req2BlockIds.size(), 1);
+    ASSERT_EQ(req2BlockIds.at(0).size(), 3);
+    EXPECT_EQ(req2BlockIds.at(0)[0], -2);
+    EXPECT_EQ(req2BlockIds.at(0)[1], 0);
+    EXPECT_GT(req2BlockIds.at(0)[2], 0);
+    EXPECT_NE(req2BlockIds.at(0)[2], 0);
+
+    auto constexpr req3NumContextTokens = tokensPerBlock * 4 + 7;
+    auto req3InputTokens = std::make_shared<VecTokens>();
+    for (int i = 0; i < req3NumContextTokens; ++i)
+    {
+        req3InputTokens->push_back(i);
+    }
+    auto req3 = std::make_shared<LlmRequest>(2, maxNewTokens, req3InputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequenceBatch({{{req3->mRequestId, req3NumContextTokens, beamWidth}}}, {std::ref(*req3)});
+
+    auto const req3BlockIds = kvCacheManager.getCacheBlockIds(req3->mRequestId, linearWindowSizeCode);
+    ASSERT_EQ(req3BlockIds.size(), 1);
+    ASSERT_EQ(req3BlockIds.at(0).size(), 5);
+    EXPECT_EQ(req3BlockIds.at(0)[0], -2);
+    EXPECT_EQ(req3BlockIds.at(0)[1], 0);
+    EXPECT_EQ(req3BlockIds.at(0)[2], -3);
+    EXPECT_EQ(req3BlockIds.at(0)[3], 1);
+    EXPECT_GT(req3BlockIds.at(0)[4], 0);
+    EXPECT_NE(req3BlockIds.at(0)[4], 1);
+}
 
 TEST_F(KVCacheManagerTest, StaticLinearHybridAllocationTest)
 {

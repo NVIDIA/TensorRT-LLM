@@ -2344,6 +2344,176 @@ bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequ
     return true;
 }
 
+void WindowBlockManager::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(
+    GenerationRequest& sequence, LlmRequest const& request)
+{
+    auto const requestId = sequence.getRequestId();
+    auto seqIt = mAllocatedBlocksPerSeq.find(requestId);
+    if (seqIt == mAllocatedBlocksPerSeq.end())
+    {
+        TLLM_LOG_WARNING("%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - Request %lu not found",
+            mLogPrefix.c_str(), requestId);
+        return;
+    }
+
+    auto const currentPosition
+        = request.isContextFinished() ? request.getNumTokens(0) : request.getContextCurrentPosition();
+    if (currentPosition < mTokensPerBlock)
+    {
+        return;
+    }
+
+    auto const beamWidth = sequence.getBeamWidth();
+    auto& allocatedBlocks = seqIt->second;
+    auto const& blockIdsByBeam = sequence.getCacheBlockIds(mWindowSize);
+    auto const maxCandidateBlockIdx = currentPosition / mTokensPerBlock - 1;
+
+    std::map<SizeType32, std::unordered_map<KVCacheBlock::IdType, std::vector<SizeType32>>>
+        sourceBlockIdxToBlockIdToBeamIdxs;
+
+    for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+    {
+        auto const& beamBlockIds = blockIdsByBeam.at(beamIdx);
+        if (beamBlockIds.empty())
+        {
+            continue;
+        }
+
+        auto const lastCandidateBlockIdx
+            = std::min<SizeType32>(maxCandidateBlockIdx, static_cast<SizeType32>(beamBlockIds.size()) - 1);
+        for (SizeType32 blockIdx = 0; blockIdx <= lastCandidateBlockIdx; ++blockIdx)
+        {
+            auto sourceBlock = getBlockById(beamBlockIds.at(blockIdx));
+            if (sourceBlock == nullptr || sourceBlock->isPlaceholder())
+            {
+                continue;
+            }
+
+            bool hasLaterRealBlock = false;
+            for (SizeType32 nextBlockIdx = blockIdx + 1; nextBlockIdx < static_cast<SizeType32>(beamBlockIds.size());
+                 ++nextBlockIdx)
+            {
+                auto nextBlock = getBlockById(beamBlockIds.at(nextBlockIdx));
+                if (nextBlock != nullptr && !nextBlock->isPlaceholder())
+                {
+                    hasLaterRealBlock = true;
+                    break;
+                }
+            }
+            if (!hasLaterRealBlock)
+            {
+                continue;
+            }
+
+            auto const sourceSlot = blockIdx * beamWidth + beamIdx;
+            TLLM_CHECK_WITH_INFO(sourceSlot < static_cast<SizeType32>(allocatedBlocks.size())
+                    && allocatedBlocks.at(sourceSlot)->getBlockId() == sourceBlock->getBlockId(),
+                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - beam %d source slot has block %d, "
+                "expected %d",
+                mLogPrefix.c_str(), beamIdx,
+                sourceSlot < static_cast<SizeType32>(allocatedBlocks.size())
+                    ? allocatedBlocks.at(sourceSlot)->getBlockId()
+                    : KVCacheBlock::kPlaceholderBlockId,
+                sourceBlock->getBlockId());
+
+            sourceBlockIdxToBlockIdToBeamIdxs[blockIdx][sourceBlock->getBlockId()].push_back(beamIdx);
+        }
+    }
+
+    for (auto const& [sourceBlockIdx, sourceBlockIdToBeamIdxs] : sourceBlockIdxToBlockIdToBeamIdxs)
+    {
+        TLLM_CHECK_WITH_INFO((sourceBlockIdx + 1) * beamWidth <= static_cast<SizeType32>(allocatedBlocks.size()),
+            "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - sourceBlockIdx %d out of range for "
+            "request %lu",
+            mLogPrefix.c_str(), sourceBlockIdx, requestId);
+
+        for (auto const& [sourceBlockId, beamIdxs] : sourceBlockIdToBeamIdxs)
+        {
+            TLLM_CHECK(!beamIdxs.empty());
+            auto sourceBlock = getBlockById(sourceBlockId);
+            TLLM_CHECK_WITH_INFO(sourceBlock != nullptr && !sourceBlock->isPlaceholder(),
+                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - invalid source block %d",
+                mLogPrefix.c_str(), sourceBlockId);
+
+            auto const firstBeamIdx = beamIdxs.front();
+            auto const& uniqueTokens = request.getUniqueTokens(firstBeamIdx);
+            auto const sourceTokenCount = (sourceBlockIdx + 1) * mTokensPerBlock;
+            TLLM_CHECK_WITH_INFO(sourceTokenCount <= static_cast<SizeType32>(uniqueTokens.size()),
+                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - sourceTokenCount %d exceeds "
+                "unique token count %zu for request %lu",
+                mLogPrefix.c_str(), sourceTokenCount, uniqueTokens.size(), requestId);
+
+            auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+                uniqueTokens, sourceTokenCount, mTokensPerBlock, /*allowPartial=*/false);
+            auto blockKeys = buildBlockKeys(blockedUniqueTokens, request);
+            TLLM_CHECK_WITH_INFO(blockKeys.size() == static_cast<std::size_t>(sourceBlockIdx + 1),
+                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - expected %d block keys, got %zu",
+                mLogPrefix.c_str(), sourceBlockIdx + 1, blockKeys.size());
+
+            std::vector<BlockPtr> beamBlocks;
+            beamBlocks.reserve(sourceBlockIdx + 1);
+            for (SizeType32 blockIdx = 0; blockIdx <= sourceBlockIdx; ++blockIdx)
+            {
+                beamBlocks.push_back(allocatedBlocks.at(blockIdx * beamWidth + firstBeamIdx));
+            }
+            TLLM_CHECK_WITH_INFO(beamBlocks.back()->getBlockId() == sourceBlockId,
+                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - source slot has block %d, "
+                "expected %d",
+                mLogPrefix.c_str(), beamBlocks.back()->getBlockId(), sourceBlockId);
+
+            auto sourceBlockKey = sourceBlock->getBlockKey();
+            bool const sourceBlockIsFull = sourceBlock->isFull();
+            auto sourcePrevBlockInSeq = sourceBlock->getPrevBlockInSeq();
+            auto const sourceHash = sourceBlock->getHash();
+
+            auto storeResult = storeBlocks(blockKeys, beamBlocks, /*pinBlocks=*/false);
+            TLLM_LOG_DEBUG(
+                "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - request %lu, source block %d at "
+                "index %d, stored %d blocks",
+                mLogPrefix.c_str(), requestId, sourceBlockId, sourceBlockIdx, storeResult.first);
+
+            auto placeholder = getFreeBlock(sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
+                std::nullopt, sequence.getTransferMode(), sequence.getDirectory(), /*wantPlaceholder=*/true);
+            placeholder->setBlockKey(sourceBlockKey, sourceBlockIsFull);
+            placeholder->setPrevBlockInSeq(sourcePrevBlockInSeq);
+            placeholder->setHash(sourceHash);
+
+            for (auto const beamIdx : beamIdxs)
+            {
+                auto const sourceSlot = sourceBlockIdx * beamWidth + beamIdx;
+                TLLM_CHECK_WITH_INFO(allocatedBlocks.at(sourceSlot)->getBlockId() == sourceBlockId,
+                    "%s::storeLinearAttentionCopySourcesAndReplaceWithPlaceholders - beam %d source slot has block "
+                    "%d, expected %d",
+                    mLogPrefix.c_str(), beamIdx, allocatedBlocks.at(sourceSlot)->getBlockId(), sourceBlockId);
+
+                placeholder->incRefCount();
+                sequence.changeCacheBlock(mWindowSize, beamIdx, sourceBlockIdx, placeholder->getBlockId());
+                allocatedBlocks.at(sourceSlot) = placeholder;
+
+                auto const& beamBlockIds = sequence.getCacheBlockIds(mWindowSize).at(beamIdx);
+                for (SizeType32 nextBlockIdx = sourceBlockIdx + 1;
+                     nextBlockIdx < static_cast<SizeType32>(beamBlockIds.size()); ++nextBlockIdx)
+                {
+                    auto nextBlock = getBlockById(beamBlockIds.at(nextBlockIdx));
+                    if (nextBlock != nullptr && !nextBlock->isPlaceholder())
+                    {
+                        nextBlock->setPrevBlockInSeq(placeholder);
+                        nextBlock->setHash();
+                        break;
+                    }
+                }
+
+                sourceBlock->decRefCount();
+            }
+
+            if (!sourceBlock->hasRefs())
+            {
+                mEvictionPolicy->releaseBlock(sourceBlock);
+            }
+        }
+    }
+}
+
 void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAmongBeams)
 {
     auto const beamWidth = sequence.getBeamWidth();
@@ -2409,6 +2579,15 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         = request.isContextFinished() ? (request.getNumTokens(0)) : request.getContextCurrentPosition();
     TLLM_LOG_DEBUG("%s::copyLinearAttentionBlock - Request %lu, currentPosition %d", mLogPrefix.c_str(), requestId,
         currentPosition);
+
+    // Copies issued during context prefill are asynchronous and are synchronized by
+    // refreshBlocks() before the next forward pass. Only store and release their
+    // source blocks once the request reaches generation, and do it before any copy
+    // that this generation step may issue.
+    if (request.isGenerationInProgressState() && mStoredLinearAttentionCopySourceReqIds.insert(requestId).second)
+    {
+        storeLinearAttentionCopySourcesAndReplaceWithPlaceholders(sequence, request);
+    }
 
     // edge case: promptLen % tokensPerBlock == 0, and this is the first token of decoding phase
     if (currentPosition == request.getPromptLen() + 1 && request.getPromptLen() % mTokensPerBlock == 0)
@@ -3062,6 +3241,7 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
     auto const requestId = sequence.getRequestId();
+    mStoredLinearAttentionCopySourceReqIds.erase(requestId);
     TLLM_LOG_DEBUG("%s::releaseBlocks - requestId=%lu, llmRequest.id=%s", mLogPrefix.c_str(), requestId,
         llmRequest.has_value() ? std::to_string(llmRequest->mRequestId).c_str() : "null");
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;

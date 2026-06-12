@@ -735,11 +735,17 @@ class KVCacheManager(BaseResourceManager):
                 # live-state slot count must scale with ``pp_size``.
                 pp_size = self.mapping.pp_size if self.mapping is not None else 1
                 live_state_slots = self.max_batch_size * pp_size
-                max_snapshots = live_state_slots
+                saves_last_snapshot = (
+                    kv_cache_config.enable_block_reuse
+                    and linear_attention_metadata.save_last_snapshot)
+                last_snapshot_slots = live_state_slots if saves_last_snapshot else 0
+                max_snapshots = live_state_slots + last_snapshot_slots
                 if kv_cache_config.enable_block_reuse:
-                    max_snapshots += (
+                    regular_snapshots = (
                         kv_cache_config.max_tokens //
-                        linear_attention_metadata.states_snapshot_interval)
+                        linear_attention_metadata.states_snapshot_interval
+                    ) if linear_attention_metadata.states_snapshot_interval > 0 else 0
+                    max_snapshots += regular_snapshots
 
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
@@ -2084,11 +2090,16 @@ class KVCacheManager(BaseResourceManager):
         # simultaneously on the same rank, each holding up to ``max_batch_size``
         # sequences' Mamba state, so the live-state slot count must scale with
         # ``pp_size``. +1 is for the CUDA graph padding dummy.
-        max_snapshots = self.max_batch_size * pp_size + 1
+        live_state_slots = self.max_batch_size * pp_size + 1
         if self.spec_config is not None:
             # cuda graph has different request ids for different draft len (CUDAGraphRunner::_get_padded_batch)
             # TODO: we can use a same slot for all these
-            max_snapshots += self.spec_config.max_draft_len
+            live_state_slots += self.spec_config.max_draft_len
+        saves_last_snapshot = (
+            kv_cache_config.enable_block_reuse
+            and self.linear_attention_metadata.save_last_snapshot)
+        last_snapshot_slots = self.max_batch_size * pp_size if saves_last_snapshot else 0
+        max_snapshots = live_state_slots + last_snapshot_slots
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
             max_snapshots += max_tokens // interval
