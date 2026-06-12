@@ -149,6 +149,23 @@ class PreprocessedInputs:
     multimodal_params: Optional[MultimodalParams] = None
 
 
+def _maybe_disable_block_reuse_for_multimodal(input_processor,
+                                              kv_cache_config) -> bool:
+    if (kv_cache_config is None
+            or not isinstance(input_processor, BaseMultimodalInputProcessor)
+            or not kv_cache_config.enable_block_reuse
+            or "enable_block_reuse" in kv_cache_config.model_fields_set):
+        return False
+    logger.warning(
+        "Disabling kv_cache_config.enable_block_reuse for multimodal model. "
+        "Prefix-block reuse is not yet safe for multimodal inputs. To opt "
+        "back in, pass KvCacheConfig(enable_block_reuse=True) to the LLM "
+        "API, or set kv_cache_config.enable_block_reuse=true in the YAML "
+        "passed to trtllm-serve --extra_llm_api_options.")
+    kv_cache_config.enable_block_reuse = False
+    return True
+
+
 class BaseLLM:
     """The base class for all LLM classes.
     """
@@ -1519,6 +1536,9 @@ class _TorchLLM(BaseLLM):
             trust_remote_code=self.args.trust_remote_code,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
+
+        _maybe_disable_block_reuse_for_multimodal(self.input_processor,
+                                                  self.args.kv_cache_config)
 
         # Resolve encode_only mode (opt-in only)
         self._encode_only = (self.args.encode_only is True)
