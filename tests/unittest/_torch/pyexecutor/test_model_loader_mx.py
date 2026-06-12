@@ -9,6 +9,9 @@ from unittest.mock import MagicMock
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.modules import attention as attention_mod
+from tensorrt_llm._torch.modules.attention import MLA
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm.llmapi.llm_args import LoadFormat
@@ -282,3 +285,56 @@ def test_reset_weights_transformed_only_resets_existing_flags():
     assert model.child._weights_transformed is False
     assert model.transformed_child._weights_transformed is False
     assert not hasattr(model.removed_child, "_weights_transformed")
+
+
+def test_linear_transform_weights_is_idempotent():
+    linear = Linear(
+        1,
+        1,
+        bias=False,
+        reduce_output=False,
+        skip_create_weights_in_init=True,
+    )
+    linear.quant_method = MagicMock()
+
+    linear.transform_weights()
+    linear.post_load_weights()
+
+    linear.quant_method.transform_weights.assert_called_once_with(linear)
+    assert linear._weights_transformed is True
+
+    linear._weights_transformed = False
+    linear.post_load_weights()
+    assert linear.quant_method.transform_weights.call_count == 2
+
+
+def test_mla_transform_weights_is_idempotent(monkeypatch):
+    monkeypatch.setattr(attention_mod, "get_sm_version", lambda: 120)
+    quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)
+    mla = MLA.__new__(MLA)
+    mla._weights_transformed = False
+    mla.kv_b_proj = SimpleNamespace(quant_config=SimpleNamespace(quant_mode=quant_mode))
+    mla.k_b_proj_trans = "k_weight"
+    mla.k_b_proj_trans_scale = "k_scale"
+    mla.v_b_proj = "v_weight"
+    mla.v_b_proj_scale = "v_scale"
+    calls = []
+
+    def fake_resmooth(weight, scale, recipe):
+        calls.append((weight, scale, recipe))
+        return f"{weight}_transformed", f"{scale}_transformed"
+
+    mla.resmooth_parameters = fake_resmooth
+
+    MLA.transform_weights(mla)
+    MLA.post_load_weights(mla)
+
+    assert calls == [
+        ("k_weight", "k_scale", (1, 128, 128)),
+        ("v_weight", "v_scale", (1, 128, 128)),
+    ]
+    assert mla.k_b_proj_trans == "k_weight_transformed"
+    assert mla.k_b_proj_trans_scale == "k_scale_transformed"
+    assert mla.v_b_proj == "v_weight_transformed"
+    assert mla.v_b_proj_scale == "v_scale_transformed"
+    assert mla._weights_transformed is True
