@@ -631,7 +631,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_priority_by_block_id", &BaseKVCacheManager::getPriorityByBlockId, nb::arg("block_id"),
             nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def("commit_and_get_block_hashes_for_request", &BaseKVCacheManager::commitAndGetBlockHashesForRequest,
-            nb::arg("llm_request"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("llm_request"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_memory_pool_block_indices", &BaseKVCacheManager::getMemoryPoolBlockIndicesByBlockIds,
+            nb::arg("block_ids"), nb::arg("window_size"), nb::arg("require_primary"),
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
         .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })
