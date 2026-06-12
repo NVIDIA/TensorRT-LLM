@@ -12,14 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-GPU tests for VSA + Ulysses sequence parallelism (ulysses=2, cfg=2, 4 GPUs)."""
+"""Multi-GPU end-to-end test for the Wan T2V VSA pipeline.
 
-import math
+Run with:
+    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_vsa_ulysses.py -v -s
+
+Override checkpoint path:
+    DIFFUSION_MODEL_PATH_WAN21_VSA=/path/to/vsa \\
+        pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_vsa_ulysses.py -v -s
+"""
+
+import gc
 import os
+from pathlib import Path
+from typing import Callable
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
-
-from typing import Callable
 
 import pytest
 import torch
@@ -28,19 +36,22 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend import (
-        CuTeDSLAttention,
-        UlyssesAttention,
-        VSAMetadataBuilder,
-        set_vsa_forward_context,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm._utils import get_free_port
-    from tensorrt_llm.visual_gen.args import VideoSparseAttentionConfig
+    from tensorrt_llm.visual_gen.args import (
+        AttentionConfig,
+        ParallelConfig,
+        TorchCompileConfig,
+        VideoSparseAttentionConfig,
+        VisualGenArgs,
+    )
 
     MODULES_AVAILABLE = True
+    _cute_dsl_available = _cute_dsl_import_error is None
 except ImportError:
     MODULES_AVAILABLE = False
+    _cute_dsl_available = False
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -50,7 +61,48 @@ def _cleanup_mpi_env():
 
 
 # =============================================================================
-# Distributed helpers (same pattern as test_ulysses_sage_attention.py)
+# Path helpers (mirrors test_wan_vsa_pipeline.py)
+# =============================================================================
+
+
+def _llm_models_root() -> str:
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ["LLM_MODELS_ROOT"])
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+    assert root.exists(), (
+        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
+    )
+    return str(root)
+
+
+def _checkpoint(env_var: str, default_name: str) -> str:
+    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
+
+
+WAN21_VSA_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN21_VSA", "Wan2.1-VSA-T2V-14B-720P-Diffusers")
+
+
+# =============================================================================
+# Inference constants
+# =============================================================================
+
+PROMPT = "A cat sitting on a sunny windowsill watching birds outside."
+NEGATIVE_PROMPT = ""
+
+HEIGHT = 720
+WIDTH = 1280
+NUM_FRAMES = 9
+NUM_STEPS = 4
+GUIDANCE_SCALE = 5.0
+SEED = 42
+
+COS_SIM_THRESHOLD = 0.97
+
+
+# =============================================================================
+# Distributed harness (mirrors test_wan_pipeline_parallel.py)
 # =============================================================================
 
 
@@ -68,10 +120,10 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def _distributed_worker(rank, world_size, backend, test_fn, port):
+def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
     try:
         init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
+        test_fn(rank, world_size, **kwargs)
     except Exception as e:
         print(f"Rank {rank} failed with error: {e}")
         raise
@@ -79,171 +131,131 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
         cleanup_distributed()
 
 
-def run_test_in_distributed(world_size: int, test_fn: Callable):
+def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs):
     if not MODULES_AVAILABLE:
         pytest.skip("Required modules not available")
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required for VSA")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-
     port = get_free_port()
     mp.spawn(
         _distributed_worker,
-        args=(world_size, "nccl", test_fn, port),
+        args=(world_size, "nccl", test_fn, port, kwargs),
         nprocs=world_size,
         join=True,
     )
 
 
-_ULYSSES_SIZE = 2
-_CFG_SIZE = 2
-_VSA_SPARSITY = 0.5
-
-# (8,8,8) latent -> 512 tokens (256/ulysses-rank at P=2); the (4,4,4) tile gives
-# 8 cubes (even, as the paired-block kernel needs) of 64 tokens (kernel block_size).
-_DIT_SEQ_SHAPE = (8, 8, 8)
-_VSA_PATCH_SIZE = (1, 1, 1)
-_HEAD_DIM = 128  # CuTe VSA fine-stage kernel requires head_dim == 128
-_HEADS_PER_RANK = 4
-
-
-def _make_vsa_backend(num_heads: int) -> "CuTeDSLAttention":
-    """CUTEDSL backend on the VSA path; effective sparsity comes from the forward context."""
-    return CuTeDSLAttention(
-        layer_idx=0,
-        num_heads=num_heads,
-        head_dim=_HEAD_DIM,
-        sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=_VSA_SPARSITY),
-    )
-
-
-def _build_full_seq_vsa_metadata(device: torch.device):
-    """VSAMetadata for the full sequence — identical on every rank after Ulysses all-to-all."""
-    builder = VSAMetadataBuilder()
-    return builder.build(
-        current_timestep=0,
-        raw_latent_shape=_DIT_SEQ_SHAPE,
-        patch_size=_VSA_PATCH_SIZE,
-        vsa_sparsity=_VSA_SPARSITY,
-        device=device,
-    )
-
-
-def _make_vgm(rank: int, world_size: int) -> "VisualGenMapping":
-    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-
-    DeviceMeshTopologyImpl.device_mesh = None
-    return VisualGenMapping(
-        world_size=world_size,
-        rank=rank,
-        cfg_size=_CFG_SIZE,
-        ulysses_size=_ULYSSES_SIZE,
-    )
-
-
 # =============================================================================
-# Test logic functions (module-level so mp.spawn can pickle them)
+# Inference helpers
 # =============================================================================
 
 
-def _logic_vsa_ulysses_forward(rank, world_size):
-    """Forward pass: output shape correct and finite (ulysses=2, cfg=2)."""
-    vgm = _make_vgm(rank, world_size)
-    ulysses_rank = vgm.ulysses_rank
+VSA_SPARSITY = 0.9
 
-    batch = 1
-    seq_full = math.prod(_DIT_SEQ_SHAPE)
-    seq_per_rank = seq_full // _ULYSSES_SIZE
-    num_heads = _ULYSSES_SIZE * _HEADS_PER_RANK
 
-    device = torch.device(f"cuda:{rank}")
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-
-    inner = _make_vsa_backend(num_heads // _ULYSSES_SIZE)
-    attention = UlyssesAttention(inner_backend=inner, process_group=vgm.ulysses_group)
-
-    # Ulysses input: sequence-sharded, head-full [B, S/P, H, D].
-    shape = (batch, seq_per_rank, num_heads, _HEAD_DIM)
-    q = torch.randn(shape, device=device, dtype=torch.bfloat16)
-    k = torch.randn(shape, device=device, dtype=torch.bfloat16)
-    v = torch.randn(shape, device=device, dtype=torch.bfloat16)
-    gate_compress = torch.randn(shape, device=device, dtype=torch.bfloat16)
-    gate_fine = torch.randn(shape, device=device, dtype=torch.bfloat16)
-
-    metadata = _build_full_seq_vsa_metadata(device)
-    with set_vsa_forward_context(metadata):
-        output = attention(q, k, v, gate_compress=gate_compress, gate_fine=gate_fine)
-
-    assert output.shape == (batch, seq_per_rank, num_heads, _HEAD_DIM), (
-        f"Rank {rank} (ulysses={ulysses_rank}, cfg={vgm.cfg_rank}): "
-        f"expected {(batch, seq_per_rank, num_heads, _HEAD_DIM)}, got {output.shape}"
-    )
-    assert torch.isfinite(output).all(), (
-        f"Rank {rank} (ulysses={ulysses_rank}, cfg={vgm.cfg_rank}): Inf/NaN in output"
+def _build_vsa_parallel_args(checkpoint_path: str) -> "VisualGenArgs":
+    """cfg=2, ulysses=4, CUTEDSL backend with vsa_sparsity=0.9."""
+    return VisualGenArgs(
+        model=checkpoint_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
+        attention_config=AttentionConfig(
+            backend="CUTEDSL",
+            sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=VSA_SPARSITY),
+        ),
+        parallel_config=ParallelConfig(cfg_size=2, ulysses_size=4),
     )
 
 
-def _logic_vsa_ulysses_vs_reference(rank, world_size):
-    """Each rank's Ulysses+VSA output matches the single-GPU VSA reference's sequence slice."""
-    vgm = _make_vgm(rank, world_size)
-    ulysses_rank = vgm.ulysses_rank
+def _build_vsa_single_args(checkpoint_path: str) -> "VisualGenArgs":
+    """Single-GPU CUTEDSL reference at the same vsa_sparsity=0.9."""
+    return VisualGenArgs(
+        model=checkpoint_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
+        attention_config=AttentionConfig(
+            backend="CUTEDSL",
+            sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=VSA_SPARSITY),
+        ),
+    )
 
-    batch = 1
-    seq_full = math.prod(_DIT_SEQ_SHAPE)
-    seq_per_rank = seq_full // _ULYSSES_SIZE
-    num_heads = _ULYSSES_SIZE * _HEADS_PER_RANK
 
-    device = torch.device(f"cuda:{rank}")
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-
-    full_shape = (batch, seq_full, num_heads, _HEAD_DIM)
-    q_full = torch.randn(full_shape, device=device, dtype=torch.bfloat16)
-    k_full = torch.randn(full_shape, device=device, dtype=torch.bfloat16)
-    v_full = torch.randn(full_shape, device=device, dtype=torch.bfloat16)
-    gate_c_full = torch.randn(full_shape, device=device, dtype=torch.bfloat16)
-    gate_f_full = torch.randn(full_shape, device=device, dtype=torch.bfloat16)
-
-    sl = slice(ulysses_rank * seq_per_rank, (ulysses_rank + 1) * seq_per_rank)
-    q_shard = q_full[:, sl].contiguous()
-    k_shard = k_full[:, sl].contiguous()
-    v_shard = v_full[:, sl].contiguous()
-    gate_c_shard = gate_c_full[:, sl].contiguous()
-    gate_f_shard = gate_f_full[:, sl].contiguous()
-
-    metadata = _build_full_seq_vsa_metadata(device)
-
-    # Ulysses path: sequence-sharded input, head-sharded inner backend.
-    inner = _make_vsa_backend(num_heads // _ULYSSES_SIZE)
-    attention = UlyssesAttention(inner_backend=inner, process_group=vgm.ulysses_group)
-    with set_vsa_forward_context(metadata):
-        ulysses_out = attention(
-            q_shard, k_shard, v_shard, gate_compress=gate_c_shard, gate_fine=gate_f_shard
+def _capture_trtllm_video(pipeline) -> "torch.Tensor | None":
+    """Run full TRTLLM pipeline; return (T, H, W, C) float in [0, 1] or None."""
+    with torch.no_grad():
+        result = pipeline.forward(
+            prompt=PROMPT,
+            negative_prompt=NEGATIVE_PROMPT,
+            height=HEIGHT,
+            width=WIDTH,
+            num_frames=NUM_FRAMES,
+            num_inference_steps=NUM_STEPS,
+            guidance_scale=GUIDANCE_SCALE,
+            seed=SEED,
         )
+    if result is None or result.video is None:
+        return None
+    return result.video.float() / 255.0
 
-    # Single-GPU VSA reference over the full sequence.
-    ref_attn = _make_vsa_backend(num_heads)
-    with set_vsa_forward_context(metadata):
-        ref_out = ref_attn.forward(
-            q_full, k_full, v_full, gate_compress=gate_c_full, gate_fine=gate_f_full
-        )
-    ref_shard = ref_out[:, sl]
 
-    ulysses_out = ulysses_out.view(batch, seq_per_rank, num_heads, _HEAD_DIM).to(torch.bfloat16)
-    ref_shard = ref_shard.to(torch.bfloat16)
+def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_flat = a.float().cpu().reshape(-1)
+    b_flat = b.float().cpu().reshape(-1)
+    return F.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0)).clamp(-1.0, 1.0).item()
 
-    cos_sim = F.cosine_similarity(
-        ulysses_out.reshape(-1).float(),
-        ref_shard.reshape(-1).float(),
-        dim=0,
-    ).item()
-    assert cos_sim > 0.990, (
-        f"Rank {rank} (ulysses={ulysses_rank}, cfg={vgm.cfg_rank}): "
-        f"cosine similarity {cos_sim:.6f} below threshold 0.990"
+
+def _free(*objs) -> None:
+    for o in objs:
+        del o
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Worker logic (module-level for mp.spawn pickling)
+# =============================================================================
+
+
+def _logic_vsa_cfg2_ulysses4(rank: int, world_size: int, *, checkpoint_path: str) -> None:
+    """End-to-end pipeline: 8-GPU (cfg=2, ulysses=4) VSA vs 1-GPU VSA reference.
+
+    Both runs use vsa_sparsity=0.9. All 8 ranks run the parallel denoising loop.
+    Rank 0 then frees the distributed model and loads a single-GPU VSA reference
+    at the same sparsity to compare.
+    """
+    assert world_size == 8, f"This test is hardcoded to world_size=8, got {world_size}"
+
+    vsa_pipe = PipelineLoader(_build_vsa_parallel_args(checkpoint_path)).load(skip_warmup=True)
+    vsa_video = _capture_trtllm_video(vsa_pipe)
+
+    if rank == 0:
+        assert vsa_video is not None, "Rank 0 produced no video from the VSA pipeline."
+
+    _free(vsa_pipe)
+    if rank != 0:
+        vsa_video = None
+    dist.barrier()
+
+    if rank != 0:
+        return
+
+    ref_pipe = PipelineLoader(_build_vsa_single_args(checkpoint_path)).load(skip_warmup=True)
+    ref_video = _capture_trtllm_video(ref_pipe)
+    _free(ref_pipe)
+
+    assert vsa_video.numel() == ref_video.numel(), (
+        f"Element count mismatch — 8-GPU {tuple(vsa_video.shape)} "
+        f"({vsa_video.numel()}) vs 1-GPU {tuple(ref_video.shape)} ({ref_video.numel()})"
     )
-    torch.testing.assert_close(ulysses_out, ref_shard, atol=2e-2, rtol=2e-2)
+
+    cos_sim = _cosine_similarity(vsa_video, ref_video)
+    print(
+        f"\n  Wan2.1-VSA-T2V-14B (cfg=2, ulysses=4, sparsity={VSA_SPARSITY}) "
+        f"cosine similarity vs 1-GPU VSA: {cos_sim:.6f}"
+    )
+    assert cos_sim >= COS_SIM_THRESHOLD, (
+        f"8-GPU VSA pipeline diverges from 1-GPU VSA reference: "
+        f"cosine similarity {cos_sim:.6f} < {COS_SIM_THRESHOLD}. "
+        f"Shapes — 8-GPU: {tuple(vsa_video.shape)}, 1-GPU: {tuple(ref_video.shape)}."
+    )
 
 
 # =============================================================================
@@ -251,22 +263,27 @@ def _logic_vsa_ulysses_vs_reference(rank, world_size):
 # =============================================================================
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestWanVsaUlyssesCfg:
-    """VSA (CUTEDSL) with Ulysses sequence parallelism and CFG parallelism (ulysses=2, cfg=2)."""
+@pytest.mark.integration
+@pytest.mark.wan_t2v
+class TestWanVsaUlysses:
+    """Multi-GPU correctness for the Wan T2V VSA pipeline (cfg=2, ulysses=4, 8 GPUs)."""
 
-    def test_vsa_ulysses_forward(self):
+    def test_cfg2_ulysses4(self):
+        """world=8, cfg=2, ulysses=4, VSA sparsity=0.9 vs 1-GPU VSA reference."""
+        if not MODULES_AVAILABLE:
+            pytest.skip("Required modules not available")
+        if not _cute_dsl_available:
+            pytest.skip(f"CUTEDSL not available (requires Blackwell GPU): {_cute_dsl_import_error}")
+        if not os.path.exists(WAN21_VSA_PATH):
+            pytest.skip(
+                f"Checkpoint not found: {WAN21_VSA_PATH}. Set DIFFUSION_MODEL_PATH_WAN21_VSA."
+            )
         run_test_in_distributed(
-            world_size=_ULYSSES_SIZE * _CFG_SIZE,
-            test_fn=_logic_vsa_ulysses_forward,
-        )
-
-    def test_vsa_ulysses_vs_reference(self):
-        run_test_in_distributed(
-            world_size=_ULYSSES_SIZE * _CFG_SIZE,
-            test_fn=_logic_vsa_ulysses_vs_reference,
+            world_size=8,
+            test_fn=_logic_vsa_cfg2_ulysses4,
+            checkpoint_path=WAN21_VSA_PATH,
         )
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    pytest.main([__file__, "-v", "-s"])

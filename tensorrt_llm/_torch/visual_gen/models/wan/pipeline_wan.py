@@ -503,7 +503,7 @@ class WanPipeline(BasePipeline):
             )
 
         # VSA: build metadata builder once per forward() call; reused across timesteps.
-        _attn_cfg = self.model_config.attention
+        _attn_cfg = self.pipeline_config.primary_model_config.attention
         _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
         _vsa_active = (
             getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"

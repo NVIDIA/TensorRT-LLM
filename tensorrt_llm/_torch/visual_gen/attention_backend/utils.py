@@ -129,7 +129,10 @@ def create_attention(
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
     if backend.upper() == "CUTEDSL" and attention_config is not None:
-        if attention_config.sparse_attention_config is not None:
+        if (
+            attention_config.sparse_attention_config is not None
+            and getattr(attention_config.sparse_attention_config, "algorithm", None) == "vsa"
+        ):
             # VSA sparse path: use VSAAttention
             from .cute_dsl.vsa import VSAAttention
 

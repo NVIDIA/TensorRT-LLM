@@ -13,12 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-CuTe DSL dense FMHA backend for visual generation models.
+CuTe DSL (NVIDIA kernels) Dense FMHA Backend for Visual Generation Models
 
-CuTeDSLAttention uses pre-compiled cubin kernels and requires head_dim=128.
-Supports float16/bfloat16 with optional QK16PV8 quantization and a
-skip-softmax threshold optimisation. Expects NHD layout ([B, S, H, D]).
-
+Uses pre-compiled cubins derived from CUTLASS CuTe DSL FMHA.
+Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
 For the VSA sparse path use VSAAttention in vsa.py.
 """
 
@@ -48,11 +46,9 @@ except (ImportError, OSError) as e:
 
 class CuTeDSLAttention(AttentionBackend):
     """
-    CuTe DSL dense FMHA backend for diffusion models.
+    CuTe DSL (NVIDIA kernels) backend for diffusion models.
 
-    Uses pre-compiled cubins and requires head_dim=128.
-    Supports float16/bfloat16 with optional QK16PV8 quantization (quant_attention_config)
-    and a skip-softmax threshold optimisation (skip_softmax_threshold_scale).
+    Uses pre-compiled cubin kernels (head_dim=128 only).
     """
 
     def __init__(
@@ -66,6 +62,7 @@ class CuTeDSLAttention(AttentionBackend):
         skip_softmax_threshold_scale: Optional[float] = None,
         **kwargs,
     ):
+        # Only head_dim=128 cubins are packaged.
         if head_dim != 128:
             raise ValueError(f"CUTEDSL cubins require head_dim=128, got head_dim={head_dim}.")
         self.layer_idx = layer_idx
@@ -76,6 +73,9 @@ class CuTeDSLAttention(AttentionBackend):
         self.quant_attention_config = quant_attention_config
         self.skip_softmax_threshold_scale = skip_softmax_threshold_scale
         self.scale = 1.0 / math.sqrt(head_dim)
+
+        # CuTe DSL expects [B, S, H, D] format
+        self._preferred_layout = AttentionTensorLayout.NHD
 
     def _prepare_inputs(
         self,
@@ -176,6 +176,20 @@ class CuTeDSLAttention(AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         **kwargs,
     ) -> torch.Tensor:
+        """
+        Forward pass using CuTe DSL (NVIDIA kernels).
+
+        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
+
+        Args:
+            q: Query tensor [batch_size, seq_len, num_heads, head_dim]
+            k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
+            v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
+            attention_mask: Attention mask type (CAUSAL or FULL)
+
+        Returns:
+            Output tensor [batch_size, seq_len, num_heads, head_dim]
+        """
         output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
         return output
 
@@ -188,9 +202,13 @@ class CuTeDSLAttention(AttentionBackend):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Forward pass returning both output and log-sum-exp (LSE).
+
         Returns:
             output: [batch_size, seq_len, num_heads, head_dim]
-            lse:    [batch_size, num_heads, seq_len] — log-sum-exp in float32.
+            lse:    [batch_size, num_heads, seq_len] - log-sum-exp per query position,
+                    always in float32. Used for numerically stable combination of
+                    partial attention results in Attention2D parallelism.
         """
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
         output, lse = self._fwd(q, k, v, is_causal, **kwargs)
@@ -204,7 +222,8 @@ class CuTeDSLAttention(AttentionBackend):
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
-        return AttentionTensorLayout.NHD
+        """Return the preferred tensor layout for this backend."""
+        return self._preferred_layout
 
     @classmethod
     def support_fused_qkv(cls) -> bool:

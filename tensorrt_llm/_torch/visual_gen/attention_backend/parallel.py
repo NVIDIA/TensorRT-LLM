@@ -163,17 +163,33 @@ class UlyssesAttention(AttentionBackend):
         v: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        gate_compress = kwargs.pop("gate_compress", None)
+        gate_fine = kwargs.pop("gate_fine", None)
+
         batch_size = q.shape[0]
         qkv = torch.stack([q, k, v], dim=2)
         qkv = all_to_all_5d(qkv, scatter_dim=3, gather_dim=1, process_group=self.process_group)
 
         B, seq_len, _, Hp, D = qkv.shape
 
+        if gate_compress is not None:
+            gate_compress = all_to_all_4d(
+                gate_compress, scatter_dim=2, gather_dim=1, process_group=self.process_group
+            )
+        if gate_fine is not None:
+            gate_fine = all_to_all_4d(
+                gate_fine, scatter_dim=2, gather_dim=1, process_group=self.process_group
+            )
+
         # Caller passed pre-A2A (sharded) seq_len; the inner backend
         # reshapes by it, so hand it the post-A2A length instead.
         kwargs["batch_size"] = batch_size
         kwargs["seq_len"] = seq_len
         kwargs["seq_len_kv"] = seq_len
+        if gate_compress is not None:
+            kwargs["gate_compress"] = gate_compress
+        if gate_fine is not None:
+            kwargs["gate_fine"] = gate_fine
 
         output = self.inner_backend.forward(q=qkv, k=None, v=None, **kwargs)
 
@@ -365,7 +381,6 @@ class UlyssesAttention(AttentionBackend):
         output = all_to_all_4d(
             output, scatter_dim=1, gather_dim=2, process_group=self.process_group
         )
-
         return output
 
     @property
