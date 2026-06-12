@@ -47,18 +47,21 @@ class GrpcRequestManager:
     - Submit requests to LLM.generate_async()
     - Stream token IDs (not text) back to gRPC clients
     - Handle abort/cancel operations
+    - Record per-request prometheus metrics when metrics_collector is provided
 
     This is modeled after vLLM's GrpcRequestManager but adapted for TensorRT-LLM's
     GenerationResult async iterator pattern.
     """
 
-    def __init__(self, llm: Any):
+    def __init__(self, llm: Any, metrics_collector=None):
         """Initialize the request manager.
 
         Args:
             llm: The TensorRT-LLM LLM instance (tensorrt_llm.LLM or tensorrt_llm._tensorrt_engine.LLM)
+            metrics_collector: Optional MetricsCollector for prometheus metrics
         """
         self.llm = llm
+        self._metrics_collector = metrics_collector
         # Track active requests: request_id -> GenerationResult
         self._rid_to_result: Dict[str, GenerationResult] = {}
 
@@ -119,6 +122,14 @@ class GrpcRequestManager:
                 yield result
 
                 if result.finished:
+                    if self._metrics_collector:
+                        md = getattr(result, 'metrics_dict', {}) or {}
+                        if not md.get('finished_reason') and result.outputs:
+                            fr = getattr(result.outputs[0], 'finish_reason', None)
+                            if fr:
+                                md['finished_reason'] = fr
+                        if md:
+                            self._metrics_collector.log_request_metrics_dict(md)
                     break
 
         except asyncio.CancelledError:
