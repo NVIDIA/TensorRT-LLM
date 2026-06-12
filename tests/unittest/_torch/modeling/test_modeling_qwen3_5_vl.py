@@ -119,6 +119,10 @@ def test_qwen35_dense_vl_config_preserves_vlm_architecture(
     # Dense: native intermediate_size is preserved (no MoE synthesis).
     assert config.text_config.intermediate_size == 2048
     assert getattr(config.text_config, "num_experts", 0) in (0, None)
+    # Dense contract: deepstack stays disabled (empty), unlike the MoE
+    # config's [8, 16, 24]. Normalization must not synthesize indices —
+    # the dense placeholder path depends on this staying empty.
+    assert config.vision_config.deepstack_visual_indexes == []
     assert config.text_config.rope_theta == 1000000.0
     assert config.text_config.partial_rotary_factor == 0.25
     assert config.text_config.rope_scaling["type"] == "mrope"
@@ -348,7 +352,9 @@ class TestQwen3_5VL(TestModelingMultimodal):
                 )
             mrope_gen_position_ids = torch.cat(mrope_gen_position_ids, dim=-1).to(self.device)
             trtllm_inputs["position_ids"] = (
-                (trtllm_inputs["position_ids"] + mrope_gen_position_ids).expand(3, -1, 1).cuda()
+                (trtllm_inputs["position_ids"] + mrope_gen_position_ids)
+                .expand(3, -1, 1)
+                .to(self.device)
             )
             gen_multimodal_params_list = []
             for multimodal_param in multimodal_params_list:
@@ -367,7 +373,7 @@ class TestQwen3_5VL(TestModelingMultimodal):
                 mrope_position_ids.append(
                     multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
                 )
-            position_ids = torch.cat(mrope_position_ids, dim=-1).cuda()
+            position_ids = torch.cat(mrope_position_ids, dim=-1).to(self.device)
             trtllm_inputs["position_ids"] = position_ids
 
         return trtllm_inputs
