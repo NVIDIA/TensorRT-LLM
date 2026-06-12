@@ -79,6 +79,15 @@ install_ubuntu_requirements() {
 
     apt-get clean
     rm -rf /var/lib/apt/lists/*
+
+    # cublas >= 13.4.1.2 installs headers to /usr/include/libcublas/<major>/
+    # instead of /usr/local/cuda/include/. Symlink them back for build compatibility.
+    CUBLAS_HDR_DIR="/usr/include/libcublas/${CUBLAS_MAJOR_VER}"
+    if [ -d "${CUBLAS_HDR_DIR}" ]; then
+        for hdr in "${CUBLAS_HDR_DIR}"/*.h; do
+            ln -sf "${hdr}" "/usr/local/cuda/include/$(basename ${hdr})"
+        done
+    fi
 }
 
 install_rockylinux_requirements() {
@@ -121,6 +130,15 @@ install_rockylinux_requirements() {
     rm -f *.rpm
     dnf clean all
     nvcc --version
+
+    # cublas >= 13.4.1.2 installs headers to /usr/include/libcublas/<major>/
+    # instead of /usr/local/cuda/include/. Symlink them back for build compatibility.
+    CUBLAS_HDR_DIR="/usr/include/libcublas/${CUBLAS_MAJOR_VER}"
+    if [ -d "${CUBLAS_HDR_DIR}" ]; then
+        for hdr in "${CUBLAS_HDR_DIR}"/*.h; do
+            ln -sf "${hdr}" "/usr/local/cuda/include/$(basename ${hdr})"
+        done
+    fi
 }
 
 install_tensorrt() {
