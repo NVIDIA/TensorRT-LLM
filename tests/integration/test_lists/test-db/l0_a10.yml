@@ -43,6 +43,7 @@ l0_a10:
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
+  - unittest/_torch/weight_sharing
   - unittest/inputs/test_chat_template_dispatch.py
   - unittest/inputs/test_content_format.py
   - unittest/inputs/test_url_validation.py
@@ -115,6 +116,7 @@ l0_a10:
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/visual_gen/test_output.py
   - unittest/media/test_encoding.py
+  - unittest/_torch/visual_gen/test_tensor_payload.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py

@@ -36,7 +36,7 @@ from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
-                      create_input_processor_with_hash, get_cache_salt_id,
+                      create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -476,8 +476,6 @@ class BaseLLM:
 
         sampling_params = self._prepare_sampling_params(sampling_params)
 
-        cache_salt_id = get_cache_salt_id(
-            cache_salt) if cache_salt is not None else None
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         # TODO: Also support for trt backend
@@ -520,7 +518,7 @@ class BaseLLM:
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id,
+            cache_salt=cache_salt,
             arrival_time=arrival_time,
             priority=priority,
         )
@@ -1495,6 +1493,33 @@ class _TorchLLM(BaseLLM):
             raise ValueError(
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
+
+    @set_api_status("beta")
+    def reset_prefix_cache(self) -> None:
+        """Reset local KV prefix-cache reuse state.
+
+        This invalidates local prefix-cache metadata in the PyTorch backend. It
+        requires no active or queued requests, and it does not reset
+        connector-managed external or offloaded cache state. Callers should
+        quiesce traffic before invoking this method.
+        """
+        if self._encode_only:
+            raise RuntimeError("reset_prefix_cache() is not available when "
+                               "encode_only=True.")
+        if self._executor is None:
+            raise RuntimeError("reset_prefix_cache() requires an active "
+                               "executor.")
+
+        if hasattr(self._executor, "collective_rpc"):
+            self._collective_rpc("reset_prefix_cache")
+            return
+
+        reset_prefix_cache = getattr(self._executor, "reset_prefix_cache", None)
+        if reset_prefix_cache is None:
+            raise NotImplementedError(
+                "reset_prefix_cache() is only supported by the PyTorch backend."
+            )
+        reset_prefix_cache()
 
     def _build_model(self):
         super()._build_model()

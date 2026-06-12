@@ -28,11 +28,16 @@ def test_image_generation(
     prompt: str = "A lovely cat lying on a sofa",
     n: int = 1,
     size: str = "512x512",
-    quality: str = "standard",
+    format: str = "png",
     response_format: str = "b64_json",
     output_file: str = "output_generation.png",
 ):
-    """Test image generation endpoint."""
+    """Test image generation endpoint.
+
+    ``format`` selects the encoding for the returned bytes. Image encoders
+    are ``"png"``, ``"webp"``, ``"jpeg"``; tensor payloads are
+    ``"safetensors"`` and ``"pt"``.
+    """
     print("=" * 80)
     print("Testing Image Generation API (POST /v1/images/generations)")
     print("=" * 80)
@@ -44,30 +49,41 @@ def test_image_generation(
     print(f"   Model: {model}")
     print(f"   Prompt: {prompt}")
     print(f"   Size: {size}")
-    print(f"   Quality: {quality}")
+    print(f"   Format: {format}")
     print(f"   Number of images: {n}")
 
     try:
-        # Use OpenAI SDK's images.generate() method
+        # ``format`` is a trtllm-serve extension over the OpenAI image
+        # API; the SDK forwards it via ``extra_body``.
         response = client.images.generate(
             model=model,
             prompt=prompt,
             n=n,
             size=size,
-            quality=quality,
             response_format=response_format,
+            extra_body={"format": format},
         )
 
         print("\n✓ Image generated successfully!")
         print(f"   Number of images: {len(response.data)}")
 
+        # Choose the on-disk extension to match the requested format so
+        # the saved file's suffix reflects its actual contents.
+        ext_map = {
+            "png": ".png",
+            "webp": ".webp",
+            "jpeg": ".jpeg",
+            "safetensors": ".safetensors",
+            "pt": ".pt",
+        }
+        ext = ext_map[format]
+        stem = output_file.rsplit(".", 1)[0]
+
         # Save images
         for i, image in enumerate(response.data):
             if response_format == "b64_json":
-                # Decode base64 image
                 image_data = base64.b64decode(image.b64_json)
-                output = f"{output_file.rsplit('.', 1)[0]}_{i}.png" if n > 1 else output_file
-
+                output = f"{stem}_{i}{ext}" if n > 1 else f"{stem}{ext}"
                 with open(output, "wb") as f:
                     f.write(image_data)
 
@@ -117,6 +133,16 @@ if __name__ == "__main__":
         help="Image size in WxH format (e.g., 512x512, 1024x1024)",
     )
     parser.add_argument(
+        "--format",
+        type=str,
+        default="png",
+        choices=["png", "webp", "jpeg", "safetensors", "pt"],
+        help=(
+            "Generation content encoding format. Image encoders: png / "
+            "webp / jpeg. Tensor payloads: safetensors / pt."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="output_generation.png",
@@ -137,6 +163,7 @@ if __name__ == "__main__":
         model=args.model,
         prompt=args.prompt,
         size=args.size,
+        format=args.format,
         output_file=args.output,
     )
 
