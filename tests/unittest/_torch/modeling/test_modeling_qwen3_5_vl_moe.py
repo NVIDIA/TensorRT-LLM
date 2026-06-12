@@ -380,7 +380,9 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
                 )
             mrope_gen_position_ids = torch.cat(mrope_gen_position_ids, dim=-1).to(self.device)
             trtllm_inputs["position_ids"] = (
-                (trtllm_inputs["position_ids"] + mrope_gen_position_ids).expand(3, -1, 1).cuda()
+                (trtllm_inputs["position_ids"] + mrope_gen_position_ids)
+                .expand(3, -1, 1)
+                .to(self.device)
             )
             gen_multimodal_params_list = []
             for multimodal_param in multimodal_params_list:
@@ -399,7 +401,7 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
                 mrope_position_ids.append(
                     multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
                 )
-            position_ids = torch.cat(mrope_position_ids, dim=-1).cuda()
+            position_ids = torch.cat(mrope_position_ids, dim=-1).to(self.device)
             trtllm_inputs["position_ids"] = position_ids
 
         return trtllm_inputs

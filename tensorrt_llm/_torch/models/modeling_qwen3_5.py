@@ -444,11 +444,18 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     same vision tower, weight mapper, and forward path, so the wrapper body is
     shared here. The concrete subclasses below carry only the registration
     decorators (outer arch string + input-processor `model_type`).
-
-    NOTE: neither variant overrides `get_model_defaults`, so the inner
-    Qwen3Next LM's `enable_block_reuse=False` default is not inherited by the
-    VLM path. Tracked as a separate follow-up that fixes both variants.
     """
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        # `ModelLoader` applies `get_model_defaults()` on the resolved outer
+        # model class (this VLM wrapper), not on the inner decoder. Both
+        # inner LMs (`Qwen3_5MoeForCausalLM` / `Qwen3_5ForCausalLM`) inherit
+        # `Qwen3NextForCausalLM`'s defaults unchanged, so delegate to it to
+        # propagate `enable_block_reuse=False` — the hybrid Mamba/SSM path
+        # doesn't support KV-cache block reuse. Without this the VLM path
+        # would silently fall back to the global default (block reuse on).
+        return Qwen3NextForCausalLM.get_model_defaults(llm_args)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
@@ -476,7 +483,7 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         self.llm.load_weights(filtered_weights, weight_mapper, params_map=params_map)
 
 
-# TODO: Add tests for disaggregated support.
+# TODO(TRTLLM-13417): Add tests for disaggregated support.
 @support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
 @register_auto_model("Qwen3_5MoeForConditionalGeneration")
@@ -489,7 +496,7 @@ class Qwen3_5MoeVLModel(_Qwen3_5VLModel):
     """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
 
 
-# TODO: Add tests for disaggregated support.
+# TODO(TRTLLM-13417): Add tests for disaggregated support.
 @support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
 @register_auto_model("Qwen3_5ForConditionalGeneration")

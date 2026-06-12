@@ -518,6 +518,7 @@ class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestQwen3_5_27B_VL(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-27B"
