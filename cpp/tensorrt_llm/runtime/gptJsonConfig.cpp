@@ -646,6 +646,13 @@ GptJsonConfig parseJson(InputType&& input)
         {
             modelConfig.setModelVariant(ModelConfig::ModelVariant::kRecurrentGemma);
         }
+        else if (architecture == std::string("Qwen3_5MoeForConditionalGeneration")
+            || architecture == std::string("Qwen3NextForCausalLM"))
+        {
+            // Qwen3.5/3.6 hybrid: Gated DeltaNet (linear attention) layers reuse the
+            // paged RNN/conv state path; full-attention layers use the KV cache.
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kQwen3Next);
+        }
         if (modelConfig.isRnnBased())
         {
             auto const& stateSize = pretrainedConfig.at("state_size").template get<SizeType32>();
