@@ -2,9 +2,12 @@ import asyncio
 import copy
 import json
 import os
+import time
+import types
 from abc import ABC
 from enum import Enum
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlencode
 
 import httpx
 import openai
@@ -19,7 +22,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from .result import ScaffoldingOutput
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
-                   MCPCallTask, StreamGenerationTask, Task, TaskStatus)
+                   MCPCallTask, StreamGenerationTask, Task, TaskStatus,
+                   TokenizeTask)
 
 ExecutorCls = GenerationExecutor
 
@@ -45,6 +49,14 @@ class Worker(ABC):
 
     task_handlers = {}
 
+    async def on_scope_end(self, scope_id: str) -> None:
+        """Called when an :class:`ExecutionScope` finishes.
+
+        Override in subclasses to release resources (SSE connections,
+        sandboxes, etc.) that were acquired under *scope_id*.  The
+        default implementation is a no-op.
+        """
+
     def shutdown(self):
         pass
 
@@ -54,7 +66,7 @@ class Worker(ABC):
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
 
@@ -84,15 +96,117 @@ class OpenaiWorker(Worker):
         async_client: openai.AsyncOpenAI,
         model: str,
         kv_cache_hint_enabled: bool = False,
+        extra_body: Optional[Dict[str, Any]] = None,
     ):
+        # Dynamic patch to support KV cache hint
+        async def send_kv_cache_hint(self, task: DropKVCacheTask, params: dict):
+            base_url = str(self.base_url)
+            if not base_url.endswith("/"):
+                base_url += "/"
+            url = base_url + "kv_cache_hints"
+
+            headers = {}
+            if self.api_key is not None:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            kv_cache_hint_params = {
+                "action":
+                "truncate",
+                "messages":
+                [message.to_dict() for message in task.chat_task.messages],
+                "messages_to_retain":
+                [message.to_dict() for message in task.messages_to_retain],
+            }
+
+            # Spread extra_body contents into the request (like OpenAI client does)
+            extra_body = params.pop("extra_body", {})
+            kv_cache_hint_params.update(params)
+            kv_cache_hint_params.update(
+                extra_body)  # Spread extra_body contents
+
+            async with httpx.AsyncClient() as client:
+                return await client.post(
+                    url,
+                    json=kv_cache_hint_params,
+                    headers=headers,
+                )
+
+        async_client.create_kv_cache_hint = types.MethodType(
+            send_kv_cache_hint, async_client)
+
         self.model = model
         self.async_client = async_client
         self.kv_cache_hint_enabled = kv_cache_hint_enabled
+        self.extra_body = copy.deepcopy(
+            extra_body) if extra_body is not None else {}
+
+    async def send_kv_cache_truncate_tokens(
+        self,
+        prefixes: List[List[int]],
+        num_tokens_to_keep: List[int],
+        request_timeout_s: float = 60.0,
+    ) -> None:
+        """POST a token-level KV cache truncate batch to trtllm-serve.
+
+        Free radix-tree blocks the worker previously caused the server to
+        commit (by sending the full ``prefix`` on a generation request).
+        ``num_tokens_to_keep[i]`` is the prefix length to retain in the
+        radix tree for ``prefixes[i]``; everything past that point on the
+        same chain has its refcount decremented, and blocks whose
+        refcount drops to zero are returned to the free pool.
+
+        Hits ``/_control/kv_cache/truncate_tokens`` (added by
+        :class:`tensorrt_llm.serve.control_plane.KVCacheControlPlane`) —
+        a sibling of ``/_control/kv_cache/truncate`` that bypasses
+        ``apply_chat_template`` so the radix-tree walk hashes the exact
+        token-id bytes the caller previously sent on a ``/v1/completions``
+        request.
+
+        The endpoint is rooted at the server's host (NOT under ``/v1``),
+        so we strip the ``/v1`` suffix that the OpenAI client's
+        ``base_url`` typically carries.
+
+        Raises :class:`RuntimeError` on a non-200 response.
+        """
+        if len(prefixes) != len(num_tokens_to_keep):
+            raise ValueError(
+                f"prefixes ({len(prefixes)}) and num_tokens_to_keep "
+                f"({len(num_tokens_to_keep)}) length mismatch")
+        if not prefixes:
+            return
+
+        base_url = str(self.async_client.base_url)
+        # The OpenAI client's base_url is typically ``http://host:port/v1``
+        # or ``http://host:port/v1/``; the control plane lives at
+        # ``http://host:port/_control/...``, one level up.
+        for v1_suffix in ("/v1/", "/v1"):
+            if base_url.endswith(v1_suffix):
+                base_url = base_url[:-len(v1_suffix)]
+                break
+        url = base_url.rstrip("/") + "/_control/kv_cache/truncate_tokens"
+
+        headers = {"Content-Type": "application/json"}
+        api_key = getattr(self.async_client, "api_key", None)
+        if api_key is not None:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "model": self.model,
+            "prefixes": [list(p) for p in prefixes],
+            "num_tokens_to_keep": list(num_tokens_to_keep),
+        }
+
+        async with httpx.AsyncClient(timeout=request_timeout_s) as http:
+            response = await http.post(url, json=payload, headers=headers)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"truncate_tokens failed: HTTP {response.status_code} "
+                    f"body={response.text!r}")
 
     def convert_task_params(self, task: GenerationTask | ChatTask):
         params = {
             "model": self.model,
-            "extra_body": {},
+            "extra_body": copy.deepcopy(self.extra_body),
         }
 
         if hasattr(task, "sub_request_markers") and os.environ.get(
@@ -100,7 +214,14 @@ class OpenaiWorker(Worker):
             print(f"task.sub_request_markers is {task.sub_request_markers}")
 
         if not isinstance(task, ChatTask):
-            params["prompt"] = task.input_str
+            # Prefer pre-tokenized prompts when available (e.g. trace replay
+            # via ReplayEngine fills ``input_tokens`` with synthetic token ids
+            # and leaves ``input_str`` unset). The OpenAI completions API
+            # natively accepts ``prompt`` as ``List[int]`` alongside ``str``.
+            if task.input_tokens is not None:
+                params["prompt"] = task.input_tokens
+            else:
+                params["prompt"] = task.input_str
             add_param_if_not_none(params, "echo", [task.echo])
 
         add_param_if_not_none(params, "best_of", [task.best_of])
@@ -109,6 +230,7 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "logit_bias", [task.logit_bias])
         add_param_if_not_none(params, "logprobs", [task.num_logprobs])
         add_param_if_not_none(params, "max_tokens", [task.max_tokens])
+        add_param_if_not_none(params, "min_tokens", [task.min_tokens])
         add_param_if_not_none(params, "n", [task.n])
         add_param_if_not_none(params, "presence_penalty",
                               [task.presence_penalty])
@@ -118,6 +240,23 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "temperature", [task.temperature])
         add_param_if_not_none(params, "top_p", [task.top_p])
         add_param_if_not_none(params, "user", [task.user])
+
+        # Forward ignore_eos so trace replay (and any caller that must emit an
+        # exact token budget) can bypass EOS early-stop. trtllm-serve surfaces
+        # ignore_eos via extra_body -> SamplingParams.
+        if task.ignore_eos:
+            params["extra_body"]["ignore_eos"] = True
+
+        # Forward skip_detokenizer so trace replay can retrieve the server's
+        # actual decoded token ids in each stream chunk's ``token_ids`` field
+        # (trtllm-serve gates this behind ``CompletionRequest.detokenize``;
+        # see openai_protocol.py and postprocess_handlers.py). Without this,
+        # the replay's per-turn segment store ends up holding RNG placeholder
+        # ids that sibling-fork off the server's real decode chain in the
+        # radix tree, dropping every subsequent turn's prefix hit at the
+        # prev-prompt block boundary. See replay.py for the consequence.
+        if getattr(task, "skip_detokenizer", False):
+            params["extra_body"]["detokenize"] = False
 
         # Override parameters for deterministic inference
         if is_deterministic_mode():
@@ -135,25 +274,117 @@ class OpenaiWorker(Worker):
 
         return params
 
-    def fill_generation_task_with_response(self, task: GenerationTask,
-                                           response: openai.Completion):
-        task.output_str = response.choices[0].text
-        task.output_tokens = response.choices[0].token_ids
-        task.finish_reason = response.choices[0].finish_reason
-        task.logprobs = response.choices[0].logprobs
+    @staticmethod
+    def _request_params_for_trace(params: dict) -> dict:
+        return {
+            key: copy.deepcopy(value)
+            for key, value in params.items()
+            if key not in ("messages", "tools", "prompt")
+        }
+
+    @staticmethod
+    def _get_response_field(obj: Any, field: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(field)
+        return getattr(obj, field, None)
+
+    @classmethod
+    def _reasoning_content_from_thinking_blocks(cls,
+                                                message: Any) -> Optional[str]:
+        thinking_blocks = cls._get_response_field(message, "thinking_blocks")
+        if not thinking_blocks:
+            return None
+        thinking = cls._get_response_field(thinking_blocks[0], "thinking")
+        return thinking if isinstance(thinking, str) else None
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
-        params = self.convert_task_params(task)
+        """Stream one completion and record per-request timing on *task*.
 
-        # Make the API call
+        Uses ``stream=True`` + ``stream_options={"include_usage": True}`` so we
+        can measure TTFT (wall-time from request start to the first chunk that
+        carries a token) and the full per-request ``latency`` (to the final
+        chunk), and pick up ``usage.completion_tokens`` from the trailing
+        usage-only chunk. These are the same per-request quantities
+        SemiAnalysis's ``benchmark_serving.py`` records for the
+        InferenceMAX ``intvty`` headline, letting the trace-replay Pareto
+        pipeline emit ``1000 / median_TPOT`` per LLM call instead of a
+        per-session proxy. See ``intvty_alignment_handoff.md`` §7 (Phase A).
+
+        The trtllm-serve ``/v1/completions`` backend emits ``token_ids`` in
+        each stream chunk only when the request opts out of detokenization
+        (``CompletionRequest.detokenize=False``). Callers that need the
+        actual decoded token ids (e.g. trace replay, which must align its
+        per-conversation segment store with the server's KV-cache radix
+        tree) should set ``task.skip_detokenizer=True`` — see
+        :meth:`convert_task_params`. Callers that only need the count use
+        ``task.usage_completion_tokens`` (authoritative, from the server's
+        ``usage`` chunk) or the known ``max_tokens`` budget.
+        """
+        params = self.convert_task_params(task)
+        task.llm_request_params = self._request_params_for_trace(params)
+        params["stream"] = True
+        params["stream_options"] = {"include_usage": True}
+
+        text_parts: List[str] = []
+        token_ids_acc: List[int] = []
+        logprobs_acc: List = []
+        finish_reason: Optional[str] = None
+        usage_completion_tokens: Optional[int] = None
+        usage_prompt_tokens: Optional[int] = None
+        ttft_s: Optional[float] = None
+        request_id: Optional[str] = None
+
+        t_start = time.perf_counter()
         try:
-            response = await self.async_client.completions.create(**params)
-            self.fill_generation_task_with_response(task, response)
+            stream = await self.async_client.completions.create(**params)
+            async for chunk in stream:
+                now = time.perf_counter()
+                # Every chunk carries the server-assigned request id. Capture
+                # it once (the first non-None value) so callers can later
+                # correlate per-request perf metrics drained from
+                # ``/perf_metrics`` with the GenerationTask that issued them.
+                if request_id is None:
+                    cid = getattr(chunk, "id", None)
+                    if cid is not None:
+                        request_id = cid
+                for choice in (chunk.choices or []):
+                    delta_text = getattr(choice, "text", "") or ""
+                    delta_token_ids = getattr(choice, "token_ids", None)
+                    if ttft_s is None and (delta_text or delta_token_ids):
+                        ttft_s = now - t_start
+                    if delta_text:
+                        text_parts.append(delta_text)
+                    if delta_token_ids:
+                        token_ids_acc.extend(delta_token_ids)
+                    delta_logprobs = getattr(choice, "logprobs", None)
+                    if delta_logprobs is not None:
+                        logprobs_acc.append(delta_logprobs)
+                    fr = getattr(choice, "finish_reason", None)
+                    if fr is not None:
+                        finish_reason = fr
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    ct = getattr(usage, "completion_tokens", None)
+                    pt = getattr(usage, "prompt_tokens", None)
+                    if ct is not None:
+                        usage_completion_tokens = int(ct)
+                    if pt is not None:
+                        usage_prompt_tokens = int(pt)
+            latency_s = time.perf_counter() - t_start
+
+            task.output_str = "".join(text_parts)
+            task.output_tokens = token_ids_acc if token_ids_acc else None
+            task.finish_reason = finish_reason
+            task.logprobs = logprobs_acc if logprobs_acc else None
+            task.ttft_s = ttft_s
+            task.latency_s = latency_s
+            task.usage_completion_tokens = usage_completion_tokens
+            task.usage_prompt_tokens = usage_prompt_tokens
+            task.request_id = request_id
 
             return TaskStatus.SUCCESS
 
         except Exception as e:
-            # Handle errors
             print('Openai client get exception: ' + str(e))
             return TaskStatus.WORKER_EXECEPTION
 
@@ -163,20 +394,36 @@ class OpenaiWorker(Worker):
         params["model"] = self.model
         if task.tools is not None:
             params["tools"] = [tool.to_dict() for tool in task.tools]
+        task.llm_request_params = self._request_params_for_trace(params)
 
         try:
             response = await self.async_client.chat.completions.create(**params)
-            task.finish_reason = response.choices[0].finish_reason
-            content = response.choices[0].message.content
-            reasoning = response.choices[0].message.reasoning
-            reasoning_content = response.choices[0].message.reasoning_content
-            tool_calls = response.choices[0].message.tool_calls
+            finish_reason = response.choices[0].finish_reason
+            task.finish_reason = finish_reason
+            message = response.choices[0].message
+            content = self._get_response_field(message, "content")
+            reasoning = self._get_response_field(message, "reasoning")
+            reasoning_content = self._get_response_field(
+                message, "reasoning_content")
+            if reasoning_content is None:
+                reasoning_content = self._reasoning_content_from_thinking_blocks(
+                    message)
+            tool_calls = self._get_response_field(message, "tool_calls")
             task.messages.append(
                 AssistantMessage(content, reasoning, reasoning_content,
-                                 tool_calls))
+                                 tool_calls, finish_reason))
             if task.enable_token_counting:
-                task.prompt_tokens_num = response.usage.prompt_tokens
-                task.completion_tokens_num = response.usage.completion_tokens
+                usage = self._get_response_field(response, "usage")
+                if usage is not None:
+                    task.prompt_tokens_num = self._get_response_field(
+                        usage, "prompt_tokens") or 0
+                    task.completion_tokens_num = self._get_response_field(
+                        usage, "completion_tokens") or 0
+                    details = self._get_response_field(
+                        usage, "completion_tokens_details")
+                    if details is not None:
+                        task.reasoning_tokens_num = self._get_response_field(
+                            details, "reasoning_tokens") or 0
 
             return TaskStatus.SUCCESS
 
@@ -189,36 +436,79 @@ class OpenaiWorker(Worker):
         if not self.kv_cache_hint_enabled:
             return TaskStatus.SUCCESS
 
-        base_url = str(self.async_client.base_url).rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
-        url = base_url + "/_resource_governor/truncate"
-
-        headers = {}
-        if self.async_client.api_key is not None:
-            headers["Authorization"] = f"Bearer {self.async_client.api_key}"
-
-        payload = {
-            "model":
-            self.model,
-            "messages":
-            [message.to_dict() for message in task.chat_task.messages],
-            "messages_to_retain":
-            [message.to_dict() for message in task.messages_to_retain],
-        }
+        params = self.convert_task_params(task.chat_task)
+        params["messages"] = task.chat_task.messages_to_dict_content()
+        params["model"] = self.model
         if task.chat_task.tools is not None:
-            payload["tools"] = [tool.to_dict() for tool in task.chat_task.tools]
+            params["tools"] = [tool.to_dict() for tool in task.chat_task.tools]
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers)
+        response = await self.async_client.create_kv_cache_hint(task, params)
         if response.status_code != 200:
             return TaskStatus.WORKER_EXECEPTION
         return TaskStatus.SUCCESS
 
+    async def tokenize_handler(self, task: TokenizeTask) -> TaskStatus:
+        base_url = str(self.async_client.base_url).rstrip("/")
+        candidate_urls = [f"{base_url}/tokenize"]
+        if base_url.endswith("/v1"):
+            candidate_urls.append(f"{base_url[:-3]}/tokenize")
+        else:
+            candidate_urls.append(f"{base_url}/v1/tokenize")
+        candidate_urls = list(dict.fromkeys(candidate_urls))
+        failures = []
+        task.tokenize_error = None
+        headers = {}
+        if self.async_client.api_key is not None:
+            headers["Authorization"] = f"Bearer {self.async_client.api_key}"
+        payload = {
+            "prompt": task.content,
+            # Include model for multi-model routers and gateways.
+            "model": self.model,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                for url in candidate_urls:
+                    try:
+                        response = await client.post(url,
+                                                     json=payload,
+                                                     headers=headers)
+                    except Exception as e:
+                        failures.append(f"{url} raised {type(e).__name__}: {e}")
+                        continue
+                    if response.status_code != 200:
+                        text_preview = response.text[:200].replace("\n", " ")
+                        failures.append(
+                            f"{url} returned {response.status_code}: {text_preview}"
+                        )
+                        continue
+                    body = response.json()
+                    if "count" in body:
+                        task.token_count = body.get("count", 0)
+                        task.tokenize_error = None
+                    elif "tokens" in body and isinstance(body["tokens"], list):
+                        task.token_count = len(body["tokens"])
+                        task.tokenize_error = None
+                    else:
+                        failures.append(
+                            f"{url} returned malformed response keys={list(body.keys())}"
+                        )
+                        continue
+                    return TaskStatus.SUCCESS
+        except Exception as e:
+            task.tokenize_error = f"Tokenize request got exception: {e}"
+            print('Tokenize request got exception: ' + str(e))
+            return TaskStatus.WORKER_EXECEPTION
+        if failures:
+            task.tokenize_error = "; ".join(failures)
+            print("Tokenize request failed across candidate endpoints: " +
+                  "; ".join(failures))
+        return TaskStatus.WORKER_EXECEPTION
+
     task_handlers = {
         GenerationTask: generation_handler,
         ChatTask: chat_handler,
-        DropKVCacheTask: drop_kv_cache_handler
+        DropKVCacheTask: drop_kv_cache_handler,
+        TokenizeTask: tokenize_handler,
     }
 
 
@@ -289,7 +579,8 @@ class TRTLLMWorker(Worker):
             top_p=task.top_p,
             top_k=task.top_k,
             return_context_logits=task.return_context_logits,
-            logprobs=task.num_logprobs)
+            logprobs=task.num_logprobs,
+            ignore_eos=task.ignore_eos)
         return sampling_params
 
     async def streaming_generate_helper(self, generate_result, step_at_least,
@@ -365,6 +656,38 @@ class TRTLLMWorker(Worker):
         GenerationTask: generation_handler,
         StreamGenerationTask: stream_generation_handler
     }
+
+
+def _apply_mcp_tool_text_payload(task: MCPCallTask,
+                                 text: Optional[str]) -> None:
+    """If *text* is a Coder-style JSON envelope, set chat content and stdio fields.
+
+    Envelope shape: ``{"content": str, "stdout": str, "stderr": str}`` (from Apiary
+    MCP).  Otherwise *task*.result_str is *text* and stdio fields stay None.
+    """
+    task.result_str = text
+    task.result_stdout = None
+    task.result_stderr = None
+    if not text or not text.lstrip().startswith("{"):
+        return
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    if not all(k in payload for k in ("content", "stdout", "stderr")):
+        return
+    content = payload["content"]
+    if not isinstance(content, str):
+        return
+    task.result_str = content
+    out = payload.get("stdout")
+    err = payload.get("stderr")
+    task.result_stdout = out if isinstance(
+        out, str) else (str(out) if out is not None else "")
+    task.result_stderr = err if isinstance(
+        err, str) else (str(err) if err is not None else "")
 
 
 class MCPWorker(Worker):
@@ -475,9 +798,194 @@ class MCPWorker(Worker):
             await tool_call.ready.wait()
             result = tool_call.result
             if result is not None:
-                task.result_str = result
+                _apply_mcp_tool_text_payload(task, result)
                 break
 
         return TaskStatus.SUCCESS
 
     task_handlers = {MCPCallTask: call_handler}
+
+
+class ApiaryMCPWorker(Worker):
+    """MCP worker with per-scope SSE connections for Apiary sandbox isolation.
+
+    Unlike :class:`MCPWorker` which maintains a single shared SSE connection,
+    ``ApiaryMCPWorker`` creates a separate SSE connection (and therefore a
+    separate Apiary sandbox session) for each :class:`ExecutionScope`.
+    The scope is read from the :data:`current_scope` ContextVar that
+    :class:`ScaffoldingLlm` sets automatically for every request and
+    parallel branch.  Connections are released when the scope ends.
+
+    Usage::
+
+        worker = ApiaryMCPWorker("http://localhost:8082/sse")
+        # No init_in_asyncio_event_loop() needed -- connections are lazy.
+    """
+
+    class _ToolCall:
+
+        def __init__(self, tool_name: str, args: dict):
+            self.tool_name = tool_name
+            self.args = args
+            self.ready = asyncio.Event()
+            self.result: Optional[str] = None
+            self.error: bool = False
+
+        def set_result(self, result: Optional[str], *, error: bool = False):
+            self.result = result
+            self.error = error
+            self.ready.set()
+
+    class _ConnState:
+        __slots__ = ("queue", "task", "ready")
+
+        def __init__(self, queue: asyncio.Queue, task: asyncio.Task,
+                     ready: asyncio.Event):
+            self.queue = queue
+            self.task = task
+            self.ready = ready
+
+    def __init__(self, base_url: str, max_connections: int = 200):
+        self.base_url = base_url.rstrip("/")
+        self._max_connections = max_connections
+        self._conns: dict[str, ApiaryMCPWorker._ConnState] = {}
+        self._scope_params: dict[str, dict[str, str | list[str]]] = {}
+        # Lazy-init for asyncio primitives (must be created inside the loop).
+        self._lock: Optional[asyncio.Lock] = None
+        self._sem: Optional[asyncio.Semaphore] = None
+
+    def _ensure_primitives(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+            self._sem = asyncio.Semaphore(self._max_connections)
+
+    def set_scope_params(self, request_id: str,
+                         **params: str | list[str]) -> None:
+        """Associate extra SSE URL query parameters with *request_id*.
+
+        These parameters are appended to the SSE URL when the connection
+        for this request (or any of its child scopes) is created.  Call
+        this **after** :meth:`ScaffoldingLlm.generate_async` returns, using
+        ``result.id`` as the *request_id*.
+
+        Values may be strings or lists of strings.  List values are
+        emitted as repeated query parameters (e.g.
+        ``base_image=/p1&base_image=/p2``).
+
+        Typical usage for SWE-bench::
+
+            result = llm.generate_async(prompt)
+            mcp_worker.set_scope_params(
+                result.id,
+                base_image=["/layer/base", "/layer/top"],
+            )
+        """
+        self._scope_params[request_id] = params
+
+    async def _conn_loop(self, url: str, queue: asyncio.Queue,
+                         ready: asyncio.Event):
+        try:
+            async with sse_client(url) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    ready.set()
+                    while True:
+                        tc = await queue.get()
+                        if tc is None:
+                            return
+                        try:
+                            resp = await session.call_tool(
+                                tc.tool_name, tc.args)
+                            tc.set_result(resp.content[0].text)
+                        except Exception as exc:
+                            tc.set_result(f"Error: {exc}", error=True)
+        except Exception:
+            ready.set()  # unblock waiters even on connection failure
+
+    @staticmethod
+    def _root_request_id(scope_id: str) -> str:
+        """Extract the root request_id from a scope_id.
+
+        Child scopes have the format ``request_id:branch.path``.
+        """
+        return scope_id.split(":")[0]
+
+    async def _get_conn(self, scope_id: str) -> "_ConnState":
+        self._ensure_primitives()
+        async with self._lock:
+            if scope_id in self._conns:
+                conn = self._conns[scope_id]
+            else:
+                await self._sem.acquire()
+                url = f"{self.base_url}?client_id=coder-{scope_id}"
+                extra = self._scope_params.get(self._root_request_id(scope_id),
+                                               {})
+                if extra:
+                    url += "&" + urlencode(extra, doseq=True)
+                queue: asyncio.Queue = asyncio.Queue()
+                ready = asyncio.Event()
+                task = asyncio.create_task(self._conn_loop(url, queue, ready))
+                conn = self._ConnState(queue=queue, task=task, ready=ready)
+                self._conns[scope_id] = conn
+        await conn.ready.wait()
+        return conn
+
+    async def release_connection(self, scope_id: str) -> None:
+        """Close the SSE connection for *scope_id* and release the slot."""
+        self._ensure_primitives()
+        async with self._lock:
+            conn = self._conns.pop(scope_id, None)
+        if conn is None:
+            return
+        conn.queue.put_nowait(None)
+        try:
+            await asyncio.wait_for(conn.task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            conn.task.cancel()
+        self._sem.release()
+        root_id = self._root_request_id(scope_id)
+        if scope_id == root_id:
+            self._scope_params.pop(root_id, None)
+
+    async def call_handler(self, task: MCPCallTask) -> TaskStatus:
+        from .execution_scope import current_scope
+        scope = current_scope.get()
+        scope_id = scope.scope_id if scope is not None else "default"
+
+        conn = await self._get_conn(scope_id)
+
+        tc = self._ToolCall(task.tool_name, json.loads(task.args))
+        conn.queue.put_nowait(tc)
+        await tc.ready.wait()
+
+        if tc.result is not None:
+            _apply_mcp_tool_text_payload(task, tc.result)
+
+        if tc.error:
+            return TaskStatus.WORKER_EXECEPTION
+        return TaskStatus.SUCCESS
+
+    task_handlers = {MCPCallTask: call_handler}
+
+    async def on_scope_end(self, scope_id: str) -> None:
+        await self.release_connection(scope_id)
+
+    async def async_shutdown(self):
+        """Close all SSE connections and wait for background tasks."""
+        self._ensure_primitives()
+        async with self._lock:
+            ids = list(self._conns.keys())
+        for rid in ids:
+            await self.release_connection(rid)
+
+    def shutdown(self):
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                fut = asyncio.run_coroutine_threadsafe(self.async_shutdown(),
+                                                       loop)
+                fut.result(timeout=30)
+            else:
+                loop.run_until_complete(self.async_shutdown())
+        except Exception:
+            pass

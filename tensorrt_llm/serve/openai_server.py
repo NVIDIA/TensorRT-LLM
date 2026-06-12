@@ -69,6 +69,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ResponseFormat,
                                                 ResponsesRequest,
                                                 ResponsesResponse,
+                                                TokenizeRequest,
+                                                TokenizeResponse,
                                                 UpdateWeightsRequest, UsageInfo,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
@@ -711,6 +713,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route('/v1/responses/{response_id}',
                                self.openai_responses_delete_response,
                                methods=["DELETE"])
+        self.app.add_api_route("/v1/tokenize", self.tokenize, methods=["POST"])
 
         # RL-only endpoints
         self.app.add_api_route("/release_memory",
@@ -989,6 +992,24 @@ class OpenAIServer(_VideoRoutesMixin):
                 timing_metrics.last_token_time.total_seconds() +
                 self.disagg_server_steady_clock_offset,
             }
+            # ``KvCacheMetrics`` (a pybind11 binding from
+            # ``tensorrt_llm.bindings.executor``) only guarantees
+            # the per-request hit-accounting fields
+            # (``num_total_allocated_blocks`` /
+            # ``num_new_allocated_blocks`` / ``num_reused_blocks`` /
+            # ``num_missed_blocks``).  The pool-state snapshot fields
+            # (``max_num_blocks`` / ``used_num_blocks`` /
+            # ``free_num_blocks``) were added to this serializer ahead
+            # of the binding and may be absent on older builds; access
+            # them via :func:`getattr` so the endpoint degrades to a
+            # ``None`` snapshot instead of returning HTTP 500.
+            max_num_blocks = getattr(kv_cache_metrics, "max_num_blocks", None)
+            used_num_blocks = getattr(kv_cache_metrics, "used_num_blocks", None)
+            free_num_blocks = getattr(kv_cache_metrics, "free_num_blocks", None)
+            utilization = None
+            if (max_num_blocks is not None and used_num_blocks is not None
+                    and max_num_blocks > 0):
+                utilization = used_num_blocks / max_num_blocks
             metrics_json["kv_cache_metrics"] = {
                 "num_total_allocated_blocks":
                 kv_cache_metrics.num_total_allocated_blocks,
@@ -996,6 +1017,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 kv_cache_metrics.num_new_allocated_blocks,
                 "num_reused_blocks": kv_cache_metrics.num_reused_blocks,
                 "num_missed_blocks": kv_cache_metrics.num_missed_blocks,
+                "max_num_blocks": max_num_blocks,
+                "used_num_blocks": used_num_blocks,
+                "free_num_blocks": free_num_blocks,
+                "utilization": utilization,
             }
             if timing_metrics.kv_cache_size > 0:
                 metrics_json["timing_metrics"].update({
@@ -1975,6 +2000,35 @@ class OpenAIServer(_VideoRoutesMixin):
             "object": "response",
             "deleted": True
         })
+
+    async def tokenize(self, request: TokenizeRequest) -> JSONResponse:
+        try:
+            if request.prompt is not None:
+                token_ids = self.tokenizer.encode(request.prompt)
+            else:
+                conversation, _, mm_placeholder_counts = (
+                    parse_chat_messages_coroutines(request.messages,
+                                                   self.model_config, None))
+                prompt = apply_chat_template(
+                    model_type=self.model_config.model_type,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    conversation=conversation,
+                    add_generation_prompt=True,
+                    mm_placeholder_counts=mm_placeholder_counts,
+                )
+                if isinstance(prompt, list):
+                    token_ids = prompt
+                else:
+                    token_ids = self.tokenizer.encode(prompt)
+
+            response = TokenizeResponse(count=len(token_ids), tokens=token_ids)
+            return JSONResponse(content=response.model_dump())
+        except Exception as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.BAD_REQUEST)
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:

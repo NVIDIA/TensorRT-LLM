@@ -133,6 +133,55 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class TokenizeRequest(OpenAIBaseModel):
+    """Request body for the ``POST /v1/tokenize`` endpoint.
+
+    Asks the server to encode some text into the token-id sequence its
+    loaded tokenizer would produce, without running any generation. The
+    caller must supply exactly one of ``prompt`` or ``messages``; providing
+    both, or neither, is rejected with a 400 by the validator below.
+
+    Fields:
+        model: Target model name. Accepted for compatibility with
+            multi-model routers but ignored -- the server always tokenizes
+            against its own loaded model.
+        prompt: Plain text to tokenize directly via ``tokenizer.encode``.
+            Mutually exclusive with ``messages``.
+        messages: OpenAI chat-completion messages rendered through the
+            server's chat template (mirroring the ``/v1/chat/completions``
+            prefill path) before being encoded. Mutually exclusive with
+            ``prompt``.
+    """
+
+    model: Optional[str] = None
+    prompt: Optional[str] = None
+    messages: Optional[List[OpenAIChatCompletionMessageParam]] = None
+
+    @model_validator(mode="after")
+    def check_prompt_or_messages(self):
+        if self.prompt is None and self.messages is None:
+            raise ValueError("Either 'prompt' or 'messages' must be provided")
+        if self.prompt is not None and self.messages is not None:
+            raise ValueError(
+                "Only one of 'prompt' or 'messages' should be provided")
+        return self
+
+
+class TokenizeResponse(OpenAIBaseModel):
+    """Response body for the ``POST /v1/tokenize`` endpoint.
+
+    Fields:
+        count: Number of tokens in the encoded sequence. Always populated;
+            clients needing only the length can ignore ``tokens``.
+        tokens: The encoded token ids. Populated for both the ``prompt``
+            and ``messages`` paths. Kept ``Optional`` so future count-only
+            variants can omit it without breaking the schema.
+    """
+
+    count: int
+    tokens: Optional[List[int]] = None
+
+
 class ResponseFormat(OpenAIBaseModel):
     type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]
@@ -936,6 +985,36 @@ class KVCacheTruncateRequest(OpenAIBaseModel):
     chat_template_kwargs: Optional[dict] = None
     reasoning_effort: Optional[str] = None
     tool_choice: Optional[str] = None
+
+
+class KVCacheTruncateTokensRequest(OpenAIBaseModel):
+    """Token-level analog of :class:`KVCacheTruncateRequest`.
+
+    Posted to the ``/_control/kv_cache/truncate_tokens`` endpoint. Bypasses
+    the chat-template tokenization path entirely: callers (e.g.
+    trace replay) that already operate on raw token ids hand the server a
+    batch of full token-id sequences plus the prefix length to retain for
+    each, and the server trims the corresponding KV-cache blocks in the
+    radix tree. Each ``prefixes[i]`` becomes one
+    :class:`tensorrt_llm.executor.request.TruncateKVCacheRequest` on the
+    executor's KV-cache control queue, so one batched HTTP request fans out
+    into N atomic per-prefix radix-tree mutations while paying a single
+    network round-trip.
+
+    Fields:
+        model: Target model name. Accepted for router compatibility but
+            ignored -- the server uses its own loaded model.
+        prefixes: Batch of full token-id sequences. Each entry is one
+            cached prefix whose KV-cache blocks should be truncated.
+        num_tokens_to_keep: Per-prefix number of leading tokens to retain,
+            parallel to ``prefixes`` (``num_tokens_to_keep[i]`` applies to
+            ``prefixes[i]``). Blocks beyond this length are dropped from the
+            radix tree.
+    """
+
+    model: Optional[str] = None
+    prefixes: List[List[int]]
+    num_tokens_to_keep: List[int]
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
