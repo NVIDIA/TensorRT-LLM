@@ -611,6 +611,12 @@ class KVCacheAwareADPRouter(ADPRouter):
                 )
                 all_ranks_num_active_tokens[target_dp_rank] += effective
                 scheduled = True
+                # Expose the prefix match length for the rank this request is
+                # actually routed to, so the worker can reuse it (e.g. to order
+                # context prefill by uncached tokens) without re-probing.
+                if req_item.request is not None:
+                    req_item.request.py_prefix_match_length = self._match_len(
+                        target_dp_rank, req_item.id)
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 # Only mark a rank as warmed once a request actually landed
                 # there; saturated picks stay pending for a later call.
@@ -694,6 +700,11 @@ class KVCacheAwareADPRouter(ADPRouter):
                     best_score = score
                     best_rank = rank
 
+            # Expose the prefix match length for the rank this request is
+            # actually routed to, so the worker can reuse it (e.g. to order
+            # context prefill by uncached tokens) without re-probing.
+            if req_item.request is not None:
+                req_item.request.py_prefix_match_length = match_lens[best_rank]
             all_ranks_new_requests[best_rank].append(req_item)
             all_ranks_num_active_requests[best_rank] += 1
 

@@ -3343,7 +3343,33 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
-        self.active_requests.extend(validated_requests)
+        # Order newly-activated context requests by uncached (non-prefix-cached)
+        # token count, heaviest-prefill first. The scheduler walks
+        # active_requests in list order, so this lets the requests that need the
+        # most prefill compute enter the context phase ahead of light,
+        # mostly-cached ones. The uncached estimate reuses
+        # ``py_prefix_match_length`` -- the prefix match the KV-cache-aware ADP
+        # router already computed for the rank this request was routed to -- so
+        # no extra radix-tree probe runs on the (host-bound) context server.
+        # Falls back to the full prompt length when the value is absent (e.g.
+        # non-KV-aware router), and is a no-op for generation-only requests.
+        def _uncached_tokens(req) -> int:
+            prompt_len = len(getattr(req, "input_token_ids", None) or [])
+            matched = getattr(req, "py_prefix_match_length", 0)
+            return max(0, prompt_len - matched)
+
+        context_requests = [
+            req for req in validated_requests
+            if not req.is_generation_only_request()
+        ]
+        other_requests = [
+            req for req in validated_requests
+            if req.is_generation_only_request()
+        ]
+        if len(context_requests) > 1:
+            context_requests.sort(key=_uncached_tokens, reverse=True)
+        self.active_requests.extend(context_requests)
+        self.active_requests.extend(other_requests)
         return validated_requests
 
     def _add_kv_cache_events(self):
