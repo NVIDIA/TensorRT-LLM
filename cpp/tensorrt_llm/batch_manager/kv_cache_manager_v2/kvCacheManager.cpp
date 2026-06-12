@@ -279,7 +279,8 @@ std::vector<AggregatedPageDesc> KvCacheManager::getAggregatedPages(std::vector<B
         auto const poolBase = mStorage->getMemPoolBaseAddress(pgIdx, poolIdx);
         size_t stride = mStorage->slotSize(pgIdx).at(poolIdx);
 
-        auto flush = [&](size_t start, size_t end, std::vector<ExpandedBuffer>& buffersInRange)
+        auto flush
+            = [&, lifeCycleId = lifeCycleId](size_t start, size_t end, std::vector<ExpandedBuffer>& buffersInRange)
         {
             result.push_back(AggregatedPageDesc{
                 MemAddress(poolBase + start), end - start, stride, lifeCycleId, std::move(buffersInRange)});
