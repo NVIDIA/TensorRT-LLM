@@ -69,7 +69,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeRoutingLogits,
     btg::Dtype dtypeRoutingBias)
 {
-    if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1)
+    if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1 && numFusedSharedExpert == 0)
     {
         // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess.
         // NOTE: routingCustom does not implement fused shared experts; when fusion is
