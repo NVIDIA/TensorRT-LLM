@@ -148,6 +148,37 @@ def _fp4_weight_scale_pipeline_cache_spec(
     }
 
 
+def _rowwise_bias_load_hook(state_dict, prefix, *args, rank, param_key):
+    """Always-apply load hook for the rank0-only row-parallel bias: zero on rank != 0.
+
+    Unlike the shape-gated ``_load_hook`` (which only transforms when the loaded
+    shape differs from the sharded shape), the row-parallel bias keeps its full
+    shape -- only its *value* changes. Idempotent (zeroing zeros / keeping rank 0).
+    Takes plain ``rank``/``param_key`` (not a closure) so the pipeline cache can
+    serialize and rebuild it via the importable-hook path.
+    """
+    key = prefix + param_key
+    if key in state_dict and rank != 0:
+        state_dict[key] = torch.zeros_like(state_dict[key])
+
+
+def _replicate_rowwise_bias(bn: WeightNode, rank: int) -> None:
+    """Keep a row-parallel linear's bias on rank 0 only; zero it on the others.
+
+    The row-parallel output is summed across ranks by the trailing ``all_reduce``,
+    so a full bias present on every rank would be added ``world_size`` times. Zeroing
+    it on rank != 0 makes the all_reduce contribute the bias exactly once. The
+    parameter shape is unchanged (unlike the column-parallel bias, which is split),
+    so a dedicated always-apply load hook is used.
+    """
+    new_bias = bn.tensor if rank == 0 else torch.zeros_like(bn.tensor)
+    pname = bn.node_key.rsplit(".", 1)[-1]
+    bn.submod._register_load_state_dict_pre_hook(
+        partial(_rowwise_bias_load_hook, rank=rank, param_key=pname)
+    )
+    setattr(bn.submod, pname, torch.nn.Parameter(new_bias.detach().clone(), requires_grad=False))
+
+
 _SHARDING_HINT_NAMES = frozenset(
     {
         "tp_mode",
@@ -353,6 +384,10 @@ class LinearShardableNode(ShardableNode):
                     world_size=dc.tp_size,
                     fused_weight_dims=fused,
                 )
+            else:
+                # Row-parallel: the trailing all_reduce would sum a full bias
+                # world_size times. Keep it on rank 0 only so it is added once.
+                _replicate_rowwise_bias(bn, dc.tp_rank)
 
         ad_logger.debug(f"  sharded linear tp_mode={tp_mode}")
         return 1
