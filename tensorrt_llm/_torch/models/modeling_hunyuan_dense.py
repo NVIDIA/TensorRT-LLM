@@ -418,7 +418,7 @@ class HunYuanAttention(Attention):
             config=model_config,
         )
         if self.use_qk_norm:
-            if config.head_dim != None:
+            if config.head_dim is not None:
                 self.head_dim = config.head_dim
             else:
                 self.head_dim = config.hidden_size // config.num_attention_heads
