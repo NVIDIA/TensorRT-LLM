@@ -1331,7 +1331,7 @@ def _persistent_main_impl(
             else:
                 RAND_DIVISOR: tl.constexpr = 1  # unreachable; keeps constexpr initialized
 
-            rand_seed = tl.load(rand_seed_ptr + cache_batch_idx)
+            rand_seed = tl.load(rand_seed_ptr)
             base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
             # Number of unique randoms per row = dstate / RAND_DIVISOR.
             # randint4x emits 4 randoms per offset, so use that / 4 offsets.
@@ -1456,7 +1456,6 @@ def _persistent_main_impl(
         step_x,
         mask=t_mask[:, None] & m_mask[None, :],
     )
-    step_x_for_dot = step_x.to(tl.bfloat16)
     step_x = step_x.to(tl.float32)
 
     cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
@@ -1472,7 +1471,7 @@ def _persistent_main_impl(
     )
 
     init_out = tl.dot(C_tile.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
-    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), step_x_for_dot)
+    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), step_x.to(tl.bfloat16))
     output_tile = init_out + cb_out
 
     if HAS_D:
@@ -1630,6 +1629,8 @@ def _persistent_rectangle_impl(
             mask=m_mask,
             other=1.0,
         ).to(tl.float32)
+    else:
+        state = state.to(tl.float32)
 
     # Group / pointer offset setup
     group_idx = pid_h // nheads_ngroups_ratio
@@ -1662,7 +1663,7 @@ def _persistent_rectangle_impl(
         + offs_m[None, :] * stride_old_x_dim,
         mask=is_history_position[:, None] & m_mask[None, :],
         other=0.0,
-    )
+    ).to(tl.float32)
 
     if WAIT_FOR_PDL_PREDECESSOR:
         _gdc_wait_with_memory_clobber()
@@ -1686,7 +1687,7 @@ def _persistent_rectangle_impl(
     )
 
     step_x_in_window_for_dot = step_x_in_window.to(tl.bfloat16)
-    x_window_for_dot = (history_x.to(tl.bfloat16) + step_x_in_window_for_dot).to(tl.bfloat16)
+    x_window_for_dot = history_x + step_x_in_window.to(tl.float32)
 
     if HAS_D:
         step_in_window_selector = offs_t[:, None] == (
@@ -1712,7 +1713,7 @@ def _persistent_rectangle_impl(
     if QUANT_MAX > 0.0:
         state_out = state_out * decode_scale[None, :]
 
-    token_out = tl.dot(CB_scaled.to(tl.bfloat16), x_window_for_dot)
+    token_out = tl.dot(CB_scaled.to(tl.bfloat16), x_window_for_dot.to(tl.bfloat16))
 
     output_tile = state_out + token_out
 
@@ -2309,7 +2310,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_block_size_m": 8,
                 "_cta_per_sm": 6,
                 "_flatten": False,
-                "_heads_per_block": 4,
+                "_heads_per_block": 1,
                 "_num_loop_stages": 1,
                 "_num_stages": 4,
                 "_num_warps": 1,
@@ -2321,7 +2322,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.57us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=1, score=6.83us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
         (
             32,
             "persistent_dynamic",
@@ -2849,7 +2850,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_num_loop_stages": 1,
                 "_num_stages": 2,
                 "_num_warps": 1,
-                "_precompute_num_warps": 8,
+                "_precompute_num_warps": 2,
                 "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": False,
@@ -2857,7 +2858,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=2, score=7.05us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=2, score=6.72us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
         (
             64,
             "persistent_dynamic",
@@ -3025,14 +3026,14 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_cta_per_sm_nowrite": 8,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
-                "_heads_per_block": 8,
+                "_heads_per_block": 16,
                 "_num_loop_stages_nowrite": 5,
                 "_num_loop_stages_write": 1,
                 "_num_stages_nowrite": 4,
                 "_num_stages_write": 1,
                 "_num_warps_nowrite": 1,
                 "_num_warps_write": 1,
-                "_precompute_num_warps": 2,
+                "_precompute_num_warps": 4,
                 "_use_tma_rect_load": True,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": True,
@@ -3041,7 +3042,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=69.44us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=512, score=67.94us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
         (
             16384,
             "persistent_main",
@@ -3277,7 +3278,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_cta_per_sm_nowrite": 4,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
-                "_heads_per_block": 8,
+                "_heads_per_block": 16,
                 "_num_loop_stages_nowrite": 5,
                 "_num_loop_stages_write": 1,
                 "_num_stages_nowrite": 4,
@@ -3293,7 +3294,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=88.87us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=512, score=88.57us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
         (
             16384,
             "persistent_main",
@@ -3538,13 +3539,13 @@ def replay_selective_state_update(
         D: (nheads, dim) optional feed-through parameter.
         z: (batch, T, nheads, dim) optional silu gate.
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
-        rand_seed: optional (cache_size,) int64 CUDA tensor of per-cache-slot
-            Philox PRNG seeds.  The caller bumps this tensor in-place for each
-            replay invocation so CUDA graph replay still gets fresh draws.  The
-            kernel indexes it by cache_batch_idx.  When provided, state is
-            stochastically rounded on store. Supported for state.dtype in
-            (fp16, int8, int16, fp8_e4m3fn). fp16+SR and fp8+SR both require
-            sm_100a (Blackwell B200+) — wrapper asserts this loudly.
+        rand_seed: optional single-element int64 CUDA tensor of Philox PRNG
+            seed.  The caller bumps this tensor in-place for each replay
+            invocation so CUDA graph replay still gets fresh draws.  When
+            provided, state is stochastically rounded on store. Supported for
+            state.dtype in (fp16, int8, int16, fp8_e4m3fn). fp16+SR and
+            fp8+SR both require sm_100a (Blackwell B200+) — wrapper asserts
+            this loudly.
             When None, standard deterministic rounding is used.
         philox_rounds: number of Philox PRNG rounds (default 10).
         state_scales: required when state.dtype in (int8, int16, fp8_e4m3fn).
@@ -3869,10 +3870,8 @@ def replay_selective_state_update(
         assert rand_seed.dim() == 1, (
             f"rand_seed must be a 1D tensor; got shape {tuple(rand_seed.shape)}"
         )
-        if rand_seed.shape[0] == 1 and cache_size > 1:
-            rand_seed = rand_seed.expand(cache_size).contiguous()
-        assert rand_seed.shape[0] >= cache_size, (
-            f"rand_seed must have length 1 or >= cache_size ({cache_size}); "
+        assert rand_seed.shape[0] == 1, (
+            "rand_seed must have length 1; "
             f"got shape {tuple(rand_seed.shape)}"
         )
 

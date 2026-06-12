@@ -523,11 +523,9 @@ class Mamba2Mixer(nn.Module):
 
                 philox_kwargs = {}
                 if use_stochastic_rounding:
-                    # Both replay and flashinfer read from the cache manager's
-                    # persistent per-slot Philox seed buffer; replay indexes by
-                    # cache_batch_idx, flashinfer reads slot 0 from a (1,)
-                    # view.  In-place add_(1) keeps CUDA-graph replay fresh
-                    # without allocating any new CUDA tensors per forward.
+                    # Both replay and flashinfer use a single Philox seed. The
+                    # cache manager owns the persistent buffer; passing a (1,)
+                    # view avoids allocating CUDA tensors per forward.
                     rand_seed = layer_cache.mamba_ssm_rand_seed
                     assert rand_seed is not None, (
                         "Mamba SSM stochastic rounding is enabled but the "
@@ -535,10 +533,7 @@ class Mamba2Mixer(nn.Module):
                         "_util.py passes mamba_ssm_stochastic_rounding=True "
                         "to the cache manager.")
                     rand_seed.add_(1)
-                    if use_replay:
-                        philox_kwargs['rand_seed'] = rand_seed
-                    else:
-                        philox_kwargs['rand_seed'] = rand_seed[:1]
+                    philox_kwargs['rand_seed'] = rand_seed[:1]
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
