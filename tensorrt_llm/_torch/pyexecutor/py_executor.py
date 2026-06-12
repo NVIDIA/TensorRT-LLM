@@ -403,16 +403,12 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        # V2 manager owns KV alloc + suspend during scheduling: it
-        # eagerly grows ctx/gen capacity in the schedule loop and calls
-        # suspend_request() when needed (offloads GPU pages while
-        # preserving the radix tree).  The executor therefore does not
-        # need to call _terminate_requests (GPU resources are already
-        # freed by suspend) or _pause_requests (V2's prepare_context
-        # handles resume internally, so resetting to CONTEXT_INIT is
-        # unnecessary).  Several revert/skip paths gate on this flag.
-        self._scheduler_manages_kv_suspend = isinstance(self.kv_cache_manager,
-                                                        KVCacheManagerV2)
+        # The V2 KV cache manager owns KV allocation, suspend, and resume.
+        # It eagerly grows ctx/gen capacity in the schedule loop and calls
+        # suspend_request() when needed. The executor therefore skips the V1
+        # terminate/pause paths and finalizes V2 context resources explicitly.
+        self._use_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
+                                                   KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
@@ -2021,11 +2017,16 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                self._handle_canceled_requests()
+                if self._use_kv_cache_manager_v2:
+                    # Finalize V2 context KV before disagg transfer/response
+                    # handling can terminate the request.
+                    self.kv_cache_manager.update_context_resources(
+                        scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
                 self._flush_pending_transfer_responses()
-                self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
                 # Complete ctx send sessions AFTER responses are created so
@@ -2038,9 +2039,6 @@ class PyExecutor:
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
                                                    'kv_cache_dtype_byte_size',
                                                    None)
-                if self._scheduler_manages_kv_suspend:
-                    self.kv_cache_manager.update_context_resources(
-                        sample_state_scheduled_requests)
                 self.resource_manager.update_resources(
                     sample_state_scheduled_requests, attn_metadata,
                     kv_cache_dtype_byte_size)
@@ -2152,14 +2150,14 @@ class PyExecutor:
         can_queue check.  V1 allocates in prepare_resources() after the
         can_queue check, so no revert is needed.
         """
-        if self._scheduler_manages_kv_suspend:
+        if self._use_kv_cache_manager_v2:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
-        if self._scheduler_manages_kv_suspend and isinstance(
-                self.kv_cache_manager, KVCacheManagerV2):
+        if self._use_kv_cache_manager_v2 and isinstance(self.kv_cache_manager,
+                                                        KVCacheManagerV2):
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
 
@@ -2469,7 +2467,7 @@ class PyExecutor:
                     self._revert_gen_alloc(scheduled_batch)
                     continue
 
-                if not self._scheduler_manages_kv_suspend:
+                if not self._use_kv_cache_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
 
@@ -2582,10 +2580,15 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
+                    self._handle_canceled_requests()
+                    if self._use_kv_cache_manager_v2:
+                        # Finalize V2 context KV before disagg transfer/response
+                        # handling can terminate the request.
+                        self.kv_cache_manager.update_context_resources(
+                            scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
                     self._flush_pending_transfer_responses()
 
-                    self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
                     # Complete ctx send sessions AFTER responses are created so
                     # _handle_responses sees the request before it is terminated.
@@ -2599,9 +2602,6 @@ class PyExecutor:
                                             None)
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    if self._scheduler_manages_kv_suspend:
-                        self.kv_cache_manager.update_context_resources(
-                            scheduled_batch)
                     self.resource_manager.update_resources(
                         scheduled_batch, attn_metadata,
                         kv_cache_dtype_byte_size)
@@ -2768,7 +2768,7 @@ class PyExecutor:
                     self._revert_gen_alloc(scheduled_batch)
                     continue
 
-                if not self._scheduler_manages_kv_suspend:
+                if not self._use_kv_cache_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 can_queue, can_queue_this_rank = self._can_queue(
@@ -2895,7 +2895,7 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                if not self._scheduler_manages_kv_suspend:
+                if not self._use_kv_cache_manager_v2:
                     self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
@@ -2929,7 +2929,7 @@ class PyExecutor:
                     # blocks freed by this chunk are visible to the next
                     # iteration's scheduler.
                     # Only applies to KV cache manager V2 + scheduler V2.
-                    if (self._scheduler_manages_kv_suspend
+                    if (self._use_kv_cache_manager_v2
                             and scheduled_batch.context_requests):
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
