@@ -62,7 +62,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
         SpecRegion whose memory is a MemRegionGroup containing all blocks
         described by region_ids.
 
-        For KV cache: each ptr = base_address + slot_id * slot_bytes, pointing
+        For KV cache: each ptr = base_address + slot_id * slot_stride, pointing
         to the start of a full slot.  The slot contains buffer entries for all
         layers in this layer_group laid out contiguously from offset 0.
 
@@ -75,7 +75,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
         pool = get_physical_pool(self._page_table, layer_group_id, pv.pool_idx)
 
         base_ptr = pool.base_address
-        block_size = pool.slot_bytes
+        block_size = pool.slot_stride
 
         # KV cache: filter out invalid block_ids (BAD_PAGE_INDEX = -1)
         valid = region_ids >= 0
@@ -104,15 +104,19 @@ def _build_layer_group_for_mamba(
     conv_state = manager._impl.mamba_cache.conv
     ssm_state = manager._impl.mamba_cache.temporal
 
+    conv_slot_bytes = conv_state.stride(1) * conv_state.element_size()
     conv_pool = PhysicalPool(
         base_address=conv_state.data_ptr(),
-        slot_bytes=conv_state.stride(1) * conv_state.element_size(),
+        slot_stride=conv_slot_bytes,
+        data_bytes=conv_slot_bytes,
         num_slots=conv_state.shape[1],
     )
 
+    ssm_slot_bytes = ssm_state.stride(1) * ssm_state.element_size()
     ssm_pool = PhysicalPool(
         base_address=ssm_state.data_ptr(),
-        slot_bytes=ssm_state.stride(1) * ssm_state.element_size(),
+        slot_stride=ssm_slot_bytes,
+        data_bytes=ssm_slot_bytes,
         num_slots=ssm_state.shape[1],
     )
 
@@ -190,7 +194,10 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                 entries.append((lid, int(DataRole.VALUE), base_offset + buffer_size, buffer_size))
 
         kv_physical = PhysicalPool(
-            base_address=base_addr, slot_bytes=slot_bytes, num_slots=num_blocks
+            base_address=base_addr,
+            slot_stride=slot_bytes,
+            data_bytes=slot_bytes,
+            num_slots=num_blocks,
         )
         kv_view = PoolView(pool_idx=0, buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE))
         physical_pools = [kv_physical]
@@ -207,7 +214,8 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
             indexer_slot_bytes = per_block_elems * indexer_pool.element_size()
             indexer_physical = PhysicalPool(
                 base_address=int(indexer_pool.data_ptr()),
-                slot_bytes=indexer_slot_bytes,
+                slot_stride=indexer_slot_bytes,
+                data_bytes=indexer_slot_bytes,
                 num_slots=num_blocks,
             )
             indexer_view = PoolView(
@@ -366,7 +374,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     pools=[
                         PhysicalPool(
                             base_address=int(pool_group._pools[pi].slot_address(0)),
-                            slot_bytes=int(pool_group._pools[pi].slot_size),
+                            slot_stride=int(pool_group._pools[pi].slot_size),
+                            data_bytes=int(pool_group._pools[pi].slot_size),
                             num_slots=int(pool_group._pools[pi].num_slots),
                         )
                         for pi in range(num_pools)

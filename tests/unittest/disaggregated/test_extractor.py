@@ -214,7 +214,7 @@ def test_layer_group_meta_serialization():
         [(0, int(DataRole.KEY), 0, 256), (0, int(DataRole.VALUE), 256, 256)],
         dtype=BUFFER_ENTRY_DTYPE,
     )
-    kv_pool = PhysicalPool(base_address=1000, slot_bytes=512, num_slots=10)
+    kv_pool = PhysicalPool(base_address=1000, slot_stride=512, data_bytes=512, num_slots=10)
     pv = PoolView(pool_idx=0, buffer_entries=entries)
     local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=0),
@@ -245,8 +245,8 @@ def test_layer_group_meta_serialization():
 def test_mamba_layer_group_serialization():
     from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup, PhysicalPool
 
-    conv_pool = PhysicalPool(base_address=1000, slot_bytes=128, num_slots=10)
-    ssm_pool = PhysicalPool(base_address=8000, slot_bytes=256, num_slots=8)
+    conv_pool = PhysicalPool(base_address=1000, slot_stride=128, data_bytes=128, num_slots=10)
+    ssm_pool = PhysicalPool(base_address=8000, slot_stride=256, data_bytes=256, num_slots=8)
     mlg = MambaLayerGroup(
         pool_group_idx=1,
         mamba_layer_offsets={10: 0, 11: 1, 12: 2},
@@ -266,10 +266,12 @@ def test_mamba_layer_group_serialization():
     assert isinstance(restored, MambaLayerGroup)
     assert restored.mamba_layer_offsets == {10: 0, 11: 1, 12: 2}
     assert restored.conv_states.base_address == 1000
-    assert restored.conv_states.slot_bytes == 128
+    assert restored.conv_states.slot_stride == 128
+    assert restored.conv_states.data_bytes == 128
     assert restored.conv_states.num_slots == 10
     assert restored.ssm_states.base_address == 8000
-    assert restored.ssm_states.slot_bytes == 256
+    assert restored.ssm_states.slot_stride == 256
+    assert restored.ssm_states.data_bytes == 256
     assert restored.ssm_states.num_slots == 8
     assert restored.conv_section_bytes == [512, 256, 256]
     assert restored.ssm_bytes_per_head == 128
@@ -306,8 +308,8 @@ def test_mixed_page_table_serialization():
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
         mamba_layer_offsets={1: 0, 2: 1},
-        conv_states=PhysicalPool(base_address=5000, slot_bytes=1024, num_slots=4),
-        ssm_states=PhysicalPool(base_address=9000, slot_bytes=2048, num_slots=4),
+        conv_states=PhysicalPool(base_address=5000, slot_stride=1024, data_bytes=1024, num_slots=4),
+        ssm_states=PhysicalPool(base_address=9000, slot_stride=2048, data_bytes=2048, num_slots=4),
         conv_section_bytes=[256, 128, 128],
         ssm_bytes_per_head=64,
     )
@@ -315,7 +317,7 @@ def test_mixed_page_table_serialization():
     page_table = KVCachePageTable(
         tokens_per_block=16,
         layer_groups=[attn_lg, mamba_lg],
-        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 10)])],
+        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 512, 10)])],
     )
 
     d = page_table.to_dict()
