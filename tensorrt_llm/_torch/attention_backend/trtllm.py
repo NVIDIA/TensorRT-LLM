@@ -184,9 +184,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @property
     def max_context_length(self) -> int:
-        """``min(max_seq_len - 1, max_num_tokens)`` — upper bound for a single
-        context window."""
-        return min(self.max_seq_len - 1, self.max_num_tokens)
+        """
+        Upper bound for a single context window.
+        Required max_seq_len for context-only attention cases like visual gen
+        """
+        return min(self.max_seq_len, self.max_num_tokens)
 
     @property
     def effective_beam_width(self) -> int:

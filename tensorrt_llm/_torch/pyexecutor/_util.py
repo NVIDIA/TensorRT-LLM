@@ -37,6 +37,7 @@ from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
+from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
@@ -46,9 +47,8 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, KVCacheManagerV2,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+from .resource_manager import (KVCacheManager, PeftCacheManager,
+                               ResourceManager, ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -949,27 +949,13 @@ class KvCacheCreator:
             is_disagg=self._is_disagg,
         )
 
-    def _split_kv_cache_budget_for_draft(
+    def _get_target_and_draft_cache_costs(
         self,
         kv_cache_config: Optional[KvCacheConfig] = None,
-    ) -> tuple[KvCacheConfig, Optional[KvCacheConfig]]:
-        """Split max_gpu_total_bytes between target and draft KV caches.
-
-        When using KVCacheManagerV2 with a separate draft KV cache,
-        max_gpu_total_bytes and host_cache_size each represent the total
-        budget for both target and draft combined.  This method splits both
-        budgets proportionally based on their per-token KV cache sizes.
-
-        Returns cloned target/draft configs for the current build.  When no
-        split is needed, the input config is returned as the target and the
-        draft config is None. The creator's base config is not mutated.
-        """
+    ) -> Optional[tuple[CacheCost, CacheCost]]:
+        """Per-manager KV cache costs for target and draft layers."""
         target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                   else self._kv_cache_config)
-        total_budget = target_kv_cache_config.max_gpu_total_bytes
-        if total_budget is None or total_budget <= 0:
-            return target_kv_cache_config, None
-
         total_kv = self._get_kv_size_per_token(target_kv_cache_config)
         target_kv = self._per_manager_cache_cost(
             self._kv_cache_manager_cls, self._model_engine.model.model_config,
@@ -979,11 +965,16 @@ class KvCacheCreator:
         draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
                              intercept=total_kv.intercept - target_kv.intercept)
         if target_kv.slope <= 0 or draft_kv.slope <= 0:
-            return target_kv_cache_config, None
+            return None
+        return target_kv, draft_kv
 
-        # Cover both managers' fixed costs first, then split the remaining
-        # budget by per-token slope. With zero intercepts this reduces to the
-        # original proportional split.
+    def _compute_draft_budget_shares(
+        self,
+        total_budget: int,
+        target_kv: CacheCost,
+        draft_kv: CacheCost,
+    ) -> Optional[tuple[int, int]]:
+        """Split *total_budget* into (target_budget, draft_budget) byte shares."""
         intercept_total = target_kv.intercept + draft_kv.intercept
         slope_budget = total_budget - intercept_total
         if slope_budget <= 0:
@@ -991,35 +982,116 @@ class KvCacheCreator:
                 f"KV cache budget {total_budget} is smaller than the fixed "
                 f"mamba state cost {intercept_total}; cannot split between "
                 f"target and draft.")
-            return target_kv_cache_config, None
+            return None
         slope_total = target_kv.slope + draft_kv.slope
         draft_slope_share = int(slope_budget * draft_kv.slope / slope_total)
         draft_budget = draft_kv.intercept + draft_slope_share
         target_budget = total_budget - draft_budget
+        return target_budget, draft_budget
+
+    def _split_kv_cache_budget_for_draft(
+        self,
+        budget_attr: str,
+        target_kv_cache_config: Optional[KvCacheConfig] = None,
+        draft_kv_cache_config: Optional[KvCacheConfig] = None,
+    ) -> tuple[KvCacheConfig, Optional[KvCacheConfig]]:
+        """Split a byte budget (attribute on ``KvCacheConfig``) between target
+        and draft KV caches.
+
+        Splits the value of ``target_kv_cache_config.<budget_attr>`` using the
+        affine target/draft cache costs, then returns cloned target and draft
+        configs containing their respective shares.
+
+        The input target config and the creator's base config are not mutated.
+        When the split is not applicable (the budget is not set, or the
+        per-manager cache costs are unavailable), the input configs are returned
+        unchanged.
+
+        The affine fixed (intercept) cost models GPU-resident state (e.g. mamba
+        SSM state). It is only charged against ``max_gpu_total_bytes``; for any
+        other budget (e.g. ``host_cache_size``, which is host offload memory the
+        GPU-resident state never occupies) the intercept is dropped so the split
+        stays proportional to the per-token cost.
+
+        When the split is *infeasible* (the combined fixed cost meets or exceeds
+        the budget — only possible for ``max_gpu_total_bytes`` after the above)
+        the shortfall is fatal: both managers need their fixed state resident in
+        GPU memory, so the run would OOM. It raises ``ValueError`` rather than
+        silently producing an unusable config. A defensive degrade-to-zero path
+        for non-GPU budgets remains so the draft never silently inherits the full
+        budget and double-allocates it.
+        """
+        target_kv_cache_config = (target_kv_cache_config
+                                  if target_kv_cache_config is not None else
+                                  self._kv_cache_config)
+        total_budget = getattr(target_kv_cache_config, budget_attr) or 0
+        if total_budget <= 0:
+            return target_kv_cache_config, draft_kv_cache_config
+
+        cache_costs = self._get_target_and_draft_cache_costs(
+            target_kv_cache_config)
+        if cache_costs is None:
+            return target_kv_cache_config, draft_kv_cache_config
+        target_kv, draft_kv = cache_costs
+
+        # The fixed (intercept) cost models GPU-resident state such as mamba SSM
+        # state; it does not consume host offload memory. When splitting a
+        # non-GPU budget (e.g. host_cache_size), drop the intercept so the split
+        # stays proportional to the per-token (slope) cost instead of being
+        # spuriously starved by a GPU-only fixed cost.
+        if budget_attr != "max_gpu_total_bytes":
+            target_kv = CacheCost(slope=target_kv.slope)
+            draft_kv = CacheCost(slope=draft_kv.slope)
+
+        shares = self._compute_draft_budget_shares(total_budget, target_kv,
+                                                   draft_kv)
+        if shares is None:
+            # The split is infeasible (combined fixed cost >= total budget).
+            intercept_total = target_kv.intercept + draft_kv.intercept
+            if budget_attr == "max_gpu_total_bytes":
+                # A GPU budget that cannot even fit the combined fixed cost is
+                # fatal: both managers need their fixed state resident in GPU
+                # memory, so the run would OOM. Fail fast with actionable
+                # guidance rather than producing an unusable zero-budget draft.
+                raise ValueError(
+                    f"KV cache GPU budget ({total_budget / GB:.2f} GiB) is "
+                    f"smaller than the combined fixed cost "
+                    f"({intercept_total / GB:.2f} GiB, e.g. mamba SSM state) "
+                    f"for target+draft. Increase free_gpu_memory_fraction or "
+                    f"max_gpu_total_bytes, or reduce max_batch_size (the fixed "
+                    f"cost scales with batch size).")
+            # Defensive: non-GPU budgets zero out the intercept above, so with a
+            # positive budget this branch is currently unreachable for them. It
+            # remains as a safety net guaranteeing that, should a non-GPU budget
+            # ever carry a fixed cost it cannot fit, we degrade gracefully rather
+            # than letting both managers inherit the full budget and
+            # double-allocate it: keep the full budget on the target and zero the
+            # draft's share for this attribute.
+            logger.warning(
+                f"Cannot split KV cache {budget_attr} between target and draft; "
+                f"assigning the draft a zero {budget_attr} budget to avoid "
+                f"double-allocating the full budget.")
+            if draft_kv_cache_config is None:
+                draft_kv_cache_config = target_kv_cache_config.model_copy()
+            else:
+                draft_kv_cache_config = draft_kv_cache_config.model_copy()
+            setattr(draft_kv_cache_config, budget_attr, 0)
+            return target_kv_cache_config, draft_kv_cache_config
+        target_budget, draft_budget = shares
 
         logger.info(
-            f"Splitting KV cache budget: total={total_budget / GB:.2f} GiB, "
+            f"Splitting KV cache {budget_attr}: total={total_budget / GB:.2f} GiB, "
             f"target={target_budget / GB:.2f} GiB ({target_kv}), "
             f"draft={draft_budget / GB:.2f} GiB ({draft_kv})")
 
         split_target_kv_cache_config = target_kv_cache_config.model_copy()
-        split_target_kv_cache_config.max_gpu_total_bytes = target_budget
-        draft_kv_cache_config = target_kv_cache_config.model_copy()
-        draft_kv_cache_config.max_gpu_total_bytes = draft_budget
-
-        host_budget = target_kv_cache_config.host_cache_size
-        if host_budget is not None and host_budget > 0:
-            draft_ratio = draft_budget / total_budget
-            draft_host_budget = int(host_budget * draft_ratio)
-            target_host_budget = host_budget - draft_host_budget
-            split_target_kv_cache_config.host_cache_size = target_host_budget
-            draft_kv_cache_config.host_cache_size = draft_host_budget
-            logger.info(
-                f"Splitting KV cache host budget: total={host_budget / GB:.2f} GiB, "
-                f"target={target_host_budget / GB:.2f} GiB, "
-                f"draft={draft_host_budget / GB:.2f} GiB")
-
-        return split_target_kv_cache_config, draft_kv_cache_config
+        setattr(split_target_kv_cache_config, budget_attr, target_budget)
+        if draft_kv_cache_config is None:
+            split_draft_kv_cache_config = target_kv_cache_config.model_copy()
+        else:
+            split_draft_kv_cache_config = draft_kv_cache_config.model_copy()
+        setattr(split_draft_kv_cache_config, budget_attr, draft_budget)
+        return split_target_kv_cache_config, split_draft_kv_cache_config
 
     def _is_encoder_decoder(self) -> bool:
         return self._model_engine.model.model_config.is_encoder_decoder
@@ -1242,6 +1314,17 @@ class KvCacheCreator:
             CacheType.CROSS,
         )
 
+    def _needs_gpu_kv_cache_budget_split(
+        self,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+    ) -> bool:
+        """Whether max_gpu_total_bytes must be split per manager."""
+        if issubclass(self._kv_cache_manager_cls, KVCacheManagerV2):
+            return self._should_create_separate_draft_kv_cache()
+        kv_cache_config = (kv_cache_config if kv_cache_config is not None else
+                           self._kv_cache_config)
+        return is_vswa_enabled(kv_cache_config)
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
@@ -1260,32 +1343,31 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
-        # For V2 with separate one-model draft KV cache, split the total budget
-        # between target and draft before creating either manager.
-        # Only split for the final managers, not during estimation — estimation
-        # uses max_tokens-based logic and must not have its config mutated.
-        # Two-model draft is excluded: V2 does not support two-model mode.
-        draft_kv_cache_config = None
-        if (not estimating_kv_cache
-                and self._should_create_separate_draft_kv_cache()
-                and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
-            self_kv_cache_config, draft_kv_cache_config = (
-                self._split_kv_cache_budget_for_draft(self_kv_cache_config))
-
-        # Also split for V1 VSWA. The VSWA pool is sized directly from
-        # max_gpu_total_bytes and ignores max_tokens, so without splitting
-        # both target and draft each allocate the full combined budget.
-        # V1 non-VSWA does not need this: max_tokens caps the block count
-        # per model, giving each a proportional share of the budget.
+        # Split combined KV cache budgets before creating managers. Skip during
+        # estimation — estimation uses max_tokens-based logic and must not
+        # mutate the config.
         has_draft = (
             self._draft_model_engine is not None  # two-model
             or self._should_create_separate_draft_kv_cache())  # one-model
-        if (not estimating_kv_cache and has_draft
-                and draft_kv_cache_config is None
-                and not issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)
-                and is_vswa_enabled(self_kv_cache_config)):
-            self_kv_cache_config, draft_kv_cache_config = (
-                self._split_kv_cache_budget_for_draft(self_kv_cache_config))
+        draft_kv_cache_config = None
+        if not estimating_kv_cache and has_draft:
+            # Used when each manager sizes pools from max_gpu_total_bytes (V2
+            # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
+            if self._needs_gpu_kv_cache_budget_split(self_kv_cache_config):
+                self_kv_cache_config, draft_kv_cache_config = (
+                    self._split_kv_cache_budget_for_draft(
+                        "max_gpu_total_bytes", self_kv_cache_config,
+                        draft_kv_cache_config))
+            # KVCacheManagerV2 does not support two-model draft budget splitting.
+            v2_two_model = (issubclass(self._kv_cache_manager_cls,
+                                       KVCacheManagerV2)
+                            and self._draft_model_engine is not None)
+            if not v2_two_model:
+                # Each manager sizes its host pool from host_cache_size directly.
+                self_kv_cache_config, draft_kv_cache_config = (
+                    self._split_kv_cache_budget_for_draft(
+                        "host_cache_size", self_kv_cache_config,
+                        draft_kv_cache_config))
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,

@@ -155,7 +155,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
         )
-        from ..resource_manager import KVCacheManagerV2
+        from ..kv_cache_manager_v2 import KVCacheManagerV2
 
         assert isinstance(kv_cache_manager, KVCacheManagerV2), (
             f"KVCacheV2Scheduler requires KVCacheManagerV2, got {type(kv_cache_manager).__name__}"
@@ -807,7 +807,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_tokens = self._get_optional_encoder_output_len(req)
         if req_tokens is None:
             return ScheduleAction.SCHEDULED
-        from ..resource_manager import KVCacheManagerV2
+        from ..kv_cache_manager_v2 import KVCacheManagerV2
 
         if isinstance(self.cross_kv_cache_manager, KVCacheManagerV2):
             if not self._try_schedule_cross_context_v2(
