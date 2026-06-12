@@ -20,7 +20,7 @@ through the ``CUTEDSL`` attention backend
 (``tensorrt_llm/_torch/attention_backend/cute_dsl.py``):
 
 - FP8 path  → ``torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell``
-- FP16 path → ``torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell``
+- FP16/BF16 path → ``torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell``
 
 Only the generation (decode) steps are asserted for numerical correctness.
 The context phase runs solely to populate the paged KV cache and to build the
@@ -54,6 +54,18 @@ _DECODE_CONTEXT_LENGTHS = [
 ]
 _DECODE_NUM_STEPS = 4
 
+# Multi-layer is the structural difference between this single-step test and the
+# real DeepSeek-V3 E2E run (61 MLA layers). With ``num_layers == 1`` the dispatch
+# only ever sees ``layer_idx == 0``, so the per-layer paged-KV resolution in
+# ``CuteDslAttention._dispatch_cute_dsl_mla_decode`` (the
+# ``host_kv_cache_pool_mapping[layer_idx]`` / per-layer ``get_buffers`` /
+# block-offset path) is never exercised. The E2E run produces correct output on
+# the first generated token (which comes from the TRTLLM prefill) and then
+# degenerates on every subsequent CuteDSL decode step — consistent with the
+# decode kernel reading the wrong blocks for ``layer_idx > 0``. Parametrize over
+# >1 layers so the unit test reproduces that real case.
+_DECODE_NUM_LAYERS = [1, 2]
+
 
 def _is_blackwell_sm100() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
@@ -70,12 +82,14 @@ pytestmark = [
 
 # kernel name -> (activation dtype, kv cache dtype)
 #
-# NOTE: only the FP8 decode kernel is currently validated here. The FP16 path
+# NOTE: the float16 instance of the FP16 decode op
 # (``cute_dsl_mla_decode_fp16_blackwell`` with dtype=float16 / fp16 KV cache)
-# aborts the process (SIGABRT) on SM100 in this environment, so it is excluded
-# until that crash is root-caused. Re-add "fp16" below once it is fixed.
+# aborts the process (SIGABRT) on SM100 in this environment, so that exact
+# dtype is excluded until the crash is root-caused. The bf16 instance uses the
+# same op and is covered below for DeepSeek-V3 bf16 runs.
 _KERNEL_DTYPES = {
     "fp8": (torch.bfloat16, torch.float8_e4m3fn),
+    "bf16": (torch.bfloat16, torch.bfloat16),
 }
 
 
@@ -101,20 +115,23 @@ def _build_rope_config(scenario: Scenario) -> RopeConfig:
 
 @pytest.fixture
 def cute_dsl_decode_counter(monkeypatch):
-    """Count CuTe DSL MLA decode dispatches so the test fails on silent
-    fallback to the TRTLLM backend."""
-    from tensorrt_llm._torch.attention_backend.cute_dsl import CuteDslAttention
+    """Count *successful* CuTe DSL MLA decode dispatches so the test fails on
+    silent fallback to the TRTLLM backend.
 
-    # Surface (rather than swallow) kernel errors during the test so a broken
-    # kernel fails loudly instead of falling back.
-    monkeypatch.setenv("TLLM_CUTE_DSL_ATTN_DEBUG_FALLBACK", "1")
+    The increment happens only after the real dispatch returns: if the kernel
+    raises, ``CuteDslAttention.forward`` catches it and falls back to TRTLLM,
+    the counter does not advance, and the per-test assertion on the expected
+    dispatch count fails loudly instead of the broken kernel masquerading as a
+    working one."""
+    from tensorrt_llm._torch.attention_backend.cute_dsl import CuteDslAttention
 
     original = CuteDslAttention._dispatch_cute_dsl_mla_decode
     counter = {"calls": 0}
 
     def _counting_dispatch(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
         counter["calls"] += 1
-        return original(self, *args, **kwargs)
+        return result
 
     monkeypatch.setattr(CuteDslAttention, "_dispatch_cute_dsl_mla_decode", _counting_dispatch)
     return counter
@@ -125,13 +142,14 @@ def cute_dsl_decode_counter(monkeypatch):
     "context_sequence_lengths", _DECODE_CONTEXT_LENGTHS, ids=lambda x: f"ctx_lens={x}"
 )
 @pytest.mark.parametrize("generation_seq_len_q", [1, 4], ids=lambda x: f"gen_seq_len_q={x}")
+@pytest.mark.parametrize("num_layers", _DECODE_NUM_LAYERS, ids=lambda x: f"num_layers={x}")
 def test_cute_dsl_mla_decode(
-    kernel, context_sequence_lengths, generation_seq_len_q, cute_dsl_decode_counter
+    kernel, context_sequence_lengths, generation_seq_len_q, num_layers, cute_dsl_decode_counter
 ):
     """Decode-only MLA validation for the Blackwell CuTe DSL kernels."""
     dtype, kv_cache_dtype = _KERNEL_DTYPES[kernel]
 
-    scenario = Scenario(dtype=dtype, kv_cache_dtype=kv_cache_dtype, num_layers=1)
+    scenario = Scenario(dtype=dtype, kv_cache_dtype=kv_cache_dtype, num_layers=num_layers)
     rope_config = _build_rope_config(scenario)
 
     _run_test_for_backend(

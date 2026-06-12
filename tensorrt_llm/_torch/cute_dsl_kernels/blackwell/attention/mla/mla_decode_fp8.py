@@ -3289,7 +3289,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             return False
         if in_dtype not in [cutlass.Float8E4M3FN]:
             return False
-        if out_dtype not in [cutlass.Float8E4M3FN]:
+        # The epilogue stores through ``self.o_dtype`` (= o.element_type) with a
+        # width-adaptive autovec copy, so a bf16 output is supported alongside
+        # fp8 (matches flashinfer's mla_decode_fp8 can_implement). Inputs stay
+        # fp8; only the attention output dtype is widened.
+        if out_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False
