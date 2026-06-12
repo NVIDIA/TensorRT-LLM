@@ -69,6 +69,7 @@ extensions = [
     'sphinxcontrib.mermaid',
     'trtllm_auto_deploy',
     'trtllm_config_selector',
+    'trtllm_schema_assets',
 ]
 
 if HAS_CPP_XML:

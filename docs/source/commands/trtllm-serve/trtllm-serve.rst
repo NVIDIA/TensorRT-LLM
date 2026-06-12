@@ -232,6 +232,12 @@ Visual Generation Serving
 
 The ``--extra_visual_gen_options`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/generations``, and video management APIs.
 
+For IDE validation of visual generation YAML files, use the `VisualGen config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-visual-gen-config.schema.json>`_ with YAML language servers:
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-visual-gen-config.schema.json
+
 For full details, see the :doc:`../../models/visual-generation.md` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
 
 Multi-node Serving with Slurm
@@ -335,6 +341,14 @@ To configure the nested level arguments like ``moe_config.backend``, the yaml fi
 
    moe_config:
        backend: CUTLASS
+
+For IDE validation and completion, TensorRT-LLM publishes a `trtllm-serve config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json>`_ for ``trtllm-serve serve --config``. Add the schema directive at the top of a config file when using a YAML language server. For the AutoDeploy backend, use the `AutoDeploy config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-autodeploy-config.schema.json>`_, and for the orchestrator config passed to ``trtllm-serve disaggregated --config``, use the `disaggregated orchestrator config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-disagg-config.schema.json>`_.
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json
+
+The schema validates the static structure of the YAML file. Runtime validation remains authoritative for model-dependent checks, GPU-dependent checks, cross-field constraints, and file existence checks. Replace ``latest`` with a specific TensorRT-LLM version (e.g., ``1.3.0rc14``) to pin the schema to that release.
 
 Syntax
 ------
