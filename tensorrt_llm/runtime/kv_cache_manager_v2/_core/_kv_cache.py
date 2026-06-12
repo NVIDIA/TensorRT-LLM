@@ -365,7 +365,22 @@ class _KVCache:
     # (beam_index >= beam_width) will be lost.
     @beam_width.setter
     def beam_width(self, beam_width: BeamIndex) -> None:
-        raise NotImplementedError("Not implemented yet for beam search")
+        if beam_width < 1:
+            raise ValueError("beam_width must be positive")
+        if beam_width == self._beam_width:
+            return
+        if self.status == self.Status.CLOSED:
+            raise LogicError("Cannot change beam_width after close()")
+        if beam_width < self._beam_width:
+            with self._record_event():
+                for block in self._blocks:
+                    del block.pages[beam_width:]
+                del self._ssm_blocks[beam_width:]
+                del self._base_page_indices[beam_width:]
+        else:
+            self._append_beams(self._beam_width, beam_width)
+        self._beam_width = beam_width
+        assert NDEBUG or self._check_sanity()
 
     # Get the indices of memory blocks for each beam.
     def get_base_page_indices(
@@ -695,24 +710,20 @@ class _KVCache:
     # notify KV cache manager that we have some finalized/accepted tokens. If a block becomes full,
     # also commit the block for reuse.
     # In case of beam search, this should be called only with finalized (converged) tokens, and the
-    # token data must be in the 0th beam.
-    # We'll destroy memory blocks for other beams if the whole block is full and committed.
+    # token data must be in the 0th beam. When a full block is committed, it is published as a
+    # beam0-canonical reusable block and memory pages for other beams are dropped.
     # Committed tokens are always history, so history_length will be automatically updated to maintain
     # (num_committed_tokens <= history_length). Note that history_length increase may trigger out-of-window
     # block eviction/dropping for SWA layers.
-    # beam_search_indices: indices indicating which candidate to choose for each token. A block with all
-    # tokens committed will be unified to one memory page and the other memory pages are dropped. Only for
-    # beam search.
+    # beam_search_indices is reserved for future use and must be None.
     def commit(
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
     ):
-        if self.beam_width != 1:
-            raise NotImplementedError("Not implemented yet for beam search")
+        assert beam_search_indices is None
         if not accepted_input_tokens:
             return
-        assert beam_search_indices is None
         assert self.status == self.Status.ACTIVE
         if self._commit_state == self.CommitState.USER_STOP:
             raise LogicError("Cannot commit tokens after stop_committing()")
@@ -746,9 +757,16 @@ class _KVCache:
             return
         assert self._commit_state == self.CommitState.ALLOWED
         if self.num_committed_tokens % self.tokens_per_block != 0:
-            ordinal = _KVCache._to_block_ordinal(self.tokens_per_block, self.num_committed_tokens)
-            with self._record_event():
-                self._commit_block(ordinal, True)
+            if self.manager.enable_partial_match:
+                ordinal = _KVCache._to_block_ordinal(
+                    self.tokens_per_block, self.num_committed_tokens
+                )
+                with self._record_event():
+                    self._commit_block(ordinal, True)
+            else:
+                # The partial suffix is finalized, but only full blocks are published for reuse.
+                self._commit_state = self.CommitState.USER_STOP
+                self._on_stop_committing()
         else:
             self._commit_state = self.CommitState.USER_STOP
             self._on_stop_committing()
@@ -1321,6 +1339,139 @@ class _KVCache:
     def _storage(self) -> StorageManager:
         return self.manager._storage
 
+    def _append_beams(self, old_beam_width: BeamIndex, new_beam_width: BeamIndex) -> None:
+        if self.status != self.Status.ACTIVE:
+            if self.num_blocks != 0 or any(
+                any(b is not None for b in beam) for beam in self._ssm_blocks
+            ):
+                raise NotImplementedError(
+                    "Changing beam_width on a suspended non-empty KV cache is not supported"
+                )
+
+        storage = self._storage
+        num_life_cycles = storage.num_life_cycles
+        slot_counts = filled_list(0, num_life_cycles)
+        num_new_beams = int(new_beam_width - old_beam_width)
+        for ordinal, block in typed_enumerate(self._blocks):
+            if self._is_block_before_history_cursor(ordinal):
+                continue
+            source_beam_block = block.pages[DEFAULT_BEAM_INDEX]
+            for lc, source_holder in typed_enumerate(source_beam_block):
+                if source_holder is not None:
+                    slot_counts[lc] += num_new_beams
+
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        if ssm_lc_id is not None and self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] is not None:
+            slot_counts[ssm_lc_id] += num_new_beams
+
+        new_slots = (
+            storage.new_gpu_slots(slot_counts)
+            if any(count > 0 for count in slot_counts)
+            else make_typed(lambda _: list[Slot](), num_life_cycles)
+        )
+        # These CPU-side containers do not depend on slot readiness.
+        for _ in typed_range(old_beam_width, new_beam_width):
+            self._base_page_indices.append(
+                make_typed(
+                    lambda _: array.array("i", [BAD_PAGE_INDEX]) * self.num_blocks,
+                    num_life_cycles,
+                )
+            )
+
+        new_slot_ready_events = tuple(slot.ready_event for slot in chain.from_iterable(new_slots))
+        if any(
+            type(indices) is memoryview
+            for beam_indices in self._base_page_indices
+            for indices in beam_indices
+        ):
+            pending_ready_events = [
+                event for event in set(new_slot_ready_events) if not event.query_complete()
+            ]
+            for event in pending_ready_events:
+                event.synchronize()
+            for slot in chain.from_iterable(new_slots):
+                slot.ready_event = CachedCudaEvent.NULL
+        if new_slot_ready_events:
+            stream_wait_events(self.cuda_stream, new_slot_ready_events)
+
+        for ordinal, block in typed_enumerate(self._blocks):
+            source_beam_block = block.pages[DEFAULT_BEAM_INDEX]
+            block_before_history_cursor = self._is_block_before_history_cursor(ordinal)
+            if block_before_history_cursor:
+                continue
+            for beam_idx in typed_range(old_beam_width, new_beam_width):
+                new_beam_block: TypedIndexList[LifeCycleId, BlockPage] = filled_list(
+                    cast(BlockPage, None), num_life_cycles
+                )
+                for lc, source_holder in typed_enumerate(source_beam_block):
+                    if source_holder is None:
+                        continue
+
+                    source_page = source_holder.page
+                    slot = new_slots[lc].pop()
+                    # Beam expansion copies existing non-historical GPU pages into new beam pages.
+                    # Fully historical blocks remain unmapped for new beams.
+                    assert source_page.cache_level == GPU_LEVEL
+                    source_lock = source_page.lock(self, beam_idx, ordinal, lc, skip_wait=False)
+                    self._copy_gpu_page_storage_to_slot(source_lock.page, slot)
+                    with self._record_event():
+                        source_lock.unlock()
+                    new_page = UncommittedPage(self, ordinal, lc, GPU_LEVEL, slot, beam_idx)
+                    new_beam_block[lc] = new_page.lock(self, beam_idx, ordinal, lc, skip_wait=True)
+                block.pages.append(new_beam_block)
+
+        source_ssm_holder = (
+            self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] if ssm_lc_id is not None else None
+        )
+        for beam_idx in typed_range(old_beam_width, new_beam_width):
+            new_ssm_block: TypedIndexList[LifeCycleId, BlockPage] = filled_list(
+                cast(BlockPage, None), num_life_cycles
+            )
+            if ssm_lc_id is not None and source_ssm_holder is not None:
+                slot = new_slots[ssm_lc_id].pop()
+                # SSM state is copied during beam expansion only while resident on GPU.
+                assert source_ssm_holder.page.cache_level == GPU_LEVEL
+                source_lock = source_ssm_holder.page.lock(
+                    self, beam_idx, BAD_BLOCK_ORDINAL, ssm_lc_id, skip_wait=False
+                )
+                self._copy_gpu_page_storage_to_slot(source_lock.page, slot)
+                with self._record_event():
+                    source_lock.unlock()
+                new_page = UncommittedPage(
+                    self, BAD_BLOCK_ORDINAL, ssm_lc_id, GPU_LEVEL, slot, beam_idx
+                )
+                new_ssm_block[ssm_lc_id] = new_page.lock(
+                    self, beam_idx, BAD_BLOCK_ORDINAL, ssm_lc_id, skip_wait=True
+                )
+            self._ssm_blocks.append(new_ssm_block)
+
+        assert all(len(slots) == 0 for slots in new_slots)
+
+    def _block_start_token(self, ordinal: BlockOrdinal) -> int:
+        return int(ordinal) * self.tokens_per_block
+
+    def _block_end_token(self, ordinal: BlockOrdinal) -> int:
+        return int(ordinal + 1) * self.tokens_per_block
+
+    def _is_block_before_history_cursor(self, ordinal: BlockOrdinal) -> bool:
+        return self._block_end_token(ordinal) <= self.history_length
+
+    def _copy_gpu_page_storage_to_slot(self, source_page: Page, dst_slot: Slot) -> None:
+        assert source_page.cache_level == GPU_LEVEL
+        storage = self._storage
+        pg_idx = storage.get_pool_group_index(source_page.life_cycle)
+        slot_sizes = storage.slot_size(pg_idx)
+        gpu_tier = storage.cache_tiers[GPU_LEVEL]
+        for pool_idx in typed_range(storage.num_pools(pg_idx)):
+            num_bytes = slot_sizes[pool_idx]
+            if num_bytes == 0:
+                continue
+            dst = storage.slot_address(GPU_LEVEL, pg_idx, dst_slot.slot_id, pool_idx)
+            src = storage.slot_address(
+                source_page.cache_level, pg_idx, source_page.slot_id, pool_idx
+            )
+            batched_copy(gpu_tier, gpu_tier, num_bytes, [CopyTask(dst, src)], self.cuda_stream)
+
     @staticmethod
     def _to_block_ordinal(tokens_per_block: int, token_ordinal: int) -> BlockOrdinal:
         return BlockOrdinal(token_ordinal // tokens_per_block)
@@ -1381,7 +1532,7 @@ class _KVCache:
         for ordinal, block in typed_enumerate(self._blocks):
             is_committed = self._never_resumed or ordinal < self._num_committed_blocks
             assert is_committed == block.is_committed
-            for beam_block in block.pages:
+            for beam_idx, beam_block in typed_enumerate(block.pages):
                 assert typed_len(beam_block) == num_life_cycles
                 for lc in typed_range(num_life_cycles):
                     holder = beam_block[lc]
@@ -1406,6 +1557,12 @@ class _KVCache:
                         is_scratch = ordinal in sr
                         if is_scratch:
                             assert holder is None
+                        elif (
+                            holder is None
+                            and beam_idx != DEFAULT_BEAM_INDEX
+                            and self._is_block_before_history_cursor(ordinal)
+                        ):
+                            pass
                         else:
                             assert isinstance(
                                 holder, (_SharedPageLock if self.is_active else _PageHolder)

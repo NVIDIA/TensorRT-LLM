@@ -155,6 +155,7 @@ l0_b200:
   - unittest/kv_cache_manager_v2_tests/
   # ------------- KV Cache V2 Scheduler IT ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_v2_vs_v1_basic
+  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_beam_search_v2_vs_v1
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_token_budget_limited
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill_multi_request
