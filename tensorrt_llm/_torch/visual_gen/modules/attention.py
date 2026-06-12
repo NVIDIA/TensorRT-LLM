@@ -182,10 +182,11 @@ class Attention(nn.Module):
         # The async-ulysses path uses SEPARATE_QKV for stream-pipelined
         # V/Q/K projections AND still needs the head-sharding wrap — opt in
         # via async_ulysses=True.
+        cp_size = vgm.cp_size if vgm else 1
         use_ulysses = (
             ulysses_size > 1
             and enable_sequence_parallel
-            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses)
+            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses or cp_size == 1)
         )
 
         # Compute head counts for the backend
