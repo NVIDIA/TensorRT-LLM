@@ -518,6 +518,36 @@ def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,
     assert result.reasoning_content == finish_reasoning
 
 
+@pytest.mark.parametrize(
+    ("text", "content", "reasoning_context", "chat_template_kwargs"),
+    [
+        # Thinking on (default): Qwen3.5's chat template pre-injects an unclosed
+        # `<think>` into the generation prompt, so the model output begins inside
+        # the reasoning block with no opening tag -> reasoning_at_start=True.
+        ("a b", "", "a b", None),
+        (f"a {R1_END} b", " b", "a ", None),
+        (f"a {R1_END} b", " b", "a ", {
+            "enable_thinking": True
+        }),
+        # Thinking off: enable_thinking=False flips reasoning_at_start to False,
+        # so the (think-free) output is returned as content.
+        ("a b", "a b", "", {
+            "enable_thinking": False
+        }),
+        (f"a {R1_END} b", f"a {R1_END} b", "", {
+            "enable_thinking": False
+        }),
+    ])
+def test_qwen3_5_reasoning_parser(text: str, content: str,
+                                  reasoning_context: str,
+                                  chat_template_kwargs: dict):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "qwen3_5", chat_template_kwargs)
+    result = reasoning_parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_context
+
+
 # ---------------------------------------------------------------------------
 # Auto-detection tests for resolve_auto_reasoning_parser
 # ---------------------------------------------------------------------------
@@ -595,6 +625,33 @@ def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "qwen3"
+
+
+def test_auto_detect_qwen3_5_moe(tmp_path):
+    """Qwen3.5 MoE → dedicated 'qwen3_5' parser, not the generic 'qwen3'.
+
+    Qwen3.5's template pre-injects an unclosed `<think>` even though it also
+    exposes an `enable_thinking` toggle, so routing must be by model_type and
+    must not fall into the generic qwen3 hybrid heuristic (which returns
+    'qwen3' / reasoning_at_start=False and would mis-split the output).
+    """
+    model_dir = str(tmp_path / "Qwen3.5-397B-A17B-NVFP4")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3_5_moe")
+    _write_tokenizer_config(model_dir, _HYBRID_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3_5"
+
+
+def test_auto_detect_qwen3_5_dense(tmp_path):
+    """Dense Qwen3.5 (model_type 'qwen3_5') also resolves to 'qwen3_5'."""
+    model_dir = str(tmp_path / "Qwen3.5-4B")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3_5")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3_5"
 
 
 def test_auto_detect_deepseek_r1(tmp_path):
