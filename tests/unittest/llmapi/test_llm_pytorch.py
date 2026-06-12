@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import pathlib
 import random
 import time
@@ -1110,9 +1111,6 @@ def _write_routed_expert_lora_adapter(save_dir: str, *, moe_layers: list[int],
     down_proj (moe_4h_to_h), keyed as .../mlp.experts.{e}.{proj}.lora_{A,B}.weight.
     lora_B is non-zero so each adapter perturbs the routed-expert output.
     """
-    import json
-    import os
-
     generator = torch.Generator().manual_seed(seed)
 
     def randn(rows, cols, std=0.02):
@@ -1182,8 +1180,6 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
     w1/w2/w3 for routed experts. lora_B is non-zero so each adapter perturbs the
     routed-expert output, letting the test assert the LoRA is actually applied.
     """
-    import json
-
     # Select the execution path. The eager device path is forced via env var
     # (read once at FusedMoeRunner construction); the CUDA-graph path always
     # takes the slot-indexed device path, so it needs no env opt-in.
