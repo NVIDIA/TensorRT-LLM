@@ -120,6 +120,22 @@ def _dequantize_state(state_quant: torch.Tensor, decode_scale: torch.Tensor):
     return state_quant.to(torch.float32) * decode_scale.unsqueeze(-1)
 
 
+def _make_strided_state_with_slot_gap(state: torch.Tensor, slot_gap_rows: int):
+    cache_size, nheads, head_dim, d_state = state.shape
+    ssm_rows_per_slot = nheads * head_dim
+    backing = torch.empty(
+        cache_size,
+        ssm_rows_per_slot + slot_gap_rows,
+        d_state,
+        device=state.device,
+        dtype=state.dtype,
+    )
+    backing[:, ssm_rows_per_slot:].fill_(float("nan"))
+    strided_state = backing[:, :ssm_rows_per_slot].view_as(state)
+    strided_state.copy_(state)
+    return strided_state, backing
+
+
 def _maybe_skip_dtype(state_dtype, use_sr):
     """Skip on insufficient SM.  fp8 e4m3fn (any) needs SM 89+; fp16/fp8 SR
     needs SM 100+; int8/int16 (RN or SR) runs anywhere."""
@@ -127,6 +143,130 @@ def _maybe_skip_dtype(state_dtype, use_sr):
         pytest.skip("fp8_e4m3fn requires SM 89+ (Ada Lovelace / Hopper / Blackwell)")
     if use_sr and state_dtype in (torch.float16, torch.float8_e4m3fn) and get_sm_version() < 100:
         pytest.skip(f"{state_dtype} stochastic rounding requires SM 100+ (Blackwell B200+)")
+
+
+@pytest.mark.skipif(get_sm_version() < 90, reason="TMA descriptor path requires SM 90+")
+@pytest.mark.parametrize("block_size_m", [8, 64], ids=["M8", "M64"])
+@pytest.mark.parametrize("rectangle_for_nowrite", [False, True], ids=["replay_nowrite", "rect"])
+def test_replay_tma_strided_state_layout_matches_contiguous(rectangle_for_nowrite, block_size_m):
+    """Block-reuse packs conv state after each slot's SSM state."""
+    torch.manual_seed(123)
+
+    cache_size = 4
+    batch = 2
+    T = 8
+    max_window = 16
+    nheads = 16
+    head_dim = 64
+    d_state = 128
+    ngroups = 1
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.float32
+    state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
+
+    state0 = torch.randn(cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype)
+    d_inner = nheads * head_dim
+    conv_dim = d_inner + 2 * ngroups * d_state
+    slot_gap_rows = conv_dim * 4 // d_state
+    assert (conv_dim * 4) % d_state == 0
+
+    old_x = torch.randn(cache_size, 2, max_window, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, max_window, device=device, dtype=torch.float32)
+    old_dA_cumsum = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    prev_tokens = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    prev_tokens[state_batch_indices[0]] = 4
+    prev_tokens[state_batch_indices[1]] = 12
+    n_writes, replay_work_items = _make_replay_work_items(
+        prev_tokens,
+        cache_buf_idx,
+        T,
+        max_window,
+        batch,
+        state_batch_indices,
+        device,
+    )
+
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    D = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
+    dt_bias = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
+
+    dense_state = state0.clone()
+    strided_state, strided_backing = _make_strided_state_with_slot_gap(state0, slot_gap_rows)
+    strided_gap = strided_backing[:, nheads * head_dim :]
+    dense_out = torch.empty(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    strided_out = torch.empty_like(dense_out)
+    dense_old_x = old_x.clone()
+    dense_old_B = old_B.clone()
+    dense_old_dt = old_dt.clone()
+    dense_old_dA_cumsum = old_dA_cumsum.clone()
+    strided_old_x = old_x.clone()
+    strided_old_B = old_B.clone()
+    strided_old_dt = old_dt.clone()
+    strided_old_dA_cumsum = old_dA_cumsum.clone()
+
+    common_kwargs = dict(
+        prev_num_accepted_tokens=prev_tokens,
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+        n_writes=n_writes,
+        replay_work_items=replay_work_items,
+        use_internal_pdl=False,
+        rectangle_for_nowrite=rectangle_for_nowrite,
+        mode="persistent_dynamic",
+        _block_size_m=block_size_m,
+        _use_tma_rect_load=True,
+        _use_tma_replay_write_load=True,
+        _use_tma_replay_write_store=True,
+        _use_tma_replay_nowrite_load=True,
+        _require_tma_state_layout=True,
+    )
+
+    replay_selective_state_update(
+        dense_state,
+        dense_old_x,
+        dense_old_B,
+        dense_old_dt,
+        dense_old_dA_cumsum,
+        cache_buf_idx.clone(),
+        out=dense_out,
+        **common_kwargs,
+    )
+    replay_selective_state_update(
+        strided_state,
+        strided_old_x,
+        strided_old_B,
+        strided_old_dt,
+        strided_old_dA_cumsum,
+        cache_buf_idx.clone(),
+        out=strided_out,
+        **common_kwargs,
+    )
+
+    torch.testing.assert_close(strided_out, dense_out, rtol=0, atol=0)
+    torch.testing.assert_close(strided_state, dense_state, rtol=0, atol=0)
+    torch.testing.assert_close(strided_old_x, dense_old_x, rtol=0, atol=0)
+    torch.testing.assert_close(strided_old_B, dense_old_B, rtol=0, atol=0)
+    torch.testing.assert_close(strided_old_dt, dense_old_dt, rtol=0, atol=0)
+    torch.testing.assert_close(strided_old_dA_cumsum, dense_old_dA_cumsum, rtol=0, atol=0)
+    assert torch.isnan(strided_gap).all()
 
 
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)

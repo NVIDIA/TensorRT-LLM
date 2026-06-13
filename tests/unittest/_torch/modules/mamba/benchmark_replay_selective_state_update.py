@@ -515,6 +515,34 @@ def _build_replay_work_items_cpu(
 _TENSOR_CACHE: dict = {}
 
 
+def _empty_state_with_slot_gap(
+    batch: int,
+    nheads: int,
+    head_dim: int,
+    d_state: int,
+    state_dtype: torch.dtype,
+    device: str,
+    slot_gap_rows: int,
+):
+    if slot_gap_rows == 0:
+        return torch.empty(batch, nheads, head_dim, d_state, device=device, dtype=state_dtype)
+
+    ssm_rows_per_slot = nheads * head_dim
+    rows_per_slot = ssm_rows_per_slot + slot_gap_rows
+    backing = torch.empty(batch, rows_per_slot, d_state, device=device, dtype=state_dtype)
+    return backing[:, :ssm_rows_per_slot].view(batch, nheads, head_dim, d_state)
+
+
+def _clone_state_preserving_layout(state: torch.Tensor):
+    if state.is_contiguous():
+        return state.clone()
+    clone = torch.empty_strided(
+        tuple(state.shape), state.stride(), device=state.device, dtype=state.dtype
+    )
+    clone.copy_(state)
+    return clone
+
+
 def _build_tensors(
     batch: int,
     mtp_len: int,
@@ -525,6 +553,7 @@ def _build_tensors(
     d_state: int,
     ngroups: int,
     max_window: int | None = None,
+    strided_state_cache: bool = False,
 ):
     """
     Build all tensors for one benchmark configuration.
@@ -544,7 +573,17 @@ def _build_tensors(
     device = "cuda"
 
     # Cache lookup — grow batch in place if needed; else return views.
-    cache_key = (state_dtype, act_dtype, max_window, mtp_len, nheads, head_dim, d_state, ngroups)
+    cache_key = (
+        state_dtype,
+        act_dtype,
+        max_window,
+        mtp_len,
+        nheads,
+        head_dim,
+        d_state,
+        ngroups,
+        strided_state_cache,
+    )
     cached = _TENSOR_CACHE.get(cache_key)
     if cached is not None and cached["max_batch"] >= batch:
         # Hit — return slices for current batch.
@@ -587,6 +626,20 @@ def _build_tensors(
 
     torch.manual_seed(42)
 
+    d_inner = nheads * head_dim
+    conv_dim = d_inner + 2 * ngroups * d_state
+    d_conv = 4  # conv kernel width for Nemotron/Mamba2
+    slot_gap_rows = 0
+    if strided_state_cache:
+        conv_state_elems_per_slot = conv_dim * d_conv
+        if conv_state_elems_per_slot % d_state != 0:
+            raise ValueError(
+                "strided state cache requires conv state to be an integer "
+                f"number of d_state rows, got {conv_state_elems_per_slot=} "
+                f"and {d_state=}"
+            )
+        slot_gap_rows = conv_state_elems_per_slot // d_state
+
     # --- SSM parameters (float32, tie_hdim strides) ---
     A_base = -torch.rand(nheads, device=device) - 0.5
     A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)  # stride(-1)=0, stride(-2)=0
@@ -618,11 +671,20 @@ def _build_tensors(
         state_scales0 = (1.0 / encode_scale).to(torch.float32)  # decode scale
         scaled = state_fp32 * encode_scale.unsqueeze(-1)
         if state_dtype == torch.float8_e4m3fn:
-            state0 = scaled.clamp(-quant_max, quant_max).to(state_dtype)
+            state0_dense = scaled.clamp(-quant_max, quant_max).to(state_dtype)
         else:
-            state0 = scaled.round().clamp(-quant_max, quant_max).to(state_dtype)
+            state0_dense = scaled.round().clamp(-quant_max, quant_max).to(state_dtype)
+        state0 = _empty_state_with_slot_gap(
+            batch, nheads, head_dim, d_state, state_dtype, device, slot_gap_rows
+        )
+        state0.copy_(state0_dense)
     else:
-        state0 = torch.randn(batch, nheads, head_dim, d_state, device=device, dtype=state_dtype)
+        state0 = _empty_state_with_slot_gap(
+            batch, nheads, head_dim, d_state, state_dtype, device, slot_gap_rows
+        )
+        state0.copy_(
+            torch.randn(batch, nheads, head_dim, d_state, device=device, dtype=state_dtype)
+        )
         state_scales0 = None
 
     # --- Cache tensors for replay kernel ---
@@ -662,10 +724,6 @@ def _build_tensors(
     out_base = torch.zeros(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
 
     # --- Conv1d tensors (for --with-conv1d mode) ---
-    d_inner = nheads * head_dim
-    conv_dim = d_inner + 2 * ngroups * d_state
-    d_conv = 4  # conv kernel width for Nemotron/Mamba2
-
     # xbc_input: (batch, conv_dim, mtp_len) — "hot" input from in_proj.
     # Match production layout: in_proj output is (batch*mtp_len, conv_dim)
     # contiguous, then .view(batch, mtp_len, conv_dim).transpose(1, 2)
@@ -2658,6 +2716,7 @@ def _bench_config(
         args.d_state,
         args.tp_ngroups,
         max_window=getattr(args, "max_window", None) or None,
+        strided_state_cache=getattr(args, "strided_state_cache", False),
     )
 
     nheads = args.tp_nheads
@@ -2680,7 +2739,7 @@ def _bench_config(
     if mode != "persistent_main" and nowrite_first:
         return
 
-    state_work = state0.clone()
+    state_work = _clone_state_preserving_layout(state0)
     state_scales_work = state_scales0.clone() if state_scales0 is not None else None
     old_x_work = old_x0.clone()
     old_B_work = old_B0.clone()
@@ -3330,6 +3389,8 @@ def _bench_config(
                     extra_kwargs["_use_tma_replay_nowrite_load"] = bool(use_tma_replay_nowrite_load)
                 if use_tma_replay_write_store is not None:
                     extra_kwargs["_use_tma_replay_write_store"] = bool(use_tma_replay_write_store)
+                if getattr(args, "require_tma_state_layout", False):
+                    extra_kwargs["_require_tma_state_layout"] = True
                 if cta_per_sm is not None:
                     extra_kwargs["_cta_per_sm"] = cta_per_sm
                 if num_loop_stages is not None:
@@ -4825,6 +4886,21 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated 0/1 sweep.  TMA state STORE in replay main "
         "for the checkpoint/write half.  Independent from all load TMA flags.",
+    )
+    parser.add_argument(
+        "--strided-state-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allocate SSM state as a view with block-reuse-like gaps between "
+        "cache slots.  Used to validate TMA descriptor handling for recurrent "
+        "state pools that pack SSM and conv state together.",
+    )
+    parser.add_argument(
+        "--require-tma-state-layout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Raise instead of falling back if a TMA state path is requested "
+        "but the state layout cannot be represented by the 2D descriptor.",
     )
     parser.add_argument(
         "--modes",

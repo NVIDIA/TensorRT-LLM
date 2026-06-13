@@ -3470,6 +3470,7 @@ def replay_selective_state_update(
     _use_tma_replay_write_load: bool | None = None,  # SSM state load when WRITE_CHECKPOINT=True
     _use_tma_replay_write_store: bool | None = None,  # SSM state store when WRITE_CHECKPOINT=True
     _use_tma_replay_nowrite_load: bool | None = None,  # SSM state load when WRITE_CHECKPOINT=False
+    _require_tma_state_layout: bool = False,
     # Persistent-mode tuning kwargs (consulted for both pd and pm; pd uses
     # _cta_per_sm / _num_loop_stages, pm uses the _write/_nowrite splits):
     # _cta_per_sm : int — CTAs per SM in the 1D persistent grid.  Internally
@@ -3590,6 +3591,12 @@ def replay_selective_state_update(
     #       launch order only.
     # Note: mode-and-knob resolution from the default-tuning table happens
     # below, after we have `batch` and `nheads`.
+    caller_forced_tma_state = (
+        _use_tma_rect_load is True
+        or _use_tma_replay_write_load is True
+        or _use_tma_replay_write_store is True
+        or _use_tma_replay_nowrite_load is True
+    )
 
     # --- Hardware support gates ---
     # fp8 e4m3fn (any rounding mode) needs SM 89+ for the fp32↔e4m3 cvt PTX
@@ -3990,42 +3997,80 @@ def replay_selective_state_update(
         state_scales_arg = state  # any valid pointer; gated by QUANT_MAX == 0
         state_scales_strides = (0, 0, 0)
 
-    # Per-path TMA descriptors for state — write-side and nowrite-side.  Each
-    # kernel launch consumes the descriptor whose block_shape[0] matches its
-    # BLOCK_SIZE_M constexpr.  With M-split (Mw != Mnw) the two sides need
-    # distinct descriptors; otherwise the descriptor's block_shape[0] would
-    # mismatch the kernel's BLOCK_SIZE_M and downstream tl.dot / arithmetic
-    # on the loaded tile fails shape inference at compile time
-    # ("Cannot make_shape_compatible: incompatible dimensions").  When Mw ==
-    # Mnw (tied, the common case) the two descriptors are the same object.
-    # Same memory (state's flat 2D view, shape (cache*nheads*dim, dstate))
-    # and same dstate block_shape — only block_shape[0] differs.
-    # When no TMA flag is on, both variables hold the raw `state` tensor as a
-    # dummy; kernels never reference it because their constexprs are all
-    # False (Triton DCEs the dead branches).
-    # `triton.set_allocator()` must run before any descriptor-using launch.
-    if (
+    # Per-path TMA descriptors for state — write-side and nowrite-side.
+    # Kernels see state as a 2D row-space: [cache/head/dim row, dstate].
+    # Dense tensors use the original flat view. Block-reuse cache tensors may
+    # have a gap between slots (conv state packed after SSM state), but the
+    # per-slot SSM rows are still dense and can use the same 2D row-space with
+    # explicit strides. Unsupported layouts fall back to raw loads/stores.
+    use_tma_state = (
         _use_tma_rect_load
         or _use_tma_replay_write_load
         or _use_tma_replay_write_store
         or _use_tma_replay_nowrite_load
-    ):
+    )
+    if use_tma_state:
+        state_row_stride = state.stride(2)
+        tma_state_supported = (
+            state.stride(-1) == 1
+            and state_row_stride > 0
+            and state.stride(1) == dim * state_row_stride
+            and state.stride(0) % state_row_stride == 0
+            and (state_row_stride * state.element_size()) % 16 == 0
+        )
+        if not tma_state_supported:
+            if _require_tma_state_layout or caller_forced_tma_state:
+                raise AssertionError(
+                    "TMA state layout requires inner stride 1, dense dim rows "
+                    "within each head, cache stride aligned to dim-row stride, "
+                    "and 16-byte-aligned row stride; got "
+                    f"shape={tuple(state.shape)} strides={state.stride()}"
+                )
+            _use_tma_rect_load = False
+            _use_tma_replay_write_load = False
+            _use_tma_replay_write_store = False
+            _use_tma_replay_nowrite_load = False
+            use_tma_state = False
+
+    # Each kernel launch consumes the descriptor whose block_shape[0] matches
+    # its BLOCK_SIZE_M constexpr. With M-split (Mw != Mnw) the two sides need
+    # distinct descriptors; otherwise the descriptor's block_shape[0] would
+    # mismatch the kernel's BLOCK_SIZE_M and downstream tl.dot/arithmetic on
+    # the loaded tile fails shape inference at compile time. When no TMA flag
+    # is on, both variables hold raw `state` as a dummy; kernels never
+    # reference it because their constexprs are all False.
+    if use_tma_state:
         from triton.tools.tensor_descriptor import TensorDescriptor
 
         _ensure_tma_allocator()
-        assert state.is_contiguous(), "TMA state requires contiguous state"
-        assert state.stride(-1) == 1, "TMA state requires inner stride 1"
-        _state_flat = state.view(-1, state.shape[-1])
+        if state.is_contiguous():
+            state_tma_base = state.view(-1, state.shape[-1])
+            make_state_tma_descriptor = TensorDescriptor.from_tensor
+        else:
+            slot_stride_rows = state.stride(0) // state_row_stride
+            state_rows = (cache_size - 1) * slot_stride_rows + nheads * dim
+            state_tma_base = state
+            state_tma_shape = [state_rows, dstate]
+            state_tma_strides = [state_row_stride, state.stride(3)]
+
+            def make_state_tma_descriptor(_state, block_shape):
+                return TensorDescriptor(
+                    _state,
+                    state_tma_shape,
+                    state_tma_strides,
+                    block_shape=block_shape,
+                )
+
         _dstate_pow2 = triton.next_power_of_2(dstate)
-        state_tma_descriptor_write = TensorDescriptor.from_tensor(
-            _state_flat,
+        state_tma_descriptor_write = make_state_tma_descriptor(
+            state_tma_base,
             block_shape=[BLOCK_SIZE_M_WRITE, _dstate_pow2],
         )
         if BLOCK_SIZE_M_NOWRITE == BLOCK_SIZE_M_WRITE:
             state_tma_descriptor_nowrite = state_tma_descriptor_write
         else:
-            state_tma_descriptor_nowrite = TensorDescriptor.from_tensor(
-                _state_flat,
+            state_tma_descriptor_nowrite = make_state_tma_descriptor(
+                state_tma_base,
                 block_shape=[BLOCK_SIZE_M_NOWRITE, _dstate_pow2],
             )
     else:
