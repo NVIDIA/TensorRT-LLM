@@ -283,6 +283,7 @@ class PyResult:
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
+        first_gen_log_probs: TokenLogprobs | None = None
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
         mrope_position_deltas: dict[str, Any] | None = None
@@ -327,6 +328,7 @@ class PyResult:
             use_chunked_generation_logits=use_chunked_generation_logits,
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
+        self._first_gen_log_probs: Optional[TokenLogprobs] = None
         self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
         self._mrope_position_ids = None
         self._mrope_position_deltas = None
@@ -364,6 +366,8 @@ class PyResult:
                 self._generation_logits.append(generation_logits)
         if diff.reset_log_probs is not None:
             self._log_probs.set_log_probs(*diff.reset_log_probs)
+        if diff.first_gen_log_probs is not None:
+            self._first_gen_log_probs = diff.first_gen_log_probs
         if diff.mm_embeddings is not None:
             self._mm_embeddings = diff.mm_embeddings
         if diff.mrope_position_ids is not None:
@@ -467,6 +471,10 @@ class PyResult:
             self._log_probs.set_log_probs(log_probs, cum_log_probs)
             self.diff.reset_log_probs = (log_probs, cum_log_probs)
 
+    def set_first_gen_log_probs(self, log_probs: TokenLogprobs):
+        self._first_gen_log_probs = log_probs
+        self.diff.first_gen_log_probs = log_probs
+
     @property
     def context_logits(self) -> torch.Tensor | None:
         if self._context_logits is None or (storage := self._context_logits.get(
@@ -518,6 +526,10 @@ class PyResult:
         return self._log_probs.cum_log_probs
 
     @property
+    def first_gen_log_probs(self) -> TokenLogprobs | None:
+        return self._first_gen_log_probs
+
+    @property
     def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:
         """Returns a list of SharedTensorContainer handles, one per multimodal item."""
         return self._mm_embeddings
@@ -567,9 +579,10 @@ class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handles', 'additional_context_outputs',
-         'additional_generation_outputs', 'encoder_output',
-         'mrope_position_ids_handle', 'mrope_position_deltas_handle'))
+         'first_gen_log_probs', 'mm_embedding_handles',
+         'additional_context_outputs', 'additional_generation_outputs',
+         'encoder_output', 'mrope_position_ids_handle',
+         'mrope_position_deltas_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],

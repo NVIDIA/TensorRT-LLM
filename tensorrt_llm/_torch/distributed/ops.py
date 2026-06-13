@@ -707,6 +707,10 @@ class AllReduce(nn.Module):
         # read it here and stash the values as class-level attributes that
         # AllReduceRunner.forward can use during the autotuner warm-up phase.
         extra_attrs = get_model_extra_attrs()
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+            _init_gb10_nccl_symmetric_workaround
+        _init_gb10_nccl_symmetric_workaround()
+
         if extra_attrs:
             from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
                 AllReduceRunner
