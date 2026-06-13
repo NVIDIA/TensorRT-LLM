@@ -1,4 +1,4 @@
-from typing import Optional, Type
+from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
@@ -12,6 +12,9 @@ from .sparse import (get_flashinfer_sparse_attn_attention_backend,
                      get_vanilla_sparse_attn_attention_backend)
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 
 def get_attention_backend(
