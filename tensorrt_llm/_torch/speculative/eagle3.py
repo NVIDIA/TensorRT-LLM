@@ -1200,8 +1200,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         '''
 
         d2t = getattr(getattr(draft_model, 'model', None), "d2t", None)
-        if (spec_metadata.use_rejection_sampling and draft_step is not None
-                and not spec_metadata.is_all_greedy_sample):
+        # All-greedy fast path must stay TP-aware. When the draft LM head is
+        # tensor-parallel (tp_size>1 without attention DP, or LM-head-TP in
+        # ADP), the draft logits are sharded along the vocab dim. A plain
+        # per-rank argmax then picks a different token on each rank, which
+        # desyncs the speculative-decoding control flow across ranks and
+        # deadlocks the next collective (observed as a generation hang on
+        # MTP-Eagle + TP). draft_sampler() all-gathers the sharded logits
+        # before argmax (and falls back to a plain argmax when no TP gather is
+        # needed). Eagle3 (non-MTP) keeps its d2t-aware argmax.
+        if spec_metadata.is_all_greedy_sample:
+            if self.is_mtp_eagle:
+                return self.draft_sampler(logits)
+            return self._draft_sampler_greedy(logits, d2t)
+        if spec_metadata.use_rejection_sampling and draft_step is not None:
             return self._draft_sampler_advanced_for_rejection(
                 logits, spec_metadata, batch_size, d2t, draft_step)
         return self._draft_sampler_advanced(logits, spec_metadata, batch_size,
