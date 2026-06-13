@@ -380,16 +380,30 @@ __global__ void routingMainKernel(KernelParams params)
             auto finalScore = OutputT{scoreNorm * params.mRouteScale / redNorm};
 
             // write expert idx out already
-            auto idxTopK = blockIdx.x * params.mTopK + laneIdx;
+            auto idxTopK = blockIdx.x * params.mTotalExpertsPerToken + laneIdx;
+            auto idxShared = blockIdx.x * params.mTotalExpertsPerToken + params.mTopK + laneIdx;
             if (laneIdx < params.mTopK && params.mPtrTopKPacked != nullptr)
             {
                 PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(finalScore), static_cast<int16_t>(expertIdx)};
                 params.mPtrTopKPacked[idxTopK] = packedScore;
             }
 
+            if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKPacked != nullptr)
+            {
+                PackedScoreIdx<OutputT> packedScore{
+                    static_cast<OutputT>(1.0F), static_cast<int16_t>(params.mNumExperts + laneIdx)};
+                params.mPtrTopKPacked[idxShared] = packedScore;
+            }
+
             if (laneIdx < params.mTopK && params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr)
             {
                 params.mPtrTopKWeights[idxTopK] = finalScore;
+            }
+
+            // Write score of 1.0 for shared expert if enabled
+            if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKWeights != nullptr)
+            {
+                params.mPtrTopKWeights[idxShared] = static_cast<OutputT>(1.0F);
             }
         }
     }
@@ -551,11 +565,28 @@ void run(Data& data, void* stream)
     }
 
     int const numBlocks = data.mNumTokens;
-    int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
+    // Account for fused shared experts (appended after the routed experts) when sizing the histogram.
+    int const numThreadsHist = getMaxNumExperts(data.mNumExperts + data.mNumFusedSharedExperts);
     static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
-    // Step 1: Run DeepSeek-specific topK computation (writes to mPtrTopKPacked)
+
+    TLLM_CHECK_WITH_INFO(data.mNumFusedSharedExperts <= WarpSize,
+        "Number of fused shared experts (%d) must be less than warp size (%d).", data.mNumFusedSharedExperts, WarpSize);
+
+    // Step 1: Run DeepSeek-specific topK computation (writes to mPtrTopKPacked).
+    // When fused shared experts are enabled, the main kernel also appends them (index mNumExperts + i, weight 1.0),
+    // so it must run before mNumExperts/mTopK are expanded below.
     int const numThreadsMain = max(data.mNumExpertGroups * WarpSize, getMaxNumExperts(data.mNumExperts));
     launchMainKernel(data, numBlocks, numThreadsMain, stream);
+
+    // Fused shared experts are appended after the routed experts; expand the expert/topK counts so the
+    // permutation pipeline below (which reads data.mNumExperts / data.mTopK) accounts for them.
+    if (data.mNumFusedSharedExperts > 0)
+    {
+        data.mNumExperts += data.mNumFusedSharedExperts;
+        data.mTopK += data.mNumFusedSharedExperts;
+        data.mNumLocalExperts += data.mNumFusedSharedExperts;
+        // data.mLocalExpertsStartIdx += data.mNumFusedSharedExperts;
+    }
 
     // Step 2: Permutation pipeline (reads from mPtrTopKPacked written by step 1)
     if (data.mPtrPermutedIdxSize != nullptr)
