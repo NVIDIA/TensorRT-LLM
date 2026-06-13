@@ -315,6 +315,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
+        "cancel_stress_test_small":
+        f"{test_configs_root}/disagg_config_cancel_stress_test_small.yaml",
         "cancel_stress_test_large":
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
         "llama31_8b_ucx":
@@ -2524,7 +2526,8 @@ def run_disaggregated_cancel_test(example_dir,
                                   requests_per_burst=64,
                                   server_start_timeout=1200,
                                   model_path=None,
-                                  cwd=None):
+                                  cwd=None,
+                                  prompt_len_range=(2000, 8000)):
     """Run disaggregated test with request cancellation stress test."""
     cleanup_output_files()
     run_env = env.copy()
@@ -2550,7 +2553,8 @@ def run_disaggregated_cancel_test(example_dir,
         # Run the cancel stress test
         run_cancel_stress_test(server_url,
                                num_bursts=num_bursts,
-                               requests_per_burst=requests_per_burst)
+                               requests_per_burst=requests_per_burst,
+                               prompt_len_range=prompt_len_range)
 
         # Create a temporary client config with the correct dynamic port
         client_config = config.copy()
@@ -2593,16 +2597,35 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
     This test sends bursts of requests with large contexts and cancels them
     during prefill to stress test resource cleanup.
+
+    DeepSeek-V3-Lite bf16 (~37 GiB) requires two disagg workers on separate
+    GPUs. On single-GPU systems with <80 GiB, fall back to TinyLlama to avoid
+    OOM while still exercising the cancellation code path.
     """
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/bf16")
+    import torch
+    gpu_mem_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    num_gpus = torch.cuda.device_count()
+
+    if gpu_mem_gib < 80 and num_gpus < 2:
+        model_path = os.path.join(llm_models_root(), "llama-models-v2",
+                                  "TinyLlama-1.1B-Chat-v1.0")
+        setup_model_symlink(llm_venv, model_path,
+                            "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        test_desc = "cancel_stress_test_small"
+        prompt_len_range = (200, 800)
+    else:
+        model_path = deepseek_v3_model_root
+        setup_model_symlink(llm_venv, model_path, "DeepSeek-V3-Lite/bf16")
+        test_desc = "cancel_stress_test"
+        prompt_len_range = (2000, 8000)
 
     run_disaggregated_cancel_test(disaggregated_example_root,
-                                  "cancel_stress_test",
+                                  test_desc,
                                   env=llm_venv._new_env,
                                   num_bursts=5,
                                   requests_per_burst=32,
-                                  model_path=deepseek_v3_model_root,
+                                  model_path=model_path,
+                                  prompt_len_range=prompt_len_range,
                                   cwd=llm_venv.get_working_directory())
 
 
