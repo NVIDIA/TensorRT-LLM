@@ -402,8 +402,17 @@ inline int computeMultiBlockCountForMLA(int batch_size, int max_seq_len, int mul
         return userSpecified.value();
     }
 
-    // 48 split-KV blocks gives one wave of 4-CGA MLA work on a 192-SM SM120 GPU.
-    constexpr int kMlaDefaultBlocksPerSequence = 48;
+    // Seq-len-aware split count. The optimal split-KV chunk on SM120 is empirically ~2100 tokens,
+    // independent of context length (measured on Kimi-K2.5-NVFP4, bs=1: 48 blocks best @ 100K, 96 best
+    // @ 200K -> chunk ~2100 in both cases). Scale the block count with sequence length to hold that
+    // chunk, with a floor of one 4-CGA wave (48 blocks on a 192-SM SM120 GPU) so short/moderate context
+    // still fills the GPU. The min() below still bounds by SM count and split-KV workspace, so very long
+    // context (or smaller batches) degrades safely instead of over-splitting.
+    constexpr int kMlaOneWaveBlocksPerSequence = 48;
+    constexpr int kMlaTargetTokensPerBlock = 2100;
+    int const blocks_for_target_chunk
+        = std::max(1, (max_seq_len + kMlaTargetTokensPerBlock - 1) / kMlaTargetTokensPerBlock);
+    int const mla_blocks_per_sequence = std::max(kMlaOneWaveBlocksPerSequence, blocks_for_target_chunk);
     int const safe_batch_size = std::max(batch_size, 1);
     int const max_by_sm = std::max(1, static_cast<int>(std::round(
                                       static_cast<float>(multiprocessor_count) / static_cast<float>(safe_batch_size))));
@@ -411,7 +420,7 @@ inline int computeMultiBlockCountForMLA(int batch_size, int max_seq_len, int mul
         1, (max_seq_len + kXqaMlaTokensPerTile * kXqaMlaMultiBlockMinTilesPerCta - 1)
             / (kXqaMlaTokensPerTile * kXqaMlaMultiBlockMinTilesPerCta));
     int const max_by_workspace = std::max(1, getXqaMaxNumSubSeq(/*isMLA=*/true) / safe_batch_size);
-    return std::max(1, std::min({kMlaDefaultBlocksPerSequence, max_by_sm, max_by_seq_len, max_by_workspace}));
+    return std::max(1, std::min({mla_blocks_per_sequence, max_by_sm, max_by_seq_len, max_by_workspace}));
 }
 
 inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multiprocessor_count)
