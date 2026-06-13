@@ -170,7 +170,6 @@ examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden SKIP
 examples/visual_gen/test_visual_gen.py::test_wan_t2v_example SKIP (https://nvbugs/6215688)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2] SKIP (https://nvbugs/6272644)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2] SKIP (https://nvbugs/6272644)
-examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses2_ring2] SKIP (https://nvbugs/6272644)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4] SKIP (https://nvbugs/6272644)
 full:A100/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS] SKIP (https://nvbugs/6273850)
 full:A100/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp[mtp_off] SKIP (https://nvbugs/6273850)
