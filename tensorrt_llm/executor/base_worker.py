@@ -18,6 +18,7 @@ import enum
 import gc
 import json
 import os
+import traceback
 import weakref
 from pathlib import Path
 from queue import Queue
@@ -693,7 +694,6 @@ class BaseWorker(GenerationExecutor):
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         # _autodeploy is intentionally excluded: its allocations are not tagged
         # under sleep_config VMM scopes, so release_with_tag would silently
@@ -707,20 +707,113 @@ class BaseWorker(GenerationExecutor):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in "
                 "the LLM arguments.")
-        # Non-rank-0 processes block on their local control_action_done
-        # threading.Event with no Python caller to release it — deadlock.
-        if self.llm_args.parallel_config.world_size > 1:
-            raise NotImplementedError(
-                f"{method}() requires parallel_config.world_size == 1; "
-                "use the Ray executor for multi-rank deployments.")
 
-    def sleep(self, sleep_tags: List[str]) -> None:
+    def _multi_rank_sleep_wakeup(
+        self,
+        action: str,
+        tags: list[ExecutorMemoryType],
+    ) -> None:
+        """Coordinate a sleep or wakeup operation across all MPI ranks.
+
+        Called on rank-0 only for ``world_size > 1`` deployments.
+
+        Sequence:
+        1. Enter ``control_action()`` to drain in-flight requests and pause
+           rank-0's event loop.  Non-rank-0 event loops become idle (starved
+           of NCCL collectives from rank-0) once the current iteration drains.
+        2. Broadcast the control message to every non-rank-0 rank via the
+           dedicated ``_sleep_wakeup_comm`` communicator.
+        3. Execute the VMM operation (``release_with_tag`` or
+           ``materialize_with_tag``) locally on rank-0.
+        4. Collect ACKs from all non-rank-0 ranks to confirm they have
+           finished their local VMM operations.
+        5. Exit ``control_action()``, resuming rank-0's event loop.
+
+        Args:
+            action: ``"sleep"`` or ``"wakeup"``.
+            tags: Parsed :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                values; forwarded verbatim to each rank's VMM call.
+        """
+        from tensorrt_llm._torch.pyexecutor.py_executor import (
+            _SleepWakeupAction, _SleepWakeupTag)
+        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+                                                        release_with_tag)
+
+        assert self.rank == 0, (
+            "_multi_rank_sleep_wakeup must only be called on rank 0")
+
+        sleep_wakeup_comm = self.engine._sleep_wakeup_comm
+        assert sleep_wakeup_comm is not None, (
+            "_sleep_wakeup_comm not initialised; was start_worker() called?")
+
+        world_size = self.llm_args.parallel_config.world_size
+        tag_strings = [t.value for t in tags]
+        msg = {"action": _SleepWakeupAction(action), "tags": tag_strings}
+
+        # Serialise concurrent sleep/wakeup calls.  control_action() uses an
+        # Event-based barrier, not a mutex, so two concurrent callers can both
+        # pass the barrier and then interleave sends/recvs on _sleep_wakeup_comm,
+        # consuming the wrong ACKs or resuming the event loop prematurely.
+        # _sleep_wakeup_lock turns the whole sequence into a critical section.
+        with self.engine._sleep_wakeup_lock, self.engine.control_action():
+            # Broadcast control message to non-rank-0 listeners.
+            for dest in range(1, world_size):
+                sleep_wakeup_comm.send(msg,
+                                       dest=dest,
+                                       tag=_SleepWakeupTag.ACTION)
+
+            # Execute locally on rank-0.  Only CUDA/VMM errors are captured
+            # as local_error; unexpected exceptions bypass the except clause
+            # and are re-raised after the finally has drained peer ACKs.
+            local_error = None
+            try:
+                torch.cuda.synchronize()
+                if action == _SleepWakeupAction.SLEEP:
+                    release_with_tag(*tags)
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                else:
+                    materialize_with_tag(*tags)
+                    torch.cuda.synchronize()
+            except (RuntimeError, torch.OutOfMemoryError) as exc:
+                local_error = (f"rank 0 '{action}' failed: {exc}\n"
+                               f"{traceback.format_exc()}")
+                logger.error(
+                    "_multi_rank_sleep_wakeup: rank-0 local %s failed:",
+                    action,
+                    exc_info=True,
+                )
+            finally:
+                # Always drain all ACKs to keep the communicator clean even
+                # if rank-0's local op failed or raised unexpectedly.
+                errors = []
+                if local_error:
+                    errors.append(local_error)
+                for src in range(1, world_size):
+                    ack = sleep_wakeup_comm.recv(source=src,
+                                                 tag=_SleepWakeupTag.ACK)
+                    if ack.get("status") != "ok":
+                        errors.append(
+                            ack.get("error")
+                            or f"rank {src} returned unknown ACK")
+                if errors:
+                    raise RuntimeError(
+                        f"{action}() failed on {len(errors)} rank(s):\n" +
+                        "\n".join(errors))
+
+    def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
-        Single-rank (``world_size == 1``) only.  Uses
-        ``PyExecutor.control_action()`` to drain in-flight requests and pause
-        the event loop before calling ``release_with_tag()``, matching the
-        ``@control_action_decorator`` behaviour used in Ray.
+        Supports both single-rank (``world_size == 1``) and multi-rank
+        (TP/PP > 1) MPI executor deployments.  For multi-rank, a lightweight
+        control-listener thread on each non-rank-0 worker handles the local
+        ``release_with_tag()`` call while rank-0 coordinates via a dedicated
+        secondary MPI communicator.
+
+        Uses ``PyExecutor.control_action()`` to drain in-flight requests and
+        pause rank-0's event loop, matching the ``@control_action_decorator``
+        behaviour used in the Ray executor.
 
         Only allocations backed by virtual memory (VMM) and registered under
         the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
@@ -735,13 +828,12 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been released and the event loop
-            has been resumed.
+            VMM-tagged allocations have been released on every rank and the
+            event loop has been resumed.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         self._check_sleep_wakeup_preconditions("sleep")
 
@@ -749,18 +841,23 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
         logger.info(f"Sleep: {tags}")
-        with self.engine.control_action():
-            torch.cuda.synchronize()
-            release_with_tag(*tags)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        if self.llm_args.parallel_config.world_size > 1:
+            self._multi_rank_sleep_wakeup("sleep", tags)
+        else:
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
+                torch.cuda.synchronize()
+                release_with_tag(*tags)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-    def wakeup(self, wakeup_tags: List[str]) -> None:
+    def wakeup(self, wakeup_tags: list[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
 
-        Single-rank (``world_size == 1``) only.  See :meth:`sleep` for
-        details on VMM scope restrictions and backend prerequisites.
+        Supports both single-rank (``world_size == 1``) and multi-rank
+        (TP/PP > 1) MPI executor deployments.  See :meth:`sleep` for details
+        on VMM scope restrictions, backend prerequisites, and multi-rank
+        coordination.
 
         Args:
             wakeup_tags: List of
@@ -769,13 +866,12 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been materialized and the event loop
-            has been resumed.
+            VMM-tagged allocations have been materialized on every rank and the
+            event loop has been resumed.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         self._check_sleep_wakeup_preconditions("wakeup")
 
@@ -783,10 +879,13 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
         logger.info(f"Wakeup: {tags}")
-        with self.engine.control_action():
-            torch.cuda.synchronize()
-            materialize_with_tag(*tags)
-            torch.cuda.synchronize()
+        if self.llm_args.parallel_config.world_size > 1:
+            self._multi_rank_sleep_wakeup("wakeup", tags)
+        else:
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
+                torch.cuda.synchronize()
+                materialize_with_tag(*tags)
+                torch.cuda.synchronize()
 
     def shutdown(self):
         if self.doing_shutdown:
