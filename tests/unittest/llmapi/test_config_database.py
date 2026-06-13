@@ -228,7 +228,7 @@ def test_database_yaml_config_serve_cli(config_path: Path):
     mock_pytorch_llm = mock.Mock(return_value=mock_llm)
 
     with (
-        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),
         mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
         mock.patch("tensorrt_llm.commands.serve.PyTorchLLM", mock_pytorch_llm),
         mock.patch("tensorrt_llm.commands.serve.OpenAIServer", _MockOpenAIServer),
@@ -268,7 +268,7 @@ def test_serve_cli_passes_middlewares_to_launch_server():
     )
 
     with (
-        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),
         mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
         mock.patch("tensorrt_llm.commands.serve.launch_server") as mock_launch_server,
     ):
@@ -289,7 +289,7 @@ def test_serve_cli_passes_middlewares_to_launch_server():
 
 def test_serve_cli_rejects_middleware_with_grpc():
     with (
-        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),
         mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
     ):
         with pytest.raises(ValueError, match="Argument 'middleware' is not supported"):

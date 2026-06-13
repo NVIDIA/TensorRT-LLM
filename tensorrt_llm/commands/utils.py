@@ -83,12 +83,41 @@ def is_diffusers_model_path(model_path: str) -> bool:
     return True
 
 
-def get_is_diffusion_model(model_path: str):
+def is_registered_trtllm_model_path(model_path: str) -> bool:
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        return False
+
+    with open(config_path) as f:
+        architectures = json.load(f).get("architectures") or []
+
+    # Importing the models package runs the @register_auto_model decorators
+    # that populate MODEL_CLASS_MAPPING. Done lazily to avoid a heavy import at
+    # module load time and to sidestep circular imports via commands.serve.
+    import tensorrt_llm._torch.models  # noqa: F401
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+
+    return any(arch in MODEL_CLASS_MAPPING for arch in architectures)
+
+
+def get_is_diffusion_only_model(model_path: str):
     model_path = _maybe_download_model(model_path)
-    is_diffusion_model = is_diffusers_model_path(model_path)
-    if is_diffusion_model:
-        logger.info("Diffusion model detected")
-    return is_diffusion_model
+    if not is_diffusers_model_path(model_path):
+        return False
+
+    # Some checkpoints ship a diffusers layout (model_index.json) alongside a
+    # regular language/vision-language model (e.g. Cosmos3-Nano). Prefer the
+    # regular model path in that case and only treat the checkpoint as a pure
+    # diffusion model when no registered TRT-LLM architecture is present.
+    if is_registered_trtllm_model_path(model_path):
+        logger.info(
+            "Diffusers layout detected, but the checkpoint also advertises a "
+            "registered TRT-LLM architecture; treating it as a language model."
+        )
+        return False
+
+    logger.info("Diffusion model detected")
+    return True
 
 
 def get_model_path(extra_argv):

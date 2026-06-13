@@ -10,6 +10,7 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
+from .modeling_cosmos3 import Cosmos3Model
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
@@ -58,6 +59,7 @@ __all__ = [
     "AutoModelForCausalLM",
     "BertForSequenceClassification",
     "CLIPVisionModel",
+    "Cosmos3Model",
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
     "Exaone4_5_ForConditionalGeneration",
