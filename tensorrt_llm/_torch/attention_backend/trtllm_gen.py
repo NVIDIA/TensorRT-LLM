@@ -65,28 +65,6 @@ if TYPE_CHECKING:
     )
 
 
-def _clear_multi_ctas_kv_counter_workspace(
-    fmha_workspace: torch.Tensor,
-    num_heads: int,
-    max_num_requests: int,
-    multi_processor_count: Optional[int],
-) -> None:
-    counter_size = _get_multi_ctas_kv_counter_size(
-        num_heads,
-        max_num_requests,
-        multi_processor_count,
-    )
-    fmha_workspace.narrow(0, 0, counter_size).zero_()
-
-
-def _get_multi_ctas_kv_counter_size(
-    num_heads: int,
-    max_num_requests: int,
-    multi_processor_count: Optional[int],
-) -> int:
-    return max(num_heads * max_num_requests, multi_processor_count or 0)
-
-
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     if bmm1_scale.numel() < 2:
         raise RuntimeError("trtllm-gen bmm1_scale workspace must contain raw and log2 scales.")
@@ -97,6 +75,7 @@ def _trtllm_gen_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_pool: torch.Tensor,
     workspace_buffer: torch.Tensor,
+    multi_ctas_kv_counter_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
@@ -112,54 +91,42 @@ def _trtllm_gen_batch_decode_with_kv_cache(
     kv_scale_pool: Optional[torch.Tensor],
     uses_shared_paged_kv_idx: bool,
 ) -> None:
-    if q_len_per_req is not None:
-        decode_max_q_len = q_len_per_req
-        batch_size = query.size(0) // q_len_per_req
-    else:
+    if q_len_per_req is None:
         if max_q_len is None or cum_seq_lens_q is None:
             raise RuntimeError(
                 "trtllm-gen multi-token generation requires max_q_len and cum_seq_lens_q."
             )
         decode_max_q_len = max_q_len
-        batch_size = cum_seq_lens_q.size(0) - 1
+    else:
+        decode_max_q_len = q_len_per_req
 
-    bmm1_scale_arg = (
-        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+    bmm1_scale_log2 = (
+        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else None
     )
+    kv_cache_sf = (kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None
 
-    run_func = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-    sm_count = flashinfer.decode.get_device_sm_count(query.device)
-    run_func(
-        out,
-        None,  # out_scale_factor
-        query,
-        kv_pool,
-        kv_pool,
-        workspace_buffer,
-        block_tables,
-        seq_lens,
-        decode_max_q_len,
-        max_seq_len,
-        bmm1_scale_arg,
-        bmm2_scale,
-        -1.0,  # o_sf_scale
-        -1,  # o_sf_vec_size
-        0,  # o_sf_start_index
-        batch_size,
-        window_left,
-        0,  # sparse_mla_top_k
-        sm_count,
-        enable_pdl,
-        workspace_buffer.numel() * workspace_buffer.element_size(),
-        sinks,
-        cum_seq_lens_q,
-        kv_scale_pool,  # k_block_scales
-        kv_scale_pool,  # v_block_scales
-        None,  # skip_softmax_threshold_scale_factor
-        uses_shared_paged_kv_idx,
-        None,  # lse
-        0,  # lse_stride_tokens
-        0,  # lse_stride_heads
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query=query,
+        kv_cache=(kv_pool, kv_pool),
+        workspace_buffer=workspace_buffer,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        window_left=window_left,
+        out=out,
+        sinks=sinks,
+        kv_layout="HND",
+        enable_pdl=enable_pdl,
+        backend="trtllm-gen",
+        q_len_per_req=q_len_per_req,
+        max_q_len=decode_max_q_len if q_len_per_req is None else None,
+        cum_seq_lens_q=cum_seq_lens_q if q_len_per_req is None else None,
+        kv_cache_sf=kv_cache_sf,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        bmm1_scale_log2=bmm1_scale_log2,
+        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
     )
 
 
@@ -167,6 +134,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_pool: torch.Tensor,
     workspace_buffer: torch.Tensor,
+    multi_ctas_kv_counter_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_q_len: int,
@@ -187,15 +155,17 @@ def _trtllm_gen_batch_context_with_kv_cache(
         _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
     )
 
-    run_func = flashinfer.prefill.get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = flashinfer.prefill.get_device_sm_count(query.device)
-    run_func(
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+
+    flashinfer.prefill.get_trtllm_gen_fmha_module().trtllm_paged_attention_context(
         out,
         None,  # out_scale_factor
         query,
         kv_pool,
         kv_pool,
         workspace_buffer,
+        multi_ctas_kv_counter_buffer,
         block_tables,
         seq_lens,
         max_q_len,
@@ -211,7 +181,7 @@ def _trtllm_gen_batch_context_with_kv_cache(
         cum_seq_lens_kv,
         sm_count,
         enable_pdl,
-        workspace_buffer.numel() * workspace_buffer.element_size(),
+        workspace_size,
         sinks,
         kv_scale_pool,  # key_block_scales
         kv_scale_pool,  # value_block_scales
@@ -451,6 +421,7 @@ class FlashInferTrtllmGenAttention:
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
+        self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @property
     def layout(self) -> str:
@@ -770,6 +741,34 @@ class FlashInferTrtllmGenAttention:
             device_index = torch.cuda.current_device()
         return self._get_multi_processor_count_for_device(device_index)
 
+    def _get_multi_ctas_kv_counter_buffer(
+        self,
+        device: torch.device,
+        num_heads: int,
+        max_num_requests: int,
+    ) -> torch.Tensor:
+        if self._multi_processor_count is None:
+            self._multi_processor_count = self._get_multi_processor_count(device)
+        counter_bytes = flashinfer.utils.get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            max_num_requests,
+            num_heads,
+            self._multi_processor_count,
+        )
+        buffer = self._multi_ctas_kv_counter_buffer
+        if (
+            buffer is None
+            or buffer.device != torch.device(device)
+            or buffer.numel() < counter_bytes
+        ):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "trtllm-gen multi-CTA KV counter buffer is smaller than the required size "
+                    "during CUDA graph capture."
+                )
+            buffer = torch.zeros((counter_bytes,), dtype=torch.uint8, device=device)
+            self._multi_ctas_kv_counter_buffer = buffer
+        return buffer
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1065,11 +1064,15 @@ class FlashInferTrtllmGenAttention:
             bmm1_scale if params.fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
         )
         ctx_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
+        multi_ctas_kv_counter_buffer = self._get_multi_ctas_kv_counter_buffer(
+            q_processed.device, attn.num_heads, meta.max_num_requests
+        )
 
         _trtllm_gen_batch_context_with_kv_cache(
             q_processed,  # query
             kv_pool,  # kv_pool
             fmha_workspace,  # workspace_buffer
+            multi_ctas_kv_counter_buffer,  # multi_ctas_kv_counter_buffer
             block_tables,  # block_tables
             params.sequence_lengths,  # seq_lens
             max_q_len,  # max_q_len
@@ -1195,20 +1198,10 @@ class FlashInferTrtllmGenAttention:
             True,  # need_build_kv_cache_metadata
         )
 
-        # FIXME: Flashinfer trtllm-gen API doesn't support a separate
-        # multi CTAs counter buffer. We have to clear a small buffer
-        # before trtllm_gen_batch_decode_with_kv_cache.
-        #
-        # We must also avoid clearing the workspace only when it is
-        # resized. The warmup phase may have already cached the workspace
-        # pointer; if the capture phase skips the zeroing step, the
-        # CUDA graph will not include the counter initialization. We
-        # have already verified—specifically in the context of the GPTOSS-20B
-        # test graph replay scenario—that this skipping logic is unsafe.
-        #
-        # https://github.com/flashinfer-ai/flashinfer/issues/3433
-        _clear_multi_ctas_kv_counter_workspace(
-            fmha_workspace, attn.num_heads, meta.max_num_requests, self._multi_processor_count
+        multi_ctas_kv_counter_buffer = self._get_multi_ctas_kv_counter_buffer(
+            q_processed.device,
+            attn.num_heads,
+            meta.max_num_requests,
         )
 
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length
@@ -1234,6 +1227,7 @@ class FlashInferTrtllmGenAttention:
             q_processed,  # query
             kv_pool,  # kv_pool
             fmha_workspace,  # workspace_buffer
+            multi_ctas_kv_counter_buffer,  # multi_ctas_kv_counter_buffer
             block_tables,  # block_tables
             params.sequence_lengths,  # seq_lens
             max_kv_len,  # max_seq_len
@@ -1302,8 +1296,11 @@ class FlashInferTrtllmGenAttention:
 
         bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
         workspace_buffer = params.workspace.view(-1, 4)
-        _clear_multi_ctas_kv_counter_workspace(
-            workspace_buffer, attn.num_heads, meta.max_num_requests, self._multi_processor_count
+        out = params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank)
+        multi_ctas_kv_counter_buffer = self._get_multi_ctas_kv_counter_buffer(
+            query.device,
+            attn.num_heads,
+            meta.max_num_requests,
         )
 
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
@@ -1317,7 +1314,7 @@ class FlashInferTrtllmGenAttention:
             params.sequence_lengths,  # seq_lens
             params.max_past_kv_length,  # max_seq_len
             0,  # sparse_mla_top_k
-            params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
+            out,  # out
             bmm1_scale,  # bmm1_scale
             1.0,  # bmm2_scale
             fwd.attention_sinks,  # sinks
@@ -1326,4 +1323,5 @@ class FlashInferTrtllmGenAttention:
             "trtllm-gen",  # backend
             True,  # is_var_seq
             self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
