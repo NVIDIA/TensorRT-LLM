@@ -326,6 +326,11 @@ l0_b200:
   - examples/test_visual_gen.py::test_ltx2_lpips_against_golden
   - examples/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
   - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_vanilla_precision_lpips_same_precision_repeat[bf16]
+  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_vanilla_precision_lpips_same_precision_repeat[dynamic-fp8]
+  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_vanilla_precision_lpips_same_precision_repeat[dynamic-fp4]
+  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_attention_backend_bf16_lpips_same_backend_repeat[fa4]
+  - examples/test_visual_gen_feature_matrix.py::test_qwen_image_attention_backend_bf16_lpips_same_backend_repeat[cutedsl]
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
 # ------------- AutoDeploy Backend Stages ---------------
