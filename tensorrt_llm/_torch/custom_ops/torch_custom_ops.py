@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import enum
+import os
 import threading
+from ctypes.util import find_library
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
@@ -40,6 +43,7 @@ from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
+
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
@@ -53,6 +57,56 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
+
+_NCCL_GB10_SYMMETRIC_FIXED_VERSION = 23004  # NCCL 2.30.4
+_NCCL_MNNVL_ENABLE = "NCCL_MNNVL_ENABLE"
+
+
+@lru_cache(maxsize=None)
+def _is_gb10() -> bool:
+    """Return True on GB10 (DGX Spark)."""
+    return "GB10" in torch.cuda.get_device_name()
+
+
+@lru_cache(maxsize=None)
+def _get_nccl_runtime_version_code() -> Optional[int]:
+    lib_names = ["libnccl.so.2", "libnccl.so"]
+    nccl_lib = find_library("nccl")
+    if nccl_lib is not None and nccl_lib not in lib_names:
+        lib_names.append(nccl_lib)
+
+    for lib_name in lib_names:
+        try:
+            nccl = ctypes.CDLL(lib_name)
+            nccl.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            nccl.ncclGetVersion.restype = ctypes.c_int
+        except (AttributeError, OSError):
+            continue
+
+        version = ctypes.c_int()
+        if nccl.ncclGetVersion(ctypes.byref(version)) == 0:
+            return version.value
+
+    return None
+
+
+@lru_cache(maxsize=None)
+def _needs_gb10_nccl_symmetric_workaround() -> bool:
+    if not _is_gb10():
+        return False
+
+    runtime_version = _get_nccl_runtime_version_code()
+    return (runtime_version is None
+            or runtime_version < _NCCL_GB10_SYMMETRIC_FIXED_VERSION)
+
+
+@lru_cache(maxsize=None)
+def _init_gb10_nccl_symmetric_workaround() -> bool:
+    if not _needs_gb10_nccl_symmetric_workaround():
+        return False
+
+    os.environ.setdefault(_NCCL_MNNVL_ENABLE, "0")
+    return True
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -1995,10 +2049,14 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
-            AllReduceStrategy.NCCL.value,
-        ]
+        # NCCL_SYMMETRIC is unsupported on GB10 (DGX Spark) before NCCL 2.30.4.
+        if _needs_gb10_nccl_symmetric_workaround():
+            valid_strategies = [AllReduceStrategy.NCCL.value]
+        else:
+            valid_strategies = [
+                AllReduceStrategy.NCCL_SYMMETRIC.value,
+                AllReduceStrategy.NCCL.value,
+            ]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -2025,6 +2083,7 @@ class AllReduceRunner(TunableRunner):
         **kwargs,
     ) -> torch.Tensor:
         input, residual, norm_weight, scale, bias, workspace = inputs
+        gb10_nccl_workaround = _needs_gb10_nccl_symmetric_workaround()
         if do_preparation:
             valid_tactics = self.get_valid_tactics(inputs,
                                                    OptimizationProfile(),
@@ -2040,11 +2099,16 @@ class AllReduceRunner(TunableRunner):
                 )
             return input
         if tactic == -1:
-            # tactic == -1 means the autotuner cache missed for this shape;
-            # fall back to NCCL_SYMMETRIC. Asymmetric ncclMemAlloc failures are
-            # handled by a cross-rank barrier in NCCLWindowAllocator, which
-            # falls back to plain NCCL if allocation fails on any rank.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # tactic == -1 means the autotuner cache missed for this shape.
+            # On GB10 (DGX Spark), NCCL_SYMMETRIC is unsupported before NCCL
+            # 2.30.4, so fall back to plain NCCL. On other platforms fall back
+            # to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
+            # by a cross-rank barrier in NCCLWindowAllocator which falls back
+            # to plain NCCL.
+            if gb10_nccl_workaround:
+                tactic = AllReduceStrategy.NCCL.value
+            else:
+                tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
         return torch.ops.trtllm.allreduce(
             input,
