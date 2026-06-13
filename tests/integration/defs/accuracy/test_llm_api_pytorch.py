@@ -5662,6 +5662,51 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
+    @pytest.mark.skip_less_device_memory(90000)
+    @pytest.mark.parametrize("one_model", [True, False],
+                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("moe_backend", [
+        "CUTLASS",
+        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRITON", marks=skip_no_hopper)
+    ],
+                             ids=["cutlass", "trtllm", "triton"])
+    def test_eagle3_1gpu(self, moe_backend, one_model, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.object(GSM8K, "NUM_SAMPLES", 300)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        pytorch_config = dict(
+            max_batch_size=8,
+            disable_overlap_scheduler=not one_model,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8))
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
+                                        dtype="auto",
+                                        enable_block_reuse=False)
+
+        eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
+        draft_len = 5
+        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=one_model)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  speculative_config=spec_config,
+                  **pytorch_config,
+                  enable_attention_dp=False,
+                  moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
     @pytest.mark.parametrize(
