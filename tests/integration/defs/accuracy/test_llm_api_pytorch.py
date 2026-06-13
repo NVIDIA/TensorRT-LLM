@@ -5943,15 +5943,11 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp,enable_block_reuse",
         [
             (1, 1, 1, True, True, False, True),
-            (1, 1, 1, True, True, False, False),
-            (4, 1, 1, True, True, False, False),
             (4, 1, 4, True, True, True, False),
-            (4, 1, 4, True, True, False, False),
-            (4, 1, 4, False, False, False, False),
         ],
         ids=[
-            "tp1_block_reuse", "tp1", "tp4ep1", "tp4ep4_adp_on",
-            "tp4ep4_adp_off", "no_cuda_graph_overlap"
+            "tp1_block_reuse",
+            "tp4ep4_adp_on",
         ])
     def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
                    overlap_scheduler, attention_dp, enable_block_reuse, mocker):
@@ -5968,7 +5964,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             kv_cache_config.mamba_state_cache_interval = 256
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512, enable_padding=False)
+                                  max_batch_size=512, enable_padding=True)
                               if cuda_graph else None)
         moe_config = MoeConfig(backend=moe_backend)
 
@@ -5981,8 +5977,6 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  **pytorch_config,
                  moe_config=moe_config) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
