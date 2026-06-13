@@ -24,7 +24,7 @@ function declaration in ``attentionOp.h`` (text/regex), and enforces:
    declared C++ type matches the source attribute's Python type at a
    coarse-category level (tensor / int / bool / float / list-of-X).
 3. Every dataclass field reachable from ``AttentionForwardArgs`` (including
-   nested dataclass sub-bags like ``AttentionSparseArgs``) is consumed at
+   nested dataclass sub-bags like ``SparsePrediction``) is consumed at
    the call site — directly, transitively via a @property of the
    containing class, or listed in ``_THOP_EXCLUDED_FIELDS``.
 4. Every kwarg passed as a literal constant matches an entry in
@@ -43,6 +43,7 @@ import typing
 from dataclasses import fields
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxKernelParams
 from tensorrt_llm._torch.attention_backend.trtllm import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
@@ -56,6 +57,7 @@ _SOURCE_CLASSES = {
     "self": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
+    "skip_softmax_kernel_params": SkipSoftmaxKernelParams,
 }
 
 # The C++ attention() declaration is the single source of truth for kwarg
@@ -496,7 +498,7 @@ def _verify_consumed(cls, chains: set[tuple[str, ...]], excluded=frozenset()):
 def test_every_forward_args_field_is_consumed():
     """Recursively check that every dataclass field reachable from
     ``AttentionForwardArgs`` (including nested sub-bags such as
-    ``AttentionSparseArgs``) is consumed at the call site, transitively
+    ``SparsePrediction``) is consumed at the call site, transitively
     via @property where applicable, or listed in ``_THOP_EXCLUDED_FIELDS``.
     """
     _verify_consumed(

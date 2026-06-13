@@ -10,8 +10,6 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
-
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -28,6 +26,7 @@ from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
+from .sparse.params import SparseMetadataParams
 
 try:
     # Transformers v5
@@ -72,6 +71,8 @@ class AttentionMetadata:
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
     draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     mapping: Optional[Mapping] = None
+    # Sparse settings for metadata allocation/update; dense metadata leaves it None.
+    sparse_metadata_params: Optional[SparseMetadataParams] = None
 
     enable_flash_mla: bool = False
     enable_context_mla_with_cached_kv: bool = False
@@ -164,7 +165,6 @@ class AttentionMetadata:
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
-    sparse_attention_config: Optional["SparseAttentionConfig"] = None
     # The number of heads per kv head.
     num_heads_per_kv: Optional[int] = 1
 
@@ -711,11 +711,14 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
-class AttentionSparseArgs:
-    """Sparse-attention inputs passed to the attention op.
+class SparsePrediction:
+    """Sparse KV / attention indices predicted by the framework backends.
 
-    Backends without sparse attention leave ``AttentionForwardArgs.sparse``
-    at its default-constructed value (all-``None`` / ``0`` fields).
+    RocketKV and DSA produce these from ``sparse_kv_predict`` /
+    ``sparse_attn_predict``, telling the attention op which KV tokens to keep
+    and which blocks to attend to. Backends that don't predict leave
+    ``AttentionForwardArgs.sparse_prediction`` at its default-constructed value
+    (all-``None`` / ``0`` fields).
     """
     sparse_kv_indices: Optional[torch.Tensor] = None
     sparse_kv_offsets: Optional[torch.Tensor] = None
@@ -767,8 +770,11 @@ class AttentionForwardArgs:
 
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
+    # Optional normalized diffusion timestep for timestep-varying sparse attention.
+    timestep: Optional[torch.Tensor] = None
 
-    sparse: AttentionSparseArgs = field(default_factory=AttentionSparseArgs)
+    sparse_prediction: SparsePrediction = field(
+        default_factory=SparsePrediction)
 
     @property
     def mask_type(self) -> int:
@@ -820,7 +826,6 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
-        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         **kwargs,
     ):
         """
@@ -831,14 +836,12 @@ class AttentionBackend(Generic[TMetadata]):
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
             quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
-            sparse_attention_config (SparseAttentionConfig): Optional sparse attention configuration. If None, no sparse attention is applied.
         """
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
-        self.sparse_attention_config = sparse_attention_config
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         """
