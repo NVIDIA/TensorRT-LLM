@@ -1239,7 +1239,9 @@ class KVCacheManager(BaseResourceManager):
         request_ids: List[int],
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
+        beam_width: Optional[int] = 1,
     ) -> List[List[int]]:
+        beam_width = beam_width or 1
         if window_size is None:
             if layer_idx is None:
                 if len(self.max_attention_window_vec) > 1:
@@ -1255,9 +1257,29 @@ class KVCacheManager(BaseResourceManager):
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
-            assert (len(result[i])) == 1
-            result[i] = result[i][0]
+            beams = [list(beam) for beam in result[i]]
+            assert len(beams) == beam_width, (
+                f"Expected {beam_width} index arrays per request, got {len(beams)}"
+            )
+            result[i] = beams[
+                0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
         return result
+
+    @staticmethod
+    def _pack_beam_cache_indices(beams: List[List[int]]) -> List[int]:
+        """Pack beam-search blocks into a flat beam-0 layout.
+
+        The first beam owns the shared prompt blocks. For every other beam,
+        append only the final block when it differs from beam 0's final block.
+        """
+        if not beams:
+            return []
+        packed = list(beams[0])
+        beam0_last = beams[0][-1] if beams[0] else None
+        for beam in beams[1:]:
+            if beam and beam[-1] != beam0_last:
+                packed.append(beam[-1])
+        return packed
 
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:
