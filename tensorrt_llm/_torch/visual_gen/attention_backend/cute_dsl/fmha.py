@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-CuTe DSL (NVIDIA kernels) Backend for Visual Generation Models
+CuTe DSL (NVIDIA kernels) Dense FMHA Backend for Visual Generation Models
 
 Uses pre-compiled cubins derived from CUTLASS CuTe DSL FMHA.
 Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
+For the VSA sparse path use VSAAttention in vsa.py.
 """
 
 import math
@@ -26,8 +27,8 @@ import torch
 
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ...attention_backend.interface import PredefinedAttentionMask
-from .interface import AttentionBackend, AttentionTensorLayout
+from ....attention_backend.interface import PredefinedAttentionMask
+from ..interface import AttentionBackend, AttentionTensorLayout
 
 _cute_dsl_import_error = None
 try:

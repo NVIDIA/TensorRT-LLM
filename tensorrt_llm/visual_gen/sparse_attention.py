@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Skip-softmax sparse attention helpers for visual generation."""
+"""Sparse attention recipe classes for visual generation (skip-softmax, VSA)."""
 
 import fnmatch
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import yaml
 from pydantic import Field as PydanticField
@@ -247,6 +247,29 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
         if "a" in formula and "b" in formula:
             return {"a": formula["a"], "b": formula["b"]}
         return None
+
+
+class VideoSparseAttentionConfig(StrictBaseModel):
+    """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
+
+    Two-stage hybrid attention: a coarse mean-pooled stage over (4,4,4) cubes
+    and a block-sparse fine stage over the top-K cubes selected per head.
+    vsa_sparsity controls the fraction of cubes dropped on the fine stage.
+    """
+
+    algorithm: Literal["vsa"] = PydanticField(
+        "vsa",
+        description="Sparse attention algorithm discriminator.",
+    )
+    vsa_sparsity: float = PydanticField(
+        0.9,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of cubes dropped on the fine stage. 0.0 keeps all cubes "
+            "(dense fine stage); values closer to 1.0 keep fewer cubes."
+        ),
+    )
 
 
 def _load_sparse_config_group_container(data: Dict[str, Any]) -> Optional[SkipSoftmaxConfig]:
