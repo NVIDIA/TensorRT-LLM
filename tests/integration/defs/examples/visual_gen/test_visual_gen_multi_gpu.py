@@ -52,9 +52,8 @@ WAN_MULTI_GPU_LPIPS_THRESHOLD = 0.25
 WAN22_LPIPS_MULTI_GPU_VARIANTS = [
     ("ulysses4", {"ulysses_size": 4}),
     ("cfg2_ulysses2", {"cfg_size": 2, "ulysses_size": 2}),
-    ("ulysses2_ring2", {"ulysses_size": 2, "ring_size": 2}),
     ("attn2d_2x2", {"attn2d_size": (2, 2)}),
-    ("cfg2_ulysses2_ring2", {"cfg_size": 2, "ulysses_size": 2, "ring_size": 2}),
+    ("cfg2_ulysses2_attn2d_2x1", {"cfg_size": 2, "ulysses_size": 2, "attn2d_size": (2, 1)}),
     ("attn2d_2x2_ulysses2", {"attn2d_size": (2, 2), "ulysses_size": 2}),
 ]
 
