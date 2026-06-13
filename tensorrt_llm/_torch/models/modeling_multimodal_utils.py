@@ -327,6 +327,13 @@ def find_input_mm_embeds(
         - Handles chunked prefill by considering chunk boundaries and current chunk tokens
         - Example: if a request has 8 MM embed rows, 2 cached rows, and 3 rows
           in the current chunk, this keeps rows [2:5].
+        - This function reads only CPU-resident counts from
+          ``MultimodalParams.multimodal_runtime`` and never touches GPU
+          tensors, so it does not introduce host-device synchronization.
+          The companion ``torch.where`` host sync sits in ``fuse_input_embeds``
+          (via ``filter_mm_token_from_input_ids``) and is avoided by routing
+          executor-precomputed ``mm_token_indices`` / ``text_token_indices``
+          through to that call — see the contract there.
     """
     if not isinstance(mm_embeds, list):
         raise TypeError("mm_embeds must be a list")
@@ -390,7 +397,10 @@ def filter_mm_token_from_input_ids(
     Args:
         input_ids: shape [text_total_length + mm_total_length].
         vocab_size: size of the model's vocabulary
-        mm_token_ids: possible token ids for multimodal tokens, if known. If not known and set to None, it is assumed that the multimodal tokens are out-of-vocabulary tokens i.e. the `input_ids` contains tokens >= vocab_size that represent the multimodal tokens.
+        mm_token_ids: possible token ids for multimodal tokens, if known. If
+            not known and set to None, it is assumed that the multimodal tokens
+            are out-of-vocabulary tokens i.e. the ``input_ids`` contains tokens
+            >= vocab_size that represent the multimodal tokens.
     Note:
         Example: input_ids=[1, 55, 2, 101], vocab_size=100, and
         mm_token_ids=[55] returns mm_token_indices=[1]; token 101 is text
@@ -445,7 +455,26 @@ def fuse_input_embeds(
         - Example: len(torch.cat(mm_embeds)) must match len(mm_token_indices);
           for chunked prefill, pass only the current chunk's mm_embeds or
           explicit indices for the active MM token positions.
-        - This function may involve host-device synchronization if indices are not provided and filtering is performed. See filter_mm_token_from_input_ids for details.
+        - Sync-free contract: passing both ``text_token_indices`` and
+          ``mm_token_indices`` skips the GPU ``torch.where`` host sync. The
+          executor (``model_engine._prepare_inputs`` /
+          ``_prepare_tp_inputs_no_cache``) precomputes them on a CPU
+          ``input_ids`` copy via ``_prepare_multimodal_indices`` (which uses
+          ``filter_mm_token_from_input_ids`` against ``self.model.mm_token_ids``
+          when present, else the OOV fallback ``>= vocab_size``) and ships
+          them as pinned async H2D tensors in the inputs dict. VLM forwards
+          are expected to forward these explicitly rather than relying on a
+          ``**kwargs`` splat — if they don't, this function falls back to the
+          host-syncing ``filter_mm_token_from_input_ids`` on GPU ``input_ids``.
+        - In-vocab fast path: when ``mm_token_ids`` is provided, the caller is
+          declaring that mm placeholder IDs are real vocabulary entries. In
+          that case the text path skips its ``index_select`` + ``torch.empty``
+          + text scatter and embeds the full ``input_ids`` once, overwriting
+          mm rows afterwards. This is the path taken by every VLM currently
+          in tree EXCEPT Hyperclovax, which keeps the legacy ``vocab_size + 1``
+          OOV remap in its input processor and therefore passes
+          ``mm_token_ids=None`` so the OOV branch is taken — embedding an OOV
+          id would be out-of-bounds.
     """
     if len(mm_embeds) == 0:
         if extra_embeds is not None and len(extra_embeds) > 0:
@@ -466,11 +495,24 @@ def fuse_input_embeds(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
             f"but received {mm_embed.shape[0]} image embeddings.")
 
-    text_embed = embedding_layer(input_ids[text_token_indices])
-    input_embeds = torch.empty(input_ids.shape[0],
-                               mm_embed.shape[-1],
-                               device=text_embed.device,
-                               dtype=text_embed.dtype)
+    if mm_token_ids is not None:
+        # In-vocab fast path: caller declared mm tokens are real vocabulary
+        # IDs, so a single full embedding lookup is safe. Saves the
+        # ``index_select`` over text positions, the ``torch.empty`` alloc, and
+        # the text scatter (~2 GPU kernels per VLM forward) at the cost of
+        # ~mm-fraction extra embedding lookups whose result is overwritten.
+        input_embeds = embedding_layer(input_ids)
+    else:
+        # OOV path: input_ids holds placeholder IDs >= num_embeddings at mm
+        # positions (e.g. ``vocab_size + 1``), so embedding the full sequence
+        # would be out-of-bounds. Gather only the in-vocab text positions and
+        # scatter into a fresh buffer.
+        text_embed = embedding_layer(input_ids[text_token_indices])
+        input_embeds = torch.empty(input_ids.shape[0],
+                                   mm_embed.shape[-1],
+                                   device=text_embed.device,
+                                   dtype=text_embed.dtype)
+        input_embeds[text_token_indices, :] = text_embed
     if extra_embeds is not None and len(extra_embeds) > 0:
         # only support single modality for deepstack features for now
         for i, extra_feature in enumerate(extra_embeds):
@@ -483,7 +525,6 @@ def fuse_input_embeds(
             extra_embed[mm_token_indices, :] = extra_feature
             extra_embeds[i] = extra_embed
 
-    input_embeds[text_token_indices, :] = text_embed
     input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
                                                     device=input_embeds.device)
     if extra_embeds is not None and len(extra_embeds) > 0:
