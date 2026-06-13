@@ -82,7 +82,6 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
-using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
 using MmKey = tensorrt_llm::executor::MmKey;
 using WindowSizeType = SizeType32;
 

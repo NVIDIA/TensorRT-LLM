@@ -32,6 +32,21 @@ class Request::Impl
 {
 
 public:
+    //! Maximum allowed length of a cache salt string. Cache salts are copied into every BlockKey and emitted
+    //! with KV cache events, so unbounded strings would inflate memory and serialization cost proportional to
+    //! the number of blocks.
+    static constexpr std::size_t kMaxCacheSaltLength{256};
+
+    static std::optional<std::string> validateCacheSalt(std::optional<std::string> cacheSalt)
+    {
+        if (cacheSalt.has_value() && cacheSalt->size() > kMaxCacheSaltLength)
+        {
+            TLLM_THROW("cacheSalt length (%zu) exceeds the maximum supported length (%zu).", cacheSalt->size(),
+                kMaxCacheSaltLength);
+        }
+        return cacheSalt;
+    }
+
     Impl(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming, SamplingConfig const& samplingConfig,
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
@@ -48,7 +63,7 @@ public:
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
         std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
-        std::optional<CacheSaltIDType> cacheSaltID, std::optional<IdType> disaggRequestId)
+        std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt = std::nullopt)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -85,7 +100,7 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
-        , mCacheSaltID(cacheSaltID)
+        , mCacheSalt(validateCacheSalt(std::move(cacheSalt)))
         , mDisaggRequestId(disaggRequestId)
     {
         validate();
@@ -298,9 +313,9 @@ public:
         return mLanguageAdapterUid;
     }
 
-    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const
+    [[nodiscard]] std::optional<std::string> getCacheSalt() const
     {
-        return mCacheSaltID;
+        return mCacheSalt;
     }
 
     [[nodiscard]] std::optional<IdType> getDisaggRequestId() const
@@ -482,9 +497,9 @@ public:
         mLanguageAdapterUid = languageAdapterUid;
     }
 
-    void setCacheSaltID(CacheSaltIDType cacheSaltID)
+    void setCacheSalt(std::optional<std::string> cacheSalt)
     {
-        mCacheSaltID = cacheSaltID;
+        mCacheSalt = validateCacheSalt(std::move(cacheSalt));
     }
 
     void setDisaggRequestId(IdType disaggRequestId)
@@ -565,8 +580,8 @@ private:
         lambda(mGuidedDecodingParams);
         lambda(mLanguageAdapterUid);
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
-        lambda(mCacheSaltID);
         lambda(mDisaggRequestId);
+        lambda(mCacheSalt);
     }
 
     VecTokens mInputTokenIds;
@@ -605,7 +620,7 @@ private:
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
     std::optional<SizeType32> mLanguageAdapterUid;
     std::optional<MillisecondsType> mAllottedTimeMs;
-    std::optional<CacheSaltIDType> mCacheSaltID;
+    std::optional<std::string> mCacheSalt;
     std::optional<IdType> mDisaggRequestId;
 };
 
