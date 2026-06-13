@@ -37,6 +37,7 @@ from typing import Any, ClassVar, Dict, Optional, Set, Union
 
 import torch
 import torch.nn as nn
+from torch.fx import GraphModule
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
@@ -48,6 +49,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
 from .modeling_nemotron_h import build_nemotron_eagle_layers
+from .modeling_qwen3_5_moe import build_qwen3_5_moe_eagle_layers
 
 # =============================================================================
 # Layer Dispatch Functions
@@ -78,10 +80,12 @@ def get_eagle_layers(config, model_type: str) -> Union[nn.ModuleList, nn.Module]
             layers = build_llama_eagle_layers(config)
         case "nemotron_h":
             layers = build_nemotron_eagle_layers(config)
+        case "qwen3_5_moe_text":
+            layers = build_qwen3_5_moe_eagle_layers(config)
         case _:
             raise ValueError(
                 f"Model type '{model_type}' not supported for Eagle drafter. "
-                f"Supported types: llama, nemotron_h"
+                f"Supported types: llama, nemotron_h, qwen3_5_moe_text"
             )
 
     if len(layers) == 1:
@@ -122,9 +126,9 @@ class EagleConfig(PretrainedConfig):
             # If False, the wrapper applies self.norm after the layers.
             # If True, layers have their own final_layernorm and wrapper skips self.norm.
             "layers_handle_final_norm": False,
-            # Llama Eagle checkpoint: fc.*, midlayer.* -> model.fc.*, model.layers.*
+            # Llama Eagle checkpoint: fc.*, midlayer.* -> eagle_drafter.fc.*, eagle_drafter.layers.*
             "_checkpoint_conversion_mapping": {
-                "^(?!lm_head|norm)": "model.",
+                "^(?!lm_head|norm)": "eagle_drafter.",
                 "midlayer": "layers",
             },
         },
@@ -137,9 +141,33 @@ class EagleConfig(PretrainedConfig):
             # NemotronH MTP layers have final_layernorm on the last layer,
             # so the wrapper should NOT apply an additional norm.
             "layers_handle_final_norm": True,
-            # NemotronH MTP checkpoint: mtp.* -> model.*
+            # NemotronH MTP checkpoint: mtp.* -> eagle_drafter.*
             "_checkpoint_conversion_mapping": {
-                r"^mtp\.": "model.",
+                r"^mtp\.": "eagle_drafter.",
+            },
+        },
+        "qwen3_5_moe_text": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": True,
+            "num_capture_layers": 1,
+            "normalize_target_hidden_state": True,
+            "layers_handle_final_norm": True,
+            "_checkpoint_conversion_mapping": {
+                r"^mtp\.layers\.0\.": "eagle_drafter.layers.",
+                r"^mtp\.fc\.": "eagle_drafter.layers.fc.",
+                r"^mtp\.pre_fc_norm_embedding\.": "eagle_drafter.layers.pre_fc_norm_embedding.",
+                r"^mtp\.pre_fc_norm_hidden\.": "eagle_drafter.layers.pre_fc_norm_hidden.",
+                r"^mtp\.norm\.": "eagle_drafter.layers.norm.",
+            },
+            # Quant exclude_modules are fnmatch globs (e.g. "mtp.layers.0*"). The draft MTP layer is
+            # unwrapped (no layer index), so its modules live under "eagle_drafter.layers.*" (mirrors
+            # _checkpoint_conversion_mapping dropping the ".0" index). Remap excludes so the
+            # unquantized MTP head is skipped in the draft sub-graph. The draft is rooted at the
+            # dedicated "eagle_drafter.*" namespace (never "model.*"), so it cannot collide with target
+            # modules regardless of whether the target is a VLM submodule export or a full-model
+            # export.
+            "_quant_exclude_conversion_mapping": {
+                r"^mtp\.layers\.0(?=\.|\*)": "eagle_drafter.layers",
             },
         },
     }
@@ -602,16 +630,27 @@ class EagleDrafterForCausalLM(PreTrainedModel):
                 nn.Module (single-layer). If None, builds based on model_type.
     """
 
-    base_model_prefix = "model"
+    # Matches the inner submodule name (self.eagle_drafter); inert in the AutoDeploy load path
+    # (weights load via _checkpoint_conversion_mapping, not HF base_model_prefix) but kept honest.
+    base_model_prefix = "eagle_drafter"
     supports_gradient_checkpointing = False
-    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer"]
+    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer", "Qwen3_5MoeEagleLayer"]
 
-    def __init__(self, config, layers: Optional[Union[nn.ModuleList, nn.Module]] = None):
+    def __init__(
+        self,
+        config,
+        layers: Optional[Union[nn.ModuleList, nn.Module]] = None,
+        **_unused_kwargs,
+    ):
+        # Accept unused HF-style kwargs such as use_cache; _from_config() forwards them.
         super().__init__(config)
 
-        # Read checkpoint conversion mapping from config (set by EagleConfig based on model_type)
+        # Read conversion mappings from config (set by EagleConfig based on model_type)
         self._checkpoint_conversion_mapping = getattr(
             config, "_checkpoint_conversion_mapping", None
+        )
+        self._quant_exclude_conversion_mapping = getattr(
+            config, "_quant_exclude_conversion_mapping", None
         )
 
         self.load_embedding_from_target = getattr(config, "load_embedding_from_target", False)
@@ -625,7 +664,10 @@ class EagleDrafterForCausalLM(PreTrainedModel):
         if layers is None:
             layers = get_eagle_layers(config, config.model_type)
 
-        self.model = EagleModel(config, layers)
+        # Rooted at a dedicated "eagle_drafter" namespace (not the generic "model") so the draft's
+        # exported node names ("eagle_drafter.layers.*") can never collide with a target model's
+        # "model.*" names -- see _quant_exclude_conversion_mapping above.
+        self.eagle_drafter = EagleModel(config, layers)
 
         # Only create norm if layers don't handle final normalization internally.
         if not self._layers_handle_final_norm:
@@ -672,7 +714,7 @@ class EagleDrafterForCausalLM(PreTrainedModel):
         if hidden_states is None:
             raise ValueError("hidden_states must be provided.")
 
-        hidden_states = self.model(
+        hidden_states = self.eagle_drafter(
             inputs_embeds=inputs_embeds, position_ids=position_ids, hidden_states=hidden_states
         )
 
@@ -692,8 +734,8 @@ class EagleDrafterForCausalLM(PreTrainedModel):
         )
 
     def get_input_embeddings(self):
-        if self.model.embed_tokens is not None:
-            return self.model.embed_tokens
+        if self.eagle_drafter.embed_tokens is not None:
+            return self.eagle_drafter.embed_tokens
         else:
             raise NotImplementedError(
                 "EagleDrafterForCausalLM does not have an input embedding layer."
@@ -772,10 +814,10 @@ class EagleWrapper(nn.Module):
     def _draft_inner_model(self):
         """Get the inner model submodule of the draft model.
 
-        Before export: self.draft_model.model (EagleModel inside EagleDrafterForCausalLM).
-        After export: self.draft_model.model (preserved by DraftModelExportInfo.post_process).
+        Before export: self.draft_model.eagle_drafter (EagleModel inside EagleDrafterForCausalLM).
+        After export: self.draft_model.eagle_drafter (preserved by DraftModelExportInfo.post_process).
         """
-        return self.draft_model.model
+        return self.draft_model.eagle_drafter
 
     @property
     def _draft_dtype(self):
@@ -917,10 +959,55 @@ class EagleWrapper(nn.Module):
         return {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
 
     @staticmethod
-    def _filter_kwargs_for_submodule(kwargs: dict, submodule: nn.Module) -> dict:
-        """Filter kwargs to only include those accepted by submodule's forward (GraphModule)."""
-        expected_names = EagleWrapper._submodule_placeholder_names(submodule)
-        return {k: v for k, v in kwargs.items() if k in expected_names}
+    def _graph_submodules(module: nn.Module) -> list[GraphModule]:
+        """Every exported GraphModule within ``module`` (including ``module`` itself if it is one).
+
+        A submodule is either an exported GraphModule directly (the draft, or a text/full-model
+        target) or an eager wrapper around its exported inner graph (a VLM target around its text
+        model, ``model.language_model``). Used both to read one submodule's own graph inputs and to
+        collect every graph's inputs across the whole wrapper.
+        """
+        return [m for m in module.modules() if isinstance(m, GraphModule)]
+
+    def _filter_kwargs_for_submodule(
+        self, kwargs: dict, submodule: nn.Module, include_unassigned_kwargs: bool = False
+    ) -> dict:
+        """Select the kwargs to call one EagleWrapper submodule with.
+
+        ``csi.named_args`` is the union of every submodule's runtime inputs (resources are keyed
+        ``r{idx}_{suffix}`` by registration order -- no per-submodule namespace). A submodule's
+        exported graph(s) declare the inputs it wants via their placeholders, so by default keep
+        only those: a strict graph rejects anything else, and this drops the *other* submodules'
+        inputs.
+
+        Some runtime inputs belong to NO submodule's graph -- they are consumed by an eager wrapper's
+        own ``forward`` (here the VLM target's vision/multimodal metadata and the persistent
+        ``mrope_delta_cache`` resource) before it delegates to its strict inner graph. Pass
+        ``include_unassigned_kwargs=True`` to also collect those orphan inputs: we do this for the
+        eager target so its forward receives its vision inputs, and leave it False for the draft (a
+        pure graph). The orphan set is discovered dynamically (the union of every graph submodule's
+        placeholders across the wrapper), so no vision arg is ever hard-coded here. A submodule that
+        is *itself* a GraphModule (a text/full-model target, or the draft) is strict -- it takes only
+        its own placeholders -- so orphans are never routed to it even with the flag set.
+
+        TODO: the proper fix is resource->submodule ownership (``add_resource`` recording the owner)
+        so these unassigned inputs are attributed to the target and no flag is needed.
+        """
+        own = set().union(
+            *(
+                EagleWrapper._submodule_placeholder_names(g)
+                for g in EagleWrapper._graph_submodules(submodule)
+            )
+        )
+        if not include_unassigned_kwargs or isinstance(submodule, GraphModule):
+            return {k: v for k, v in kwargs.items() if k in own}
+        assigned = set().union(
+            *(
+                EagleWrapper._submodule_placeholder_names(g)
+                for g in EagleWrapper._graph_submodules(self)
+            )
+        )
+        return {k: v for k, v in kwargs.items() if k in own or k not in assigned}
 
     @staticmethod
     def _collect_hidden_states(kwargs: dict, num_tokens: int) -> torch.Tensor:
@@ -971,7 +1058,11 @@ class EagleWrapper(nn.Module):
         # ---- Phase 1: Target model forward ----
         out = self.target_model(
             inputs_embeds=self.target_model.get_input_embeddings()(csi.get_arg("input_ids")),
-            **self._filter_kwargs_for_submodule(csi.named_args, self.target_model),
+            # The eager VLM target also collects the unassigned (vision / mrope_delta_cache) inputs
+            # that belong to no submodule's graph.
+            **self._filter_kwargs_for_submodule(
+                csi.named_args, self.target_model, include_unassigned_kwargs=True
+            ),
         )
         # NOTE: we assume gather_context_logits is False so that gathering here works!
         target_logits = csi.info.maybe_gather_and_squeeze(out.logits)
@@ -1106,7 +1197,9 @@ class EagleWrapper(nn.Module):
             draft_output = self.draft_model(
                 inputs_embeds=self.apply_draft_embedding(csi.get_arg("input_ids")),
                 hidden_states=csi.info.unflatten(hidden_states),
-                **self._filter_kwargs_for_submodule(csi.named_args, self.draft_model),
+                **self._filter_kwargs_for_submodule(
+                    csi.named_args, self.draft_model, include_unassigned_kwargs=False
+                ),
             )
             draft_output_logits = self.apply_lm_head(draft_output.norm_hidden_state)
 

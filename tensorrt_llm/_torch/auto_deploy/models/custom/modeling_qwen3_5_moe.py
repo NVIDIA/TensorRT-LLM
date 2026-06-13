@@ -834,6 +834,64 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         return hidden_states
 
 
+class Qwen3_5MoeEagleLayer(nn.Module):
+    """Qwen3.5 MTP layer for the AutoDeploy Eagle one-model path."""
+
+    def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int):
+        super().__init__()
+        self.pre_fc_norm_embedding = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.self_attn = Qwen3_5MoeAttention(config, layer_idx)
+        self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        if position_ids.ndim == 1:
+            position_ids = position_ids.view(1, -1).expand(hidden_states.shape[0], -1)
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = self.fc(torch.cat([inputs_embeds, hidden_states], dim=-1))
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return self.norm(hidden_states)
+
+
+def build_qwen3_5_moe_eagle_layers(config: Qwen3_5MoeTextConfig) -> list[nn.Module]:
+    mtp_num_hidden_layers = getattr(
+        config, "mtp_num_hidden_layers", getattr(config, "num_nextn_predict_layers", 1)
+    )
+    if mtp_num_hidden_layers != 1:
+        raise ValueError(
+            "Qwen3.5 AutoDeploy MTP currently supports exactly one MTP layer, "
+            f"but config has {mtp_num_hidden_layers}."
+        )
+    return [Qwen3_5MoeEagleLayer(config, layer_idx=0)]
+
+
 # =============================================================================
 # Model
 # =============================================================================
@@ -952,6 +1010,12 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.embed_tokens = new_embeddings
 
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_final_normalization(self):
+        return self.norm
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1031,6 +1095,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
         self.model.set_lm_head(new_embeddings)
+
+    def get_final_normalization(self):
+        return self.model.get_final_normalization()
 
     def forward(
         self,
@@ -1858,8 +1925,12 @@ def qwen3_mrope_delta_with_cache(
     mrope_delta_cache: torch.Tensor,
     spatial_merge_size: int,
 ) -> torch.Tensor:
-    num_prefill, _, num_decode = BatchInfo(batch_info_host).get_absorbed_info()
-    num_seq = num_prefill + num_decode
+    # Three-way split (not get_absorbed_info, which folds extend into prefill): the vision-derived
+    # delta is computed once at prefill and is persistent. Extend (MTP draft/verify) continues an
+    # existing sequence with no new vision input, so it must READ the cached delta like decode --
+    # not recompute it on the prefill/write path.
+    num_prefill, num_extend, num_decode = BatchInfo(batch_info_host).get_num_sequences()
+    num_seq = num_prefill + num_extend + num_decode
     out = torch.zeros((num_seq, 1), dtype=torch.int32, device=mrope_delta_cache.device)
     video_grid_norm = _normalize_video_grid_for_mrope(video_grid_thw)
     has_mm_metadata = all(
@@ -1912,7 +1983,8 @@ def qwen3_mrope_delta_with_cache(
             slot_idx[:num_prefill].to(torch.long),
             out[:num_prefill].to(mrope_delta_cache.dtype),
         )
-    if num_decode > 0:
+    # Extend and decode both read the persistent delta (extend must not clobber it -- see above).
+    if num_extend + num_decode > 0:
         out[num_prefill:num_seq] = mrope_delta_cache[
             slot_idx[num_prefill:num_seq].to(torch.long)
         ].to(torch.int32)
@@ -1933,8 +2005,8 @@ def qwen3_mrope_delta_with_cache_fake(
     mrope_delta_cache: torch.Tensor,
     spatial_merge_size: int,
 ) -> torch.Tensor:
-    num_prefill, _, num_decode = BatchInfo(batch_info_host).get_absorbed_info()
-    num_seq = num_prefill + num_decode
+    num_prefill, num_extend, num_decode = BatchInfo(batch_info_host).get_num_sequences()
+    num_seq = num_prefill + num_extend + num_decode
     return torch.zeros((num_seq, 1), dtype=torch.int32, device=slot_idx.device)
 
 
@@ -1955,6 +2027,9 @@ class Qwen3_5MoeModel(nn.Module):
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
+
+    def get_final_normalization(self):
+        return self.language_model.get_final_normalization()
 
     def get_rope_index(
         self,
@@ -2187,6 +2262,7 @@ class Qwen3_5MoeModel(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
@@ -2213,7 +2289,10 @@ class Qwen3_5MoeModel(nn.Module):
         2. Otherwise (decode-only or text-only prefill without images): expand
            ``position_ids + delta`` to 3D where delta defaults to 0.
         """
-        inputs_embeds = self.get_input_embeddings()(input_ids)
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("Either input_ids or inputs_embeds must be provided")
+            inputs_embeds = self.get_input_embeddings()(input_ids)
 
         has_images = pixel_values is not None and image_grid_thw is not None
         has_videos = pixel_values_videos is not None and video_grid_thw is not None
@@ -2431,6 +2510,8 @@ class Qwen3_5MoeModel(nn.Module):
             else:
                 position_ids_3d = (position_ids + delta)[None].expand(3, -1, -1)
 
+        # These runtime inputs were consumed above and are not inputs of the inner language-model
+        # graph, so strip them before delegating to it.
         for key in (
             "input_pos",
             "mm_chunk_flat_start",
@@ -2788,13 +2869,20 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
     def get_input_embeddings(self):
         return self.model.language_model.get_input_embeddings()
 
+    def get_output_embeddings(self):
+        return self.lm_head
+
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
         self.model.language_model.set_lm_head(new_embeddings)
 
+    def get_final_normalization(self):
+        return self.model.language_model.get_final_normalization()
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
@@ -2805,6 +2893,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
     ) -> Qwen3_5MoeConditionalOutput:
         outputs = self.model(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             pixel_values=pixel_values,

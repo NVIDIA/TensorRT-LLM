@@ -84,6 +84,79 @@ def _preprocess_for_reference(q, k, a, b_proj, A_log, dt_bias, num_v_heads=None)
     return q_norm, k_norm, g, beta
 
 
+def make_extend_kernel_inputs(device, dtype, num_k_heads=2, num_v_heads=2):
+    """Build a minimal spec-dec extend request for the cached gated-delta op.
+
+    The request writes per-prefix states into ``intermediate_delta_cache`` instead of
+    updating ``delta_cache`` directly, matching how extend requests are used during
+    speculative decoding.
+    """
+    num_extend = 2
+    tokens_per_extend = 3
+    total_tokens = num_extend * tokens_per_extend
+    key_dim = 8
+    value_dim = 8
+    max_batch_size = 4
+    scale = key_dim**-0.5
+
+    q, k, v, a, b, A_log, dt_bias = _random_inputs(
+        device,
+        dtype,
+        1,
+        total_tokens,
+        num_k_heads,
+        num_v_heads,
+        key_dim,
+        value_dim,
+    )
+
+    slot_idx = torch.tensor([1, 3], device=device, dtype=torch.int32)
+    delta_cache = torch.zeros(
+        max_batch_size,
+        num_v_heads,
+        key_dim,
+        value_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    batch_info = BatchInfo()
+    batch_info.update([0, 0, num_extend, total_tokens, 0, 0])
+    batch_info.update_max_draft_len(tokens_per_extend - 1)
+    batch_info_host = batch_info.serialize()
+    cu_seqlen = torch.tensor([0], device=device, dtype=torch.int32)
+    use_initial_states = torch.ones(num_extend, device=device, dtype=torch.bool)
+    any_prefill_use_initial_states_host = torch.tensor([False], device=device, dtype=torch.bool)
+    intermediate_delta_cache = torch.zeros(
+        max_batch_size,
+        tokens_per_extend,
+        num_v_heads,
+        key_dim,
+        value_dim,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    args = (
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        batch_info_host,
+        cu_seqlen,
+        slot_idx,
+        use_initial_states,
+        any_prefill_use_initial_states_host,
+        delta_cache,
+        intermediate_delta_cache,
+        scale,
+    )
+    return args, v
+
+
 @pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 2), (2, 4)])
 def test_decode_only(gdr_env, num_k_heads, num_v_heads):
     """Decode-only: batch of single tokens through the cached op.
@@ -146,6 +219,7 @@ def test_decode_only(gdr_env, num_k_heads, num_v_heads):
         use_initial_states,
         any_prefill_use_initial_states_host,
         delta_cache,
+        None,
         scale,
     )
 
@@ -249,6 +323,7 @@ def test_prefill_only(gdr_env, num_k_heads, num_v_heads):
         use_initial_states,
         any_prefill_use_initial_states_host,
         delta_cache,
+        None,
         scale,
     )
 
@@ -285,6 +360,118 @@ def test_prefill_only(gdr_env, num_k_heads, num_v_heads):
         )
 
     torch.testing.assert_close(y, y_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 2), (2, 4)])
+def test_intermediate_delta_cache(gdr_env, num_k_heads, num_v_heads):
+    """Extend writes each prefix state to ``intermediate_delta_cache``.
+
+    For an extend request with N tokens, the intermediate state at each prefix length X
+    should match the ``delta_cache`` state produced by running a cached prefill over
+    the first X tokens from the same initial cache. The full-prefix output should also
+    match the extend output, while the original ``delta_cache`` remains unchanged.
+    """
+    device = gdr_env["device"]
+    dtype = gdr_env["dtype"]
+    atol = 5e-3
+    rtol = 5e-3
+    state_atol = 1e-2
+    state_rtol = 2e-2
+
+    args, _ = make_extend_kernel_inputs(device, dtype, num_k_heads, num_v_heads)
+    (
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        batch_info_host,
+        cu_seqlen,
+        slot_idx,
+        use_initial_states,
+        any_prefill_use_initial_states_host,
+        delta_cache,
+        intermediate_delta_cache,
+        scale,
+    ) = args
+    del batch_info_host, cu_seqlen, use_initial_states, any_prefill_use_initial_states_host
+
+    delta_cache.copy_(torch.randn_like(delta_cache))
+    initial_cache = delta_cache.clone()
+
+    y_extend = torch.ops.auto_deploy.fla_cached_gated_delta_rule(*args)
+
+    num_extend = slot_idx.numel()
+    tokens_per_extend = q.shape[1] // num_extend
+    for request_idx, slot in enumerate(slot_idx):
+        request_start = request_idx * tokens_per_extend
+        request_end = request_start + tokens_per_extend
+        for prefix_len in range(1, tokens_per_extend + 1):
+            prefix_delta_cache = initial_cache.clone()
+            prefix_batch_info = BatchInfo()
+            prefix_batch_info.update([1, prefix_len, 0, 0, 0, 0])
+            prefix_cu_seqlen = torch.tensor([0, prefix_len], device=device, dtype=torch.int32)
+            prefix_slot_idx = slot_idx[request_idx : request_idx + 1]
+            prefix_use_initial_states = torch.ones(1, device=device, dtype=torch.bool)
+            prefix_any_use_initial_states_host = torch.tensor(
+                [True], device=device, dtype=torch.bool
+            )
+
+            prefix_slice = slice(request_start, request_start + prefix_len)
+            y_prefill = torch.ops.auto_deploy.fla_cached_gated_delta_rule(
+                q[:, prefix_slice],
+                k[:, prefix_slice],
+                v[:, prefix_slice],
+                a[:, prefix_slice],
+                b[:, prefix_slice],
+                A_log,
+                dt_bias,
+                prefix_batch_info.serialize(),
+                prefix_cu_seqlen,
+                prefix_slot_idx,
+                prefix_use_initial_states,
+                prefix_any_use_initial_states_host,
+                prefix_delta_cache,
+                None,
+                scale,
+            )
+
+            torch.testing.assert_close(
+                intermediate_delta_cache[request_idx, prefix_len - 1],
+                prefix_delta_cache[slot.long()].to(intermediate_delta_cache.dtype),
+                atol=state_atol,
+                rtol=state_rtol,
+            )
+            if prefix_len == tokens_per_extend:
+                torch.testing.assert_close(
+                    y_extend[:, request_start:request_end], y_prefill, atol=atol, rtol=rtol
+                )
+
+    torch.testing.assert_close(delta_cache, initial_cache, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_extend_cuda_graph_capture():
+    """Spec-dec extend FLA cached gated-delta op should be CUDA-graph capturable."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(42)
+
+    warmup_args, _ = make_extend_kernel_inputs(device, dtype)
+    for _ in range(3):
+        torch.ops.auto_deploy.fla_cached_gated_delta_rule(*warmup_args)
+
+    capture_args, capture_v = make_extend_kernel_inputs(device, dtype)
+    static_out = torch.empty_like(capture_v)
+
+    cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(cuda_graph):
+        static_out.copy_(torch.ops.auto_deploy.fla_cached_gated_delta_rule(*capture_args))
+
+    cuda_graph.replay()
+    assert torch.isfinite(static_out).all()
 
 
 @pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 2), (2, 4)])
@@ -347,6 +534,7 @@ def test_prefill_with_initial_state(gdr_env, num_k_heads, num_v_heads):
         use_initial_states,
         any_prefill_use_initial_states_host,
         delta_cache,
+        None,
         scale,
     )
 
@@ -394,6 +582,7 @@ def test_prefill_with_initial_state(gdr_env, num_k_heads, num_v_heads):
         use_initial_states_false,
         any_prefill_use_initial_states_host_false,
         delta_cache_zero,
+        None,
         scale,
     )
 

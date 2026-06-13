@@ -286,6 +286,7 @@ class TestSpeculativeConfigValidation:
         # Should not raise.
         args = LlmArgs(model="test-model", speculative_config=spec_config)
         assert args.model_factory == "eagle_one_model"
+        assert args.target_model_factory == "AutoModelForCausalLM"
 
     def test_accepts_mtp_eagle_one_model(self):
         from tensorrt_llm.llmapi import MTPDecodingConfig
@@ -297,6 +298,42 @@ class TestSpeculativeConfigValidation:
         # Should not raise.
         args = LlmArgs(model="test-model", speculative_config=spec_config)
         assert args.model_factory == "eagle_one_model"
+        assert args.target_model_factory == "AutoModelForCausalLM"
+
+    def test_moves_declared_target_factory_for_mtp_eagle_one_model(self):
+        from tensorrt_llm.llmapi import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
+
+        args = LlmArgs(
+            model="test-model",
+            model_factory="AutoModelForImageTextToText",
+            speculative_config=spec_config,
+        )
+
+        assert args.model_factory == "eagle_one_model"
+        assert args.target_model_factory == "AutoModelForImageTextToText"
+
+    def test_rejects_eagle_wrapper_factory_without_target_factory(self):
+        from tensorrt_llm.llmapi import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="target_model_factory must be set",
+        ):
+            LlmArgs(
+                model="test-model",
+                model_factory="eagle_one_model",
+                speculative_config=spec_config,
+            )
 
     @pytest.mark.parametrize("compile_backend", ["torch-cudagraph", "torch-opt"])
     def test_rejects_flashinfer_cuda_graph_backend(self, compile_backend):
