@@ -53,6 +53,13 @@ def pytest_configure(config):
     # Dump all threads' stacks when SIGALRM is received
     signal.signal(signal.SIGALRM, dump_threads)
 
+    # xdist worker processes must not register PeriodicJUnitXML: all worker
+    # reports are forwarded to the controller via xdist and processed there,
+    # so registering on workers causes concurrent writers to the same
+    # unfinished_test.txt and races out cleanup entries.
+    if hasattr(config, "workerinput"):
+        return
+
     # Register PeriodicJUnitXML when invoked from integration test_unittests.py
     periodic = config.getoption("--periodic-junit", default=False)
     periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
