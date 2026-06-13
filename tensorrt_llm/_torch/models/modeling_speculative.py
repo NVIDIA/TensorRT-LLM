@@ -50,6 +50,37 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
     config.draft_vocab_size = config.vocab_size
 
 
+def _resolve_eagle3_sliding_window(config: PretrainedConfig,
+                                   local_layer_idx: int) -> Optional[int]:
+    """Resolve the sliding-window size for a single Eagle3 draft layer.
+
+    For variable-sliding-window (VSWA) models the draft config exposes a
+    ``layer_types`` list (e.g. the alternating ``"sliding_attention"`` /
+    ``"full_attention"`` pattern used by GPT-OSS / Ministral). Only
+    sliding-attention layers use ``config.sliding_window``; full-attention
+    layers get ``None`` so they keep global attention. When ``layer_types`` is
+    absent we fall back to applying ``config.sliding_window`` uniformly, which
+    preserves behaviour for single-layer drafts that only set
+    ``sliding_window``. This mirrors ``MistralAttention`` in
+    ``modeling_mistral.py``.
+
+    ``local_layer_idx`` is the draft-local layer index (0-based within the
+    draft model). It is distinct from the global ``layer_idx`` used for KV
+    cache, which is offset past the target model's layers
+    (see ``get_draft_model``).
+    """
+    sliding_window = getattr(config, "sliding_window", None)
+    if sliding_window is None:
+        return None
+
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None and 0 <= local_layer_idx < len(layer_types):
+        if layer_types[local_layer_idx] != "sliding_attention":
+            return None
+
+    return sliding_window
+
+
 def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
                              num_tokens: int) -> Optional[torch.Tensor]:
     """Slice speculative position IDs along the token dimension."""
@@ -184,6 +215,7 @@ class Eagle3DecoderLayer(DecoderLayer):
         is_first_layer: bool = True,
         use_mla: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        local_layer_idx: int = 0,
     ) -> None:
         super().__init__()
         config = model_config.pretrained_config
@@ -205,6 +237,30 @@ class Eagle3DecoderLayer(DecoderLayer):
         else:
             self.self_attn = Eagle3Attention(model_config, layer_idx,
                                              self._next_layer_regular)
+
+        # Resolve the per-layer sliding window. VSWA drafts expose
+        # ``layer_types`` so that only sliding-attention layers use
+        # ``config.sliding_window``; full-attention layers fall back to global
+        # attention (``None``). Drafts that only set ``sliding_window`` (no
+        # ``layer_types``) keep applying it uniformly. The window is forwarded
+        # to attention as ``attention_window_size`` only when its forward
+        # accepts it -- MLA does not, and no MLA model currently uses SWA.
+        sliding_window = _resolve_eagle3_sliding_window(config, local_layer_idx)
+        self.self_attn.sliding_window = sliding_window
+        self._attn_kwargs = {}
+        if sliding_window is not None:
+            forward_params = inspect.signature(
+                self.self_attn.forward).parameters
+            if "attention_window_size" in forward_params:
+                self._attn_kwargs["attention_window_size"] = sliding_window
+            else:
+                logger.warning(
+                    "sliding_window=%s is configured on %s but its forward "
+                    "method does not accept attention_window_size; ignoring "
+                    "sliding window for this attention module.",
+                    sliding_window,
+                    type(self.self_attn).__name__,
+                )
 
         if config.model_type == "llama4_text":
             inter_size = config.intermediate_size_mlp
@@ -259,6 +315,7 @@ class Eagle3DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            **self._attn_kwargs,
         )
 
         hidden_states, residual = self.post_attention_layernorm(
@@ -338,6 +395,7 @@ class Eagle3DraftModel(DecoderModel):
                     is_first_layer=(i == 0),
                     use_mla=use_mla,
                     aux_stream=self.aux_stream,
+                    local_layer_idx=i,
                 ) for i in range(self.num_layers)
             ])
         else:
@@ -346,6 +404,7 @@ class Eagle3DraftModel(DecoderModel):
                 start_layer_idx,
                 use_mla=use_mla,
                 aux_stream=self.aux_stream,
+                local_layer_idx=0,
             )
 
         self.norm = RMSNorm(
