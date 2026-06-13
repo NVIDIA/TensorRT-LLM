@@ -92,9 +92,9 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             name="cbts-periodic-save",
         ).start()
 
-    # In worker processes, attribute coverage to the current test via the CBTS_TEST_ID env var and a polled marker file.
+    # In worker processes and nested inner pytests, attribute coverage to the current test via the CBTS_TEST_ID env var.
     _initial_nodeid = os.environ.get("CBTS_TEST_ID", "").strip()
-    if _initial_nodeid and not _is_pytest_main:
+    if _initial_nodeid and (not _is_pytest_main or _is_nested_pytest):
         with _cov_lock:
             cov.switch_context(_initial_nodeid)
 
