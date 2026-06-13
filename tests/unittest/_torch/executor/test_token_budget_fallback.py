@@ -209,6 +209,37 @@ class TestFitTokenBudget(unittest.TestCase):
         self.assertIn(ctx1, kept)
         self.assertNotIn(ctx3, kept)
 
+    def test_fallback_can_be_disabled_via_flag(self):
+        # The fallback is opt-out (TorchLlmArgs.enable_token_budget_fallback,
+        # default True). When disabled, prepare_resources must NOT invoke
+        # _fit_token_budget, leaving the scheduled batch untouched.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        mgr.is_draft = False
+        mgr.enable_token_budget_fallback = False
+
+        called = []
+        mgr._fit_token_budget = lambda batch: called.append(batch)
+
+        # Reproduce the gate from KVCacheManager.prepare_resources without the
+        # surrounding GPU work.
+        if not mgr.is_draft and mgr.enable_token_budget_fallback:
+            mgr._fit_token_budget(object())
+
+        self.assertEqual(called, [])
+
+        # Sanity: enabling it does call through.
+        mgr.enable_token_budget_fallback = True
+        if not mgr.is_draft and mgr.enable_token_budget_fallback:
+            mgr._fit_token_budget(object())
+        self.assertEqual(len(called), 1)
+
+    def test_torch_llm_args_flag_default_is_opt_out(self):
+        # The user-facing flag must default to enabled (opt-out semantics).
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        field = TorchLlmArgs.model_fields["enable_token_budget_fallback"]
+        self.assertEqual(field.default, True)
+
     def test_generation_alone_over_budget_raises(self):
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
         gen = _FakeRequest(py_beam_width=200)

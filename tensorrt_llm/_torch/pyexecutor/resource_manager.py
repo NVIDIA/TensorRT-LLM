@@ -572,6 +572,7 @@ class KVCacheManager(BaseResourceManager):
         # head_dim=512).
         pool_configurations: Optional[List[PoolConfiguration]] = None,
         enable_chunked_prefill: bool = False,
+        enable_token_budget_fallback: bool = True,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -665,6 +666,10 @@ class KVCacheManager(BaseResourceManager):
         # Defaults to False (safe: defer instead of re-chunk) and is set to the
         # finalized value by _create_kv_cache_manager.
         self.enable_chunked_prefill = enable_chunked_prefill
+        # Opt-out switch for the prep-boundary token-budget fallback
+        # (_fit_token_budget). Enabled by default; set False to restore the
+        # pre-fallback behavior. Wired from TorchLlmArgs.enable_token_budget_fallback.
+        self.enable_token_budget_fallback = enable_token_budget_fallback
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
@@ -1127,9 +1132,10 @@ class KVCacheManager(BaseResourceManager):
             scheduled_batch.reset_context_requests(kept)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        if not self.is_draft:
+        if not self.is_draft and self.enable_token_budget_fallback:
             # The draft-model engine builds inputs with a different token shape;
-            # its budget is handled separately.
+            # its budget is handled separately. Gated by an opt-out flag so the
+            # fallback can be disabled to restore pre-fallback behavior.
             self._fit_token_budget(scheduled_batch)
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy

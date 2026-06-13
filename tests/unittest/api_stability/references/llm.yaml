@@ -74,6 +74,10 @@ methods:
         annotation: int
         default: 20000
         status: beta
+      enable_token_budget_fallback:
+        annotation: bool
+        default: True
+        status: beta
       # Misc
       backend:
         annotation: Literal["pytorch"]
