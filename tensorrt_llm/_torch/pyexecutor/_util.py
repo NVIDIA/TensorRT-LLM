@@ -226,8 +226,6 @@ class KvCacheCreator:
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
         self._llm_args = llm_args
-        # For V2 fallback use only, will be removed after V2 is stable
-        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -237,6 +235,7 @@ class KvCacheCreator:
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
+        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._execution_stream = execution_stream
         self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine)
@@ -244,35 +243,13 @@ class KvCacheCreator:
         self._skip_est = skip_est
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
-        config = model_engine.model.model_config.pretrained_config
         cls = get_kv_cache_manager_cls(
             model_engine.model.model_config,
             self._kv_cache_config,
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
-        if cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None and self._max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
-                # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
-                # split-pool layout. KVCacheManager (V1) coerces head_dim list
-                # to max(head_dim), changing per-layer KV byte sizes — which
-                # breaks correctness, not just efficiency. Fail fast here
-                # rather than silently producing wrong outputs.
-                if is_gemma4_hybrid(config):
-                    raise NotImplementedError(
-                        "Gemma4 hybrid attention requires KVCacheManagerV2, "
-                        "which is not yet supported with kv_connector_manager, "
-                        "beam_width > 1, event_buffer_max_size > 0, or "
-                        "cache_transceiver. Disable these features to run "
-                        "Gemma4 hybrid models.")
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
-                )
-                cls = KVCacheManager
+        cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+            cls, model_engine.model.model_config)
         # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
         # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
         # state in a separate cache that doesn't honor block reuse. Warn at
@@ -289,6 +266,36 @@ class KvCacheCreator:
                     "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
                 )
         return cls
+
+    def _fallback_if_unsupported_kv_cache_manager_v2(
+            self,
+            kv_cache_manager_cls,
+            model_config: Optional[ModelConfig] = None):
+        if kv_cache_manager_cls == KVCacheManagerV2:
+            if self._kv_connector_manager is not None or (
+                    self._max_beam_width is not None and self._max_beam_width
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
+                # split-pool layout. KVCacheManager (V1) coerces head_dim list
+                # to max(head_dim), changing per-layer KV byte sizes — which
+                # breaks correctness, not just efficiency. Fail fast here
+                # rather than silently producing wrong outputs.
+                if (model_config is not None
+                        and is_gemma4_hybrid(model_config.pretrained_config)):
+                    raise NotImplementedError(
+                        "Gemma4 hybrid attention requires KVCacheManagerV2, "
+                        "which is not yet supported with kv_connector_manager, "
+                        "beam_width > 1, event_buffer_max_size > 0, or "
+                        "cache_transceiver. Disable these features to run "
+                        "Gemma4 hybrid models.")
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
+                    "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
+                )
+                return KVCacheManager
+        return kv_cache_manager_cls
 
     def _per_manager_cache_cost(self, manager_cls, model_config,
                                 **extra_kwargs) -> CacheCost:
@@ -773,6 +780,7 @@ class KvCacheCreator:
             sparse_attn_config=self._sparse_attention_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
+            max_input_len=self._llm_args.max_input_len,
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
@@ -817,6 +825,11 @@ class KvCacheCreator:
         if self._mapping.enable_attention_dp:
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
+            )
+            return False
+        if self._sparse_attention_config is not None:
+            logger.info(
+                "Sparse attention is enabled, separate draft KV cache is not supported."
             )
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
@@ -881,18 +894,8 @@ class KvCacheCreator:
             effective_draft_config,
             self._kv_cache_config,
             is_disagg=self._is_disagg)
-
-        # Use V2 if enabled and the base class is KVCacheManager
-        if draft_kv_cache_manager_cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None and self._max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
-                    "Falling back to KVCacheManager for draft model.")
-                draft_kv_cache_manager_cls = KVCacheManager
+        draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+            draft_kv_cache_manager_cls, effective_draft_config)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
@@ -1186,6 +1189,8 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
+        is_disagg: bool = False,
+        max_input_len: Optional[int] = None,
         estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         # Optional overrides for one-model draft case (when model_engine is None)
@@ -1193,8 +1198,7 @@ def _create_kv_cache_manager(
         dtype: Optional[torch.dtype] = None,
         is_draft: Optional[bool] = None,
         layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None,
-        is_disagg: bool = False) -> KVCacheManager:
+        num_layers: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1322,6 +1326,7 @@ def _create_kv_cache_manager(
             vocab_size=config.vocab_size,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
+            max_input_len=max_input_len,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             sparse_attn_config=sparse_attn_config,
@@ -1329,6 +1334,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
+            max_num_tokens=max_num_tokens,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1507,6 +1513,7 @@ def _create_kv_cache_manager(
             max_num_tokens=max_num_tokens,
             model_config=binding_model_config,
             max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
@@ -1554,7 +1561,13 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
-    max_num_sequences = max_batch_size * mapping.pp_size
+    # Slot pool needs headroom for two iterations under overlap (prev-iter
+    # finished requests still hold slots when next-iter prepare_resources runs).
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = 1 if llm_args.disable_overlap_scheduler else 2
+    max_num_sequences = max_batch_size * num_micro_batches
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
@@ -1728,9 +1741,22 @@ def create_py_executor_instance(
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
-    scheduler_capacity = max_num_sequences
+    # V1 scheduler handles overlap via two_step_lookahead, so skip the slot-pool overlap factor here.
+    scheduler_capacity = max_batch_size * mapping.pp_size
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
+
+    # V2 scheduler uses scheduler_capacity as the per-iteration request
+    # budget (BudgetTracker.max_num_requests).  Unlike V1 which has a
+    # separate CapacityScheduler (needs pp_size * max_batch_size to hold
+    # requests across PP stages) and MicroBatchScheduler (uses
+    # max_batch_size for per-forward batch limit), V2 merges both into
+    # one loop.  PP on-the-fly is handled by inflight_request_ids
+    # filtering, so its budget should be based on max_batch_size, not
+    # max_num_sequences (which includes the pp_size multiplier).
+    v2_scheduler_capacity = max_batch_size
+    if v2_scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
+        v2_scheduler_capacity += 1
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -1747,7 +1773,7 @@ def create_py_executor_instance(
             ctx_chunk_config=ctx_chunk_config,
             peft_cache_manager=peft_cache_manager.impl
             if peft_cache_manager is not None else None,
-            scheduler_capacity=scheduler_capacity,
+            scheduler_capacity=v2_scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
     elif (scheduler_config is not None
@@ -1846,7 +1872,12 @@ def create_torch_sampler_args(
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
 ):
-    max_num_sequences = max_batch_size * mapping.pp_size
+    # Must match create_py_executor_instance's slot-pool sizing.
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = 1 if disable_overlap_scheduler else 2
+    max_num_sequences = max_batch_size * num_micro_batches
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else

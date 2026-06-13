@@ -508,7 +508,9 @@ class RopeParams:
     duplicate_data: bool = False
 
     @staticmethod
-    def from_config(config) -> "RopeParams":
+    def from_config(config,
+                    *,
+                    runtime_max_seq_len: Optional[int] = None) -> "RopeParams":
         rope_params = RopeParams()
 
         hf_rope_parameters = getattr(config, 'rope_parameters', None)
@@ -583,6 +585,22 @@ class RopeParams:
             rope_params.scale_type = RotaryScalingType.yarn
         # Other metdadata for RoPE.
         rope_params.max_seq_len = getattr(config, 'max_seq_len', None)
+
+        # Auto-cap the precomputed cos/sin table size to runtime_max_seq_len
+        # when the caller opts in. For YaRN / plain / linear / llama3 / dynamic
+        # scaling, cos/sin at position p depends only on p and scaling
+        # constants (not on the table size), so truncating max_positions
+        # yields bitwise-identical values for indices < cap. The cap
+        # participates in the dataclass hash so per-layer RopeParams still
+        # dedup into a single cos/sin tensor. The cap is opt-in because
+        # RotaryScalingType.longrope folds num_pos into its scaling_factor
+        # (scale = num_pos / original_max_pos), where truncation would change
+        # the produced cos/sin values; LongRoPE callers must NOT pass
+        # runtime_max_seq_len. ensure_rope_table_size remains a runtime
+        # safety net for any kernel that asks for a larger max_positions.
+        if (runtime_max_seq_len is not None and runtime_max_seq_len > 0
+                and runtime_max_seq_len < rope_params.max_positions):
+            rope_params.max_positions = runtime_max_seq_len
 
         return rope_params
 
@@ -728,6 +746,10 @@ class AttentionSparseArgs:
     sparse_attn_indices: Optional[torch.Tensor] = None
     sparse_attn_offsets: Optional[torch.Tensor] = None
     sparse_attn_indices_block_size: int = 0
+    # DeepSeek-V4 sparse-MLA only: per-token compressed top-k lengths and the
+    # base pointer of the compressed KV cache pool (compress_ratio > 1).
+    sparse_mla_topk_lens: Optional[torch.Tensor] = None
+    compressed_kv_cache_pool_ptr: Optional[int] = None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -763,6 +785,8 @@ class AttentionForwardArgs:
     mla_bmm1_scale: Optional[torch.Tensor] = None
     mla_bmm2_scale: Optional[torch.Tensor] = None
     quant_q_buffer: Optional[torch.Tensor] = None
+
+    is_generation: Optional[bool] = None
 
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0

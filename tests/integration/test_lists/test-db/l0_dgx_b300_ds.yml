@@ -1,0 +1,63 @@
+version: 0.0.1
+l0_dgx_b300_ds:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*b300*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
+  - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python
+  # ------------- DeepSeek-V4 (4x B300, pre_merge) ---------------
+  # B300's larger per-GPU memory (~288 GB) lets V4 EPLB and FP8 aggregate
+  # smoke fit at TP=4. (Same tests at TP=8 would also fit on 8x B200, but a
+  # dedicated 8-GPU B200 stage is not currently provisioned.)
+  # V4-Flash-Base FP8 aggregate smoke (TP=4, no EPLB): 1 MMLU sample.
+  # TRTLLMGen FP8 backend selected here: it is the user-facing default on
+  # Blackwell (model_config.py::resolve_moe_backend) and ~7% faster per step
+  # than WIDEEP in our measurements. WIDEEP variant of the same test is
+  # currently held out of CI (see test_auto_dtype[moe_backend=WIDEEP]).
+  # TODO: re-enable once DeepSeek-V4-Flash-Base is uploaded to the CI model
+  # share at /scratch.trt_llm_data/llm-models/DeepSeek-V4-Flash-Base. The
+  # model is currently missing on B300 CI workers, so LLM(...) treats the
+  # path as an HF repo id and HFValidationError fires.
+  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=TRTLLM] TIMEOUT (60)
+  # V4-Flash NVFP4 aggregate smoke (TP=4, no EPLB): 1 MMLU sample.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
+  # V4-Flash-Base FP8 chunked-prefill smoke with FP8 KV cache. Keep
+  # max_num_tokens small in the test to force chunked prefill scheduling.
+  # Held out for the same model-availability reason as test_auto_dtype above;
+  # re-enable together once DeepSeek-V4-Flash-Base is uploaded to the CI
+  # model share.
+  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_chunked_prefill TIMEOUT (60)
+  # V4-Flash NVFP4 static EPLB sanity. WIDEEP backend is skipped at the
+  # test level because V4-Flash MXFP4 routed experts are unsupported by
+  # WIDEEP (raises "Unsupported quantization mode: [65536]"); TRTLLM is the
+  # supported backend. Measured GSM8K accuracy 95.11 (see
+  # references/gsm8k.yaml; reference was captured at TP=8 / 8x B200, may
+  # drift slightly at TP=4 / 4x B300 — re-measure if hypothesis test flaps).
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM] TIMEOUT (120)
+  # Same TP=4 EP=4 ADP layout with DG's fused fp8_fp4_mega_moe backend.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=MEGAMOE_DEEPGEMM] TIMEOUT (120)
+  # Known issues (uncomment when unblocked):
+  # * V4-Flash-Base FP8 + EPLB hits CUBLAS_STATUS_EXECUTION_FAILED in
+  #   forward pass with WIDEEP backend (memory pressure aside).
+  #   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_4gpus_static_eplb[moe_backend=WIDEEP]
+  # * Online EPLB (layer_updates_per_iter>0) requires gdrcopy/gdrdrv for
+  #   HostAccessibleDeviceAllocator (moeLoadBalancer.cpp:846); without
+  #   gdrcopy the executor crashes during initialization. Static EPLB does
+  #   not hit this path.
+  #   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_online_eplb[mtp_nextn=0-moe_backend=TRTLLM]
+  #   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_online_eplb[mtp_nextn=1-moe_backend=TRTLLM]
+  #   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_4gpus_online_eplb[moe_backend=WIDEEP]

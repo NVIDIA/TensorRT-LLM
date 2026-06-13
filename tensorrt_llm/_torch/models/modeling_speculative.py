@@ -1437,6 +1437,9 @@ class MTPForCausalLM(nn.Module):
             case "step3p7" | "step3p5":
                 from .modeling_step3p7 import Step3p7MTP
                 mtp_layer = Step3p7MTP
+            case "deepseek_v4":
+                from .modeling_deepseekv4 import DeepseekV4MTP
+                mtp_layer = DeepseekV4MTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -1496,6 +1499,12 @@ class MTPDraftModel(nn.Module):
         elif model_type == "qwen3_next":
             from .modeling_qwen3_next import Qwen3NextMTP
             mtp_layer = Qwen3NextMTP(model_config, layer_idx, aux_stream_dict)
+        elif model_type == "deepseek_v4":
+            from .modeling_deepseekv4 import DeepseekV4MTP
+            mtp_layer = DeepseekV4MTP(model_config,
+                                      layer_idx,
+                                      aux_stream_dict,
+                                      is_separate_draft_engine=True)
         else:
             raise ValueError(
                 f"MTPDraftModel does not support model_type: {model_type}")

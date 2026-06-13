@@ -107,6 +107,10 @@ def _register_fake():
           trigger_completion_at_end):
         return [torch.empty_like(q), torch.empty_like(k)]
 
+    @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
+    def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
+        return torch.empty_like(q)
+
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
         if sizes is None:
@@ -220,7 +224,10 @@ def _register_fake():
           next_n,
           index_topk,
           pre_idx=None,
-          heuristic_scratch=None):
+          heuristic_scratch=None,
+          compress_ratio=1,
+          radix_aux_indices=None,
+          radix_aux_logits=None):
         # In-place operation, no return value (void function)
         pass
 
@@ -233,6 +240,21 @@ def _register_fake():
         m = a.shape[0]
         n = b.shape[0]
         return a.new_empty((m, n), dtype=torch.bfloat16)
+
+    @torch.library.register_fake("trtllm::gate_forward")
+    def _(
+        scores_in: torch.Tensor,
+        bias: torch.Tensor,
+        input_ids: torch.Tensor,
+        tid2eid: torch.Tensor,
+        out_weights: torch.Tensor,
+        out_indices: torch.Tensor,
+        topk: int,
+        route_scale: float,
+        is_hash: bool,
+    ) -> None:
+        # In-place operation, no return value (void function)
+        pass
 
     @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
     def _(input: torch.Tensor):
@@ -634,6 +656,17 @@ def _register_fake():
         packed = pe.new_empty((M, head_dim // 2), dtype=torch.int8)
         scale = pe.new_empty((M, 1), dtype=torch.int32)
         return packed, scale
+
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
+    def _(input: torch.Tensor):
+        # Returns (fp8_e4m3 [m, k], packed_ue8m0_int32 [m, packed_sf_k])
+        # matching deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor's return shape.
+        m, k = input.shape[0], input.shape[1]
+        num_n_blocks = (k + 127) // 128
+        num_packed_sf_k = (num_n_blocks + 3) // 4
+        return torch.empty_like(input,
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    (m, num_packed_sf_k), dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(

@@ -12,7 +12,7 @@ from .moe_load_balancer import (MoeLoadBalancer,
 from .quantization import FusedMoEQuantScalesFP8
 # yapf: disable
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
-                      DefaultMoeRoutingMethod,
+                      DeepSeekV4MoeRoutingMethod, DefaultMoeRoutingMethod,
                       Llama4RenormalizeMoeRoutingMethod,
                       LoadBalancedMoeRoutingMethod, MiniMaxM2MoeRoutingMethod,
                       RenormalizeMoeRoutingMethod,
@@ -41,6 +41,7 @@ __all__ = [
     "MoeLoadBalancer",
     "MoEWeightLoadingMode",
     "MiniMaxM2MoeRoutingMethod",
+    "DeepSeekV4MoeRoutingMethod",
     "RenormalizeMoeRoutingMethod",
     "SigmoidRenormMoeRoutingMethod",
     "RenormalizeNaiveMoeRoutingMethod",

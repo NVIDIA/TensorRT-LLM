@@ -174,6 +174,8 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        if override_quant_config is not None:
+            self.quant_config = override_quant_config
 
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
@@ -321,6 +323,7 @@ class ConfigurableMoE(MoE):
                 swiglu_alpha=kwargs.get("swiglu_alpha"),
                 swiglu_beta=kwargs.get("swiglu_beta"),
                 swiglu_limit=kwargs.get("swiglu_limit"),
+                swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
                 without_comm=True,
                 activation_type=self.activation_type,
@@ -556,7 +559,7 @@ class ConfigurableMoE(MoE):
 
         DP-padding handling and chunking live in the scheduler.
         """
-        del kwargs
+        input_ids = kwargs.get("input_ids")
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -577,6 +580,7 @@ class ConfigurableMoE(MoE):
             output_dtype=output_dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            input_ids=input_ids,
             lora_params=lora_params,
         )
 

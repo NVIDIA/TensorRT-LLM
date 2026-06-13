@@ -804,6 +804,85 @@ class TestLogIterationStatsKvCacheIteration:
             collector, "kv_cache_intra_device_copy_bytes_total"
         ) - before_intra_device == pytest.approx(16384)
 
+    def test_v2_lifecycle_and_pool_group_stats_are_aggregated(self):
+        """V2 split stats should aggregate reuse from lifecycle and storage from PG."""
+        collector = _make_kv_iter_collector()
+        stats = {
+            "kvCacheIterationStatsByLifecycle": {
+                "0": {
+                    "iterReusedBlocks": 5,
+                    "iterFullReusedBlocks": 4,
+                    "iterPartialReusedBlocks": 1,
+                    "iterMissedBlocks": 3,
+                }
+            },
+            "kvCacheIterationStatsByPoolGroup": {
+                "0": {
+                    "secondaryMaxNumBlocks": 50,
+                    "secondaryUsedNumBlocks": 20,
+                    "iterGenAllocBlocks": 2,
+                    "iterOnboardBytes": 4096,
+                    "iterOffloadBytes": 2048,
+                    "iterIntraDeviceCopyBytes": 8192,
+                }
+            },
+        }
+
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+        before_gen_alloc = _get_counter_value(collector, "kv_cache_gen_alloc_blocks_total")
+        before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
+
+        collector.log_iteration_stats(stats)
+
+        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
+        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(5 / 8)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_reused_blocks"
+        ) - before_reused == pytest.approx(5)
+        assert _get_counter_value(
+            collector, "kv_cache_gen_alloc_blocks_total"
+        ) - before_gen_alloc == pytest.approx(2)
+        assert _get_counter_value(
+            collector, "kv_cache_onboard_bytes_total"
+        ) - before_onboard == pytest.approx(4096)
+
+    def test_v2_none_stats_are_treated_as_zero(self):
+        """V2 stats may report optional fields as None instead of omitting them."""
+        collector = _make_kv_iter_collector()
+        stats = {
+            "kvCacheIterationStatsByLifecycle": {
+                "0": {
+                    "iterReusedBlocks": 2,
+                    "iterFullReusedBlocks": None,
+                    "iterPartialReusedBlocks": None,
+                    "iterMissedBlocks": 1,
+                }
+            },
+            "kvCacheIterationStatsByPoolGroup": {
+                "0": {
+                    "secondaryMaxNumBlocks": None,
+                    "secondaryUsedNumBlocks": None,
+                    "iterGenAllocBlocks": None,
+                    "iterOnboardBytes": None,
+                    "iterOffloadBytes": None,
+                    "iterIntraDeviceCopyBytes": None,
+                }
+            },
+        }
+
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
+
+        collector.log_iteration_stats(stats)
+
+        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(2 / 3)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_reused_blocks"
+        ) - before_reused == pytest.approx(2)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_missed_blocks"
+        ) - before_missed == pytest.approx(1)
+
     def test_multiple_windows_aggregated(self):
         """Stats from multiple window sizes should be summed."""
         collector = _make_kv_iter_collector()

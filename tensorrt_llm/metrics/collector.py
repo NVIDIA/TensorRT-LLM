@@ -797,9 +797,20 @@ class MetricsCollector:
                 self._log_gauge(self.spec_decode_draft_overhead,
                                 spec_stats["draftOverhead"])
 
-        # Per-iteration KV cache stats (aggregated across window sizes)
-        if kv_iter := iteration_stats.get("kvCacheIterationStats"):
-            # Aggregate across all window sizes
+        # Per-iteration KV cache stats. V2 reports reuse/miss by lifecycle and
+        # storage/transfer counters by pool group; legacy V1 uses window stats.
+        kv_iter = iteration_stats.get("kvCacheIterationStats")
+        kv_iter_by_lifecycle = iteration_stats.get(
+            "kvCacheIterationStatsByLifecycle")
+        kv_iter_by_pool_group = iteration_stats.get(
+            "kvCacheIterationStatsByPoolGroup")
+        if kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group:
+            reuse_stats = kv_iter_by_lifecycle or kv_iter or {}
+            pool_group_stats = kv_iter_by_pool_group or kv_iter or {}
+
+            def stat_value(stats, key):
+                return stats.get(key) or 0
+
             total_secondary_max = 0
             total_secondary_used = 0
             total_reused = 0
@@ -811,20 +822,23 @@ class MetricsCollector:
             total_offload_bytes = 0
             total_intra_device_copy_bytes = 0
 
-            for ws_stats in kv_iter.values():
-                total_secondary_max += ws_stats.get("secondaryMaxNumBlocks", 0)
-                total_secondary_used += ws_stats.get("secondaryUsedNumBlocks",
-                                                     0)
-                total_reused += ws_stats.get("iterReusedBlocks", 0)
-                total_full_reused += ws_stats.get("iterFullReusedBlocks", 0)
-                total_partial_reused += ws_stats.get("iterPartialReusedBlocks",
-                                                     0)
-                total_missed += ws_stats.get("iterMissedBlocks", 0)
-                total_gen_alloc += ws_stats.get("iterGenAllocBlocks", 0)
-                total_onboard_bytes += ws_stats.get("iterOnboardBytes", 0)
-                total_offload_bytes += ws_stats.get("iterOffloadBytes", 0)
-                total_intra_device_copy_bytes += ws_stats.get(
-                    "iterIntraDeviceCopyBytes", 0)
+            for stats in reuse_stats.values():
+                total_reused += stat_value(stats, "iterReusedBlocks")
+                total_full_reused += stat_value(stats, "iterFullReusedBlocks")
+                total_partial_reused += stat_value(stats,
+                                                   "iterPartialReusedBlocks")
+                total_missed += stat_value(stats, "iterMissedBlocks")
+
+            for stats in pool_group_stats.values():
+                total_secondary_max += stat_value(stats,
+                                                  "secondaryMaxNumBlocks")
+                total_secondary_used += stat_value(stats,
+                                                   "secondaryUsedNumBlocks")
+                total_gen_alloc += stat_value(stats, "iterGenAllocBlocks")
+                total_onboard_bytes += stat_value(stats, "iterOnboardBytes")
+                total_offload_bytes += stat_value(stats, "iterOffloadBytes")
+                total_intra_device_copy_bytes += stat_value(
+                    stats, "iterIntraDeviceCopyBytes")
 
             # Gauges
             if total_secondary_max > 0:

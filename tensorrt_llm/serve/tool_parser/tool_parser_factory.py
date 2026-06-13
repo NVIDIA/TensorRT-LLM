@@ -4,6 +4,7 @@ from typing import Optional, Type
 
 from .base_tool_parser import BaseToolParser
 from .deepseekv3_parser import DeepSeekV3Parser
+from .deepseekv4_parser import DeepSeekV4Parser
 from .deepseekv31_parser import DeepSeekV31Parser
 from .deepseekv32_parser import DeepSeekV32Parser
 from .gemma4_parser import Gemma4ToolParser
@@ -24,6 +25,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek_v3",
     "deepseek_v32": "deepseek_v32",
+    "deepseek_v4": "deepseek_v4",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k2",
     "glm4": "glm4",
@@ -57,6 +59,7 @@ class ToolParserFactory:
         "deepseek_v3": DeepSeekV3Parser,
         "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,
+        "deepseek_v4": DeepSeekV4Parser,
         "gemma4": Gemma4ToolParser,
         "glm4": Glm4ToolParser,
         "glm47": Glm47ToolParser,

@@ -2335,3 +2335,11 @@ class PeftCacheManager(BaseResourceManager):
 
     def is_task_cached_device(self, task_id: int) -> bool:
         return self.impl.is_task_cached_device(task_id)
+
+
+def __getattr__(name: str):
+    if name in ("KVCacheManagerV2", "Role"):
+        from .kv_cache_manager_v2 import KVCacheManagerV2, Role
+
+        return {"KVCacheManagerV2": KVCacheManagerV2, "Role": Role}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

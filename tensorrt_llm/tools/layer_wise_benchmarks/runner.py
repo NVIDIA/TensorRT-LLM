@@ -237,8 +237,8 @@ def make_balanced_routing_method(
     dp_rank,
     ep_size,
 ):
-    def balanced_routing_method(router_logits):
-        token_selected_experts, token_final_scales = apply_method_orig(router_logits)
+    def balanced_routing_method(router_logits, input_ids=None):
+        token_selected_experts, token_final_scales = apply_method_orig(router_logits, input_ids)
         assert moe_module._routing_results_replaced_at in [None, "make_balanced_routing_method"]
         if balance_method == BalanceMethod.Balanced:
             token_selected_experts = get_balanced_selection(

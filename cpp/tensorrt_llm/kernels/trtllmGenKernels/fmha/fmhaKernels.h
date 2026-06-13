@@ -230,7 +230,7 @@ public:
         {
             return false;
         }
-        return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
+        return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !isTokenSparse(options.mSparseType)
             && options.mDtypeKv != tg::Dtype::E2m1;
     }
 

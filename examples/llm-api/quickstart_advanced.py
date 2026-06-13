@@ -224,6 +224,7 @@ def add_llm_args(parser):
                         type=str,
                         default=None,
                         nargs='+')
+    parser.add_argument('--tokenizer_dir', type=str, default=None)
 
     return parser
 
@@ -363,6 +364,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        tokenizer=args.tokenizer_dir,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
