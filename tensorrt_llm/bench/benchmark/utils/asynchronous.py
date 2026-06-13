@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import asyncio
@@ -31,8 +45,11 @@ class LlmManager:
                  streaming: bool,
                  concurrency: int = -1,
                  modality: Optional[str] = None,
-                 tokenizer: Optional[PreTrainedTokenizer] = None) -> None:
+                 tokenizer: Optional[PreTrainedTokenizer] = None,
+                 duration: Optional[int] = None) -> None:
         self.llm = llm
+        self.duration = duration
+        self.start_time: Optional[float] = None
         self._inbox: asyncio.Queue[Tuple[InferenceRequest,
                                          SamplingParams]] = asyncio.Queue()
         self._outbox = outbox
@@ -63,7 +80,10 @@ class LlmManager:
     async def _process_single_request(self, request: InferenceRequest,
                                       sampling_params: SamplingParams,
                                       post_proc_params: PostprocParams):
+        """Process a single inference request."""
         self.request_seen.set()
+        if self.start_time is None:
+            self.start_time = time.perf_counter()
         sampling_params = copy.copy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
 
@@ -113,6 +133,8 @@ class LlmManager:
         slot so that the conversation history stays consistent.
         """
         self.request_seen.set()
+        if self.start_time is None:
+            self.start_time = time.perf_counter()
         sampling_params = copy.copy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
         tokenizer = self.tokenizer
@@ -198,9 +220,20 @@ class LlmManager:
             self._task_errors.append(error)
 
     async def worker(self) -> None:
+        """Worker task that pulls requests from inbox and processes them."""
         try:
             while not self._stop.is_set():
                 self._raise_for_failed_tasks()
+
+                if self.duration is not None and self.start_time and time.perf_counter() - self.start_time >= self.duration:
+                    logger.info("Duration reached. Stopping pulling requests.")
+                    while not self._inbox.empty():
+                        try:
+                            self._inbox.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    break
+
                 try:
                     request, sampling_params, post_proc_params = self._inbox.get_nowait(
                     )
@@ -217,9 +250,13 @@ class LlmManager:
         except asyncio.CancelledError:
             logger.info("Worker task cancelled.")
         finally:
-            logger.debug("Worker task cancelling remaining requests...")
-            for task in self._tasks:
-                task.cancel()
+            logger.debug("Worker task finishing...")
+            if self._stop.is_set():
+                logger.debug("Worker task cancelling remaining requests due to stop signal...")
+                for task in self._tasks:
+                    task.cancel()
+            else:
+                logger.debug("Worker task exiting. Waiting for in-flight tasks to complete...")
             logger.debug("Waiting for requests...")
             if self._tasks:
                 await asyncio.wait(self._tasks)
@@ -341,7 +378,25 @@ async def async_benchmark(
     iteration_log_addr: str = None,
     modality: Optional[str] = None,
     tokenizer: Optional[PreTrainedTokenizer] = None,
+    duration: Optional[int] = None,
 ) -> StatsKeeper:
+    """Run an asynchronous benchmark.
+
+    Args:
+        llm: The LLM instance to use.
+        sampling_params: Sampling parameters for generation.
+        post_proc_params: Post-processing parameters.
+        requests: List of inference requests.
+        streaming: Whether to use streaming mode.
+        concurrency: Maximum concurrency limit.
+        iteration_log_addr: Address for iteration logging.
+        modality: Modality of requests.
+        tokenizer: Tokenizer for multi-turn requests.
+        duration: Maximum run time in seconds.
+
+    Returns:
+        StatsKeeper containing benchmark statistics.
+    """
     outbox = asyncio.Queue()
     statistics = StatsKeeper()
     submit_finished = asyncio.Event()
@@ -352,7 +407,8 @@ async def async_benchmark(
                          streaming,
                          concurrency=concurrency,
                          modality=modality,
-                         tokenizer=tokenizer)
+                         tokenizer=tokenizer,
+                         duration=duration)
     enqueue_task: Optional[asyncio.Task] = None
     try:
         backend.run(iteration_addr=iteration_log_addr)
@@ -377,7 +433,10 @@ async def async_benchmark(
                 except asyncio.TimeoutError:
                     logger.debug("No items in queue. Continuing.")
 
-            assert finished_requests == len(requests), "Benchmark failed"
+            if duration is None:
+                assert finished_requests == len(requests), "Benchmark failed"
+            elif finished_requests < len(requests):
+                logger.info(f"Duration limit reached. Processed {finished_requests}/{len(requests)} requests.")
 
         statistics.set_energy(monitor.total_energy)
         logger.info("Benchmark complete.")
