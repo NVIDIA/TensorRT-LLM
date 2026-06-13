@@ -22,7 +22,6 @@ This module provides two-stage transformation for SwiGLU MLP:
 The SwiGLU pattern is: silu(x @ gate.T) * (x @ up.T) @ down.T
 """
 
-from contextlib import contextmanager
 from typing import Tuple, Type
 
 import torch
@@ -48,7 +47,7 @@ from ...utils._graph import (
     eliminate_dead_code,
     get_attr_by_name,
 )
-from ...utils.node_utils import extract_op_args, is_op, set_op_args
+from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ...utils.quantization_utils import ensure_tma_col_major
 from ..interface import (
@@ -58,42 +57,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-
-def _weight_key(node: Node):
-    """Stable key for a weight arg: the get_attr target FQN (survives node re-creation
-    during pattern replacement), falling back to node identity. ``args[1]`` is the
-    weight for both linear and SwiGLU ops."""
-    w = node.args[1] if len(node.args) > 1 else None
-    if not isinstance(w, Node):
-        return None
-    return w.target if w.op == "get_attr" else w
-
-
-@contextmanager
-def preserve_layer_types(gm: GraphModule, linear_op, fused_op):
-    """Carry the ``layer_type`` hint across a fusion that consumes ``linear_op`` nodes
-    and emits ``fused_op`` nodes (which would otherwise drop the hint).
-
-    Snapshots each source weight's ``layer_type`` before the rewrite, then re-applies
-    it to the fused node keyed by weight, so hint-driven sharding (``shard_layers``)
-    can still classify the fused node. Wrap the matcher's ``patterns.apply`` call.
-    """
-    wmap = {}
-    for n in gm.graph.nodes:
-        if is_op(n, linear_op):
-            [lt] = extract_op_args(n, "layer_type")
-            key = _weight_key(n)
-            if lt is not None and key is not None:
-                wmap[key] = lt
-    yield
-    if not wmap:
-        return
-    for n in gm.graph.nodes:
-        if is_op(n, fused_op):
-            key = _weight_key(n)
-            if key is not None and key in wmap:
-                set_op_args(n, layer_type=wmap[key])
 
 
 def _maybe_to_deepgemm_layout(
@@ -279,12 +242,7 @@ class MatchSwiGLUPattern(BaseTransform):
             dummy_args=dummy_args_with_bias,
         )
 
-        with preserve_layer_types(
-            gm,
-            torch.ops.auto_deploy.torch_linear_simple.default,
-            torch.ops.auto_deploy.torch_swiglu_mlp.default,
-        ):
-            num_matches = patterns.apply(gm.graph)
+        num_matches = patterns.apply(gm.graph)
 
         if num_matches > 0:
             gm.recompile()
@@ -596,12 +554,7 @@ class MatchNVFP4SwiGLUPattern(BaseTransform):
             dummy_args=dummy_args,
         )
 
-        with preserve_layer_types(
-            gm,
-            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear.default,
-            torch.ops.auto_deploy.torch_nvfp4_swiglu_mlp.default,
-        ):
-            num_matches = patterns.apply(gm.graph)
+        num_matches = patterns.apply(gm.graph)
 
         if num_matches > 0:
             gm.recompile()
@@ -882,12 +835,7 @@ class MatchFineGrainedFP8SwiGLUPattern(BaseTransform):
             dummy_args=dummy_args,
         )
 
-        with preserve_layer_types(
-            gm,
-            torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default,
-            torch.ops.auto_deploy.torch_finegrained_fp8_swiglu_mlp.default,
-        ):
-            num_matches = patterns.apply(gm.graph)
+        num_matches = patterns.apply(gm.graph)
 
         if num_matches > 0:
             gm.recompile()
