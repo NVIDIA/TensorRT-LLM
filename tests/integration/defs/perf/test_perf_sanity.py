@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """TensorRT LLM perf sanity tests."""
+# CI-only: trivial no-op edit to re-trigger gb200 deepseek-v32 gen-only perf-sanity (see PR #15224).
 
 import copy
 import fcntl
