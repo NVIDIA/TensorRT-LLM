@@ -168,11 +168,14 @@ class LTX2Attention(Attention):
             # (sharded inner backend + UlyssesAttention) for both self-attn and
             # cross-attn paths.
 
-        # For audio self-attention that may need a runtime Ulysses toggle
-        # (sequence length not always divisible by ulysses_size), create a
-        # plain backend as fallback.  The base class already set self.attn
-        # to UlyssesAttention(inner_backend=sharded_backend).
-        if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
+        # Build a Ulysses/plain dual-attn pair so set_ulysses_active() can toggle
+        # at runtime. Needed for self-attn (audio seq not always divisible by
+        # ulysses_size) and for v2a cross-attn under pure Ulysses (cp_size == 1),
+        # where it lets the block forward use Ulysses a2a instead of all-gathering
+        # the full video K/V. Combined ring/attn2d + Ulysses (cp_size > 1) keeps
+        # cross-attn on the all-gather fallback. The base class already set
+        # self.attn to UlyssesAttention(inner_backend=sharded_backend).
+        if use_ulysses and (cp_size == 1 or not self._is_cross_attn) and ulysses_size > 1:
             self._ulysses_attn = self.attn
             self._plain_attn = create_attention(
                 backend=self.attn_backend,
@@ -673,6 +676,7 @@ class BasicAVTransformerBlock(nn.Module):
             config=model_config,
             layer_idx=idx,
             enable_sequence_parallel=True,
+            use_ulysses=True,
         )
         self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, a_cfg.dim))
         self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, v_cfg.dim))
