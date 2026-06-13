@@ -1,4 +1,4 @@
-from typing import Optional, Type
+from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
@@ -12,6 +12,9 @@ from .sparse import (get_flashinfer_sparse_attn_attention_backend,
                      get_vanilla_sparse_attn_attention_backend)
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 
 def get_attention_backend(
@@ -36,9 +39,6 @@ def get_attention_backend(
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
         return StarAttention
-    elif backend_name == "CUTEDSL":
-        from .cute_dsl import CuteDslAttention
-        return CuteDslAttention
 
     logger.warning("Falling back to TRTLLM attention backend")
     return TrtllmAttention

@@ -7264,13 +7264,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            max_context_len,
                            dtype=output_dtype,
                            device=q.device)
+
     # =========================================================================
-    # MLA decode (Blackwell) — wraps the CuTe DSL kernels that live at
+    # MLA decode (Blackwell) - wraps the CuTe DSL kernels that live at
     # tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/.
-    # Used by the CUTEDSL attention backend (see attention_backend/cute_dsl.py).
+    # Used by the cute_dsl_mla FMHA library (see attention_backend/fmha/cute_dsl.py).
     #
     # One generic Runner ``CuteDSLNVMlaDecodeBlackwellRunner`` services both
-    # FP8 and FP16/BF16 paths — only the cutlass ``in_dtype`` is passed at
+    # FP8 and FP16/BF16 paths - only the cutlass ``in_dtype`` is passed at
     # construction; the kernel class is derived from it via
     # ``CuteDSLNVMlaDecodeBlackwellRunner._KERNEL_CLASS_BY_DTYPE``. Each
     # dtype still has its own ``@torch.library.custom_op`` (distinct op
@@ -7278,13 +7279,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # they hand the generic Runner.
     #
     #   torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
-    #       → CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float8E4M3FN)
-    #         (→ BlackwellMultiHeadLatentAttentionForwardFP8)
+    #       -> CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float8E4M3FN)
+    #         (-> BlackwellMultiHeadLatentAttentionForwardFP8)
     #
     #   torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
-    #       → CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float16)
+    #       -> CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float16)
     #         or CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.BFloat16)
-    #         (→ BlackwellMultiHeadLatentAttentionForwardFP16)
+    #         (-> BlackwellMultiHeadLatentAttentionForwardFP16)
     # =========================================================================
 
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import \
@@ -7297,29 +7298,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
         """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
 
-        Works for FP8, FP16, and BF16 — pass the cutlass input dtype at
+        Works for FP8, FP16, and BF16 - pass the cutlass input dtype at
         construction; the kernel class is derived from it:
 
             CuteDSLNVMlaDecodeBlackwellRunner(
-                in_dtype=cutlass.Float8E4M3FN, ...)   # → ...ForwardFP8
+                in_dtype=cutlass.Float8E4M3FN, ...)   # -> ...ForwardFP8
             CuteDSLNVMlaDecodeBlackwellRunner(
-                in_dtype=cutlass.Float16, ...)        # → ...ForwardFP16
+                in_dtype=cutlass.Float16, ...)        # -> ...ForwardFP16
             CuteDSLNVMlaDecodeBlackwellRunner(
-                in_dtype=cutlass.BFloat16, ...)       # → ...ForwardFP16
+                in_dtype=cutlass.BFloat16, ...)       # -> ...ForwardFP16
 
         ``get_valid_tactics`` returns the tiler shapes as tactics
         (``(mma_qk_tiler_mn, mma_pv_tiler_mn)`` tuples), filtered by the
         kernel's static ``can_implement``. The current candidate list
-        carries only ``((128, 128), (128, 256))`` — the lone combination
-        both kernels accept today — but more can be added without
+        carries only ``((128, 128), (128, 256))`` - the lone combination
+        both kernels accept today - but more can be added without
         touching ``forward``. ``kernel_cache`` is class-level and keyed
-        by ``(in_dtype, ..., mma_qk_tiler_mn, mma_pv_tiler_mn)``, so FP8
-        and FP16 compilations, plus future tilers, coexist without
-        collisions.
+        by ``(in_dtype, ..., out_dtype, mma_qk_tiler_mn,
+        mma_pv_tiler_mn)``, so FP8/FP16/BF16 output variants and future
+        tilers coexist without collisions.
         """
         kernel_cache = dict()
 
-        # in_dtype → kernel class. The kernels' own ``can_implement`` is
+        # in_dtype -> kernel class. The kernels' own ``can_implement`` is
         # what ultimately rejects unsupported dtypes, but this lookup
         # picks which kernel we even try to compile.
         _KERNEL_CLASS_BY_DTYPE = {
@@ -7359,7 +7360,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def unique_id(self):
             # `kernel_class` is derived from `in_dtype`, so dropping it
             # from the key keeps cache slots 1-to-1 with the in_dtype.
-            # The tilers are NOT here — they're part of the tactic and
+            # The tilers are NOT here - they're part of the tactic and
             # appended into the cache key inside ``forward``.
             return (
                 self.in_dtype,
@@ -7386,12 +7387,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if get_sm_version() not in (100, 103):
                 return []
             q_latent, q_rope, _c_latent, _c_rope, _page_table, cache_seqs, \
-                *_rest = inputs
+                _block_split_kvs, o, *_rest = inputs
             h, latent_dim, seq_len_q, _ = q_latent.shape
             rope_dim = q_rope.shape[1]
             batch_size = cache_seqs.shape[0]
+            if o.dtype == torch.float16:
+                out_dtype = cutlass.Float16
+            elif o.dtype == torch.bfloat16:
+                out_dtype = cutlass.BFloat16
+            else:
+                out_dtype = self.in_dtype
 
-            # Candidate tilers — widen this list to enable AutoTuner
+            # Candidate tilers - widen this list to enable AutoTuner
             # exploration over tile shapes. Each entry is
             # ``(mma_qk_tiler_mn, mma_pv_tiler_mn)``.
             candidate_tiler_tactics = [
@@ -7408,7 +7415,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         latent_dim,
                         rope_dim,
                         self.in_dtype,  # in_dtype
-                        self.in_dtype,  # out_dtype
+                        out_dtype,
                         cutlass.Float32,  # acc_dtype
                         cutlass.Float32,  # lse_dtype
                         mma_qk_tiler_mn,
@@ -7449,8 +7456,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_scale = float(kwargs.get("output_scale", 1.0))
 
             # Unpack the tactic produced by ``get_valid_tactics``. When
-            # AutoTuner isn't engaged (e.g. the attention backend calls
-            # the op without ``choose_one``), tactic may be ``None`` —
+            # AutoTuner isn't engaged (e.g. the FMHA library calls the op
+            # without ``choose_one``), tactic may be ``None`` -
             # fall back to the default (128,128)/(128,256) shape.
             if isinstance(tactic, tuple) and len(tactic) == 2:
                 mma_qk_tiler_mn, mma_pv_tiler_mn = tactic
@@ -7462,7 +7469,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            cache_key = self.unique_id() + (mma_qk_tiler_mn, mma_pv_tiler_mn)
+            if o.dtype == torch.float16:
+                out_dtype = cutlass.Float16
+            elif o.dtype == torch.bfloat16:
+                out_dtype = cutlass.BFloat16
+            else:
+                out_dtype = self.in_dtype
+
+            cache_key = self.unique_id() + (
+                out_dtype,
+                mma_qk_tiler_mn,
+                mma_pv_tiler_mn,
+            )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -7688,9 +7706,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 "trtllm::cute_dsl_mla_decode_fp16_blackwell supports "
                 "torch.float16 or torch.bfloat16 inputs, got "
                 f"{q_latent.dtype}")
-        if not (
-                q_rope.dtype == c_latent.dtype == c_rope.dtype == o.dtype
-                == q_latent.dtype):
+        if not (q_rope.dtype == c_latent.dtype == c_rope.dtype == o.dtype ==
+                q_latent.dtype):
             raise ValueError(
                 "trtllm::cute_dsl_mla_decode_fp16_blackwell requires q, KV, "
                 f"and output dtypes to match; got q_latent={q_latent.dtype}, "

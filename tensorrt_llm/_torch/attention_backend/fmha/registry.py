@@ -16,6 +16,7 @@
 import os
 from typing import TypeAlias
 
+from .cute_dsl import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
@@ -23,6 +24,7 @@ from .interface import Fmha
 FmhaCls: TypeAlias = type[Fmha]
 
 FMHA_LIBS: dict[str, FmhaCls] = {
+    "cute_dsl_mla": CuteDslMlaFmha,
     "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
     "fallback": FallbackFmha,
 }
