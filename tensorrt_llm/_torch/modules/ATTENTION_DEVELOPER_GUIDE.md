@@ -246,21 +246,23 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from
-FlashInfer into the `TRTLLM` backend, and `FallbackFmha` calls the regular
-`thop.attention` runtime path. These are not separate attention backends.
+libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+`FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
+the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
+runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force the fallback path. Each FMHA
-library exposes `is_available()` for module/static environment checks and
-`is_supported()` for per-forward request checks.
+`cute_dsl_mla,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
+or `TLLM_FMHA_LIBS=-cute_dsl_mla,-flashinfer_trtllm_gen` to force the fallback
+path. Each FMHA library exposes `is_available()` for module/static environment
+checks and `is_supported()` for per-forward request checks.
 
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
   requests and dispatches them to phase-specific hooks.
+- `fmha/cute_dsl.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
