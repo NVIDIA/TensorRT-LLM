@@ -14,6 +14,11 @@
   config_path: examples/configs/curated/qwen3-next.yaml
   scenario: Max Throughput
   gpu_compatibility: "Any"
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "B200, B300, GB200, GB300"
 - model: Qwen/Qwen3-30B-A3B
   arch: Qwen3MoeForCausalLM
   config_path: examples/configs/curated/qwen3.yaml

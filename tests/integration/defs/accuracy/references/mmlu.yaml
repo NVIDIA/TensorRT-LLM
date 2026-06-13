@@ -431,6 +431,13 @@ nvidia/Nemotron-Ultra-V3:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 85.70
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 89.449
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 89.449
 nvidia/Nemotron-3-Nano:
   - accuracy: 73.85
   - quant_algo: FP8

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -262,6 +262,11 @@ struct MHARunnerParams
     int totalQSeqLen;
     // The total number of KV sequence lengths in the batch.
     int totalKvSeqLen;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllmGenJITWarmup = false;
+    int32_t trtllmGenJITWarmupMaxNumRequests = 0;
+    int32_t trtllmGenJITWarmupMaxSeqLenQ = 0;
+    int32_t trtllmGenJITWarmupMaxSeqLenKv = 0;
 
     // Buffers.
     // The packed QKV buffer ptr.

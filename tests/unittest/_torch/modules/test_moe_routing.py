@@ -151,6 +151,54 @@ def test_default_moe_routing(top_k):
             reference_scales[2, reference_indices[2, i]])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_tokens, num_experts, top_k", [
+    (32, 128, 8),
+    (1, 128, 8),
+    (8192, 128, 8),
+])
+def test_default_moe_routing_decode_anchor(num_tokens, num_experts, top_k):
+    """Numerics check for the ``default_moe_routing_op`` (softmax-before-topk)
+    path backed by ``customMoeRoutingKernel``.
+
+    This exercises the exact shapes the Qwen3-235B-A22B + EAGLE3 dyntree
+    decode path runs through (decode anchor num_tokens=32, num_experts=128,
+    top_k=8; plus the single-token and prefill corners). The kernel is
+    per-warp independent — each warp owns one token and computes the full
+    softmax + top-k for it — so its output is bit-identical regardless of the
+    block geometry. Lowering ``BLOCK_SIZE`` (1024 -> 128) and raising
+    ``maxNumBlocks`` (1024 -> 8192) only changes how warps are tiled across
+    SMs, never the per-token arithmetic; this test guards that invariant.
+    """
+    routing = DefaultMoeRoutingMethod(top_k=top_k)
+
+    # Unique logits per row so top-k selection has no tie ambiguity.
+    router_logits = gen_unique_logits(num_tokens, num_experts, torch.float32)
+
+    indices, scales = routing.apply(router_logits)
+    assert indices.shape == (num_tokens, top_k)
+    assert scales.shape == (num_tokens, top_k)
+    assert indices.dtype == torch.int32
+    assert scales.dtype == torch.float32
+
+    # Reference: softmax over all experts, then take the top-k.
+    probs = F.softmax(router_logits.float(), dim=1)
+    ref_scales, ref_indices = probs.topk(top_k, dim=1)
+
+    # Compare the selected expert set (order-independent) and the gathered
+    # softmax weights aligned by sorted expert id.
+    idx_sorted, perm = torch.sort(indices, dim=1)
+    ref_idx_sorted, ref_perm = torch.sort(ref_indices.to(torch.int32), dim=1)
+    assert torch.equal(idx_sorted.cpu(), ref_idx_sorted.cpu())
+
+    scales_sorted = torch.gather(scales, 1, perm)
+    ref_scales_sorted = torch.gather(ref_scales, 1, ref_perm)
+    torch.testing.assert_close(scales_sorted,
+                               ref_scales_sorted,
+                               rtol=1e-3,
+                               atol=1e-3)
+
+
 @pytest.mark.parametrize("top_k", [1, 2, 3])
 def test_renormalize_moe_routing(top_k):
     routing = RenormalizeMoeRoutingMethod(top_k=top_k)
