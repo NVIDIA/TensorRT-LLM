@@ -1296,7 +1296,19 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     ConstraintSpec(11, 0, _num_tokens),  # combine_output
                 ),
                 inputs_pre_hook=self._autotuner_inputs_pre_hook,
-                use_cold_l2_cache=True,
+                # MUST stay False for multi-rank MegaMoE. ``use_cold_l2_cache``
+                # makes the AutoTuner ``clone()`` the profiling inputs into extra
+                # buffers for L2-cold rotation. The cross-rank inputs
+                # (activation / activation_sf / topk_weights / combine_output)
+                # are routed by ``_autotuner_inputs_pre_hook`` to a SYMMETRIC
+                # scratch; the clones are ordinary NON-symmetric tensors, so the
+                # kernel's peer-pointer mapping (base = clone ptr + the scratch's
+                # peer_offsets) resolves outside any symmetric region and a
+                # dispatch/combine peer access lands out of bounds (CUDA illegal
+                # memory access during autotuning, e.g. e4_k4 at the m=128
+                # profiling bucket). Single-batch profiling keeps every launch on
+                # the real symmetric scratch.
+                use_cold_l2_cache=False,
                 # Pin the num_tokens bucket ladder to the per-rank token
                 # ceiling instead of letting it depend on whatever
                 # num_tokens the autotuner warmup forward happened to feed
