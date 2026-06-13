@@ -190,26 +190,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, total_blocks - stale_end)
-                if block_ids.size > expected_valid:
-                    block_ids = (
-                        block_ids[-expected_valid:]
-                        if expected_valid > 0
-                        else np.array([], dtype=np.int64)
-                    )
                 # Stale prefix already pruned above; skip reuse-hit blocks that
                 # land inside the window. Clamp to 0: ctx side has cached_per_lg
                 # synthetically 0, and a reuse hit may fall entirely inside the
                 # stale region (those blocks were already pruned, no extra skip).
                 cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
+                total_blocks = (req.prompt_len + tpb - 1) // tpb
+                expected_valid = total_blocks
                 cache_skip = cached_per_lg[idx] // tpb
 
-            if cache_skip > 0:
-                block_ids = (
-                    block_ids[cache_skip:]
-                    if cache_skip < block_ids.size
-                    else np.array([], dtype=np.int64)
-                )
+            block_ids = self._trim_packed_beam_block_ids(
+                block_ids,
+                beam_width=req.py_beam_width,
+                total_blocks=total_blocks,
+                expected_valid=expected_valid,
+                cache_skip=cache_skip,
+            )
 
             groups.append(block_ids)
 
@@ -223,6 +220,56 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             mamba_state_index=mamba_state_index,
             token_range=token_range,
         )
+
+    @staticmethod
+    def _split_packed_beam_block_ids(
+        block_ids: np.ndarray,
+        beam_width: int,
+        total_blocks: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Split 1-D block IDs into beam-0 prefix and appended beam-tail blocks."""
+        if beam_width <= 1 or block_ids.size <= total_blocks:
+            return block_ids, np.array([], dtype=np.int64)
+        tail_count = min(beam_width - 1, block_ids.size - total_blocks)
+        if tail_count <= 0:
+            return block_ids, np.array([], dtype=np.int64)
+        return block_ids[:-tail_count], block_ids[-tail_count:]
+
+    @staticmethod
+    def _trim_packed_beam_block_ids(
+        block_ids: np.ndarray,
+        beam_width: int,
+        total_blocks: int,
+        expected_valid: int,
+        cache_skip: int,
+    ) -> np.ndarray:
+        """Trim/skip beam-0 blocks while preserving packed beam-tail blocks."""
+        if expected_valid <= 0:
+            return np.array([], dtype=np.int64)
+
+        beam0_block_ids, tail_block_ids = KvCacheTransceiverV2._split_packed_beam_block_ids(
+            block_ids, beam_width, total_blocks
+        )
+
+        if beam0_block_ids.size > expected_valid:
+            beam0_block_ids = (
+                beam0_block_ids[-expected_valid:]
+                if expected_valid > 0
+                else np.array([], dtype=np.int64)
+            )
+            if beam0_block_ids.size == 0:
+                tail_block_ids = np.array([], dtype=np.int64)
+
+        if cache_skip > 0:
+            if cache_skip < beam0_block_ids.size:
+                beam0_block_ids = beam0_block_ids[cache_skip:]
+            else:
+                beam0_block_ids = np.array([], dtype=np.int64)
+                tail_block_ids = np.array([], dtype=np.int64)
+
+        if tail_block_ids.size == 0:
+            return beam0_block_ids
+        return np.concatenate([beam0_block_ids, tail_block_ids])
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
