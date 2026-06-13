@@ -35,7 +35,8 @@ from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
+from tensorrt_llm.inputs.utils import (ConversationMessage,
+                                       async_apply_chat_template)
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
@@ -1241,7 +1242,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt: str = apply_chat_template(
+                prompt_task = async_apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
@@ -1253,9 +1254,12 @@ class OpenAIServer(_VideoRoutesMixin):
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
+                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
+                    prompt_task, mm_coroutines)
             prompt = prompt_inputs(prompt)
 
-            mm_data, mm_embeddings = await mm_coroutines
+            if request.prompt_token_ids is not None:
+                mm_data, mm_embeddings = await mm_coroutines
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
             if mm_embeddings:
@@ -1391,7 +1395,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                prompt: str = apply_chat_template(
+                prompt_task = async_apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
@@ -1403,9 +1407,12 @@ class OpenAIServer(_VideoRoutesMixin):
                     chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
+                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
+                    prompt_task, mm_coroutines)
             prompt = prompt_inputs(prompt)
 
-            mm_data, mm_embeddings = await mm_coroutines
+            if request.prompt_token_ids is not None:
+                mm_data, mm_embeddings = await mm_coroutines
             if mm_embeddings:
                 raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
