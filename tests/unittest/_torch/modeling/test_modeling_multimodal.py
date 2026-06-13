@@ -173,6 +173,9 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         """Create a TensorRT-LLM model instance."""
 
         model_config = ModelConfig(pretrained_config=self.hf_config)
+        model_config.max_num_tokens = max(
+            self.get_max_num_tokens(scenario) for scenario in self.get_scenarios()
+        )
         model_class = self.get_trtllm_model_class()
         model = model_class(model_config, **kwargs).to("cuda")
 

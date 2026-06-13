@@ -782,6 +782,24 @@ public:
             enqueue_params.batch_size = num_seqs;
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
+            if (cu_q_seqlens.has_value())
+            {
+                TORCH_CHECK(cu_q_seqlens->dim() == 1, "cu_q_seqlens must be a 1-D tensor.");
+                TORCH_CHECK(cu_q_seqlens->is_cuda(), "cu_q_seqlens must be a CUDA tensor.");
+                TORCH_CHECK(cu_q_seqlens->scalar_type() == at::ScalarType::Int, "cu_q_seqlens must be int32.");
+                TORCH_CHECK(
+                    cu_q_seqlens->size(0) >= num_seqs + 1, "cu_q_seqlens must have at least num_seqs + 1 elements.");
+                enqueue_params.cu_q_seqlens = cu_q_seqlens->data_ptr<int32_t>();
+            }
+            if (cu_kv_seqlens.has_value())
+            {
+                TORCH_CHECK(cu_kv_seqlens->dim() == 1, "cu_kv_seqlens must be a 1-D tensor.");
+                TORCH_CHECK(cu_kv_seqlens->is_cuda(), "cu_kv_seqlens must be a CUDA tensor.");
+                TORCH_CHECK(cu_kv_seqlens->scalar_type() == at::ScalarType::Int, "cu_kv_seqlens must be int32.");
+                TORCH_CHECK(
+                    cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
+                enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
+            }
             // Pass V's actual token stride so the FMHA runner handles both
             // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
             // kv.split() view) correctly.

@@ -104,3 +104,47 @@ class TestBackwardCompatibility:
 
         assert config.TelemetryConfig is llm_args.TelemetryConfig
         assert config.UsageContext is llm_args.UsageContext
+
+
+class TestFieldTelemetryMetadata:
+    """Verify llm_args.Field telemetry metadata handling."""
+
+    def test_telemetry_false_records_exclude_marker(self):
+        """Field(telemetry=False) records an honored exclude sentinel.
+
+        Under type-driven auto-enroll, telemetry=False is no longer a no-op: it
+        is the explicit opt-out for a type-safe-but-sensitive field, recorded as
+        json_schema_extra['telemetry'] = {"exclude": True} and honored by
+        build_capture_manifest's selection rule.
+        """
+        from tensorrt_llm.llmapi import llm_args
+
+        field = llm_args.Field(default=0, telemetry=False)
+
+        assert field.json_schema_extra == {"telemetry": {"exclude": True}}
+
+    def test_telemetry_false_preserves_status_and_records_exclude_marker(self):
+        """Field(telemetry=False) preserves unrelated json schema metadata."""
+        from tensorrt_llm.llmapi import llm_args
+
+        field = llm_args.Field(default=0, status="beta", telemetry=False)
+
+        assert field.json_schema_extra == {
+            "status": "beta",
+            "telemetry": {"exclude": True},
+        }
+
+
+class TestTelemetryFieldCategorical:
+    """Verify TelemetryField.categorical(*values) allowlist shorthand."""
+
+    def test_categorical_builds_allowlist_metadata(self):
+        from tensorrt_llm.usage.config import TelemetryField
+
+        field = TelemetryField.categorical("a", "b")
+
+        assert field.as_json_schema_extra() == {
+            "kind": "categorical",
+            "converter": "allowlist",
+            "allowed_values": ["a", "b"],
+        }
