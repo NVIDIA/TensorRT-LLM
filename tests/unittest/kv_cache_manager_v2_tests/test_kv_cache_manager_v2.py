@@ -56,7 +56,9 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._block_radix_tree import Hasher, traverse_post_order
     from kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
+        DISK_LEVEL,
         GPU_LEVEL,
+        HOST_LEVEL,
         CacheTier,
         MemAddress,
         PageIndexMode,
@@ -112,7 +114,9 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
+        DISK_LEVEL,
         GPU_LEVEL,
+        HOST_LEVEL,
         CacheTier,
         MemAddress,
         PageIndexMode,
@@ -1336,9 +1340,6 @@ class TestResizeQuota(TestKVCacheManagerV2):
         # suspended requests, and resume happens in FIFO order.
         for kv_cache in reversed(kv_cache_lst):
             kv_cache.suspend()
-        GPU_LEVEL = CacheLevel(0)
-        HOST_LEVEL = CacheLevel(1)
-        DISK_LEVEL = CacheLevel(2)
         # Shrink the gpu quota
         success = self.manager.resize(GPU_LEVEL, 32 << 20)
         assert success and self.manager.get_quota(GPU_LEVEL) <= 32 << 20
