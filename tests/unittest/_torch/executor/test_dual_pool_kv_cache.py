@@ -25,7 +25,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 # ---------------------------------------------------------------------------
@@ -129,9 +131,6 @@ def _make_creator(kv_cache_config, model_config=None, is_enc_dec=False, manager_
     if model_config is None:
         model_config = _make_mock_model_config(is_encoder_decoder=is_enc_dec)
     model_engine = _make_mock_model_engine(model_config)
-
-    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 
     if manager_cls is None:
         manager_cls = (
@@ -355,8 +354,6 @@ class TestCrossKvCacheConstruction:
 
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
     def test_create_cross_kv_cache_manager_uses_encoder_geometry(self, use_kv_cache_manager_v2):
-        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
-
         expected_cls = KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
         config = _make_mock_kv_cache_config(
             cross_kv_cache_fraction=0.5,
@@ -629,8 +626,6 @@ class TestKVCacheV2SchedulerCrossParam:
     """KVCacheV2Scheduler should accept and store cross_kv_cache_manager."""
 
     def _make_mock_kv_mgr(self, tokens_per_block=64):
-        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
-
         mgr = Mock(spec=KVCacheManagerV2)
         mgr.tokens_per_block = tokens_per_block
         return mgr
@@ -852,8 +847,6 @@ class TestV1DualPoolSmoke:
     """
 
     def test_build_managers_uses_v1_kv_cache_manager_for_both_pools(self):
-        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-
         kv_cache_config = _make_mock_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=8 * (1 << 30),
