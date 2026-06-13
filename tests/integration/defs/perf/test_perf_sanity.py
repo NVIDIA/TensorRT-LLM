@@ -1907,3 +1907,6 @@ def test_e2e(output_dir, perf_sanity_test_case):
 
     # Upload results to database
     config.upload_test_results_to_database()
+
+
+# CI-only: force perf-sanity re-run to verify v32_fp4_tep4_mtp3_8k1k stability at 5f106dfa (DO NOT MERGE)
