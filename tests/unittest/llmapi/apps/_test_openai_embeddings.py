@@ -37,6 +37,15 @@ BERT_MODEL = "bert/bert-base-uncased-yelp-polarity"
 NUM_CLASSES = 2  # bert-base-uncased-yelp-polarity has 2 output classes
 PROMPTS = ["Hello, world!", "TensorRT-LLM serves embeddings.", "foo bar baz"]
 
+# A per-token reward model on a decoder (Qwen2) backbone. Unlike the BERT
+# classifier (which pools to a fixed [num_labels] vector), this emits a
+# per-token [seq_len, NUM_REWARD_LABELS] tensor, so the flattened embedding
+# length is seq_len * NUM_REWARD_LABELS and varies per input. It exercises the
+# model-output-agnostic serialization path on a different architecture + a
+# variable-length output shape that BERT alone does not cover.
+PRM_MODEL = "Qwen2.5-Math-PRM-7B"
+NUM_REWARD_LABELS = 2  # Qwen2.5-Math-PRM-7B emits 2 reward logits per token
+
 
 @pytest.fixture(scope="module")
 def server():
@@ -141,3 +150,85 @@ async def test_concurrent_requests_are_batched(async_client: openai.AsyncOpenAI)
         assert len(response.data) == 1
         assert response.data[0].index == 0
         assert len(response.data[0].embedding) == NUM_CLASSES
+
+
+# --------------------------------------------------------------------------- #
+# Per-token reward model (decoder backbone) — different arch + output shape.
+# A separate, opt-in server because it loads a 7B checkpoint; selected only
+# when these tests run. Assertions are model-output-agnostic: the flattened
+# embedding is a non-empty float vector whose length is a multiple of
+# NUM_REWARD_LABELS (seq_len * NUM_REWARD_LABELS), not a fixed size.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def prm_server():
+    model_path = get_model_path(PRM_MODEL)
+    args = [
+        "--trust_remote_code",
+        "--max_batch_size",
+        "4",
+        "--max_queue_delay",
+        "0.05",
+        "--max_queue_size",
+        "64",
+        "--max_num_tokens",
+        "8192",
+    ]
+    with RemoteEmbeddingServer(model_path, args) as remote_server:
+        yield remote_server
+
+
+@pytest.fixture(scope="module")
+def prm_client(prm_server: RemoteEmbeddingServer):
+    return prm_server.get_client()
+
+
+@pytest.fixture(scope="module")
+def prm_async_client(prm_server: RemoteEmbeddingServer):
+    return prm_server.get_async_client()
+
+
+def _assert_reward_embedding(embedding):
+    """A per-token reward vector: non-empty floats, length a multiple of 2."""
+    assert len(embedding) > 0
+    assert len(embedding) % NUM_REWARD_LABELS == 0
+    assert all(isinstance(v, float) for v in embedding)
+
+
+def test_prm_single_string(prm_client: openai.OpenAI):
+    response = prm_client.embeddings.create(model=PRM_MODEL, input="Hello, world!")
+    assert response.object == "list"
+    assert len(response.data) == 1
+    assert response.data[0].object == "embedding"
+    assert response.data[0].index == 0
+    _assert_reward_embedding(response.data[0].embedding)
+    assert response.usage.prompt_tokens > 0
+    assert response.usage.total_tokens == response.usage.prompt_tokens
+
+
+def test_prm_batch_indexing(prm_client: openai.OpenAI):
+    response = prm_client.embeddings.create(model=PRM_MODEL, input=PROMPTS)
+    assert len(response.data) == len(PROMPTS)
+    assert [d.index for d in response.data] == list(range(len(PROMPTS)))
+    for d in response.data:
+        _assert_reward_embedding(d.embedding)
+    assert response.usage.prompt_tokens > 0
+
+
+@pytest.mark.asyncio
+async def test_prm_concurrent_requests_are_batched(prm_async_client: openai.AsyncOpenAI):
+    # Concurrent independent requests must coalesce in the dynamic batcher yet
+    # still return correct, independently-indexed responses.
+    num_requests = 8
+    responses = await asyncio.gather(
+        *[
+            prm_async_client.embeddings.create(model=PRM_MODEL, input=f"concurrent request {i}")
+            for i in range(num_requests)
+        ]
+    )
+    assert len(responses) == num_requests
+    for response in responses:
+        assert len(response.data) == 1
+        assert response.data[0].index == 0
+        _assert_reward_embedding(response.data[0].embedding)
