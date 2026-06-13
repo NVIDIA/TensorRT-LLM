@@ -902,19 +902,38 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         // Finalize fusion may not actually be supported by the kernel,
         // if they are not we will catch the error and skip them
         auto configs = getTmaWarpSpecializedConfigs(sm_, true);
-        auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+        // <e4m3, e4m3> compiles both per-tensor FP8 (NONE) and MXFP8 block-
+        // scaled (MXFPX) kernel variants in the same template instantiation,
+        // selected at runtime via use_mxfp8_weight_scaling_. The MXFP8 path
+        // typically needs a larger workspace, so we estimate workspace size
+        // for both variants and take the maximum to guarantee enough memory
+        // regardless of which path runs.
+        constexpr bool is_wmxfp8amxfp8_eligible
+            = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
+        std::vector<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType> scaling_variants;
         if constexpr (use_wfp4afp8)
         {
-            fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
         }
         else if (use_fp4)
         {
-            fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
+        }
+        else if constexpr (is_wmxfp8amxfp8_eligible)
+        {
+            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE);
+            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+        }
+        else
+        {
+            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE);
         }
         size_t max_size = 0;
         bool has_config = false;
         for (auto conf : configs)
         {
+            for (auto fpX_block_scaling_type : scaling_variants)
+            {
 #define CALC_SIZE_FUSION(FUSION)                                                                                       \
     do                                                                                                                 \
     {                                                                                                                  \
@@ -932,13 +951,14 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         }                                                                                                              \
     } while (0)
 
-            CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
-            if (sm_ == 90)
-            {
-                CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
-            }
+                CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
+                if (sm_ == 90)
+                {
+                    CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
+                }
 
 #undef CALC_SIZE_FUSION
+            }
         }
         TLLM_CHECK_WITH_INFO(has_config, "Could not find valid config when calculating workspace size");
         return max_size;
