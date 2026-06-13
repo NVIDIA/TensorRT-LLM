@@ -131,6 +131,8 @@ def checkoutSource ()
 }
 
 def getPulseToken(serviceId, scopes) {
+    def maxRetries = 3
+    def retryDelaySec = 10
     def token
     //Configure credential 'starfleet-client-id' under Jenkins Credential Manager
     withCredentials([usernamePassword(
@@ -138,12 +140,29 @@ def getPulseToken(serviceId, scopes) {
         usernameVariable: 'SF_CLIENT_ID',
         passwordVariable: 'SF_CLIENT_SECRET'
     )]) {
-        // Do not save AUTH_HEADER to a groovy variable since that
-        // will expose the auth_header without being masked
-        token= sh(script: """
-            AUTH_HEADER=\$(echo -n \$SF_CLIENT_ID:\$SF_CLIENT_SECRET | base64 -w0)
-            curl -s --request POST --header "Authorization: Basic \$AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://${serviceId}.ssa.nvidia.com/token?grant_type=client_credentials&scope=${scopes}" | jq ".access_token" |  tr -d '"'
-        """, returnStdout: true).trim()
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                // Do not save AUTH_HEADER to a groovy variable since that
+                // will expose the auth_header without being masked
+                token = sh(script: """
+                    AUTH_HEADER=\$(echo -n \$SF_CLIENT_ID:\$SF_CLIENT_SECRET | base64 -w0)
+                    curl -s --request POST --header "Authorization: Basic \$AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://${serviceId}.ssa.nvidia.com/token?grant_type=client_credentials&scope=${scopes}" | jq ".access_token" |  tr -d '"'
+                """, returnStdout: true).trim()
+            } catch (Exception e) {
+                echo "getPulseToken attempt ${attempt}/${maxRetries} failed: ${e.getMessage()}"
+                token = ""
+            }
+            if (token && token != "null") {
+                break
+            }
+            if (attempt < maxRetries) {
+                echo "getPulseToken returned an empty token (attempt ${attempt}/${maxRetries}), retrying in ${retryDelaySec}s..."
+                sleep(retryDelaySec)
+            }
+        }
+    }
+    if (!token || token == "null") {
+        error("getPulseToken failed to obtain a valid token after ${maxRetries} attempts")
     }
     return token
 }
@@ -347,6 +366,9 @@ pipeline {
         string(name: 'postMergePipelineName', defaultValue: '', description: 'Optional: post-merge pipeline job name to associate with this scan')
         string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
         choice(name: 'scanMode', choices: ['monitor','release'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
+        booleanParam(name: 'runSourceCodeScanning', defaultValue: true, description: 'Run Source Code OSS Scanning (lock file generation + Pulse OSS scan)')
+        booleanParam(name: 'runContainerScanning', defaultValue: true, description: 'Run Container Scanning (Pulse container scan)')
+        booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
     }
     options {
         skipDefaultCheckout()
@@ -380,6 +402,9 @@ pipeline {
         stage('Run TRT-LLM PLC Jobs') {
             parallel {
                 stage("Source Code OSS Scanning") {
+                    when {
+                        expression { return params.runSourceCodeScanning }
+                    }
                     steps {
                         script {
                             generateLockFiles(env.LLM_REPO, env.REF)
@@ -388,6 +413,9 @@ pipeline {
                     }
                 }
                 stage("Container Scanning") {
+                    when {
+                        expression { return params.runContainerScanning }
+                    }
                     steps {
                         script {
                             pulseScanContainer(env.LLM_REPO, env.REF)
@@ -395,6 +423,9 @@ pipeline {
                     }
                 }
                 stage("SonarQube Code Analysis") {
+                    when {
+                        expression { return params.runSonarQube }
+                    }
                     steps {
                         script {
                             sonarScan()
