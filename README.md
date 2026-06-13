@@ -298,9 +298,10 @@ Deprecation is used to inform developers that some APIs and tools are no longer 
 TensorRT-LLM collects anonymous telemetry data by default. This data is used
 in aggregate to understand usage patterns and prioritize engineering efforts.
 **This data cannot be traced back to any individual user.** No prompts,
-user-identifying information, or persistent identifiers are collected. Any
-deployment identifiers are ephemeral, randomly generated per deployment, and
-not linked to users. The data we collect includes:
+outputs, model weights, model paths, tokenizer paths, user-identifying
+information, raw free-form configuration strings, or persistent identifiers are
+collected. Any deployment identifiers are ephemeral, randomly generated per
+deployment, and not linked to users. The data we collect includes:
 
 - Ingress point (e.g., LLM API, CLI, serve command)
 - Deployment duration (via periodic heartbeats)
@@ -309,8 +310,10 @@ not linked to users. The data we collect includes:
 - Parallelism configuration (TP/PP/CP/MoE-EP/MoE-TP sizes), quantization algorithm, dtype, KV cache dtype
 - System information (OS platform, Python version, CPU architecture, CPU count)
 - TRT-LLM version and backend
-- Feature flags (LoRA, speculative decoding, prefix caching, CUDA graphs, chunked context, data parallelism)
+- Feature summary flags (LoRA, speculative decoding, prefix caching, CUDA graphs, chunked context, data parallelism)
 - Disaggregated serving metadata (role and deployment ID)
+- Selected LLM API configuration values: parallelism, dtype, KV cache, scheduler, CUDA graph, and compile settings
+- Capture diagnostics for that payload: a schema checksum (for provenance), the count of captured fields, and whether any free-form value was skipped
 
 Telemetry is automatically disabled in CI and test environments.
 
