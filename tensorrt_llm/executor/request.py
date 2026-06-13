@@ -146,13 +146,15 @@ class GenerationRequest:
         self.id = id
         return self
 
-    # --- int32 token-id wire serialization + ctor buffer side-channel ----------
+    # --- int32 token-id wire serialization + LAZY list materialization ----------
     # Pickling a flat list[int] on the hot proxy->worker RPC-submit path emits one
-    # PyLong frame per token (O(ISL)). Encode token-ids as int32 bytes for the
-    # wire; on decode rebuild the list[int] (consumers unchanged) AND stash the
-    # int32 ndarray in `_prompt_token_ids_i32`, which base_worker._enqueue_request
-    # hands to the C++ Request ctor for a memcpy (no per-token cast on the
-    # GIL-held submit thread). Symmetric / single-build -> no wire-version concern.
+    # PyLong frame per token (O(ISL)). Encode token-ids as int32 bytes for the wire.
+    # On decode we DO NOT eagerly rebuild the list: stash the int32 ndarray in
+    # `_prompt_token_ids_i32` (the C++ Request ctor memcpy's it -- see
+    # base_worker._enqueue_request) and leave `prompt_token_ids` unset. The list is
+    # built lazily (and cached) via __getattr__ only if a consumer actually reads
+    # `prompt_token_ids` (e.g. prompt-logprobs at base_worker:911, star-attention).
+    # Plain decode never reads it -> the O(ISL) `.tolist()` never runs.
     _I32 = "\x00i32be"
 
     @staticmethod
@@ -164,39 +166,50 @@ class GenerationRequest:
                     np.asarray(v, dtype=np.int32).tobytes())
         return v
 
-    @staticmethod
-    def _dec_tokens(v):
-        # (_I32, bytes) -> (list[int], int32 ndarray buffer); else (v, None).
-        if type(v) is tuple and len(v) == 2 and v[0] == GenerationRequest._I32:
-            arr = np.frombuffer(v[1], dtype=np.int32)
-            return arr.tolist(), arr
-        return v, None
-
     def __getstate__(self):
         state = self.__dict__.copy()
-        # transient buffer is rebuilt on decode; never pickle it
-        state.pop("_prompt_token_ids_i32", None)
+        buf = state.pop("_prompt_token_ids_i32", None)
         if "prompt_token_ids" in state:
             state["prompt_token_ids"] = GenerationRequest._enc_tokens(
                 state["prompt_token_ids"])
+        elif buf is not None:
+            # not yet materialized -> encode the buffer's bytes directly
+            state["prompt_token_ids"] = (GenerationRequest._I32, buf.tobytes())
         if state.get("query_token_ids") is not None:
             state["query_token_ids"] = GenerationRequest._enc_tokens(
                 state["query_token_ids"])
         return state
 
     def __setstate__(self, state):
-        pt_buf = None
-        if "prompt_token_ids" in state:
-            # rebuild list[int] for all consumers; keep the int32 buffer for the ctor
-            state["prompt_token_ids"], pt_buf = GenerationRequest._dec_tokens(
-                state["prompt_token_ids"])
-        if state.get("query_token_ids") is not None:
-            # query_token_ids stays a plain list (no ctor fast-path for it)
-            q_list, _ = GenerationRequest._dec_tokens(state["query_token_ids"])
-            state["query_token_ids"] = q_list
+        buf = None
+        pt = state.get("prompt_token_ids")
+        if type(pt) is tuple and len(
+                pt) == 2 and pt[0] == GenerationRequest._I32:
+            buf = np.frombuffer(pt[1], dtype=np.int32)
+            state.pop("prompt_token_ids")  # leave unset -> lazy via __getattr__
+        qt = state.get("query_token_ids")
+        if type(qt) is tuple and len(
+                qt) == 2 and qt[0] == GenerationRequest._I32:
+            # query_token_ids is rare/small -> materialize to list eagerly
+            state["query_token_ids"] = np.frombuffer(qt[1],
+                                                     dtype=np.int32).tolist()
         self.__dict__.update(state)
-        # int32 buffer for the C++ Request ctor memcpy; None if not bytes-encoded
-        self._prompt_token_ids_i32 = pt_buf
+        self._prompt_token_ids_i32 = buf
+
+    def __getattr__(self, name):
+        # Only invoked when `name` is not a normal attribute. Lazily build the
+        # prompt_token_ids list from the int32 buffer the first time it is actually
+        # read, then cache it. base_worker's ctor fast-path reads
+        # `_prompt_token_ids_i32` (a real attribute) instead, so it never triggers
+        # this -> no `.tolist()` on the common decode path.
+        if name == "prompt_token_ids":
+            buf = self.__dict__.get("_prompt_token_ids_i32")
+            if buf is not None:
+                lst = buf.tolist()
+                self.__dict__["prompt_token_ids"] = lst  # cache
+                return lst
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}")
 
 
 class TruncateKVCacheRequest:
