@@ -88,6 +88,19 @@ install_ubuntu_requirements() {
             ln -sf "${hdr}" "/usr/local/cuda/include/$(basename ${hdr})"
         done
     fi
+
+    # cublas >= 13.4.1.2 installs .so files to /usr/lib/<arch>-linux-gnu/libcublas/<major>/
+    # instead of /usr/local/cuda/lib64/. Symlink them so LD_LIBRARY_PATH=/usr/local/cuda/lib64 finds them.
+    ARCH=$(uname -m)
+    CUBLAS_LIB_DIR="/usr/lib/${ARCH}-linux-gnu/libcublas/${CUBLAS_MAJOR_VER}"
+    if [ -d "${CUBLAS_LIB_DIR}" ]; then
+        for lib in "${CUBLAS_LIB_DIR}"/libcublas*.so*; do
+            [ -e "${lib}" ] || continue
+            target="/usr/local/cuda/lib64/$(basename ${lib})"
+            [ -e "${target}" ] || ln -sf "${lib}" "${target}"
+        done
+    fi
+    ldconfig
 }
 
 install_rockylinux_requirements() {
@@ -139,6 +152,18 @@ install_rockylinux_requirements() {
             ln -sf "${hdr}" "/usr/local/cuda/include/$(basename ${hdr})"
         done
     fi
+
+    # cublas >= 13.4.1.2 installs .so files to /usr/lib64/libcublas/<major>/
+    # instead of /usr/local/cuda/lib64/. Symlink them so LD_LIBRARY_PATH=/usr/local/cuda/lib64 finds them.
+    CUBLAS_LIB_DIR="/usr/lib64/libcublas/${CUBLAS_MAJOR_VER}"
+    if [ -d "${CUBLAS_LIB_DIR}" ]; then
+        for lib in "${CUBLAS_LIB_DIR}"/libcublas*.so*; do
+            [ -e "${lib}" ] || continue
+            target="/usr/local/cuda/lib64/$(basename ${lib})"
+            [ -e "${target}" ] || ln -sf "${lib}" "${target}"
+        done
+    fi
+    ldconfig
 }
 
 install_tensorrt() {
