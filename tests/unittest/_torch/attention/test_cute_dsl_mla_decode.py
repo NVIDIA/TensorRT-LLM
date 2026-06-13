@@ -16,21 +16,19 @@
 
 This test validates the CuTe DSL MLA *decode* kernels added under
 ``tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla`` and dispatched
-through the ``CUTEDSL`` attention backend
-(``tensorrt_llm/_torch/attention_backend/cute_dsl.py``):
+through the ``cute_dsl_mla`` TRTLLM FMHA library
+(``tensorrt_llm/_torch/attention_backend/fmha/cute_dsl.py``):
 
-- FP8 path  → ``torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell``
-- FP16/BF16 path → ``torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell``
+- FP8 path: ``torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell``
+- FP16/BF16 path: ``torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell``
 
 Only the generation (decode) steps are asserted for numerical correctness.
 The context phase runs solely to populate the paged KV cache and to build the
 reference latent cache (``skip_context_assert=True``).
 
-Crucially, the test monkeypatches ``CuteDslAttention._dispatch_cute_dsl_mla_decode``
-to count invocations and asserts the CuTe DSL decode path was actually taken on
-every decode step. Without this guard the backend would silently fall back to
-TRTLLM on any kernel error and the test could "pass" without ever exercising
-the CuTe DSL kernel under test.
+Crucially, the test monkeypatches ``CuteDslMlaFmha._run_mla_decode`` to count
+invocations and asserts the CuTe DSL decode path was actually taken on every
+decode step.
 
 Platform: Blackwell SM100 / SM103 only.
 """
@@ -47,7 +45,8 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 # DeepSeek-V3-like MLA geometry the CuTe DSL kernel targets (num_heads=128,
 # latent_dim=512, rope_dim=64). Kept small along the batch/step axes so the
-# decode-only test stays fast.
+# decode-only test stays fast. Multi-token/MTP decode is handled by replaying
+# the single-token CuTe DSL kernel once per intra-step query.
 _DECODE_CONTEXT_LENGTHS = [
     [10, 12, 5],
     [100, 300, 20, 10],
@@ -57,11 +56,11 @@ _DECODE_NUM_STEPS = 4
 # Multi-layer is the structural difference between this single-step test and the
 # real DeepSeek-V3 E2E run (61 MLA layers). With ``num_layers == 1`` the dispatch
 # only ever sees ``layer_idx == 0``, so the per-layer paged-KV resolution in
-# ``CuteDslAttention._dispatch_cute_dsl_mla_decode`` (the
+# ``CuteDslMlaFmha._run_mla_decode`` (the
 # ``host_kv_cache_pool_mapping[layer_idx]`` / per-layer ``get_buffers`` /
 # block-offset path) is never exercised. The E2E run produces correct output on
 # the first generated token (which comes from the TRTLLM prefill) and then
-# degenerates on every subsequent CuteDSL decode step — consistent with the
+# degenerates on every subsequent CuteDSL decode step, consistent with the
 # decode kernel reading the wrong blocks for ``layer_idx > 0``. Parametrize over
 # >1 layers so the unit test reproduces that real case.
 _DECODE_NUM_LAYERS = [1, 2]
@@ -115,17 +114,18 @@ def _build_rope_config(scenario: Scenario) -> RopeConfig:
 
 @pytest.fixture
 def cute_dsl_decode_counter(monkeypatch):
-    """Count *successful* CuTe DSL MLA decode dispatches so the test fails on
+    """Count successful CuTe DSL MLA decode dispatches so the test fails on
     silent fallback to the TRTLLM backend.
 
-    The increment happens only after the real dispatch returns: if the kernel
-    raises, ``CuteDslAttention.forward`` catches it and falls back to TRTLLM,
-    the counter does not advance, and the per-test assertion on the expected
-    dispatch count fails loudly instead of the broken kernel masquerading as a
-    working one."""
-    from tensorrt_llm._torch.attention_backend.cute_dsl import CuteDslAttention
+    The increment happens only after the real dispatch returns. If the kernel
+    raises or the registry selects the fallback FMHA library, the counter does
+    not advance and the per-test assertion fails loudly instead of the broken
+    kernel masquerading as a working one."""
+    from tensorrt_llm._torch.attention_backend.fmha.cute_dsl import CuteDslMlaFmha
 
-    original = CuteDslAttention._dispatch_cute_dsl_mla_decode
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "cute_dsl_mla,fallback")
+
+    original = CuteDslMlaFmha._run_mla_decode
     counter = {"calls": 0}
 
     def _counting_dispatch(self, *args, **kwargs):
@@ -133,7 +133,7 @@ def cute_dsl_decode_counter(monkeypatch):
         counter["calls"] += 1
         return result
 
-    monkeypatch.setattr(CuteDslAttention, "_dispatch_cute_dsl_mla_decode", _counting_dispatch)
+    monkeypatch.setattr(CuteDslMlaFmha, "_run_mla_decode", _counting_dispatch)
     return counter
 
 
@@ -153,7 +153,7 @@ def test_cute_dsl_mla_decode(
     rope_config = _build_rope_config(scenario)
 
     _run_test_for_backend(
-        "CUTEDSL",
+        "TRTLLM",
         num_heads=scenario.num_heads,
         num_kv_heads=scenario.num_kv_heads,
         num_layers=scenario.num_layers,
@@ -200,9 +200,7 @@ _LONG_DECODE_NUM_STEPS = 64
 @pytest.mark.parametrize("kernel", list(_KERNEL_DTYPES))
 @pytest.mark.parametrize("num_layers", _DECODE_NUM_LAYERS, ids=lambda x: f"num_layers={x}")
 @pytest.mark.parametrize("v2_kv_cache", [True, False], ids=lambda x: f"v2_kv_cache={x}")
-def test_cute_dsl_mla_decode_long_decode(
-    v2_kv_cache, num_layers, kernel, cute_dsl_decode_counter
-):
+def test_cute_dsl_mla_decode_long_decode(v2_kv_cache, num_layers, kernel, cute_dsl_decode_counter):
     """Long decode-only MLA run that crosses paged-KV block boundaries mid-decode.
 
     Reproduction for the DeepSeek-V3 E2E degeneration: short prompt, long
