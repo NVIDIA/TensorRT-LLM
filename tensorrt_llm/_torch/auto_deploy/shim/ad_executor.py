@@ -141,13 +141,21 @@ def maybe_pad_for_cuda_graph(func):
             return func(self, scheduled_requests, resource_manager, *args, **kwargs)
 
         def _call_func_eager():
-            # When this wrapper has decided that all ranks must run eager, also force
-            # the inner cudagraph backend to bypass captured graphs. Otherwise, ranks
-            # whose shapes happen to match a captured graph would still replay and
-            # use stale capture-time scalar kernel args (e.g. runtime_max_tokens_per_rank
-            # baked from local total at capture, vs cross-rank max read fresh in eager).
+            # Force captured-graph wrappers to short-circuit to eager (see
+            # BypassCapturedGraphs): a rank whose shapes match a captured graph would
+            # otherwise replay with stale capture-time per-rank scalar args.
             with BypassCapturedGraphs():
                 return _call_func()
+
+        # Pick the cudagraph-fallback path: only attention-DP mixed mode needs the
+        # eager bypass (stale per-rank scalar args). Without attention-DP all ranks
+        # share shapes, so the plain eager call keeps piecewise cudagraph for prefill
+        # — bypassing would force every prefill eager (a needless low-concurrency hit).
+        _fallback = (
+            _call_func_eager
+            if (self.enable_attention_dp and self.dist_config.tp_size > 1)
+            else _call_func
+        )
 
         # check conditions for current rank
         can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
@@ -180,7 +188,7 @@ def maybe_pad_for_cuda_graph(func):
         can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
 
         if not can_run_cuda_graph_all:
-            return _call_func_eager()
+            return _fallback()
 
         # get closest cudagraph batch size based on max_batch_size across ALL ranks
         # NOTE: we assume uniform cudagraph batch sizes across all ranks ensuring all ranks get the
@@ -189,14 +197,14 @@ def maybe_pad_for_cuda_graph(func):
         cg_batch_size = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
 
         if cg_batch_size is None:
-            return _call_func_eager()
+            return _fallback()
 
         # let's check if all ranks can pad the batch if they need to
         can_pad_all = all(r_info[1] or (r_info[2] == cg_batch_size) for r_info in all_rank_info)
 
         # fall back if we cannot run cudagraph due to padding issues
         if not can_pad_all:
-            return _call_func_eager()
+            return _fallback()
 
         # check actual amount of padding needed
         num_padding = cg_batch_size - batch_size
