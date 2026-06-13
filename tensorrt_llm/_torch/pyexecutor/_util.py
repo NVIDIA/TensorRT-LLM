@@ -1718,13 +1718,29 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
+    # Register the compression manager (if one is configured) with the other
+    # managers, before building ResourceManager, so it is part of the manager
+    # set from the start. Reads its own config, not the sparse-attention one.
+    if llm_args.kv_cache_compression_config is not None:
+        from .resource_manager import create_kv_cache_compression_manager
+        compression_manager = create_kv_cache_compression_manager(
+            llm_args.kv_cache_compression_config, kv_cache_manager)
+        if compression_manager is not None:
+            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                compression_manager)
+
     resource_manager = ResourceManager(resources)
 
-    # Make sure the kv cache manager is always invoked last as it could
-    # depend on the results of other resource managers.
+    # KV cache manager runs last (others may depend on it), except the
+    # compression manager which reconciles after it (below).
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
+    # Compression manager runs after the cache manager: reconciles history once it's resized.
+    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+            in resource_manager.resource_managers):
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
