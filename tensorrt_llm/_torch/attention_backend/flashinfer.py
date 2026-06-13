@@ -105,6 +105,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _paged_kv_last_page_len: torch.Tensor = field(init=False)
     _qo_indptr: torch.Tensor = field(init=False)
     _kv_indptr: torch.Tensor = field(init=False)
+    _ragged_qo_indptr_buf: torch.Tensor = field(init=False)
+    _ragged_kv_indptr_buf: torch.Tensor = field(init=False)
     _cached_token_lens: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
@@ -475,6 +477,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.max_num_requests + 1, device='cuda',
             dtype=torch.int) if self.is_cross else self._qo_indptr
 
+        self._ragged_qo_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_ragged_qo_indptr_buf",
+            capture_graph=capture_graph,
+        )
+        self._ragged_kv_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_ragged_kv_indptr_buf",
+            capture_graph=capture_graph,
+        )
+
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
@@ -663,8 +680,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             seq_lens_q=q_seqlens_cuda,
             max_token_per_sequence=max_query_tokens_per_sequence,
             max_sequence_kv=max_key_value_tokens_per_sequence,
-            v_indptr=key_value_element_indptr,
-            o_indptr=query_output_element_indptr,
         )
 
     def prepare(self) -> None:
@@ -994,18 +1009,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             )
 
         if self.kv_cache_manager is None:
-            if self.is_cuda_graph:
-                raise NotImplementedError(
-                    "FlashInfer without a KV cache manager does not support "
-                    "CUDA graph capture; use the TRTLLM attention backend.")
             if plan_params in self._plan_params_to_wrappers:
                 ragged_prefill_wrapper = self._plan_params_to_wrappers[
                     plan_params].ragged_prefill_wrapper
             else:
+                qo_indptr_buf = self._ragged_qo_indptr_buf[:self.num_contexts +
+                                                           1]
+                kv_indptr_buf = self._ragged_kv_indptr_buf[:self.num_contexts +
+                                                           1]
                 ragged_prefill_wrapper = (
                     flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
                         self.workspace_buffer,
                         self.kv_layout,
+                        use_cuda_graph=self.is_cuda_graph,
+                        qo_indptr_buf=qo_indptr_buf,
+                        kv_indptr_buf=kv_indptr_buf,
                         backend="cudnn",
                     ))
             if self.num_contexts <= 0:
