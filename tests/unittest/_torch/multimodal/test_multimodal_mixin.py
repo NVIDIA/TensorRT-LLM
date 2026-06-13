@@ -52,6 +52,17 @@ def make_cached_multimodal_param(mm_embeds: torch.Tensor) -> MultimodalParams:
     return MultimodalParams(multimodal_data={"multimodal_embedding": mm_embeds})
 
 
+def test_cast_multimodal_encoder_dtype_keeps_meta_tensors_meta():
+    module = torch.nn.Linear(4, 4, device="meta")
+
+    MultimodalModelMixin._cast_multimodal_encoder_dtype(module, torch.float16)
+
+    assert module.weight.device.type == "meta"
+    assert module.weight.dtype == torch.float16
+    assert module.bias.device.type == "meta"
+    assert module.bias.dtype == torch.float16
+
+
 @pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
 def test_prepare_multimodal_inputs_forwards_precomputed_indices(device):
     hidden = 8
