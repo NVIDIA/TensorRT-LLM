@@ -328,7 +328,7 @@ class MistralConfigLoader(BaseConfigLoader):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        hf_quant_config = pretrained_config.quantization_config
+        hf_quant_config = getattr(pretrained_config, "quantization_config", {}) or {}
         if hf_quant_config.get("quant_method") == "compressed-tensors":
             if "NVFP4" in hf_quant_config.get("config_groups"):
                 quant_config.quant_algo = QuantAlgo.NVFP4
@@ -390,7 +390,7 @@ class MistralConfigLoader(BaseConfigLoader):
         from tensorrt_llm._torch.models.modeling_mistral_large3 import Mistral3Gate
 
         model_config.pretrained_config.gate_cls = Mistral3Gate
-        model_config.pretrained_config.input_processor_type = "mistral_large_3"
-        model_config.pretrained_config.model_type = "mistral_large_3"
+        model_config.pretrained_config.input_processor_type = "mistral3"
+        model_config.pretrained_config.model_type = "mistral3"
         model_config._frozen = True
         return model_config

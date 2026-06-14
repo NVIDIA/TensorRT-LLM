@@ -538,7 +538,7 @@ def test_processor_get_num_tokens_per_image(
     with mock.patch(
         "tensorrt_llm._torch.models.modeling_mistral.AutoProcessor"
     ) as mocked_auto_processor:
-        input_processor = modeling_mistral.Mistral3InputProcessor(
+        input_processor = modeling_mistral.MistralHFInputProcessor(
             model_path=str(tmp_path),
             config=mistral_3_config,
             tokenizer=mock.MagicMock(),

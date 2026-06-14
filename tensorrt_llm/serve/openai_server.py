@@ -388,6 +388,15 @@ class OpenAIServer(_VideoRoutesMixin):
 
         self.chat_template = load_chat_template(chat_template)
 
+        # When an explicit input_processor override is active,
+        # use its registered model_type for all chat-template
+        # and placeholder-registry lookups
+        _input_proc = getattr(self.generator, 'input_processor', None)
+        _registered = getattr(_input_proc, '_registered_model_type', None)
+        self.effective_model_type = _registered or resolve_top_level_model_type(
+            self.model_config) if self.model_config is not None else (
+                _registered or "")
+
         # Enable response storage for Responses API
         self.enable_store = (len(
             os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE", ""))
@@ -1227,7 +1236,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                    model_type_override=self.effective_model_type or None)
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
@@ -1236,13 +1246,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                    model_type_override=self.effective_model_type or None)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
+                    model_type=self.effective_model_type,
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1377,7 +1388,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                    model_type_override=self.effective_model_type or None)
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
@@ -1386,13 +1398,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=request.media_io_kwargs)
+                    request_media_io_kwargs=request.media_io_kwargs,
+                    model_type_override=self.effective_model_type or None)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=resolve_top_level_model_type(self.model_config),
+                    model_type=self.effective_model_type,
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
