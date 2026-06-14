@@ -42,6 +42,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.modules.fused_moe import (
     CuteDslFusedMoE,
     CutlassFusedMoE,
+    MarlinFusedMoE,
     TRTLLMGenFusedMoE,
 )
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -68,6 +69,7 @@ class MoeBackendType(str, Enum):
     DENSEGEMM = "DENSEGEMM"
     MEGAMOE = "MEGAMOE_DEEPGEMM"
     CUTE_DSL_B12X = "CUTE_DSL_B12X"
+    MARLIN = "MARLIN"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -80,6 +82,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE: MegaMoEDeepGemm,
         MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
+        MoeBackendType.MARLIN: MarlinFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -999,11 +1002,12 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM, MEGAMOE, and CUTE_DSL_B12X do not support autotuner capture
+    # DEEPGEMM, MEGAMOE, CUTE_DSL_B12X, and MARLIN do not support autotuner capture
     if backend_type in (
         MoeBackendType.DEEPGEMM,
         MoeBackendType.MEGAMOE,
         MoeBackendType.CUTE_DSL_B12X,
+        MoeBackendType.MARLIN,
     ):
         return False
 
@@ -1264,6 +1268,8 @@ def should_skip_to_accelerate_ci(
     Rules applied (in order):
     0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
        unquantized coverage enabled.
+    0a. MARLIN backend: only NVFP4 on Hopper (SM90); skip all other
+        quant_algo / architecture combinations.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
     3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
@@ -1297,6 +1303,16 @@ def should_skip_to_accelerate_ci(
         and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
     ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
+
+    # --- Rule 0a: MARLIN backend only runs NVFP4 on Hopper (SM90) ---
+    if backend_type == MoeBackendType.MARLIN:
+        from tensorrt_llm._utils import get_sm_version
+
+        if quant_algo != QuantAlgo.NVFP4:
+            return f"[CI accel] MARLIN only tests NVFP4 in CI (got {quant_algo})"
+        sm_version = get_sm_version()
+        if sm_version != 90:
+            return f"[CI accel] MARLIN only runs on Hopper (SM90) in CI (got SM{sm_version})"
 
     # Any e256-class model_config triggers CI Rule-1 minimal coverage:
     # the full dtype x seq_len x swiglu x routing matrix on e256 models

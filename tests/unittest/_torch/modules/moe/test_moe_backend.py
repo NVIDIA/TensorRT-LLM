@@ -304,6 +304,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.DENSEGEMM,
     MoeBackendType.MEGAMOE,
     MoeBackendType.CUTE_DSL_B12X,
+    MoeBackendType.MARLIN,
 ]
 
 # Data types to test

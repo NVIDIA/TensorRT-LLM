@@ -23,7 +23,7 @@ from torch import nn
 from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..utils import Fp4QuantizedTensor
+from ..utils import Fp4QuantizedTensor, is_nvfp4_marlin_enabled
 
 
 class RMSNorm(nn.Module):
@@ -82,7 +82,7 @@ class RMSNorm(nn.Module):
         # the downstream linear layer handle FP4 quantization.
         if self.is_nvfp4:
             sm_version = get_sm_version()
-            if not (90 <= sm_version < 120):
+            if not (90 <= sm_version < 120) or is_nvfp4_marlin_enabled():
                 self.is_nvfp4 = False
                 return_hp_output = False
         self.return_hp_output = return_hp_output
@@ -186,7 +186,7 @@ class RMSNorm(nn.Module):
                     gather=True,
                     use_gemma=self.use_gemma,
                 )
-        elif IS_FLASHINFER_AVAILABLE:
+        elif IS_FLASHINFER_AVAILABLE and not is_nvfp4_marlin_enabled():
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_gemma_fused_add_rmsnorm,
                                       flashinfer_gemma_rmsnorm,
