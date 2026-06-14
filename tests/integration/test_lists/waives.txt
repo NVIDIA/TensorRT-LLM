@@ -97,7 +97,6 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_27BInstruct::test_fp8_pr
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray SKIP (https://nvbugs/6094070)
 cpp/test_e2e.py::test_benchmarks[bart-90] SKIP (https://nvbugs/5550689)
 cpp/test_e2e.py::test_benchmarks[gpt-80] SKIP (https://nvbugs/5550689)
-cpp/test_e2e.py::test_model[-bart-90] SKIP (https://nvbugs/6162804)
 cpp/test_e2e.py::test_model[-encoder-90] SKIP (waive Encoder-only test because it doesn't take batched input)
 cpp/test_e2e.py::test_model[-gpt-80] SKIP (https://nvbugs/5983283)
 cpp/test_e2e.py::test_model[-mamba-86] SKIP (https://nvbugs/5781665)

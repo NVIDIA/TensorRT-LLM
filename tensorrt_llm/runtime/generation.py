@@ -598,7 +598,9 @@ class _Runtime(object):
         try:
             if self.address is not None:
                 cudart.cudaFree(self.address)
-        except TypeError:
+        except (TypeError, AttributeError):
+            # cudart can be set to None during interpreter shutdown,
+            # which raises AttributeError instead of TypeError.
             pass
 
     @property
@@ -1160,7 +1162,8 @@ class GenerationSession(object):
             if self.use_gemm_allreduce_plugin:
                 assert self.gemm_allreduce_output_handle is not None
                 ipc_nvls_free(self.gemm_allreduce_output_handle)
-        except TypeError:
+        except (TypeError, AttributeError):
+            # Module globals can be None during interpreter shutdown.
             pass
 
     @property

@@ -243,3 +243,12 @@ def keep_log_files(build_dir):
                 _logger.error(f"Error copying {xml_file}: {str(e)}")
     else:
         _logger.info("No XML files found in the build directory.")
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    # C++ static destructors from tensorrt_llm.bindings (and torch / NIXL /
+    # UCX) can race during Py_FinalizeEx and SIGSEGV after pytest has already
+    # written its result line, turning a passing run into EXIT_CODE=139.
+    # Skip the unsafe interpreter finalizer while preserving pytest's status.
+    _os._exit(exitstatus)
