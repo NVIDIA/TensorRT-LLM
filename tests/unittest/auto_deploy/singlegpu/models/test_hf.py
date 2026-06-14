@@ -230,3 +230,69 @@ def test_custom_model_mapping_in_parent_does_not_affect_parent():
     )
 
     assert AutoModelForCausalLMFactory._custom_model_mapping == parent_mapping
+
+
+def test_construct_with_kwargs_drops_kwarg_rejected_by_constructor():
+    """Config-level leftovers (e.g. use_cache) that the constructor rejects are dropped.
+
+    Reproduces the Gemma3 AutoDeploy failure where ``use_cache`` could not be
+    applied to the composite config and was forwarded into the model __init__,
+    raising ``TypeError: ... unexpected keyword argument 'use_cache'``.
+    """
+    built = SimpleModel()
+    calls = []
+
+    def build_fn(**kwargs):
+        calls.append(dict(kwargs))
+        if "use_cache" in kwargs:
+            raise TypeError(
+                "Gemma3ForConditionalGeneration.__init__() got an unexpected "
+                "keyword argument 'use_cache'"
+            )
+        return built
+
+    model = AutoModelForCausalLMFactory._construct_with_kwargs(
+        build_fn, trust_remote_code=True, use_cache=False
+    )
+
+    assert model is built
+    assert calls[0] == {"trust_remote_code": True, "use_cache": False}
+    assert calls[-1] == {"trust_remote_code": True}
+
+
+def test_construct_with_kwargs_passes_accepted_kwargs_unchanged():
+    built = SimpleModel()
+
+    def build_fn(**kwargs):
+        assert kwargs == {"trust_remote_code": True}
+        return built
+
+    assert (
+        AutoModelForCausalLMFactory._construct_with_kwargs(build_fn, trust_remote_code=True)
+        is built
+    )
+
+
+def test_construct_with_kwargs_reraises_unrelated_type_error():
+    def build_fn(**kwargs):
+        raise TypeError("some unrelated type error")
+
+    with pytest.raises(TypeError, match="some unrelated type error"):
+        AutoModelForCausalLMFactory._construct_with_kwargs(build_fn, use_cache=False)
+
+
+def test_construct_with_kwargs_drops_multiple_rejected_kwargs():
+    built = SimpleModel()
+
+    def build_fn(**kwargs):
+        for bad in ("use_cache", "foo"):
+            if bad in kwargs:
+                raise TypeError(
+                    f"Model.__init__() got an unexpected keyword argument '{bad}'"
+                )
+        return built
+
+    model = AutoModelForCausalLMFactory._construct_with_kwargs(
+        build_fn, trust_remote_code=True, use_cache=False, foo=1
+    )
+    assert model is built
