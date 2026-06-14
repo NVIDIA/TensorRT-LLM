@@ -118,10 +118,14 @@ def add_rms_norm_kernel(
 
 def add_rms_norm(hidden_states: Tensor, residual: Tensor, weight: Tensor, eps: float = 1e-5):
     """Fused (x + residual) then RMSNorm.  Returns (normed, x+residual)."""
-    if hidden_states.stride(-1) != 1:
+    # Kernel shares one row_stride across in/residual/out; empty_like outputs are
+    # contiguous, so non-contiguous inputs must be made contiguous (cf. rms_norm).
+    if not hidden_states.is_contiguous():
         hidden_states = hidden_states.contiguous()
-    if residual.stride(-1) != 1:
+    if not residual.is_contiguous():
         residual = residual.contiguous()
+    if hidden_states.shape != residual.shape:
+        raise ValueError("hidden_states and residual must have the same shape")
     feat_size = weight.shape[0]
     seq_len = hidden_states.numel() // hidden_states.size(-1)
     row_stride = hidden_states.stride(-2)
