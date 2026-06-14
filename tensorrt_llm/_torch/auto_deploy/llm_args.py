@@ -483,6 +483,15 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             `self.max_seq_len` so that all downstream consumers see the same value.
         """
 
+        # Resolve enable_attention_dp from the same source `init_dist_config`
+        # uses so the factory sees the same value the runtime will see.
+        # TODO remove it once this is fixed: https://github.com/NVIDIA/TensorRT-LLM/issues/13134
+        ash = self.transforms.get("apply_sharding_hints", {})
+        sharding_config = (
+            ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
+        )
+        enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+
         # TODO (lucaslie): consider supporting Path objects in the model factory
         factory = ModelFactoryRegistry.get(self.model_factory)(
             model=str(self.model),
@@ -493,6 +502,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             max_seq_len=self.max_seq_len,
             # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
             sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
+            enable_attention_dp=enable_attention_dp,
             speculative_config=self.speculative_config,
             speculative_model_kwargs=self.speculative_model_kwargs or None,
         )

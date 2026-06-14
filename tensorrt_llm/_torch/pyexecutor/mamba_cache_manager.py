@@ -459,13 +459,22 @@ class PythonMambaCacheManager(BaseResourceManager):
         ssm_state_shape = (nheads, head_dim, d_state)
 
         # create mamba conv and ssm states
-        conv_states = torch.empty(
+        # Zero-initialize (not torch.empty): an un-prefilled cache slot (e.g. an
+        # attention-DP idle/dummy generation request that is decoded without a
+        # prefill) is read by the causal-conv / SSM ops before anything writes it.
+        # Uninitialized HBM can be NaN/Inf, which the causal-conv then propagates
+        # into the residual stream (and the SSM replay path latches into the
+        # persistent recurrent state, spreading it across ranks via the MoE
+        # all-to-all). Whether the garbage is NaN vs finite depends on the
+        # allocation layout, which is exactly why the failure only surfaced under
+        # {ssm_replay=true × attention-DP × MTP}. Zeros are a valid empty state.
+        conv_states = torch.zeros(
             size=(num_local_layers, max_batch_size) + conv_state_shape,
             dtype=dtype,
             device=device,
         )
 
-        ssm_states = torch.empty(
+        ssm_states = torch.zeros(
             size=(num_local_layers, max_batch_size) + ssm_state_shape,
             dtype=self.mamba_ssm_cache_dtype,
             device=device,
