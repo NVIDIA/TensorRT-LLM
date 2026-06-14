@@ -58,6 +58,9 @@ transforms:
     - mla
     - moe
     - mlp
+    # Gather-shard the huge vocab projection (column split + all_gather); the
+    # weight is read every decode step, so TP splitting the read speeds it up.
+    simple_shard_filter: "lm_head"
   cleanup_identity_dtype_cast:
     enabled: true
   gather_logits_before_lm_head:
