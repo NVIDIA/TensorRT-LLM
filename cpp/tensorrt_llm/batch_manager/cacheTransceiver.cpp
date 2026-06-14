@@ -71,16 +71,19 @@ using RequestIdType = LlmRequest::RequestIdType;
 
 constexpr int kTransferFuturePollIntervalMs = 10;
 
-// Finite status checks are scheduler polls, not terminal deadlines. Keep each
-// slice short so the caller can yield back to scheduling and transfer progress.
-std::chrono::milliseconds getTransferFuturePollInterval(std::optional<int> const& configuredTimeoutMs)
+// Finite status checks are scheduler polls, not terminal deadlines. Pure polls
+// use short slices; calls that ask for at least one completion keep bounded
+// backpressure by waiting up to the configured future timeout.
+std::chrono::milliseconds getTransferFutureWaitInterval(
+    std::optional<int> const& configuredTimeoutMs, bool const needsProgress)
 {
     auto waitMs = kTransferFuturePollIntervalMs;
     if (configuredTimeoutMs.has_value())
     {
-        waitMs = std::max(1, std::min(configuredTimeoutMs.value(), kTransferFuturePollIntervalMs));
+        waitMs = needsProgress ? configuredTimeoutMs.value()
+                               : std::min(configuredTimeoutMs.value(), kTransferFuturePollIntervalMs);
     }
-    return std::chrono::milliseconds(waitMs);
+    return std::chrono::milliseconds(std::max(1, waitMs));
 }
 
 enum class TransferConsensusState : std::uint64_t
@@ -727,7 +730,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     {
         senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
     }
-    auto const futurePollInterval = getTransferFuturePollInterval(senderFutureTimeoutMs);
+    bool const needsProgress = atLeastRequestNum.value_or(0) > 0;
+    auto const futureWaitInterval = getTransferFutureWaitInterval(senderFutureTimeoutMs, needsProgress);
     // Observe-only: WARN per-request when the wall-clock transfer time exceeds
     // kvTransferTimeoutMs. No cancellation, eviction, or state transition.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
@@ -809,7 +813,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             try
             {
-                auto const status = blockAll ? std::future_status::ready : future.wait_for(futurePollInterval);
+                auto const status = blockAll ? std::future_status::ready : future.wait_for(futureWaitInterval);
                 if (status == std::future_status::ready)
                 {
                     future.get();
@@ -823,7 +827,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     TLLM_LOG_DEBUG(
                         "Context KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping it "
                         "in progress.",
-                        requestId, static_cast<long>(futurePollInterval.count()));
+                        requestId, static_cast<long>(futureWaitInterval.count()));
                     ++it;
                 }
                 else
@@ -1004,7 +1008,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     {
         requesterFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
     }
-    auto const futurePollInterval = getTransferFuturePollInterval(requesterFutureTimeoutMs);
+    bool const needsProgress = atLeastRequestNum.value_or(0) > 0;
+    auto const futureWaitInterval = getTransferFutureWaitInterval(requesterFutureTimeoutMs, needsProgress);
 
     // Observe-only: gen-side mirror of the context-side timeout WARN.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
@@ -1033,7 +1038,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             try
             {
-                auto const status = blockAll ? std::future_status::ready : it->second.wait_for(futurePollInterval);
+                auto const status = blockAll ? std::future_status::ready : it->second.wait_for(futureWaitInterval);
                 if (status == std::future_status::ready)
                 {
                     it->second.get();
@@ -1052,7 +1057,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     TLLM_LOG_DEBUG(
                         "Generation KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping "
                         "it in progress.",
-                        requestId, static_cast<long>(futurePollInterval.count()));
+                        requestId, static_cast<long>(futureWaitInterval.count()));
                     ++it;
                     continue;
                 }
