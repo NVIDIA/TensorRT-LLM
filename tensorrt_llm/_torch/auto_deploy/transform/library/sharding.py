@@ -2174,22 +2174,28 @@ def _insert_sharded_moe(
         # - Each GPU computes partial results for local experts only
         # - all_reduce sums partial results across GPUs
         # ---------------------------------------------------------------------------
-        # Fuse the 4 localize ops (sub / floordiv / eq|ge / mul) into one Triton kernel.
-        from ...custom_ops.fused_moe import triton_routing  # noqa: F401  (registers op)
-
-        is_last_rank = ep_rank == ep_size - 1
         with gm.graph.inserting_before(node):
-            route_node = gm.graph.create_node(
+            # Localize expert IDs: selected_experts_local = selected_experts - (ep_rank * experts_per_rank)
+            lower = experts_per_rank * ep_rank
+            selected_experts_local = gm.graph.create_node(
+                "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
+            )
+
+            # Create rank mask: True only for tokens routed to this rank's experts
+            div_node = gm.graph.create_node(
                 "call_function",
-                torch.ops.auto_deploy.ep_local_route,
-                args=(selected_experts, final_scales, experts_per_rank, ep_rank, is_last_rank),
+                operator.floordiv,
+                args=(selected_experts, experts_per_rank),
                 kwargs={},
             )
-            selected_experts_local = gm.graph.create_node(
-                "call_function", operator.getitem, args=(route_node, 0), kwargs={}
+            comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
+            rank_mask = gm.graph.create_node(
+                "call_function", comp_op, args=(div_node, ep_rank), kwargs={}
             )
+
+            # Zero out routing weights for remote experts
             final_scales_local = gm.graph.create_node(
-                "call_function", operator.getitem, args=(route_node, 1), kwargs={}
+                "call_function", operator.mul, args=(final_scales, rank_mask), kwargs={}
             )
 
         args[1] = selected_experts_local

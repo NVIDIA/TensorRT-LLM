@@ -2347,29 +2347,7 @@ def _find_selected_experts_noaux(node) -> Optional[Node]:
         and isinstance(node.args[1], int)
     ):
         return _find_selected_experts_noaux(node.args[0])
-
-    # V24: fused EP localize — getitem(ep_local_route(selected_experts=getitem(noaux,1), ...), 0)
-    ep_in = _peel_ep_local_route(node, expected_index=0)
-    if ep_in is not None:
-        return _direct_noaux_getitem(ep_in, expected_index=1)
     return None
-
-
-def _peel_ep_local_route(node, expected_index: int) -> Optional[Node]:
-    """If node is getitem(ep_local_route(...), expected_index), return ep_local_route's
-    arg for that output: arg0 (selected_experts) for index 0, arg1 (routing_weights) for
-    index 1.  Otherwise None."""
-    if not (
-        isinstance(node, Node)
-        and node.target is operator.getitem
-        and len(node.args) >= 2
-        and node.args[1] == expected_index
-        and isinstance(node.args[0], Node)
-        and is_op(node.args[0], torch.ops.auto_deploy.ep_local_route)
-    ):
-        return None
-    route = node.args[0]
-    return route.args[expected_index] if len(route.args) > expected_index else None
 
 
 def _find_ep_rank_mask_noaux(node) -> Optional[Node]:
@@ -2408,11 +2386,6 @@ def _find_routing_weights_noaux(node) -> Optional[Node]:
     noaux = _direct_noaux_getitem(node, expected_index=0)
     if noaux is not None:
         return noaux
-
-    # V24: fused EP localize — getitem(ep_local_route(routing_weights=getitem(noaux,0), ...), 1)
-    ep_in = _peel_ep_local_route(node, expected_index=1)
-    if ep_in is not None:
-        return _direct_noaux_getitem(ep_in, expected_index=0)
 
     if not (isinstance(node, Node) and node.target is operator.mul and len(node.args) == 2):
         return None
