@@ -843,6 +843,19 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "--cap-add=SYSLOG"
 
                 echo "Final dockerArgs: ${dockerArgs}"
+
+                if (cluster.containerRuntime.toString() == "ENROOT" && slurmJobID) {
+                    def setupLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
+                    def enrootLog = Utils.exec(
+                        pipeline,
+                        script: Utils.sshUserCmd(remote, "\"grep '\\[ENROOT\\]' ${setupLogPath} 2>/dev/null || true\""),
+                        returnStdout: true,
+                        numRetries: 3
+                    ).trim()
+                    if (enrootLog) {
+                        echo "[Enroot setup log]\n${enrootLog}"
+                    }
+                }
                 } else {
                     error "The Slurm node does not come online in the waiting period. Terminating the job."
                 }
