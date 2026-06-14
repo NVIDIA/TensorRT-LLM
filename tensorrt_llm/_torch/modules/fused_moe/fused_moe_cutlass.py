@@ -1076,17 +1076,12 @@ class CutlassFusedMoE(MoE):
         if output_dtype is None:
             output_dtype = x.dtype
 
-        # Same EP id convention as the FP8 path above: global ids (or
-        # ``local_n``-padded under alltoall). Clamp to local range so the
-        # active-mask scatter is in-bounds; non-local tokens collapse onto a
-        # boundary expert (1 extra dequant/rank). ``trtllm.fused_moe`` below
-        # still gets the original global ids -- it does its own remap.
+        # ids are GLOBAL (alltoall dispatch does not rebase them; C++ fused_moe
+        # does). Subtract slot_start to get local indices; out-of-range ids
+        # clamp to a boundary expert -- harmless 1-expert over-dequant.
         local_n = self.expert_size_per_partition
-        if enable_alltoall:
-            local_ids = token_selected_experts.clamp(0, local_n - 1)
-        else:
-            local_ids = (token_selected_experts - self.slot_start).clamp(
-                0, local_n - 1)
+        local_ids = (token_selected_experts - self.slot_start).clamp(
+            0, local_n - 1)
 
         w3_w1_hp, w2_hp = self.quant_method.dequant_active_experts_to_hp(
             self, local_ids, output_dtype)

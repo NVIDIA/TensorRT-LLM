@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import re
 from contextlib import contextmanager
 from dataclasses import replace
@@ -438,8 +437,9 @@ class NemotronHLayer(DecoderLayer):
 
         quant_mode = (model_config.quant_config.quant_mode
                       if model_config.quant_config is not None else None)
-        # We don't use the RMSNorm+NVFP4 on SM < 100
-        _has_fp4_hw = get_sm_version() >= 100
+        # We don't use the RMSNorm+NVFP4 on SM < 100 or SM >= 120
+        sm = get_sm_version()
+        _has_fp4_hw = 100 <= sm < 120
         self.is_nvfp4 = (quant_mode is not None and quant_mode.has_nvfp4()
                          and _has_fp4_hw)
         # For MIXED_PRECISION models, the global quant_mode is QuantMode(0). Check per-layer
@@ -772,10 +772,10 @@ class NemotronHModel(DecoderModel):
 
 def _force_moe_backend_for_w4a16_on_hopper(
         model_config: NemotronHModelConfig) -> None:
-    """SM<100 + NVFP4: force ``moe_backend=CUTLASS`` (only backend with the
-    W4A16 fallback) and disable attention FP4 output fusion.
+    """No native NVFP4 HW (SM<100 or SM>=120) + NVFP4 ckpt: force
+    ``moe_backend=CUTLASS`` (only backend with the W4A16 fallback).
     """
-    if get_sm_version() >= 100:
+    if 100 <= get_sm_version() < 120:
         return
 
     # NVFP4 may live in global quant_config OR per-layer quant_config_dict
@@ -787,14 +787,6 @@ def _force_moe_backend_for_w4a16_on_hopper(
                         for cfg in model_config.quant_config_dict.values())
     if not has_nvfp4:
         return
-
-    # o_proj.has_nvfp4 stays True under W4A16 -- the property reads quant_config.
-    # Use the documented env override to keep attention output in bf16.
-    if os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT") != "0":
-        logger.warning(
-            f"Nemotron-H SM{get_sm_version()}: TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0"
-        )
-        os.environ["TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT"] = "0"
 
     if model_config.moe_backend.upper() in ('CUTLASS', 'AUTO'):
         return
@@ -808,17 +800,20 @@ def _force_moe_backend_for_w4a16_on_hopper(
 
 @contextmanager
 def _use_w4a16_for_nvfp4_on_hopper():
-    """SM<100 + NVFP4: swap NVFP4 quant methods -> W4A16 fallback,
-    loosen MoE SM constraint, and disable MLP's fused relu2+FP4 quant.
+    """No native NVFP4 HW (SM<100 or SM>=120) + NVFP4: swap NVFP4 quant
+    methods -> W4A16 fallback, loosen MoE SM constraint, disable MLP's
+    fused relu2+FP4 quant, and disable per-instance FP4 attention output.
     Class-level patches; model construction is single-threaded today.
     """
-    if get_sm_version() >= 100:
+    sm = get_sm_version()
+    if 100 <= sm < 120:
         yield
         return
 
     original_linear = Linear.get_quant_method
     original_moe = CutlassFusedMoE._get_quant_method
     original_mlp_create_weights = MLP.create_weights
+    original_attn_create_weights = Attention.create_weights
     nvfp4_entry = CutlassFusedMoE._QUANT_SUPPORT_TABLE[QuantAlgo.NVFP4]
     original_sm_constraint = nvfp4_entry["sm_constraint"]
 
@@ -840,6 +835,13 @@ def _use_w4a16_for_nvfp4_on_hopper():
         original_mlp_create_weights(self)
         self._use_fused_relu2_quant = False
 
+    def _patched_attn_create_weights(self):
+        # Per-instance disable of FP4 attention output (kernel is SM100-only).
+        # Mirrors what `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0` does.
+        original_attn_create_weights(self)
+        if hasattr(self.attn, 'use_nvfp4_output'):
+            self.attn.use_nvfp4_output = lambda *args, **kwargs: False
+
     # Allow SM 90 through can_implement(); existing entries preserved.
     constraint_type, constraint_set = original_sm_constraint
     nvfp4_entry["sm_constraint"] = (constraint_type,
@@ -848,12 +850,14 @@ def _use_w4a16_for_nvfp4_on_hopper():
     Linear.get_quant_method = _patched_linear
     CutlassFusedMoE._get_quant_method = _patched_moe
     MLP.create_weights = _patched_mlp_create_weights
+    Attention.create_weights = _patched_attn_create_weights
     try:
         yield
     finally:
         Linear.get_quant_method = original_linear
         CutlassFusedMoE._get_quant_method = original_moe
         MLP.create_weights = original_mlp_create_weights
+        Attention.create_weights = original_attn_create_weights
         nvfp4_entry["sm_constraint"] = original_sm_constraint
 
 

@@ -14,6 +14,8 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
+from tensorrt_llm._torch.modules.triton_dequant_nvfp4 import \
+    dequant_nvfp4_2d_triton
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -1894,10 +1896,14 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
                 "W4A16NVFP4LinearMethod: hp input required; disable upstream "
                 "FP4 fusion (e.g. TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0)")
 
-        ## FP8 input from upstream FMHA pre-quant: invert by / module.inv_input_scale.
+        # FP8 input from upstream FMHA pre-quant: invert by / inv_input_scale.
         if input.dtype == torch.float8_e4m3fn:
-            assert module.inv_input_scale is not None, \
-                "W4A16NVFP4LinearMethod: FP8 input requires static inv_input_scale"
+            assert (
+                not module.force_dynamic_quantization
+                and module.inv_input_scale is not None), (
+                    "W4A16NVFP4LinearMethod: FP8 input requires static "
+                    "inv_input_scale (force_dynamic_quantization must be False "
+                    "and the ckpt must provide the scale)")
             input = (input.to(module.dtype) / module.inv_input_scale).to(
                 module.dtype)
 
@@ -1912,8 +1918,6 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
                 "Input dtype and pre_quant_scale dtype must match")
             input = input * module.pre_quant_scale
 
-        from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
-            dequant_nvfp4_2d_triton
         weight_deq = dequant_nvfp4_2d_triton(
             module.weight.view(torch.uint8),
             module.weight_scale,
