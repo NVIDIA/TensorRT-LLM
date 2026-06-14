@@ -387,6 +387,9 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_4gpus
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_4gpus[llguidance-mtp_nextn=2]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_4gpus[xgrammar-mtp_nextn=0]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_4gpus[xgrammar-mtp_nextn=2]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_dynamic_draft_len
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_eagle_dynamic_draft_len
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_sa_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=fp8-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=none-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=nvfp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
@@ -600,6 +603,8 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=TRTLLM]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=FLASHINFER]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dflash_dynamic_draft_len
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dummy_load_format
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=False-overlap_scheduler=False]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=True-overlap_scheduler=True]
@@ -607,6 +612,7 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_a
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_rejection_dynamic_tree_smoke[no_dynamic_tree]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_rejection_dynamic_tree_smoke[dynamic_tree]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa_global_pool
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=FLASHINFER-torch_compile=True]
@@ -659,8 +665,11 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_c
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=True-attn_backend=TRTLLM-torch_compile=True]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=False]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=True]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa_global_pool
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_suffix_automaton_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=False]

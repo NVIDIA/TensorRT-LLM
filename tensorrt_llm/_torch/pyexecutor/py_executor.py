@@ -2480,26 +2480,53 @@ class PyExecutor:
             from tensorrt_llm._torch.speculative.utils import \
                 get_draft_len_for_batch_size
 
+            spec_dec_mode = self.model_engine.spec_config.spec_dec_mode
+
             # 1. Resolve runtime draft length from schedule
             runtime_draft_len = get_draft_len_for_batch_size(
                 self.model_engine.spec_config.draft_len_schedule,
                 scheduled_batch.batch_size, self.model_engine.max_draft_len)
-
             # 2. Pad or truncate draft tokens to the resolved length
-            PADDING_TOKEN = 0
+            DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             for request in scheduled_batch.generation_requests:
-                current_draft_len = len(request.py_draft_tokens)
-                if current_draft_len < runtime_draft_len:
-                    padding_needed = runtime_draft_len - current_draft_len
-                    request.py_draft_tokens.extend([PADDING_TOKEN] *
-                                                   padding_needed)
-                elif current_draft_len > runtime_draft_len:
-                    request.py_draft_tokens = request.py_draft_tokens[:
-                                                                      runtime_draft_len]
+                current_num_draft_tokens = len(request.py_draft_tokens)
+                if spec_dec_mode.is_pard():
+                    # special case: PARD carries 2K-1 draft tokens per request
+                    runtime_draft_token_buffer_width = (
+                        self.model_engine.spec_config.
+                        get_runtime_tokens_per_gen_step(runtime_draft_len) - 1)
+                    current_runtime_draft_len = (
+                        current_num_draft_tokens +
+                        1) // 2 if current_num_draft_tokens > 0 else 0
+                    real_draft_tokens = request.py_draft_tokens[:min(
+                        current_runtime_draft_len, runtime_draft_len)]
+                    real_draft_tokens.extend(
+                        [DRAFT_BUFFER_PAD] *
+                        (runtime_draft_len - len(real_draft_tokens)))
+                    request.py_draft_tokens = real_draft_tokens + [
+                        DRAFT_BUFFER_PAD
+                    ] * (runtime_draft_token_buffer_width -
+                         len(real_draft_tokens))
+                else:
+                    if current_num_draft_tokens < runtime_draft_len:
+                        padding_needed = (runtime_draft_len -
+                                          current_num_draft_tokens)
+                        request.py_draft_tokens.extend([DRAFT_BUFFER_PAD] *
+                                                       padding_needed)
+                    elif current_num_draft_tokens > runtime_draft_len:
+                        request.py_draft_tokens = request.py_draft_tokens[:
+                                                                          runtime_draft_len]
 
             self.model_engine.runtime_draft_len = runtime_draft_len
         else:
-            self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
+            # Linear-tree modes (incl. PARD) use logical K; tree decoding
+            # (e.g. EAGLE3 dynamic tree) uses total tree tokens. Same
+            # selection as _prepare_tp_inputs and _get_graphs_to_capture.
+            spec_config = self.model_engine.spec_config
+            self.model_engine.runtime_draft_len = (
+                self.model_engine.max_draft_len
+                if spec_config is not None and spec_config.is_linear_tree else
+                self.model_engine.max_total_draft_tokens)
 
     def _can_queue(self, scheduled_batch):
 

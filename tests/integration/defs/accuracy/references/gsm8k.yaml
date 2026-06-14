@@ -16,6 +16,8 @@ meta-llama/Llama-3.1-8B-Instruct:
   - spec_dec_algo: PARD
     extra_acc_spec: use_sa_spec
     accuracy: 74.20
+  - spec_dec_algo: Draft_Target
+    accuracy: 74.20
   - spec_dec_algo: DFlash
     accuracy: 74.20
   - quant_algo: FP8

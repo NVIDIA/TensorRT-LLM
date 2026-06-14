@@ -276,7 +276,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_config.tokens_per_gen_step -
             1) if spec_config is not None else 0
         # Saved before zeroing for draft models; used by update_spec_dec_param.
-        self._spec_dec_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
+        self._spec_dec_max_total_draft_tokens = (
+            spec_config.max_total_draft_tokens
+            if spec_config is not None else 0)
 
         # Dynamic tree draft loop produces up to K * max_draft_len tokens,
         # which may exceed max_total_draft_tokens. Use the larger value for
@@ -496,6 +498,8 @@ class PyTorchModelEngine(ModelEngine):
             self.llm_args.attn_backend,
             sparse_attn_config=self.sparse_attention_config)
 
+        self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
+
         if self.is_spec_decode:
             self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
@@ -518,19 +522,8 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # Parallel-draft modes (PARD, DFlash) size their per-request draft
-            # buffer by tokens_per_gen_step - 1 so the engine reserves exactly
-            # one slot per draft token the target will verify.  PARD still uses
-            # 2K tokens per gen req (K drafts + K mask fillers); DFlash was
-            # reduced to K+1 (K drafts + 1 bonus) - the spec config's
-            # tokens_per_gen_step carries the per-algorithm width.
-            if spec_config.spec_dec_mode.is_parallel_draft():
-                self.max_draft_len = self.max_total_draft_tokens
-            else:
-                self.max_draft_len = spec_config.max_draft_len
-            # Mutable per-iteration draft length (updated each iteration when
-            # dynamic draft length is enabled; otherwise stays fixed).
-            self.runtime_draft_len = self.max_draft_len
+            self.max_draft_len = spec_config.max_draft_len
+            self.runtime_draft_len = spec_config.max_draft_len
 
         else:
             self.without_logits = False
@@ -1274,12 +1267,38 @@ class PyTorchModelEngine(ModelEngine):
         ):
             graphs = [(graph_bs, draft_len) for graph_bs, draft_len in
                       self._dynamic_draft_len_mapping.items()]
+            # Workaround for dynamic draft length:
+            # capture the maximum speculative graph shape up front. Dynamic draft length
+            # breaks the previous assumption that attention workspace demand can be safely
+            # ordered by batch size alone; a later graph shape may require a larger shared
+            # graph workspace, and resizing that workspace can change its data_ptr and
+            # invalidate pointers captured by earlier graphs, causing illegal memory access
+            # on replay.
+            #
+            # This adds the overhead of one extra captured graph, and that graph is not
+            # expected to be used by the normal schedule-driven dynamic draft-length path.
+            #
+            # Follow-up first-principles fix:
+            # query or precompute the exact attention workspace requirement for all
+            # reachable graph shapes, pre-size the shared graph workspace once without
+            # capturing an extra graph, and avoid resizing it in graph mode afterward.
+            max_spec_graph = (max(cuda_graph_batch_sizes),
+                              self.original_max_draft_len)
+            if max_spec_graph not in graphs:
+                graphs.append(max_spec_graph)
             logger.info(f"Dynamic draft length enabled for one-model path. "
                         f"Capturing {len(graphs)} graphs: {graphs}")
             return graphs
 
         # Case 3: Target model (two-model) or one-model without dynamic draft
-        draft_lengths = [self.max_total_draft_tokens]
+        # Match the runtime_draft_len semantics enforced in _prepare_tp_inputs:
+        # logical K for linear-tree modes, total tree tokens for tree decoding.
+        # spec_config is None for non-spec models — fall back to max_draft_len (= 0).
+        draft_lengths = [
+            self.max_draft_len if
+            (self.spec_config is None or self.spec_config.is_linear_tree) else
+            self.max_total_draft_tokens
+        ]
         should_capture_no_spec = (
             self.max_total_draft_tokens > 0
             and not self.spec_config.spec_dec_mode.use_one_engine()
@@ -1331,11 +1350,14 @@ class PyTorchModelEngine(ModelEngine):
         sparse_config = self.sparse_attention_config
         if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(
         ):
-            # For short sequences, use the (seq_len_threshold - max_draft_len - 1) as the maximum sequence length
-            # to make sure all of the past and current input tokens are within the sequence length threshold.
+            # For short sequences, subtract the maximum runtime tokens consumed
+            # by a generation step so all current-step tokens stay within the
+            # sequence length threshold. PARD uses 2K tokens here, not K+1.
+            max_runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+                self.max_draft_len)
             # For long sequences, use the default maximum sequence length.
-            max_seq_len = sparse_config.seq_len_threshold - (
-                self.max_draft_len + 1)
+            max_seq_len = (sparse_config.seq_len_threshold -
+                           max_runtime_tokens_per_gen_step)
             if max_seq_len < effective_max_seq_len:
                 max_seq_len_list = [effective_max_seq_len, max_seq_len]
             else:
@@ -1608,12 +1630,15 @@ class PyTorchModelEngine(ModelEngine):
 
         result = ScheduledRequests()
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+            draft_len)
+        runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
         # Add (batch_size - 1) dummy requests with seq_len=1.
         requests = kv_cache_manager.add_dummy_requests(
             list(range(batch_size - 1)),
             is_gen=True,
-            max_num_draft_tokens=draft_len,
+            max_num_draft_tokens=runtime_draft_token_buffer_width,
             kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
@@ -1666,7 +1691,7 @@ class PyTorchModelEngine(ModelEngine):
             request_ids=[batch_size - 1],
             token_nums=[token_num],
             is_gen=True,
-            max_num_draft_tokens=draft_len,
+            max_num_draft_tokens=runtime_draft_token_buffer_width,
             kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
@@ -2508,8 +2533,10 @@ class PyTorchModelEngine(ModelEngine):
                                                      non_blocking=True)
 
         # Prepare draft tokens
+        num_draft_tokens_per_extend_request = num_tokens_per_extend_request - 1
         self.draft_tokens_cuda[:previous_batch_draft_tokens].copy_(
-            next_draft_tokens_device[previous_slots, :].flatten(),
+            next_draft_tokens_device[
+                previous_slots, :num_draft_tokens_per_extend_request].flatten(),
             non_blocking=True)
 
         # Compute kv_len_offsets and update offset tensors
@@ -2545,8 +2572,10 @@ class PyTorchModelEngine(ModelEngine):
         # Pre-compute constants
         extend_requests = scheduled_requests.generation_requests
         num_extend_requests = len(extend_requests)
-        num_tokens_per_extend_request = self.runtime_draft_len + 1
         spec_config = self.spec_config
+        num_tokens_per_extend_request = self.get_runtime_tokens_per_gen_step(
+            self.runtime_draft_len)
+        runtime_draft_token_buffer_width = num_tokens_per_extend_request - 1
 
         prompt_lengths = torch.empty(num_extend_requests,
                                      dtype=torch.int,
@@ -2608,7 +2637,8 @@ class PyTorchModelEngine(ModelEngine):
         prompt_lengths = prompt_lengths.tolist()
         num_cached_tokens_per_seq = num_cached_tokens_per_seq.tolist()
 
-        previous_batch_draft_tokens = num_extend_reqeust_wo_dummy * self.runtime_draft_len
+        previous_batch_draft_tokens = (num_extend_reqeust_wo_dummy *
+                                       runtime_draft_token_buffer_width)
 
         self._update_target_input_tensors(
             num_accepted_tokens_device=num_accepted_tokens_device,
@@ -2916,6 +2946,9 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+        runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+            self.runtime_draft_len)
+        runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
             request_ids.append(request.py_request_id)
             request_accepted_path[
@@ -2964,31 +2997,31 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_idx = request.py_batch_idx
                 request.py_batch_idx = request.py_seq_slot
 
-                sequence_lengths.append(1 + self.runtime_draft_len)
+                sequence_lengths.append(runtime_tokens_per_gen_step)
                 num_accepted_draft_tokens.append(
                     request.py_num_accepted_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
 
-                draft_lens.append(self.runtime_draft_len)
+                draft_lens.append(runtime_draft_token_buffer_width)
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
-                              len(position_ids) + 1 + self.runtime_draft_len)))
+                              len(position_ids) + runtime_tokens_per_gen_step)))
                 position_ids.extend(
                     list(
-                        range(past_seen_token_num, past_seen_token_num + 1 +
-                              self.runtime_draft_len)))
+                        range(past_seen_token_num, past_seen_token_num +
+                              runtime_tokens_per_gen_step)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
-                                            (1 + self.runtime_draft_len))
+                                            runtime_tokens_per_gen_step)
 
                 num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 self.runtime_draft_len + 1)
+                                                 runtime_tokens_per_gen_step)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
-                    prompt_lengths.append(1 + self.runtime_draft_len)
+                    prompt_lengths.append(runtime_tokens_per_gen_step)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
@@ -3320,30 +3353,36 @@ class PyTorchModelEngine(ModelEngine):
             # Initialize these two values to zeros
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
+            runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+                self.runtime_draft_len)
+            runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
                 # previous input ids
-                previous_batch_tokens = previous_batch_len * (
-                    1 + self.runtime_draft_len)
+                previous_batch_tokens = (previous_batch_len *
+                                         runtime_tokens_per_gen_step)
                 new_tokens = new_tokens_device.transpose(
                     0,
-                    1)[previous_slots, :(1 + self.runtime_draft_len)].flatten()
+                    1)[previous_slots, :runtime_tokens_per_gen_step].flatten()
                 self.input_ids_cuda[num_tokens:num_tokens +
                                     previous_batch_tokens].copy_(
                                         new_tokens, non_blocking=True)
 
                 # previous draft tokens
-                previous_batch_draft_tokens = previous_batch_len * self.runtime_draft_len
-                if self.runtime_draft_len > 0:
-                    self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
-                                           previous_batch_draft_tokens].copy_(
-                                               next_draft_tokens_device[
-                                                   previous_slots, :self.
-                                                   runtime_draft_len].flatten(),
-                                               non_blocking=True)
+                previous_batch_draft_tokens = (previous_batch_len *
+                                               runtime_draft_token_buffer_width)
+                if runtime_draft_token_buffer_width > 0:
+                    self.draft_tokens_cuda[
+                        num_draft_tokens:num_draft_tokens +
+                        previous_batch_draft_tokens].copy_(
+                            next_draft_tokens_device[
+                                previous_slots, :
+                                runtime_draft_token_buffer_width].flatten(),
+                            non_blocking=True)
                 # prepare data for the preprocess inputs
-                kv_len_offsets_device = new_tokens_lens_device - self.runtime_draft_len - 1
+                kv_len_offsets_device = (new_tokens_lens_device -
+                                         runtime_tokens_per_gen_step)
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices,
                     dtype=torch.int,
@@ -3369,8 +3408,8 @@ class PyTorchModelEngine(ModelEngine):
                     extend_dummy_requests)
                 self.previous_pos_id_offsets_cuda[
                     (num_extend_reqeust_wo_dummy - previous_batch_len) *
-                    (1 + self.runtime_draft_len):num_extend_reqeust_wo_dummy *
-                    (1 + self.runtime_draft_len)].copy_(
+                    runtime_tokens_per_gen_step:num_extend_reqeust_wo_dummy *
+                    runtime_tokens_per_gen_step].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
                             0:previous_batch_tokens]],
                         non_blocking=True)
@@ -4622,6 +4661,8 @@ class PyTorchModelEngine(ModelEngine):
             # Propagate runtime_draft_len (already set on self by py_executor)
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
+            spec_metadata.runtime_tokens_per_gen_step = (
+                self.get_runtime_tokens_per_gen_step(self.runtime_draft_len))
 
             # Parallel-draft modes advertise a per-gen-step width via
             # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass

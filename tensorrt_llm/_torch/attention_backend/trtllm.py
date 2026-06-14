@@ -1091,15 +1091,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
                 # So we create cache for position offsets and packed mask for each draft length to avoid reallocation.
                 assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
-                runtime_draft_len = (spec_metadata.runtime_draft_len
-                                     if spec_metadata is not None else
-                                     max_draft_len)
+                # For algos other than PARD, this equals runtime_draft_len (K); for PARD it's 2K-1.
+                runtime_draft_token_buffer_width = (
+                    spec_metadata.runtime_tokens_per_gen_step -
+                    1 if spec_metadata is not None else max_draft_len)
                 self.generate_spec_decoding_generation_length(
-                    runtime_draft_len=runtime_draft_len)
+                    runtime_draft_len=runtime_draft_token_buffer_width)
                 self.spec_decoding_position_offsets = generate_spec_decoding_position_offsets(
-                    self.max_num_requests, runtime_draft_len)
+                    self.max_num_requests, runtime_draft_token_buffer_width)
                 self.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
-                    self.max_num_requests, runtime_draft_len)
+                    self.max_num_requests, runtime_draft_token_buffer_width)
 
             self.update_position_offsets_for_cpp(cpp_query_len)
 
