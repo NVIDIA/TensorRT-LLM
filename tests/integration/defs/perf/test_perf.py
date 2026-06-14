@@ -1034,17 +1034,21 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_trtllm_bench_model(self):
         return get_model_dir(self._config.model_name)
 
+    def get_trtllm_bench_model_name(self):
+        # Legacy "<name>_hf" label; weights load from --model_path.
+        model_name = self._config.model_name
+        if not model_name.endswith("_hf"):
+            model_name = model_name + "_hf"
+        return model_name
+
     def get_trtllm_bench_build_command(self, engine_dir) -> list:
         model_dir = self.get_trtllm_bench_model()
         if model_dir == "":
             pytest.skip("Model Name is not supported by trtllm-bench")
-        model_name = self._config.model_name
-        if not model_name.endswith("_hf"):
-            model_name = model_name + "_hf"
-        hf_model_name = HF_MODEL_PATH.get(model_name, "")
+        model_name = self.get_trtllm_bench_model_name()
         build_cmd = [
             self._build_script, f"--log_level=info",
-            f"--workspace={engine_dir}", f"--model={hf_model_name}",
+            f"--workspace={engine_dir}", f"--model={model_name}",
             f"--model_path={model_dir}", "build",
             f"--tp_size={self._config.tp_size}",
             f"--pp_size={self._config.pp_size}"
@@ -1167,14 +1171,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def get_trtllm_bench_command(self, engine_dir):
         model_dir = self.get_trtllm_bench_model()
-        model_name = self._config.model_name
+        model_name = self.get_trtllm_bench_model_name()
         dataset_path = os.path.join(engine_dir, "synthetic_data.json")
         report_path = os.path.join(engine_dir, "report.json")
-        if not model_name.endswith("_hf"):
-            model_name = model_name + "_hf"
-        hf_model_name = HF_MODEL_PATH.get(model_name, "")
         tp_pp_str = f"tp_{self._config.tp_size}_pp_{self._config.pp_size}"
-        engine_dir = os.path.join(engine_dir, hf_model_name, tp_pp_str)
+        trt_engine_dir = os.path.join(engine_dir, model_name, tp_pp_str)
+        engine_dir = os.path.join(engine_dir, tp_pp_str)
         benchmark_cmd = [
             self._benchmark_script,
             f"--model={model_name}",
@@ -1192,7 +1194,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += ["--backend=_autodeploy"]
         else:
             benchmark_cmd += [
-                f"--backend=tensorrt", f"--engine_dir={engine_dir}"
+                f"--backend=tensorrt", f"--engine_dir={trt_engine_dir}"
             ]
         if self._config.num_reqs > 0:
             benchmark_cmd += [f"--num_requests={self._config.num_reqs}"]
