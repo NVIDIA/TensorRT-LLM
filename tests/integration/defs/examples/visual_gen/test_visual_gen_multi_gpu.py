@@ -21,7 +21,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from defs.examples.test_visual_gen import (
+from defs.examples.visual_gen.test_visual_gen import (
     WAN22_LPIPS_FRAME_RATE,
     WAN22_LPIPS_GUIDANCE_SCALE,
     WAN22_LPIPS_HEIGHT,
@@ -40,8 +40,8 @@ from defs.examples.test_visual_gen import (
 )
 
 try:
-    from tensorrt_llm._torch.visual_gen.config import ParallelConfig
     from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm.visual_gen.args import ParallelConfig
 
     MODULES_AVAILABLE = True
 except ImportError:
