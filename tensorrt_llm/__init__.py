@@ -61,7 +61,17 @@ def _preload_python_lib():
 _preload_python_lib()
 
 import sys
+import warnings
 from pathlib import Path
+
+# Suppress the modelopt warning about transformers version incompatibility.
+# TRT-LLM pins a specific transformers version that is tested and works correctly;
+# the modelopt check is overly conservative for our use case.
+warnings.filterwarnings(
+    "ignore",
+    message="transformers version .* is incompatible with nvidia-modelopt",
+    category=UserWarning,
+)
 
 
 def _setup_vendored_triton_kernels():
