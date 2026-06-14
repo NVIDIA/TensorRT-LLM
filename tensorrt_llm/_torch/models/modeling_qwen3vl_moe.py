@@ -59,6 +59,8 @@ class Qwen3MoeVLModel(Qwen3VLModelBase):
             "image.pixel_values",
             "video.pixel_values_videos",
             "multimodal_embedding",
+            "mrope_config.mrope_position_ids",
+            "mrope_config.mrope_position_deltas",
         ]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
