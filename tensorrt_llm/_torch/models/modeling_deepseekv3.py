@@ -856,7 +856,7 @@ class DeepseekV3Gate(nn.Module):
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
-        self.e_score_correction_bias = nn.Parameter(torch.empty(
+        self.e_score_correction_bias = nn.Parameter(torch.zeros(
             (num_experts), dtype=bias_dtype),
                                                     requires_grad=False)
 
@@ -896,9 +896,10 @@ class DeepseekV3Gate(nn.Module):
 
         self.weight.copy_(weights[0]["weight"][:])
 
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(
-                self.e_score_correction_bias.dtype))
+        if "e_score_correction_bias" in weights[0]:
+            self.e_score_correction_bias.copy_(
+                weights[0]["e_score_correction_bias"][:].to(
+                    self.e_score_correction_bias.dtype))
 
     @property
     def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
