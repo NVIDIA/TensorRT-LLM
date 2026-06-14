@@ -1786,9 +1786,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         forward_args.is_fused_qkv = not metadata.is_cross and k is None
         forward_args.update_kv_cache = not metadata.is_cross or k is not None
-        assert (forward_args.is_fused_qkv and k is None
-                and v is None) or (not forward_args.is_fused_qkv
-                                   and k is not None and v is not None)
+        has_fused_qkv = forward_args.is_fused_qkv and k is None and v is None
+        has_unfused_kv = (not forward_args.is_fused_qkv and k is not None
+                          and v is not None)
+        uses_cached_cross_kv = (metadata.is_cross
+                                and not forward_args.update_kv_cache
+                                and k is None and v is None)
+        assert has_fused_qkv or has_unfused_kv or uses_cached_cross_kv
         if forward_args.cu_q_seqlens is None:
             forward_args.cu_q_seqlens = metadata.cu_q_seqlens
         if forward_args.cu_kv_seqlens is None:
