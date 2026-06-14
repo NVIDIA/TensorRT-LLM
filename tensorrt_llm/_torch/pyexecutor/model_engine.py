@@ -4330,46 +4330,30 @@ class PyTorchModelEngine(ModelEngine):
         """Synthesize an inputs dict that will bucket exactly at
         (batch_size, num_tokens, max_seq_len).
 
-        Uses two distribution strategies:
-        - Case A: `total >= max_seq_len + (batch_size - 1)` — one request at
-          `max_seq_len` tokens, remaining tokens distributed evenly across
-          the other `batch_size - 1` requests.
-        - Case B: `total < max_seq_len + (batch_size - 1)` — one request of
-          `total - (batch_size - 1)` tokens, the rest at 1 token each.
-
         Returns None for infeasible combinations (e.g., batch_size <= 0).
+
+        Mirror the runtime regime: produce the longest real request (size
+        ``max_seq_len`` capped at ``num_tokens - (batch_size - 1)``) plus
+        ``batch_size - 1`` 1-token dummy entries. ``sum(lengths)`` is therefore
+        ``min(max_seq_len, num_tokens - (batch_size - 1)) + (batch_size - 1)``,
+        which is strictly less than ``num_tokens`` whenever
+        ``max_seq_len < num_tokens - (batch_size - 1)`` (i.e. the bucket has
+        token-padding headroom). At runtime ``pad_batch`` always inserts
+        1-token dummies for the padding entries, so the captured FMHA grid
+        and tokensInfo seqEnd-extension regime now match what replay sees.
         """
         if batch_size <= 0 or num_tokens <= 0 or max_seq_len <= 0:
             return None
 
-        total = min(num_tokens, batch_size * max_seq_len)
-
-        if batch_size == 1:
-            lengths = [total]
-        elif total >= max_seq_len + batch_size - 1:
-            # Case A
-            remaining = total - max_seq_len
-            base = remaining // (batch_size - 1)
-            extra = remaining % (batch_size - 1)
-            lengths = [max_seq_len]
-            lengths += [base + 1] * extra + [base] * (batch_size - 1 - extra)
-        else:
-            # Case B
-            first_len = total - (batch_size - 1)
-            lengths = [first_len] + [1] * (batch_size - 1)
-
-        # Sanity: every length must be >= 1.
-        if any(length <= 0 for length in lengths):
+        first_len = min(max_seq_len, num_tokens - (batch_size - 1))
+        if first_len <= 0:
             return None
 
-        actual_num_tokens = sum(lengths)
-        input_ids = [0] * actual_num_tokens
-
-        inputs: Dict[str, Any] = {
-            'input_ids': input_ids,
+        lengths = [first_len] + [1] * (batch_size - 1)
+        return {
+            'input_ids': [0] * sum(lengths),
             'seq_lens': lengths,
         }
-        return inputs
 
     @contextlib.contextmanager
     def no_encoder_cuda_graph(self):
