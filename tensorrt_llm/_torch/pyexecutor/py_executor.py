@@ -2330,6 +2330,15 @@ class PyExecutor:
                 if executed_batch is None:
                     break
                 self._ring_broadcast_sample_state(executed_batch)
+                # When the broadcast queue is empty this thread is about to
+                # block on Queue.get(); without an MPI call here the rank's
+                # progress engine stops driving the just-issued isend and the
+                # next stage's recv_sample_state stalls (NVBugs/6194812).
+                # Use non-blocking test() (bounded poll) instead of wait() to
+                # keep the shutdown-safety property from NVBugs/6050489.
+                if self.executed_batch_queue.empty():
+                    self.progress_pp_send_handles(self.send_handles,
+                                                  executed_batch.microbatch_id)
                 # Do not wait for PP send handles here. The next
                 # _ring_broadcast_sample_state call drains the previous isend
                 # for the same microbatch_id before reusing that slot.
@@ -2451,6 +2460,27 @@ class PyExecutor:
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
+
+    @nvtx_range("progress_pp_send_handles")
+    def progress_pp_send_handles(self,
+                                 send_handles,
+                                 microbatch_id,
+                                 max_polls: int = 64):
+        # Non-blocking MPI-progress driver for an outstanding isend.
+        # Polls Request.test() up to max_polls times so the broadcast
+        # thread keeps the MPI progress engine alive while it is about
+        # to block on Queue.get(). Bounded count means the loop cannot
+        # hang at shutdown if the receiver has already exited
+        # (NVBugs/6050489), while restoring the per-step progress
+        # cadence the blocking wait_on_pp_send_handles previously
+        # provided (NVBugs/6194812).
+        handle = send_handles[microbatch_id]
+        if handle is None:
+            return
+        for _ in range(max_polls):
+            if handle.test()[0]:
+                send_handles[microbatch_id] = None
+                return
 
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
