@@ -723,6 +723,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
     if (!triggeredFlags.isEmpty()) {
         pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
+        _cbtsReportDecision(pipeline, globalVars, "deferred",
+                            "user flags: ${triggeredFlags.join(', ')}", null)
         return null
     }
 
@@ -767,6 +769,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (result.scope == null) {
             pipeline.echo("CBTS: deferring — Python returned scope=null. " +
                           "Reasons: ${result.reasons.join('; ')}")
+            _cbtsReportDecision(pipeline, globalVars, "fallback", "", output)
             return null
         }
         // Upload the generated cbts_test_db/ to Artifactory so each L0_Test
@@ -790,12 +793,48 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
+        def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
+        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output)
         return result
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
         return null
+    }
+}
+
+// Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
+// decisionJson null for deferred; reason used only then. Context/creds via env.
+def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson)
+{
+    try {
+        def args = "--status ${status}"
+        if (decisionJson != null) {
+            pipeline.writeFile(file: "${LLM_ROOT}/cbts_decision.json", text: decisionJson)
+            args += " --decision cbts_decision.json"
+        } else if (reason) {
+            args += " --reason '${reason.replace("'", "")}'"
+        }
+        // PR number for s_pr_number, mirroring perf_regression_utils: GitHub PR
+        // builds carry it in github_pr_api_url (.../pulls/<n>); GitLab MR builds
+        // expose env.gitlabMergeRequestIid. Pass it explicitly since neither is
+        // in the shell env. Empty for post-merge/branch builds.
+        def prNumber = ""
+        def prUrl = globalVars[GITHUB_PR_API_URL]
+        if (prUrl) {
+            def m = (prUrl =~ /\/pulls?\/(\d+)/)
+            if (m.find()) {
+                prNumber = m.group(1)
+            }
+        } else {
+            prNumber = env.gitlabMergeRequestIid ?: ""
+        }
+        sh "cd ${LLM_ROOT} && CBTS_PR_NUMBER='${prNumber}' python3 jenkins/scripts/cbts/tools/report_cbts_decision.py ${args}"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS: decision telemetry failed (non-fatal): ${e.message}")
     }
 }
 
@@ -1699,6 +1738,11 @@ pipeline {
         // to better analyze the time for each step/test
         timestamps()
         timeout(time: 24, unit: 'HOURS')
+    }
+    environment {
+        // CBTS decision telemetry; auto-exposes _USR/_PSW that open_search_db.py reads.
+        OPEN_SEARCH_DB_BASE_URL=credentials("open_search_db_base_url")
+        OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
     }
     post {
         unsuccessful {

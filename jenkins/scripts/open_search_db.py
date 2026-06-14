@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,8 +37,15 @@ import logging
 import os
 import time
 
-import requests
-from requests.auth import HTTPProxyAuth
+try:
+    import requests
+    from requests.auth import HTTPProxyAuth
+except ImportError:
+    # Lightweight CI pods (e.g. the Setup Environment pod) may not ship
+    # requests. Keep the module importable so requests-free callers can still
+    # use the constants and helpers; postToOpenSearchDB itself needs requests.
+    requests = None
+    HTTPProxyAuth = None
 
 PROJECT_ROOT = "swdl-trtllm-infra"
 MODE = "prod"
@@ -52,6 +59,7 @@ JOB_MACHINE_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-job_machine_info"
 FAILED_STEP_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-failed_step_info"
 PR_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-pr_info"
 PERF_SANITY_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-perf_sanity_info"
+CBTS_PROJECT_NAME = f"{PROJECT_ROOT}-ci-{MODE}-cbts_info"
 
 READ_ACCESS_PROJECT_NAME = [
     JOB_PROJECT_NAME,
@@ -61,10 +69,12 @@ READ_ACCESS_PROJECT_NAME = [
     FAILED_STEP_PROJECT_NAME,
     PR_PROJECT_NAME,
     PERF_SANITY_PROJECT_NAME,
+    CBTS_PROJECT_NAME,
 ]
 
 WRITE_ACCESS_PROJECT_NAME = [
     PERF_SANITY_PROJECT_NAME,
+    CBTS_PROJECT_NAME,
 ]
 
 DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST = False
