@@ -1106,19 +1106,23 @@ class DecodingBaseConfig(StrictBaseModel):
     load_format: Optional[str] = Field(
         default=None, description="The load format of the speculative model.")
 
-    acceptance_window: Optional[NonNegativeInt] = Field(
+    acceptance_rate_window_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
-        "The rolling average window size (N) for acceptance length across completed requests. "
+        "The rolling average window size (N) for acceptance rate across "
+        "speculation-enabled decoding iterations. "
         "If not set or set to 0, the feature is disabled. PyTorch backend only."
     )
 
-    acceptance_length_threshold: Optional[NonNegativeFloat] = Field(
+    acceptance_rate_threshold: Optional[float] = Field(
         default=None,
-        description=
-        "The threshold for average acceptance length; speculation will be disabled permanently once the "
-        "rolling average over the last N completed requests (N = acceptance_window) drops below this value. "
-        "PyTorch backend only.")
+        ge=0.0,
+        le=1.0,
+        description="The threshold for average true acceptance rate "
+        "(accepted_draft_tokens / drafted_tokens); speculation will be "
+        "disabled permanently once the rolling average over the last N "
+        "speculation-enabled decoding iterations "
+        "(N = acceptance_rate_window_size) drops below this value. ")
 
     allow_advanced_sampling: bool = Field(
         default=False,
