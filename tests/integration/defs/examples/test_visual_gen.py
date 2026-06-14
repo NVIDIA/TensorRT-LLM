@@ -28,9 +28,11 @@ import zipfile
 
 import pytest
 import torch
+import torch._inductor.config as inductor_config
 from defs import conftest
 from defs.common import venv_check_call
 from defs.trt_test_alternative import check_call
+from torch._inductor.async_compile import shutdown_compile_workers
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
@@ -359,10 +361,22 @@ def _ltx2_lpips_text_encoder_path():
     return candidates[0]
 
 
+def _disable_inductor_compile_worker_quiesce():
+    # The quiesce timer thread can outlive shutdown_compile_workers() long
+    # enough for pytest-threadleak to report it as a leaked thread.
+    if hasattr(inductor_config, "quiesce_async_compile_pool"):
+        inductor_config.quiesce_async_compile_pool = False
+
+
 def _cleanup_cuda():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    # torch.compile / unconditional @torch.compile decorators (e.g. on the TRT-LLM
+    # attention backend's _concat_qkv) lazily spawn an InductorSubproc worker
+    # pool the first time a compiled function runs. The pool's daemon threads
+    # outlive the test and trip pytest-threadleak. Tear them down explicitly.
+    shutdown_compile_workers()
 
 
 def _save_lpips_video_mp4(video, output_path, frame_rate):
@@ -466,6 +480,7 @@ def _generate_flux_lpips_image(model_path, output_path):
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     _skip_if_missing(model_path, "FLUX checkpoint", is_dir=True)
+    _disable_inductor_compile_worker_quiesce()
     args = VisualGenArgs(model=model_path)
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
@@ -497,6 +512,7 @@ def _generate_ltx2_lpips_video(output_path):
     _skip_if_missing(text_encoder_path, "LTX-2 text encoder", is_dir=True)
     _skip_if_missing(spatial_upsampler_path, "LTX-2 spatial upsampler")
     _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
+    _disable_inductor_compile_worker_quiesce()
 
     args = VisualGenArgs(
         model=checkpoint_path,
@@ -550,6 +566,7 @@ def _run_wan_lpips_pipeline(
     )
 
     _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
+    _disable_inductor_compile_worker_quiesce()
     args_kwargs = dict(
         model=model_path,
         compilation_config=CompilationConfig(skip_warmup=True),
